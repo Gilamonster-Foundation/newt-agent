@@ -390,6 +390,47 @@ fn reclaim_attempts_for_test() -> usize {
     RECLAIM_ATTEMPTS.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Overrides [`reclaimable_lock`]'s `now` for the duration of a test.
+    /// Thread-local, same reasoning as [`RECLAIM_ATTEMPTS`]: no cross-test
+    /// serialization needed beyond what `real_fs` already requires.
+    ///
+    /// Why this exists: counting attempts (above) proves the owner-aware,
+    /// live-PID branch fired instead of the slow legacy age-based fallback —
+    /// but only if `age()` reads a value close to when the lock was written.
+    /// Without pinning, a deliberately broken implementation that folds the
+    /// age check into the OWNER branch could still pass by coincidence: if
+    /// the real wall clock has, by the time `acquire_lock` finally calls
+    /// `reclaim_lock_once`, already crossed `LEGACY_LOCK_STALE` past the
+    /// lock's real write time (an unlikely but unbounded delay — process
+    /// spawn/kill/wait, scheduler contention), the broken branch's age check
+    /// would ALSO be satisfied on attempt 1, matching the correct
+    /// implementation's attempt count for the wrong reason. Pinning `now` to
+    /// a value captured close to when the lock was written makes `age()`
+    /// small regardless of how long the surrounding test machinery actually
+    /// takes in real time, closing that gap.
+    static PINNED_NOW: std::cell::Cell<Option<std::time::SystemTime>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`reclaimable_lock`]'s `now` to `now` for the returned guard's
+/// lifetime; real [`std::time::SystemTime::now`] resumes on drop (including
+/// on an early return or a panic, so a failing assertion cannot leak the pin
+/// into a later test on this thread).
+#[cfg(test)]
+#[must_use]
+fn pin_now_for_test(now: std::time::SystemTime) -> impl Drop {
+    struct Unpin;
+    impl Drop for Unpin {
+        fn drop(&mut self) {
+            PINNED_NOW.with(|cell| cell.set(None));
+        }
+    }
+    PINNED_NOW.with(|cell| cell.set(Some(now)));
+    Unpin
+}
+
 /// Attempt one stale-generation takeover while holding a kernel advisory lock
 /// on a persistent recovery sidecar. Every reclaimer must hold this lease
 /// across both the liveness proof and unlink, so a second reclaimer cannot act
@@ -511,7 +552,13 @@ fn try_native_exclusive_lock(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 fn reclaimable_lock(lock_path: &Path) -> bool {
-    reclaimable_lock_at(lock_path, SystemTime::now())
+    #[cfg(test)]
+    let now = PINNED_NOW
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(SystemTime::now);
+    #[cfg(not(test))]
+    let now = SystemTime::now();
+    reclaimable_lock_at(lock_path, now)
 }
 
 /// [`reclaimable_lock`] with the clock injected: the age comparisons read
@@ -1279,6 +1326,11 @@ mod tests {
             let _ = child.wait();
             panic!("lock-holder child did not become ready");
         }
+        // Captured the moment the lock is known fresh (the child just
+        // published readiness, immediately after acquiring it) — pinned
+        // below so `age()` reflects THIS instant, not whatever real time
+        // `kill`/`wait`/the retry loop happen to take.
+        let lock_is_fresh_at = std::time::SystemTime::now();
         child.kill().unwrap();
         let exit_status = child.wait().unwrap();
 
@@ -1295,9 +1347,13 @@ mod tests {
         // `LOCK_RETRY_DELAY`'s real sleeps stretched far enough that even a
         // DELIBERATELY broken owner-aware path (mutated to also require the
         // age threshold) happened to cross `LEGACY_LOCK_STALE` and reclaim
-        // anyway — see the measured red below. Attempt count has no such
-        // failure mode: it is unaffected by how long each attempt took.
+        // anyway — see the measured red below. Attempt count alone is not
+        // enough either, if the broken implementation folds age INTO the
+        // owner branch: pin `now` to when the lock was known fresh, so
+        // `age()` cannot pick up a real delay between then and whenever
+        // `acquire_lock` actually runs below, no matter how long that is.
         reset_reclaim_attempts_for_test();
+        let _unpin = pin_now_for_test(lock_is_fresh_at);
         let _guard = acquire_lock(&lock).expect("dead owner's lock is reclaimable");
         assert_eq!(
             reclaim_attempts_for_test(),

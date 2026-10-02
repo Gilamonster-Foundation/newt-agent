@@ -572,6 +572,7 @@ mod tests {
         let release = Arc::new(std::sync::Mutex::new(()));
         let held = release.lock().unwrap();
         let gate = Arc::clone(&release);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         // Keep the far end of the socketpair alive, or the "connection" would
         // be born already hung up and prove nothing.
         let peers: Arc<std::sync::Mutex<Vec<UnixStream>>> =
@@ -579,6 +580,7 @@ mod tests {
         let peer_sink = Arc::clone(&peers);
         let connect: Connector = Arc::new(move |_p: &std::path::Path| {
             counter.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(()); // the connector thread has genuinely run
             let _wait = gate.lock().unwrap(); // blocks until the test releases
             let (near, far) = UnixStream::pair()?;
             peer_sink.lock().unwrap().push(far);
@@ -590,11 +592,19 @@ mod tests {
         // only lengthen it) is still a wall-clock stopwatch. Shrinking the
         // wait removes the need to measure it at all; the structural proof —
         // one attempt stays outstanding no matter how many calls follow — is
-        // `attempts == 1` below, not timing.
+        // `attempts == 1` below, not timing. The shrunken wait only bounds how
+        // long THIS thread blocks in `recv_timeout`; it says nothing about
+        // when the spawned "herdr-connect" thread is actually scheduled, so
+        // it is not the synchronization — the handshake below is.
         let mut sink =
             SocketSink::with_connector(path, connect).with_wait(Duration::from_millis(1));
 
         assert!(!sink.deliver(&working()));
+        // Wait for the connector thread to have ENTERED connect() (past the
+        // counter increment) before trusting the counter at all — a delayed
+        // thread that hasn't run yet would otherwise read as zero attempts,
+        // not one.
+        newt_core::test_guard::recv_guarded(&entered_rx, "herdr-connect thread entering connect()");
         for _ in 0..5 {
             assert!(!sink.deliver(&working()));
         }

@@ -463,4 +463,47 @@ mod wait_for_after_tests {
              false on the first check"
         );
     }
+
+    /// `polls > 1` alone cannot tell a real deadline-driven loop from one that
+    /// hardcodes a small fixed number of checks and quits — both satisfy it.
+    /// Scripting the deadline clock itself closes that: it says "not yet" for
+    /// a fixed, known number of checks and "expired" on the next, so the
+    /// EXPECTED poll count is derived from the script rather than assumed. A
+    /// premature-return implementation that ignores the injected clock (loops
+    /// a hardcoded count, or bails before consulting it) produces a different
+    /// count and fails here, with no real timeout to wait out or race.
+    #[test]
+    fn consults_the_injected_clock_rather_than_a_hardcoded_poll_count() {
+        let buf = Mutex::new(b"before after".to_vec()); // the needle never arrives
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let clock_calls = std::sync::atomic::AtomicUsize::new(0);
+        let anchor = std::time::Instant::now();
+        let step = Duration::from_millis(10);
+        // The script: 5 "not yet expired" deadline checks, then expired on
+        // the 6th — chosen so the window (call_index * step) straddles
+        // `timeout` at exactly that boundary.
+        const NOT_EXPIRED_CHECKS: usize = 5;
+        let timeout = step * u32::try_from(NOT_EXPIRED_CHECKS).unwrap() + Duration::from_millis(5);
+        let seen = tests_pty::wait_for_bytes_with_clock(
+            &buf,
+            7,
+            "SHOWN",
+            timeout,
+            || {
+                let call = clock_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anchor + step * u32::try_from(call).unwrap()
+            },
+            || {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        assert!(!seen, "a needle that never arrives must return false");
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            NOT_EXPIRED_CHECKS + 1,
+            "must poll exactly as many times as the scripted clock says \"not \
+             yet\" plus the one check that observes expiry — a hardcoded \
+             iteration count diverges from this script"
+        );
+    }
 }

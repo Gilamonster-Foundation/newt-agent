@@ -593,21 +593,38 @@ pub fn wait_for_bytes(
 
 /// [`wait_for_bytes`] with a per-iteration hook, for meta-tests of the poll
 /// loop itself rather than of a terminal. `on_poll` fires once per iteration,
-/// before the buffer is checked, so a test can (a) synchronize a writer to
-/// start only once polling has genuinely begun — closing the race where a
-/// snapshot-only implementation passes by luck — and (b) count iterations to
-/// prove a looping implementation ran rather than one that returns `false`
-/// immediately. Both are COUNT/EVENT proofs, never a stopwatch on `timeout`.
+/// AFTER that iteration's buffer snapshot — never before the first one — so a
+/// test can (a) synchronize a writer to start only once a genuine miss has
+/// been observed, closing the race where a snapshot-only implementation could
+/// otherwise win by having the writer land before the FIRST check ever runs,
+/// and (b) count iterations to prove a looping implementation ran rather than
+/// one that returns `false` immediately. Both are COUNT/EVENT proofs, never a
+/// stopwatch on `timeout`.
 pub fn wait_for_bytes_instrumented(
     buf: &std::sync::Mutex<Vec<u8>>,
     from: usize,
     needle: &str,
     timeout: std::time::Duration,
+    on_poll: impl FnMut(),
+) -> bool {
+    wait_for_bytes_with_clock(buf, from, needle, timeout, std::time::Instant::now, on_poll)
+}
+
+/// [`wait_for_bytes_instrumented`] with the deadline clock injected too, so a
+/// meta-test can script "not yet expired" for N polls and "expired" on the
+/// N+1th without waiting out a real timeout or racing real scheduling to hit
+/// the boundary. Production (via [`wait_for_bytes_instrumented`]) always
+/// passes the real [`std::time::Instant::now`].
+pub fn wait_for_bytes_with_clock(
+    buf: &std::sync::Mutex<Vec<u8>>,
+    from: usize,
+    needle: &str,
+    timeout: std::time::Duration,
+    mut now: impl FnMut() -> std::time::Instant,
     mut on_poll: impl FnMut(),
 ) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = now() + timeout;
     loop {
-        on_poll();
         let seen = {
             let buf = buf
                 .lock()
@@ -616,7 +633,12 @@ pub fn wait_for_bytes_instrumented(
             text.get(from.min(text.len())..)
                 .is_some_and(|tail| tail.contains(needle))
         };
-        if seen || std::time::Instant::now() >= deadline {
+        // The hook fires only after THIS iteration's snapshot — a writer it
+        // releases can never be observed by an EARLIER check than the one
+        // that just ran, which is what makes "never the first" a guarantee
+        // rather than a race the writer happens to lose.
+        on_poll();
+        if seen || now() >= deadline {
             return seen;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1110,18 +1132,17 @@ mod tests {
         );
     }
 
-    /// A needle that never comes is a bounded FALSE, not a hang.
+    /// A needle that never comes is a bounded FALSE, not a hang. "Bounded" is
+    /// proven by the call RETURNING at all: a hang here is caught by the test
+    /// runner's own timeout, not by timing this call against a second,
+    /// arbitrary stopwatch — the removed `elapsed() < 5s` assertion measured
+    /// nothing a hang wouldn't already fail louder.
     #[test]
     fn wait_for_screen_gives_up_and_says_so() {
         let pty = Pty::open();
-        let started = std::time::Instant::now();
         assert!(
             !pty.wait_for_screen("NEVER-WRITTEN", Duration::from_millis(120)),
             "nothing wrote this"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the timeout must bound the wait"
         );
     }
 

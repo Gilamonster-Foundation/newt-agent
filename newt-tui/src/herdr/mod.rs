@@ -619,7 +619,7 @@ impl Adapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     // -- test doubles -------------------------------------------------------
@@ -1162,7 +1162,42 @@ mod tests {
         // No stopwatch: a shutdown that joined the stuck worker would never
         // return (the gate is released only below), so returning at all is the
         // proof; production's own SHUTDOWN_GRACE loop is what bounds it.
+        //
+        // That proof needs its own backstop: a regression to a plain blocking
+        // join deadlocks THIS thread inside `reporter.shutdown()` itself,
+        // which `cargo test`'s own default timeout cannot catch (it is not
+        // configured here) — the whole run would hang rather than fail. An
+        // independent real-OS-clock watchdog (immune to anything the test
+        // thread gets stuck in, unlike a paused/async timeout) turns that
+        // into a loud, bounded failure instead.
+        let watchdog_fired = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        {
+            let watchdog_fired = Arc::clone(&watchdog_fired);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                std::thread::sleep(newt_core::test_guard::HANG_GUARD);
+                if !done.load(Ordering::SeqCst) {
+                    watchdog_fired.store(true, Ordering::SeqCst);
+                    eprintln!(
+                        "hung: reporter.shutdown() did not return within the {}s hang \
+                         guard — a stuck worker must be detached, not joined",
+                        newt_core::test_guard::HANG_GUARD.as_secs()
+                    );
+                    // `shutdown()` is a single blocking call on THIS test's
+                    // own thread, not a loop it can poll a flag inside —
+                    // there is no other way to stop a thread wedged inside
+                    // someone else's blocking join than ending the process.
+                    std::process::exit(101);
+                }
+            });
+        }
         reporter.shutdown();
+        done.store(true, Ordering::SeqCst);
+        assert!(
+            !watchdog_fired.load(Ordering::SeqCst),
+            "shutdown() returned only after the watchdog already declared it hung"
+        );
         drop(held);
     }
 
