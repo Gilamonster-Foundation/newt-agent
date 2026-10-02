@@ -54,14 +54,41 @@ pub struct HeldReadRoot {
 
 impl HeldReadRoot {
     /// Bind `fd` — a directory descriptor the caller keeps, or a dup of one
-    /// (same object) — to the root the grant spells as `provenance`.
+    /// (same object) — to `provenance`, the root the grant spells it as. This
+    /// is the ONLY constructor: fields are private and there is no public
+    /// struct literal, and this one REFUSES unless `fd`'s `(dev, ino)` equals
+    /// what `provenance` names right now (`fstat(fd)` vs `stat(path)` — the
+    /// path is never reopened to do this). A caller cannot install a
+    /// (label, descriptor) pair admission never saw as matching: neither an
+    /// honestly-paired but un-admitted root (that is `apply_with_held_roots`'s
+    /// job — #2674 P1) nor a falsely labelled one (a mismatched pair is
+    /// refused right here, before any `HeldReadRoot` for it can exist).
+    ///
+    /// # Errors
+    /// [`ToolError::Denied`] when `fd` and `provenance` do not name the same
+    /// object, or either cannot be inspected.
     #[cfg(unix)]
-    #[must_use]
-    pub fn new(provenance: impl Into<String>, fd: std::os::fd::OwnedFd) -> Self {
-        Self {
-            provenance: provenance.into(),
-            fd: Arc::new(fd),
+    pub fn bind(
+        provenance: impl Into<String>,
+        fd: std::os::fd::OwnedFd,
+    ) -> crate::ToolResult<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let provenance = provenance.into();
+        // `File::from`/`OwnedFd::from` are plain ownership retyping (no
+        // syscall) — `file` is the SAME object `fd` was, just typed so
+        // `.metadata()` can `fstat` it.
+        let file = std::fs::File::from(fd);
+        let held = file.metadata().map_err(crate::ToolError::from)?;
+        let named = std::fs::metadata(&provenance).map_err(crate::ToolError::from)?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(crate::ToolError::denied(format!(
+                "held descriptor does not name '{provenance}'"
+            )));
         }
+        Ok(Self {
+            provenance,
+            fd: Arc::new(std::os::fd::OwnedFd::from(file)),
+        })
     }
 
     /// The pathname the grant spells this root as (provenance only).
@@ -3880,6 +3907,36 @@ mod tests {
             SandboxKind::AppContainer
         );
     }
+
+    /// A descriptor that does not name the label it is bound to — the fd is
+    /// open on object B while the caller claims it is root A — is refused by
+    /// the validated constructor itself: `HeldReadRoot::bind` never returns an
+    /// object for a (label, descriptor) pair that disagree about which object
+    /// they name. No sandbox backend is involved; this is pure `fstat`/`stat`.
+    ///
+    /// Regression for #2674 P1: previously `HeldReadRoot::new` took any
+    /// `(String, OwnedFd)` pair with no check at all, so a falsely labelled
+    /// `HeldReadRoot(A, fd(B))` was fully constructible.
+    #[cfg(unix)]
+    #[test]
+    fn falsely_labelled_held_root_is_refused_at_construction() {
+        let pid = std::process::id();
+        let a = std::env::temp_dir().join(format!("agent-bridle-bind-a-{pid}"));
+        let b = std::env::temp_dir().join(format!("agent-bridle-bind-b-{pid}"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let fd_b = std::os::fd::OwnedFd::from(std::fs::File::open(&b).unwrap());
+
+        let err = crate::HeldReadRoot::bind(a.to_string_lossy().into_owned(), fd_b)
+            .expect_err("a's label over b's descriptor must not bind");
+        assert!(
+            err.to_string().contains("does not name"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
 }
 
 // Real kernel enforcement test. Only meaningful with the feature on Linux; it
@@ -4110,6 +4167,10 @@ mod landlock_kernel_tests {
             fs_read: Scope::only([root.to_string_lossy().into_owned()]),
             ..Caveats::top()
         };
+        // Bind while `root` still names the held object — the validated
+        // constructor checks `(dev, ino)` NOW, before the swap below.
+        let held = crate::HeldReadRoot::bind(root.to_string_lossy().into_owned(), fd)
+            .expect("bind before the swap");
 
         // The swap: the held directory goes aside; a different directory takes
         // its pathname.
@@ -4117,7 +4178,6 @@ mod landlock_kernel_tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("swapped.txt"), b"swapped").unwrap();
 
-        let held = crate::HeldReadRoot::new(root.to_string_lossy().into_owned(), fd);
         let (root_t, aside_t, cav_t) = (root.clone(), aside.clone(), cav.clone());
         let (held_read, swapped_read) = std::thread::spawn(move || {
             LandlockSandbox::new()

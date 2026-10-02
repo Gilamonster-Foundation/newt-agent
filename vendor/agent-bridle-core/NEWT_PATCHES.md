@@ -96,3 +96,14 @@ still spelled in `fs_read` — only how the rule is built changes. A wrapper
 backend (Seatbelt) refuses a non-empty set rather than fall back to the path.
 Newt's governed push uses this for the confined object copy. Filed upstream as
 a patch; retire this section when it lands.
+
+Hardened (#2674 P1): the two claims above — "admission unchanged" and "a
+caller that has verified its identity" — are now enforced, not merely
+documented preconditions. `HeldReadRoot::bind` (the only constructor; fields
+are private, no public struct literal) refuses unless `fd`'s `(dev, ino)`
+equals what `provenance` names right now, so a falsely labelled
+`HeldReadRoot(A, fd(B))` cannot be constructed. `ConfinedCommand::spawn`
+separately refuses any held root whose `provenance` is not a member of the
+admitted `fs_read` scope, before the spawn thread starts, so a genuinely
+bound but un-admitted `HeldReadRoot(B, fd(B))` cannot reach the sandbox
+either.
