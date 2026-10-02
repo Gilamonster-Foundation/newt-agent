@@ -1040,6 +1040,16 @@ async fn yolo_keeps_the_fs_workspace_fence() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = caveats_no_exec(ws.path());
     let escape = "/definitely-outside-the-fence/escape.txt";
+    // The denial names the WORKSPACE-JOINED path (#2629), not the model's raw
+    // spelling. On Windows, joining this rooted-but-driveless literal onto an
+    // absolute workspace keeps the workspace's own drive prefix (e.g.
+    // `C:/definitely-outside-the-fence/escape.txt`) rather than replacing the
+    // path outright, so the expected value must be computed with the SAME
+    // join the production code performs — a hardcoded Unix-style literal
+    // only matched by coincidence on platforms where join fully replaces an
+    // absolute path (round 3 review item 2).
+    #[allow(clippy::join_absolute_paths)] // intentional: mirrors production's own join exactly
+    let escape_full = ws.path().join(escape).to_string_lossy().into_owned();
     let out = run_tool(
         "write_file",
         serde_json::json!({"path": escape, "content": "nope"}),
@@ -1047,8 +1057,8 @@ async fn yolo_keeps_the_fs_workspace_fence() {
         &caveats,
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_write", escape));
-    assert!(!std::path::Path::new(escape).exists());
+    assert_eq!(out, denied_fs_result("fs_write", &escape_full));
+    assert!(!std::path::Path::new(&escape_full).exists());
 
     let out = run_tool(
         "delete_file",
@@ -1057,16 +1067,19 @@ async fn yolo_keeps_the_fs_workspace_fence() {
         &caveats,
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_write", escape));
+    assert_eq!(out, denied_fs_result("fs_write", &escape_full));
 
+    let outside_read = "/etc/hostname";
+    #[allow(clippy::join_absolute_paths)] // intentional: mirrors production's own join exactly
+    let outside_read_full = ws.path().join(outside_read).to_string_lossy().into_owned();
     let out = run_tool(
         "read_file",
-        serde_json::json!({"path": "/etc/hostname"}),
+        serde_json::json!({"path": outside_read}),
         ws.path(),
         &caveats,
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_read", "/etc/hostname"));
+    assert_eq!(out, denied_fs_result("fs_read", &outside_read_full));
 }
 
 /// Precedence (#297): with both `--disable-ocap` and a #263 gate present,

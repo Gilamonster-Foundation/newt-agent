@@ -2166,6 +2166,19 @@ pub(crate) fn absent_binary_refusal(
 
 /// The absence message for the program brush named in `command not found: X`,
 /// whatever the envelope's exit code. `None` for a structured denial.
+///
+/// #2629 round 3: `prog` comes from the CHILD's own stderr, which a permitted
+/// script can forge — print `command not found: /usr/bin/git` and exit
+/// whatever code it likes. The renderer this replaces resolved that name on
+/// the host and, when found, pasted the resolved absolute path into an
+/// "ask the operator for exec:<abs>" recommendation. The host lookup proves
+/// the PATH exists; it proves nothing about what the confined child actually
+/// ran, so the child's own chosen text was picking which host path the
+/// operator got coached to authorize. The lookup still selects which of the
+/// two generic sentences below applies (a real distinction for
+/// [`run_command_result_is_denial`]'s grant-gap classification), but its
+/// resolved path is never interpolated into either one. Only a trusted,
+/// invocation-bound refusal (the leash's `denials`) may name a target.
 fn absent_program_note(
     envelope: &serde_json::Value,
     exec: &crate::caveats::Scope<String>,
@@ -2179,24 +2192,28 @@ fn absent_program_note(
     let prog = named_program(envelope, "command not found: ")?.to_string();
     let granted = granted_host_binaries(exec);
 
-    // The host probe is what makes the two 127 states distinguishable.
-    Some(match host_path_lookup(&prog) {
-        Some(abs) => format!(
+    // The host probe only picks WHICH generic sentence applies; its resolved
+    // path is deliberately discarded, never rendered.
+    Some(if host_path_lookup(&prog).is_some() {
+        format!(
             "error: {prog}: {ABSENT_BINARY_MARKER}.\n  \
              granted host binaries: {granted}\n  \
              For project compiler/test validation, if lifecycle is advertised, prefer lifecycle action=build \
              for the appropriate project phase: it requests explicit offline build authority.\n  \
-             For direct execution, ask the operator for exec:{abs}; this does not grant compiler descendants \
-             or their filesystem access. Existing permission requirements remain binding; do not retry a declined grant."
-        ),
+             The shell's own report named this program; that text is not trusted evidence of what the \
+             confined child actually ran, so no specific path is named here. If direct execution would \
+             genuinely help, ask the operator via request_permissions rather than guessing a target; do \
+             not retry a declined grant."
+        )
+    } else {
         // Deliberately NO grant coaching here: granting exec for a binary that
         // is not installed is a no-op, and teaching the model to ask for one is
         // exactly the futile loop the denial journal exists to detect.
-        None => format!(
+        format!(
             "error: {prog}: {ABSENT_BINARY_MARKER}, and {NOT_ON_HOST_MARKER}.\n  \
              granted host binaries: {granted}\n  \
              no grant can supply it - install it on the host, or use a carried tool."
-        ),
+        )
     })
 }
 

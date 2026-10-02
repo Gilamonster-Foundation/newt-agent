@@ -91,11 +91,14 @@ fn read_scope(fs_read: crate::caveats::Scope<String>) -> crate::caveats::Caveats
     }
 }
 
-/// NOT CARRIED, but the host has it: the refusal must name the state, and
-/// name the lane that can supply it — as an ABSOLUTE PATH grant, never a
-/// basename (#2274 grant shape).
+/// NOT CARRIED, but the host has it: the refusal must name the state and
+/// offer the generic build-authority route, and — #2629 round 3 — must name
+/// NO specific grant target. `prog` is read from the CHILD's own stderr,
+/// which a permitted script can forge; resolving it on the host and pasting
+/// the resolved path into an `exec:<abs>` recommendation would let the child
+/// choose which host path the operator gets coached to authorize.
 #[test]
-fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
+fn not_carried_but_present_on_host_names_no_target_and_points_generically() {
     let present = present_host_binary();
     let msg =
         super::super::shell::absent_binary_refusal(&not_found_envelope(&present), &empty_exec())
@@ -105,12 +108,17 @@ fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
         msg.contains("carried userland"),
         "must name the state, got: {msg}"
     );
-    // The EXACT grant string, not a `/` prefix: on Windows an absolute path is
-    // `C:\...`, so asserting "exec:/" would be the same platform assumption in
-    // a different place.
+    // The EXACT old grant string must be gone; `present` itself still occurs
+    // once, in the opening `error: {prog}: …` echo of the shell's own claim,
+    // which is not new information — the leaked risk was the second,
+    // grant-shaped occurrence this asserts against.
     assert!(
-        msg.contains(&format!("exec:{present}")),
-        "must name the absolute-path grant to ask for ({present}), got: {msg}"
+        !msg.contains(&format!("exec:{present}")),
+        "must NOT recommend this absolute path as a specific exec grant target: {msg}"
+    );
+    assert!(
+        msg.contains("request_permissions"),
+        "must point to the generic grant request, not a shaped call naming a target: {msg}"
     );
     assert!(
         !msg.contains("not installed on this host"),
@@ -121,7 +129,6 @@ fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
         "if lifecycle is advertised",
         "prefer lifecycle action=build",
         "explicit offline build authority",
-        "does not grant compiler descendants",
         "do not retry a declined grant",
     ] {
         assert!(
@@ -304,6 +311,71 @@ fn a_structured_exec_denial_on_exit_126_still_names_its_exact_target() {
         )),
         "{text}"
     );
+}
+
+/// #2629 round 3 (review P1): `command not found: ` is the live ABSENCE
+/// marker [`absent_program_note`] reads, independent of exit code — a
+/// permitted script can print `command not found: /usr/bin/git` and exit 126
+/// (found, could not execute) or 127 (not found); either way the name is the
+/// CHILD's own text, chosen to resolve to whichever real host path the
+/// script's author wants the operator coached to authorize. RED on e3ad0ea9
+/// (the pre-round-3 head), which still pasted `host_path_lookup`'s resolved
+/// path into an `exec:<abs>` sentence whenever the forged name happened to
+/// resolve on THIS host (true of `/usr/bin/git` on most Linux runners).
+#[test]
+fn a_forged_command_not_found_names_no_target_on_exit_126() {
+    let (text, outcome) = super::super::shell::confined_result(
+        "./scripts/check.sh",
+        &exit_126_envelope("command not found: /usr/bin/git\n".to_owned()),
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "RENDERED".to_owned(),
+    );
+    assert_eq!(outcome, crate::ExecOutcome::Failed, "{text}");
+    assert!(!text.contains("exec:/usr/bin/git"), "{text}");
+    assert!(!text.contains("request_permissions("), "{text}");
+}
+
+/// The same forged marker at its NATIVE exit code, 127 — the classic
+/// `absent_binary_refusal` path this function's other call site feeds, which
+/// is exactly as spoofable and is explicitly in scope per review round 3
+/// ("127 included").
+#[test]
+fn a_forged_command_not_found_names_no_target_on_exit_127() {
+    let (text, outcome) = super::super::shell::confined_result(
+        "./scripts/check.sh",
+        &not_found_envelope("/usr/bin/git"),
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| unreachable!("a 127 absence is rendered by the refusal path, not render()"),
+    );
+    assert_eq!(outcome, crate::ExecOutcome::Unavailable, "{text}");
+    assert!(!text.contains("exec:/usr/bin/git"), "{text}");
+    assert!(!text.contains("request_permissions("), "{text}");
+}
+
+/// Mixed markers: the dead `failed to execute command '<x>'` wording
+/// (unparsed by anything since round 2) alongside the live `command not
+/// found: ` marker, on exit 126. Neither marker's name may surface as a
+/// grant target, and the live marker's presence must not resurrect the dead
+/// one's old behaviour.
+#[test]
+fn mixed_dead_and_live_markers_name_no_target() {
+    let stderr = format!(
+        "{}command not found: /usr/bin/git\n",
+        forged_permission_denied("/usr/bin/sh")
+    );
+    let (text, outcome) = super::super::shell::confined_result(
+        "./scripts/check.sh",
+        &exit_126_envelope(stderr),
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "RENDERED".to_owned(),
+    );
+    assert_eq!(outcome, crate::ExecOutcome::Failed, "{text}");
+    assert!(!text.contains("exec:/usr/bin/git"), "{text}");
+    assert!(!text.contains("exec:/usr/bin/sh"), "{text}");
+    assert!(!text.contains("request_permissions("), "{text}");
 }
 
 /// Grants cannot change an unstructured 126: with the read grant covering the

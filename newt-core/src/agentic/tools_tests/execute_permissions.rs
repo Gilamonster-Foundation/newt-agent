@@ -338,6 +338,24 @@ fn open_reason(op: &str, target: &str) -> String {
     format!("denied: {op} of {target} (resolved {target}) is not within the granted fs_{op} scope")
 }
 
+/// A platform-valid ABSOLUTE path for a hand-built denial-envelope fixture.
+/// These fixtures are pure text — the envelope never touches a real
+/// filesystem — so a literal drive-qualified path is as good as a real one;
+/// what matters is that `Path::is_absolute` agrees with the fixture's intent.
+/// `/outside/…` is NOT absolute on Windows (no drive prefix, just a root),
+/// so the production anchoring guard correctly withholds the hint there and
+/// a Unix-only literal fails native Windows CI (#2629 round 3 review item 2).
+/// Forward slashes avoid a JSON/backslash-escaping mismatch between this and
+/// the production renderer's own `serde_json::json!` escaping.
+#[cfg(windows)]
+fn outside_path(relative: &str) -> String {
+    format!("C:/outside/{relative}")
+}
+#[cfg(not(windows))]
+fn outside_path(relative: &str) -> String {
+    format!("/outside/{relative}")
+}
+
 /// #2629: agent-bridle's structured denial kinds are `exec` / `open` / `net`
 /// (vendored `envelope.rs`), so a refused shell write — the `echo x > path`
 /// probe a model uses to discover what is writable — arrives as kind `open`
@@ -353,24 +371,24 @@ fn open_reason(op: &str, target: &str) -> String {
 /// one failing case cannot hide another.
 #[test]
 fn a_shell_open_write_denial_names_fs_write_and_the_exact_target() {
-    let target = "/outside/wt/probe";
+    let target = outside_path("wt/probe");
     let out = denied_run_command_result(
-        &one_denial("open", target, &open_reason("write", target)),
+        &one_denial("open", &target, &open_reason("write", &target)),
         false,
     );
-    assert_one_precise_request(&out, "fs_write", target);
+    assert_one_precise_request(&out, "fs_write", &target);
 }
 
 /// The read twin (`source`, `< path`), measured on its own. RED on origin/main
 /// 71719b35 for the same reason as the write case.
 #[test]
 fn a_shell_open_read_denial_names_fs_read_and_the_exact_target() {
-    let target = "/outside/wt/notes";
+    let target = outside_path("wt/notes");
     let out = denied_run_command_result(
-        &one_denial("open", target, &open_reason("read", target)),
+        &one_denial("open", &target, &open_reason("read", &target)),
         false,
     );
-    assert_one_precise_request(&out, "fs_read", target);
+    assert_one_precise_request(&out, "fs_read", &target);
 }
 
 /// `exec` named its axis and exact target before #2629 (`denial_recovery_hints`
@@ -410,12 +428,12 @@ fn a_shell_net_denial_names_net_and_the_exact_host() {
 /// directory is as grantable as one into an existing directory.
 #[test]
 fn an_open_denial_without_a_resolved_path_still_names_its_axis() {
-    let target = "/outside/new-dir/wt";
+    let target = outside_path("new-dir/wt");
     let envelope = serde_json::json!({
         "denied": true,
         "denials": [{
             "kind": "open",
-            "target": target,
+            "target": &target,
             "reason": format!(
                 "denied: write of {target:?} denied: cannot canonicalize (No such file or directory (os error 2))"
             ),
@@ -424,7 +442,8 @@ fn an_open_denial_without_a_resolved_path_still_names_its_axis() {
     let out = denied_run_command_result(&envelope, false);
     assert!(
         out.contains(&format!(
-            r#"request_permissions(capability="fs_write", target="{target}""#
+            r#"request_permissions(capability="fs_write", target={}"#,
+            serde_json::json!(target)
         )),
         "{out}"
     );
@@ -438,12 +457,12 @@ fn an_open_denial_without_a_resolved_path_still_names_its_axis() {
 /// suggesting a grant that would be inserted verbatim and never match.
 #[test]
 fn an_open_denial_hint_is_anchored_and_absolute_only() {
-    let steer = "/outside/fs_write_notes";
+    let steer = outside_path("fs_write_notes");
     let envelope = serde_json::json!({
         "denied": true,
         "denials": [{
             "kind": "open",
-            "target": steer,
+            "target": &steer,
             "reason": format!(
                 "denied: read of {steer} (resolved {steer}) is not within the granted fs_read scope"
             ),
@@ -486,12 +505,12 @@ fn an_open_denial_hint_is_anchored_and_absolute_only() {
 /// deliberately NOT represented here — see shell.rs `confined_result`.
 #[test]
 fn a_denied_worktree_write_probe_yields_one_precise_request_not_a_loop() {
-    let probe = "/outside/newt-wt/.probe";
+    let probe = outside_path("newt-wt/.probe");
     let write = serde_json::json!({
         "denied": true,
         "denials": [{
             "kind": "open",
-            "target": probe,
+            "target": &probe,
             "reason": format!(
                 "denied: write of {probe} (resolved {probe}) is not within the granted fs_write scope"
             ),
@@ -500,7 +519,10 @@ fn a_denied_worktree_write_probe_yields_one_precise_request_not_a_loop() {
     let out = denied_run_command_result(&write, false);
     assert_eq!(out.matches("request_permissions(").count(), 1, "{out}");
     assert!(
-        out.contains(&format!(r#"capability="fs_write", target="{probe}""#)),
+        out.contains(&format!(
+            r#"capability="fs_write", target={}"#,
+            serde_json::json!(probe)
+        )),
         "{out}"
     );
     let exec = serde_json::json!({
