@@ -263,7 +263,7 @@ async fn physical_symlink_escape_write_is_denied_object_bound() {
     let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 0, false);
     let expected = receipt.present(
         crate::agentic::tools::file_capture::failure(
-            denied_fs_result("fs_write", "link/target.txt"),
+            denied_fs_result("fs_write", &full.to_string_lossy()),
             "",
         ),
         "",
