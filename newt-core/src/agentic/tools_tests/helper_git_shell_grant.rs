@@ -367,6 +367,94 @@ async fn hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture() {
     );
 }
 
+/// #2682: when the session's OWN workspace IS the linked worktree (the
+/// production shape `apply_cli_fs_grants` builds — `fs_write` scoped to the
+/// worktree only, with the common gitdir reached only through the per-
+/// dispatch widening below), a `git commit` must succeed there, not only
+/// `git add`. Would have failed before the fix: the widening granted write
+/// on the worktree's own admin dir (`index`/`index.lock`/`HEAD`) and the
+/// common `objects/`, but NOT the common dir's `refs/heads/<branch>[.lock]`
+/// or its `logs/refs/heads/<branch>` reflog — both of which `git commit`
+/// updates to advance the checked-out branch, and both of which live in the
+/// common dir even for a linked worktree. `git add` alone never touches a
+/// ref, so this gap was invisible to the pre-existing `git add`-only proof
+/// below.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_default_branch() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    if !crate::confined_exec::kernel_fs_fence_available()
+        || !std::path::Path::new(FIXTURE_GIT).exists()
+    {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    real_git(&main, &["init", "-q"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    real_git(&main, &["add", "seed"]);
+    real_git(&main, &["commit", "-q", "-m", "init"]);
+    let wt = root.path().join("wt");
+    real_git(
+        &main,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+    );
+    std::fs::write(wt.join("f.txt"), "hi\n").unwrap();
+
+    // The same wiring `apply_cli_fs_grants` produces in production: `fs_write`
+    // scoped to the worktree ONLY — the common dir is reached only through
+    // the per-dispatch widening under test.
+    let own_git = crate::git_hardening::own_gitdir_grants(&wt);
+    let mut read_roots = vec![wt.to_string_lossy().into_owned()];
+    read_roots.extend(own_git.read);
+    let session = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::only(read_roots),
+        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: crate::caveats::Scope::only(["git".to_string()]),
+        net: crate::caveats::Scope::none(),
+        ..crate::caveats::Caveats::top()
+    };
+    let widened = super::shell::dispatch_caveats_for_git_shell(
+        "git add f.txt && git commit -q -m update",
+        &wt.to_string_lossy(),
+        &session,
+    );
+
+    let envelope = super::shell::dispatch_bridled_shell(
+        serde_json::json!({
+            "cmd": "git add f.txt && git commit -q -m update",
+            "cwd": wt.to_string_lossy(),
+            "env": hermetic_git_env(&home),
+        }),
+        &widened,
+        None,
+    )
+    .await
+    .expect("dispatch");
+    assert_eq!(
+        envelope["sandbox_kind"], "landlock",
+        "must be kernel-confined: {envelope}"
+    );
+    assert_eq!(
+        envelope["exit_code"], 0,
+        "git commit must succeed under the widened fence: {envelope}"
+    );
+
+    let log = hermetic_git(&wt, &home)
+        .args(["log", "--oneline", "-1"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("update"),
+        "the commit must actually land: {}",
+        String::from_utf8_lossy(&log.stdout)
+    );
+}
+
 /// Item 2(b): the widening is scoped to the ONE dispatch — the SESSION
 /// `fs_write` scope itself still does not permit the common dir's
 /// `objects/`, so a file tool (`write_file`/`delete_file`) stays refused.

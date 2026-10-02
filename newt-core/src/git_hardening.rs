@@ -76,12 +76,43 @@ pub struct OwnGitGrant {
 /// DIRECTORY rights a file-level Landlock rule cannot carry (round 1's
 /// per-file list was empirically provable to work for the tool's OWN
 /// direct-filesystem writes, but not for a REAL confined shell `git add`
-/// under the kernel fence). So `write` is exactly two DIRECTORIES: the
-/// worktree gitdir itself, and the common dir's `objects/` subtree. `refs/`
-/// and `config`/`hooks/` stay out of it — the default-branch guard in
-/// `newt-git` (`refuse_if_default_branch`) and the shell `git commit`
-/// redirect (`run_command_creates_shell_git_commit`) are what stop a ref
-/// move, not this grant. A confined-shell `rm -rf <common>/objects` IS
+/// under the kernel fence). So `write` is exactly FOUR DIRECTORIES: the
+/// worktree gitdir itself, the common dir's `objects/` subtree, the common
+/// dir's `refs/heads/` directory, and the common dir's `logs/refs/heads/`
+/// directory. `config`/`hooks/` and every OTHER refs/reflog namespace
+/// (`refs/tags`, `refs/remotes`, `logs/HEAD` at the common-dir level) stay
+/// out of it.
+///
+/// #2682: `refs/heads/` and `logs/refs/heads/` are NEW (round 5) — `git add`
+/// alone never touches a ref, so round 3's two-directory grant was never
+/// exercised against a real `git commit`. Measured red, in order: a
+/// confined-shell `git commit` on a linked worktree's own non-default
+/// branch, under exactly round 3's grant, first failed with `fatal: cannot
+/// lock ref 'HEAD': Unable to create '<common>/refs/heads/<branch>.lock':
+/// Permission denied`; adding `refs/heads/` then surfaced `fatal: cannot
+/// update the ref 'refs/heads/<branch>': unable to append to
+/// '<common>/logs/refs/heads/<branch>': Permission denied` — the branch's
+/// reflog append, which also lives in the common dir even for a linked
+/// worktree. Both needed DIRECTORY-level MAKE_REG/REFER rights on the lock
+/// (respectively log) file's PARENT, for the identical reason `index.lock`
+/// needed them on the worktree gitdir — a per-file rule on just
+/// `refs/heads/<branch>` or `logs/refs/heads/<branch>` cannot carry them.
+/// Scoped to `refs/heads/`/`logs/refs/heads/` (not the whole `refs/`/`logs/`)
+/// to exclude `refs/tags`, `refs/remotes`, and the common dir's own
+/// top-level `logs/HEAD`; the default-branch guard in `newt-git`
+/// (`refuse_if_default_branch`) and the shell `git commit` redirect
+/// (`run_command_creates_shell_git_commit`) still refuse moving `main`'s own
+/// ref, and `newt-core::agentic::tools::native_git::inspect_commands` already
+/// refuses `git branch -f/-m/-c`, `update-ref`, `symbolic-ref`, and `push`
+/// UNCONDITIONALLY, independent of any filesystem grant — `commit`/`amend`
+/// can only ever advance the CHECKED-OUT branch's own ref, never an
+/// arbitrary other one, by git's own design. So this grant's remaining
+/// exposure is the SAME shape as the already-accepted `objects/` trade-off
+/// below, extended to two more directories: a compound `git status && echo
+/// payload > <common>/refs/heads/other-task` smuggles a plain shell
+/// redirect (not a git ref-mutation VERB, so the guard above never sees it)
+/// past the widened fence to clobber ANOTHER non-default branch's ref file
+/// directly, not just the checked-out one. A confined-shell `rm -rf <common>/objects` IS
 /// possible from a directory-write grant on non-default branches — Shawn
 /// accepted that trade-off (see `RESULT-dec2-own-gitdir.md`).
 pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
@@ -115,6 +146,8 @@ pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
     let write = vec![
         path_to_string(&absolute_git_dir),
         path_to_string(&common_dir.join("objects")),
+        path_to_string(&common_dir.join("refs").join("heads")),
+        path_to_string(&common_dir.join("logs").join("refs").join("heads")),
     ];
     OwnGitGrant { read, write }
 }
@@ -182,6 +215,8 @@ pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
     vec![
         path_to_string(&cached_git_dir),
         path_to_string(&cached_common.join("objects")),
+        path_to_string(&cached_common.join("refs").join("heads")),
+        path_to_string(&cached_common.join("logs").join("refs").join("heads")),
     ]
 }
 
@@ -986,9 +1021,13 @@ mod own_gitdir_grant_tests {
 
     /// Would have failed before this fix: no grants existed at all, so
     /// `permits_path` denied every file `git add`/`git commit` touches on a
-    /// linked worktree's own branch (F32, #2537).
+    /// linked worktree's own branch (F32, #2537). #2682 (round 5) added
+    /// `refs/heads/` and `logs/refs/heads/` to the write set below — `git
+    /// commit` advances the checked-out branch's ref and appends its reflog,
+    /// which round 3's two-directory grant never covered because only `git
+    /// add` was proven against it.
     #[test]
-    fn linked_worktree_on_own_branch_grants_the_two_write_directories() {
+    fn linked_worktree_on_own_branch_grants_the_four_write_directories() {
         let root = tempfile::tempdir().unwrap();
         // Git resolves macOS's /var alias; compare the same physical paths.
         let root_path = root.path().canonicalize().unwrap();
@@ -1007,10 +1046,8 @@ mod own_gitdir_grant_tests {
         std::fs::write(wt.join("f.txt"), "hi").unwrap();
         let scope = crate::caveats::Scope::only(grant.write.clone());
         let path = |rel: &str| main.join(".git").join(rel).to_string_lossy().into_owned();
-        // What `git add` needs (round 3: the write grant serves the confined
-        // SHELL lane's `git add` only — `git commit` from the shell is refused
-        // outright and redirected to the `git` tool, so refs never need a
-        // filesystem write grant here at all).
+        // What `git add` + `git commit` need, including the checked-out
+        // branch's own ref lock+rename (#2682).
         for touched in [
             path("worktrees/wt/index"),
             path("worktrees/wt/index.lock"),
@@ -1018,18 +1055,30 @@ mod own_gitdir_grant_tests {
             path("worktrees/wt/logs/HEAD"),
             path("worktrees/wt/COMMIT_EDITMSG"),
             path("objects/pack/multi-pack-index"),
+            path("refs/heads/task"),
+            path("refs/heads/task.lock"),
+            path("logs/refs/heads/task"),
         ] {
             assert!(
                 crate::caveats::permits_path(&scope, &touched),
                 "{touched} must be permitted"
             );
         }
-        // Refs, config, and hooks stay out of the write grant — moving a ref
-        // is what `refuse_if_default_branch` (the `git` tool) guards, not a
-        // filesystem grant.
+        // `refs/tags`, the common dir's own top-level `logs/HEAD`, `config`,
+        // and `hooks/` stay out of the write grant. A SIBLING branch's own
+        // `refs/heads/<name>` is NOT excluded here — Landlock's directory
+        // rights for the lock-then-rename `commit` needs cannot be scoped
+        // narrower than the whole `refs/heads/` directory (same reasoning
+        // as `objects/` below). What actually stops a confined shell from
+        // MOVING a sibling branch's ref is a separate, unconditional
+        // semantic guard — `inspect_commands`' refusal of `git branch
+        // -f/-m/-c` and of `update-ref`/`symbolic-ref`/`push` regardless of
+        // filesystem authority (`newt-core/src/agentic/tools/native_git.rs`)
+        // — plus the fact that `commit`/`amend` can only ever advance the
+        // CHECKED-OUT branch's own ref, never an arbitrary other one.
         for denied in [
-            path("refs/heads/task"),
-            path("refs/heads/main"),
+            path("refs/tags/v1"),
+            path("logs/HEAD"),
             path("config"),
             path("hooks/pre-commit"),
         ] {
@@ -1042,7 +1091,8 @@ mod own_gitdir_grant_tests {
         // The grant is real enough for a real (unconfined, this is a plain
         // subprocess — not the kernel fence) `git add` + `git commit` to
         // succeed; the confined-shell version of this property is
-        // `newt-core::agentic::tools::shell::git_shell_dispatch_tests`.
+        // `newt-core::agentic::tools::shell::git_shell_grant`'s
+        // `confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_default_branch`.
         git(&wt, &["add", "f.txt"]);
         git(&wt, &["commit", "-q", "-m", "task work"]);
     }
