@@ -429,8 +429,12 @@ async fn read_file_offset_as_string_non_numeric_fails_loudly() {
     )
     .await;
     assert!(
-        page.contains("offset"),
-        "a non-numeric offset must fail with a message naming `offset`, got: {page:?}"
+        page.starts_with("error: read_file: `offset`"),
+        "a non-numeric offset must fail with a named read_file error, got: {page:?}"
+    );
+    assert!(
+        !crate::agentic::tools::tool_ok(&page, None),
+        "a bad-argument read must classify as a FAILED tool result: {page:?}"
     );
     assert!(
         !page.trim_start().starts_with("line 1"),

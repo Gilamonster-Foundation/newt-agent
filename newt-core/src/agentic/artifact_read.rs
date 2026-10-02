@@ -851,21 +851,14 @@ fn optional_string<'a>(args: &'a Value, field: &str, default: &'a str) -> Result
     }
 }
 
-fn parse_nonnegative_usize(args: &Value, field: &str, default: usize) -> Result<usize, String> {
-    match args.get(field) {
-        None | Some(Value::Null) => Ok(default),
-        Some(value) => value.as_u64().map_or_else(
-            || {
-                Err(format!(
-                    "artifact_read `{field}` must be a non-negative integer"
-                ))
-            },
-            |value| {
-                usize::try_from(value)
-                    .map_err(|_| format!("artifact_read `{field}` is too large for this platform"))
-            },
-        ),
-    }
+fn parse_nonnegative_usize(
+    args: &serde_json::Value,
+    field: &str,
+    default: usize,
+) -> Result<usize, String> {
+    super::tool_args::nonnegative_usize(args, field)
+        .map(|value| value.unwrap_or(default))
+        .map_err(|message| format!("artifact_read {message}"))
 }
 
 fn tool_error(message: &str) -> String {

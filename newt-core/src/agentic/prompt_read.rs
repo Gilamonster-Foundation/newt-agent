@@ -841,20 +841,9 @@ fn parse_nonnegative_usize(
     field: &str,
     default: usize,
 ) -> Result<usize, String> {
-    match args.get(field) {
-        None | Some(serde_json::Value::Null) => Ok(default),
-        Some(value) => value.as_u64().map_or_else(
-            || {
-                Err(format!(
-                    "prompt_read `{field}` must be a non-negative integer"
-                ))
-            },
-            |value| {
-                usize::try_from(value)
-                    .map_err(|_| format!("prompt_read `{field}` is too large for this platform"))
-            },
-        ),
-    }
+    super::tool_args::nonnegative_usize(args, field)
+        .map(|value| value.unwrap_or(default))
+        .map_err(|message| format!("prompt_read {message}"))
 }
 
 fn tool_error(message: &str) -> String {

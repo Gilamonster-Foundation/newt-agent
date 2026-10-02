@@ -227,8 +227,6 @@ ignore = "0.4"
 # refusal can't take the agent's grep with it). See newt-core tools/grep_tool.rs.
 grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
-# Matcher trait (Matcher::is_match) used by the embedded `grep` tool.
-grep-matcher = "0.1"
 # Path glob filters for the embedded `grep` tool (the `glob` argument).
 globset = "0.4"
 

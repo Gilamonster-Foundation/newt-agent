@@ -53,7 +53,6 @@ ignore.workspace = true
 # the agent's grep with it. See agentic/tools/grep_tool.rs.
 grep-searcher.workspace = true
 grep-regex.workspace = true
-grep-matcher.workspace = true
 globset.workspace = true
 # #1030 collision fix (store.rs live_owners): pid-liveness probe
 # (`libc::kill(pid, 0)`) so a conversation claimed by a crashed/rebooted

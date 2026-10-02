@@ -50,11 +50,14 @@ async fn grep_case_insensitive_match() {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 2, "got: {out}");
     // Two hits: line 1 (`HELLO`) and line 3 (`Hello there`), case-insensitive.
-    assert!(out.contains("a.rs:1:HELLO") && out.contains("a.rs:3:Hello there"), "got: {out}");
+    assert!(
+        out.contains("a.rs:1:HELLO") && out.contains("a.rs:3:Hello there"),
+        "got: {out}"
+    );
 }
 
-/// `context` N emits N lines before and after each hit, using the `-`
-/// line slot, as grep's `-N` does.
+/// `context` N emits N lines before and after each hit, as grep does
+/// (`path-N-text`).
 #[tokio::test]
 async fn grep_emits_context_lines_with_dash_slot() {
     let ws = tempfile::TempDir::new().unwrap();
@@ -65,11 +68,7 @@ async fn grep_emits_context_lines_with_dash_slot() {
         ws.path(),
     )
     .await;
-    assert_eq!(
-        out,
-        "a.rs:-:line2\na.rs:3:HIT\na.rs:-:line4",
-        "got: {out}"
-    );
+    assert_eq!(out, "a.rs-2-line2\na.rs:3:HIT\na.rs-4-line4", "got: {out}");
 }
 
 /// Binary files (any NUL byte) are skipped silently, like `grep -I`.
@@ -104,7 +103,11 @@ async fn grep_rejects_junk_context() {
     let ws = tempfile::TempDir::new().unwrap();
     touch(ws.path(), "a.rs");
     std::fs::write(ws.path().join("a.rs"), b"x\n").unwrap();
-    let out = run_grep(serde_json::json!({ "pattern": "x", "context": "lots" }), ws.path()).await;
+    let out = run_grep(
+        serde_json::json!({ "pattern": "x", "context": "lots" }),
+        ws.path(),
+    )
+    .await;
     assert!(out.starts_with("error"), "got: {out}");
 }
 
@@ -114,7 +117,10 @@ async fn grep_requires_pattern() {
     let ws = tempfile::TempDir::new().unwrap();
     touch(ws.path(), "a.rs");
     let out = run_grep(serde_json::json!({}), ws.path()).await;
-    assert!(out.starts_with("error: `pattern` is required"), "got: {out}");
+    assert!(
+        out.starts_with("error: grep: `pattern` is required"),
+        "got: {out}"
+    );
 }
 
 /// `max_results` caps the number of hits and notes truncation.
@@ -143,7 +149,10 @@ async fn grep_refuses_root_outside_workspace() {
     std::fs::write(parent.path().join("outside.txt"), b"secret\n").unwrap();
     let ws = parent.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    for path in ["..".to_string(), parent.path().to_string_lossy().into_owned()] {
+    for path in [
+        "..".to_string(),
+        parent.path().to_string_lossy().into_owned(),
+    ] {
         for fs_read in [Scope::All, Scope::none()] {
             let caveats = Caveats {
                 fs_read,
@@ -177,8 +186,14 @@ async fn grep_denied_without_fs_read() {
         fs_read: Scope::none(),
         ..caveats_rw(ws.path())
     };
-    let out = run_tool("grep", serde_json::json!({ "pattern": "secret" }), ws.path(), &denied, None)
-        .await;
+    let out = run_tool(
+        "grep",
+        serde_json::json!({ "pattern": "secret" }),
+        ws.path(),
+        &denied,
+        None,
+    )
+    .await;
     assert!(out.starts_with("capability denied"), "got: {out}");
     let mut gate = MockGate::new(true, &denied);
     let out = run_tool_gated(
@@ -190,5 +205,51 @@ async fn grep_denied_without_fs_read() {
     )
     .await;
     assert!(out.contains("secret.txt:1:top secret"), "got: {out}");
-    assert_eq!(gate.asks.len(), 1, "in-workspace authority remains grantable");
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "in-workspace authority remains grantable"
+    );
+}
+
+/// A file with one invalid UTF-8 byte is still searched (shown lossily), not
+/// silently skipped: real source trees carry the odd Latin-1 byte.
+#[tokio::test]
+async fn grep_searches_a_file_with_invalid_utf8() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("a.txt"), b"caf\xe9\nNEEDLE here\n").unwrap();
+    let out = run_grep(serde_json::json!({ "pattern": "NEEDLE" }), ws.path()).await;
+    assert_eq!(out, "a.txt:2:NEEDLE here", "got: {out}");
+}
+
+/// A hit on line 9,000 of a 13,000-line file reports that line number.
+#[tokio::test]
+async fn grep_reports_the_right_line_in_a_large_file() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let body = (1..=13_000)
+        .map(|n| {
+            if n == 9_000 {
+                "NEEDLE".to_string()
+            } else {
+                format!("line {n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(ws.path().join("big.rs"), body).unwrap();
+    let out = run_grep(serde_json::json!({ "pattern": "^NEEDLE$" }), ws.path()).await;
+    assert_eq!(out, "big.rs:9000:NEEDLE", "got: {out}");
+}
+
+/// A junk `max_results` fails loudly instead of silently using the default.
+#[tokio::test]
+async fn grep_rejects_junk_max_results() {
+    let ws = tempfile::TempDir::new().unwrap();
+    touch(ws.path(), "a.rs");
+    let out = run_grep(
+        serde_json::json!({ "pattern": "x", "max_results": "lots" }),
+        ws.path(),
+    )
+    .await;
+    assert!(out.starts_with("error: grep: `max_results`"), "got: {out}");
 }

@@ -33,6 +33,8 @@ use output_budget::DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN;
 #[cfg(test)]
 use output_budget::{cap_model_output, cap_model_output_with_handle};
 use output_budget::{paginate_unspillable, read_file_page};
+// #2672: numeric args as models send them (int, "531", 531.0); fails loudly otherwise.
+use super::tool_args::nonnegative_usize as arg_usize;
 pub use output_budget::{
     set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
 };
@@ -2860,6 +2862,47 @@ fn glob_to_regex(glob: &str, case_sensitive: bool) -> Result<regex::Regex, Strin
     regex::Regex::new(&re).map_err(|e| format!("invalid name pattern: {e}"))
 }
 
+/// The workspace walk `find` and `grep` share: gitignore-aware (also outside
+/// a git checkout), no symlink following, and `target/`/`node_modules/` pruned
+/// before descent. `respect_gitignore = false` means "walk everything".
+pub(super) fn workspace_walker(
+    root: &std::path::Path,
+    respect_gitignore: bool,
+    max_depth: Option<usize>,
+) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(respect_gitignore)
+        .ignore(respect_gitignore)
+        .git_ignore(respect_gitignore)
+        .git_global(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .parents(respect_gitignore)
+        // Honour .gitignore even outside a git repo (the agent's cwd may not be
+        // a checkout); without this `ignore` silently ignores gitignore files.
+        .require_git(false)
+        .follow_links(false);
+    if let Some(d) = max_depth {
+        builder.max_depth(Some(d));
+    }
+    // The `ignore` walker prunes via .gitignore/hidden but has no built-in
+    // skip for build/dep dirs. Prune them explicitly (and cheaply, before
+    // descent) so a default `find` doesn't drown in target/ or node_modules/.
+    // `.git` is already covered by `.hidden(true)`. Skipped only when respecting
+    // ignores — `respect_gitignore=false` means "search everything".
+    if respect_gitignore {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        // In override globs a leading `!` excludes; with no whitelist globs
+        // present, everything else stays included.
+        if ob.add("!target/").is_ok() && ob.add("!node_modules/").is_ok() {
+            if let Ok(ov) = ob.build() {
+                builder.overrides(ov);
+            }
+        }
+    }
+    builder
+}
+
 /// Recursively walk `root` and collect matches as workspace-relative,
 /// `/`-normalised, sorted paths. Pure-`ignore`-crate traversal (no shell, no
 /// subprocess) — the whole point of #496. Never follows symlinked directories
@@ -2880,36 +2923,7 @@ fn find_walk(
         _ => None,
     };
 
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(opts.respect_gitignore)
-        .ignore(opts.respect_gitignore)
-        .git_ignore(opts.respect_gitignore)
-        .git_global(opts.respect_gitignore)
-        .git_exclude(opts.respect_gitignore)
-        .parents(opts.respect_gitignore)
-        // Honour .gitignore even outside a git repo (the agent's cwd may not be
-        // a checkout); without this `ignore` silently ignores gitignore files.
-        .require_git(false)
-        .follow_links(false);
-    if let Some(d) = opts.max_depth {
-        builder.max_depth(Some(d));
-    }
-    // The `ignore` walker prunes via .gitignore/hidden but has no built-in
-    // skip for build/dep dirs. Prune them explicitly (and cheaply, before
-    // descent) so a default `find` doesn't drown in target/ or node_modules/.
-    // `.git` is already covered by `.hidden(true)`. Skipped only when respecting
-    // ignores — `respect_gitignore=false` means "search everything".
-    if opts.respect_gitignore {
-        let mut ob = ignore::overrides::OverrideBuilder::new(root);
-        // In override globs a leading `!` excludes; with no whitelist globs
-        // present, everything else stays included.
-        if ob.add("!target/").is_ok() && ob.add("!node_modules/").is_ok() {
-            if let Ok(ov) = ob.build() {
-                builder.overrides(ov);
-            }
-        }
-    }
+    let builder = workspace_walker(root, opts.respect_gitignore, opts.max_depth);
 
     // Collect every match as `(byte size, workspace-relative path)`. The whole
     // match set is gathered (not truncated mid-walk) so `sort=size` can order the
@@ -3422,66 +3436,6 @@ async fn execute_authorized_tool(
     // aliases, or permission widening can run.
     disposition: PromptDisposition,
 ) -> String {
-    // read_file's paging args arrive from models as JSON. Local models
-    // commonly emit XML-style tool calls whose values are STRINGS
-    // (`offset="531"`) or floats (`531.0`); `as_u64()` returns None for those,
-    // so the model silently got page 1 (#2672). Coerce the three numeric args
-    // through ONE helper that accepts all three shapes and otherwise fails
-    // loudly instead of falling back to page 1. Defined at function scope so
-    // both read_file dispatch arms can call it.
-    /// Parse a string argument as a non-negative integer. Accepts whole-valued
-/// numeric JSON (`2`) as well as string JSON (`"2"`); rejects junk (`"abc"`),
-/// negative, and fractional values. Shared by the embedded `grep` tool's
-/// `context`/`max_results` so a string `"2"` and junk `"abc"` behave like
-/// `read_file`'s paging args (accepted, rejected).
-fn parse_pos_int(value: &serde_json::Value) -> Option<usize> {
-    match value {
-        serde_json::Value::Number(n) => n.as_u64().and_then(|i| usize::try_from(i).ok()),
-        serde_json::Value::String(s) => s.trim().parse::<usize>().ok(),
-        _ => None,
-    }
-}
-
-fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
-        let Some(value) = args.get(key) else {
-            return Ok(None);
-        };
-        match value {
-            serde_json::Value::Number(n) => {
-                let big = format!("read_file: `{key}` is too large to page by, e.g. offset=531");
-                if let Some(i) = n.as_u64() {
-                    usize::try_from(i).map(Some).map_err(|_| big)
-                } else {
-                    // Only a float reaches here; a whole-valued float is
-                    // accepted, anything with a fractional part is not.
-                    let f = n.as_f64().unwrap_or(0.0);
-                    if f.fract() == 0.0 && f >= 0.0 {
-                        usize::try_from(f as i64).map(Some).map_err(|_| big)
-                    } else {
-                        Err(format!(
-                            "read_file: `{key}` must be a non-negative integer, \
- e.g. offset=531; got {value}"
-                        ))
-                    }
-                }
-            }
-            serde_json::Value::String(s) => {
-                let t = s.trim();
-                match t.parse::<usize>() {
-                    Ok(n) => Ok(Some(n)),
-                    Err(_) => Err(format!(
-                        "read_file: `{key}` must be a non-negative integer, e.g. \
- offset=531; got {value}"
-                    )),
-                }
-            }
-            _ => Err(format!(
-                "read_file: `{key}` must be a non-negative integer, e.g. offset=531; \
- got {value}"
-            )),
-        }
-    }
-
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
         default_command_cwd,
@@ -4678,7 +4632,7 @@ fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, Strin
                             limit,
                             char_offset,
                         ),
-                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => e,
+                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => format!("error: read_file: {e}"),
                     },
                     Err(refusal) => refusal,
                 },
@@ -4698,11 +4652,11 @@ fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, Strin
                     // can't saturate the context window and abandon the task.
                     let offset = match arg_usize(args, "offset") {
                         Ok(v) => v,
-                        Err(e) => return e,
+                        Err(e) => return format!("error: read_file: {e}"),
                     };
                     let limit = match arg_usize(args, "limit") {
                         Ok(v) => v,
-                        Err(e) => return e,
+                        Err(e) => return format!("error: read_file: {e}"),
                     };
                     // #726: char backstop now derives from the shared token
                     // budget so read_file and run_command share one cap —
@@ -4710,7 +4664,7 @@ fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, Strin
                     // file pages with `offset=` instead of becoming a handle.
                     let char_offset = match arg_usize(args, "char_offset") {
                         Ok(v) => v,
-                        Err(e) => return e,
+                        Err(e) => return format!("error: read_file: {e}"),
                     };
                     read_file_page(path, &contents, offset, limit, char_offset, tool_offload)
                 }
@@ -5444,17 +5398,14 @@ fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, Strin
             let glob = args["glob"].as_str();
             let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
             // Absent -> default; junk -> fail loudly (mirrors read_file paging).
-            let context = match args.get("context") {
-                // Absent -> default (0); junk -> fail loudly, like read_file.
-                None => 0,
-                Some(v) => match parse_pos_int(v) {
-                    Some(v) => v,
-                    None => return "error: `context` must be a non-negative integer".to_string(),
-                },
+            // #2672: numbers as models send them; junk fails loudly, never a default.
+            let context = match arg_usize(args, "context") {
+                Ok(v) => v.unwrap_or(0),
+                Err(e) => return format!("error: grep: {e}"),
             };
-            let max_results = match args.get("max_results") {
-                Some(v) => parse_pos_int(v).unwrap_or(grep_tool::DEFAULT_MAX_RESULTS),
-                None => grep_tool::DEFAULT_MAX_RESULTS,
+            let max_results = match arg_usize(args, "max_results") {
+                Ok(v) => v.unwrap_or(grep_tool::DEFAULT_MAX_RESULTS),
+                Err(e) => return format!("error: grep: {e}"),
             };
             if !full.exists() {
                 return format!("error: no such path '{path}'");
@@ -5469,39 +5420,20 @@ fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, Strin
                 context,
                 max_results,
             };
-            if opts.pattern.is_empty() {
-                return "error: `pattern` is required".to_string();
-            }
-            let mut lines: Vec<String> = Vec::new();
-            let mut truncated = false;
-            let result = grep_tool::grep_search(
-                &full,
-                std::path::Path::new(workspace),
-                &opts,
-                |line: &str| {
-                    if lines.len() >= opts.max_results {
-                        truncated = true;
-                        return;
-                    }
-                    lines.push(line.to_string());
-                },
-            );
-            match result {
-                Ok(()) => {
-                    if lines.is_empty() {
-                        format!("no matches for {} under {}", opts.pattern, path)
-                    } else {
-                        let mut out = lines.join("\n");
-                        if truncated {
-                            out.push_str(&format!(
-                                "\n[stopped at {} results; narrow pattern/path/glob or raise max_results]",
-                                opts.max_results
-                            ));
-                        }
-                        out
-                    }
+            match grep_tool::grep_search(&full, std::path::Path::new(workspace), &opts) {
+                Ok(found) if found.lines.is_empty() => {
+                    format!("no matches for {} under {path}", opts.pattern)
                 }
-                Err(e) => e,
+                Ok(found) => {
+                    let mut out = found.lines.join("\n");
+                    if found.truncated {
+                        out.push_str(&format!(
+                            "\n[stopped at {max_results} results; narrow pattern/path/glob or raise max_results]"
+                        ));
+                    }
+                    out
+                }
+                Err(e) => format!("error: grep: {e}"),
             }
         }
 
