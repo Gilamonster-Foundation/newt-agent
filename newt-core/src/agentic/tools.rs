@@ -51,6 +51,7 @@ pub use dispatch::{
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) mod exposure;
+mod grep_tool;
 mod live_output;
 mod native_git;
 pub(crate) mod output_budget;
@@ -3428,7 +3429,20 @@ async fn execute_authorized_tool(
     // through ONE helper that accepts all three shapes and otherwise fails
     // loudly instead of falling back to page 1. Defined at function scope so
     // both read_file dispatch arms can call it.
-    fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+    /// Parse a string argument as a non-negative integer. Accepts whole-valued
+/// numeric JSON (`2`) as well as string JSON (`"2"`); rejects junk (`"abc"`),
+/// negative, and fractional values. Shared by the embedded `grep` tool's
+/// `context`/`max_results` so a string `"2"` and junk `"abc"` behave like
+/// `read_file`'s paging args (accepted, rejected).
+fn parse_pos_int(value: &serde_json::Value) -> Option<usize> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|i| usize::try_from(i).ok()),
+        serde_json::Value::String(s) => s.trim().parse::<usize>().ok(),
+        _ => None,
+    }
+}
+
+fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
         let Some(value) = args.get(key) else {
             return Ok(None);
         };
@@ -5396,6 +5410,98 @@ async fn execute_authorized_tool(
                     listing
                 }
                 Err(e) => format!("error: {e}"),
+            }
+        }
+
+        "grep" => {
+            // In-process regex line search (ripgrep's searcher + regex
+            // matcher) — needs only `fs_read`, like `read_file`. No shell,
+            // no subprocess, so a run_command refusal can't take the agent's
+            // grep with it.
+            let path = args["path"].as_str().unwrap_or(".");
+            let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            const WORKSPACE_ONLY: &str = "capability denied: grep is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
+            if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
+                return WORKSPACE_ONLY.to_string();
+            }
+            if !tui_permits_path(&caveats.fs_read, &full_str) {
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "grep", DenialKind::FsRead, &full_str, |c| &c.fs_read)
+                });
+                if !allowed {
+                    return denied_fs_result("fs_read", path);
+                }
+            }
+            // #1176: shadow-OCAP — record the search root under --full-access.
+            if full_access_requested() {
+                crate::flight_recorder::log_observed(
+                    crate::flight_recorder::ShadowAxis::FsRead,
+                    &full_str,
+                    "grep",
+                );
+            }
+            let glob = args["glob"].as_str();
+            let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
+            // Absent -> default; junk -> fail loudly (mirrors read_file paging).
+            let context = match args.get("context") {
+                // Absent -> default (0); junk -> fail loudly, like read_file.
+                None => 0,
+                Some(v) => match parse_pos_int(v) {
+                    Some(v) => v,
+                    None => return "error: `context` must be a non-negative integer".to_string(),
+                },
+            };
+            let max_results = match args.get("max_results") {
+                Some(v) => parse_pos_int(v).unwrap_or(grep_tool::DEFAULT_MAX_RESULTS),
+                None => grep_tool::DEFAULT_MAX_RESULTS,
+            };
+            if !full.exists() {
+                return format!("error: no such path '{path}'");
+            }
+            if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
+                return WORKSPACE_ONLY.to_string();
+            }
+            let opts = grep_tool::GrepOpts {
+                pattern: args["pattern"].as_str().unwrap_or(""),
+                glob,
+                ignore_case,
+                context,
+                max_results,
+            };
+            if opts.pattern.is_empty() {
+                return "error: `pattern` is required".to_string();
+            }
+            let mut lines: Vec<String> = Vec::new();
+            let mut truncated = false;
+            let result = grep_tool::grep_search(
+                &full,
+                std::path::Path::new(workspace),
+                &opts,
+                |line: &str| {
+                    if lines.len() >= opts.max_results {
+                        truncated = true;
+                        return;
+                    }
+                    lines.push(line.to_string());
+                },
+            );
+            match result {
+                Ok(()) => {
+                    if lines.is_empty() {
+                        format!("no matches for {} under {}", opts.pattern, path)
+                    } else {
+                        let mut out = lines.join("\n");
+                        if truncated {
+                            out.push_str(&format!(
+                                "\n[stopped at {} results; narrow pattern/path/glob or raise max_results]",
+                                opts.max_results
+                            ));
+                        }
+                        out
+                    }
+                }
+                Err(e) => e,
             }
         }
 
