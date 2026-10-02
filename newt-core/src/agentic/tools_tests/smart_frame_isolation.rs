@@ -611,7 +611,9 @@ async fn smart_find_refuses_the_unbound_recursive_walker() {
 
 /// Native grep walks and reopens paths exactly as find does, so smart
 /// sessions refuse it for the same reason until the walker retains directory
-/// capability (#2677 review).
+/// capability (#2677 review). Linux/macOS only, like the find test: elsewhere
+/// the durable smart harness refuses every filesystem tool up front.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 #[serial_test::serial]
 async fn smart_grep_refuses_the_unbound_recursive_walker() {
