@@ -335,3 +335,105 @@ fn char_offset_is_not_in_the_read_file_tool_schema() {
         "char_offset leaked into read_file's schema: {rendered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2672 — read_file's paging args arrive from local models as STRINGS or
+// floats (XML-style tool calls: `offset="531"`), which `as_u64()` rejects,
+// so the model silently got page 1. Coercion must accept the same logical
+// value whether it is an int, a string, or a whole-valued float, and refuse
+// anything that is not a non-negative integer with a loud, named error.
+
+/// Build a read_file args value with an offset given in an arbitrary JSON
+/// shape (int / string / float) plus an optional limit.
+fn offset_args(path: &str, offset: serde_json::Value, limit: Option<usize>) -> serde_json::Value {
+    let mut args = serde_json::json!({ "path": path });
+    args["offset"] = offset;
+    if let Some(l) = limit {
+        args["limit"] = serde_json::json!(l);
+    }
+    args
+}
+
+// RED test (before the #2672 coercion): an offset sent as the STRING
+// `"531"` used to fail `as_u64()` and return PAGE 1. Run this on the fixed
+// code — it must PASS. Reverting the fix makes it fail (returns page 1),
+// which is captured in ./red.txt.
+#[tokio::test]
+async fn read_file_offset_as_string_starts_at_that_line() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let lines: String = (1..=600)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(ws.path().join("f.txt"), format!("{lines}\n")).unwrap();
+    let caveats = caveats_rw(ws.path());
+
+    let page = run_tool(
+        "read_file",
+        offset_args("f.txt", serde_json::json!("531"), Some(1)),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    // Strip the page's continuation footer (``\n\n[showing...``) — the
+    // body is the text before it.
+    let body = page.split("\n\n[showing").next().unwrap_or("").trim();
+    assert_eq!(
+        body, "line 531",
+        "offset=\"531\" (string) must start at line 531, got: {page:?}"
+    );
+}
+
+// The same logical value arrives as a JSON float 531.0 (also rejected by
+// as_u64) and as a plain int — both must land on line 531.
+#[tokio::test]
+async fn read_file_offset_as_float_starts_at_that_line() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let lines: String = (1..=600)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(ws.path().join("f.txt"), format!("{lines}\n")).unwrap();
+    let caveats = caveats_rw(ws.path());
+
+    let page = run_tool(
+        "read_file",
+        offset_args("f.txt", serde_json::json!(531.0), Some(1)),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    let body = page.split("\n\n[showing").next().unwrap_or("").trim();
+    assert_eq!(
+        body, "line 531",
+        "offset=531.0 (float) must start at line 531"
+    );
+}
+
+// A non-numeric offset must FAIL LOUDLY with an error naming `offset` — it
+// must never silently fall back to page 1.
+#[tokio::test]
+async fn read_file_offset_as_string_non_numeric_fails_loudly() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("f.txt"), "line 1\nline 2\n").unwrap();
+    let caveats = caveats_rw(ws.path());
+
+    let page = run_tool(
+        "read_file",
+        offset_args("f.txt", serde_json::json!("abc"), Some(1)),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(
+        page.contains("offset"),
+        "a non-numeric offset must fail with a message naming `offset`, got: {page:?}"
+    );
+    assert!(
+        !page.trim_start().starts_with("line 1"),
+        "a bad offset must NOT silently return page 1: {page:?}"
+    );
+}

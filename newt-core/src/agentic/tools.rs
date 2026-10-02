@@ -3421,6 +3421,53 @@ async fn execute_authorized_tool(
     // aliases, or permission widening can run.
     disposition: PromptDisposition,
 ) -> String {
+    // read_file's paging args arrive from models as JSON. Local models
+    // commonly emit XML-style tool calls whose values are STRINGS
+    // (`offset="531"`) or floats (`531.0`); `as_u64()` returns None for those,
+    // so the model silently got page 1 (#2672). Coerce the three numeric args
+    // through ONE helper that accepts all three shapes and otherwise fails
+    // loudly instead of falling back to page 1. Defined at function scope so
+    // both read_file dispatch arms can call it.
+    fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+        let Some(value) = args.get(key) else {
+            return Ok(None);
+        };
+        match value {
+            serde_json::Value::Number(n) => {
+                let big = format!("read_file: `{key}` is too large to page by, e.g. offset=531");
+                if let Some(i) = n.as_u64() {
+                    usize::try_from(i).map(Some).map_err(|_| big)
+                } else {
+                    // Only a float reaches here; a whole-valued float is
+                    // accepted, anything with a fractional part is not.
+                    let f = n.as_f64().unwrap_or(0.0);
+                    if f.fract() == 0.0 && f >= 0.0 {
+                        usize::try_from(f as i64).map(Some).map_err(|_| big)
+                    } else {
+                        Err(format!(
+                            "read_file: `{key}` must be a non-negative integer, \
+ e.g. offset=531; got {value}"
+                        ))
+                    }
+                }
+            }
+            serde_json::Value::String(s) => {
+                let t = s.trim();
+                match t.parse::<usize>() {
+                    Ok(n) => Ok(Some(n)),
+                    Err(_) => Err(format!(
+                        "read_file: `{key}` must be a non-negative integer, e.g. \
+ offset=531; got {value}"
+                    )),
+                }
+            }
+            _ => Err(format!(
+                "read_file: `{key}` must be a non-negative integer, e.g. offset=531; \
+ got {value}"
+            )),
+        }
+    }
+
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
         default_command_cwd,
@@ -4607,13 +4654,18 @@ async fn execute_authorized_tool(
             let address = args["path"].as_str().unwrap_or("").trim();
             match memory_source {
                 Some(source) => match super::memory_fetch::resolve_memory_address(address, source) {
-                    Ok(body) => paginate_unspillable(
-                        address,
-                        &body,
-                        args["offset"].as_u64().map(|n| n as usize),
-                        args["limit"].as_u64().map(|n| n as usize),
-                        args["char_offset"].as_u64().map(|n| n as usize),
-                    ),
+                    Ok(body) => match (arg_usize(args, "offset"), arg_usize(args, "limit"),
+                        arg_usize(args, "char_offset"))
+                    {
+                        (Ok(offset), Ok(limit), Ok(char_offset)) => paginate_unspillable(
+                            address,
+                            &body,
+                            offset,
+                            limit,
+                            char_offset,
+                        ),
+                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => e,
+                    },
                     Err(refusal) => refusal,
                 },
                 None => format!(
@@ -4630,13 +4682,22 @@ async fn execute_authorized_tool(
                     // #719: window + cap the MODEL-facing payload (the on-screen
                     // display is capped separately) so one read of a large file
                     // can't saturate the context window and abandon the task.
-                    let offset = args["offset"].as_u64().map(|n| n as usize);
-                    let limit = args["limit"].as_u64().map(|n| n as usize);
+                    let offset = match arg_usize(args, "offset") {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    let limit = match arg_usize(args, "limit") {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     // #726: char backstop now derives from the shared token
                     // budget so read_file and run_command share one cap —
                     // held under the spill cap when offload is on, so a big
                     // file pages with `offset=` instead of becoming a handle.
-                    let char_offset = args["char_offset"].as_u64().map(|n| n as usize);
+                    let char_offset = match arg_usize(args, "char_offset") {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                     read_file_page(path, &contents, offset, limit, char_offset, tool_offload)
                 }
                 Err(tool_output) => tool_output,
