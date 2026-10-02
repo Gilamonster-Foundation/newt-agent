@@ -344,12 +344,15 @@ pub(super) fn read_for_edit(
     match read {
         Ok(text) => Ok(text),
         Err(error) => {
+            // #2629: the denial names the exact absolute target the gate
+            // would be asked for; `label` (the model's spelling) is kept for
+            // the ordinary read error only.
             if error.kind() == io::ErrorKind::PermissionDenied {
-                return Err(super::denied_fs_result("fs_write", label));
+                return Err(super::denied_fs_result("fs_write", &path.to_string_lossy()));
             }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if super::is_fs_containment_denied(&error) {
-                return Err(super::denied_fs_result("fs_write", label));
+                return Err(super::denied_fs_result("fs_write", &path.to_string_lossy()));
             }
             Err(format!("error: reading {label}: {error}"))
         }

@@ -23,7 +23,6 @@ fn smart_solve_admits_private_storage_before_loading_the_auxiliary() {
     ] {
         let mut command = common::newt();
         let home = command.home().to_path_buf();
-        common::isolate_loopback_chat(&mut *command, &home);
         let workspace = home.join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         let frame = if exposed {
@@ -2902,7 +2901,6 @@ async fn a_signed_ocap_fs_read_grant_is_admitted_into_headless_caveats_and_the_c
 
     let mut cmd = common::newt();
     let home = cmd.home().to_path_buf();
-    common::isolate_loopback_chat(&mut *cmd, &home);
     let config_dir = cmd.config_dir();
 
     // The disposable ROOT identity + a signed approve entry for a path
@@ -3006,7 +3004,6 @@ async fn headless_reading_the_ocap_store_never_mints_an_identity_key() {
 
     let mut cmd = common::newt();
     let home = cmd.home().to_path_buf();
-    common::isolate_loopback_chat(&mut *cmd, &home);
     let config_dir = cmd.config_dir();
     let identity_path = config_dir.join("identity.pem");
     assert!(!identity_path.exists(), "no key before the run");

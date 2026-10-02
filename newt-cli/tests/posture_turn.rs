@@ -201,14 +201,9 @@ scheduled = false
     .expect("isolated explicit config");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_newt"));
+    // The hermetic setup starts from a cleared environment, so no inherited
+    // grant, bypass, model or UI override can change this authority run.
     common::isolate(&mut cmd, root.path());
-    // This test drives authority, so also remove the entire NEWT_* family:
-    // inherited grant, bypass, model, and UI overrides must not change its run.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("NEWT_") {
-            cmd.env_remove(key);
-        }
-    }
     cmd.arg("--config-dir")
         .arg(&config_dir)
         .arg("--config")

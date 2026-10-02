@@ -611,6 +611,36 @@ async fn smart_find_refuses_the_unbound_recursive_walker() {
     assert!(output.contains("Error: frame isolation:"), "{output}");
 }
 
+/// Native grep walks and reopens paths exactly as find does, so smart
+/// sessions refuse it for the same reason until the walker retains directory
+/// capability (#2677 review). Linux/macOS only, like the find test: elsewhere
+/// the durable smart harness refuses every filesystem tool up front.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+#[serial_test::serial]
+async fn smart_grep_refuses_the_unbound_recursive_walker() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
+    let workspace = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let (harness, _) = harness(directory.path());
+    let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+    let output = dispatch(
+        &harness,
+        workspace.path(),
+        &caveats,
+        "grep",
+        serde_json::json!({"pattern":"x","path":"."}),
+        None,
+    )
+    .await;
+    assert!(
+        output.contains("Error: frame isolation: native grep"),
+        "{output}"
+    );
+}
+
 impl super::super::git_tool::GitTool for UnconfinedDelegate {
     fn dispatch(
         &self,

@@ -147,6 +147,9 @@ fn run_command_redirect_passes_composed_commands_through() {
     assert_eq!(run_command_redirect("read_file `pick_file`"), None);
     // Bare servable forms still redirect (the true positives hold).
     assert_eq!(run_command_redirect("find . -name \"*.rs\""), Some("find"));
+    // The embedded `grep` tool: a regex search that needs no shell spawn, so
+    // it survives where `find` does and where run_command spawn is refused.
+    assert_eq!(run_command_redirect("grep error ."), Some("grep"));
     assert_eq!(run_command_redirect("list_dir src"), Some("list_dir"));
     assert_eq!(run_command_redirect("git status"), None);
 }

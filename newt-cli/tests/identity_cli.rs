@@ -12,7 +12,7 @@ mod common;
 
 /// A fake home plus a workspace below it, keeping both directories alive.
 fn identity_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
     let workspace = tempfile::tempdir_in(home.path()).unwrap();
     (home, workspace)
 }

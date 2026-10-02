@@ -40,23 +40,75 @@ fn env_deltas(cmd: &assert_cmd::Command) -> HashMap<OsString, Option<OsString>> 
         .collect()
 }
 
-/// Every variable in the family is explicitly REMOVED from the child.
-///
-/// Not "the ones that broke": pinning `NEWT_CONFIG_DIR` while leaving
-/// `NEWT_PROVIDER` exported does not isolate a test, it changes which piece of
-/// the operator's session leaks in.
+/// The environment is cleared and only [`common::INHERITED_ENV`] survives, so
+/// the question is no longer "is every ambient family scrubbed?" (a list that
+/// was always behind — #2665 found `HERDR_*` and the proxies still leaking)
+/// but "does the allowlist admit one?". It must not: nothing that steers
+/// which configuration, backend, identity or helper a run resolves, and no
+/// inference key. The built command's pins are checked the same way, because
+/// a pin is the only way an ambient value can reach the child now.
 #[test]
-fn the_whole_ambient_config_family_is_scrubbed() {
-    let cmd = common::newt();
-    let deltas = env_deltas(&cmd);
-    for key in common::AMBIENT_CONFIG_ENV {
-        let entry = deltas.get(OsStr::new(key));
+fn the_inherited_allowlist_admits_no_ambient_family() {
+    let ambient = |key: &str| {
+        [
+            "NEWT_",
+            "HERDR_",
+            "OLLAMA_",
+            "XDG_",
+            "OPENAI_",
+            "ANTHROPIC_",
+        ]
+        .iter()
+        .any(|family| key.starts_with(family))
+            || key.ends_with("_API_KEY")
+            || key.ends_with("_PROXY")
+            || key.ends_with("_proxy")
+    };
+    for key in common::INHERITED_ENV {
         assert!(
-            matches!(entry, Some(None)),
-            "{key} is not scrubbed from the isolated command (got {entry:?}); \
-             a half-scrubbed family is not isolation"
+            !ambient(key),
+            "{key} is on the inherited allowlist; the child must not see it"
         );
     }
+    let cmd = common::newt();
+    for key in env_deltas(&cmd).keys() {
+        let key = key.to_string_lossy();
+        assert!(!ambient(&key), "{key} is pinned into the isolated command");
+    }
+}
+
+/// The git identity the child resolves is the fixture's, by configuration
+/// the child cannot miss: `git config --get` reads `GIT_CONFIG_COUNT` the way
+/// it reads a file, there is no `~/.gitconfig` in the root, and the system
+/// file is switched off. `hermetic_spawn.rs` reads it back through the real
+/// binary's `/byline`.
+#[test]
+fn the_git_identity_is_the_fixtures() {
+    let cmd = common::newt();
+    let deltas = env_deltas(&cmd);
+    let pinned = |key: &str| {
+        deltas
+            .get(OsStr::new(key))
+            .cloned()
+            .flatten()
+            .map(|v| v.to_string_lossy().into_owned())
+    };
+    assert_eq!(pinned("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+    assert_eq!(pinned("GIT_CONFIG_COUNT").as_deref(), Some("2"));
+    assert_eq!(pinned("GIT_CONFIG_KEY_0").as_deref(), Some("user.name"));
+    assert_eq!(
+        pinned("GIT_CONFIG_VALUE_0").as_deref(),
+        Some(common::GIT_FIXTURE_NAME)
+    );
+    assert_eq!(pinned("GIT_CONFIG_KEY_1").as_deref(), Some("user.email"));
+    assert_eq!(
+        pinned("GIT_CONFIG_VALUE_1").as_deref(),
+        Some(common::GIT_FIXTURE_EMAIL)
+    );
+    assert!(
+        !cmd.home().join(".gitconfig").exists(),
+        "the identity is environment, not a file in the root"
+    );
 }
 
 /// All THREE config-discovery axes are pinned, not just the obvious two.
@@ -72,12 +124,12 @@ fn all_three_config_discovery_axes_are_pinned() {
     let root = cmd.home().to_path_buf();
     let deltas = env_deltas(&cmd);
 
-    // Axis 1 + 2: the file and the user config root.
+    // Axis 1 + 2: the file and the user config root. Nothing pins either —
+    // and the clear means nothing inherits them.
     for key in ["NEWT_CONFIG", "NEWT_CONFIG_DIR"] {
-        assert_eq!(
-            deltas.get(OsStr::new(key)),
-            Some(&None),
-            "{key} must be removed so the run cannot be redirected by the shell"
+        assert!(
+            !deltas.contains_key(OsStr::new(key)),
+            "{key} must not be pinned, or the run can be redirected"
         );
     }
     // `home_dir()` reads HOME then USERPROFILE — pinning one leaves the other.
@@ -136,6 +188,11 @@ fn the_isolated_root_starts_empty_and_is_unique_per_command() {
 ///   their spawns (a raw `std::process::Command`, a `tokio` one) and hand them
 ///   to `common::isolate`. The number is pinned so a NEW spawn site has to be
 ///   justified in review rather than appearing silently.
+/// - #2665 brought every remaining binary under the policy. The non-zero
+///   baselines left are the sites that take the binary's PATH rather than
+///   spawn it (`doctor_cli.rs` writes it into an MCP config, `web_cli.rs`
+///   copies it, `mcp_probe_cli.rs` probes it) or hand a raw spawn to
+///   `common::isolate` (`mcp_cli/grant_net.rs`).
 ///
 /// The needles are built with `concat!` so this file's own source — which
 /// `include_str!` pulls in — cannot match them. Sources are embedded at
@@ -157,6 +214,29 @@ fn newt_is_only_constructed_through_the_isolation_helper() {
         ("identity_cli.rs", include_str!("identity_cli.rs"), 0),
         ("worker_cli.rs", include_str!("worker_cli.rs"), 2),
         ("stdout_purity.rs", include_str!("stdout_purity.rs"), 0),
+        ("doctor_cli.rs", include_str!("doctor_cli.rs"), 2),
+        ("mcp_cli.rs", include_str!("mcp_cli.rs"), 0),
+        (
+            "mcp_cli/grant_net.rs",
+            include_str!("mcp_cli/grant_net.rs"),
+            1,
+        ),
+        ("mcp_probe_cli.rs", include_str!("mcp_probe_cli.rs"), 1),
+        (
+            "net_guard_selfexec_cli.rs",
+            include_str!("net_guard_selfexec_cli.rs"),
+            0,
+        ),
+        (
+            "ocap_denials_cli.rs",
+            include_str!("ocap_denials_cli.rs"),
+            0,
+        ),
+        ("providers_cli.rs", include_str!("providers_cli.rs"), 0),
+        ("setup_cli.rs", include_str!("setup_cli.rs"), 0),
+        ("timer_cli.rs", include_str!("timer_cli.rs"), 0),
+        ("tunings_cli.rs", include_str!("tunings_cli.rs"), 0),
+        ("web_cli.rs", include_str!("web_cli.rs"), 1),
     ] {
         let found: usize = needles.iter().map(|n| src.matches(n).count()).sum();
         assert!(
@@ -181,7 +261,7 @@ fn the_policy_applies_to_a_raw_std_command() {
         .get_envs()
         .map(|(k, v)| (k.to_owned(), v.map(OsStr::to_owned)))
         .collect();
-    assert_eq!(deltas.get(OsStr::new("NEWT_CONFIG_DIR")), Some(&None));
+    assert!(!deltas.contains_key(OsStr::new("NEWT_CONFIG_DIR")));
     assert_eq!(
         deltas
             .get(OsStr::new("HOME"))

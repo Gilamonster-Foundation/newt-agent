@@ -134,6 +134,9 @@ pub struct ExecRequest {
     /// owner-only just before spawning, removed when the run ends, so building
     /// a request never touches the filesystem.
     scratch_dirs: Vec<PathBuf>,
+    /// Read roots the caller holds as directory descriptors: the Landlock
+    /// fence anchors on them instead of re-opening the root by path.
+    held_read_roots: Vec<agent_bridle::HeldReadRoot>,
 }
 
 impl ExecRequest {
@@ -158,7 +161,22 @@ impl ExecRequest {
             net_grant: NetGrant::Unrestricted,
             net_guard_bin: None,
             scratch_dirs: Vec::new(),
+            held_read_roots: Vec::new(),
         }
+    }
+
+    /// Anchor the fence's read rules for these roots on the descriptors the
+    /// caller holds ([`agent_bridle::HeldReadRoot`]), so a root swapped at
+    /// its pathname after the caller's check is outside the fence. Each root
+    /// must also be in `caveats.fs_read`; this changes how the fence is
+    /// built, never what is admitted.
+    #[must_use]
+    pub fn held_read_roots(
+        mut self,
+        roots: impl IntoIterator<Item = agent_bridle::HeldReadRoot>,
+    ) -> Self {
+        self.held_read_roots.extend(roots);
+        self
     }
 
     /// Give the run a private scratch `dir`: created just before spawning
@@ -325,13 +343,20 @@ fn mint_context(origin: ExecOrigin, caveats: &Caveats) -> Result<ToolContext, Ex
 /// FAILS CLOSED ([`ExecRefused::ConfinementUnenforceable`]) rather than running
 /// unconfined — the honest signal a caller (or a test) uses to know whether the
 /// executor will confine or refuse on this host.
+///
+/// Linux uses Landlock; macOS uses Seatbelt (A3, operator-accepted 2026-09-30,
+/// verified on a remote macOS test runner — see `docs/security/ocap-deviations.md`).
 #[must_use]
 pub fn kernel_fs_fence_available() -> bool {
     #[cfg(target_os = "linux")]
     {
         agent_bridle::landlock_is_supported()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        agent_bridle::seatbelt_is_supported()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         false
     }
@@ -423,7 +448,8 @@ impl ConstrainedExecutor {
             .new_process_group()
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .held_read_roots(req.held_read_roots.iter().cloned());
         // The child's ENTIRE environment: the explicit grants and nothing else
         // (ConfinedCommand starts env-empty). No inherited credentials/switches.
         for (k, v) in &req.env {

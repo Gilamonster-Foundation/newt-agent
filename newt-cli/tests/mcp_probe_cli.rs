@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -19,7 +21,7 @@ struct Sandbox {
 }
 
 fn sandbox() -> Sandbox {
-    let root = tempfile::tempdir().unwrap();
+    let root = common::isolated_root();
     let config_dir = root.path().join("cfg");
     let home = root.path().join("home");
     // Project-config discovery stops at HOME; keep that boundary above cwd.
@@ -58,11 +60,8 @@ fn stdio_transport_sandbox() -> Sandbox {
 }
 
 fn newt(sb: &Sandbox) -> Command {
-    let mut cmd = Command::cargo_bin("newt").unwrap();
+    let mut cmd = common::newt_at(&sb.home);
     cmd.env("NEWT_CONFIG_DIR", &sb.config_dir)
-        .env("HOME", &sb.home)
-        .env("USERPROFILE", &sb.home)
-        .env_remove("NEWT_CONFIG")
         .env("OLLAMA_HOST", "http://127.0.0.1:1")
         .current_dir(&sb.cwd);
     cmd

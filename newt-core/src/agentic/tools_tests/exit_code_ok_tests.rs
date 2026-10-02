@@ -316,10 +316,13 @@ fn host_lane_127_is_unavailable_only_when_the_program_does_not_resolve() {
     assert_eq!(host(failing_compile_envelope()).1, ExecOutcome::Failed);
 }
 
-/// The kernel refusing a program outside the fs-read grant is a denial.
-#[cfg(unix)]
+/// #2629 round 2: a 126 with no structured denial is a FAILURE the model can
+/// read, not a denial newt asserts. The class is the envelope's own, the
+/// output keeps the child's words under the ordinary failure header, and the
+/// renderer adds only the unknown-target note — no `capability denied`, no
+/// grant. (Before: `Denied`, `capability denied: exec of sh at …`.)
 #[test]
-fn a_kernel_refused_binary_is_denied() {
+fn an_unstructured_126_is_a_failure_not_a_denial() {
     let no_reads = crate::caveats::Caveats {
         fs_read: crate::caveats::Scope::none(),
         ..crate::caveats::Caveats::top()
@@ -334,8 +337,12 @@ fn a_kernel_refused_binary_is_denied() {
         ),
         &no_reads,
     );
-    assert_eq!(class, ExecOutcome::Denied, "{text}");
-    assert!(text.starts_with("capability denied:"), "{text}");
+    assert_eq!(class, ExecOutcome::Failed, "{text}");
+    assert!(text.starts_with("error: command exited 126"), "{text}");
+    assert!(!tool_result_ok(&text));
+    assert!(!text.contains("capability denied"), "{text}");
+    assert!(!text.contains("request_permissions"), "{text}");
+    assert!(text.contains("exit 126"), "{text}");
 }
 
 /// #2637: `from_cache` is additive on persisted `turns.events` and the headless

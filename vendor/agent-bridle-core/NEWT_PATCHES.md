@@ -59,6 +59,21 @@ SandboxPolicy option or a complete SBPL ruleset. This patch does not promote
 that partial projection to a ruleset-level filesystem proof. Inherited terminal
 descriptors and `/dev/tty` remain separate surfaces.
 
+## Backport of agent-bridle#407, pending rc.6
+
+Upstream commit `c6268667f4d1f7bf05253a20686217fabb460dd4` (merged
+2026-09-29, "fix(landlock): a git-only exec grant admits git's own exec-path
+helpers, execution-free"), applied verbatim to `src/sandbox.rs` plus its
+`content-addressable` pin bump (`0.1.0` → `0.1.2`, for `RawContentId`). On
+Linux, `landlock_impl::resolve_exec_paths` now also admits `<exec-path>/git`
+for a granted `git` whose canonical parent is one of `/usr/bin`, `/bin`,
+`/usr/sbin`, `/sbin`, provided both files and their whole ancestry are
+root-owned and not group/other-writable and the alias is the same image as
+the granted binary. Nothing is executed to decide that, and nothing outside
+that one alias is admitted. Closes newt-agent#2630 (`git worktree add` under a
+`git`-only exec grant failed with `cannot exec 'branch'`). Remove this section
+when the vendored base moves to a release that contains the commit.
+
 ## agent-mesh-protocol 0.7
 
 The published 0.8.0-rc.5 manifest requires `agent-mesh-protocol` 0.6.4. This
@@ -68,3 +83,27 @@ this change, Cargo resolves the two ranges to two separate crates, and every
 the version requirement changed: protocol 0.7 adds `AgentKey::issue_derived`
 and removes nothing this crate uses. Upstream agent-bridle needs the same bump
 before this vendored copy can be retired.
+
+## Descriptor-bound read roots
+
+`HeldReadRoot`, `Sandbox::apply_with_held_roots` and
+`ConfinedCommand::held_read_roots`: a caller that already holds a read root as
+a directory descriptor (and has verified its identity) hands a duplicate to the
+spawn. The Landlock ruleset adds `PathBeneath` on that descriptor and drops the
+path-opened rule for the same root, so a swap at the pathname after the
+caller's check cannot re-point the fence. Admission is unchanged — the root is
+still spelled in `fs_read` — only how the rule is built changes. A wrapper
+backend (Seatbelt) refuses a non-empty set rather than fall back to the path.
+Newt's governed push uses this for the confined object copy. Filed upstream as
+a patch; retire this section when it lands.
+
+Hardened (#2674 P1): the two claims above — "admission unchanged" and "a
+caller that has verified its identity" — are now enforced, not merely
+documented preconditions. `HeldReadRoot::bind` (the only constructor; fields
+are private, no public struct literal) refuses unless `fd`'s `(dev, ino)`
+equals what `provenance` names right now, so a falsely labelled
+`HeldReadRoot(A, fd(B))` cannot be constructed. `ConfinedCommand::spawn`
+separately refuses any held root whose `provenance` is not a member of the
+admitted `fs_read` scope, before the spawn thread starts, so a genuinely
+bound but un-admitted `HeldReadRoot(B, fd(B))` cannot reach the sandbox
+either.

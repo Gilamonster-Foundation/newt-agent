@@ -222,6 +222,13 @@ parking_lot = "0.12"
 # (#496). Pure-Rust (ripgrep's walker), no C deps → preserves the PyO3 wheel
 # story; honours nested .gitignore / .git/info/exclude / hidden-file rules.
 ignore = "0.4"
+# In-process regex line search for the embedded `grep` tool (no spawn, no C
+# deps — ripgrep's searcher + regex matcher, reused so a macOS run_command
+# refusal can't take the agent's grep with it). See newt-core tools/grep_tool.rs.
+grep-searcher = "0.1.17"
+grep-regex = "0.1.14"
+# Path glob filters for the embedded `grep` tool (the `glob` argument).
+globset = "0.4"
 
 # Patch application — optional strict backend behind newt-tools'
 # `applier-diffy` feature (default applier stays the in-house fuzzy

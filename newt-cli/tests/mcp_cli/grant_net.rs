@@ -476,11 +476,9 @@ fn grant_net_kill_boundaries_recover_to_an_atomic_connector_and_grant() {
         let ready = sb.cwd.join(format!("{step}-ready"));
         let newt_bin = assert_cmd::cargo::cargo_bin("newt");
         let mut child = std::process::Command::new(newt_bin);
+        crate::common::isolate(&mut child, &sb.home);
         child
             .env("NEWT_CONFIG_DIR", &sb.config_dir)
-            .env("HOME", &sb.home)
-            .env("USERPROFILE", &sb.home)
-            .env_remove("NEWT_CONFIG")
             .current_dir(&sb.cwd)
             .env("NEWT_TEST_MCP_IMPORT_KILL_AFTER", step)
             .env("NEWT_TEST_MCP_IMPORT_READY", &ready)

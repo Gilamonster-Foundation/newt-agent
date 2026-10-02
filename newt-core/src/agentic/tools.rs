@@ -33,6 +33,8 @@ use output_budget::DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN;
 #[cfg(test)]
 use output_budget::{cap_model_output, cap_model_output_with_handle};
 use output_budget::{paginate_unspillable, read_file_page};
+// #2672: numeric args as models send them (int, "531", 531.0); fails loudly otherwise.
+use super::tool_args::nonnegative_usize as arg_usize;
 pub use output_budget::{
     set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
 };
@@ -51,6 +53,7 @@ pub use dispatch::{
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) mod exposure;
+mod grep_tool;
 mod live_output;
 mod native_git;
 pub(crate) mod output_budget;
@@ -61,9 +64,9 @@ mod shell;
 #[cfg(all(test, unix))]
 mod tool_spinner_pty_test;
 use live_output::LiveOutputSession;
-pub use shell::venv_cmd_prefix;
 #[cfg(test)]
-pub(crate) use shell::{absent_binary_refusal, kernel_refused_binary};
+pub(crate) use shell::absent_binary_refusal;
+pub use shell::venv_cmd_prefix;
 #[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
@@ -596,7 +599,7 @@ fn object_bound_read(
     match object_bound_target(scope, full_str) {
         // The gate already permitted this read, so `None` here would be a logic
         // error (the two matchers disagreeing); fail closed rather than read.
-        None => Err(denied_fs_result(axis, path)),
+        None => Err(denied_fs_result(axis, full_str)),
         Some(None) => {
             std::fs::read_to_string(full).map_err(|e| format!("error: reading {path}: {e}"))
         }
@@ -613,7 +616,7 @@ fn object_bound_read(
             });
             match read {
                 Ok(s) => Ok(s),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, full_str)),
                 Err(e) => Err(format!("error: reading {path}: {e}")),
             }
         }
@@ -627,12 +630,11 @@ fn object_bound_read(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_list(
     scope: &crate::caveats::Scope<String>,
-    path: &str,
     full: &std::path::Path,
     full_str: &str,
 ) -> Result<Vec<String>, String> {
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_read", path)),
+        None => Err(denied_fs_result("fs_read", full_str)),
         Some(None) => std_list_dir(full),
         Some(Some((root, rel))) => {
             match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
@@ -642,7 +644,9 @@ fn object_bound_list(
                     .into_iter()
                     .map(|n| n.to_string_lossy().into_owned())
                     .collect()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_read", path)),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(denied_fs_result("fs_read", full_str))
+                }
                 Err(e) => Err(format!("error: {e}")),
             }
         }
@@ -666,7 +670,6 @@ fn object_bound_read(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_list(
     _scope: &crate::caveats::Scope<String>,
-    _path: &str,
     full: &std::path::Path,
     _full_str: &str,
 ) -> Result<Vec<String>, String> {
@@ -701,7 +704,7 @@ fn object_bound_write(
 ) -> Result<(), String> {
     use std::io::Write;
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result(axis, path)),
+        None => Err(denied_fs_result(axis, full_str)),
         Some(None) => std_write(full, path, content),
         Some(Some((root, rel))) => {
             let write =
@@ -712,7 +715,7 @@ fn object_bound_write(
                     });
             match write {
                 Ok(()) => Ok(()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, full_str)),
                 Err(e) => Err(format!("error: writing {path}: {e}")),
             }
         }
@@ -744,7 +747,7 @@ fn object_bound_delete(
     full_str: &str,
 ) -> Result<(), String> {
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_write", path)),
+        None => Err(denied_fs_result("fs_write", full_str)),
         Some(None) => {
             std::fs::remove_file(full).map_err(|e| format!("error: deleting {path}: {e}"))
         }
@@ -753,7 +756,9 @@ fn object_bound_delete(
                 .and_then(|dir| dir.unlink(&rel))
             {
                 Ok(()) => Ok(()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_write", path)),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(denied_fs_result("fs_write", full_str))
+                }
                 Err(e) => Err(format!("error: deleting {path}: {e}")),
             }
         }
@@ -1594,6 +1599,12 @@ fn crew_off_recovery_result(name: &str) -> String {
 /// [`denial_recovery_hint`]. One factored message + regression point shared by
 /// every fs denial (read_file / write_file / edit_file / delete_file / list_dir /
 /// find), so the recoverable wording can never drift between them.
+///
+/// `path` is the EXACT target: the workspace-joined absolute path the #263
+/// gate is asked for (`fs_gate_allows`), never the model's relative spelling
+/// (#2629). `caveats::permits_path` is a lexical prefix test, so a relative
+/// root granted through `request_permissions` would not cover the retry — the
+/// model would be told "granted" and denied again.
 fn denied_fs_result(kind: &str, path: &str) -> String {
     format!(
         "capability denied: {kind} does not permit '{path}'. {}",
@@ -1629,7 +1640,7 @@ pub(super) fn authorized_read(
             fs_gate_allows(gate, tool, DenialKind::FsRead, &full_str, |c| &c.fs_read)
         });
         if !allowed {
-            return Err(denied_fs_result("fs_read", path));
+            return Err(denied_fs_result("fs_read", &full_str));
         }
     }
     // #1176: shadow-OCAP — under --full-access the fs fence is top(), so this
@@ -2859,6 +2870,47 @@ fn glob_to_regex(glob: &str, case_sensitive: bool) -> Result<regex::Regex, Strin
     regex::Regex::new(&re).map_err(|e| format!("invalid name pattern: {e}"))
 }
 
+/// The workspace walk `find` and `grep` share: gitignore-aware (also outside
+/// a git checkout), no symlink following, and `target/`/`node_modules/` pruned
+/// before descent. `respect_gitignore = false` means "walk everything".
+pub(super) fn workspace_walker(
+    root: &std::path::Path,
+    respect_gitignore: bool,
+    max_depth: Option<usize>,
+) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(respect_gitignore)
+        .ignore(respect_gitignore)
+        .git_ignore(respect_gitignore)
+        .git_global(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .parents(respect_gitignore)
+        // Honour .gitignore even outside a git repo (the agent's cwd may not be
+        // a checkout); without this `ignore` silently ignores gitignore files.
+        .require_git(false)
+        .follow_links(false);
+    if let Some(d) = max_depth {
+        builder.max_depth(Some(d));
+    }
+    // The `ignore` walker prunes via .gitignore/hidden but has no built-in
+    // skip for build/dep dirs. Prune them explicitly (and cheaply, before
+    // descent) so a default `find` doesn't drown in target/ or node_modules/.
+    // `.git` is already covered by `.hidden(true)`. Skipped only when respecting
+    // ignores — `respect_gitignore=false` means "search everything".
+    if respect_gitignore {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        // In override globs a leading `!` excludes; with no whitelist globs
+        // present, everything else stays included.
+        if ob.add("!target/").is_ok() && ob.add("!node_modules/").is_ok() {
+            if let Ok(ov) = ob.build() {
+                builder.overrides(ov);
+            }
+        }
+    }
+    builder
+}
+
 /// Recursively walk `root` and collect matches as workspace-relative,
 /// `/`-normalised, sorted paths. Pure-`ignore`-crate traversal (no shell, no
 /// subprocess) — the whole point of #496. Never follows symlinked directories
@@ -2879,36 +2931,7 @@ fn find_walk(
         _ => None,
     };
 
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(opts.respect_gitignore)
-        .ignore(opts.respect_gitignore)
-        .git_ignore(opts.respect_gitignore)
-        .git_global(opts.respect_gitignore)
-        .git_exclude(opts.respect_gitignore)
-        .parents(opts.respect_gitignore)
-        // Honour .gitignore even outside a git repo (the agent's cwd may not be
-        // a checkout); without this `ignore` silently ignores gitignore files.
-        .require_git(false)
-        .follow_links(false);
-    if let Some(d) = opts.max_depth {
-        builder.max_depth(Some(d));
-    }
-    // The `ignore` walker prunes via .gitignore/hidden but has no built-in
-    // skip for build/dep dirs. Prune them explicitly (and cheaply, before
-    // descent) so a default `find` doesn't drown in target/ or node_modules/.
-    // `.git` is already covered by `.hidden(true)`. Skipped only when respecting
-    // ignores — `respect_gitignore=false` means "search everything".
-    if opts.respect_gitignore {
-        let mut ob = ignore::overrides::OverrideBuilder::new(root);
-        // In override globs a leading `!` excludes; with no whitelist globs
-        // present, everything else stays included.
-        if ob.add("!target/").is_ok() && ob.add("!node_modules/").is_ok() {
-            if let Ok(ov) = ob.build() {
-                builder.overrides(ov);
-            }
-        }
-    }
+    let builder = workspace_walker(root, opts.respect_gitignore, opts.max_depth);
 
     // Collect every match as `(byte size, workspace-relative path)`. The whole
     // match set is gathered (not truncated mid-walk) so `sort=size` can order the
@@ -4117,7 +4140,7 @@ async fn execute_authorized_tool(
             // Corrective guard: the model tried to call a tool as a shell binary.
             // Return a correction so the model can retry with the right tool call.
             if let Some(tool) = run_command_redirect(cmd)
-                .filter(|tool| smart_harness.is_none() || *tool != "find")
+                .filter(|tool| smart_harness.is_none() || !matches!(*tool, "find" | "grep"))
             {
                 return host_return(format!(
                     "error: '{tool}' is a tool, not a shell command. \
@@ -4164,6 +4187,32 @@ async fn execute_authorized_tool(
             // `cwd` arg — it's the more specific, in-command intent).
             let command_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
             let run_cwd = resolve_exec_cwd(&command_cwd, cd_path.as_deref());
+            // issue-1188: `git push` / `gh pr create` cannot reach the forge
+            // from the confined child at all (#2619 narrows any host-scoped
+            // net grant to `net: none` for spawned children on Linux — the
+            // kernel fence cannot bound hosts). A recognized push/PR-create
+            // invocation is diverted here to run HOST-SIDE, entirely outside
+            // the confined shell, under a fixed argv the broker itself
+            // constructs — never falling through to the confined executor,
+            // where it would either hang against `net: none` or (if that
+            // narrowing ever regressed) inherit the session's full net scope
+            // inside a hostile-repo-influenced child.
+            if native_git::needs_push_broker(cmd) {
+                return host_return(native_git::execute_governed_push(
+                    cmd,
+                    std::path::Path::new(&run_cwd),
+                    caveats,
+                    &mut permission_gate,
+                ));
+            }
+            if native_git::needs_pr_create_broker(cmd) {
+                return host_return(native_git::execute_governed_pr_create(
+                    cmd,
+                    std::path::Path::new(&run_cwd),
+                    caveats,
+                    &mut permission_gate,
+                ));
+            }
             if let Err(reason) = native_git::preflight(
                 cmd,
                 std::path::Path::new(&run_cwd),
@@ -4581,13 +4630,18 @@ async fn execute_authorized_tool(
             let address = args["path"].as_str().unwrap_or("").trim();
             match memory_source {
                 Some(source) => match super::memory_fetch::resolve_memory_address(address, source) {
-                    Ok(body) => paginate_unspillable(
-                        address,
-                        &body,
-                        args["offset"].as_u64().map(|n| n as usize),
-                        args["limit"].as_u64().map(|n| n as usize),
-                        args["char_offset"].as_u64().map(|n| n as usize),
-                    ),
+                    Ok(body) => match (arg_usize(args, "offset"), arg_usize(args, "limit"),
+                        arg_usize(args, "char_offset"))
+                    {
+                        (Ok(offset), Ok(limit), Ok(char_offset)) => paginate_unspillable(
+                            address,
+                            &body,
+                            offset,
+                            limit,
+                            char_offset,
+                        ),
+                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => format!("error: read_file: {e}"),
+                    },
                     Err(refusal) => refusal,
                 },
                 None => format!(
@@ -4604,13 +4658,22 @@ async fn execute_authorized_tool(
                     // #719: window + cap the MODEL-facing payload (the on-screen
                     // display is capped separately) so one read of a large file
                     // can't saturate the context window and abandon the task.
-                    let offset = args["offset"].as_u64().map(|n| n as usize);
-                    let limit = args["limit"].as_u64().map(|n| n as usize);
+                    let offset = match arg_usize(args, "offset") {
+                        Ok(v) => v,
+                        Err(e) => return format!("error: read_file: {e}"),
+                    };
+                    let limit = match arg_usize(args, "limit") {
+                        Ok(v) => v,
+                        Err(e) => return format!("error: read_file: {e}"),
+                    };
                     // #726: char backstop now derives from the shared token
                     // budget so read_file and run_command share one cap —
                     // held under the spill cap when offload is on, so a big
                     // file pages with `offset=` instead of becoming a handle.
-                    let char_offset = args["char_offset"].as_u64().map(|n| n as usize);
+                    let char_offset = match arg_usize(args, "char_offset") {
+                        Ok(v) => v,
+                        Err(e) => return format!("error: read_file: {e}"),
+                    };
                     read_file_page(path, &contents, offset, limit, char_offset, tool_offload)
                 }
                 Err(tool_output) => tool_output,
@@ -4683,7 +4746,7 @@ async fn execute_authorized_tool(
                     })
                 });
                 if !allowed {
-                    return denied_fs_result("fs_write", path);
+                    return denied_fs_result("fs_write", &full_str);
                 }
             }
             // #1176: shadow-OCAP — under --full-access the fs fence is top(), so
@@ -4863,7 +4926,7 @@ async fn execute_authorized_tool(
                     })
                 });
                 if !allowed {
-                    return denied_fs_result("fs_write", path);
+                    return denied_fs_result("fs_write", &full_str);
                 }
             }
 
@@ -5008,7 +5071,7 @@ async fn execute_authorized_tool(
                     })
                 });
                 if !allowed {
-                    return denied_fs_result("fs_write", path);
+                    return denied_fs_result("fs_write", &full_str);
                 }
             }
             // #1176: shadow-OCAP — edit is a write; record under --full-access.
@@ -5191,7 +5254,7 @@ async fn execute_authorized_tool(
                     })
                 });
                 if !allowed {
-                    return denied_fs_result("fs_read", path);
+                    return denied_fs_result("fs_read", &full_str);
                 }
             }
             // #1176: shadow-OCAP — record the listed dir under --full-access.
@@ -5206,7 +5269,7 @@ async fn execute_authorized_tool(
             // symlink-escape directory is refused by the kernel); a gate-approved
             // out-of-scope path lists as-is.
             let listing = if scope_permits {
-                object_bound_list(&caveats.fs_read, path, &full, &full_str)
+                object_bound_list(&caveats.fs_read, &full, &full_str)
             } else {
                 std_list_dir(&full)
             };
@@ -5223,11 +5286,11 @@ async fn execute_authorized_tool(
         // agent that needed `find` but the build's shell tool was unavailable;
         // this arm walks the workspace with the `ignore` crate (no subprocess),
         // gated by the same fs_read caveat as list_dir/read_file.
-        "find" if smart_harness.is_some() =>
+        "find" | "grep" if smart_harness.is_some() =>
             {
                 invocation.expect("smart dispatch has a witness").host();
                 executed((
-                    "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string(),
+                    format!("Error: frame isolation: native {name} is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search"),
                     crate::ExecOutcome::Unavailable,
                 ))
             },
@@ -5244,7 +5307,7 @@ async fn execute_authorized_tool(
                     fs_gate_allows(gate, "find", DenialKind::FsRead, &full_str, |c| &c.fs_read)
                 });
                 if !allowed {
-                    return denied_fs_result("fs_read", path);
+                    return denied_fs_result("fs_read", &full_str);
                 }
             }
             // #1176: shadow-OCAP — record the search root under --full-access
@@ -5309,6 +5372,84 @@ async fn execute_authorized_tool(
                     listing
                 }
                 Err(e) => format!("error: {e}"),
+            }
+        }
+
+        "grep" => {
+            // In-process regex line search (ripgrep's searcher + regex
+            // matcher) — needs only `fs_read`, like `read_file`. No shell,
+            // no subprocess, so a run_command refusal can't take the agent's
+            // grep with it.
+            let path = args["path"].as_str().unwrap_or(".");
+            let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            const WORKSPACE_ONLY: &str = "capability denied: grep is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
+            if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
+                return WORKSPACE_ONLY.to_string();
+            }
+            if !tui_permits_path(&caveats.fs_read, &full_str) {
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "grep", DenialKind::FsRead, &full_str, |c| &c.fs_read)
+                });
+                if !allowed {
+                    return denied_fs_result("fs_read", &full_str);
+                }
+            }
+            // #1176: shadow-OCAP — record the search root under --full-access.
+            if full_access_requested() {
+                crate::flight_recorder::log_observed(
+                    crate::flight_recorder::ShadowAxis::FsRead,
+                    &full_str,
+                    "grep",
+                );
+            }
+            let glob = args["glob"].as_str();
+            let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
+            // Absent -> default; junk -> fail loudly (mirrors read_file paging).
+            // #2672: numbers as models send them; junk fails loudly, never a default.
+            let context = match arg_usize(args, "context") {
+                Ok(v) => v.unwrap_or(0),
+                Err(e) => return format!("error: grep: {e}"),
+            };
+            let max_results = match arg_usize(args, "max_results") {
+                Ok(Some(0)) => return "error: grep: `max_results` must be at least 1".to_string(),
+                Ok(v) => v.unwrap_or(grep_tool::DEFAULT_MAX_RESULTS),
+                Err(e) => return format!("error: grep: {e}"),
+            };
+            if !full.exists() {
+                return format!("error: no such path '{path}'");
+            }
+            if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
+                return WORKSPACE_ONLY.to_string();
+            }
+            let opts = grep_tool::GrepOpts {
+                pattern: args["pattern"].as_str().unwrap_or(""),
+                glob,
+                ignore_case,
+                context,
+                max_results,
+            };
+            match grep_tool::grep_search(&full, std::path::Path::new(workspace), &opts) {
+                Ok(found) => {
+                    let mut out = if found.lines.is_empty() {
+                        format!("no matches for {} under {path}", opts.pattern)
+                    } else {
+                        found.lines.join("\n")
+                    };
+                    if found.truncated {
+                        out.push_str(&format!(
+                            "\n[stopped at {max_results} results; narrow pattern/path/glob or raise max_results]"
+                        ));
+                    }
+                    if found.skipped > 0 {
+                        out.push_str(&format!(
+                            "\n[{} file(s) not searched: binary or unreadable]",
+                            found.skipped
+                        ));
+                    }
+                    out
+                }
+                Err(e) => format!("error: grep: {e}"),
             }
         }
 

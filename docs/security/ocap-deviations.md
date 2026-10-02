@@ -65,6 +65,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
+| `governed-push-macos-net-unrestricted` | confined fetch uses net=none on every platform | 🟠 ACTIVE (macos) | (macOS-only: Seatbelt cannot kernel-enforce net=none; confined fetch uses net=Scope::All; fs is enforced via fd-based O_NOFOLLOW walk, exec not yet separately confined in copy; copy-side exec follow-up: #2661; net follow-up: #2662) |
+| `governed-push-macos-copy-fence-path-bound` | the confined copy's read fence anchors on the held root objects | 🟠 ACTIVE (macos) | (macOS-only, residual #8: Seatbelt admits paths, so a root swapped between the identity check and the profile may be read by the confined fetch; what is pushed is fixed by oid. Linux anchors on the held descriptors) |
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
 | `local-deputy-egress` | no indirect egress via a host AF_UNIX / Windows named-pipe deputy | 🟠 ACTIVE (linux/windows) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
 | `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
@@ -1077,6 +1079,68 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Ratchet guard:** `confined_exec::tests::dependency_fetch_is_online_to_crates_io_only_and_never_writes_credentials`
   pins the fence; `dependency_fetch::tests` pin the screens and the fail-closed gate.
 - **Status:** OPEN. owner: — · review-by: #1599.
+
+### Known issues (governed push)
+
+The staging-repo governed push / `gh pr create` broker (issue #1188, #2641
+design round 4, `newt-core/src/git_staging.rs`) closes the config-gadget
+class of finding this register otherwise tracks per-key. The operator
+accepted the following residuals on 2026-09-29 as known issues, each to be
+resolved in a later release:
+
+- Windows is refused outright — no native ownership/writability check exists
+  yet for the trust predicate the broker relies on.
+- `Scope::All` (unrestricted network) is refused, and push governance is
+  disclaimed there entirely — the model already holds unrestricted network
+  in that grant, so nothing this broker adds would bound it.
+- Credential-helper compatibility is limited to two forms: a bare name
+  (resolved inside the trusted git's `--exec-path`) and the exact `gh
+  setup-git` form (`!<trusted gh> auth git-credential`). Any other
+  `credential.helper` value is refused, naming it.
+- Raw git/gh child diagnostic output (stdout/stderr) is captured and dropped
+  entirely — never surfaced to the model, the terminal, or a log — so a
+  failed push or PR create degrades to one of a small fixed-form outcome
+  category and the operator must re-run by hand to see the real error.
+  Refusal detail is dropped the same way: the model sees
+  `failed(refused_by_harness)`, since a refusal can quote operator config.
+- The trust predicate refuses any group- or other-writable component, so an
+  operator whose umask left `~/.newt`, `~/.gitconfig` or `~/.config/gh`
+  group-writable must `chmod g-w` them. The operator-accepted 2026-09-30
+  amendment permits a root-owned sticky directory such as `/tmp` (CERT
+  FIO15-C): a directory is exempt when it has the sticky bit, is owned by
+  root, and its immediate child is owned by root or by the current user.
+  Negative controls: non-sticky world-writable directories are refused, and
+  sticky directories not owned by root are refused.
+- A5 named widening (operator-accepted 2026-09-30, the same decision as
+  agent-bridle #409): on macOS the trust walk exempts EXACTLY the root-owned,
+  admin-group-writable Apple developer directories — `/Applications` and
+  `/Applications/Xcode.app/…` only en route to a file under Xcode.app, and
+  `/Library/Developer/CommandLineTools` only when the SELECTED git resolves
+  there (read from the authenticated git's binary path or reported exec-path
+  and carried in the trust context for the whole call, never inferred from
+  the file under check). The root-owned symlink exception is limited to the
+  system aliases `/tmp`, `/var` and `/etc` → `/private/*`. Everything else
+  group- or other-writable is refused.
+- The confined copy's exec axis is unrestricted (operator-accepted 2026-09-30):
+  Landlock/Seatbelt deliver exec restriction only at the interceptor level, so
+  a `Kernel` floor refuses a restricted exec scope; neither Landlock nor
+  Seatbelt can kernel-enforce which executables the confined git spawns.  Its fs
+  and net axes are kernel-enforced (Landlock on Linux, Seatbelt on macOS), and
+  the broker checks the sandbox kind actually applied.  A follow-up issue will
+  bound exec to the trusted git and its exec-path via Landlock `EXECUTE`.
+- Concurrent edits to a TRUSTED OPERATOR's own git/gh config files (made by
+  the operator themselves, not the model, which cannot write those paths at
+  all) between the broker's trust check and its dial are not detected.
+- Residual #8 (2026-10-01), macOS only: the confined copy's read fence is
+  path-bound. Seatbelt admits paths, so the window between
+  `HeldRoots::verify_identities` and the profile cannot be closed there. An
+  attacker with write access to a read root's parent directory can swap the
+  root for a different real directory inside that window, and the confined
+  fetch may then read beneath the swap. The approved commit is fetched by
+  oid, so a swapped root cannot change WHAT is pushed, only what the
+  confined fetch may read. On Linux the fence anchors on the held
+  descriptors (`agent_bridle::HeldReadRoot`), which closes the window;
+  `verify_identities` stays as defence in depth.
 
 ## 5. How to use this (for the practical-caveat moments)
 

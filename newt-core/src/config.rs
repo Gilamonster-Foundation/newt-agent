@@ -1321,10 +1321,21 @@ pub enum SelectionOutcome<'a> {
 /// sole backend (no config file at all) and as the [`Config::resolve`] fallback
 /// when neither inline `[[backends]]` nor per-file drop-ins supply any, so a
 /// bare install still talks to a local Ollama.
+///
+/// An explicit `$OLLAMA_HOST` names THAT Ollama (#2665). Ollama's own CLI and
+/// `newt worker` already honour it; the chat path resolves its backend from
+/// this config and used to pin `127.0.0.1:11434` regardless, so a session
+/// started with `OLLAMA_HOST` pointing elsewhere still probed the developer's
+/// live Ollama. Verbatim, like `LocalOllamaBackend::discover`: the operator's
+/// endpoint is not second-guessed.
 fn fallback_localhost_backend() -> BackendConfig {
+    let endpoint = std::env::var("OLLAMA_HOST")
+        .ok()
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:11434".into());
     BackendConfig {
         name: "ollama".into(),
-        endpoint: "http://127.0.0.1:11434".into(),
+        endpoint,
         model: Some("llama3.1:8b".into()),
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
         kind: Some(BackendKind::Ollama),

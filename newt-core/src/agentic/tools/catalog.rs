@@ -145,6 +145,25 @@ pub fn tool_definitions() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "grep",
+                "description": "Search file contents in the workspace for a regex, WITHOUT a shell or subprocess. Returns one line per hit as `relative/path:LINE:matching-text`, with context lines prefixed by `:-:` (matching grep). In-process via ripgrep's library, so it works even where every spawned command is refused. Respects .gitignore and skips binary files. Use for finding text across many files; prefer read_file for reading one file whole.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "A regular expression to search for, e.g. 'error|panic' or '\\d{4}'" },
+                        "path": { "type": "string", "description": "Directory to search under, relative to workspace root. Default '.' (the whole workspace)." },
+                        "glob": { "type": "string", "description": "Optional path glob to restrict the search, e.g. '*.rs' or 'src/**'" },
+                        "ignore_case": { "type": "boolean", "description": "Case-insensitive match. Default false." },
+                        "context": { "type": "integer", "description": "Lines to show before and after each hit. Default 0 (hits only)." },
+                        "max_results": { "type": "integer", "description": "Cap on the number of hits returned. Default 100; output notes when truncated." }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "use_skill",
                 "description": "Load a skill's full procedural instructions on demand. The system prompt lists the available skills (name + description); call this with a skill's name to get its complete SKILL.md body plus the paths of any bundled files (scripts/templates) you can read or run.",
                 "parameters": {
@@ -472,6 +491,7 @@ fn common_read_only_tool_allowed(name: &str) -> bool {
                 | "git"
                 | "list_dir"
                 | "find"
+                | "grep"
                 | "prompt_read"
                 | "artifact_read"
                 | "resume_context"
@@ -576,6 +596,10 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
     // #496: `find …` typed at run_command redirects to the embedded `find`
     // tool — which works even when the shell is unavailable in this build.
     "find",
+    // The embedded `grep` tool: a regex search that needs no shell spawn, so
+    // it survives everywhere `find` does (and where run_command spawn is
+    // refused).
+    "grep",
 ];
 
 /// Shell composition/metacharacter markers (#1262): a command containing any of
@@ -984,6 +1008,7 @@ pub(super) const BASE_TOOL_NAMES: &[&str] = &[
     "delete_file",
     "list_dir",
     "find",
+    "grep",
     "use_skill",
     "web_fetch",
     "request_permissions",

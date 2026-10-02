@@ -137,7 +137,10 @@ async fn edit_file_symlink_under_workspace_escaping_is_denied() {
     );
     assert_eq!(
         out,
-        denied_fs_result("fs_write", "link/secret.txt"),
+        denied_fs_result(
+            "fs_write",
+            &ws.path().join("link/secret.txt").to_string_lossy()
+        ),
         "the symlink-escape edit must be denied: {out}"
     );
     assert_eq!(
@@ -352,7 +355,7 @@ async fn delete_file_symlink_under_workspace_escaping_is_denied() {
     let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 0, false);
     let expected = receipt.present(
         crate::agentic::tools::file_capture::failure(
-            denied_fs_result("fs_write", "link/victim.txt"),
+            denied_fs_result("fs_write", &full.to_string_lossy()),
             "",
         ),
         "",
@@ -433,7 +436,10 @@ async fn read_file_symlink_under_workspace_escaping_is_denied() {
     );
     assert_eq!(
         out,
-        denied_fs_result("fs_read", "link/secret.txt"),
+        denied_fs_result(
+            "fs_read",
+            &ws.path().join("link/secret.txt").to_string_lossy()
+        ),
         "a contained-read escape must surface as an fs_read denial: {out}"
     );
 }
@@ -497,7 +503,11 @@ async fn list_dir_symlink_under_workspace_escaping_is_denied() {
         !out.contains("outside_secret.txt"),
         "object-bound list_dir must not enumerate a directory outside the workspace: {out}"
     );
-    assert_eq!(out, denied_fs_result("fs_read", "link"), "got: {out}");
+    assert_eq!(
+        out,
+        denied_fs_result("fs_read", &ws.path().join("link").to_string_lossy()),
+        "got: {out}"
+    );
 }
 
 /// Permission to write an external file must not bypass the existing shrink

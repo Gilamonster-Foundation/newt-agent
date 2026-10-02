@@ -3459,8 +3459,12 @@ async fn execute_tool_with_tui_gate_allow_once_then_reprompt() {
         None, // step_ledger
     )
     .await;
+    // #2629: the denial names the exact absolute target the gate was asked for.
     assert!(
-        out.starts_with("capability denied: fs_read does not permit 'outside.txt'"),
+        out.starts_with(&format!(
+            "capability denied: fs_read does not permit '{}'",
+            ws.path().join("outside.txt").display()
+        )),
         "got: {out}"
     );
     assert!(out.contains("request_permissions"), "got: {out}");
