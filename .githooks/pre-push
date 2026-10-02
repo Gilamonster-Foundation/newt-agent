@@ -59,6 +59,40 @@
 #       newt-agent::personality_turn     real chat loop, 60 s
 #       newt-agent::migration_notices    real CLI startup, 20-30 s
 #       newt-agent::terminal_exit_pty    real PTY + CLI startup, 30 s budget
+#   - two more real-resource lanes, same tier as the six above (#2663 named
+#     the six real-`newt`-session binaries but missed these -- measured in
+#     the push rejections of 2026-10-01/02):
+#       newt-eval::mock_e2e                        builds the real `newt`
+#                                                    worker binary once
+#                                                    (worker_under_test) and
+#                                                    spawns it per bundled
+#                                                    case (golden_mcp_handshake
+#                                                    _boundary,
+#                                                    all_bundled_cases_pass_in
+#                                                    _mock_mode, and the rest
+#                                                    of the file) -- excluded
+#                                                    whole-binary, like the six
+#                                                    above, because every test
+#                                                    in it shares that cost.
+#       newt-tui::prompt_visibility_test (2 tests)  a real PTY, not a whole
+#                                                    binary -- the module
+#                                                    lives inside newt-tui's
+#                                                    lib unit-test binary
+#                                                    alongside ~1,360 fast
+#                                                    tests, so NEXTEST_EXCLUDE
+#                                                    names the two slow tests
+#                                                    by exact test() match
+#                                                    instead of excluding the
+#                                                    whole binary_id:
+#                                                      mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal
+#                                                      a_permission_prompt_is_visible_and_survives_a_live_spinner
+#                                                    (the module's own
+#                                                    strip_ansi_tests are pure
+#                                                    string checks and stay in
+#                                                    the per-push run.)
+#     CI's `test` job runs both on every PR via its unchanged `cargo test
+#     --workspace` step -- no ci.yml edit needed, only this account and the
+#     NEXTEST_EXCLUDE filter below.
 #   - the npm installer matrix (test-npm, all three OS legs): this hook runs
 #     no npm check on any OS -- ci.yml's test-npm job is the only gate;
 #     `just npm-test` / `just check` are the by-hand local equivalents
@@ -312,9 +346,11 @@ cargo fmt --all -- --check
 # `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
 # real-resource CI lane of their own (tracked separately; out of scope here).
 #
-# The six newt-agent binaries are the real-`newt`-session / real-PTY tier:
-# see the CI-ONLY list in the header for each one's reason and where CI runs
-# it. scripts/test_pre_push.py pins this list; change both together.
+# The six newt-agent binaries are the real-`newt`-session / real-PTY tier;
+# newt-eval::mock_e2e (whole binary) and the two named newt-tui tests are the
+# same tier, added later: see the CI-ONLY list in the header for each one's
+# reason and where CI runs it. scripts/test_pre_push.py pins this list;
+# change both together.
 NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(agent-harness::writer_inheritance)
     and not binary_id(newt-git::native_git_commit)
@@ -323,7 +359,10 @@ NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-agent::posture_turn)
     and not binary_id(newt-agent::personality_turn)
     and not binary_id(newt-agent::migration_notices)
-    and not binary_id(newt-agent::terminal_exit_pty)'
+    and not binary_id(newt-agent::terminal_exit_pty)
+    and not binary_id(newt-eval::mock_e2e)
+    and not (binary_id(newt-tui) and test(=prompt_visibility_test::mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal))
+    and not (binary_id(newt-tui) and test(=prompt_visibility_test::a_permission_prompt_is_visible_and_survives_a_live_spinner))'
 
 # nextest presence is probed the way cargo resolves subcommands (PATH plus
 # $CARGO_HOME/bin) rather than with `command -v cargo-nextest`, so the hook's
