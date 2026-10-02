@@ -1823,24 +1823,29 @@ pub(super) fn permission_grant_succeeded(
         || execution == Some(crate::ExecOutcome::Passed)
 }
 
-/// #2628/#2636: a `run_command` denied purely for undeclared filesystem
-/// authority, remembered for ONE immediate `request_permissions` reply — see
-/// `UNGRANTED_FS_AUTHORITY_DENIAL` for the exact denial shape eligible here.
+/// #2628/#2636/#2681: a `run_command` denied purely for undeclared filesystem
+/// authority, OR for an exec target outside the granted authority, remembered
+/// for ONE immediate `request_permissions` reply — see
+/// `UNGRANTED_FS_AUTHORITY_DENIAL` and `exec_denial_requests` for the exact
+/// denial shapes eligible here.
 ///
-/// Binding (round1 finding 1): `missing` is the exact set of filesystem
-/// requests this command was denied on, captured at denial time. Replay is
-/// permitted only when the operator's grant now covers every one of them —
-/// an unrelated or narrower approval does not authorize replaying this
-/// invocation. The slot is cleared on ANY tool call other than the
-/// `request_permissions` that consumes it (see `execute_authorized_tool`),
-/// so an unrelated intervening command — successful, failed, or a
-/// replacement for this one — invalidates a stale rerun.
+/// Binding (round1 finding 1): `missing` is the exact set of requests this
+/// command was denied on, captured at denial time. Replay is permitted only
+/// when the operator's grant now covers every one of them — an unrelated or
+/// narrower approval does not authorize replaying this invocation. The slot
+/// is cleared on ANY tool call other than the `request_permissions` that
+/// consumes it (see `execute_authorized_tool`), so an unrelated intervening
+/// command — successful, failed, or a replacement for this one — invalidates
+/// a stale rerun.
 pub(crate) struct PendingRerun {
     cmd: String,
     cwd: String,
     declared: Vec<PermissionRequest>,
-    /// The subset of `declared` NOT covered by caveats at denial time — what
-    /// the operator's grant must cover for replay to proceed.
+    /// What the operator's grant must cover for replay to proceed: for an FS
+    /// denial, the subset of `declared` not covered by caveats at denial
+    /// time; for an exec denial (#2681), the exec target(s) the confined
+    /// shell reported as denied — independent of `declared`, which a plain
+    /// `run_command` call rarely populates at all.
     missing: Vec<PermissionRequest>,
 }
 
@@ -1863,14 +1868,19 @@ impl EligibleReplay {
     }
 }
 
-/// #2636 round3 blocker 1: does a single grant of `kind` for `target` cover
-/// EVERY request in `missing`? Checked BEFORE asking the operator, using only
-/// the requested capability/target — never the widened caveats the gate
+/// #2636 round3 blocker 1 / #2681: does a single grant of `kind` for `target`
+/// cover EVERY request in `missing`? Checked BEFORE asking the operator, using
+/// only the requested capability/target — never the widened caveats the gate
 /// eventually returns, which don't exist yet — so the prompt shown to the
 /// operator can honestly say whether this approval alone would replay the
-/// bound command. A single-target grant only ever produces one path-scope
-/// root, so this mirrors `permits_filesystem_request` against that one-root
-/// scope: an unrelated target, the wrong axis, or a grant that covers only
+/// bound command. For `FsRead`/`FsWrite` a single-target grant only ever
+/// produces one path-scope root, so this mirrors `permits_filesystem_request`
+/// against that one-root scope. For `Exec` there is no path hierarchy to
+/// widen into — coverage is the EXACT target string the command was denied
+/// on, deliberately no more tolerant than that (a bare name and its resolved
+/// absolute path are different targets, same as the narrowing already pinned
+/// in newt-tui's `bare_pending_once_exec_grant_survives_an_absolute_request_
+/// denial`). An unrelated target, the wrong axis, or a grant that covers only
 /// part of `missing` (e.g. one of two denied paths) all return `false`.
 fn single_grant_covers_missing(
     kind: DenialKind,
@@ -1880,11 +1890,18 @@ fn single_grant_covers_missing(
     if missing.is_empty() {
         return false;
     }
-    let scope = crate::caveats::Scope::only([target.to_string()]);
     missing.iter().all(|request| {
-        request.kind == kind
-            && matches!(kind, DenialKind::FsRead | DenialKind::FsWrite)
-            && crate::caveats::permits_path(&scope, &request.target)
+        if request.kind != kind {
+            return false;
+        }
+        match kind {
+            DenialKind::FsRead | DenialKind::FsWrite => {
+                let scope = crate::caveats::Scope::only([target.to_string()]);
+                crate::caveats::permits_path(&scope, &request.target)
+            }
+            DenialKind::Exec => request.target == target,
+            _ => false,
+        }
     })
 }
 
@@ -2002,10 +2019,13 @@ fn execute_request_permissions(
                 // once-grant: report plainly (via the caller's fallback
                 // message) that the command was not re-run.
                 let covers_missing = eligible.is_some_and(|pending| {
-                    pending
-                        .missing
-                        .iter()
-                        .all(|r| permits_filesystem_request(&widened, r))
+                    pending.missing.iter().all(|r| match r.kind {
+                        // #2681: an exec entry is checked against the actual
+                        // enforcement predicate, not `permits_filesystem_request`
+                        // (which returns `false` for every non-FS kind by design).
+                        DenialKind::Exec => widened.permits_exec(&r.target),
+                        _ => permits_filesystem_request(&widened, r),
+                    })
                 });
                 let replay_auth = EligibleReplay::new(covers_missing);
                 if replay_auth.is_some() {
@@ -3905,11 +3925,11 @@ async fn execute_authorized_tool(
         // of a "Retry the original operation now" instruction.
         //
         // Binding (round1 finding 1): replay proceeds ONLY when the grant
-        // just obtained covers EVERY filesystem request the command was
-        // denied on (`pending.missing`) — an approval for a different
-        // capability, target, or axis is not consent to replay this
-        // invocation, and the model's own retry path (a fresh `run_command`
-        // call) is unaffected either way.
+        // just obtained covers EVERY request the command was denied on
+        // (`pending.missing`, FS or — #2681 — exec) — an approval for a
+        // different capability, target, or axis is not consent to replay
+        // this invocation, and the model's own retry path (a fresh
+        // `run_command` call) is unaffected either way.
         "request_permissions" => {
             let rerun = pending_rerun.and_then(|slot| slot.take());
             let (granted, replay_auth, msg) = execute_request_permissions(
@@ -3927,13 +3947,16 @@ async fn execute_authorized_tool(
             // independently as a caller-side belt-and-suspenders, not because
             // the token could otherwise be forged: an ineligible or
             // insufficient approval never reaches `Some(_auth)` in the first
-            // place.
+            // place. #2681: an exec entry is checked against the SAME minted
+            // caveats via `permits_exec` (which is exactly what the confined
+            // shell's own enforcement checks), not `permits_filesystem_request`
+            // (which returns `false` for every non-FS kind by design).
             match (granted, replay_auth, rerun) {
                 (Some(widened), Some(_auth), Some(pending))
-                    if pending
-                        .missing
-                        .iter()
-                        .all(|request| permits_filesystem_request(&widened, request)) =>
+                    if pending.missing.iter().all(|request| match request.kind {
+                        DenialKind::Exec => widened.permits_exec(&request.target),
+                        _ => permits_filesystem_request(&widened, request),
+                    }) =>
                 {
                     executed(
                         exec_confined_command(
@@ -4263,7 +4286,7 @@ async fn execute_authorized_tool(
             // `dispatch_caveats_for_git_shell`'s doc comment.
             let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
             let commit_broker_used = commit_broker.is_some();
-            let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
+            let mut pre_exec_missing: Option<Vec<PermissionRequest>> = None;
             let result = executed(
                 shell::exec_confined_command_with_broker(
                     cmd,
@@ -4280,17 +4303,19 @@ async fn execute_authorized_tool(
                     live_tool_output.clone(),
                     presentation,
                     commit_broker,
-                    &mut fs_pre_exec_missing,
+                    &mut pre_exec_missing,
                 )
                 .await,
             );
-            // #2636 finding 1: use the typed out-param from the pre-exec denial
-            // path — only a denial that fired BEFORE the child ran populates
-            // fs_pre_exec_missing. Child stdout that happens to contain the
-            // denial string does not. A native-Git commit-producing command is
-            // excluded (commit_broker_used) to prevent replaying under a bypass
-            // of the attribution/signing policy and the gitdir-write caveat.
-            if let (Some(slot), Some(missing)) = (pending_rerun, fs_pre_exec_missing) {
+            // #2636 finding 1 / #2681: use the typed out-param from the
+            // pre-exec denial path — only a structured denial (a missing
+            // declared FS request, or an exec denial the confined shell
+            // reported) populates `pre_exec_missing`. Child stdout that
+            // happens to contain the denial string does not. A native-Git
+            // commit-producing command is excluded (commit_broker_used) to
+            // prevent replaying under a bypass of the attribution/signing
+            // policy and the gitdir-write caveat.
+            if let (Some(slot), Some(missing)) = (pending_rerun, pre_exec_missing) {
                 if !commit_broker_used {
                     *slot = Some(PendingRerun {
                         cmd: cmd.to_string(),

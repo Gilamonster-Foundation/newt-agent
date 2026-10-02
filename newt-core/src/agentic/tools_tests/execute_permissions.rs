@@ -1458,6 +1458,127 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
     );
 }
 
+/// #2681 regression: an exec denial is #2628/#2636-replay-eligible exactly
+/// like an FS denial already is. Before the fix, `single_grant_covers_missing`
+/// and `pending_rerun` population were wired for `FsRead`/`FsWrite` only (see
+/// `approved_request_permissions_reruns_denied_run_command` above) — an exec
+/// denial never populated `pending_rerun` at all, so an operator's `AllowOnce`
+/// answer to the model's `request_permissions(capability="exec", …)` could
+/// only ever produce "Retry the original operation now", forcing the model to
+/// reissue the identical `run_command` call itself. Each such manual re-issue
+/// is a FRESH, independent denial/grant round-trip — exactly the "intermittent
+/// denial" pattern #2681 reports (`~/workspaces/.handoff/retest-2026-10-02/
+/// COMPARE.md`: 129 prompts, 14+ for `git`, before the model gave up).
+///
+/// This test also pins the issue's literal ask: the command execs the SAME
+/// out-of-scope program TWICE (`&&`-chained) — the single grant must cover
+/// BOTH execs of the one approved invocation, not just the first.
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_request_permissions_reruns_denied_run_command_for_exec() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    let ws = tempfile::tempdir().unwrap();
+    let workspace = ws.path().canonicalize().unwrap();
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    // `/bin/echo` is an external program under every engine (bare `echo` is a
+    // Brush builtin and needs no exec grant) — denied by an empty exec scope.
+    let base = Caveats {
+        exec: Scope::none(),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(&workspace)
+    };
+
+    // ── Step 1: run_command denied — exec not granted ───────────────────────
+    let mut deny_gate = MockGate::new(false, &base);
+    let mut pending_rerun: Option<crate::agentic::tools::PendingRerun> = None;
+    let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result1 = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "/bin/echo one && /bin/echo two"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut deny_gate as &mut dyn PermissionGate),
+            execution: Some(&execution1),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        execution1.get(),
+        Some(&ExecOutcome::Denied),
+        "run_command must be denied: {result1}"
+    );
+    assert!(
+        pending_rerun.is_some(),
+        "#2681: an exec denial must be stored in pending_rerun exactly like an \
+         FS denial already is: {result1}"
+    );
+
+    // ── Step 2: request_permissions approved for the ACTUAL bound target ────
+    let mut allow_gate = MockGate::new(true, &base);
+    let execution2 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result2 = execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({
+            "capability": "exec",
+            "target": "/bin/echo",
+            "reason": "#2681 regression test",
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut allow_gate as &mut dyn PermissionGate),
+            execution: Some(&execution2),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        pending_rerun.is_none(),
+        "#2681: pending_rerun must be consumed after approval: {result2}"
+    );
+    assert!(
+        !result2.contains("Retry the original operation"),
+        "#2681: harness must re-run the command directly, not instruct the model \
+         to retry it itself: {result2}"
+    );
+    assert_eq!(
+        execution2.get(),
+        Some(&ExecOutcome::Passed),
+        "#2681: the replay must actually succeed: {result2}"
+    );
+    assert!(result2.contains("one"), "{result2}");
+    assert!(
+        result2.contains("two"),
+        "the single grant must cover BOTH execs of the approved command, not \
+         just the first: {result2}"
+    );
+}
+
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
 /// A harmless test executable is reached through temporary non-system symlinks;
 /// granting one must launch it without granting its same-named sibling.
