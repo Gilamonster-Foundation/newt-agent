@@ -5450,9 +5450,11 @@ fn run_command_is_advertised(tools: &serde_json::Value) -> bool {
 }
 
 /// Result text that marks a REFUSED CAPABILITY in newt's OWN vocabulary — what
-/// `tools::denied_fs_result`, the exec leash's `denied_run_command_result` and
-/// the kernel-refusal renderer `tools::kernel_refused_binary` emit. Used by
-/// the exec-denial ground-truth check.
+/// `tools::denied_fs_result` and the exec leash's `denied_run_command_result`
+/// emit. Used by the exec-denial ground-truth check. An exit 126 with no
+/// structured denial emits none of these (#2629 round 2): its note is
+/// deliberately outside this vocabulary, so only the child's own
+/// `Permission denied` (below) can ground a claim about it.
 const CONFINEMENT_DENIAL_NEEDLES: [&str; 3] = [
     "not within the granted authority",
     "does not permit",
