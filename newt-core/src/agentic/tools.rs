@@ -4619,7 +4619,7 @@ async fn execute_authorized_tool(
                             limit,
                             char_offset,
                         ),
-                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => e,
+                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => format!("error: read_file: {e}"),
                     },
                     Err(refusal) => refusal,
                 },
@@ -4639,11 +4639,11 @@ async fn execute_authorized_tool(
                     // can't saturate the context window and abandon the task.
                     let offset = match arg_usize(args, "offset") {
                         Ok(v) => v,
-                        Err(e) => return e,
+                        Err(e) => return format!("error: read_file: {e}"),
                     };
                     let limit = match arg_usize(args, "limit") {
                         Ok(v) => v,
-                        Err(e) => return e,
+                        Err(e) => return format!("error: read_file: {e}"),
                     };
                     // #726: char backstop now derives from the shared token
                     // budget so read_file and run_command share one cap —
@@ -4651,7 +4651,7 @@ async fn execute_authorized_tool(
                     // file pages with `offset=` instead of becoming a handle.
                     let char_offset = match arg_usize(args, "char_offset") {
                         Ok(v) => v,
-                        Err(e) => return e,
+                        Err(e) => return format!("error: read_file: {e}"),
                     };
                     read_file_page(path, &contents, offset, limit, char_offset, tool_offload)
                 }

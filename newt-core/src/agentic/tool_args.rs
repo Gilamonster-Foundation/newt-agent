@@ -25,7 +25,9 @@ pub(crate) fn nonnegative_usize(args: &Value, field: &str) -> Result<Option<usiz
             }
             match n.as_f64() {
                 Some(f) if f >= 0.0 && f.fract() == 0.0 => {
-                    if f > usize::MAX as f64 {
+                    // 2^BITS exactly: `usize::MAX as f64` rounds UP to it, so a
+                    // `>` test against that would let 2^64 saturate silently.
+                    if f >= 2f64.powi(usize::BITS as i32) {
                         Err(too_large())
                     } else {
                         Ok(Some(f as usize))
@@ -58,6 +60,19 @@ mod tests {
         ] {
             assert_eq!(nonnegative_usize(&args, "offset"), Ok(Some(531)), "{args}");
         }
+    }
+
+    #[test]
+    fn a_float_at_or_past_two_to_the_bits_is_too_large_not_saturated() {
+        let limit = 2f64.powi(usize::BITS as i32);
+        let err = nonnegative_usize(&json!({ "offset": limit }), "offset").expect_err("2^BITS");
+        assert!(err.contains("too large"), "{err}");
+        // The largest f64 below 2^BITS is exactly representable and accepted.
+        let below = limit - 2f64.powi(usize::BITS as i32 - 53);
+        assert_eq!(
+            nonnegative_usize(&json!({ "offset": below }), "offset"),
+            Ok(Some(below as usize))
+        );
     }
 
     #[test]
