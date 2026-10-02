@@ -53,6 +53,7 @@ pub use dispatch::{
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) mod exposure;
+mod grep_tool;
 mod live_output;
 mod native_git;
 pub(crate) mod output_budget;
@@ -2869,6 +2870,47 @@ fn glob_to_regex(glob: &str, case_sensitive: bool) -> Result<regex::Regex, Strin
     regex::Regex::new(&re).map_err(|e| format!("invalid name pattern: {e}"))
 }
 
+/// The workspace walk `find` and `grep` share: gitignore-aware (also outside
+/// a git checkout), no symlink following, and `target/`/`node_modules/` pruned
+/// before descent. `respect_gitignore = false` means "walk everything".
+pub(super) fn workspace_walker(
+    root: &std::path::Path,
+    respect_gitignore: bool,
+    max_depth: Option<usize>,
+) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(respect_gitignore)
+        .ignore(respect_gitignore)
+        .git_ignore(respect_gitignore)
+        .git_global(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .parents(respect_gitignore)
+        // Honour .gitignore even outside a git repo (the agent's cwd may not be
+        // a checkout); without this `ignore` silently ignores gitignore files.
+        .require_git(false)
+        .follow_links(false);
+    if let Some(d) = max_depth {
+        builder.max_depth(Some(d));
+    }
+    // The `ignore` walker prunes via .gitignore/hidden but has no built-in
+    // skip for build/dep dirs. Prune them explicitly (and cheaply, before
+    // descent) so a default `find` doesn't drown in target/ or node_modules/.
+    // `.git` is already covered by `.hidden(true)`. Skipped only when respecting
+    // ignores — `respect_gitignore=false` means "search everything".
+    if respect_gitignore {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        // In override globs a leading `!` excludes; with no whitelist globs
+        // present, everything else stays included.
+        if ob.add("!target/").is_ok() && ob.add("!node_modules/").is_ok() {
+            if let Ok(ov) = ob.build() {
+                builder.overrides(ov);
+            }
+        }
+    }
+    builder
+}
+
 /// Recursively walk `root` and collect matches as workspace-relative,
 /// `/`-normalised, sorted paths. Pure-`ignore`-crate traversal (no shell, no
 /// subprocess) — the whole point of #496. Never follows symlinked directories
@@ -2889,36 +2931,7 @@ fn find_walk(
         _ => None,
     };
 
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(opts.respect_gitignore)
-        .ignore(opts.respect_gitignore)
-        .git_ignore(opts.respect_gitignore)
-        .git_global(opts.respect_gitignore)
-        .git_exclude(opts.respect_gitignore)
-        .parents(opts.respect_gitignore)
-        // Honour .gitignore even outside a git repo (the agent's cwd may not be
-        // a checkout); without this `ignore` silently ignores gitignore files.
-        .require_git(false)
-        .follow_links(false);
-    if let Some(d) = opts.max_depth {
-        builder.max_depth(Some(d));
-    }
-    // The `ignore` walker prunes via .gitignore/hidden but has no built-in
-    // skip for build/dep dirs. Prune them explicitly (and cheaply, before
-    // descent) so a default `find` doesn't drown in target/ or node_modules/.
-    // `.git` is already covered by `.hidden(true)`. Skipped only when respecting
-    // ignores — `respect_gitignore=false` means "search everything".
-    if opts.respect_gitignore {
-        let mut ob = ignore::overrides::OverrideBuilder::new(root);
-        // In override globs a leading `!` excludes; with no whitelist globs
-        // present, everything else stays included.
-        if ob.add("!target/").is_ok() && ob.add("!node_modules/").is_ok() {
-            if let Ok(ov) = ob.build() {
-                builder.overrides(ov);
-            }
-        }
-    }
+    let builder = workspace_walker(root, opts.respect_gitignore, opts.max_depth);
 
     // Collect every match as `(byte size, workspace-relative path)`. The whole
     // match set is gathered (not truncated mid-walk) so `sort=size` can order the
@@ -4127,7 +4140,7 @@ async fn execute_authorized_tool(
             // Corrective guard: the model tried to call a tool as a shell binary.
             // Return a correction so the model can retry with the right tool call.
             if let Some(tool) = run_command_redirect(cmd)
-                .filter(|tool| smart_harness.is_none() || *tool != "find")
+                .filter(|tool| smart_harness.is_none() || !matches!(*tool, "find" | "grep"))
             {
                 return host_return(format!(
                     "error: '{tool}' is a tool, not a shell command. \
@@ -5273,11 +5286,11 @@ async fn execute_authorized_tool(
         // agent that needed `find` but the build's shell tool was unavailable;
         // this arm walks the workspace with the `ignore` crate (no subprocess),
         // gated by the same fs_read caveat as list_dir/read_file.
-        "find" if smart_harness.is_some() =>
+        "find" | "grep" if smart_harness.is_some() =>
             {
                 invocation.expect("smart dispatch has a witness").host();
                 executed((
-                    "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string(),
+                    format!("Error: frame isolation: native {name} is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search"),
                     crate::ExecOutcome::Unavailable,
                 ))
             },
@@ -5359,6 +5372,84 @@ async fn execute_authorized_tool(
                     listing
                 }
                 Err(e) => format!("error: {e}"),
+            }
+        }
+
+        "grep" => {
+            // In-process regex line search (ripgrep's searcher + regex
+            // matcher) — needs only `fs_read`, like `read_file`. No shell,
+            // no subprocess, so a run_command refusal can't take the agent's
+            // grep with it.
+            let path = args["path"].as_str().unwrap_or(".");
+            let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            const WORKSPACE_ONLY: &str = "capability denied: grep is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
+            if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
+                return WORKSPACE_ONLY.to_string();
+            }
+            if !tui_permits_path(&caveats.fs_read, &full_str) {
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "grep", DenialKind::FsRead, &full_str, |c| &c.fs_read)
+                });
+                if !allowed {
+                    return denied_fs_result("fs_read", &full_str);
+                }
+            }
+            // #1176: shadow-OCAP — record the search root under --full-access.
+            if full_access_requested() {
+                crate::flight_recorder::log_observed(
+                    crate::flight_recorder::ShadowAxis::FsRead,
+                    &full_str,
+                    "grep",
+                );
+            }
+            let glob = args["glob"].as_str();
+            let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
+            // Absent -> default; junk -> fail loudly (mirrors read_file paging).
+            // #2672: numbers as models send them; junk fails loudly, never a default.
+            let context = match arg_usize(args, "context") {
+                Ok(v) => v.unwrap_or(0),
+                Err(e) => return format!("error: grep: {e}"),
+            };
+            let max_results = match arg_usize(args, "max_results") {
+                Ok(Some(0)) => return "error: grep: `max_results` must be at least 1".to_string(),
+                Ok(v) => v.unwrap_or(grep_tool::DEFAULT_MAX_RESULTS),
+                Err(e) => return format!("error: grep: {e}"),
+            };
+            if !full.exists() {
+                return format!("error: no such path '{path}'");
+            }
+            if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
+                return WORKSPACE_ONLY.to_string();
+            }
+            let opts = grep_tool::GrepOpts {
+                pattern: args["pattern"].as_str().unwrap_or(""),
+                glob,
+                ignore_case,
+                context,
+                max_results,
+            };
+            match grep_tool::grep_search(&full, std::path::Path::new(workspace), &opts) {
+                Ok(found) => {
+                    let mut out = if found.lines.is_empty() {
+                        format!("no matches for {} under {path}", opts.pattern)
+                    } else {
+                        found.lines.join("\n")
+                    };
+                    if found.truncated {
+                        out.push_str(&format!(
+                            "\n[stopped at {max_results} results; narrow pattern/path/glob or raise max_results]"
+                        ));
+                    }
+                    if found.skipped > 0 {
+                        out.push_str(&format!(
+                            "\n[{} file(s) not searched: binary or unreadable]",
+                            found.skipped
+                        ));
+                    }
+                    out
+                }
+                Err(e) => format!("error: grep: {e}"),
             }
         }
 

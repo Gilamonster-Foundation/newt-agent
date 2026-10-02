@@ -62,6 +62,7 @@ fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
             "delete_file",
             "list_dir",
             "find",
+            "grep",
             "use_skill",
             "web_fetch",
             // #721: advertised ALWAYS (core capability-grant request, no

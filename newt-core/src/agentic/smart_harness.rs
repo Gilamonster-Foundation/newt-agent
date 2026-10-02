@@ -1061,8 +1061,12 @@ pub(super) fn cancelled(
 pub(crate) fn advertise(mut tools: Value, harness: Option<&SmartHarness>) -> Value {
     if harness.is_some() {
         if let Some(tools) = tools.as_array_mut() {
-            tools
-                .retain(|tool| !matches!(tool["function"]["name"].as_str(), Some("crew" | "find")));
+            tools.retain(|tool| {
+                !matches!(
+                    tool["function"]["name"].as_str(),
+                    Some("crew" | "find" | "grep")
+                )
+            });
             tools.push(
                 serde_json::from_str(include_str!("re_read.json"))
                     .expect("bundled re_read tool is valid JSON"),
