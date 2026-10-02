@@ -33,6 +33,8 @@ use output_budget::DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN;
 #[cfg(test)]
 use output_budget::{cap_model_output, cap_model_output_with_handle};
 use output_budget::{paginate_unspillable, read_file_page};
+// #2672: numeric args as models send them (int, "531", 531.0); fails loudly otherwise.
+use super::tool_args::nonnegative_usize as arg_usize;
 pub use output_budget::{
     set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
 };
@@ -3421,53 +3423,6 @@ async fn execute_authorized_tool(
     // aliases, or permission widening can run.
     disposition: PromptDisposition,
 ) -> String {
-    // read_file's paging args arrive from models as JSON. Local models
-    // commonly emit XML-style tool calls whose values are STRINGS
-    // (`offset="531"`) or floats (`531.0`); `as_u64()` returns None for those,
-    // so the model silently got page 1 (#2672). Coerce the three numeric args
-    // through ONE helper that accepts all three shapes and otherwise fails
-    // loudly instead of falling back to page 1. Defined at function scope so
-    // both read_file dispatch arms can call it.
-    fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
-        let Some(value) = args.get(key) else {
-            return Ok(None);
-        };
-        match value {
-            serde_json::Value::Number(n) => {
-                let big = format!("read_file: `{key}` is too large to page by, e.g. offset=531");
-                if let Some(i) = n.as_u64() {
-                    usize::try_from(i).map(Some).map_err(|_| big)
-                } else {
-                    // Only a float reaches here; a whole-valued float is
-                    // accepted, anything with a fractional part is not.
-                    let f = n.as_f64().unwrap_or(0.0);
-                    if f.fract() == 0.0 && f >= 0.0 {
-                        usize::try_from(f as i64).map(Some).map_err(|_| big)
-                    } else {
-                        Err(format!(
-                            "read_file: `{key}` must be a non-negative integer, \
- e.g. offset=531; got {value}"
-                        ))
-                    }
-                }
-            }
-            serde_json::Value::String(s) => {
-                let t = s.trim();
-                match t.parse::<usize>() {
-                    Ok(n) => Ok(Some(n)),
-                    Err(_) => Err(format!(
-                        "read_file: `{key}` must be a non-negative integer, e.g. \
- offset=531; got {value}"
-                    )),
-                }
-            }
-            _ => Err(format!(
-                "read_file: `{key}` must be a non-negative integer, e.g. offset=531; \
- got {value}"
-            )),
-        }
-    }
-
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
         default_command_cwd,
