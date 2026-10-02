@@ -860,6 +860,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /mode [name]             - show/set operating style: chat, dev, admin, plan, diagnose, auto, full-auto",
         "  /posture [name]          - show/set configured posture; permission floor is optional",
         "  /permissions             - prompted decisions + active permission posture",
+        "  /ocap propose            - propose this session's approve.toml from its flight-recorder capture (session-scoped; --save persists candidates)",
+        "  /ocap list               - list the saved approval candidates from a prior /ocap propose --save",
         "  /workspace               - review and save workspace access for the next process launch",
         "  /settings workspaces     - open the same operator workspace editor",
         "  /status                  - session and environment summary (the default view)",

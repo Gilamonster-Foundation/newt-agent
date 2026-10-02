@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 
 use newt_core::denial_journal::ChainBreak;
-use newt_core::flight_recorder::{read_capture_jsonl, CAPTURE_PATH_ENV};
-use newt_core::ocap_propose::{in_policy_pairs, propose_from_capture, Proposal};
-use newt_core::ocap_store::{build_store, CapabilityClass, PolicyFile, Verdict, VERDICTS};
+use newt_core::flight_recorder::CAPTURE_PATH_ENV;
+use newt_core::ocap_propose::Proposal;
+use newt_core::ocap_store::{CapabilityClass, Verdict, VERDICTS};
 
 #[derive(Subcommand, Debug)]
 pub enum OcapCmd {
@@ -272,9 +272,11 @@ fn run_propose(save: bool, capture: Option<PathBuf>, config: Option<&Path>) -> a
 /// contents + the existing `approve.toml` → the [`Proposal`] and the merged
 /// `approve.toml` text the caller writes when `--write` is set.
 ///
-/// Uses the UNVERIFIED `build_store` on purpose: an unsigned candidate already
-/// on disk must be treated as accounted-for so re-running `propose` is
-/// idempotent (the signed-load path would drop it and re-propose forever).
+/// Delegates to [`newt_core::ocap_propose::propose_for`] so the CLI and the
+/// TUI share ONE proposer — grouping, the danger gate, provenance stamp and
+/// the retain-then-push dedup are defined once. Uses the UNVERIFIED `build_store`
+/// on purpose (via `propose_for`): an unsigned candidate already on disk must be
+/// treated as accounted-for so re-running `propose` is idempotent.
 pub(crate) fn plan_proposal(
     capture_text: &str,
     store_files: &[(Verdict, Option<String>)],
@@ -282,18 +284,15 @@ pub(crate) fn plan_proposal(
     is_high_danger: impl Fn(CapabilityClass, &str) -> bool,
     now: &str,
 ) -> Result<(Proposal, String), String> {
-    let cap = read_capture_jsonl(capture_text);
-    let (set, _warnings) = build_store(store_files);
-    let in_policy = in_policy_pairs(&set);
-    let proposal = propose_from_capture(&cap, &in_policy, is_high_danger, now);
-
-    let mut merged = match existing_approve {
-        Some(t) => PolicyFile::parse(t).map_err(|e| format!("approve.toml: {e}"))?,
-        None => PolicyFile::default(),
-    };
-    merged.exec.extend(proposal.additions.exec.iter().cloned());
-    merged.fs.extend(proposal.additions.fs.iter().cloned());
-    merged.net.extend(proposal.additions.net.iter().cloned());
+    let (merged, proposal) = newt_core::ocap_propose::propose_for(
+        capture_text,
+        store_files,
+        existing_approve,
+        is_high_danger,
+        now,
+        None,
+    )
+    .map_err(|e| format!("propose: {e}"))?;
     let toml = merged
         .to_toml()
         .map_err(|e| format!("serialize approve.toml: {e}"))?;
@@ -466,6 +465,7 @@ pub(crate) fn render_denials(body: &str, path: &Path, head: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use newt_core::ocap_store::PolicyFile;
 
     /// Production-shaped danger predicate for the tests.
     fn danger(class: CapabilityClass, target: &str) -> bool {

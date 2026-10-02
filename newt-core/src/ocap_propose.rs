@@ -28,7 +28,9 @@
 use std::collections::HashSet;
 
 use crate::flight_recorder::{FlightCapture, ShadowAxis};
-use crate::ocap_store::{CapabilityClass, ExecEntry, FsEntry, NetEntry, PolicyFile, PolicySet};
+use crate::ocap_store::{
+    CapabilityClass, ExecEntry, FsEntry, NetEntry, PolicyFile, PolicySet, Verdict,
+};
 
 /// The provenance stamped on every proposed entry's `by` field — mirrors the
 /// contract's free-form provenance (`human` / `seed` / a tool name). This value
@@ -192,6 +194,67 @@ pub fn propose_from_capture(
         }
     }
     proposal
+}
+
+/// The reusable entry point the CLI (`newt ocap propose`) AND the TUI
+/// (`/ocap propose`) both call. It is the SINGLE SOURCE OF TRUTH for folding a
+/// capture into a proposal — the TUI must not re-derive the grouping, the
+/// danger gate, or the provenance stamp. It reads the store files UNVERIFIED
+/// (an already-written-but-unsigned candidate counts as accounted-for, so a
+/// re-run never re-offers it), merges the low-danger additions on top of any
+/// existing entries, and returns both the merged file and the pure
+/// [`Proposal`]. `existing` is the raw text read from `approve.toml`, or `None`
+/// when no file is configured.
+///
+/// `session` scopes the capture to one session: when `Some`, caveats recorded
+/// under a different session are excluded from a shared capture file. The
+/// CLI and TUI both pass [`newt_core::lifecycle::active_session`]; when it is
+/// `None` the whole file is read (unscoped).
+///
+/// This is exactly the composition the CLI wires, so the TUI cannot drift from
+/// it: parse the store, build the in-policy pair set, call
+/// [`propose_from_capture`], then merge the additions on top of the existing
+/// file. Any other caller gets the same result for the same inputs.
+pub fn propose_for(
+    capture_text: &str,
+    store_files: &[(Verdict, Option<String>)],
+    existing: Option<&str>,
+    is_high_danger: impl Fn(CapabilityClass, &str) -> bool,
+    now: &str,
+    session: Option<&str>,
+) -> anyhow::Result<(PolicyFile, Proposal)> {
+    use crate::ocap_store::build_store;
+
+    let (set, _) = build_store(store_files);
+    let in_policy = in_policy_pairs(&set);
+    // Session-scoped read: with `session` set, caveats recorded under a
+    // different session are excluded (a shared capture file holds every
+    // session). `None` reads everything, preserving the unscoped behaviour.
+    let capture = crate::flight_recorder::read_capture_jsonl_sessioned(capture_text, session);
+    let proposal = propose_from_capture(&capture, &in_policy, is_high_danger, now);
+
+    // Merge the proposed additions on top of any existing entries. An entry
+    // that is already present (same class+target) is left as-is except that a
+    // plain existing approve is annotated with the flight-recorder provenance;
+    // a pre-existing candidate or signed grant is left untouched (idempotent).
+    let mut merged = match existing {
+        Some(text) => PolicyFile::parse(text).map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => PolicyFile::default(),
+    };
+    for e in &proposal.additions.exec {
+        merged.exec.retain(|x| x.target != e.target);
+        merged.exec.push(e.clone());
+    }
+    for e in &proposal.additions.fs {
+        merged.fs.retain(|x| x.path != e.path);
+        merged.fs.push(e.clone());
+    }
+    for e in &proposal.additions.net {
+        merged.net.retain(|x| x.host != e.host);
+        merged.net.push(e.clone());
+    }
+
+    Ok((merged, proposal))
 }
 
 #[cfg(test)]

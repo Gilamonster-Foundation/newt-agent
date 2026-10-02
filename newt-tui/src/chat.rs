@@ -3991,6 +3991,35 @@ fn session_body(
                         println!();
                         continue;
                     }
+                    // #2679: propose a durable `approve.toml` from this session's
+                    // flight-recorder capture. Session-scoped — only the caveats
+                    // recorded under THIS session survive, so a shared capture
+                    // never mixes one session's observed authority with another's.
+                    if slash_body == "ocap" || slash_body.starts_with("ocap ") {
+                        let tail = slash_body.strip_prefix("ocap").unwrap_or("").trim();
+                        let sub = tail.split_whitespace().next().unwrap_or("");
+                        let save = sub == "save";
+                        let user_config = newt_core::Config::user_config_path();
+                        let config_path = user_config.as_deref();
+                        let lines = match crate::ocap_propose_command_lines(
+                            None,
+                            config_path,
+                            save,
+                            &active_conversation_id,
+                        ) {
+                            Ok(lines) => lines,
+                            Err(error) => {
+                                print_newt(&error.to_string(), color, verbose);
+                                println!();
+                                continue;
+                            }
+                        };
+                        for line in lines {
+                            println!("{line}");
+                        }
+                        println!();
+                        continue;
+                    }
                     // #263: review surface for prompted permission decisions.
                     // Read-only by design — promoting an allow to a durable
                     // grant is a human editing [tui.permissions] in config.
