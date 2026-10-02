@@ -33,6 +33,8 @@ use output_budget::DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN;
 #[cfg(test)]
 use output_budget::{cap_model_output, cap_model_output_with_handle};
 use output_budget::{paginate_unspillable, read_file_page};
+// #2672: numeric args as models send them (int, "531", 531.0); fails loudly otherwise.
+use super::tool_args::nonnegative_usize as arg_usize;
 pub use output_budget::{
     set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
 };
@@ -4615,13 +4617,18 @@ async fn execute_authorized_tool(
             let address = args["path"].as_str().unwrap_or("").trim();
             match memory_source {
                 Some(source) => match super::memory_fetch::resolve_memory_address(address, source) {
-                    Ok(body) => paginate_unspillable(
-                        address,
-                        &body,
-                        args["offset"].as_u64().map(|n| n as usize),
-                        args["limit"].as_u64().map(|n| n as usize),
-                        args["char_offset"].as_u64().map(|n| n as usize),
-                    ),
+                    Ok(body) => match (arg_usize(args, "offset"), arg_usize(args, "limit"),
+                        arg_usize(args, "char_offset"))
+                    {
+                        (Ok(offset), Ok(limit), Ok(char_offset)) => paginate_unspillable(
+                            address,
+                            &body,
+                            offset,
+                            limit,
+                            char_offset,
+                        ),
+                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => format!("error: read_file: {e}"),
+                    },
                     Err(refusal) => refusal,
                 },
                 None => format!(
@@ -4638,13 +4645,22 @@ async fn execute_authorized_tool(
                     // #719: window + cap the MODEL-facing payload (the on-screen
                     // display is capped separately) so one read of a large file
                     // can't saturate the context window and abandon the task.
-                    let offset = args["offset"].as_u64().map(|n| n as usize);
-                    let limit = args["limit"].as_u64().map(|n| n as usize);
+                    let offset = match arg_usize(args, "offset") {
+                        Ok(v) => v,
+                        Err(e) => return format!("error: read_file: {e}"),
+                    };
+                    let limit = match arg_usize(args, "limit") {
+                        Ok(v) => v,
+                        Err(e) => return format!("error: read_file: {e}"),
+                    };
                     // #726: char backstop now derives from the shared token
                     // budget so read_file and run_command share one cap —
                     // held under the spill cap when offload is on, so a big
                     // file pages with `offset=` instead of becoming a handle.
-                    let char_offset = args["char_offset"].as_u64().map(|n| n as usize);
+                    let char_offset = match arg_usize(args, "char_offset") {
+                        Ok(v) => v,
+                        Err(e) => return format!("error: read_file: {e}"),
+                    };
                     read_file_page(path, &contents, offset, limit, char_offset, tool_offload)
                 }
                 Err(tool_output) => tool_output,
