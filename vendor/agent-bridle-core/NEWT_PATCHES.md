@@ -150,3 +150,27 @@ this newt backport are unopened, per operator instruction, pending review.
 Remove this section (and fold the Mach-floor logic back into a plain `rc.6`
 bump) once agent-bridle's own release contains both #406 and the #405
 promotion.
+
+## Descriptor-bound read roots
+
+`HeldReadRoot`, `Sandbox::apply_with_held_roots` and
+`ConfinedCommand::held_read_roots`: a caller that already holds a read root as
+a directory descriptor (and has verified its identity) hands a duplicate to the
+spawn. The Landlock ruleset adds `PathBeneath` on that descriptor and drops the
+path-opened rule for the same root, so a swap at the pathname after the
+caller's check cannot re-point the fence. Admission is unchanged — the root is
+still spelled in `fs_read` — only how the rule is built changes. A wrapper
+backend (Seatbelt) refuses a non-empty set rather than fall back to the path.
+Newt's governed push uses this for the confined object copy. Filed upstream as
+a patch; retire this section when it lands.
+
+Hardened (#2674 P1): the two claims above — "admission unchanged" and "a
+caller that has verified its identity" — are now enforced, not merely
+documented preconditions. `HeldReadRoot::bind` (the only constructor; fields
+are private, no public struct literal) refuses unless `fd`'s `(dev, ino)`
+equals what `provenance` names right now, so a falsely labelled
+`HeldReadRoot(A, fd(B))` cannot be constructed. `ConfinedCommand::spawn`
+separately refuses any held root whose `provenance` is not a member of the
+admitted `fs_read` scope, before the spawn thread starts, so a genuinely
+bound but un-admitted `HeldReadRoot(B, fd(B))` cannot reach the sandbox
+either.

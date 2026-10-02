@@ -287,6 +287,10 @@ mod crew;
 mod find;
 
 #[cfg(test)]
+#[path = "execute_grep.rs"]
+mod grep;
+
+#[cfg(test)]
 #[path = "reads_do_not_publish.rs"]
 mod reads_do_not_publish;
 

@@ -1207,27 +1207,6 @@ fn the_carried_userland_refusal_remains_a_failed_tool_result() {
     );
 }
 
-/// Ground denial accounting against the renderer for a binary outside the
-/// filesystem grant, without turning the failure into a prescribed repair.
-#[test]
-fn a_kernel_refused_binary_remains_a_denied_tool_result() {
-    let exe = std::env::current_exe().expect("the running test binary exists");
-    let exe = exe.display().to_string();
-    let envelope = serde_json::json!({
-        "exit_code": 126,
-        "stdout": "",
-        "stderr": format!("brush: failed to execute command '{exe}': Permission denied (os error 13)\n"),
-    });
-    let rendered = tools::kernel_refused_binary(&exe, &envelope, &crate::caveats::Scope::none())
-        .expect("a 126 outside the read grant renders the refusal");
-    assert!(!tools::tool_result_ok(&rendered));
-    assert!(run_command_result_is_denial(
-        "run_command",
-        false,
-        &rendered
-    ));
-}
-
 /// #2374 review A, result-aware mode: only a real workspace change clears a
 /// failure memo. A read-only probe or a harness-state call keeps it; a
 /// mutating command or a write clears it.

@@ -48,6 +48,12 @@ age.workspace = true
 # agents search the workspace without the shell, which can be unavailable in a
 # given build (the stub-shell case that motivated the issue).
 ignore.workspace = true
+# In-process regex line search for the embedded `grep` tool — ripgrep's
+# searcher + regex matcher, reused so a macOS run_command refusal can't take
+# the agent's grep with it. See agentic/tools/grep_tool.rs.
+grep-searcher.workspace = true
+grep-regex.workspace = true
+globset.workspace = true
 # #1030 collision fix (store.rs live_owners): pid-liveness probe
 # (`libc::kill(pid, 0)`) so a conversation claimed by a crashed/rebooted
 # process is reclaimable rather than stuck claimed forever.
