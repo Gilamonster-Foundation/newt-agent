@@ -253,3 +253,65 @@ async fn grep_rejects_junk_max_results() {
     .await;
     assert!(out.starts_with("error: grep: `max_results`"), "got: {out}");
 }
+
+/// A file that turns binary AFTER a hit contributes nothing: its hit neither
+/// shows nor eats the cap, a later text file's hit still appears, and the skip
+/// is reported (#2677 review).
+#[tokio::test]
+async fn a_late_binary_file_is_rolled_back_and_reported() {
+    let ws = tempfile::TempDir::new().unwrap();
+    // The NUL sits past the searcher's first buffer, so the hit is reported
+    // before the file is found to be binary.
+    let mut late = b"NEEDLE first\n".to_vec();
+    late.extend(std::iter::repeat_n(b"filler line\n".as_slice(), 40_000).flatten());
+    late.extend(b"\0tail\n");
+    std::fs::write(ws.path().join("a.bin"), late).unwrap();
+    std::fs::write(ws.path().join("b.txt"), b"NEEDLE second\n").unwrap();
+    let out = run_grep(
+        serde_json::json!({ "pattern": "NEEDLE", "max_results": 1 }),
+        ws.path(),
+    )
+    .await;
+    assert!(out.starts_with("b.txt:1:NEEDLE second"), "got: {out}");
+    assert!(!out.contains("a.bin"), "got: {out}");
+    assert!(
+        !out.contains("[stopped at"),
+        "a rolled-back hit must not consume the cap: {out}"
+    );
+    assert!(out.contains("[1 file(s) not searched"), "got: {out}");
+}
+
+/// An unreadable file is reported as not searched, never hidden behind
+/// "no matches".
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_file_is_reported_not_hidden() {
+    use std::os::unix::fs::PermissionsExt;
+    let ws = tempfile::TempDir::new().unwrap();
+    let f = ws.path().join("locked.txt");
+    std::fs::write(&f, b"NEEDLE\n").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&f).is_ok() {
+        return; // running as root: permissions don't bind, nothing to prove
+    }
+    let out = run_grep(serde_json::json!({ "pattern": "NEEDLE" }), ws.path()).await;
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(out.starts_with("no matches"), "got: {out}");
+    assert!(out.contains("[1 file(s) not searched"), "got: {out}");
+}
+
+/// `max_results: 0` is rejected rather than reported as "no matches".
+#[tokio::test]
+async fn a_zero_cap_is_rejected() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("a.rs"), b"x\n").unwrap();
+    let out = run_grep(
+        serde_json::json!({ "pattern": "x", "max_results": 0 }),
+        ws.path(),
+    )
+    .await;
+    assert!(
+        out.starts_with("error: grep: `max_results` must be at least 1"),
+        "got: {out}"
+    );
+}

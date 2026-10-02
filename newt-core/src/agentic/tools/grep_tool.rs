@@ -31,6 +31,9 @@ pub(crate) const DEFAULT_MAX_RESULTS: usize = 100;
 pub(crate) struct GrepOutput {
     pub lines: Vec<String>,
     pub truncated: bool,
+    /// Files (or walk entries) not searched: binary, unreadable, or a walk
+    /// error. Reported so "no matches" is never claimed for a partial search.
+    pub skipped: usize,
 }
 
 /// Search every file under `root` that the workspace walk yields. `Err` only
@@ -66,11 +69,19 @@ pub(crate) fn grep_search(
         out: GrepOutput {
             lines: Vec::new(),
             truncated: false,
+            skipped: 0,
         },
         hits: 0,
         max: opts.max_results,
     };
-    for entry in super::workspace_walker(root, true, None).build().flatten() {
+    // Name order, so the same search always reports the same lines.
+    let mut walker = super::workspace_walker(root, true, None);
+    walker.sort_by_file_name(|a, b| a.cmp(b));
+    for entry in walker.build() {
+        let Ok(entry) = entry else {
+            sink.out.skipped += 1;
+            continue;
+        };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -92,18 +103,21 @@ pub(crate) fn grep_search(
     Ok(sink.out)
 }
 
+/// Search one file as a transaction: a file that turns out binary or
+/// unreadable part-way contributes nothing (no lines, no hits, no cap) and is
+/// counted as skipped.
 fn search_one(
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
     path: &std::path::Path,
     sink: &mut Collect,
 ) {
-    let before = sink.out.lines.len();
-    // An unreadable file is skipped, as `find` skips one; a binary file
-    // (NUL byte) stops early. Neither leaves partial output behind.
-    let ok = searcher.search_path(matcher, path, &mut *sink).is_ok();
-    if !ok {
-        sink.out.lines.truncate(before);
+    let (lines, hits, truncated) = (sink.out.lines.len(), sink.hits, sink.out.truncated);
+    if searcher.search_path(matcher, path, &mut *sink).is_err() {
+        sink.out.lines.truncate(lines);
+        sink.hits = hits;
+        sink.out.truncated = truncated;
+        sink.out.skipped += 1;
     }
 }
 

@@ -4140,7 +4140,7 @@ async fn execute_authorized_tool(
             // Corrective guard: the model tried to call a tool as a shell binary.
             // Return a correction so the model can retry with the right tool call.
             if let Some(tool) = run_command_redirect(cmd)
-                .filter(|tool| smart_harness.is_none() || *tool != "find")
+                .filter(|tool| smart_harness.is_none() || !matches!(*tool, "find" | "grep"))
             {
                 return host_return(format!(
                     "error: '{tool}' is a tool, not a shell command. \
@@ -5286,11 +5286,11 @@ async fn execute_authorized_tool(
         // agent that needed `find` but the build's shell tool was unavailable;
         // this arm walks the workspace with the `ignore` crate (no subprocess),
         // gated by the same fs_read caveat as list_dir/read_file.
-        "find" if smart_harness.is_some() =>
+        "find" | "grep" if smart_harness.is_some() =>
             {
                 invocation.expect("smart dispatch has a witness").host();
                 executed((
-                    "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string(),
+                    format!("Error: frame isolation: native {name} is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search"),
                     crate::ExecOutcome::Unavailable,
                 ))
             },
@@ -5392,7 +5392,7 @@ async fn execute_authorized_tool(
                     fs_gate_allows(gate, "grep", DenialKind::FsRead, &full_str, |c| &c.fs_read)
                 });
                 if !allowed {
-                    return denied_fs_result("fs_read", path);
+                    return denied_fs_result("fs_read", &full_str);
                 }
             }
             // #1176: shadow-OCAP — record the search root under --full-access.
@@ -5412,6 +5412,7 @@ async fn execute_authorized_tool(
                 Err(e) => return format!("error: grep: {e}"),
             };
             let max_results = match arg_usize(args, "max_results") {
+                Ok(Some(0)) => return "error: grep: `max_results` must be at least 1".to_string(),
                 Ok(v) => v.unwrap_or(grep_tool::DEFAULT_MAX_RESULTS),
                 Err(e) => return format!("error: grep: {e}"),
             };
@@ -5429,14 +5430,21 @@ async fn execute_authorized_tool(
                 max_results,
             };
             match grep_tool::grep_search(&full, std::path::Path::new(workspace), &opts) {
-                Ok(found) if found.lines.is_empty() => {
-                    format!("no matches for {} under {path}", opts.pattern)
-                }
                 Ok(found) => {
-                    let mut out = found.lines.join("\n");
+                    let mut out = if found.lines.is_empty() {
+                        format!("no matches for {} under {path}", opts.pattern)
+                    } else {
+                        found.lines.join("\n")
+                    };
                     if found.truncated {
                         out.push_str(&format!(
                             "\n[stopped at {max_results} results; narrow pattern/path/glob or raise max_results]"
+                        ));
+                    }
+                    if found.skipped > 0 {
+                        out.push_str(&format!(
+                            "\n[{} file(s) not searched: binary or unreadable]",
+                            found.skipped
                         ));
                     }
                     out
