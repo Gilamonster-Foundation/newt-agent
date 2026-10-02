@@ -134,6 +134,9 @@ pub struct ExecRequest {
     /// owner-only just before spawning, removed when the run ends, so building
     /// a request never touches the filesystem.
     scratch_dirs: Vec<PathBuf>,
+    /// Read roots the caller holds as directory descriptors: the Landlock
+    /// fence anchors on them instead of re-opening the root by path.
+    held_read_roots: Vec<agent_bridle::HeldReadRoot>,
 }
 
 impl ExecRequest {
@@ -158,7 +161,22 @@ impl ExecRequest {
             net_grant: NetGrant::Unrestricted,
             net_guard_bin: None,
             scratch_dirs: Vec::new(),
+            held_read_roots: Vec::new(),
         }
+    }
+
+    /// Anchor the fence's read rules for these roots on the descriptors the
+    /// caller holds ([`agent_bridle::HeldReadRoot`]), so a root swapped at
+    /// its pathname after the caller's check is outside the fence. Each root
+    /// must also be in `caveats.fs_read`; this changes how the fence is
+    /// built, never what is admitted.
+    #[must_use]
+    pub fn held_read_roots(
+        mut self,
+        roots: impl IntoIterator<Item = agent_bridle::HeldReadRoot>,
+    ) -> Self {
+        self.held_read_roots.extend(roots);
+        self
     }
 
     /// Give the run a private scratch `dir`: created just before spawning
@@ -430,7 +448,8 @@ impl ConstrainedExecutor {
             .new_process_group()
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .held_read_roots(req.held_read_roots.iter().cloned());
         // The child's ENTIRE environment: the explicit grants and nothing else
         // (ConfinedCommand starts env-empty). No inherited credentials/switches.
         for (k, v) in &req.env {

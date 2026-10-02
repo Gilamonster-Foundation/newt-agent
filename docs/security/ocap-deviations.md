@@ -66,6 +66,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
 | `governed-push-macos-net-unrestricted` | confined fetch uses net=none on every platform | 🟠 ACTIVE (macos) | (macOS-only: Seatbelt cannot kernel-enforce net=none; confined fetch uses net=Scope::All; fs is enforced via fd-based O_NOFOLLOW walk, exec not yet separately confined in copy; copy-side exec follow-up: #2661; net follow-up: #2662) |
+| `governed-push-macos-copy-fence-path-bound` | the confined copy's read fence anchors on the held root objects | 🟠 ACTIVE (macos) | (macOS-only, residual #8: Seatbelt admits paths, so a root swapped between the identity check and the profile may be read by the confined fetch; what is pushed is fixed by oid. Linux anchors on the held descriptors) |
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
 | `local-deputy-egress` | no indirect egress via a host AF_UNIX / Windows named-pipe deputy | 🟠 ACTIVE (linux/windows) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
 | `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
@@ -1130,6 +1131,16 @@ resolved in a later release:
 - Concurrent edits to a TRUSTED OPERATOR's own git/gh config files (made by
   the operator themselves, not the model, which cannot write those paths at
   all) between the broker's trust check and its dial are not detected.
+- Residual #8 (2026-10-01), macOS only: the confined copy's read fence is
+  path-bound. Seatbelt admits paths, so the window between
+  `HeldRoots::verify_identities` and the profile cannot be closed there. An
+  attacker with write access to a read root's parent directory can swap the
+  root for a different real directory inside that window, and the confined
+  fetch may then read beneath the swap. The approved commit is fetched by
+  oid, so a swapped root cannot change WHAT is pushed, only what the
+  confined fetch may read. On Linux the fence anchors on the held
+  descriptors (`agent_bridle::HeldReadRoot`), which closes the window;
+  `verify_identities` stays as defence in depth.
 
 ## 5. How to use this (for the practical-caveat moments)
 
