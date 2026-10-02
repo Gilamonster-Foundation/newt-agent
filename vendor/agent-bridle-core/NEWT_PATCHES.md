@@ -51,16 +51,40 @@ Cherry-picks agent-bridle PR #417 (ADR 0015 amendment E7, open upstream at the
 time of this backport — not yet merged): adds `ConfinedStdio::WorkerControl`,
 a fourth named/audited `ConfinedStdio` variant for the trusted-worker's
 one-shot authenticated control-socket stdin (`WorkerControlHandle`,
-crate-private constructor), and wires `SandboxedWorker::spawn_supported`'s
-stdin/stdout/stderr through the named variants instead of raw `Stdio`. Fixes
-`run_command` (Brush) refusing on macOS under `net: none` even for commands
-that touch no network — "backend authority on the Net axis is not decidable
-...(L3 BOUND)" — since the worker's stdin never claimed the audited stdio
-shape this crate's own `net:none` Seatbelt promotion (the `#406`/`#416`
-backport above) requires. See the upstream PR for the full argument and
-agent-bridle's ADR 0015 (ignore this file's own copy drift; the PR is
-authoritative). Does NOT resolve a non-empty host net allow-list — see the
-PR body's "Scope note".
+module-private constructor — narrowed from crate-private in round 2, since
+its only call site is `SandboxedWorker::spawn_supported` in the same
+module), and wires `SandboxedWorker::spawn_supported`'s stdin/stdout/stderr
+through the named variants instead of raw `Stdio`. Fixes `run_command`
+(Brush) refusing on macOS under `net: none` even for commands that touch no
+network — "backend authority on the Net axis is not decidable ...(L3
+BOUND)" — since the worker's stdin never claimed the audited stdio shape
+this crate's own `net:none` Seatbelt promotion (the `#406`/`#416` backport
+above) requires. See the upstream PR for the full argument and agent-bridle's
+ADR 0015 (ignore this file's own copy drift; the PR is authoritative).
+Does NOT resolve a RAW host net allow-list handed directly to this crate —
+newt's own `shell.rs` (`dispatch_caveats_for_command`/`spawn_net_scope`)
+narrows any non-empty host-list `net` grant to `net: none` before calling in,
+so `run_command` here only ever sees the `net: none` shape this fix
+resolves; see the PR body's "Scope note" / "Out of scope" sections.
+
+**Round 2 (2026-10-02):** `agent-bridle-tool-shell/src/host_shell.rs`
+(ADR 0019's separate "sandboxed-host" engine) still built its
+`ConfinedCommand` with raw `Stdio::null()`/`Stdio::piped()` — upstream's own
+copy was already migrated by `#416`, but that migration was never part of
+`#417`'s cherry-pick above, so it was missed when this vendor was first
+synced. Backported now: named `ConfinedStdio::Null`/`Piped`. A new pair of
+tests in `tests/host_shell_real.rs` exercises the `ConfinedCommand` shape
+`host_shell.rs` builds (`/bin/sh -c <cmd>`, its default `SandboxPolicy`)
+directly against a `net: none` context — `HostShellTool::invoke` itself can
+never reach a restricted-net admission check this way; ADR 0019 D2 refuses
+any restricted `exec`/`net` grant before a spawn is built at all — so this
+is a shape/hygiene fix (matching upstream, claiming the audit credit the
+mechanism already allows), not a user-visible behavior change through
+`HostShellTool`'s own API. Measured on the Mac test runner (macOS 15.7.3,
+Apple Silicon): both the new named-stdio admit test and the raw-`Other`
+refuse test pass identically whether `host_shell.rs` carries this fix or
+not, confirming they characterize the `ConfinedCommand` mechanism for this
+invocation shape rather than regression-testing `host_shell.rs` itself.
 
 The macOS profile also adds a trusted, default-off `macos_private_ptys` option.
 Newt opts in so confined terminal tests can allocate PTYs. It permits the
