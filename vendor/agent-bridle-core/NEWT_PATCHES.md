@@ -45,6 +45,23 @@ synchronously on its single-thread runtime before another command can spawn.
 Publication and cross-platform verification are separate required follow-ups;
 this provenance note is not evidence that either has completed.
 
+## Worker-control stdio audit backport (agent-bridle#417, 2026-10-02)
+
+Cherry-picks agent-bridle PR #417 (ADR 0015 amendment E7, open upstream at the
+time of this backport — not yet merged): adds `ConfinedStdio::WorkerControl`,
+a fourth named/audited `ConfinedStdio` variant for the trusted-worker's
+one-shot authenticated control-socket stdin (`WorkerControlHandle`,
+crate-private constructor), and wires `SandboxedWorker::spawn_supported`'s
+stdin/stdout/stderr through the named variants instead of raw `Stdio`. Fixes
+`run_command` (Brush) refusing on macOS under `net: none` even for commands
+that touch no network — "backend authority on the Net axis is not decidable
+...(L3 BOUND)" — since the worker's stdin never claimed the audited stdio
+shape this crate's own `net:none` Seatbelt promotion (the `#406`/`#416`
+backport above) requires. See the upstream PR for the full argument and
+agent-bridle's ADR 0015 (ignore this file's own copy drift; the PR is
+authoritative). Does NOT resolve a non-empty host net allow-list — see the
+PR body's "Scope note".
+
 The macOS profile also adds a trusted, default-off `macos_private_ptys` option.
 Newt opts in so confined terminal tests can allocate PTYs. It permits the
 allocator at `/dev/ptmx` and slave paths only with the kernel's

@@ -409,19 +409,49 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
 /// but the builder defaulted to inherited stdio and accepted an arbitrary
 /// `Stdio`). [`Self::Piped`] and [`Self::Null`] are exactly the shape that
 /// audit covers — a descriptor this process just minted, which cannot already
-/// be a connected endpoint. [`Self::Other`] is everything else (inherited, a
-/// redirected file, an existing fd) and is a legitimate, supported shape (shell
-/// redirects, a trusted-worker control channel) — it just does not qualify a
-/// Seatbelt `net:none` spawn for the Kernel witness; see
-/// [`ConfinementMechanism::with_stdio_posture`].
+/// be a connected endpoint. [`Self::WorkerControl`] is the trusted-worker's
+/// one-shot authenticated control channel — audited for a DIFFERENT reason;
+/// see its own doc (ADR 0015 amendment E7, agent-bridle#417 / newt#2673).
+/// [`Self::Other`] is everything else (inherited, a redirected file, an
+/// existing fd) and is a legitimate, supported shape (shell redirects) — it
+/// just does not qualify a Seatbelt `net:none` spawn for the Kernel witness;
+/// see [`ConfinementMechanism::with_stdio_posture`].
 #[derive(Debug)]
 pub enum ConfinedStdio {
     /// `Stdio::piped()` — a pipe this process owns the opposite end of.
     Piped,
     /// `Stdio::null()` — `/dev/null`.
     Null,
+    /// The trusted-worker's own half of a fresh `UnixStream::pair()`, wired as
+    /// its stdin and consumed by exactly one host-authored, signed frame
+    /// before the host drops its end (ADR 0015 E7). Audited for the same
+    /// reason `Piped`/`Null` are: by the time the worker executes a single
+    /// caveat-governed action, this descriptor carries no further traffic in
+    /// either direction — the host's end is gone, not merely half-closed. It
+    /// cannot be an ongoing XPC-style network deputy because the protocol
+    /// riding it has no worker→host request at all, let alone one that
+    /// performs I/O. Constructible only by
+    /// [`SandboxedWorker::spawn_supported`] via [`WorkerControlHandle::new`]
+    /// (crate-private), so a model-selected or otherwise external caller
+    /// cannot claim this credit for an arbitrary fd.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    WorkerControl(WorkerControlHandle),
     /// Any other descriptor: inherited, a redirected file, a raw or dup'd fd.
     Other(Stdio),
+}
+
+/// Opaque owner of the trusted-worker control descriptor, constructible only
+/// from this crate's own trusted-worker spawn path (crate-private
+/// constructor) — see [`ConfinedStdio::WorkerControl`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub struct WorkerControlHandle(std::os::fd::OwnedFd);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl WorkerControlHandle {
+    pub(crate) fn new(fd: std::os::fd::OwnedFd) -> Self {
+        Self(fd)
+    }
 }
 
 impl ConfinedStdio {
@@ -429,14 +459,24 @@ impl ConfinedStdio {
         match self {
             Self::Piped => Stdio::piped(),
             Self::Null => Stdio::null(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::WorkerControl(handle) => Stdio::from(handle.0),
             Self::Other(stdio) => stdio,
         }
     }
 
-    /// `true` for exactly [`Self::Piped`]/[`Self::Null`] — the shape ADR 0015
-    /// amendment E6's Seatbelt audit covers.
+    /// `true` for [`Self::Piped`]/[`Self::Null`] (ADR 0015 amendment E6) and
+    /// [`Self::WorkerControl`] (ADR 0015 amendment E7) — the shapes the
+    /// Seatbelt audit covers.
     fn is_audited(&self) -> bool {
-        matches!(self, Self::Piped | Self::Null)
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            matches!(self, Self::Piped | Self::Null | Self::WorkerControl(_))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            matches!(self, Self::Piped | Self::Null)
+        }
     }
 }
 
@@ -1170,9 +1210,11 @@ impl SandboxedWorker {
             .args([flag, kind])
             .env("AGENT_BRIDLE_WORKER_NONCE", nonce)
             .current_dir(cwd)
-            .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_control)))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdin(ConfinedStdio::WorkerControl(WorkerControlHandle::new(
+                std::os::fd::OwnedFd::from(child_control),
+            )))
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
             .new_process_group()
             .sandbox_policy(self.sandbox_policy);
         command.worker_read_resources = worker_read_resources;
