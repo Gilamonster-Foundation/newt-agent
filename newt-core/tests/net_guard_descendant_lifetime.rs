@@ -11,8 +11,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::time::Duration;
-
 use newt_core::confined_exec::{
     workspace_confined_caveats, ConstrainedExecutor, ExecOrigin, ExecRefused, ExecRequest, NetGrant,
 };
@@ -43,8 +41,15 @@ fn a_setsid_escaped_descendant_is_killed_by_the_cgroup() {
     // process group) that would create the marker after 3s; the parent exits
     // immediately. `killpg` cannot reach the setsid session — only the cgroup
     // subtree kill can — so if the marker never appears, cgroup containment held.
-    let script =
-        format!("setsid sh -c 'sleep 3; : > {marker_s}' </dev/null >/dev/null 2>&1 & echo started");
+    // The escapee records its own pid before anything else, and the parent does
+    // not exit until that pid is on disk, so after `run()` the test holds the
+    // exact process the cgroup kill had to reach.
+    let pidfile = ws.path().join("escapee-pid");
+    let pidfile_s = pidfile.to_string_lossy().into_owned();
+    let script = format!(
+        "setsid sh -c 'echo $$ > {pidfile_s}; sleep 3; : > {marker_s}' </dev/null >/dev/null 2>&1 & \
+         until [ -s {pidfile_s} ]; do sleep 0.01; done; echo started"
+    );
     let req = ExecRequest::new(
         ExecOrigin::AgentInfluenced,
         "sh",
@@ -65,9 +70,27 @@ fn a_setsid_escaped_descendant_is_killed_by_the_cgroup() {
         Err(e) => panic!("confined run errored: {e}"),
     }
 
-    // Wait well past the escapee's 3s timer. If it survived the run's cgroup.kill,
-    // it will have created the marker.
-    std::thread::sleep(Duration::from_secs(5));
+    // Event, not timer: wait for the escapee's pid to be gone (a zombie counts
+    // as gone) under the shared hang guard; only then is the marker's absence a
+    // fact. The former 5 s sleep cost 5 s per run and could pass a survivor
+    // whose write had merely been delayed past the check.
+    let pid = std::fs::read_to_string(&pidfile)
+        .expect("the escapee wrote its pid before the parent exited")
+        .trim()
+        .to_owned();
+    let alive = |pid: &str| {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .map(|status| !status.contains("State:\tZ"))
+            .unwrap_or(false)
+    };
+    let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
+    while alive(&pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "escapee {pid} outlived the hang guard; the cgroup kill did not reach it"
+        );
+        std::thread::yield_now();
+    }
     assert!(
         !marker.exists(),
         "a setsid-ESCAPED descendant survived the run and wrote {marker_s} — the cgroup subtree \

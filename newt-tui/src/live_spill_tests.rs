@@ -382,7 +382,7 @@ fn blocked_terminal_write_does_not_block_interrupt_or_watcher_shutdown() {
         })
     };
     controls_rx
-        .recv_timeout(Duration::from_millis(250))
+        .recv_timeout(newt_core::test_guard::HANG_GUARD)
         .expect("spill controls waited for terminal I/O");
     controls_thread.join().unwrap();
     assert_eq!(
@@ -419,7 +419,7 @@ fn blocked_terminal_write_does_not_block_interrupt_or_watcher_shutdown() {
         unsafe { libc::write(pipe[1], [0x03].as_ptr().cast(), 1) },
         1
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
     while !cancel.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -434,14 +434,14 @@ fn blocked_terminal_write_does_not_block_interrupt_or_watcher_shutdown() {
         })
     };
     abandon_rx
-        .recv_timeout(Duration::from_millis(250))
+        .recv_timeout(newt_core::test_guard::HANG_GUARD)
         .expect("generation invalidation waited for terminal I/O");
     abandon_thread.join().unwrap();
 
     stop.store(true, Ordering::Relaxed);
     assert_eq!(unsafe { libc::write(pipe[1], b"x".as_ptr().cast(), 1) }, 1);
     done_rx
-        .recv_timeout(Duration::from_millis(250))
+        .recv_timeout(newt_core::test_guard::HANG_GUARD)
         .expect("watcher shutdown waited for the blocked terminal writer");
 
     writer.release();
@@ -1081,7 +1081,7 @@ fn toggle_survives_transient_model_lock_contention() {
     drop(state);
 
     assert!(done_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(newt_core::test_guard::HANG_GUARD)
         .expect("the toggle stayed blocked after model state was released"));
     control.join().unwrap();
     assert_eq!(

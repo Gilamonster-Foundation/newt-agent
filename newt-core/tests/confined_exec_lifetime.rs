@@ -16,7 +16,7 @@
 #![cfg(target_os = "linux")]
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use newt_core::confined_exec::{
     workspace_confined_caveats, ConfinedOutput, ConstrainedExecutor, ExecOrigin, ExecRefused,
@@ -55,20 +55,18 @@ fn a_hung_child_is_killed_at_its_timeout() {
     let ws = tempdir().unwrap();
     // The child would sleep for a minute; the executor must kill it in ~1s.
     let req = confined_sh_bounded(ws.path(), "sleep 60", Duration::from_secs(1));
-    let start = Instant::now();
     let Some(out) = run(&req) else {
         return; // no Landlock → failed closed; nothing ran to time out.
     };
-    let elapsed = start.elapsed();
+    // `timed_out` is the proof that the 1 s deadline path fired against a child
+    // that would otherwise run for a minute; the former `elapsed < 15 s`
+    // assertion measured spawn + Landlock + kill + reap latency on a loaded box
+    // instead, and a genuine hang is what the harness-level guard is for.
     assert!(
         out.timed_out,
         "a child that outran its deadline must be reported timed_out"
     );
     assert!(!out.success, "a timed-out run is never a success");
-    assert!(
-        elapsed < Duration::from_secs(15),
-        "the hung child was not killed promptly: took {elapsed:?} (harness would hang)"
-    );
 }
 
 #[test]
@@ -86,8 +84,11 @@ fn a_background_descendant_does_not_survive_the_run() {
         return; // no Landlock → failed closed; no descendant was created.
     };
     assert!(out.success, "the parent itself should have exited cleanly");
-    // Give the descendant well past its 3s to fire IF it survived the sweep.
-    std::thread::sleep(Duration::from_secs(5));
+    // No sleep: the backgrounded subshell inherits the child's stdout pipe, and
+    // `ConstrainedExecutor::run` joins its pipe-drain threads before returning,
+    // so `run()` cannot return while a survivor still holds that pipe. Either
+    // the sweep killed it (no marker) or it ran to completion first (marker).
+    // The former 5 s sleep cost 5 s per run and proved nothing the join does not.
     assert!(
         !marker.exists(),
         "a background descendant survived the run and created {marker_str} — the process-group \

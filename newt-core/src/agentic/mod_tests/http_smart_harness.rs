@@ -47,7 +47,7 @@ async fn run(
             .collect::<std::collections::VecDeque<_>>(),
     ));
     let harness = SmartHarness::new(
-        agent_harness::Session::new(Default::default()).unwrap(),
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
         Arc::new(move |prompt| {
             assert!(
                 prompt.contains("reply_cid"),

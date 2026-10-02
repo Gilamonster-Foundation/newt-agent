@@ -2,10 +2,10 @@
 use super::*;
 
 async fn dispatch(url: &str) -> anyhow::Result<Option<(anthropic_wire::AnthropicRound, bool)>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap();
+    // No client timeout: every peer here answers and closes, so the round ends
+    // on that event. A 5 s request budget turned a slow reply into a reqwest
+    // timeout (Retry) under load, which is a different classification.
+    let client = reqwest::Client::new();
     let retry = RetryPolicy::immediate(2);
     let dispatcher = AnthropicDispatch {
         smart_harness: None,
@@ -18,13 +18,16 @@ async fn dispatch(url: &str) -> anyhow::Result<Option<(anthropic_wire::Anthropic
         markdown: false,
         retain: None,
     };
-    anthropic_dispatch_round(
-        &dispatcher,
-        &serde_json::json!({"model":"test","messages":[],"stream":true}),
-        &[],
-        true,
-        None,
-        None,
+    crate::test_guard::hang_guarded(
+        "the anthropic round",
+        anthropic_dispatch_round(
+            &dispatcher,
+            &serde_json::json!({"model":"test","messages":[],"stream":true}),
+            &[],
+            true,
+            None,
+            None,
+        ),
     )
     .await
 }

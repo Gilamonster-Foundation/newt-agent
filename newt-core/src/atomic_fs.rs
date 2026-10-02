@@ -367,11 +367,77 @@ pub fn is_lock_contended(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains(CONTENDED))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times THIS thread's in-flight `acquire_lock` call has invoked
+    /// [`reclaim_lock_once`] — the count-based alternative to timing the call
+    /// (`killed_process_lock_is_reclaimed` asserts this instead of elapsed
+    /// time). Thread-local, not a global `static`: tests on other threads
+    /// never pollute it, no serialization needed beyond what `real_fs`
+    /// already requires for the filesystem itself.
+    static RECLAIM_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset [`RECLAIM_ATTEMPTS`] before a call under test.
+#[cfg(test)]
+fn reset_reclaim_attempts_for_test() {
+    RECLAIM_ATTEMPTS.with(|count| count.set(0));
+}
+
+/// How many reclaim attempts the most recent call made on this thread.
+#[cfg(test)]
+fn reclaim_attempts_for_test() -> usize {
+    RECLAIM_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Overrides [`reclaimable_lock`]'s `now` for the duration of a test.
+    /// Thread-local, same reasoning as [`RECLAIM_ATTEMPTS`]: no cross-test
+    /// serialization needed beyond what `real_fs` already requires.
+    ///
+    /// Why this exists: counting attempts (above) proves the owner-aware,
+    /// live-PID branch fired instead of the slow legacy age-based fallback —
+    /// but only if `age()` reads a value close to when the lock was written.
+    /// Without pinning, a deliberately broken implementation that folds the
+    /// age check into the OWNER branch could still pass by coincidence: if
+    /// the real wall clock has, by the time `acquire_lock` finally calls
+    /// `reclaim_lock_once`, already crossed `LEGACY_LOCK_STALE` past the
+    /// lock's real write time (an unlikely but unbounded delay — process
+    /// spawn/kill/wait, scheduler contention), the broken branch's age check
+    /// would ALSO be satisfied on attempt 1, matching the correct
+    /// implementation's attempt count for the wrong reason. Pinning `now` to
+    /// a value captured close to when the lock was written makes `age()`
+    /// small regardless of how long the surrounding test machinery actually
+    /// takes in real time, closing that gap.
+    static PINNED_NOW: std::cell::Cell<Option<std::time::SystemTime>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`reclaimable_lock`]'s `now` to `now` for the returned guard's
+/// lifetime; real [`std::time::SystemTime::now`] resumes on drop (including
+/// on an early return or a panic, so a failing assertion cannot leak the pin
+/// into a later test on this thread).
+#[cfg(test)]
+#[must_use]
+fn pin_now_for_test(now: std::time::SystemTime) -> impl Drop {
+    struct Unpin;
+    impl Drop for Unpin {
+        fn drop(&mut self) {
+            PINNED_NOW.with(|cell| cell.set(None));
+        }
+    }
+    PINNED_NOW.with(|cell| cell.set(Some(now)));
+    Unpin
+}
+
 /// Attempt one stale-generation takeover while holding a kernel advisory lock
 /// on a persistent recovery sidecar. Every reclaimer must hold this lease
 /// across both the liveness proof and unlink, so a second reclaimer cannot act
 /// on an observation from the previous generation.
 fn reclaim_lock_once(lock_path: &Path) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    RECLAIM_ATTEMPTS.with(|count| count.set(count.get() + 1));
     let Some(_lease) = try_reclaim_lease(lock_path)? else {
         return Ok(false);
     };
@@ -486,8 +552,27 @@ fn try_native_exclusive_lock(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 fn reclaimable_lock(lock_path: &Path) -> bool {
+    #[cfg(test)]
+    let now = PINNED_NOW
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(SystemTime::now);
+    #[cfg(not(test))]
+    let now = SystemTime::now();
+    reclaimable_lock_at(lock_path, now)
+}
+
+/// [`reclaimable_lock`] with the clock injected: the age comparisons read
+/// `now`, so a test states the lock's age outright instead of racing the
+/// grace against scheduler latency. Production passes `SystemTime::now()`.
+fn reclaimable_lock_at(lock_path: &Path, now: SystemTime) -> bool {
     let Ok(body) = std::fs::read_to_string(lock_path) else {
         return false;
+    };
+    let age = || {
+        std::fs::metadata(lock_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
     };
     match LockOwner::decode(&body) {
         Some(owner) => !crate::store::pid_is_alive(owner.pid),
@@ -500,16 +585,8 @@ fn reclaimable_lock(lock_path: &Path) -> bool {
         // live writer gets before calling it dead. A non-empty but
         // undecodable body has unknown provenance and keeps the
         // conservative 30s legacy age fallback.
-        None if body.is_empty() => std::fs::metadata(lock_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > EMPTY_LOCK_GRACE),
-        None => std::fs::metadata(lock_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > LEGACY_LOCK_STALE),
+        None if body.is_empty() => age().is_some_and(|age| age > EMPTY_LOCK_GRACE),
+        None => age().is_some_and(|age| age > LEGACY_LOCK_STALE),
     }
 }
 
@@ -934,10 +1011,20 @@ mod tests {
     fn fresh_empty_lock_is_not_reclaimed_within_the_grace() {
         let dir = TempDir::new().unwrap();
         let lock = lock_path_for(&dir.path().join("config.toml"));
-        std::fs::File::create(&lock).unwrap();
+        let file = std::fs::File::create(&lock).unwrap();
+        // The age is stated, not measured: the lock's mtime is pinned and the
+        // reader's clock is one tick inside the grace. The former form ("created
+        // the statement before") was a bet that fewer than 200 ms passed between
+        // two adjacent statements, which a loaded box does not honour.
+        let created = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        file.set_modified(created).unwrap();
         assert!(
-            !reclaimable_lock(&lock),
+            !reclaimable_lock_at(&lock, created + EMPTY_LOCK_GRACE - Duration::from_millis(1)),
             "a fresh empty lock must not read as a dead owner yet"
+        );
+        assert!(
+            reclaimable_lock_at(&lock, created + EMPTY_LOCK_GRACE + Duration::from_millis(1)),
+            "one tick past the grace, the same empty lock is a crash artifact"
         );
     }
 
@@ -1239,14 +1326,40 @@ mod tests {
             let _ = child.wait();
             panic!("lock-holder child did not become ready");
         }
+        // Captured the moment the lock is known fresh (the child just
+        // published readiness, immediately after acquiring it) — pinned
+        // below so `age()` reflects THIS instant, not whatever real time
+        // `kill`/`wait`/the retry loop happen to take.
+        let lock_is_fresh_at = std::time::SystemTime::now();
         child.kill().unwrap();
         let exit_status = child.wait().unwrap();
 
-        let started = std::time::Instant::now();
+        // No stopwatch: count reclaim attempts instead of timing the call.
+        // Owner-aware reclaim (a live PID check, no sleep) succeeds on the
+        // FIRST attempt; falling through to the legacy age path would need
+        // many — `reclaimable_lock` only returns `true` for an undecodable
+        // owner once the file is older than `LEGACY_LOCK_STALE` (30s), so
+        // `acquire_lock`'s retry loop (`LOCK_RETRIES` × `LOCK_RETRY_DELAY`)
+        // would sleep and recheck repeatedly rather than succeed at once. A
+        // wall-clock bound here is unreliable in EITHER direction: too tight
+        // and a loaded box's own scheduling delay (not a regression) trips it;
+        // too loose and, measured on this lane's box under load average 39,
+        // `LOCK_RETRY_DELAY`'s real sleeps stretched far enough that even a
+        // DELIBERATELY broken owner-aware path (mutated to also require the
+        // age threshold) happened to cross `LEGACY_LOCK_STALE` and reclaim
+        // anyway — see the measured red below. Attempt count alone is not
+        // enough either, if the broken implementation folds age INTO the
+        // owner branch: pin `now` to when the lock was known fresh, so
+        // `age()` cannot pick up a real delay between then and whenever
+        // `acquire_lock` actually runs below, no matter how long that is.
+        reset_reclaim_attempts_for_test();
+        let _unpin = pin_now_for_test(lock_is_fresh_at);
         let _guard = acquire_lock(&lock).expect("dead owner's lock is reclaimable");
-        assert!(
-            started.elapsed() < LEGACY_LOCK_STALE,
-            "owner-aware recovery must not wait for the legacy age threshold"
+        assert_eq!(
+            reclaim_attempts_for_test(),
+            1,
+            "owner-aware recovery must reclaim on its first attempt, not fall \
+             through to the legacy age-based retry loop"
         );
         // Keep `Child` (and therefore its Windows process handle) alive through
         // reclamation. An exited Windows process remains openable while this

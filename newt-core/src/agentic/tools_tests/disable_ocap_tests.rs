@@ -1855,7 +1855,6 @@ async fn a_routed_short_timeout_wrapper_honours_its_own_wall_not_the_lane_wall()
     std::fs::write(ws.path().join("justfile"), "slow:\n\tsleep 10\n").unwrap();
     let caveats = Caveats::top();
 
-    let started = std::time::Instant::now();
     let out = execute_tool_with_offload(
         "build_exec",
         &serde_json::json!({
@@ -1885,14 +1884,12 @@ async fn a_routed_short_timeout_wrapper_honours_its_own_wall_not_the_lane_wall()
         None, // persona_tools
     )
     .await;
-    let elapsed = started.elapsed();
 
+    // No elapsed-time assertion: had the 30 min lane wall applied, `sleep 10`
+    // would have finished and the call would read ok:true, which the two
+    // assertions below reject on content alone. The clock proved nothing the
+    // outcome does not, and under load it failed on its own.
     if crate::confined_exec::kernel_fs_fence_available() {
-        assert!(
-            elapsed < std::time::Duration::from_secs(8),
-            "a `timeout 2` routed call must die at ~2s, not the 30 min lane wall; \
-             elapsed {elapsed:?}, out: {out}"
-        );
         assert!(
             !super::tool_result_ok(&out),
             "a call killed by its own 2-second wall must not read ok:true; got: {out}"

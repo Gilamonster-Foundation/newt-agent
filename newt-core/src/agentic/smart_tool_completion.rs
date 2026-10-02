@@ -357,7 +357,8 @@ mod tests {
         for collect_execution in [true, false] {
             let workspace = tempfile::tempdir().unwrap();
             let harness = SmartHarness::new(
-                agent_harness::Session::new(Default::default()).unwrap(),
+                agent_harness::Session::new(crate::test_guard::unbudgeted_session_config())
+                    .unwrap(),
                 Arc::new(|_| panic!("no inference")),
                 Default::default(),
             )
@@ -418,7 +419,7 @@ mod tests {
     #[test]
     fn long_host_return_is_delivered_without_deriving_another_generation() {
         let harness = SmartHarness::new(
-            agent_harness::Session::new(Default::default()).unwrap(),
+            agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(|_| panic!("no inference")),
             super::super::AdjudicationSettings {
                 initial_tool_bytes: 8,
@@ -446,7 +447,11 @@ mod spill_failures {
     fn returned_hint_survives_failure(kind: &str) {
         let directory = tempfile::tempdir().unwrap();
         let harness = SmartHarness::new(
-            agent_harness::Session::open(directory.path(), Default::default()).unwrap(),
+            agent_harness::Session::open(
+                directory.path(),
+                crate::test_guard::unbudgeted_session_config(),
+            )
+            .unwrap(),
             Arc::new(|_| panic!("no inference")),
             Default::default(),
         )
