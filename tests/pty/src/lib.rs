@@ -588,8 +588,26 @@ pub fn wait_for_bytes(
     needle: &str,
     timeout: std::time::Duration,
 ) -> bool {
+    wait_for_bytes_instrumented(buf, from, needle, timeout, || {})
+}
+
+/// [`wait_for_bytes`] with a per-iteration hook, for meta-tests of the poll
+/// loop itself rather than of a terminal. `on_poll` fires once per iteration,
+/// before the buffer is checked, so a test can (a) synchronize a writer to
+/// start only once polling has genuinely begun — closing the race where a
+/// snapshot-only implementation passes by luck — and (b) count iterations to
+/// prove a looping implementation ran rather than one that returns `false`
+/// immediately. Both are COUNT/EVENT proofs, never a stopwatch on `timeout`.
+pub fn wait_for_bytes_instrumented(
+    buf: &std::sync::Mutex<Vec<u8>>,
+    from: usize,
+    needle: &str,
+    timeout: std::time::Duration,
+    mut on_poll: impl FnMut(),
+) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
+        on_poll();
         let seen = {
             let buf = buf
                 .lock()

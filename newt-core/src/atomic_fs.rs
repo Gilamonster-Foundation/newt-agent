@@ -367,11 +367,36 @@ pub fn is_lock_contended(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains(CONTENDED))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times THIS thread's in-flight `acquire_lock` call has invoked
+    /// [`reclaim_lock_once`] — the count-based alternative to timing the call
+    /// (`killed_process_lock_is_reclaimed` asserts this instead of elapsed
+    /// time). Thread-local, not a global `static`: tests on other threads
+    /// never pollute it, no serialization needed beyond what `real_fs`
+    /// already requires for the filesystem itself.
+    static RECLAIM_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset [`RECLAIM_ATTEMPTS`] before a call under test.
+#[cfg(test)]
+fn reset_reclaim_attempts_for_test() {
+    RECLAIM_ATTEMPTS.with(|count| count.set(0));
+}
+
+/// How many reclaim attempts the most recent call made on this thread.
+#[cfg(test)]
+fn reclaim_attempts_for_test() -> usize {
+    RECLAIM_ATTEMPTS.with(std::cell::Cell::get)
+}
+
 /// Attempt one stale-generation takeover while holding a kernel advisory lock
 /// on a persistent recovery sidecar. Every reclaimer must hold this lease
 /// across both the liveness proof and unlink, so a second reclaimer cannot act
 /// on an observation from the previous generation.
 fn reclaim_lock_once(lock_path: &Path) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    RECLAIM_ATTEMPTS.with(|count| count.set(count.get() + 1));
     let Some(_lease) = try_reclaim_lease(lock_path)? else {
         return Ok(false);
     };
@@ -1257,11 +1282,28 @@ mod tests {
         child.kill().unwrap();
         let exit_status = child.wait().unwrap();
 
-        let started = std::time::Instant::now();
+        // No stopwatch: count reclaim attempts instead of timing the call.
+        // Owner-aware reclaim (a live PID check, no sleep) succeeds on the
+        // FIRST attempt; falling through to the legacy age path would need
+        // many — `reclaimable_lock` only returns `true` for an undecodable
+        // owner once the file is older than `LEGACY_LOCK_STALE` (30s), so
+        // `acquire_lock`'s retry loop (`LOCK_RETRIES` × `LOCK_RETRY_DELAY`)
+        // would sleep and recheck repeatedly rather than succeed at once. A
+        // wall-clock bound here is unreliable in EITHER direction: too tight
+        // and a loaded box's own scheduling delay (not a regression) trips it;
+        // too loose and, measured on this lane's box under load average 39,
+        // `LOCK_RETRY_DELAY`'s real sleeps stretched far enough that even a
+        // DELIBERATELY broken owner-aware path (mutated to also require the
+        // age threshold) happened to cross `LEGACY_LOCK_STALE` and reclaim
+        // anyway — see the measured red below. Attempt count has no such
+        // failure mode: it is unaffected by how long each attempt took.
+        reset_reclaim_attempts_for_test();
         let _guard = acquire_lock(&lock).expect("dead owner's lock is reclaimable");
-        assert!(
-            started.elapsed() < LEGACY_LOCK_STALE,
-            "owner-aware recovery must not wait for the legacy age threshold"
+        assert_eq!(
+            reclaim_attempts_for_test(),
+            1,
+            "owner-aware recovery must reclaim on its first attempt, not fall \
+             through to the legacy age-based retry loop"
         );
         // Keep `Child` (and therefore its Windows process handle) alive through
         // reclamation. An exited Windows process remains openable while this

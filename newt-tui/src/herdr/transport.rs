@@ -73,6 +73,12 @@ mod unix {
         /// before starting another, so hung connects cannot pile up.
         pending: Option<Receiver<std::io::Result<std::os::unix::net::UnixStream>>>,
         next_id: u64,
+        /// How long [`Self::reconnect`] waits before abandoning an attempt.
+        /// Always [`CONNECT_WAIT`] in production; a test shrinks it via
+        /// [`Self::with_wait`] so the hung-connect proof is an injected,
+        /// near-instant wait rather than a real-time stopwatch on the
+        /// production constant.
+        connect_wait: std::time::Duration,
     }
 
     impl SocketSink {
@@ -87,7 +93,16 @@ mod unix {
                 conn: None,
                 pending: None,
                 next_id: 0,
+                connect_wait: CONNECT_WAIT,
             }
+        }
+
+        /// Override the connect wait. Test-only: production always uses
+        /// [`CONNECT_WAIT`].
+        #[cfg(test)]
+        pub(super) fn with_wait(mut self, wait: std::time::Duration) -> Self {
+            self.connect_wait = wait;
+            self
         }
 
         /// A live connection, or `None` — never a wait longer than
@@ -130,7 +145,7 @@ mod unix {
             {
                 return;
             }
-            match rx.recv_timeout(CONNECT_WAIT) {
+            match rx.recv_timeout(self.connect_wait) {
                 Ok(Ok(stream)) => self.conn = Some(stream),
                 Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {}
                 // Hung or merely slow: abandon the wait, keep the receiver.
@@ -569,20 +584,17 @@ mod tests {
             peer_sink.lock().unwrap().push(far);
             Ok(near)
         });
-        let mut sink = SocketSink::with_connector(path, connect);
+        // The connect wait is injected to near-zero: production's own
+        // CONNECT_WAIT is a real timer firing on a real `recv_timeout`, and a
+        // test asserting on how long that took (even a lower bound — load can
+        // only lengthen it) is still a wall-clock stopwatch. Shrinking the
+        // wait removes the need to measure it at all; the structural proof —
+        // one attempt stays outstanding no matter how many calls follow — is
+        // `attempts == 1` below, not timing.
+        let mut sink =
+            SocketSink::with_connector(path, connect).with_wait(Duration::from_millis(1));
 
-        // The first attempt really waits out CONNECT_WAIT (the production
-        // timer firing is the behaviour; load can only lengthen it). The former
-        // upper bounds (`< CONNECT_WAIT * 10`, `< CONNECT_WAIT * 12` across the
-        // five follow-ups) were stopwatches on a loaded box; the structural
-        // proof that later calls do not each pay the wait is `attempts == 1`.
-        let t0 = Instant::now();
         assert!(!sink.deliver(&working()));
-        let first = t0.elapsed();
-        assert!(
-            first >= CONNECT_WAIT,
-            "the first attempt waits out CONNECT_WAIT: {first:?}"
-        );
         for _ in 0..5 {
             assert!(!sink.deliver(&working()));
         }

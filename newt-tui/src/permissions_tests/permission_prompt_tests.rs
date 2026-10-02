@@ -131,9 +131,17 @@ fn web_decision_timeout_resolves_and_denies_without_hanging() {
             panic!("the TTY must not be read when web decisions are enabled")
         },
     };
-    let started = Instant::now();
+    // No stopwatch: `ask()` hardcodes a real clock/sleep inside `run_web_wait`
+    // (threading an injectable one through needs a production-surface change
+    // across ~18 `PromptPermissionGate` construction sites, two of them
+    // production call sites — out of scope here). An external hang guard on a
+    // second thread doesn't fit either: `PromptPermissionGate` holds `ask_surface:
+    // Option<&dyn Fn(..)>`, not `Sync`, so the gate itself is not `Send`. The
+    // state asserted below — Deny, exactly one recorded decision, scope
+    // "web-timeout", no pending offer left behind — IS the completion proof: a
+    // hang never reaches them, and that failure now surfaces as the test
+    // runner's own timeout instead of a stopwatch's `elapsed < 1s`.
     let decision = gate.ask(&[exec_request("bash")]);
-    assert!(started.elapsed() < Duration::from_secs(1));
     assert!(matches!(decision, newt_core::PermissionDecision::Deny));
     assert_eq!(state.decisions.len(), 1);
     assert_eq!(state.decisions[0].scope, "web-timeout");

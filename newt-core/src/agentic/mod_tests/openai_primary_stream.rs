@@ -1,7 +1,7 @@
 //! Primary streaming dispatch, distinct from the final display reissue.
 use super::*;
 use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
-use crate::test_guard::hang_guarded;
+use crate::test_guard::{hang_guarded, HANG_GUARD};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -536,6 +536,28 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
     assert_eq!(request["stream"], true);
 
     tokio::time::pause();
+    // An independent REAL-clock watchdog for the loop below. `hang_guarded`
+    // (a `tokio::time::timeout`) measures against THIS runtime's clock, which
+    // is paused and only advances via `advance()` or when the runtime goes
+    // idle — and the loop below stays runnable on purpose (`yield_now`), to
+    // stop paused time auto-advancing while the real socket catches up. A
+    // stalled reader or a `consumed` mismatch would therefore spin forever
+    // without ever tripping a paused-clock timeout. A plain OS thread sleeping
+    // the REAL `HANG_GUARD` is immune to the pause and can still catch a
+    // genuine hang; the loop polls the flag it sets, same shape as
+    // `hang_guarded`, just driven by a real clock instead of a paused one.
+    let watchdog_fired = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    {
+        let fired = Arc::clone(&watchdog_fired);
+        let done = Arc::clone(&watchdog_done);
+        std::thread::spawn(move || {
+            std::thread::sleep(HANG_GUARD);
+            if !done.load(Ordering::SeqCst) {
+                fired.store(true, Ordering::SeqCst);
+            }
+        });
+    }
     let mut expected = 0;
     let mut completed = None;
     for (index, frame) in FRAMES.iter().enumerate() {
@@ -549,6 +571,12 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
         // time again. Yield stays runnable, preventing paused-time auto-advance
         // while the real socket's readiness notification catches up.
         while consumed.load(Ordering::SeqCst) < expected || index == FRAMES.len() - 1 {
+            assert!(
+                !watchdog_fired.load(Ordering::SeqCst),
+                "hung: the progress loop produced no result within the {}s \
+                 real-clock hang guard",
+                HANG_GUARD.as_secs()
+            );
             tokio::select! {
                 biased;
                 result = &mut completion => {
@@ -562,6 +590,7 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
         }
         assert_eq!(consumed.load(Ordering::SeqCst), expected);
     }
+    watchdog_done.store(true, Ordering::SeqCst);
     tokio::time::resume();
     let result = completed.expect("the progressing generation must finish");
     let (text, streamed, _, _) = result.expect("progress must reset the idle timeout");

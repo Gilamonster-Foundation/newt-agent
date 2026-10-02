@@ -393,28 +393,45 @@ mod wait_for_after_tests {
 
     /// The race this exists to close: the needle is not there yet, but a
     /// concurrent writer appends it shortly after the wait begins. A
-    /// snapshot-only check (no poll) would have missed this.
+    /// snapshot-only check (no poll) would have missed this — but ONLY if the
+    /// writer is actually made to wait for polling to begin. The former
+    /// unsynchronized writer could (and under a fast box, would) append before
+    /// `wait_for_bytes` ever checked the buffer, so a snapshot-only
+    /// implementation could pass by racing the writer, having proven nothing
+    /// about the poll loop. An "entered poll" handshake closes that: the
+    /// writer blocks until the loop has made its first pass, guaranteeing the
+    /// needle is observed on a LATER iteration, never the first.
     #[test]
     fn observes_a_needle_appended_after_the_wait_begins() {
         let buf = Arc::new(Mutex::new(b"before ".to_vec()));
-        // The writer appends from its own thread with no pacing sleep: whether
-        // the append lands before or after the wait begins, the poll loop must
-        // observe it. The former 30 ms sleep plus a 1 s bound was a bet on
-        // thread scheduling that a loaded box loses; the bound is now the
-        // shared hang guard.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         let writer = std::thread::spawn({
             let buf = Arc::clone(&buf);
             move || {
+                newt_core::test_guard::recv_guarded(
+                    &entered_rx,
+                    "wait_for_bytes entering its poll loop",
+                );
                 buf.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(b"SHOWN after");
             }
         });
-        assert!(wait_for_after(
+        let mut signaled = false;
+        assert!(tests_pty::wait_for_bytes_instrumented(
             &buf,
             7,
             "SHOWN",
-            newt_core::test_guard::HANG_GUARD
+            newt_core::test_guard::HANG_GUARD,
+            move || {
+                // Only the first pass is the "entered" event; later sends
+                // would hit a receiver the writer already consumed and stopped
+                // listening on.
+                if !signaled {
+                    signaled = true;
+                    let _ = entered_tx.send(());
+                }
+            },
         ));
         writer.join().expect("writer thread");
     }
@@ -423,14 +440,27 @@ mod wait_for_after_tests {
     /// hanging — the timeout is a real bound, not decoration.
     #[test]
     fn times_out_and_returns_false_when_the_needle_never_arrives() {
-        // The `false` return is the proof that the timeout path ran; measuring
-        // the elapsed time on top of it kept a stopwatch in the unit tier.
+        // `false` alone is not the proof: an implementation that always
+        // returns `false` on its FIRST check (never actually polling across
+        // the deadline) would also pass. Count iterations instead of timing
+        // them — more than one pass is the event-free, count-based proof that
+        // the loop genuinely ran out the deadline rather than bailing early.
         let buf = Mutex::new(b"before after".to_vec());
-        assert!(!wait_for_after(
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let seen = tests_pty::wait_for_bytes_instrumented(
             &buf,
             7,
             "SHOWN",
-            Duration::from_millis(100)
-        ));
+            Duration::from_millis(100),
+            || {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        assert!(!seen, "a needle that never arrives must return false");
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "must actually poll more than once before giving up, not return \
+             false on the first check"
+        );
     }
 }

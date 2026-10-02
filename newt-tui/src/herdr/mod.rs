@@ -630,6 +630,9 @@ mod tests {
     struct FakeSink {
         calls: Arc<Mutex<Vec<Call>>>,
         gate: Option<Arc<Mutex<()>>>,
+        /// Set the instant `deliver` is about to block on `gate`: the event a
+        /// test awaits instead of sleeping and hoping the worker got there.
+        entered_gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
         fail_first: Arc<AtomicUsize>,
         panics: bool,
     }
@@ -639,6 +642,7 @@ mod tests {
             Self {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 gate: None,
+                entered_gate: None,
                 fail_first: Arc::new(AtomicUsize::new(0)),
                 panics: false,
             }
@@ -647,8 +651,23 @@ mod tests {
         fn gated(gate: &Arc<Mutex<()>>) -> Self {
             Self {
                 gate: Some(Arc::clone(gate)),
+                entered_gate: Some(Arc::new((Mutex::new(false), std::sync::Condvar::new()))),
                 ..Self::new()
             }
+        }
+
+        /// Block until the worker thread is inside `deliver`, about to take
+        /// the gate. Only meaningful after [`Self::gated`].
+        fn wait_entered_gate(&self) {
+            let entered = self
+                .entered_gate
+                .as_ref()
+                .expect("wait_entered_gate requires FakeSink::gated");
+            let (lock, cv) = &**entered;
+            let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let _guard = cv
+                .wait_while(guard, |entered| !*entered)
+                .unwrap_or_else(PoisonError::into_inner);
         }
 
         fn failing(n: usize) -> Self {
@@ -721,6 +740,11 @@ mod tests {
                 panic!("sink exploded");
             }
             if let Some(gate) = &self.gate {
+                if let Some(entered) = &self.entered_gate {
+                    let (lock, cv) = &**entered;
+                    *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                    cv.notify_all();
+                }
                 let _held = gate.lock().unwrap_or_else(PoisonError::into_inner);
             }
             self.calls.lock().unwrap().push(call.clone());
@@ -1010,9 +1034,10 @@ mod tests {
         let sink = FakeSink::gated(&gate);
         let (adapter, mut reporter) = harness(sink.clone());
 
-        // Let the worker enter `deliver` and block there.
+        // Wait for the worker to actually be inside `deliver`, blocked on the
+        // gate (the event), instead of sleeping and hoping it got there.
         adapter.on_bare(None, LifecycleEvent::TurnStarted);
-        std::thread::sleep(Duration::from_millis(20));
+        sink.wait_entered_gate();
 
         const FLOOD: usize = 20_000;
         for i in 0..FLOOD {
@@ -1126,15 +1151,17 @@ mod tests {
     fn teardown_is_prompt_even_when_herdr_is_stuck() {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
-        let (adapter, mut reporter) = harness(FakeSink::gated(&gate));
+        let sink = FakeSink::gated(&gate);
+        let (adapter, mut reporter) = harness(sink.clone());
         adapter.on_bare(None, LifecycleEvent::TurnStarted);
-        std::thread::sleep(Duration::from_millis(20));
+        // The worker being inside `deliver`, blocked on the gate, is the event
+        // "Herdr is stuck" describes; waiting for it (rather than sleeping and
+        // hoping) is what makes `shutdown()` below a proof against a genuinely
+        // stuck worker, not an idle one.
+        sink.wait_entered_gate();
         // No stopwatch: a shutdown that joined the stuck worker would never
-        // return (the gate is released only below), so returning is the proof.
-        // `< SHUTDOWN_GRACE * 4` measured a production grace loop on a loaded
-        // box. (The 20 ms sleep above is a "let the worker reach the gate" bet
-        // that needs an entered-deliver signal from FakeSink; it can only make
-        // the test vacuous, never red, so it stays for now.)
+        // return (the gate is released only below), so returning at all is the
+        // proof; production's own SHUTDOWN_GRACE loop is what bounds it.
         reporter.shutdown();
         drop(held);
     }
