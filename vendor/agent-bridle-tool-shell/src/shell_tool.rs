@@ -39,7 +39,7 @@ use agent_bridle_core::{
     is_unbridled, unenforceable_axis, AdmissionDecision, AdmittedFence, BackendProjection, Caveats,
     ConfinedAxis, ConfinementMechanism, Denial, DenialKind, Disclosure, EnforcementReport,
     Invocation, LimitsPolicy, ResolvedScope, RuntimeClosure, SandboxKind, SandboxPolicy, Scope,
-    Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
+    StdioPosture, Tool, ToolContext, ToolEnvelope, ToolError, ToolResult,
 };
 use async_trait::async_trait;
 
@@ -852,7 +852,17 @@ impl Tool for ShellTool {
             // a restricted grant is refused here instead of spawning fail-open.
             if self.spawner.requires_backend_admission() {
                 let sandbox = best_available_sandbox(&self.sandbox);
-                let mut resolved = sandbox.resolved_authority(&backend_caveats);
+                // `Unaudited`: this route builds each pipeline stage's stdio with
+                // raw `std::process::Stdio` (file redirects, OS pipes between
+                // stages), never `agent_bridle_core::ConfinedStdio` — so it is
+                // never the "only production caller with actual, per-channel
+                // knowledge of what it configured" `StdioPosture::Audited` requires
+                // (report.rs's `ConfinementMechanism::with_stdio_posture` doc
+                // comment; `ConfinedCommand::spawn` is that caller, this is not).
+                // Passing anything else here would assert a per-channel audit this
+                // builder genuinely cannot vouch for (agent-bridle#416 round 3).
+                let mut resolved =
+                    sandbox.resolved_authority(&backend_caveats, StdioPosture::Unaudited);
                 // AppContainer cannot express a non-empty exec allowlist in its
                 // native policy, but this route has already atomically checked
                 // every pipeline stage through the ShellTool exec interceptor.

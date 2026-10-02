@@ -97,11 +97,12 @@ fn unix_socket_grants_stay_advisory_on_every_backend_including_seatbelt() {
 mod seatbelt {
     use super::*;
     use agent_bridle_core::{
-        ConfinedCommand, Gate, Sandbox, SeatbeltSandbox, Tool, ToolContext, ToolResult,
+        ConfinedCommand, ConfinedStdio, Gate, Sandbox, SeatbeltSandbox, Tool, ToolContext,
+        ToolResult,
     };
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, ExitStatus, Stdio};
+    use std::process::{Child, ExitStatus};
     use std::time::Duration;
 
     struct Endpoints {
@@ -212,6 +213,10 @@ mod seatbelt {
     }
 
     fn probe_command(mode: &str, path: &Path, expected: &str) -> ConfinedCommand {
+        // Named `ConfinedStdio` variants, not a bare `Stdio::piped()` — a
+        // `unix:`-grant spawn needs the audited shape to admit at L3 since
+        // agent-bridle#416 round 3 (an unnamed `Stdio` conversion is
+        // conservatively `Other`/unaudited regardless of what it is).
         ConfinedCommand::new(std::env::current_exe().unwrap().to_str().unwrap())
             .args([
                 "--exact",
@@ -222,8 +227,9 @@ mod seatbelt {
             .env("BRIDLE_SOCKET_PROBE", mode)
             .env("BRIDLE_SOCKET_PATH", path)
             .env("BRIDLE_SOCKET_EXPECT", expected)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdin(ConfinedStdio::Null)
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
     }
 
     fn wait_for_probe(child: &mut Child, timeout: Duration) -> std::io::Result<ExitStatus> {

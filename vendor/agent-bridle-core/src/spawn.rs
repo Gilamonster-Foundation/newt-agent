@@ -716,7 +716,7 @@ impl ConfinedCommand {
                 mechanism,
                 cx.strength_floor(),
                 |caveats| BackendProjection {
-                    resolved: sandbox.resolved_authority(caveats),
+                    resolved: sandbox.resolved_authority(caveats, stdio_posture),
                     runtime_closure: sandbox.runtime_closure(caveats),
                 },
             )
@@ -746,7 +746,9 @@ impl ConfinedCommand {
                         let mut resolved = crate::ResolvedAuthority::from_delegated(&effective);
                         resolved.fs_read =
                             crate::ResolvedScope::from_scope(&mechanism_caveats.fs_read);
-                        resolved.net = sandbox.resolved_authority(mechanism_caveats).net;
+                        resolved.net = sandbox
+                            .resolved_authority(mechanism_caveats, stdio_posture)
+                            .net;
                         return BackendProjection {
                             resolved,
                             runtime_closure: crate::ResolvedAuthority {
@@ -771,7 +773,7 @@ impl ConfinedCommand {
                     // fails closed until the io_uring egress floor lands (PR-1). No
                     // caveats-grain net override: `resolved` is the honest projection.
                     BackendProjection {
-                        resolved: sandbox.resolved_authority(mechanism_caveats),
+                        resolved: sandbox.resolved_authority(mechanism_caveats, stdio_posture),
                         runtime_closure: sandbox.runtime_closure(mechanism_caveats),
                     }
                 },
@@ -875,7 +877,7 @@ impl ConfinedCommand {
                     &apply_policy.resolve_named_root_protected_roots()?,
                     mechanism,
                     BackendProjection {
-                        resolved: sandbox.resolved_authority(&mechanism_effective),
+                        resolved: sandbox.resolved_authority(&mechanism_effective, stdio_posture),
                         runtime_closure: sandbox.runtime_closure(&mechanism_effective),
                     },
                 )?;
@@ -2791,20 +2793,83 @@ mod seatbelt_child_tests {
         addr
     }
 
-    /// agent-bridle#405 / ADR 0015 amendment E6 — the CI kernel proof the
-    /// promotion exists to back: with the deputy audit `Complete`, a `net:
-    /// none`, zero-`mach:`-grant scope now ADMITS through the real production
-    /// path (`Gate::authorize` + `ConfinedCommand::spawn`, the exact seam
-    /// `restricted_net_authority_is_denied_before_spawn` used to pin the
-    /// OPPOSITE of — `resolved.net` is now the bottom element `∅`, trivially a
-    /// subset of any delegated grant, where it used to be `Unknown`). The real
-    /// kernel still blocks the child's own egress: an unconfined positive
-    /// control proves the probe reaches an owned loopback listener (curl exit
-    /// 0); the SAME request through the confined spawn must not (curl exit 7,
-    /// the exact "couldn't connect" code — not a timeout, not a
-    /// malformed-profile exit 65).
+    /// agent-bridle#416 round 3 (fix-first review): a `net:none` spawn whose
+    /// stdio was never declared — `ConfinedCommand`'s `stdin`/`stdout`/
+    /// `stderr` default to `None`, which `ConfinedCommand::spawn` turns into
+    /// `std::process::Command`'s own inherited-stdio default — is exactly the
+    /// shape ADR 0015 amendment E6's audit never measured (a connected
+    /// endpoint could already live on an inherited descriptor, invisible to
+    /// Seatbelt's socket rules). It must refuse admission under the DEFAULT
+    /// floor, not resolve a named `Bounded(∅)` on `MACH_DEPUTY_AUDIT` alone —
+    /// the regression this round's L3 fix (`SeatbeltSandbox::resolved_authority`
+    /// now takes the spawn's `StdioPosture`) closes. This is the test that, by
+    /// construction, exercises the production default every caller gets
+    /// unless it explicitly asks for `ConfinedStdio::Piped`/`Null` (see the
+    /// positive control below).
     #[test]
-    fn net_none_now_admits_and_the_kernel_still_blocks_egress() {
+    fn net_none_with_default_stdio_refuses_admission() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        let cx = ctx(Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        });
+        // No .stdin()/.stdout()/.stderr() calls at all — the production
+        // default every caller gets who doesn't explicitly ask for the
+        // audited shape.
+        let res = ConfinedCommand::new("/usr/bin/true").spawn(&cx);
+        assert!(
+            matches!(res, Err(ToolError::Denied { .. })),
+            "net:none with default (inherited, unaudited) stdio must refuse before spawn, got {res:?}"
+        );
+    }
+
+    /// The sibling of the above for an EXPLICIT, non-audited `Stdio`: a
+    /// caller that converts a raw [`std::process::Stdio`] in (even one that is
+    /// itself a freshly-made pipe) gets [`ConfinedStdio::Other`], not credit
+    /// for [`ConfinedStdio::Piped`] — "a caller that wants Piped/Null credit
+    /// must say so by name, not by what the `Stdio` happens to contain" (the
+    /// type's own doc comment). Proves the gate keys on the NAMED variant, not
+    /// on what the underlying descriptor would look like if inspected.
+    #[test]
+    fn net_none_with_other_stdio_refuses_admission() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        let cx = ctx(Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        });
+        let res = ConfinedCommand::new("/usr/bin/true")
+            // A raw `Stdio::piped()` converts in as `Other`, same as the ADR's
+            // inherited/redirected-file cases — never `Piped` by inspection.
+            .stdin(std::process::Stdio::piped())
+            .stdout(ConfinedStdio::Null)
+            .stderr(ConfinedStdio::Null)
+            .spawn(&cx);
+        assert!(
+            matches!(res, Err(ToolError::Denied { .. })),
+            "an `Other` stdio channel must refuse net:none admission even though two of three channels are audited, got {res:?}"
+        );
+    }
+
+    /// agent-bridle#405 / ADR 0015 amendment E6 — the CI kernel proof the
+    /// promotion exists to back, now gated on the audited shape this round
+    /// added: with the deputy audit `Complete`, an unprivileged caller, AND
+    /// every one of stdin/stdout/stderr declared `Piped`/`Null` BY NAME, a
+    /// `net: none`, zero-`mach:`-grant scope ADMITS through the real
+    /// production path (`Gate::authorize` + `ConfinedCommand::spawn`;
+    /// `resolved.net` is the bottom element `∅`, trivially a subset of any
+    /// delegated grant). The real kernel still blocks the child's own egress:
+    /// an unconfined positive control proves the probe reaches an owned
+    /// loopback listener (curl exit 0); the SAME request through the confined
+    /// spawn must not (curl exit 7, the exact "couldn't connect" code — not a
+    /// timeout, not a malformed-profile exit 65).
+    #[test]
+    fn net_none_with_audited_stdio_admits_and_the_kernel_still_blocks_egress() {
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
@@ -2816,11 +2881,15 @@ mod seatbelt_child_tests {
             ..Caveats::top()
         });
 
-        // The benign leg: admission no longer refuses net:none before spawn.
+        // The benign leg: admission no longer refuses net:none before spawn,
+        // once the spawn declares the audited stdio shape BY NAME.
         let mut touch = ConfinedCommand::new("/usr/bin/touch")
             .arg(&marker)
+            .stdin(ConfinedStdio::Null)
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
             .spawn(&cx)
-            .expect("net:none with zero mach: grants must now be admitted");
+            .expect("net:none with zero mach: grants and audited stdio must now be admitted");
         assert!(touch.child.wait().expect("wait").success());
         assert!(
             marker.exists(),
@@ -2845,6 +2914,9 @@ mod seatbelt_child_tests {
         let url2 = format!("http://{addr2}/");
         let mut curl = ConfinedCommand::new("/usr/bin/curl")
             .args(["-sS", "--max-time", "5", &url2])
+            .stdin(ConfinedStdio::Null)
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
             .spawn(&cx)
             .expect("spawn");
         assert_eq!(
