@@ -32,7 +32,7 @@
 //! this occupying a reactor worker.
 
 use std::io::{ErrorKind, Read, Write};
-use std::process::{Child, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -160,9 +160,15 @@ impl LocalExecutionBackend {
     ) -> ToolResult<ManagedSpawn> {
         let mut cmd = ConfinedCommand::new(request.executable.clone())
             .args(request.argv.iter())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // `ConfinedStdio::Piped` (not a bare `Stdio::piped()`) so this
+            // spawn can honestly claim the audited stdio shape ADR 0015
+            // amendment E6 requires for the Seatbelt net:none Kernel witness
+            // (agent-bridle#416 round-2 review, item 1) — this is the path
+            // `run_command` uses, which does require Kernel net under
+            // `AgentInfluenced` + `NetGrant::DenyAll`.
+            .stdin(crate::ConfinedStdio::Piped)
+            .stdout(crate::ConfinedStdio::Piped)
+            .stderr(crate::ConfinedStdio::Piped)
             // Bounded tree ownership: the child leads its own process group, so
             // a tree-wide signal can reach its descendants and *only* its
             // descendants.

@@ -402,6 +402,54 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
     serde_json::from_slice(body).map_err(|error| format!("invalid trusted-worker request: {error}"))
 }
 
+/// A child's stdio stream, named by WHICH descriptor produces it rather than
+/// an already-constructed [`Stdio`] whose actual shape would otherwise have
+/// to be taken on trust (agent-bridle#416 round-2 review, item 1: ADR 0015
+/// amendment E6 claimed the spawn mechanism "supplies only pipe/null stdio",
+/// but the builder defaulted to inherited stdio and accepted an arbitrary
+/// `Stdio`). [`Self::Piped`] and [`Self::Null`] are exactly the shape that
+/// audit covers — a descriptor this process just minted, which cannot already
+/// be a connected endpoint. [`Self::Other`] is everything else (inherited, a
+/// redirected file, an existing fd) and is a legitimate, supported shape (shell
+/// redirects, a trusted-worker control channel) — it just does not qualify a
+/// Seatbelt `net:none` spawn for the Kernel witness; see
+/// [`ConfinementMechanism::with_stdio_posture`].
+#[derive(Debug)]
+pub enum ConfinedStdio {
+    /// `Stdio::piped()` — a pipe this process owns the opposite end of.
+    Piped,
+    /// `Stdio::null()` — `/dev/null`.
+    Null,
+    /// Any other descriptor: inherited, a redirected file, a raw or dup'd fd.
+    Other(Stdio),
+}
+
+impl ConfinedStdio {
+    fn into_stdio(self) -> Stdio {
+        match self {
+            Self::Piped => Stdio::piped(),
+            Self::Null => Stdio::null(),
+            Self::Other(stdio) => stdio,
+        }
+    }
+
+    /// `true` for exactly [`Self::Piped`]/[`Self::Null`] — the shape ADR 0015
+    /// amendment E6's Seatbelt audit covers.
+    fn is_audited(&self) -> bool {
+        matches!(self, Self::Piped | Self::Null)
+    }
+}
+
+/// Any already-constructed [`Stdio`] converts in as [`ConfinedStdio::Other`] —
+/// deliberately conservative: a value built outside this type has no attached
+/// provenance, so a caller that wants [`ConfinedStdio::Piped`]/[`Null`] credit
+/// must say so by name, not by what the `Stdio` happens to contain.
+impl From<Stdio> for ConfinedStdio {
+    fn from(stdio: Stdio) -> Self {
+        Self::Other(stdio)
+    }
+}
+
 /// Builder for a subprocess confined by a [`ToolContext`].
 ///
 /// Like [`std::process::Command`], but: the environment starts **empty** (only
@@ -437,9 +485,9 @@ pub struct ConfinedCommand {
     args: Vec<OsString>,
     envs: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
-    stdin: Option<Stdio>,
-    stdout: Option<Stdio>,
-    stderr: Option<Stdio>,
+    stdin: Option<ConfinedStdio>,
+    stdout: Option<ConfinedStdio>,
+    stderr: Option<ConfinedStdio>,
     /// Put the child in a fresh process group so a supervising caller can
     /// terminate the complete descendant tree at a timeout boundary.
     new_process_group: bool,
@@ -518,24 +566,26 @@ impl ConfinedCommand {
         self
     }
 
-    /// Configure the child's stdin (e.g. [`Stdio::piped`] for an MCP server).
+    /// Configure the child's stdin (e.g. [`ConfinedStdio::Piped`] for an MCP
+    /// server). A plain [`Stdio`] also converts in, as [`ConfinedStdio::Other`]
+    /// (agent-bridle#416 round-2 review, item 1).
     #[must_use]
-    pub fn stdin(mut self, cfg: Stdio) -> Self {
-        self.stdin = Some(cfg);
+    pub fn stdin(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stdin = Some(cfg.into());
         self
     }
 
     /// Configure the child's stdout.
     #[must_use]
-    pub fn stdout(mut self, cfg: Stdio) -> Self {
-        self.stdout = Some(cfg);
+    pub fn stdout(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stdout = Some(cfg.into());
         self
     }
 
     /// Configure the child's stderr.
     #[must_use]
-    pub fn stderr(mut self, cfg: Stdio) -> Self {
-        self.stderr = Some(cfg);
+    pub fn stderr(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stderr = Some(cfg.into());
         self
     }
 
@@ -613,6 +663,20 @@ impl ConfinedCommand {
         // installs the seccomp `DenyDirect` leg at apply time. So the net witness
         // (Landlock `net:none` = Kernel only under `DenyDirect`) cannot diverge
         // from the mechanism actually applied to the spawn.
+        // The stdio shape ADR 0015 amendment E6's Seatbelt audit assumed —
+        // every one of stdin/stdout/stderr a pipe or `/dev/null` — checked
+        // against what THIS spawn actually configured, not assumed
+        // (agent-bridle#416 round-2 review, item 1). Unset defaults to the
+        // same inherited-stdio behavior `std::process::Command` always had,
+        // which is NOT the audited shape.
+        let stdio_audited = [&self.stdin, &self.stdout, &self.stderr]
+            .into_iter()
+            .all(|cfg| cfg.as_ref().is_some_and(ConfinedStdio::is_audited));
+        let stdio_posture = if stdio_audited {
+            crate::StdioPosture::Audited
+        } else {
+            crate::StdioPosture::Unaudited
+        };
         let mechanism = match sandbox.exec_boundary() {
             crate::ExecBoundary::ProcessTree => {
                 ConfinementMechanism::new(reported_kind, self.sandbox_policy.child_network)
@@ -621,7 +685,8 @@ impl ConfinedCommand {
                 reported_kind,
                 self.sandbox_policy.child_network,
             ),
-        };
+        }
+        .with_stdio_posture(stdio_posture);
 
         // (2) The declared runtime closure — the ONLY door for authority beyond
         // the delegated grant. A fixed worker executable is an internal
@@ -776,13 +841,13 @@ impl ConfinedCommand {
                 cmd.current_dir(dir);
             }
             if let Some(cfg) = stdin {
-                cmd.stdin(cfg);
+                cmd.stdin(cfg.into_stdio());
             }
             if let Some(cfg) = stdout {
-                cmd.stdout(cfg);
+                cmd.stdout(cfg.into_stdio());
             }
             if let Some(cfg) = stderr {
-                cmd.stderr(cfg);
+                cmd.stderr(cfg.into_stdio());
             }
             #[cfg(unix)]
             if new_process_group {

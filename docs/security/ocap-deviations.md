@@ -236,10 +236,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   any caveat carrying a real host grant — NOTHING CHANGED**: no Mach floor is installed at all
   (`seatbelt_profile_with`'s net branch only touches mach-lookup for the direct-denied family), so
   Mach service lookup stays fully AMBIENT there, same as before this backport.
-- **Residual:** 🟡 NARROWED (macOS, deny-all/`unix:`/`mach:`-only net) — closed by the zero floor,
-  backed by agent-bridle's native evidence. 🟠 STILL REACHABLE (macOS, loopback or host-granted net)
-  — bounded in practice by what ambient XPC services exist on the host, not by any Newt-enforced
-  kernel rule; unchanged.
+- **Residual:** 🟡 NARROWED (macOS, deny-all/`unix:`/`mach:`-only net) — ungranted named Mach/XPC
+  lookups are closed by the zero floor, backed by agent-bridle's native evidence; an
+  operator-granted `mach:<service>` class remains reachable by design (reported L4 Advisory, not a
+  Kernel-closed claim — agent-bridle#416 round-2 review). 🟠 STILL REACHABLE (macOS, loopback or
+  host-granted net) — bounded in practice by what ambient XPC services exist on the host, not by any
+  Newt-enforced kernel rule; unchanged.
 - **Disabled while open:** nothing — a Seatbelt confinement LIMITATION on the loopback/host-granted
   `run_command` / build_check / crew paths, not a gated capability (no fail-closed toggle; the child
   runs with the incomplete confinement for those shapes). The deny-all shape used by
@@ -258,9 +260,13 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   for the `net: none` shape `workspace_confined_caveats` renders — so a future change that removes
   the floor, or that starts ambiently re-allowing a service, trips the test and forces this entry to
   be re-derived.
-- **Status:** NARROWED (macOS, deny-all/`unix:`/`mach:`-only net is now DENIED, not reachable);
-  OPEN (macOS, loopback/host-granted net, unaffected); Linux and Windows builds are unaffected (no
-  Mach). Originally discovered by #1632; narrowed by #2673. owner: — · review-by: #1599 / epic #749.
+- **Status:** OPEN — macOS: ungranted named Mach/XPC lookups denied for deny-all/`unix:`/`mach:`-only
+  net; an explicitly granted deputy class remains reachable, reported L4 Advisory, not Kernel-closed
+  (agent-bridle#416 round-2 review corrected the earlier "DENIED, not reachable" framing of the whole
+  `unix:`/`mach:` family — a granted class was always reachable by design). Loopback/host-granted net
+  unaffected: no Mach floor installed at all. Linux and Windows builds are unaffected (no Mach).
+  Originally discovered by #1632; narrowed by #2673; reworded by agent-bridle#416 round 2. owner: —
+  · review-by: #1599 / epic #749.
 
 ### windows-inheritable-handle-leak
 - **Invariant (ideal):** an attacker-exec child receives only explicitly granted capabilities; arbitrary

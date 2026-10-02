@@ -428,9 +428,15 @@ impl ConstrainedExecutor {
             // descendant tree (the executor's own cancellation is a follow-up;
             // the group is set up now so it is available without a re-spawn).
             .new_process_group()
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            // `ConfinedStdio::Null`/`Piped` (not a bare `Stdio`) so this
+            // `AgentInfluenced`/`Kernel`-floor spawn can honestly claim the
+            // audited stdio shape ADR 0015 amendment E6 requires for the
+            // Seatbelt net:none Kernel witness (agent-bridle#416 round-2
+            // review, item 1) — this is the exact route
+            // `seatbelt_net_deny_all_runs_kernel_denied` exercises.
+            .stdin(agent_bridle::ConfinedStdio::Null)
+            .stdout(agent_bridle::ConfinedStdio::Piped)
+            .stderr(agent_bridle::ConfinedStdio::Piped);
         // The child's ENTIRE environment: the explicit grants and nothing else
         // (ConfinedCommand starts env-empty). No inherited credentials/switches.
         for (k, v) in &req.env {

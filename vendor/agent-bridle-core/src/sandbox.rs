@@ -313,19 +313,48 @@ pub(crate) fn seatbelt_mach_deputy_audit_complete() -> bool {
     }
 }
 
+/// `true` when this process is NOT running as root (effective UID ≠ 0). ADR
+/// 0015 amendment E6's probes all ran unprivileged (agent-bridle#416 round-2
+/// review, item 2): a root-owned bridle process can reach kernel controls
+/// (privileged IOKit classes, sysctl write paths, privileged Mach services)
+/// the probes never exercised, so the Kernel net witness must not extend to
+/// it. Mirrors [`seatbelt_mach_deputy_audit_complete`]'s cfg-crossing shape:
+/// unconditionally `true` off a Seatbelt-capable build, since nothing there
+/// depends on it (`seatbelt_net_kernel_witness`'s `audit_complete` term is
+/// already `false` there).
+#[must_use]
+pub(crate) fn seatbelt_caller_is_unprivileged() -> bool {
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    {
+        !seatbelt_impl::caller_is_root()
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-seatbelt")))]
+    {
+        true
+    }
+}
+
 /// `true` when a Seatbelt `net` scope is a **Kernel** egress-deny witness: the
 /// deny-all shape (`net_fully_denied`, which already implies zero `mach:`/
-/// `unix:` grants — they are entries in the same non-empty scope set) AND a
-/// complete Mach-lookup deputy audit (agent-bridle#405/ADR 0015 E6). Pure —
-/// takes `audit_complete` as a parameter rather than reading
-/// [`seatbelt_mach_deputy_audit_complete`] itself, so `report.rs`'s test suite
-/// can pin this pure predicate directly, independent of whichever state the
-/// production constant ships (`Complete` as of agent-bridle#405/ADR 0015
-/// amendment E6, 2026-10-01; see [`seatbelt_impl::MACH_DEPUTY_AUDIT`]'s doc
-/// comment for the evidence).
+/// `unix:` grants — they are entries in the same non-empty scope set), a
+/// complete Mach-lookup deputy audit (agent-bridle#405/ADR 0015 E6), the
+/// spawn's stdio in the shape that audit covered, and an unprivileged
+/// spawning process (agent-bridle#416 round-2 review, items 1/2 — the ADR's
+/// probes assumed pipe/null-only stdio and ran unprivileged; neither was
+/// enforced by construction). Pure — every precondition is a parameter rather
+/// than read from ambient state, so `report.rs`'s test suite can pin this
+/// predicate directly, independent of whichever state the production
+/// constant ships or the actual privilege of whatever process runs the suite
+/// (`Complete` as of agent-bridle#405/ADR 0015 amendment E6, 2026-10-01; see
+/// [`seatbelt_impl::MACH_DEPUTY_AUDIT`]'s doc comment for the evidence).
 #[must_use]
-pub(crate) fn seatbelt_net_kernel_witness(effective: &Caveats, audit_complete: bool) -> bool {
-    audit_complete && net_fully_denied(effective)
+pub(crate) fn seatbelt_net_kernel_witness(
+    effective: &Caveats,
+    audit_complete: bool,
+    stdio_audited: bool,
+    caller_unprivileged: bool,
+) -> bool {
+    audit_complete && stdio_audited && caller_unprivileged && net_fully_denied(effective)
 }
 
 /// An explicit `unix:<path>` token names a path-anchored Unix-domain socket
@@ -2721,16 +2750,24 @@ mod seatbelt_impl {
     }
 
     /// The audit state this build ships. **Complete** (agent-bridle#405, ADR
-    /// 0015 amendment E6, 2026-10-01): the zero floor closes every *named*
-    /// Mach lookup, and the full channel sweep this audit required —
-    /// unix-domain sockets, `open(1)`/LaunchServices, Darwin notifications,
-    /// pasteboard, `iokit-open`, `sysctl-write`, a write-class `file-ioctl`,
-    /// `process-info`/`signal`, XPC beyond `mach-lookup`, and AppleEvents —
-    /// is each shown closed or correctly placed out of the net-egress threat
-    /// model (full evidence table: ADR 0015 amendment E6). This governs ONLY
-    /// the deny-all, zero-`mach:`-grant shape; a named grant, a loopback
-    /// scope, or a remote-host allowlist are unaffected and stay
-    /// `Unknown`/`Advisory`.
+    /// 0015 amendment E6, 2026-10-01; narrowed by the round-2 review,
+    /// agent-bridle#416): the zero floor closes every *named* Mach lookup, and
+    /// the measured legs of the channel sweep — unix-domain sockets,
+    /// `open(1)`/LaunchServices, Darwin notifications, pasteboard,
+    /// `iokit-open`, `sysctl-write`, a write-class `file-ioctl`, XPC beyond
+    /// `mach-lookup`, and AppleEvents — are each shown closed under an
+    /// UNPRIVILEGED probing process (full evidence table: ADR 0015 amendment
+    /// E6). `process-info`/`signal` and the shared-memory/file-drop surface
+    /// are stated as explicit ACCEPTED LIMITS of a direct-egress claim (they
+    /// carry no network authority), not as proof the deputy set is exhaustive;
+    /// "no ambient relay found" on the probed host is an observation about
+    /// that host, not a closure proof. This governs ONLY the deny-all,
+    /// zero-`mach:`-grant shape, and ONLY when the caller is unprivileged and
+    /// the spawn's stdio is pipe/null-only — [`super::seatbelt_net_kernel_witness`]'s
+    /// other parameters, enforced at `caller_is_root`/the spawn's declared
+    /// [`crate::StdioPosture`]. A named grant, a loopback scope, a remote-host
+    /// allowlist, a root-owned caller, or unaudited stdio are all unaffected
+    /// and stay `Unknown`/`Advisory`.
     pub(super) const MACH_DEPUTY_AUDIT: MachDeputyAudit = MachDeputyAudit::Complete;
 
     /// The conservative network projection for `effective` under `audit`.
@@ -2789,6 +2826,18 @@ mod seatbelt_impl {
     #[must_use]
     pub fn seatbelt_is_supported() -> bool {
         Path::new(SANDBOX_EXEC).exists()
+    }
+
+    /// `true` when this process's effective UID is 0 (root). ADR 0015 E6's
+    /// probes all ran unprivileged (agent-bridle#416 round-2 review, item 2).
+    /// Reads the real ambient UID via `rustix` (a safe wrapper, so core stays
+    /// `forbid(unsafe_code)`) — deliberately NOT a pure/parameterized
+    /// predicate, unlike [`super::seatbelt_net_kernel_witness`], which takes
+    /// the already-read value as a plain bool specifically so its logic stays
+    /// testable without depending on the actual privilege of whatever process
+    /// runs the suite.
+    pub(super) fn caller_is_root() -> bool {
+        rustix::process::geteuid().is_root()
     }
 
     /// A real, kernel-enforced Seatbelt sandbox (macOS).
@@ -2928,7 +2977,18 @@ mod seatbelt_impl {
         /// (agent-bridle#405 D4: fail closed first).
         fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
             let mut resolved = crate::ResolvedAuthority::from_delegated(effective);
-            resolved.net = seatbelt_net_projection(effective, MACH_DEPUTY_AUDIT);
+            // A root-owned process narrows straight back to `Incomplete` — the
+            // SAME `Unknown`/held-for-admission treatment an actually
+            // incomplete audit already gets (agent-bridle#416 round-2 review,
+            // item 2: the probes behind `MACH_DEPUTY_AUDIT` all ran
+            // unprivileged, so nothing backs a claim about the privileged
+            // kernel-control surface a root process can reach).
+            let audit = if caller_is_root() {
+                MachDeputyAudit::Incomplete
+            } else {
+                MACH_DEPUTY_AUDIT
+            };
+            resolved.net = seatbelt_net_projection(effective, audit);
             resolved
         }
 
