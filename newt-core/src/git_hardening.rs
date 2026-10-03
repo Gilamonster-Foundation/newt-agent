@@ -122,6 +122,22 @@ pub struct OwnGitGrant {
 /// resulting commit really is a fast-forward (or amendment) of the branch's
 /// OWN previous tip before moving ONLY that one ref (reusing
 /// `inspect_commands`'s guard, unmodified, against everything else).
+///
+/// **Round 7 (#2686 review round 3, P1)**: the host-side broker above was
+/// itself unbound — `advance_own_branch_ref`/`reattach_own_head` re-derived
+/// the git-dir/common-dir pair with a fresh `git rev-parse` against the
+/// WORKSPACE, i.e. through the worktree's `.git` gitlink and the admin
+/// dir's `commondir` file, both ordinary files inside this grant's own
+/// write set. A confined child's second, non-`git` compound segment could
+/// rewrite either AFTER a legitimate detached commit, redirecting the
+/// publish/reattach onto a DIFFERENT repository (concretely: the primary
+/// checkout's own `HEAD`/`refs/heads/<branch>`). [`BoundGitIdentity`] closes
+/// this: the pair is resolved and held (as directory descriptors on Unix)
+/// ONCE, by [`own_branch_for_commit_ref_move`], before the confined child
+/// ever runs, and every later operation binds `GIT_DIR` to those held paths
+/// — re-verified against the descriptors' `(dev, ino)` immediately before
+/// use — instead of ever re-resolving through the
+/// workspace again.
 pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
     // PR #2577 round 4, Blocker 1: this is the SESSION-START call
     // (`caveats::apply_cli_fs_grants`'s sole production caller runs before any
@@ -202,15 +218,9 @@ fn cached_identity(workspace: &Path) -> Option<GitDirPair> {
 /// grant (a default branch → nothing), never widen it, so re-reading it is
 /// safe in a way re-trusting the path resolve is not.
 pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
-    let Some((cached_common, cached_git_dir)) = cached_identity(workspace) else {
+    let Some((common_dir, git_dir)) = verified_identity(workspace) else {
         return Vec::new();
     };
-    let Some((fresh_common, fresh_git_dir)) = git_dirs(workspace) else {
-        return Vec::new();
-    };
-    if fresh_common != cached_common || fresh_git_dir != cached_git_dir {
-        return Vec::new(); // re-pointed since session start — grant nothing
-    }
     let Some(branch) = own_branch(workspace) else {
         return Vec::new();
     };
@@ -218,23 +228,215 @@ pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
         return Vec::new();
     }
     vec![
-        path_to_string(&cached_git_dir),
-        path_to_string(&cached_common.join("objects")),
+        path_to_string(&git_dir),
+        path_to_string(&common_dir.join("objects")),
     ]
+}
+
+/// `(common_dir, absolute_git_dir)` when the identity [`own_gitdir_grants`]
+/// cached at session start still matches a FRESH resolve — the one point
+/// `.git`/`commondir` are re-consulted at all, and only to confirm they
+/// still agree with what session start trusted. A mismatch (re-pointed
+/// since session start) or no cached identity (bootstrap never ran, or
+/// resolved to "not a repo") both return `None`; the caller treats them
+/// identically. Factored out of [`own_gitdir_shell_write_grant`] so every
+/// caller that needs the identity PAIR (not just the write-grant strings —
+/// [`own_branch_for_commit_ref_move`] does) shares one check.
+fn verified_identity(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (cached_common, cached_git_dir) = cached_identity(workspace)?;
+    let (fresh_common, fresh_git_dir) = git_dirs(workspace)?;
+    if fresh_common != cached_common || fresh_git_dir != cached_git_dir {
+        return None; // re-pointed since session start — trust nothing
+    }
+    Some((cached_common, cached_git_dir))
 }
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// A worktree's git-dir/common-dir identity, bound ONCE — via held
+/// directory descriptors on Unix — right before a commit-creating confined
+/// child runs (#2686 review round 3, P1). The child's write grant includes
+/// the worktree's own admin dir (for `HEAD`, `index`, …), which also holds
+/// the `commondir` pointer file, and the workspace's `.git` gitlink is an
+/// ordinary, model-writable file too — both reachable by a compound
+/// command's non-`git` second segment. Every host-side operation
+/// bracketing the child ([`detach_own_head`], [`advance_own_branch_ref`],
+/// [`reattach_own_head`]) binds `GIT_DIR` to the paths resolved HERE —
+/// never a fresh `git rev-parse` against the workspace, which would walk
+/// back through whatever the child just rewrote — and [`Self::verify`]
+/// re-checks their `(dev, ino)` against the held descriptor before each
+/// use. Ref/object resolution always targets [`Self::common_dir`]
+/// DIRECTLY, never the admin dir plus an env override: measured, git
+/// ignores `GIT_COMMON_DIR` outright whenever `GIT_DIR` itself names a
+/// directory carrying its own `commondir` file (a linked worktree's admin
+/// dir always does), so that env var cannot stand in for a rewritten one.
+/// The one read that is genuinely worktree-local — the detached `HEAD`
+/// oid — is read as a raw file beneath the held descriptor instead
+/// ([`Self::read_detached_head`]), never through git's own resolution.
+pub struct BoundGitIdentity {
+    common_dir: PathBuf,
+    git_dir: PathBuf,
+    #[cfg(unix)]
+    common_root: agent_bridle_fdguard::GrantedRoot,
+    #[cfg(unix)]
+    git_root: agent_bridle_fdguard::GrantedRoot,
+}
+
+impl BoundGitIdentity {
+    /// Bind `common_dir`/`git_dir` — already [`verified_identity`]-checked
+    /// against the session-start cache by the caller — as held descriptors.
+    fn bind(common_dir: PathBuf, git_dir: PathBuf) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            let common_root =
+                agent_bridle_fdguard::GrantedRoot::acquire(&common_dir).map_err(|e| {
+                    format!(
+                        "refused: cannot bind the common git dir '{}' ({e})",
+                        common_dir.display()
+                    )
+                })?;
+            let git_root = agent_bridle_fdguard::GrantedRoot::acquire(&git_dir).map_err(|e| {
+                format!(
+                    "refused: cannot bind the worktree admin dir '{}' ({e})",
+                    git_dir.display()
+                )
+            })?;
+            Ok(Self {
+                common_dir,
+                git_dir,
+                common_root,
+                git_root,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                common_dir,
+                git_dir,
+            })
+        }
+    }
+
+    /// Re-check both held identities against a fresh `stat` of the SAME two
+    /// paths this was bound to — never a fresh `git rev-parse` through the
+    /// workspace. Fails closed: the directory at that exact path is no
+    /// longer the object bound before the confined child ran.
+    pub fn verify(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            for (label, path, root) in [
+                ("common git dir", &self.common_dir, &self.common_root),
+                ("worktree admin dir", &self.git_dir, &self.git_root),
+            ] {
+                let now = std::fs::metadata(path).map_err(|e| {
+                    format!(
+                        "refused: the {label} '{}' can no longer be inspected ({e})",
+                        path.display()
+                    )
+                })?;
+                let held = root.identity();
+                if (now.dev(), now.ino()) != (held.device, held.inode) {
+                    return Err(format!(
+                        "refused: the {label} '{}' no longer names the directory bound \
+                         before the confined command ran",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the worktree-local `HEAD` file directly — beneath the held
+    /// descriptor on Unix — never through git's own gitdir machinery.
+    /// Measured: for a linked worktree's admin dir, git reads that dir's
+    /// own `commondir` FILE unconditionally to find refs/objects, and
+    /// `GIT_COMMON_DIR` has NO effect in that case — it is silently
+    /// ignored whenever `GIT_DIR` itself carries a `commondir` file, so it
+    /// cannot override a rewritten one. Reading `HEAD` as a raw file sides
+    /// steps that resolution entirely: a detached `HEAD` is nothing but a
+    /// literal hex object id, and verifying the id is itself a reachable
+    /// commit happens AFTER this read, against [`Self::common_dir`]
+    /// directly ([`advance_own_branch_ref`]'s `commit_parents_of` call).
+    ///
+    /// `Ok(None)` for a symbolic ref (not detached) or an absent file.
+    fn read_detached_head(&self) -> Result<Option<String>, String> {
+        let text = {
+            #[cfg(unix)]
+            {
+                use std::io::Read;
+                match self.git_root.open_read(Path::new("HEAD")) {
+                    Ok(mut file) => {
+                        let mut text = String::new();
+                        file.read_to_string(&mut text)
+                            .map_err(|e| format!("refused: cannot read HEAD ({e})"))?;
+                        text
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(format!("refused: cannot read HEAD ({e})")),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                match std::fs::read_to_string(self.git_dir.join("HEAD")) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(format!("refused: cannot read HEAD ({e})")),
+                }
+            }
+        };
+        let text = text.trim();
+        if text.is_empty() || text.starts_with("ref:") {
+            return Ok(None);
+        }
+        Ok(Some(text.to_string()))
+    }
+}
+
+/// [`hardened_git`] pinned to `identity`'s held ADMIN dir (never
+/// `workspace`) — for the two operations that must write the
+/// worktree-LOCAL `HEAD` file: [`detach_own_head`] and
+/// [`reattach_own_head`]. Never used for anything that resolves a ref or an
+/// object — those live in the common dir and must go through
+/// [`hardened_git_common`] instead ([`Self::read_detached_head`]'s doc
+/// comment explains why `GIT_DIR` alone cannot safely stand in for both).
+fn hardened_git_bound(identity: &BoundGitIdentity, args: &[&str]) -> io::Result<Command> {
+    let mut cmd = hardened_git(&identity.git_dir, args)?;
+    cmd.env("GIT_DIR", &identity.git_dir);
+    Ok(cmd)
+}
+
+/// [`hardened_git`] pinned DIRECTLY to `identity`'s held COMMON dir — an
+/// ordinary, non-worktree gitdir from git's own perspective, so there is no
+/// `commondir` file for it to read at all and nothing for a confined
+/// child's write grant on the ADMIN dir to redirect. Every ref/object
+/// resolution and the one host-side ref move route through this, never
+/// through the admin dir.
+fn hardened_git_common(identity: &BoundGitIdentity, args: &[&str]) -> io::Result<Command> {
+    let mut cmd = hardened_git(&identity.common_dir, args)?;
+    cmd.env("GIT_DIR", &identity.common_dir);
+    Ok(cmd)
+}
+
+/// Bound state for one commit-creating `run_command` dispatch: the
+/// branch/tip it will publish to, plus the identity every host-side
+/// operation around the confined child binds to.
+pub struct OwnBranchRefMove {
+    pub branch: String,
+    pub old_tip: String,
+    pub identity: BoundGitIdentity,
+}
+
 /// #2682 round 2 (#2686 review): is this workspace eligible for the
 /// host-side commit-ref-move broker, and if so, what branch/tip does it
-/// bind to? Reuses [`own_gitdir_shell_write_grant`]'s identity-cache check
-/// (non-empty exactly when a non-default branch's cached identity still
-/// matches a fresh resolve) rather than duplicating it — this is the SAME
-/// gate that used to decide whether to widen the confined fence onto
-/// `refs/heads/`; it now decides whether to run the detach/advance/reattach
-/// dance around an UNWIDENED dispatch instead.
+/// bind to? Reuses [`verified_identity`] (the SAME gate that used to decide
+/// whether to widen the confined fence onto `refs/heads/`) rather than
+/// duplicating it — it now decides whether to run the detach/advance/
+/// reattach dance around an UNWIDENED dispatch instead, and (round 3, P1)
+/// supplies the [`BoundGitIdentity`] that dance is bound to.
 ///
 /// `None` also for a genuinely unborn branch (no prior commit on it) — there
 /// is no tip to detach `HEAD` to, so this mechanism does not cover a
@@ -243,22 +445,31 @@ fn path_to_string(path: &Path) -> String {
 /// unconditionally), accepted because every real worktree-commit scenario
 /// starts from an existing commit (`git worktree add -b <branch>
 /// <start-point>`); a genuinely unborn branch committing through this path
-/// fails exactly as it did before #2682 (no ref-directory write at all).
-pub fn own_branch_for_commit_ref_move(workspace: &Path) -> Option<(String, String)> {
-    if own_gitdir_shell_write_grant(workspace).is_empty() {
+/// fails exactly as it did before #2682 (no ref-directory write at all). A
+/// failure to bind the identity (fd exhaustion, a symlink on the way) is
+/// the same narrowing, not a widening: the commit then fails exactly as it
+/// did with no ref-directory write at all, never with a wider grant.
+pub fn own_branch_for_commit_ref_move(workspace: &Path) -> Option<OwnBranchRefMove> {
+    let (common_dir, git_dir) = verified_identity(workspace)?;
+    let branch = own_branch(workspace)?;
+    if is_default_branch(workspace, &branch) {
         return None;
     }
-    let branch = own_branch(workspace)?;
-    let tip = own_branch_tip(workspace, &branch)?;
-    Some((branch, tip))
+    let identity = BoundGitIdentity::bind(common_dir, git_dir).ok()?;
+    let old_tip = own_branch_tip(&identity, &branch)?;
+    Some(OwnBranchRefMove {
+        branch,
+        old_tip,
+        identity,
+    })
 }
 
 /// `refs/heads/<branch>`'s current oid, or `None` for an unborn branch (no
 /// commits on it yet — `rev-parse --verify` exits non-zero rather than
 /// erroring, so this is the ordinary "nothing there yet" case, not a
 /// resolution failure).
-fn own_branch_tip(workspace: &Path, branch: &str) -> Option<String> {
-    rev_parse(workspace, &format!("refs/heads/{branch}"))
+fn own_branch_tip(identity: &BoundGitIdentity, branch: &str) -> Option<String> {
+    rev_parse(identity, &format!("refs/heads/{branch}"))
         .ok()
         .flatten()
 }
@@ -269,27 +480,51 @@ fn own_branch_tip(workspace: &Path, branch: &str) -> Option<String> {
 /// mechanism exists to avoid granting to a confined child. Must be paired
 /// with [`reattach_own_head`] once the confined dispatch this brackets
 /// returns, success or failure alike — an unpaired call leaves the worktree
-/// stuck in a detached state.
-pub fn detach_own_head(workspace: &Path, tip: &str) -> Result<(), String> {
-    run_ok(workspace, &["update-ref", "--no-deref", "HEAD", tip])
+/// stuck in a detached state. See [`DetachedHeadGuard`] for cancellation.
+pub fn detach_own_head(identity: &BoundGitIdentity, tip: &str) -> Result<(), String> {
+    identity.verify()?;
+    run_ok_bound(identity, &["update-ref", "--no-deref", "HEAD", tip])
 }
 
 /// Reverses [`detach_own_head`]: `HEAD` becomes a symbolic ref to `branch`
 /// again. Idempotent — safe to call even when `HEAD` was never actually
-/// detached (e.g. the bracketed dispatch never ran at all).
-pub fn reattach_own_head(workspace: &Path, branch: &str) -> Result<(), String> {
-    run_ok(
-        workspace,
+/// detached (e.g. the bracketed dispatch never ran at all). Fails closed —
+/// never touches `HEAD` — when `identity` no longer verifies: a mid-dispatch
+/// identity change means the worktree-local `HEAD` file this would write is
+/// not provably the one this dispatch detached.
+pub fn reattach_own_head(identity: &BoundGitIdentity, branch: &str) -> Result<(), String> {
+    identity.verify()?;
+    run_ok_bound(
+        identity,
         &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
     )
 }
 
+/// [`advance_own_branch_ref`]'s refusal: the reason, plus the detached
+/// commit's oid when one genuinely exists and differs from `old_tip` — so a
+/// caller reports it instead of losing it silently (#2686 review round 3,
+/// P2: "preserve/report the candidate OID rather than just recommending
+/// another commit").
+#[derive(Debug)]
+pub struct AdvanceRefusal {
+    pub candidate_oid: Option<String>,
+    pub reason: String,
+}
+
+impl std::fmt::Display for AdvanceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
 /// The host-side, bounded ref-update broker (#2682 round 2 review): call
 /// after a confined child committed with `HEAD` detached at `old_tip`
-/// ([`detach_own_head`]) and exited successfully. Verifies the resulting
-/// detached `HEAD` really is a fast-forward OR an amendment of `old_tip` —
-/// the SAME two shapes `NativeGitBroker`'s reference-transaction hook
-/// already accepts (`newt_core::native_git_broker::NativeCommitSession::
+/// ([`detach_own_head`]) and exited successfully. Verifies `identity`
+/// first (round 3, P1) — refusing before reading anything if it no longer
+/// matches what [`own_branch_for_commit_ref_move`] bound — then that the
+/// resulting detached `HEAD` really is a fast-forward OR an amendment of
+/// `old_tip` — the SAME two shapes `NativeGitBroker`'s reference-transaction
+/// hook already accepts (`newt_core::native_git_broker::NativeCommitSession::
 /// check_commit_context`) — never an arbitrary other parent, then performs
 /// the SINGLE compare-and-swap `update-ref` that moves `refs/heads/<branch>`
 /// (and appends its reflog, via `-m`) forward. It never resolves or touches
@@ -297,12 +532,28 @@ pub fn reattach_own_head(workspace: &Path, branch: &str) -> Result<(), String> {
 /// caller ([`own_branch_for_commit_ref_move`]) and threaded through
 /// unchanged, and the compare-and-swap's `<oldvalue>` closes the race where
 /// something else moved the branch between that resolve and this call.
-pub fn advance_own_branch_ref(workspace: &Path, branch: &str, old_tip: &str) -> Result<(), String> {
-    let new_oid = rev_parse(workspace, "HEAD")?.ok_or("no commit was created on detached HEAD")?;
+pub fn advance_own_branch_ref(
+    identity: &BoundGitIdentity,
+    branch: &str,
+    old_tip: &str,
+) -> Result<String, AdvanceRefusal> {
+    let refuse = |reason: String, candidate_oid: Option<String>| AdvanceRefusal {
+        candidate_oid,
+        reason,
+    };
+    identity.verify().map_err(|reason| refuse(reason, None))?;
+    let new_oid = identity
+        .read_detached_head()
+        .map_err(|e| refuse(e, None))?
+        .ok_or_else(|| refuse("no commit was created on detached HEAD".to_string(), None))?;
     if new_oid == old_tip {
-        return Err("HEAD did not move — nothing to publish".to_string());
+        return Err(refuse(
+            "HEAD did not move — nothing to publish".to_string(),
+            None,
+        ));
     }
-    let new_parents = commit_parents_of(workspace, &new_oid)?;
+    let new_parents =
+        commit_parents_of(identity, &new_oid).map_err(|e| refuse(e, Some(new_oid.clone())))?;
     let is_append = new_parents == [old_tip.to_string()];
     // Amend reuses old_tip's OWN parent list. Excluded when old_tip itself
     // is a root commit (empty parent list): every unrelated root commit
@@ -311,21 +562,26 @@ pub fn advance_own_branch_ref(workspace: &Path, branch: &str, old_tip: &str) -> 
     // elsewhere" — amending a repo's literal first commit is rare enough
     // to leave out of this mechanism's scope rather than accept that
     // collision.
-    let old_parents = commit_parents_of(workspace, old_tip)?;
+    let old_parents =
+        commit_parents_of(identity, old_tip).map_err(|e| refuse(e, Some(new_oid.clone())))?;
     let is_amend = !is_append && !old_parents.is_empty() && new_parents == old_parents;
     if !is_append && !is_amend {
-        return Err(format!(
-            "the new commit {new_oid} is not an append or amendment of branch '{branch}''s \
-             previous tip {old_tip} (parents: {new_parents:?})"
+        return Err(refuse(
+            format!(
+                "the new commit {new_oid} is not an append or amendment of branch '{branch}''s \
+                 previous tip {old_tip} (parents: {new_parents:?})"
+            ),
+            Some(new_oid),
         ));
     }
-    let subject = git_text(workspace, &["log", "-1", "--format=%s", &new_oid])?;
+    let subject = git_text(identity, &["log", "-1", "--format=%s", &new_oid])
+        .map_err(|e| refuse(e, Some(new_oid.clone())))?;
     let message = format!(
         "commit{}: {subject}",
         if is_amend { " (amend)" } else { "" }
     );
-    run_ok(
-        workspace,
+    run_ok_common(
+        identity,
         &[
             "update-ref",
             "-m",
@@ -335,13 +591,86 @@ pub fn advance_own_branch_ref(workspace: &Path, branch: &str, old_tip: &str) -> 
             old_tip,
         ],
     )
+    .map_err(|e| refuse(e, Some(new_oid.clone())))?;
+    Ok(new_oid)
 }
 
-/// `rev-parse --verify --quiet <rev>`: `Ok(Some(oid))` on success, `Ok(None)`
-/// for "nothing there" (exit 1, e.g. an unborn branch or no commit yet on
-/// detached HEAD), `Err` only for an actual failure to run git at all.
-fn rev_parse(workspace: &Path, rev: &str) -> Result<Option<String>, String> {
-    let output = hardened_git(workspace, &["rev-parse", "--verify", "--quiet", rev])
+/// After a commit-creating dispatch that did NOT exit 0 (e.g. a compound
+/// `git commit … && false`): did a commit still land on the detached HEAD?
+/// Read-only — never publishes, so the caller can report the oid without
+/// moving the branch ref out from under a dispatch the model saw fail
+/// (#2686 review round 3, P2). `None` when `identity` no longer verifies,
+/// nothing was created, or `HEAD` cannot be read — the caller treats all
+/// three the same (nothing to report).
+#[must_use]
+pub fn detached_commit_candidate(identity: &BoundGitIdentity, old_tip: &str) -> Option<String> {
+    identity.verify().ok()?;
+    let oid = identity.read_detached_head().ok()??;
+    (oid != old_tip).then_some(oid)
+}
+
+/// Cancellation safety for the detach/dispatch/advance/reattach bracket
+/// (#2686 review round 3, P2): if the future awaiting the confined dispatch
+/// is dropped between [`detach_own_head`] and the caller's own explicit
+/// advance+reattach, nothing would otherwise ever run them again — the
+/// worktree stays stuck detached, and any commit the child made before
+/// cancellation is unreachable by any ref. Construct right after a
+/// successful detach; call [`Self::resolve`] once the normal path has run
+/// its own advance/reattach (whatever the outcome) so `Drop` does not
+/// repeat it.
+///
+/// Both underlying calls are self-guarding — a compare-and-swap and an
+/// idempotent write — so an unresolved guard's `Drop` running them again on
+/// a path that already succeeded is harmless; `resolve` exists only to
+/// skip the redundant subprocess spawns on the common case, not because a
+/// double call would be unsafe.
+pub struct DetachedHeadGuard<'a> {
+    identity: &'a BoundGitIdentity,
+    branch: String,
+    old_tip: String,
+    resolved: bool,
+}
+
+impl<'a> DetachedHeadGuard<'a> {
+    #[must_use]
+    pub fn new(identity: &'a BoundGitIdentity, branch: String, old_tip: String) -> Self {
+        Self {
+            identity,
+            branch,
+            old_tip,
+            resolved: false,
+        }
+    }
+
+    /// The normal path already ran its own advance/reattach (success or
+    /// refusal alike) — skip `Drop`'s best-effort recovery.
+    pub fn resolve(&mut self) {
+        self.resolved = true;
+    }
+}
+
+impl Drop for DetachedHeadGuard<'_> {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        // Best-effort recovery for a cancelled dispatch: land a commit that
+        // exists, then reattach regardless. Errors are unreportable here —
+        // the task that could report them is already gone — and a Drop
+        // must never panic, so both are swallowed.
+        let _ = advance_own_branch_ref(self.identity, &self.branch, &self.old_tip);
+        let _ = reattach_own_head(self.identity, &self.branch);
+    }
+}
+
+/// `rev-parse --verify --quiet <rev>` against the COMMON dir — `rev` is
+/// always a ref name here (`refs/heads/<branch>`), which lives there, never
+/// the worktree-local `HEAD` (see [`BoundGitIdentity::read_detached_head`]
+/// for that). `Ok(Some(oid))` on success, `Ok(None)` for "nothing there"
+/// (exit 1, e.g. an unborn branch), `Err` only for an actual failure to run
+/// git at all.
+fn rev_parse(identity: &BoundGitIdentity, rev: &str) -> Result<Option<String>, String> {
+    let output = hardened_git_common(identity, &["rev-parse", "--verify", "--quiet", rev])
         .map_err(|e| e.to_string())?
         .output()
         .map_err(|e| e.to_string())?;
@@ -352,8 +681,8 @@ fn rev_parse(workspace: &Path, rev: &str) -> Result<Option<String>, String> {
     Ok((!oid.is_empty()).then_some(oid))
 }
 
-fn commit_parents_of(workspace: &Path, oid: &str) -> Result<Vec<String>, String> {
-    let output = hardened_git(workspace, &["cat-file", "commit", oid])
+fn commit_parents_of(identity: &BoundGitIdentity, oid: &str) -> Result<Vec<String>, String> {
+    let output = hardened_git_common(identity, &["cat-file", "commit", oid])
         .map_err(|e| e.to_string())?
         .output()
         .map_err(|e| e.to_string())?;
@@ -363,8 +692,8 @@ fn commit_parents_of(workspace: &Path, oid: &str) -> Result<Vec<String>, String>
     crate::native_git_broker::commit_parents(&output.stdout)
 }
 
-fn git_text(workspace: &Path, args: &[&str]) -> Result<String, String> {
-    let output = hardened_git(workspace, args)
+fn git_text(identity: &BoundGitIdentity, args: &[&str]) -> Result<String, String> {
+    let output = hardened_git_common(identity, args)
         .map_err(|e| e.to_string())?
         .output()
         .map_err(|e| e.to_string())?;
@@ -374,8 +703,24 @@ fn git_text(workspace: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn run_ok(workspace: &Path, args: &[&str]) -> Result<(), String> {
-    let output = hardened_git(workspace, args)
+/// For [`detach_own_head`]/[`reattach_own_head`] only — the two writes that
+/// must land in the worktree-LOCAL `HEAD` file.
+fn run_ok_bound(identity: &BoundGitIdentity, args: &[&str]) -> Result<(), String> {
+    let output = hardened_git_bound(identity, args)
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// For [`advance_own_branch_ref`]'s `update-ref` only — `refs/heads/<branch>`
+/// lives in the common dir.
+fn run_ok_common(identity: &BoundGitIdentity, args: &[&str]) -> Result<(), String> {
+    let output = hardened_git_common(identity, args)
         .map_err(|e| e.to_string())?
         .output()
         .map_err(|e| e.to_string())?;
@@ -1161,14 +1506,45 @@ mod own_gitdir_grant_tests {
     use super::*;
     use std::process::Command;
 
+    /// The explicit, minimal environment every fixture git runs under —
+    /// mirror of `agentic::tools::tests::git_shell_grant::hermetic_git_env`
+    /// (`agentic/tools_tests/helper_git_shell_grant.rs`), the canonical
+    /// hermetic constructor (#2686 review round 3, P3): that module's
+    /// private test tree is not reachable from here, so this duplicates its
+    /// shape rather than its code. `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL`
+    /// close the config sources that live OUTSIDE the process environment
+    /// (`/etc/gitconfig`, the operator's own `~/.gitconfig`).
+    fn hermetic_git_env(home: &Path) -> Vec<(&'static str, String)> {
+        vec![
+            ("HOME", home.to_string_lossy().into_owned()),
+            ("GIT_AUTHOR_NAME", "t".to_string()),
+            ("GIT_AUTHOR_EMAIL", "t@example.invalid".to_string()),
+            ("GIT_COMMITTER_NAME", "t".to_string()),
+            ("GIT_COMMITTER_EMAIL", "t@example.invalid".to_string()),
+            ("GIT_CONFIG_NOSYSTEM", "1".to_string()),
+            ("GIT_CONFIG_GLOBAL", "/dev/null".to_string()),
+            ("GIT_TEMPLATE_DIR", "/dev/null".to_string()),
+        ]
+    }
+
+    /// `env_clear()` rather than a denylist, so an inherited `GIT_DIR`,
+    /// `GIT_WORK_TREE`, `GIT_COMMON_DIR`, or any other ambient git knob
+    /// cannot leak into a fixture-setup invocation — the SAME property
+    /// `hardened_git` enforces for production, applied here to the test's
+    /// own unconfined setup/probe git calls.
+    fn hermetic_git(dir: &Path, home: &Path) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir)
+            .env_clear()
+            .envs(hermetic_git_env(home));
+        cmd
+    }
+
+    /// A throwaway private `HOME` that lives only for the one command.
     fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let home = tempfile::tempdir().unwrap();
+        let status = hermetic_git(dir, home.path())
             .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
             .status()
             .expect("git invocation");
         assert!(status.success(), "git {args:?} failed");
@@ -1180,9 +1556,9 @@ mod own_gitdir_grant_tests {
     /// site reused by every read, rather than hand-rolling a new one each
     /// time.
     fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let home = tempfile::tempdir().unwrap();
+        let output = hermetic_git(dir, home.path())
             .args(args)
-            .current_dir(dir)
             .output()
             .expect("git invocation");
         assert!(output.status.success(), "git {args:?} failed");
@@ -1342,11 +1718,14 @@ mod own_gitdir_grant_tests {
         );
         own_gitdir_grants(&wt); // prime the identity cache, as session start does
 
-        let (branch, old_tip) =
-            own_branch_for_commit_ref_move(&wt).expect("task is a non-default, born branch");
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).expect("task is a non-default, born branch");
         assert_eq!(branch, "task");
 
-        detach_own_head(&wt, &old_tip).unwrap();
+        detach_own_head(&identity, &old_tip).unwrap();
         let symref = Command::new("git")
             .args(["symbolic-ref", "-q", "HEAD"])
             .current_dir(&wt)
@@ -1361,10 +1740,14 @@ mod own_gitdir_grant_tests {
         git(&wt, &["add", "f.txt"]);
         git(&wt, &["commit", "-q", "-m", "task work"]);
 
-        advance_own_branch_ref(&wt, &branch, &old_tip).unwrap();
-        reattach_own_head(&wt, &branch).unwrap();
+        let new_oid = advance_own_branch_ref(&identity, &branch, &old_tip).unwrap();
+        reattach_own_head(&identity, &branch).unwrap();
 
         let tip = git_output(&main, &["rev-parse", "refs/heads/task"]);
+        assert_eq!(
+            new_oid, tip,
+            "advance_own_branch_ref returns the published oid"
+        );
         let head = git_output(&wt, &["rev-parse", "HEAD"]);
         assert_eq!(tip, head, "refs/heads/task must advance to the new commit");
         assert_ne!(tip, old_tip);
@@ -1397,19 +1780,27 @@ mod own_gitdir_grant_tests {
             &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
         );
         own_gitdir_grants(&wt);
-        let (branch, old_tip) = own_branch_for_commit_ref_move(&wt).unwrap();
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
 
         // A commit with NO relation to old_tip at all (an orphan root
         // commit), as if a hostile `commit-tree` forged one out of thin air.
-        detach_own_head(&wt, &old_tip).unwrap();
+        detach_own_head(&identity, &old_tip).unwrap();
         git(&wt, &["checkout", "--orphan", "forged"]);
         std::fs::write(wt.join("evil"), "x").unwrap();
         git(&wt, &["add", "evil"]);
         git(&wt, &["commit", "-q", "-m", "forged"]);
         git(&wt, &["checkout", "-q", "--detach", "HEAD"]);
 
-        let result = advance_own_branch_ref(&wt, &branch, &old_tip);
-        assert!(result.is_err(), "an unrelated commit must be refused");
+        let result = advance_own_branch_ref(&identity, &branch, &old_tip);
+        let refusal = result.expect_err("an unrelated commit must be refused");
+        assert!(
+            refusal.candidate_oid.is_some(),
+            "a real (if unrelated) commit exists, so its oid must be reported, not lost: {refusal}"
+        );
 
         assert_eq!(
             git_output(&main, &["rev-parse", "refs/heads/task"]),
@@ -1438,20 +1829,374 @@ mod own_gitdir_grant_tests {
             &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
         );
         own_gitdir_grants(&wt);
-        let (branch, old_tip) = own_branch_for_commit_ref_move(&wt).unwrap();
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
 
-        detach_own_head(&wt, &old_tip).unwrap();
+        detach_own_head(&identity, &old_tip).unwrap();
         std::fs::write(wt.join("f.txt"), "hi").unwrap();
         git(&wt, &["add", "f.txt"]);
         git(&wt, &["commit", "-q", "--amend", "-m", "amended second"]);
 
-        advance_own_branch_ref(&wt, &branch, &old_tip).unwrap();
-        reattach_own_head(&wt, &branch).unwrap();
+        advance_own_branch_ref(&identity, &branch, &old_tip).unwrap();
+        reattach_own_head(&identity, &branch).unwrap();
 
         assert_eq!(
             git_output(&main, &["log", "--format=%s", "-1", "refs/heads/task"]),
             "amended second"
         );
+    }
+
+    /// #2686 review round 3, P3: a concurrent mover wins the compare-and-swap.
+    /// Between [`detach_own_head`] and [`advance_own_branch_ref`], a SEPARATE
+    /// actor (modeled here as a direct `update-ref` from the primary
+    /// checkout — the common dir is shared, so this is exactly what a second
+    /// session or a race with another dispatch looks like) moves
+    /// `refs/heads/task` to an unrelated commit. The old-tip CAS must refuse
+    /// rather than clobber that external move, and the detached commit's oid
+    /// must still be reported rather than silently dropped.
+    #[test]
+    fn advance_own_branch_ref_refuses_when_the_branch_moved_concurrently() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+
+        // The race: a concurrent actor moves refs/heads/task BEFORE this
+        // dispatch's advance runs, directly through the shared common dir.
+        // `main` commits something unrelated first — forcing `task` straight
+        // to `main`'s UNCHANGED HEAD would be a same-oid no-op, not a race.
+        std::fs::write(main.join("elsewhere"), "y").unwrap();
+        git(&main, &["add", "elsewhere"]);
+        git(&main, &["commit", "-q", "-m", "elsewhere"]);
+        git(&main, &["branch", "-f", "task", "HEAD"]);
+        let moved_to = git_output(&main, &["rev-parse", "refs/heads/task"]);
+        assert_ne!(moved_to, old_tip, "the race must actually move the ref");
+
+        let refusal = advance_own_branch_ref(&identity, &branch, &old_tip)
+            .expect_err("a moved-tip CAS must refuse, not clobber the concurrent move");
+        assert!(
+            refusal.candidate_oid.is_some(),
+            "the detached commit genuinely exists and must be reported: {refusal}"
+        );
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/task"]),
+            moved_to,
+            "refs/heads/task must stay exactly where the concurrent mover left it"
+        );
+    }
+
+    /// #2686 review round 2, P2: `git commit … && false` creates a commit on
+    /// detached HEAD, then the compound command's failing second segment
+    /// means the overall dispatch did not exit 0 — so `advance_own_branch_ref`
+    /// is never called (publishing would misrepresent a failed dispatch as a
+    /// successful branch update). The commit must not be silently lost: its
+    /// oid is still readable, and the branch ref stays untouched.
+    #[test]
+    fn detached_commit_candidate_reports_an_unpublished_commit_without_moving_the_ref() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            old_tip, identity, ..
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]); // the "git commit" half of "&& false"
+
+        let candidate = detached_commit_candidate(&identity, &old_tip)
+            .expect("a real commit was made and must be reported");
+        assert_eq!(candidate, git_output(&wt, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/task"]),
+            old_tip,
+            "reporting the candidate must not itself move the branch ref"
+        );
+    }
+
+    /// #2686 review round 3, P2: cancellation between detach and the normal
+    /// advance+reattach must not strand the worktree detached or lose a
+    /// commit that was actually made. Simulated by dropping
+    /// [`DetachedHeadGuard`] without ever resolving it — exactly what
+    /// happens when the future awaiting the confined dispatch is cancelled
+    /// mid-await, since Rust drops live locals (this guard included) when
+    /// an async fn's state machine is torn down.
+    #[test]
+    fn detached_head_guard_publishes_and_reattaches_on_an_unresolved_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        {
+            let _guard = DetachedHeadGuard::new(&identity, branch.clone(), old_tip.clone());
+            std::fs::write(wt.join("f.txt"), "hi").unwrap();
+            git(&wt, &["add", "f.txt"]);
+            git(&wt, &["commit", "-q", "-m", "task work"]);
+            // `_guard` drops here, unresolved — modeling cancellation.
+        }
+
+        assert_eq!(
+            git_output(&wt, &["symbolic-ref", "HEAD"]),
+            "refs/heads/task",
+            "a cancelled dispatch must not leave the worktree stuck detached"
+        );
+        assert_eq!(
+            git_output(&main, &["log", "--format=%s", "-1", "refs/heads/task"]),
+            "task work",
+            "a commit made before cancellation must not be lost"
+        );
+    }
+
+    /// #2686 review round 3, P1 — the concrete attack named in the review:
+    /// after a legitimate detached commit, a non-git second segment of a
+    /// compound confined-shell command rewrites the worktree's `.git`
+    /// gitlink to point at the PRIMARY checkout's own gitdir. The OLD
+    /// mechanism (round 2, `66589bfa`) re-derived the git-dir/common-dir
+    /// pair with a fresh `git rev-parse` against the workspace on every
+    /// publish/reattach call — i.e. through this exact, now-rewritten
+    /// pointer — so it would have moved `refs/heads/task` in the WRONG
+    /// repository and (via `reattach_own_head`'s `symbolic-ref HEAD`)
+    /// overwritten the primary checkout's own protected `HEAD`.
+    ///
+    /// Measured red for that class, reproduced here with a hand-rolled
+    /// analog of the OLD discovery (`git -C <workspace> rev-parse
+    /// --git-common-dir --absolute-git-dir`, re-run AFTER the rewrite): it
+    /// resolves to `main`'s own `.git`, not `wt`'s admin dir — the exact
+    /// redirection the review names. [`BoundGitIdentity`] is bound BEFORE
+    /// the rewrite and never re-resolves, so [`advance_own_branch_ref`] and
+    /// [`reattach_own_head`] must publish/reattach correctly on `wt` while
+    /// `main`'s own `HEAD` and `refs/heads/task` stay byte-identical.
+    #[test]
+    fn bound_identity_resists_a_gitlink_rewrite_after_the_detached_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]); // the confined child's work
+
+        let main_head_before = std::fs::read(main.join(".git").join("HEAD")).unwrap();
+        let main_task_ref_before =
+            std::fs::read(main.join(".git").join("refs/heads/task")).unwrap();
+
+        // The attack: a non-git compound-command segment rewrites the
+        // worktree's gitlink to point straight at the primary checkout.
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git").display()),
+        )
+        .unwrap();
+
+        // Measured red for the CLASS this closes: the old re-discovery
+        // pattern, run fresh AFTER the rewrite, now resolves to `main`'s own
+        // gitdir — not `wt`'s admin dir — which is the whole vulnerability.
+        let redirected = Command::new("git")
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(String::from_utf8_lossy(&redirected.stdout).trim())
+                .canonicalize()
+                .unwrap(),
+            main.join(".git").canonicalize().unwrap(),
+            "the rewrite must actually redirect a fresh rev-parse — proving the attack is real"
+        );
+
+        // The fix: `identity` was bound BEFORE the rewrite and never
+        // re-resolves through the workspace, so it is unaffected.
+        let new_oid = advance_own_branch_ref(&identity, &branch, &old_tip)
+            .expect("the bound identity must still publish correctly on wt");
+        reattach_own_head(&identity, &branch).unwrap();
+
+        assert_eq!(
+            std::fs::read(main.join(".git").join("HEAD")).unwrap(),
+            main_head_before,
+            "the primary checkout's own HEAD must be untouched by the rewrite"
+        );
+        assert_ne!(
+            std::fs::read(main.join(".git").join("refs/heads/task")).unwrap(),
+            main_task_ref_before,
+            "wt's task branch DOES still live in the (unrewritten) common dir and must advance"
+        );
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/task"]),
+            new_oid,
+            "the commit must land on task's real ref, resolved via the bound identity"
+        );
+    }
+
+    /// The other half of the `.git` rewrite: the admin dir's OWN `commondir`
+    /// file lives INSIDE the worktree's admin dir, which is itself in the
+    /// write grant (for `HEAD`/`index`/…) — so a confined child can rewrite
+    /// it to point `refs/heads/` resolution at a different repository
+    /// entirely, same attack class as the gitlink rewrite, different file.
+    /// This rewrite has no effect because ref/object operations never go
+    /// through the admin dir's `GIT_DIR` at all — `hardened_git_common`
+    /// points `GIT_DIR` straight at [`BoundGitIdentity::common_dir`], an
+    /// ordinary non-worktree gitdir with no `commondir` file to consult
+    /// (measured: a `GIT_COMMON_DIR` env override does NOT work here — git
+    /// ignores it whenever `GIT_DIR` itself names a directory that carries
+    /// its own `commondir` file, which a worktree admin dir always does).
+    #[test]
+    fn bound_identity_resists_a_commondir_rewrite_after_the_detached_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let decoy = root_path.join("decoy");
+        std::fs::create_dir(&decoy).unwrap();
+        init_repo(&decoy);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+
+        let decoy_head_before = std::fs::read(decoy.join(".git").join("HEAD")).unwrap();
+
+        // The attack: the admin dir's own `commondir` file — inside the
+        // write grant — is rewritten to point at an unrelated repository.
+        let admin_dir = &identity.git_dir;
+        std::fs::write(
+            admin_dir.join("commondir"),
+            format!("{}\n", decoy.join(".git").display()),
+        )
+        .unwrap();
+
+        let new_oid = advance_own_branch_ref(&identity, &branch, &old_tip)
+            .expect("ref resolution must bypass the rewritten commondir file entirely");
+        reattach_own_head(&identity, &branch).unwrap();
+
+        assert_eq!(
+            std::fs::read(decoy.join(".git").join("HEAD")).unwrap(),
+            decoy_head_before,
+            "the decoy repository named by the rewritten commondir must be untouched"
+        );
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/task"]),
+            new_oid,
+            "the commit must land on task's real ref in the ORIGINAL common dir"
+        );
+    }
+
+    /// [`BoundGitIdentity::verify`] fails closed (#2686 review round 3, P1:
+    /// "refuse if the held identities no longer match") when the directory
+    /// object itself — not merely a pointer file inside it — changes: here,
+    /// the admin dir is removed and a fresh, empty directory is created at
+    /// the SAME path. A pathname re-check alone would see an unchanged path
+    /// and wrongly pass; the held descriptor's `(dev, ino)` disagrees.
+    #[test]
+    fn bound_identity_refuses_once_the_admin_dir_itself_is_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+
+        // Replace the admin directory object at the SAME path.
+        let admin_dir = identity.git_dir.clone();
+        std::fs::rename(&admin_dir, root_path.join("admin-dir-moved-aside")).unwrap();
+        std::fs::create_dir(&admin_dir).unwrap();
+
+        let refusal = advance_own_branch_ref(&identity, &branch, &old_tip)
+            .expect_err("a replaced admin dir must refuse, not publish through the new object");
+        assert!(refusal.reason.contains("no longer names the directory"));
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/task"]),
+            old_tip,
+            "a refused advance must not move the branch ref"
+        );
+
+        let reattach_refusal = reattach_own_head(&identity, &branch)
+            .expect_err("reattach must also refuse against the replaced admin dir");
+        assert!(reattach_refusal.contains("no longer names the directory"));
     }
 }
 

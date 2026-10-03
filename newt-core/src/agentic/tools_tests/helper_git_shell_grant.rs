@@ -442,10 +442,14 @@ async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_defaul
 
     // What `agentic::tools`'s `run_command` arm does before the confined
     // dispatch: resolve the branch/tip and detach HEAD to it.
-    let (branch, old_tip) = crate::git_hardening::own_branch_for_commit_ref_move(&wt)
+    let crate::git_hardening::OwnBranchRefMove {
+        branch,
+        old_tip,
+        identity,
+    } = crate::git_hardening::own_branch_for_commit_ref_move(&wt)
         .expect("task is a non-default, born branch");
     assert_eq!(branch, "task");
-    crate::git_hardening::detach_own_head(&wt, &old_tip).unwrap();
+    crate::git_hardening::detach_own_head(&identity, &old_tip).unwrap();
 
     let envelope = super::shell::dispatch_bridled_shell(
         serde_json::json!({
@@ -469,8 +473,8 @@ async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_defaul
 
     // What the arm does after a successful confined dispatch: publish the
     // detached commit onto the branch, host-side, then reattach.
-    crate::git_hardening::advance_own_branch_ref(&wt, &branch, &old_tip).unwrap();
-    crate::git_hardening::reattach_own_head(&wt, &branch).unwrap();
+    crate::git_hardening::advance_own_branch_ref(&identity, &branch, &old_tip).unwrap();
+    crate::git_hardening::reattach_own_head(&identity, &branch).unwrap();
 
     let log = hermetic_git(&wt, &home)
         .args(["log", "--oneline", "-1", "refs/heads/task"])
@@ -974,4 +978,144 @@ fn git_shell_widening_grants_read_on_etc_gitconfig() {
         crate::caveats::permits_path(&widened.fs_read, "/etc/gitconfig"),
         "the widened dispatch must grant read on /etc/gitconfig"
     );
+}
+
+/// Supplies a REAL native commit policy, as production always does for a
+/// commit-creating command (`run_command`'s arm refuses the command outright
+/// when `git_tool.native_commit_policy()` is `None` — see
+/// `run_command_creates_shell_git_commit(cmd) && commit_broker.is_none()`),
+/// without exercising `NativeGitBroker`'s hook-protocol signing/attribution
+/// machinery, which only round-trips correctly from a `maybe_dispatch`-aware
+/// binary (`newt`/`brush_build_pipeline`'s `harness = false` tests) — never
+/// from the ordinary `cargo test` harness this file runs under.
+struct QuietCommitPolicy;
+impl agent_toolchain::native_git::CommitPolicy for QuietCommitPolicy {
+    fn finalize_message(&self, message: &str) -> Result<String, String> {
+        Ok(message.to_string())
+    }
+    fn signing_required(&self) -> bool {
+        false
+    }
+    fn sign_commit(&self, _payload: &[u8]) -> Result<String, String> {
+        Err("signing not exercised by this fixture".into())
+    }
+    fn committed(&self) {}
+}
+
+struct FixtureGitTool;
+impl crate::agentic::git_tool::GitTool for FixtureGitTool {
+    fn native_commit_policy(
+        &self,
+    ) -> Option<std::sync::Arc<dyn agent_toolchain::native_git::CommitPolicy>> {
+        Some(std::sync::Arc::new(QuietCommitPolicy))
+    }
+    fn dispatch(
+        &self,
+        _op: &str,
+        _args: &serde_json::Value,
+        _caveats: &agent_toolchain::git_caveats::GitCaveats,
+        _session: &crate::caveats::Caveats,
+    ) -> Result<String, String> {
+        Err("the embedded git tool is not exercised by this fixture".into())
+    }
+}
+
+/// #2686 review round 3, P2: through the COMPLETE `run_command` dispatch
+/// (`execute_tool_with_collaborators`, the same entry point the TUI/headless
+/// driver calls — not the lower-level `advance_own_branch_ref` directly), a
+/// detached-HEAD commit that is NOT a descendant of `old_tip` (here, an
+/// orphan commit the model's own compound command creates) must be refused
+/// publication AND reported as a typed FAILURE — never `ExecOutcome::Passed`
+/// with merely different text. Deterministic (no timing race): the orphan
+/// shape is produced by the dispatched command itself, not by an external
+/// mover, so this is reproducible every run rather than a timing-dependent
+/// race.
+#[tokio::test]
+async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_failure_not_passed() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    if skip_without_real_kernel_fence() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    real_git(&main, &["init", "-q"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    real_git(&main, &["add", "seed"]);
+    real_git(&main, &["commit", "-q", "-m", "init"]);
+    let wt = root.path().join("wt");
+    real_git(
+        &main,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+    );
+
+    let own_git = crate::git_hardening::own_gitdir_grants(&wt);
+    let mut read_roots = vec![wt.to_string_lossy().into_owned()];
+    read_roots.extend(own_git.read);
+    let session = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::only(read_roots),
+        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: crate::caveats::Scope::only(["git".to_string()]),
+        net: crate::caveats::Scope::none(),
+        ..crate::caveats::Caveats::top()
+    };
+
+    let before = real_git_output(&main, &["rev-parse", "refs/heads/task"]);
+    // An unrelated root commit (no parent), already in the shared object
+    // store (same tree as `main`'s own init commit, just no parent) — so
+    // the confined child can detach straight to it without a fence write on
+    // any ref: `checkout --detach` only touches the worktree-local HEAD.
+    let tree = real_git_output(&main, &["rev-parse", "HEAD^{tree}"]);
+    let unrelated_oid = real_git_output(&main, &["commit-tree", "-m", "unrelated", &tree]);
+
+    let git_tool = FixtureGitTool;
+    let execution = std::sync::OnceLock::new();
+    let out = super::execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({
+            "command": format!(
+                "git checkout -q --detach {unrelated_oid} && git commit -q --allow-empty -m forged"
+            )
+        }),
+        &wt.to_string_lossy(),
+        false,
+        200,
+        &session,
+        &mut crate::agentic::NoMcp,
+        super::ToolCollaborators {
+            git_tool: Some(&git_tool),
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        super::PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        execution.get().copied(),
+        Some(crate::ExecOutcome::Failed),
+        "a refused publication must be a typed failure, not Passed with different text: {out}"
+    );
+    assert_eq!(
+        real_git_output(&main, &["rev-parse", "refs/heads/task"]),
+        before,
+        "a refused advance must not move refs/heads/task at all"
+    );
+    assert!(
+        out.contains("refused publication"),
+        "the text must explain the refusal: {out}"
+    );
+}
+
+/// Like [`real_git`], but returns trimmed stdout.
+fn real_git_output(dir: &std::path::Path, args: &[&str]) -> String {
+    let home = tempfile::tempdir().unwrap();
+    let output = hermetic_git(dir, home.path()).args(args).output().unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }

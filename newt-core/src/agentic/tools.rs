@@ -4279,17 +4279,33 @@ async fn execute_authorized_tool(
                     ))
                 })
                 .flatten();
-            if let Some((branch, old_tip)) = &ref_move {
+            // #2686 review round 3, P1: `ref_move.identity` is bound ONCE,
+            // here, before the confined child runs — every host-side
+            // operation below (detach, advance, reattach) binds to THESE
+            // held paths and never re-derives them through the workspace,
+            // which the child could have rewritten by the time any of them
+            // runs. P2: `detach_guard` recovers (publish-if-possible, then
+            // reattach) even if this async call is CANCELLED mid-dispatch —
+            // without it, a dropped future between detach and the explicit
+            // reattach below would strand the worktree detached forever.
+            let mut detach_guard = None;
+            if let Some(move_info) = &ref_move {
                 if let Err(error) =
-                    crate::git_hardening::detach_own_head(std::path::Path::new(workspace), old_tip)
+                    crate::git_hardening::detach_own_head(&move_info.identity, &move_info.old_tip)
                 {
                     return host_return(format!(
-                        "error: could not prepare branch '{branch}' for a governed commit: {error}"
+                        "error: could not prepare branch '{}' for a governed commit: {error}",
+                        move_info.branch
                     ));
                 }
+                detach_guard = Some(crate::git_hardening::DetachedHeadGuard::new(
+                    &move_info.identity,
+                    move_info.branch.clone(),
+                    move_info.old_tip.clone(),
+                ));
             }
             let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
-            let (mut exec_text, exec_outcome) = shell::exec_confined_command_with_broker(
+            let (mut exec_text, mut exec_outcome) = shell::exec_confined_command_with_broker(
                 cmd,
                 &run_cwd,
                 workspace,
@@ -4307,37 +4323,65 @@ async fn execute_authorized_tool(
                 &mut fs_pre_exec_missing,
             )
             .await;
-            if let Some((branch, old_tip)) = &ref_move {
+            if let Some(move_info) = &ref_move {
+                let branch = &move_info.branch;
                 // Only once the confined child actually exited 0 — a denial
                 // or a failing hook leaves the checked-out branch untouched,
                 // same as before this command ran.
                 if exec_outcome == crate::ExecOutcome::Passed {
                     match crate::git_hardening::advance_own_branch_ref(
-                        std::path::Path::new(workspace),
+                        &move_info.identity,
                         branch,
-                        old_tip,
+                        &move_info.old_tip,
                     ) {
-                        Ok(()) => {
+                        Ok(_new_oid) => {
                             exec_text = exec_text.replace("detached HEAD ", &format!("{branch} "));
                         }
-                        Err(error) => {
+                        Err(refusal) => {
+                            // #2686 review round 3, P2: a refused publication
+                            // is a FAILURE of this tool call, not a passed
+                            // one with different text — the model's requested
+                            // branch update did not happen.
+                            exec_outcome = crate::ExecOutcome::Failed;
+                            let candidate = refusal
+                                .candidate_oid
+                                .as_deref()
+                                .map(|oid| format!(" The commit exists, unpublished, as {oid}."))
+                                .unwrap_or_default();
                             exec_text = format!(
                                 "error: the commit was created but refused publication to \
-                                 branch '{branch}': {error}. No branch ref moved; retry the commit."
+                                 branch '{branch}': {refusal}.{candidate} No branch ref moved; \
+                                 retry the commit."
                             );
                         }
                     }
+                } else if let Some(candidate) = crate::git_hardening::detached_commit_candidate(
+                    &move_info.identity,
+                    &move_info.old_tip,
+                ) {
+                    // The dispatch itself did not exit 0 (e.g. a compound
+                    // `git commit … && false`) — never publish behind a
+                    // reported failure, but don't lose the commit silently
+                    // either: name its oid so it is recoverable.
+                    exec_text = format!(
+                        "{exec_text}\nnote: a commit was created on detached HEAD but left \
+                         unpublished because the dispatch did not succeed: {candidate}. It is \
+                         reachable only by this SHA until a retried commit publishes it."
+                    );
                 }
                 // Always reattach, success or failure alike — an unpaired
                 // detach leaves the worktree stuck on a detached HEAD for
                 // every subsequent git command in this session.
-                if let Err(error) = crate::git_hardening::reattach_own_head(
-                    std::path::Path::new(workspace),
-                    branch,
-                ) {
+                if let Err(error) =
+                    crate::git_hardening::reattach_own_head(&move_info.identity, branch)
+                {
+                    exec_outcome = crate::ExecOutcome::Failed;
                     exec_text = format!(
-                        "{exec_text}\nwarning: could not restore branch '{branch}' as HEAD: {error}"
+                        "{exec_text}\nerror: could not restore branch '{branch}' as HEAD: {error}"
                     );
+                }
+                if let Some(guard) = detach_guard.as_mut() {
+                    guard.resolve();
                 }
             }
             let result = executed((exec_text, exec_outcome));
