@@ -1458,6 +1458,83 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
     );
 }
 
+/// A command broker that changes nothing — stands in for `NativeGitBroker`
+/// so this test exercises the real `CommandBroker`-bearing dispatch path
+/// without needing a real repository or signing key.
+struct NoopBroker;
+
+impl agent_bridle_tool_shell::CommandBroker for NoopBroker {
+    fn prepare(
+        &self,
+        _command: &agent_bridle_tool_shell::BrokerCommand,
+        _context: &agent_bridle::ToolContext,
+        _control: &agent_bridle_tool_shell::BrokerControl,
+    ) -> agent_bridle::ToolResult<Option<agent_bridle_tool_shell::PreparedBrokerCommand>> {
+        Ok(None)
+    }
+}
+
+/// #2689 regression: a broker-bearing exec denial (a `git commit` command,
+/// which installs the attribution/signing broker — see `needs_commit_broker`)
+/// must take the SAME operator-prompt path as any other exec denial. Before
+/// the fix, `exec_confined_command_with_broker` returned the denial the
+/// moment `command_broker.is_some()`, before `permission_gate.ask_with_caveats`
+/// was ever called — so an operator's "allow once" had nothing to land on and
+/// a broker-bearing commit could never be let through without a durable
+/// grant (the reported symptom: repeated "capability denied" for `git`).
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_broker() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let denied = Caveats {
+        exec: Scope::none(),
+        // Isolate the exec-retry lifecycle from macOS's unsupported network floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+    let broker: std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker> =
+        std::sync::Arc::new(NoopBroker);
+
+    let out = shell::exec_confined_command_with_broker(
+        "/bin/echo broker-retry-visible",
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        Some(broker),
+        &mut None,
+    )
+    .await;
+
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "a broker-bearing exec denial must consult the gate exactly like any \
+         other exec denial: {}",
+        out.0
+    );
+    assert!(
+        out.0.contains("broker-retry-visible"),
+        "the operator's allow-once must let the broker-bearing command \
+         through on retry, broker still attached: {}",
+        out.0
+    );
+    assert_eq!(out.1, ExecOutcome::Passed, "{}", out.0);
+}
+
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
 /// A harmless test executable is reached through temporary non-system symlinks;
 /// granting one must launch it without granting its same-named sibling.

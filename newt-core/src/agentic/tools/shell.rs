@@ -1041,8 +1041,18 @@ pub(super) async fn exec_confined_command(
 }
 
 /// Broker-bearing native commands use Brush's runtime external-command hook.
-/// They retain the complete source and grant and are never replayed after a
-/// runtime denial: an earlier stage may already have changed the repository.
+///
+/// #2689: a structured exec denial takes the operator to the SAME interactive
+/// `permission_gate.ask_with_caveats` prompt as any other exec denial, and an
+/// allow-once retries THIS SAME call with `command_broker` still attached —
+/// the attribution/signing policy applies to the replay exactly as it would
+/// have to the original attempt. This repeats whatever an earlier `&&`/`;`
+/// stage already did, same as the existing non-broker retry a few lines
+/// down — accepted here for the identical reason: before this fix an
+/// allow-once could never satisfy a broker-bearing denial at all. This is the
+/// model-synchronous retry inside one call; it is distinct from the
+/// model-driven `request_permissions`/`PendingRerun` replay in `tools.rs`,
+/// which still excludes a commit-broker command (`commit_broker_used`).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn exec_confined_command_with_broker(
     cmd: &str,
@@ -1225,17 +1235,16 @@ pub(super) async fn exec_confined_command_with_broker(
                     crate::denial_journal::DenialStage::Initial,
                     &envelope,
                 );
-                if command_broker.is_some() {
-                    return with_denial_context(
-                        (
-                            denied_run_command_result(&envelope, color),
-                            ExecOutcome::Denied,
-                        ),
-                        workspace,
-                        cwd,
-                        Some(caveats),
-                    );
-                }
+                // #2689: a broker-bearing command (a native Git commit — see
+                // `needs_commit_broker`) takes the SAME operator-prompt path
+                // as any other exec denial below. It used to return here
+                // unconditionally, before `permission_gate.ask_with_caveats`
+                // was ever called — so an operator's "allow once" had nothing
+                // to land on and a broker-bearing commit could never be let
+                // through without a durable grant. The retry a few lines down
+                // carries `command_broker` along, so the broker's
+                // attribution/signing policy still applies to the replay.
+                //
                 // #263: an interactive gate may turn this denial into a human grant.
                 // ONE consult + ONE re-execution per call: a second denial (a
                 // different target reached on the re-run) surfaces as the standard
@@ -1278,13 +1287,32 @@ pub(super) async fn exec_confined_command_with_broker(
                             {
                                 return (format!("error: {refusal}"), ExecOutcome::Unavailable);
                             }
-                            let retried = match dispatch_bridled_shell(
-                                dispatch_args,
-                                &widened,
-                                live_tool_output,
-                            )
-                            .await
-                            {
+                            // #2689: carry the broker into the retry — a
+                            // broker-bearing command must keep applying its
+                            // attribution/signing policy on the replay, not
+                            // silently fall back to an unbrokered dispatch.
+                            let retry = match command_broker {
+                                Some(broker) => {
+                                    dispatch_bridled_shell_with_floor(
+                                        dispatch_args,
+                                        &widened,
+                                        live_tool_output,
+                                        None,
+                                        None,
+                                        Some(broker),
+                                    )
+                                    .await
+                                }
+                                None => {
+                                    dispatch_bridled_shell(
+                                        dispatch_args,
+                                        &widened,
+                                        live_tool_output,
+                                    )
+                                    .await
+                                }
+                            };
+                            let retried = match retry {
                                 Ok(env2) if envelope_denied(&env2) => {
                                     crate::denial_journal::record_envelope(
                                         cmd,
