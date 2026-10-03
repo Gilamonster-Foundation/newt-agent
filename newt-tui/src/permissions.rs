@@ -1867,6 +1867,12 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             .remove(&(kind, target.to_string()));
     }
 
+    fn queue_pending_once(&mut self, kind: newt_core::DenialKind, target: &str) {
+        self.state
+            .pending_once_grants
+            .insert((kind, target.to_string()));
+    }
+
     fn ask_with_caveats(
         &mut self,
         baseline: &newt_core::Caveats,

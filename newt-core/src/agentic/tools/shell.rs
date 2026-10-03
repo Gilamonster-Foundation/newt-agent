@@ -11,8 +11,8 @@ use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
 use super::{
-    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled,
-    permission_granted_result, resolve_tool_alias, AliasOutcome,
+    denial_context, denial_recovery_hint, exec_denial_is_replay_safe, full_access_requested,
+    ocap_disabled, permission_granted_result, resolve_tool_alias, AliasOutcome,
 };
 use crate::ExecOutcome;
 
@@ -1047,10 +1047,11 @@ pub(super) async fn exec_confined_command(
 /// retry below replays THIS SAME call — with `command_broker` still
 /// attached, so the attribution/signing policy applies to the replay exactly
 /// as it would have to the original attempt — ONLY when
-/// `is_safely_replayable` proves the denied command is a single simple
-/// command: no chain, substitution, pipeline, loop, or redirect that could
-/// already have run an earlier stage's effect, or would repeat one on
-/// replay (#2681 round 3's rule). Anything else records the call-local
+/// `exec_denial_is_replay_safe` (reused from `tools.rs`, #2681 round 3)
+/// proves the denied command is a single simple command: no chain,
+/// substitution, pipeline, loop, or redirect that could already have run an
+/// earlier stage's effect, or would repeat one on replay. Anything else
+/// records the call-local
 /// allow-once grant in the gate's pending-once queue and reports the grant
 /// without replaying, so the model's own retry picks it up with no second
 /// prompt. This is the model-synchronous retry inside one call; it is
@@ -1279,14 +1280,19 @@ pub(super) async fn exec_confined_command_with_broker(
                             // mid-dispatch, so an earlier stage of `cmd` may
                             // already have run a real effect, or may be the
                             // ONE effect a whole-command replay would repeat
-                            // (see `is_safely_replayable`'s doc comment for
-                            // both measured shapes). Replay only when `cmd`
-                            // is provably a single simple command; otherwise
-                            // hold the grant in the gate's pending-once queue
-                            // for the model's own next matching call instead
-                            // of spending it on a replay that could duplicate
-                            // an effect.
-                            if !is_safely_replayable(cmd) {
+                            // (see `exec_denial_is_replay_safe`'s doc comment
+                            // in `tools.rs` for both measured shapes — reused
+                            // here rather than a second predicate). Replay
+                            // only when EVERY denied target is provably a
+                            // single simple command naming it; otherwise hold
+                            // the grant in the gate's pending-once queue for
+                            // the model's own next matching call instead of
+                            // spending it on a replay that could duplicate an
+                            // effect.
+                            if !requests
+                                .iter()
+                                .all(|request| exec_denial_is_replay_safe(&request.target, cmd))
+                            {
                                 for request in &requests {
                                     gate.queue_pending_once(request.kind, &request.target);
                                 }
@@ -2786,33 +2792,6 @@ fn is_structural_refusal(reason: &str) -> bool {
     reason.contains("refused by design:")
         || reason.contains("dynamic construct the confined shell")
         || reason.contains("not yet supported by the confined shell")
-}
-
-/// #2689/#2681 round 3: may `cmd` be auto-replayed whole after an operator
-/// grant? An exec/net denial fires mid-dispatch — unlike the FS pre-flight
-/// check, which runs before anything is dispatched at all — so an earlier
-/// stage in a `&&`/`;` chain, or an earlier stage of a pipeline, may already
-/// have run a real effect (a write, a commit) before the denied spawn was
-/// even attempted. Blindly re-dispatching the whole source on grant would
-/// repeat that effect (`echo x >> f && git commit -m m`), or — if the EARLIER
-/// stage is the one that already succeeded — repeat ITS effect instead
-/// (`git commit -m m && false-denied-prog`).
-///
-/// The simplest sound rule: replay only when `cmd` is PROVABLY a single
-/// simple command with nothing else that could have run or could run again —
-/// `agent_bridle::inspect_shell`'s flattened, non-executing inventory makes
-/// this checkable without executing anything. Fails closed (false) on an
-/// inspection error, more than one command, any dynamic construct (command
-/// substitution, backquotes, arithmetic), any redirect on that one command,
-/// or any topology warning (`&&`/`||`, `|`, `!`, `time`, `&` background, a
-/// `for` loop — see `agent_bridle_tool_shell::shell_inspect`'s warnings).
-fn is_safely_replayable(cmd: &str) -> bool {
-    agent_bridle::inspect_shell(cmd).is_ok_and(|inspection| {
-        inspection.commands.len() == 1
-            && inspection.constructs.is_empty()
-            && inspection.warnings.is_empty()
-            && inspection.commands[0].redirects.is_empty()
-    })
 }
 
 pub(super) fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRequest>> {

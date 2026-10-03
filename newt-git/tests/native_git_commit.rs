@@ -135,6 +135,9 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
     );
     println!("test composed_commit_is_native_attributed_and_signed ... ok");
 
+    broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution(&repo, &tool, &allowed)
+        .await;
+
     // A direct command's broker does not cover a native dispatcher's child.
     // Preflight must reject the whole source before even its first commit.
     for source in [
@@ -435,6 +438,126 @@ impl newt_core::PermissionGate for DenyingParentGate {
     fn ask_question(&mut self, _: &str) -> newt_core::HumanQuestionOutcome {
         newt_core::HumanQuestionOutcome::Unavailable
     }
+}
+
+/// Always grants, counting how many times the gate was consulted — the
+/// production-equivalent broker seam for #2689/#2681 round 3: this exercises
+/// the REAL `NEWT_SHELL_ENGINE=brush` dispatch and the real `LocalGitTool`
+/// broker (attribution + SSH signing), never the `#[cfg(test)]` safe-subset
+/// substitute newt-core's own unit tests are confined to (that substitute
+/// drops `command_broker` entirely — see `bridle_registry`'s `#[cfg(test)]
+/// let _ = &command_broker;` — so no newt-core unit test can ground a claim
+/// about the broker's attribution/signing policy surviving a replay).
+#[derive(Default)]
+struct CountingAllowGate {
+    asks: usize,
+}
+
+impl newt_core::PermissionGate for CountingAllowGate {
+    fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
+        self.asks += 1;
+        let _ = requests;
+        newt_core::PermissionDecision::Allow(newt_core::Caveats::top())
+    }
+
+    fn ask_question(&mut self, _: &str) -> newt_core::HumanQuestionOutcome {
+        newt_core::HumanQuestionOutcome::Unavailable
+    }
+}
+
+/// #2689/#2681 round 3 (P2): a broker-bearing commit denial must consult the
+/// SAME interactive gate as any other exec denial, and the retry must keep
+/// applying the broker's attribution/signing policy — not silently fall back
+/// to an unbrokered dispatch, which would publish an unsigned, unattributed
+/// commit. Reverting ONLY the broker-carrying retry (so the grant replays
+/// through `dispatch_bridled_shell` instead of `dispatch_bridled_shell_with_
+/// floor(..., Some(broker))`) makes this fail: the commit still publishes
+/// (the confined dispatch has no OTHER broker-shaped guard on a `git commit`
+/// that already cleared exec authority), but with no `Co-authored-by:`
+/// trailer and no SSH signature — measured directly, not assumed.
+///
+/// A LATER commit must prompt again: the grant is a single allow-once, never
+/// a durable exec grant that would let a second, separately-unreviewed
+/// commit through silently.
+async fn broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution(
+    repo: &std::path::Path,
+    tool: &newt_git::LocalGitTool,
+    allowed_signers: &std::path::Path,
+) {
+    let narrow_exec = newt_core::Caveats {
+        exec: newt_core::Scope::none(),
+        fs_read: newt_core::Scope::only([repo.to_string_lossy().into_owned()]),
+        fs_write: newt_core::Scope::only([repo.to_string_lossy().into_owned()]),
+        ..newt_core::Caveats::top()
+    };
+    let mut gate = CountingAllowGate::default();
+
+    let before = git(repo, &["rev-parse", "HEAD"]).stdout;
+    let output = execute_gated(
+        repo,
+        tool,
+        &narrow_exec,
+        "run_command",
+        &serde_json::json!({"command": "git commit --allow-empty -m 'gated fixture commit'"}),
+        &mut gate,
+    )
+    .await;
+    assert_succeeded(&output);
+    assert_eq!(
+        gate.asks, 1,
+        "a broker-bearing exec denial must consult the gate exactly once \
+         before retrying: {output}"
+    );
+    assert_ne!(
+        git(repo, &["rev-parse", "HEAD"]).stdout,
+        before,
+        "the allow-once grant must let the retry publish: {output}"
+    );
+    let message = String::from_utf8(git(repo, &["log", "-1", "--format=%B"]).stdout).unwrap();
+    assert!(message.contains("gated fixture commit"), "{message}");
+    assert!(message.contains("fixture-model"), "{message}");
+    assert!(
+        message.contains("Co-authored-by:"),
+        "the retry must keep the broker attached, not fall back to an \
+         unbrokered dispatch that would publish without attribution: {message}"
+    );
+    assert_eq!(tool.drain_commit_success(), 1);
+    git(
+        repo,
+        &[
+            "-c",
+            &format!("gpg.ssh.allowedSignersFile={}", allowed_signers.display()),
+            "verify-commit",
+            "HEAD",
+        ],
+    );
+
+    // A later commit must prompt again — the allow-once grant does not persist.
+    let before = git(repo, &["rev-parse", "HEAD"]).stdout;
+    let output = execute_gated(
+        repo,
+        tool,
+        &narrow_exec,
+        "run_command",
+        &serde_json::json!({"command": "git commit --allow-empty -m 'second gated commit'"}),
+        &mut gate,
+    )
+    .await;
+    assert_succeeded(&output);
+    assert_eq!(
+        gate.asks, 2,
+        "a later commit must prompt the gate again, not silently reuse the \
+         prior allow-once: {output}"
+    );
+    assert_ne!(
+        git(repo, &["rev-parse", "HEAD"]).stdout,
+        before,
+        "{output}"
+    );
+    assert_eq!(tool.drain_commit_success(), 1);
+    println!(
+        "test broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution ... ok"
+    );
 }
 
 async fn denied_parent_keeps_child_authority(

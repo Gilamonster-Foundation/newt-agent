@@ -326,6 +326,15 @@ pub trait PermissionGate {
     /// such queue have nothing to drop.
     fn consume_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
 
+    /// #2689/#2681 round 3: the inverse of [`Self::consume_pending_once`] —
+    /// a caller that just received `Allow(kind, target)` but is NOT spending
+    /// it on an immediate, one-shot action (because replaying the denied
+    /// command is not provably safe) tells the gate to hold the grant for
+    /// the model's own next matching call instead, exactly as the ordinary
+    /// request→retry flow already does for `request_permissions`. Default
+    /// no-op: gates with no such queue have nothing to hold.
+    fn queue_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
+
     /// Ask for additions to this invocation's authority, retaining its caller
     /// bounds and prior one-shot grants. Legacy gates may conservatively drop
     /// prior call-only authority, but cannot restore unrelated broader authority.

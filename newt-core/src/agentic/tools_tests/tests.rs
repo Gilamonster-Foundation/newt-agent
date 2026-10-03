@@ -75,9 +75,14 @@ mod shell_authority;
 // fence. On Windows, `own_gitdir_grants` resolves no write set, so the grant
 // fails closed (no shell write on git metadata) and these real-git tests do
 // not apply.
+//
+// `pub(in crate::agentic::tools)`, not private: #2681 round 3's
+// `execute_tool_branch_tests::permissions` tests reuse [`git_shell_grant::
+// hermetic_git`] for their own real-git fixture rather than open-coding a
+// second one that inherits the ambient `GIT_DIR`/`HOME`/hooks.
 #[cfg(all(test, unix))]
 #[path = "helper_git_shell_grant.rs"]
-mod git_shell_grant;
+pub(in crate::agentic::tools) mod git_shell_grant;
 
 // #2274 part 1 — a binary the carried userland does not carry must produce a
 // NAMED refusal, distinguishable from a grant denial and from a binary that is

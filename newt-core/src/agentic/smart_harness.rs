@@ -213,6 +213,10 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
     fn consume_pending_once(&mut self, kind: super::permissions::DenialKind, target: &str) {
         self.inner.consume_pending_once(kind, target);
     }
+
+    fn queue_pending_once(&mut self, kind: super::permissions::DenialKind, target: &str) {
+        self.inner.queue_pending_once(kind, target);
+    }
 }
 
 /// Transport-free session plus a bounded, tool-less inference callback.
