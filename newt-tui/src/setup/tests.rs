@@ -3063,3 +3063,112 @@ fn setup_writes_the_sandbox_git_profile_through_settings() {
         console.transcript()
     );
 }
+
+/// #2660, red-first: appending `offer_caveat_pack` after `offer_sandbox_git`
+/// must not disturb every existing scripted test that stops providing
+/// answers once the backend write completes — `Script` returns a blank for
+/// every question asked after its queue runs dry, and "writes files: blank
+/// must not consent" (the same rule the backend-write confirm already uses)
+/// means a dry queue must decline both new prompts (exclude names, then
+/// sign-and-write) and leave `approve.toml` untouched.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_declines_on_blank_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    let console = ScriptedConsole::new(&[]);
+
+    offer_caveat_pack(&console.operator(), &config_path, Some("127.0.0.1"));
+
+    assert!(
+        !config_path
+            .with_file_name("ocap")
+            .join("approve.toml")
+            .exists(),
+        "a dry answer queue must decline the write, not default to it"
+    );
+}
+
+/// #2660: the standard pack signs the low-danger text tools and the
+/// configured host, names `awk`/`xargs`/`sh` as high-danger without ever
+/// signing them, and never lists `git`/`gh` at all. The signed result is
+/// verified back through the REAL gate question
+/// (`ocap_store::evaluate_request`) with the SAME root key the step just
+/// minted — proving a listed tool/host is granted and an unlisted one still
+/// falls through to the prompt, per #2660's acceptance contract.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_signs_low_danger_defers_high_danger_excludes_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+
+    offer_caveat_pack(&console.operator(), &config_path, Some("127.0.0.1"));
+
+    let transcript = console.transcript();
+    assert!(transcript.contains("exec  cat"), "{transcript}");
+    for high in ["awk", "xargs", "sh"] {
+        assert!(
+            transcript.contains(high),
+            "high-danger target named in the review: {transcript}"
+        );
+    }
+    assert!(!transcript.contains("exec  git"), "{transcript}");
+    assert!(!transcript.contains("exec  gh"), "{transcript}");
+
+    let key_path = newt_identity::default_key_path().unwrap();
+    let user = newt_identity::load_or_generate(&key_path).unwrap();
+    let (set, warnings) =
+        newt_core::ocap_store::load_store(&config_path, Some(user.public().as_bytes()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "cat"),
+        Some(newt_core::ocap_store::Verdict::Approve),
+        "a listed tool is durably granted"
+    );
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Net, "127.0.0.1"),
+        Some(newt_core::ocap_store::Verdict::Approve),
+        "the configured host is durably granted"
+    );
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "awk"),
+        None,
+        "a named high-danger target is never durably signed"
+    );
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "git"),
+        None,
+        "an unlisted tool still falls through to the interactive gate"
+    );
+}
+
+/// #2660: "every entry is visible and removable" — the operator can exclude
+/// one by name before anything is signed.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_exclude_prompt_removes_the_named_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    // exclude: "cat"; sign-and-write: y.
+    let console = ScriptedConsole::new(&["cat", "y"]);
+
+    offer_caveat_pack(&console.operator(), &config_path, None);
+
+    let approve_path = config_path.with_file_name("ocap").join("approve.toml");
+    let text = std::fs::read_to_string(&approve_path).unwrap();
+    let file = newt_core::ocap_store::PolicyFile::parse(&text).unwrap();
+    assert!(
+        !file.exec.iter().any(|e| e.target == "cat"),
+        "excluded entry was still signed: {file:?}"
+    );
+    assert!(
+        file.exec.iter().any(|e| e.target == "head"),
+        "a non-excluded entry was still written: {file:?}"
+    );
+}

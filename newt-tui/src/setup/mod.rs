@@ -628,6 +628,7 @@ async fn run_with_flow(
     // land in one sitting. With several written, the default is picked at
     // the end (until then, each committed setup round selects its backend).
     let mut written: Vec<String> = Vec::new();
+    let mut last_endpoint: Option<String> = None;
     loop {
         let (cfg, backend, pending_token) = match choose_backend(op)? {
             BackendChoice::LocalOllama => configure_ollama(op, client).await?,
@@ -672,6 +673,7 @@ async fn run_with_flow(
                 dropin.display()
             ));
             written.push(backend.name.clone());
+            last_endpoint = Some(backend.endpoint.clone());
         }
 
         if !decide(
@@ -707,6 +709,11 @@ async fn run_with_flow(
     op.say("Edit those files (or re-run `newt setup`) to change anything.");
     offer_identity(op);
     offer_sandbox_git(op);
+    let backend_host = last_endpoint
+        .as_deref()
+        .and_then(|e| reqwest::Url::parse(e).ok())
+        .and_then(|u| u.host_str().map(str::to_string));
+    offer_caveat_pack(op, config_path, backend_host.as_deref());
     Ok(())
 }
 
@@ -728,6 +735,185 @@ fn offer_sandbox_git(op: &Operator<'_>) {
             op.say(&format!("  {line}"));
         }
     }
+}
+
+/// Offer the first-run/setup **standard caveat pack** (#2660): common
+/// read-only text tools (+ the backend host just configured) as durable,
+/// SIGNED `approve.toml` candidates — so the routine "run_command wants to
+/// run `cat` — outside the granted exec allowlist" prompt stops firing every
+/// session for exactly these tools (the 2026-10-02 retest: 129 prompts in
+/// one run, mostly for `git`/`find`/`sort`/`head`/`grep`/`sed`/`awk`/
+/// `xargs`).
+///
+/// `git`/`gh` are never offered — see `newt_core::caveat_pack`'s module docs
+/// for why: git authority already goes through the governed staging-repo
+/// push/PR broker (#2641, merged) and the worktree-commit ref grant (#2682,
+/// open), neither of which is a plain exec-allowlist entry. A named
+/// high-danger candidate (`awk`/`xargs`/`sh`) is shown with its reason, never
+/// signed: `ocap_store::sign_approves` unconditionally refuses a high-danger
+/// target, so there is no durable "opt in" that changes that today.
+///
+/// Every candidate is visible before anything is written, and removable —
+/// the operator can exclude any by name before the pack is signed. A failure
+/// here (fs, parse, signing) is reported and swallowed, never propagated: a
+/// problem in this last, optional step must not make a successful backend
+/// write look like a failed `newt setup`.
+fn offer_caveat_pack(op: &Operator<'_>, config_path: &Path, backend_host: Option<&str>) {
+    if let Err(e) = try_offer_caveat_pack(op, config_path, backend_host) {
+        op.say(&format!("\nStandard caveat pack: {e:#} — skipped."));
+    }
+}
+
+fn try_offer_caveat_pack(
+    op: &Operator<'_>,
+    config_path: &Path,
+    backend_host: Option<&str>,
+) -> anyhow::Result<()> {
+    use newt_core::caveat_pack::{
+        merge_candidates, propose_standard_pack, CaveatPackDropIn, STANDARD_TEXT_TOOLS,
+    };
+    use newt_core::ocap_propose::in_policy_pairs;
+    use newt_core::ocap_store::{build_store, lock_approve_file, PolicyFile, Verdict, VERDICTS};
+
+    let store_dir = config_path.with_file_name("ocap");
+    let store_files: Vec<(Verdict, Option<String>)> = VERDICTS
+        .iter()
+        .map(|&v| {
+            (
+                v,
+                std::fs::read_to_string(store_dir.join(v.filename())).ok(),
+            )
+        })
+        .collect();
+    let (set, _warnings) = build_store(&store_files);
+    let in_policy = in_policy_pairs(&set);
+
+    let drop_in_path = config_path.with_file_name("caveat-pack.toml");
+    let drop_in = match std::fs::read_to_string(&drop_in_path) {
+        Ok(text) => match CaveatPackDropIn::parse(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                op.say(&format!(
+                    "\nStandard caveat pack: {e} — ignoring the drop-in."
+                ));
+                CaveatPackDropIn::default()
+            }
+        },
+        Err(_) => CaveatPackDropIn::default(),
+    };
+    let exec_candidates = merge_candidates(STANDARD_TEXT_TOOLS, &drop_in.exec);
+    let net_builtin: Vec<&str> = backend_host.into_iter().collect();
+    let net_candidates = merge_candidates(&net_builtin, &drop_in.net);
+
+    let today = crate::probe::today_local_date();
+    let proposal = propose_standard_pack(
+        &exec_candidates,
+        &net_candidates,
+        &in_policy,
+        crate::ocap_high_danger_predicate(),
+        &today,
+    );
+    if proposal.is_empty() {
+        op.say("\nStandard caveat pack: the current policy already covers it.");
+        return Ok(());
+    }
+
+    op.say(
+        "\nStandard caveat pack: common read-only text tools, plus the endpoint you just \
+         configured. Signing these now stops the routine permission prompt for each of them \
+         (`/permissions` edits this later; the model never can):",
+    );
+    for e in &proposal.additions.exec {
+        op.say(&format!("  exec  {}", e.target));
+    }
+    for e in &proposal.additions.net {
+        op.say(&format!("  net   {}", e.host));
+    }
+    if !proposal.deferred.is_empty() {
+        op.say("  Not included (durable approval is refused by policy — named here so they don't silently keep prompting):");
+        for d in &proposal.deferred {
+            op.say(&format!("    {} — {}", d.target, d.reason));
+        }
+    }
+    if proposal.additions.exec.is_empty() && proposal.additions.net.is_empty() {
+        return Ok(());
+    }
+
+    let exclude_raw = op
+        .ask(&interaction_form::text_field(
+            "Exclude any by name?",
+            "comma-separated, Enter to keep all",
+        ))
+        .unwrap_or_default();
+    let excluded: std::collections::HashSet<&str> = exclude_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut additions = proposal.additions;
+    additions
+        .exec
+        .retain(|e| !excluded.contains(e.target.as_str()));
+    additions
+        .net
+        .retain(|e| !excluded.contains(e.host.as_str()));
+    let kept = additions.exec.len() + additions.net.len();
+    if kept == 0 {
+        op.say("  All candidates excluded; nothing written.");
+        return Ok(());
+    }
+
+    if !decide(
+        op,
+        &interaction_form::confirm(
+            format!(
+                "Sign and write {kept} entr{}?",
+                if kept == 1 { "y" } else { "ies" }
+            ),
+            "",
+            "yes, sign it",
+            "no, skip",
+        ),
+        // Writes files: blank must not consent.
+        None,
+    )
+    .unwrap_or(false)
+    {
+        op.say("  Skipped. Nothing written.");
+        return Ok(());
+    }
+
+    let (destination, _lock) = lock_approve_file(config_path)?;
+    let approve_path = destination.as_path().to_path_buf();
+    let mut merged = match std::fs::read_to_string(&approve_path) {
+        Ok(text) => PolicyFile::parse(&text).map_err(|e| anyhow::anyhow!("approve.toml: {e}"))?,
+        Err(_) => PolicyFile::default(),
+    };
+    merged.exec.extend(additions.exec);
+    merged.net.extend(additions.net);
+
+    let key_path = newt_identity::default_key_path()?;
+    let user = newt_identity::load_or_generate(&key_path)?;
+    let (signed, refused) = newt_core::ocap_store::sign_approves(
+        &mut merged,
+        crate::ocap_high_danger_predicate(),
+        |payload| user.sign(payload).to_bytes(),
+    );
+    destination
+        .atomic_write(merged.to_toml().map_err(|e| anyhow::anyhow!(e))?.as_bytes())
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", approve_path.display()))?;
+
+    op.say(&format!(
+        "  Signed {signed} entr{} into {} (root key {}).",
+        if signed == 1 { "y" } else { "ies" },
+        approve_path.display(),
+        key_path.display()
+    ));
+    for r in &refused {
+        op.say(&format!("    refused: {r}"));
+    }
+    Ok(())
 }
 
 fn persist_default_backend(config_path: &Path, chosen: &str) -> anyhow::Result<()> {
