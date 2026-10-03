@@ -48,6 +48,23 @@ fn hermetic_git(dir: &std::path::Path, home: &std::path::Path) -> std::process::
     cmd
 }
 
+/// The real-kernel-fence tests in this file need Landlock AND the
+/// root-owned fixture git; both are present in CI. A bare `return` on
+/// either being missing would make a quietly-green local run look identical
+/// to one that measured nothing — print an explicit line so a skip is
+/// visible in test output instead (#2686 review round 2).
+fn skip_without_real_kernel_fence() -> bool {
+    let available = crate::confined_exec::kernel_fs_fence_available()
+        && std::path::Path::new(FIXTURE_GIT).exists();
+    if !available {
+        eprintln!(
+            "skip: real-kernel-fence test requires Landlock + {FIXTURE_GIT}, neither of \
+             which is available on this host"
+        );
+    }
+    !available
+}
+
 /// Unconfined fixture setup (`init`/`add`/`commit`/`worktree add`) under a
 /// throwaway private `HOME` that lives only for the one command.
 fn real_git(dir: &std::path::Path, args: &[&str]) {
@@ -73,9 +90,7 @@ fn real_git(dir: &std::path::Path, args: &[&str]) {
 async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_branch() {
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
-    if !crate::confined_exec::kernel_fs_fence_available()
-        || !std::path::Path::new(FIXTURE_GIT).exists()
-    {
+    if skip_without_real_kernel_fence() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -161,9 +176,7 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn confined_shell_git_worktree_add_succeeds_under_a_git_only_exec_grant() {
-    if !crate::confined_exec::kernel_fs_fence_available()
-        || !std::path::Path::new(FIXTURE_GIT).exists()
-    {
+    if skip_without_real_kernel_fence() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -282,9 +295,7 @@ async fn hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture() {
         worktree_add_under_git_only_exec_grant(std::path::Path::new(&root)).await;
         return;
     }
-    if !crate::confined_exec::kernel_fs_fence_available()
-        || !std::path::Path::new(FIXTURE_GIT).exists()
-    {
+    if skip_without_real_kernel_fence() {
         return;
     }
 
@@ -371,22 +382,29 @@ async fn hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture() {
 /// production shape `apply_cli_fs_grants` builds — `fs_write` scoped to the
 /// worktree only, with the common gitdir reached only through the per-
 /// dispatch widening below), a `git commit` must succeed there, not only
-/// `git add`. Would have failed before the fix: the widening granted write
-/// on the worktree's own admin dir (`index`/`index.lock`/`HEAD`) and the
-/// common `objects/`, but NOT the common dir's `refs/heads/<branch>[.lock]`
-/// or its `logs/refs/heads/<branch>` reflog — both of which `git commit`
-/// updates to advance the checked-out branch, and both of which live in the
-/// common dir even for a linked worktree. `git add` alone never touches a
-/// ref, so this gap was invisible to the pre-existing `git add`-only proof
-/// below.
+/// `git add`.
+///
+/// Round 2 (#2686 review round 2): a confined `git commit` no longer gets
+/// write on the common dir's `refs/heads/`/`logs/refs/heads/` AT ALL — round
+/// 5 (`8c537f17`) granted those two directories so `git commit` could
+/// advance the checked-out branch's own ref, but a directory-wide grant
+/// there covers EVERY branch's ref/reflog, and a compound command's second,
+/// non-`git` segment can reach them (`confined_shell_cannot_redirect_…`
+/// below, red under that grant). This test now drives the REPLACEMENT
+/// mechanism end to end: `HEAD` detached at the branch's current tip
+/// ([`crate::git_hardening::detach_own_head`]) so the confined commit only
+/// ever touches `objects/` + the worktree's own admin dir, then the
+/// host-side, bounded `update-ref`
+/// ([`crate::git_hardening::advance_own_branch_ref`]) that publishes it,
+/// then reattachment ([`crate::git_hardening::reattach_own_head`]) — the
+/// exact sequence `agentic::tools`'s `run_command` arm performs around this
+/// same confined dispatch.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_default_branch() {
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
-    if !crate::confined_exec::kernel_fs_fence_available()
-        || !std::path::Path::new(FIXTURE_GIT).exists()
-    {
+    if skip_without_real_kernel_fence() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -418,15 +436,20 @@ async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_defaul
         net: crate::caveats::Scope::none(),
         ..crate::caveats::Caveats::top()
     };
-    let widened = super::shell::dispatch_caveats_for_git_shell(
-        "git add f.txt && git commit -q -m update",
-        &wt.to_string_lossy(),
-        &session,
-    );
+    let cmd = "git add f.txt && git commit -q -m update";
+    let widened =
+        super::shell::dispatch_caveats_for_git_shell(cmd, &wt.to_string_lossy(), &session);
+
+    // What `agentic::tools`'s `run_command` arm does before the confined
+    // dispatch: resolve the branch/tip and detach HEAD to it.
+    let (branch, old_tip) = crate::git_hardening::own_branch_for_commit_ref_move(&wt)
+        .expect("task is a non-default, born branch");
+    assert_eq!(branch, "task");
+    crate::git_hardening::detach_own_head(&wt, &old_tip).unwrap();
 
     let envelope = super::shell::dispatch_bridled_shell(
         serde_json::json!({
-            "cmd": "git add f.txt && git commit -q -m update",
+            "cmd": cmd,
             "cwd": wt.to_string_lossy(),
             "env": hermetic_git_env(&home),
         }),
@@ -441,18 +464,238 @@ async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_defaul
     );
     assert_eq!(
         envelope["exit_code"], 0,
-        "git commit must succeed under the widened fence: {envelope}"
+        "git commit must succeed under the (narrowed) fence with HEAD detached: {envelope}"
     );
 
+    // What the arm does after a successful confined dispatch: publish the
+    // detached commit onto the branch, host-side, then reattach.
+    crate::git_hardening::advance_own_branch_ref(&wt, &branch, &old_tip).unwrap();
+    crate::git_hardening::reattach_own_head(&wt, &branch).unwrap();
+
     let log = hermetic_git(&wt, &home)
-        .args(["log", "--oneline", "-1"])
+        .args(["log", "--oneline", "-1", "refs/heads/task"])
         .output()
         .unwrap();
     assert!(
         String::from_utf8_lossy(&log.stdout).contains("update"),
-        "the commit must actually land: {}",
+        "the commit must actually land on refs/heads/task: {}",
         String::from_utf8_lossy(&log.stdout)
     );
+    let branch_ref = hermetic_git(&wt, &home)
+        .args(["symbolic-ref", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&branch_ref.stdout).trim(),
+        "refs/heads/task",
+        "HEAD must be reattached, not left detached"
+    );
+}
+
+/// #2686 review round 2, P1: a compound confined-shell command whose
+/// LEADING program is `git` shares its (possibly widened) fence with every
+/// OTHER program in the same dispatch — `dispatch_caveats_for_git_shell`'s
+/// own doc comment names this as an accepted trade-off for the common
+/// `objects/` directory, but round 5's (`8c537f17`) `refs/heads/`/
+/// `logs/refs/heads/` widening extended the SAME trade-off to every
+/// branch's ref and reflog, not just the checked-out one. A plain shell
+/// redirect is not a `git` VERB, so `inspect_commands`'s unconditional
+/// `update-ref`/`push`/`branch -f` refusal
+/// (`newt-core::agentic::tools::native_git`) never inspects it — the
+/// directory-wide Landlock grant was the only thing standing in the way.
+///
+/// Measured red against `8c537f17` (confirmed by temporarily restoring
+/// round 5's two extra directories to `own_gitdir_grants`/
+/// `own_gitdir_shell_write_grant`): every sub-case below SUCCEEDED
+/// (`exit_code == 0`, sentinel bytes CHANGED) — the compound command
+/// reached past the checked-out branch into a sibling branch's ref/reflog
+/// and into `main`'s own ref/reflog. Green once those two directories are
+/// never granted to a confined child at all.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn confined_shell_cannot_redirect_into_a_sibling_or_default_branch_ref_or_reflog() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    if skip_without_real_kernel_fence() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    real_git(&main, &["init", "-q", "-b", "main"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    real_git(&main, &["add", "seed"]);
+    real_git(&main, &["commit", "-q", "-m", "init"]);
+    // A sibling branch, so its ref/reflog exist to be targeted.
+    real_git(&main, &["branch", "other"]);
+    let wt = root.path().join("wt");
+    real_git(
+        &main,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+    );
+    std::fs::write(wt.join("f.txt"), "hi\n").unwrap();
+    let own_git = crate::git_hardening::own_gitdir_grants(&wt);
+
+    let common = main.join(".git");
+    // `fs_read` includes the own-gitdir read grant (common dir + worktree
+    // gitdir), same as production (`apply_cli_fs_grants`) and the positive
+    // test above — WITHOUT it, `git add` itself fails before the `&&`
+    // reaches the redirect, which would make every sub-case below pass for
+    // the wrong reason (nothing ran) rather than because the redirect was
+    // denied.
+    let mut read_roots = vec![wt.to_string_lossy().into_owned()];
+    read_roots.extend(own_git.read);
+    // `exec` includes `echo` (not just `git`): the realistic shape this
+    // proves is a session that already has ordinary shell exec authority
+    // (the common case), where the FS grant is the only thing that can
+    // stop a redirect — not an artificially git-only exec scope that would
+    // deny `echo` before the FS fence is ever reached.
+    let session = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::only(read_roots),
+        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: crate::caveats::Scope::only(["git".to_string(), "echo".to_string()]),
+        net: crate::caveats::Scope::none(),
+        ..crate::caveats::Caveats::top()
+    };
+
+    for (label, target) in [
+        ("sibling branch's ref", common.join("refs/heads/other")),
+        (
+            "sibling branch's reflog",
+            common.join("logs/refs/heads/other"),
+        ),
+        ("default branch's ref", common.join("refs/heads/main")),
+        (
+            "default branch's reflog",
+            common.join("logs/refs/heads/main"),
+        ),
+    ] {
+        let before = std::fs::read(&target).unwrap_or_default();
+        let cmd = format!("git add f.txt && echo payload >> {}", target.display());
+        let widened =
+            super::shell::dispatch_caveats_for_git_shell(&cmd, &wt.to_string_lossy(), &session);
+        let envelope = super::shell::dispatch_bridled_shell(
+            serde_json::json!({
+                "cmd": cmd,
+                "cwd": wt.to_string_lossy(),
+                "env": hermetic_git_env(&home),
+            }),
+            &widened,
+            None,
+        )
+        .await
+        .expect("dispatch");
+        let after = std::fs::read(&target).unwrap_or_default();
+        assert_eq!(
+            before,
+            after,
+            "{label} ({}) must be byte-identical after a confined-shell commit attempt: {envelope}",
+            target.display()
+        );
+        assert_ne!(
+            envelope["exit_code"], 0,
+            "{label}: the redirect into it must be denied by the kernel fence: {envelope}"
+        );
+    }
+}
+
+/// #2686 review round 2: files OUTSIDE the (now two) granted directories
+/// must stay byte-identical across a confined-shell commit attempt — the
+/// common dir's `config`, its top-level `HEAD` (the MAIN checkout's own
+/// HEAD, never this worktree's), `packed-refs`, and ANOTHER linked
+/// worktree's own admin `HEAD`. None of these were ever in
+/// `own_gitdir_grants`'s write set; this pins that a compound redirect
+/// cannot reach them either, so it can't regress silently later.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn confined_shell_commit_cannot_reach_config_packed_refs_common_head_or_a_foreign_worktree_admin_dir(
+) {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    if skip_without_real_kernel_fence() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    real_git(&main, &["init", "-q", "-b", "main"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    real_git(&main, &["add", "seed"]);
+    real_git(&main, &["commit", "-q", "-m", "init"]);
+    real_git(&main, &["pack-refs", "--all"]);
+    let wt = root.path().join("wt");
+    real_git(
+        &main,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+    );
+    let wt2 = root.path().join("wt2");
+    real_git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt2.to_str().unwrap(),
+            "-b",
+            "other-task",
+        ],
+    );
+    std::fs::write(wt.join("f.txt"), "hi\n").unwrap();
+    let own_git = crate::git_hardening::own_gitdir_grants(&wt);
+
+    let common = main.join(".git");
+    let mut read_roots = vec![wt.to_string_lossy().into_owned()];
+    read_roots.extend(own_git.read);
+    // `exec` includes `echo` for the same reason as the sibling test above.
+    let session = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::only(read_roots),
+        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: crate::caveats::Scope::only(["git".to_string(), "echo".to_string()]),
+        net: crate::caveats::Scope::none(),
+        ..crate::caveats::Caveats::top()
+    };
+
+    for (label, target) in [
+        ("the common dir's config", common.join("config")),
+        ("packed-refs", common.join("packed-refs")),
+        ("the common dir's own top-level HEAD", common.join("HEAD")),
+        (
+            "a foreign worktree's admin HEAD",
+            common.join("worktrees/wt2/HEAD"),
+        ),
+    ] {
+        assert!(
+            target.exists(),
+            "fixture sentinel {label} must exist: {}",
+            target.display()
+        );
+        let before = std::fs::read(&target).unwrap();
+        let cmd = format!("git add f.txt && echo payload >> {}", target.display());
+        let widened =
+            super::shell::dispatch_caveats_for_git_shell(&cmd, &wt.to_string_lossy(), &session);
+        let envelope = super::shell::dispatch_bridled_shell(
+            serde_json::json!({
+                "cmd": cmd,
+                "cwd": wt.to_string_lossy(),
+                "env": hermetic_git_env(&home),
+            }),
+            &widened,
+            None,
+        )
+        .await
+        .expect("dispatch");
+        let after = std::fs::read(&target).unwrap();
+        assert_eq!(
+            before,
+            after,
+            "{label} ({}) must be byte-identical after a confined-shell commit attempt: {envelope}",
+            target.display()
+        );
+    }
 }
 
 /// Item 2(b): the widening is scoped to the ONE dispatch — the SESSION

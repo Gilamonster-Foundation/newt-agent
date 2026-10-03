@@ -76,45 +76,52 @@ pub struct OwnGitGrant {
 /// DIRECTORY rights a file-level Landlock rule cannot carry (round 1's
 /// per-file list was empirically provable to work for the tool's OWN
 /// direct-filesystem writes, but not for a REAL confined shell `git add`
-/// under the kernel fence). So `write` is exactly FOUR DIRECTORIES: the
-/// worktree gitdir itself, the common dir's `objects/` subtree, the common
-/// dir's `refs/heads/` directory, and the common dir's `logs/refs/heads/`
-/// directory. `config`/`hooks/` and every OTHER refs/reflog namespace
-/// (`refs/tags`, `refs/remotes`, `logs/HEAD` at the common-dir level) stay
-/// out of it.
+/// under the kernel fence). So `write` is exactly TWO DIRECTORIES: the
+/// worktree gitdir itself and the common dir's `objects/` subtree.
+/// `config`/`hooks/` and EVERY refs/reflog namespace in the common dir
+/// (`refs/heads`, `refs/tags`, `refs/remotes`, `logs/HEAD`, …) stay out of
+/// it — including the checked-out branch's own `refs/heads/<branch>`.
 ///
-/// #2682: `refs/heads/` and `logs/refs/heads/` are NEW (round 5) — `git add`
-/// alone never touches a ref, so round 3's two-directory grant was never
-/// exercised against a real `git commit`. Measured red, in order: a
-/// confined-shell `git commit` on a linked worktree's own non-default
-/// branch, under exactly round 3's grant, first failed with `fatal: cannot
-/// lock ref 'HEAD': Unable to create '<common>/refs/heads/<branch>.lock':
-/// Permission denied`; adding `refs/heads/` then surfaced `fatal: cannot
-/// update the ref 'refs/heads/<branch>': unable to append to
-/// '<common>/logs/refs/heads/<branch>': Permission denied` — the branch's
-/// reflog append, which also lives in the common dir even for a linked
-/// worktree. Both needed DIRECTORY-level MAKE_REG/REFER rights on the lock
-/// (respectively log) file's PARENT, for the identical reason `index.lock`
-/// needed them on the worktree gitdir — a per-file rule on just
-/// `refs/heads/<branch>` or `logs/refs/heads/<branch>` cannot carry them.
-/// Scoped to `refs/heads/`/`logs/refs/heads/` (not the whole `refs/`/`logs/`)
-/// to exclude `refs/tags`, `refs/remotes`, and the common dir's own
-/// top-level `logs/HEAD`; the default-branch guard in `newt-git`
-/// (`refuse_if_default_branch`) and the shell `git commit` redirect
-/// (`run_command_creates_shell_git_commit`) still refuse moving `main`'s own
-/// ref, and `newt-core::agentic::tools::native_git::inspect_commands` already
-/// refuses `git branch -f/-m/-c`, `update-ref`, `symbolic-ref`, and `push`
-/// UNCONDITIONALLY, independent of any filesystem grant — `commit`/`amend`
-/// can only ever advance the CHECKED-OUT branch's own ref, never an
-/// arbitrary other one, by git's own design. So this grant's remaining
-/// exposure is the SAME shape as the already-accepted `objects/` trade-off
-/// below, extended to two more directories: a compound `git status && echo
-/// payload > <common>/refs/heads/other-task` smuggles a plain shell
-/// redirect (not a git ref-mutation VERB, so the guard above never sees it)
-/// past the widened fence to clobber ANOTHER non-default branch's ref file
-/// directly, not just the checked-out one. A confined-shell `rm -rf <common>/objects` IS
-/// possible from a directory-write grant on non-default branches — Shawn
-/// accepted that trade-off (see `RESULT-dec2-own-gitdir.md`).
+/// #2682 (round 5, `8c537f17`) added `refs/heads/` and `logs/refs/heads/`
+/// here so a confined `git commit` could advance the checked-out branch's
+/// own ref — `git add` alone never touches a ref, so round 3's two-directory
+/// grant was never exercised against a real `git commit`, and it failed:
+/// `fatal: cannot lock ref 'HEAD': Unable to create
+/// '<common>/refs/heads/<branch>.lock': Permission denied`, then (once
+/// `refs/heads/` was added) `fatal: cannot update the ref
+/// 'refs/heads/<branch>': unable to append to
+/// '<common>/logs/refs/heads/<branch>': Permission denied`.
+///
+/// **Round 6 (#2686 review round 2) reverted that widening**: a directory-wide
+/// Landlock grant on `refs/heads/`/`logs/refs/heads/` covers EVERY branch's
+/// ref and reflog, not just the checked-out one, and nothing about a `git`
+/// VERB guards it — `inspect_commands`'s unconditional refusal of `update-ref`/
+/// `branch -f/-m/-c`/`symbolic-ref`/`push`
+/// (`newt-core::agentic::tools::native_git`) only inspects `git` invocations,
+/// so a compound confined-shell command whose SECOND segment is a plain shell
+/// redirect (`git add . && echo payload > <common>/refs/heads/main`, not a
+/// `git` verb at all) reached straight past it: measured, under round 5's
+/// grant, writing into a SIBLING branch's ref/reflog AND into `main`'s own
+/// ref/reflog both succeeded (`confined_shell_cannot_redirect_into_a_sibling_or_default_branch_ref_or_reflog`
+/// in `newt-core::agentic::tools_tests::helper_git_shell_grant`, red before
+/// this revert). `dispatch_caveats_for_git_shell`'s doc comment already names
+/// an analogous `objects/`-directory trade-off as deliberately accepted (a
+/// confined `rm -rf <common>/objects` becomes possible) — but THAT directory
+/// holds no ref identity, while `refs/heads/` is exactly the authority
+/// boundary between branches, so the same shape of exposure there is not an
+/// accepted trade-off, it is the hole.
+///
+/// A commit now lands with HEAD DETACHED instead: the confined child never
+/// touches the common dir's `refs/heads/`/`logs/refs/heads/` at all (a
+/// detached HEAD's own ref IS the worktree-local `HEAD` file, already
+/// inside the worktree-gitdir grant), and
+/// [`crate::agentic::tools::native_git::needs_commit_broker`] firing routes
+/// the dispatch through a HOST-SIDE, bounded `update-ref` compare-and-swap —
+/// [`own_branch_for_commit_ref_move`], [`detach_own_head`],
+/// [`advance_own_branch_ref`], [`reattach_own_head`] — that verifies the
+/// resulting commit really is a fast-forward (or amendment) of the branch's
+/// OWN previous tip before moving ONLY that one ref (reusing
+/// `inspect_commands`'s guard, unmodified, against everything else).
 pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
     // PR #2577 round 4, Blocker 1: this is the SESSION-START call
     // (`caveats::apply_cli_fs_grants`'s sole production caller runs before any
@@ -146,8 +153,6 @@ pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
     let write = vec![
         path_to_string(&absolute_git_dir),
         path_to_string(&common_dir.join("objects")),
-        path_to_string(&common_dir.join("refs").join("heads")),
-        path_to_string(&common_dir.join("logs").join("refs").join("heads")),
     ];
     OwnGitGrant { read, write }
 }
@@ -215,13 +220,170 @@ pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
     vec![
         path_to_string(&cached_git_dir),
         path_to_string(&cached_common.join("objects")),
-        path_to_string(&cached_common.join("refs").join("heads")),
-        path_to_string(&cached_common.join("logs").join("refs").join("heads")),
     ]
 }
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// #2682 round 2 (#2686 review): is this workspace eligible for the
+/// host-side commit-ref-move broker, and if so, what branch/tip does it
+/// bind to? Reuses [`own_gitdir_shell_write_grant`]'s identity-cache check
+/// (non-empty exactly when a non-default branch's cached identity still
+/// matches a fresh resolve) rather than duplicating it — this is the SAME
+/// gate that used to decide whether to widen the confined fence onto
+/// `refs/heads/`; it now decides whether to run the detach/advance/reattach
+/// dance around an UNWIDENED dispatch instead.
+///
+/// `None` also for a genuinely unborn branch (no prior commit on it) — there
+/// is no tip to detach `HEAD` to, so this mechanism does not cover a
+/// worktree's first-ever commit on brand-new, history-less branch. That is a
+/// narrower surface than #2682's own fix (which granted the directory
+/// unconditionally), accepted because every real worktree-commit scenario
+/// starts from an existing commit (`git worktree add -b <branch>
+/// <start-point>`); a genuinely unborn branch committing through this path
+/// fails exactly as it did before #2682 (no ref-directory write at all).
+pub fn own_branch_for_commit_ref_move(workspace: &Path) -> Option<(String, String)> {
+    if own_gitdir_shell_write_grant(workspace).is_empty() {
+        return None;
+    }
+    let branch = own_branch(workspace)?;
+    let tip = own_branch_tip(workspace, &branch)?;
+    Some((branch, tip))
+}
+
+/// `refs/heads/<branch>`'s current oid, or `None` for an unborn branch (no
+/// commits on it yet — `rev-parse --verify` exits non-zero rather than
+/// erroring, so this is the ordinary "nothing there yet" case, not a
+/// resolution failure).
+fn own_branch_tip(workspace: &Path, branch: &str) -> Option<String> {
+    rev_parse(workspace, &format!("refs/heads/{branch}"))
+        .ok()
+        .flatten()
+}
+
+/// Detach this workspace's `HEAD` to `tip` — `--no-deref` updates `HEAD`
+/// ITSELF (a worktree-local file) rather than following it to update
+/// `refs/heads/<branch>` in the common dir, which is exactly the write this
+/// mechanism exists to avoid granting to a confined child. Must be paired
+/// with [`reattach_own_head`] once the confined dispatch this brackets
+/// returns, success or failure alike — an unpaired call leaves the worktree
+/// stuck in a detached state.
+pub fn detach_own_head(workspace: &Path, tip: &str) -> Result<(), String> {
+    run_ok(workspace, &["update-ref", "--no-deref", "HEAD", tip])
+}
+
+/// Reverses [`detach_own_head`]: `HEAD` becomes a symbolic ref to `branch`
+/// again. Idempotent — safe to call even when `HEAD` was never actually
+/// detached (e.g. the bracketed dispatch never ran at all).
+pub fn reattach_own_head(workspace: &Path, branch: &str) -> Result<(), String> {
+    run_ok(
+        workspace,
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+    )
+}
+
+/// The host-side, bounded ref-update broker (#2682 round 2 review): call
+/// after a confined child committed with `HEAD` detached at `old_tip`
+/// ([`detach_own_head`]) and exited successfully. Verifies the resulting
+/// detached `HEAD` really is a fast-forward OR an amendment of `old_tip` —
+/// the SAME two shapes `NativeGitBroker`'s reference-transaction hook
+/// already accepts (`newt_core::native_git_broker::NativeCommitSession::
+/// check_commit_context`) — never an arbitrary other parent, then performs
+/// the SINGLE compare-and-swap `update-ref` that moves `refs/heads/<branch>`
+/// (and appends its reflog, via `-m`) forward. It never resolves or touches
+/// any OTHER ref: the destination is always `branch`, resolved once by the
+/// caller ([`own_branch_for_commit_ref_move`]) and threaded through
+/// unchanged, and the compare-and-swap's `<oldvalue>` closes the race where
+/// something else moved the branch between that resolve and this call.
+pub fn advance_own_branch_ref(workspace: &Path, branch: &str, old_tip: &str) -> Result<(), String> {
+    let new_oid = rev_parse(workspace, "HEAD")?.ok_or("no commit was created on detached HEAD")?;
+    if new_oid == old_tip {
+        return Err("HEAD did not move — nothing to publish".to_string());
+    }
+    let new_parents = commit_parents_of(workspace, &new_oid)?;
+    let is_append = new_parents == [old_tip.to_string()];
+    // Amend reuses old_tip's OWN parent list. Excluded when old_tip itself
+    // is a root commit (empty parent list): every unrelated root commit
+    // ALSO has an empty parent list, so that shape alone cannot distinguish
+    // "amends this repo's first commit" from "an orphan commit forged
+    // elsewhere" — amending a repo's literal first commit is rare enough
+    // to leave out of this mechanism's scope rather than accept that
+    // collision.
+    let old_parents = commit_parents_of(workspace, old_tip)?;
+    let is_amend = !is_append && !old_parents.is_empty() && new_parents == old_parents;
+    if !is_append && !is_amend {
+        return Err(format!(
+            "the new commit {new_oid} is not an append or amendment of branch '{branch}''s \
+             previous tip {old_tip} (parents: {new_parents:?})"
+        ));
+    }
+    let subject = git_text(workspace, &["log", "-1", "--format=%s", &new_oid])?;
+    let message = format!(
+        "commit{}: {subject}",
+        if is_amend { " (amend)" } else { "" }
+    );
+    run_ok(
+        workspace,
+        &[
+            "update-ref",
+            "-m",
+            &message,
+            &format!("refs/heads/{branch}"),
+            &new_oid,
+            old_tip,
+        ],
+    )
+}
+
+/// `rev-parse --verify --quiet <rev>`: `Ok(Some(oid))` on success, `Ok(None)`
+/// for "nothing there" (exit 1, e.g. an unborn branch or no commit yet on
+/// detached HEAD), `Err` only for an actual failure to run git at all.
+fn rev_parse(workspace: &Path, rev: &str) -> Result<Option<String>, String> {
+    let output = hardened_git(workspace, &["rev-parse", "--verify", "--quiet", rev])
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!oid.is_empty()).then_some(oid))
+}
+
+fn commit_parents_of(workspace: &Path, oid: &str) -> Result<Vec<String>, String> {
+    let output = hardened_git(workspace, &["cat-file", "commit", oid])
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    crate::native_git_broker::commit_parents(&output.stdout)
+}
+
+fn git_text(workspace: &Path, args: &[&str]) -> Result<String, String> {
+    let output = hardened_git(workspace, args)
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_ok(workspace: &Path, args: &[&str]) -> Result<(), String> {
+    let output = hardened_git(workspace, args)
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 /// `(git-common-dir, absolute-git-dir)`, both made absolute against
@@ -1012,6 +1174,21 @@ mod own_gitdir_grant_tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    /// Same contract as [`git`], but returns trimmed stdout instead of just
+    /// asserting success — for the detach/advance/reattach tests' reads
+    /// (`rev-parse`, `symbolic-ref`, `log --format=%s`). One shared spawn
+    /// site reused by every read, rather than hand-rolling a new one each
+    /// time.
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     fn init_repo(dir: &Path) {
         git(dir, &["init", "-q"]);
         std::fs::write(dir.join("seed"), "x").unwrap();
@@ -1019,15 +1196,22 @@ mod own_gitdir_grant_tests {
         git(dir, &["commit", "-q", "-m", "init"]);
     }
 
-    /// Would have failed before this fix: no grants existed at all, so
-    /// `permits_path` denied every file `git add`/`git commit` touches on a
-    /// linked worktree's own branch (F32, #2537). #2682 (round 5) added
-    /// `refs/heads/` and `logs/refs/heads/` to the write set below — `git
-    /// commit` advances the checked-out branch's ref and appends its reflog,
-    /// which round 3's two-directory grant never covered because only `git
-    /// add` was proven against it.
+    /// Would have failed before F32/#2537: no grants existed at all, so
+    /// `permits_path` denied every file `git add` touches on a linked
+    /// worktree's own branch.
+    ///
+    /// #2682 round 5 (`8c537f17`) briefly ALSO granted the common dir's
+    /// whole `refs/heads/` and `logs/refs/heads/` directories here, so a
+    /// confined `git commit` could advance the checked-out branch's ref —
+    /// but a directory-wide grant there covers every OTHER branch's ref and
+    /// reflog too, and nothing inspects a plain shell redirect (not a `git`
+    /// verb) in a compound confined-shell command to stop it reaching them.
+    /// Round 6 (#2686 review round 2) reverted that: a commit instead lands
+    /// with `HEAD` detached (see `own_branch_for_commit_ref_move` and
+    /// friends) and a host-side, bounded `update-ref` publishes it, so this
+    /// grant goes back to exactly the two directories `git add` needs.
     #[test]
-    fn linked_worktree_on_own_branch_grants_the_four_write_directories() {
+    fn linked_worktree_on_own_branch_grants_the_two_write_directories() {
         let root = tempfile::tempdir().unwrap();
         // Git resolves macOS's /var alias; compare the same physical paths.
         let root_path = root.path().canonicalize().unwrap();
@@ -1046,8 +1230,9 @@ mod own_gitdir_grant_tests {
         std::fs::write(wt.join("f.txt"), "hi").unwrap();
         let scope = crate::caveats::Scope::only(grant.write.clone());
         let path = |rel: &str| main.join(".git").join(rel).to_string_lossy().into_owned();
-        // What `git add` + `git commit` need, including the checked-out
-        // branch's own ref lock+rename (#2682).
+        // What `git add` needs: the worktree's own admin dir + the common
+        // `objects/` subtree. A commit's ref move is no longer in here at
+        // all — it happens host-side, after the confined dispatch returns.
         for touched in [
             path("worktrees/wt/index"),
             path("worktrees/wt/index.lock"),
@@ -1055,28 +1240,20 @@ mod own_gitdir_grant_tests {
             path("worktrees/wt/logs/HEAD"),
             path("worktrees/wt/COMMIT_EDITMSG"),
             path("objects/pack/multi-pack-index"),
-            path("refs/heads/task"),
-            path("refs/heads/task.lock"),
-            path("logs/refs/heads/task"),
         ] {
             assert!(
                 crate::caveats::permits_path(&scope, &touched),
                 "{touched} must be permitted"
             );
         }
+        // `refs/heads/` (the checked-out branch's own ref included),
         // `refs/tags`, the common dir's own top-level `logs/HEAD`, `config`,
-        // and `hooks/` stay out of the write grant. A SIBLING branch's own
-        // `refs/heads/<name>` is NOT excluded here — Landlock's directory
-        // rights for the lock-then-rename `commit` needs cannot be scoped
-        // narrower than the whole `refs/heads/` directory (same reasoning
-        // as `objects/` below). What actually stops a confined shell from
-        // MOVING a sibling branch's ref is a separate, unconditional
-        // semantic guard — `inspect_commands`' refusal of `git branch
-        // -f/-m/-c` and of `update-ref`/`symbolic-ref`/`push` regardless of
-        // filesystem authority (`newt-core/src/agentic/tools/native_git.rs`)
-        // — plus the fact that `commit`/`amend` can only ever advance the
-        // CHECKED-OUT branch's own ref, never an arbitrary other one.
+        // and `hooks/` all stay out of the write grant — none of it is a
+        // directory a confined child may create or rename inside anymore.
         for denied in [
+            path("refs/heads/task"),
+            path("refs/heads/task.lock"),
+            path("logs/refs/heads/task"),
             path("refs/tags/v1"),
             path("logs/HEAD"),
             path("config"),
@@ -1089,12 +1266,11 @@ mod own_gitdir_grant_tests {
         }
 
         // The grant is real enough for a real (unconfined, this is a plain
-        // subprocess — not the kernel fence) `git add` + `git commit` to
-        // succeed; the confined-shell version of this property is
-        // `newt-core::agentic::tools::shell::git_shell_grant`'s
+        // subprocess — not the kernel fence) `git add` to succeed; the
+        // confined-shell proof of the FULL commit-ref-move mechanism is
+        // `newt-core::agentic::tools_tests::helper_git_shell_grant`'s
         // `confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_default_branch`.
         git(&wt, &["add", "f.txt"]);
-        git(&wt, &["commit", "-q", "-m", "task work"]);
     }
 
     #[test]
@@ -1145,6 +1321,137 @@ mod own_gitdir_grant_tests {
             "detached HEAD must not get write roots"
         );
         assert!(!grant.read.is_empty(), "detached HEAD still gets read");
+    }
+
+    /// The detach/advance/reattach cycle, driven directly (real unconfined
+    /// git — the confined-kernel-fence proof of the whole thing lives in
+    /// `helper_git_shell_grant`'s `confined_shell_git_commit_succeeds_…`).
+    /// Mirrors exactly what `agentic::tools`'s `run_command` arm does around
+    /// the confined dispatch.
+    #[test]
+    fn detach_advance_reattach_publishes_a_commit_made_on_detached_head() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt); // prime the identity cache, as session start does
+
+        let (branch, old_tip) =
+            own_branch_for_commit_ref_move(&wt).expect("task is a non-default, born branch");
+        assert_eq!(branch, "task");
+
+        detach_own_head(&wt, &old_tip).unwrap();
+        let symref = Command::new("git")
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            !symref.status.success(),
+            "HEAD must be a detached oid, not a symbolic ref, while the confined child runs"
+        );
+
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+
+        advance_own_branch_ref(&wt, &branch, &old_tip).unwrap();
+        reattach_own_head(&wt, &branch).unwrap();
+
+        let tip = git_output(&main, &["rev-parse", "refs/heads/task"]);
+        let head = git_output(&wt, &["rev-parse", "HEAD"]);
+        assert_eq!(tip, head, "refs/heads/task must advance to the new commit");
+        assert_ne!(tip, old_tip);
+
+        assert_eq!(
+            git_output(&wt, &["symbolic-ref", "HEAD"]),
+            "refs/heads/task",
+            "HEAD must be reattached as a symbolic ref to the branch"
+        );
+        assert_eq!(
+            git_output(&main, &["log", "--format=%s", "-1", "refs/heads/task"]),
+            "task work"
+        );
+    }
+
+    /// `advance_own_branch_ref` is a verifier, not a blind publisher: a
+    /// detached-HEAD commit whose parent is NOT `old_tip` (forged, or made
+    /// against a stale tip) must be refused, and `refs/heads/task` must stay
+    /// exactly where it was.
+    #[test]
+    fn advance_own_branch_ref_refuses_a_commit_that_is_not_old_tips_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let (branch, old_tip) = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        // A commit with NO relation to old_tip at all (an orphan root
+        // commit), as if a hostile `commit-tree` forged one out of thin air.
+        detach_own_head(&wt, &old_tip).unwrap();
+        git(&wt, &["checkout", "--orphan", "forged"]);
+        std::fs::write(wt.join("evil"), "x").unwrap();
+        git(&wt, &["add", "evil"]);
+        git(&wt, &["commit", "-q", "-m", "forged"]);
+        git(&wt, &["checkout", "-q", "--detach", "HEAD"]);
+
+        let result = advance_own_branch_ref(&wt, &branch, &old_tip);
+        assert!(result.is_err(), "an unrelated commit must be refused");
+
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/task"]),
+            old_tip,
+            "a refused advance must not move the branch ref at all"
+        );
+    }
+
+    /// `--amend` reuses `old_tip`'s OWN parent, not `old_tip` itself — the
+    /// other accepted shape alongside a plain append. A non-root `old_tip`
+    /// (two commits deep) so the amend/root-collision guard added above
+    /// does not itself suppress this acceptance path.
+    #[test]
+    fn advance_own_branch_ref_accepts_an_amended_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        std::fs::write(main.join("second"), "y").unwrap();
+        git(&main, &["add", "second"]);
+        git(&main, &["commit", "-q", "-m", "second"]);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let (branch, old_tip) = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&wt, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "--amend", "-m", "amended second"]);
+
+        advance_own_branch_ref(&wt, &branch, &old_tip).unwrap();
+        reattach_own_head(&wt, &branch).unwrap();
+
+        assert_eq!(
+            git_output(&main, &["log", "--format=%s", "-1", "refs/heads/task"]),
+            "amended second"
+        );
     }
 }
 

@@ -4260,30 +4260,87 @@ async fn execute_authorized_tool(
             // F32/#2537 round 3: a bare `git …` in this session's own repo, on
             // a non-default branch, gets kernel WRITE on its own gitdir +
             // `objects/` for THIS dispatch only — see
-            // `dispatch_caveats_for_git_shell`'s doc comment.
+            // `dispatch_caveats_for_git_shell`'s doc comment. #2682 round 2
+            // (#2686 review round 2): the common dir's `refs/heads/`/
+            // `logs/refs/heads/` are NEVER granted here anymore — a
+            // commit-creating command instead runs with HEAD DETACHED (so it
+            // only ever touches `objects/` + this worktree's own admin dir,
+            // both still granted below) and a host-side, bounded
+            // `update-ref` publishes the result afterward. See
+            // `git_hardening::own_branch_for_commit_ref_move`'s doc comment
+            // for the full mechanism and why the old directory-wide grant
+            // was a hole, not an accepted trade-off.
             let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
             let commit_broker_used = commit_broker.is_some();
+            let ref_move = commit_requested
+                .then(|| {
+                    crate::git_hardening::own_branch_for_commit_ref_move(std::path::Path::new(
+                        workspace,
+                    ))
+                })
+                .flatten();
+            if let Some((branch, old_tip)) = &ref_move {
+                if let Err(error) =
+                    crate::git_hardening::detach_own_head(std::path::Path::new(workspace), old_tip)
+                {
+                    return host_return(format!(
+                        "error: could not prepare branch '{branch}' for a governed commit: {error}"
+                    ));
+                }
+            }
             let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
-            let result = executed(
-                shell::exec_confined_command_with_broker(
-                    cmd,
-                    &run_cwd,
-                    workspace,
-                    color,
-                    tool_output_lines,
-                    &git_shell_caveats,
-                    &filesystem_requests,
-                    exec_floor,
-                    &mut permission_gate,
-                    tool_offload,
-                    spill_store,
-                    live_tool_output.clone(),
-                    presentation,
-                    commit_broker,
-                    &mut fs_pre_exec_missing,
-                )
-                .await,
-            );
+            let (mut exec_text, exec_outcome) = shell::exec_confined_command_with_broker(
+                cmd,
+                &run_cwd,
+                workspace,
+                color,
+                tool_output_lines,
+                &git_shell_caveats,
+                &filesystem_requests,
+                exec_floor,
+                &mut permission_gate,
+                tool_offload,
+                spill_store,
+                live_tool_output.clone(),
+                presentation,
+                commit_broker,
+                &mut fs_pre_exec_missing,
+            )
+            .await;
+            if let Some((branch, old_tip)) = &ref_move {
+                // Only once the confined child actually exited 0 — a denial
+                // or a failing hook leaves the checked-out branch untouched,
+                // same as before this command ran.
+                if exec_outcome == crate::ExecOutcome::Passed {
+                    match crate::git_hardening::advance_own_branch_ref(
+                        std::path::Path::new(workspace),
+                        branch,
+                        old_tip,
+                    ) {
+                        Ok(()) => {
+                            exec_text = exec_text.replace("detached HEAD ", &format!("{branch} "));
+                        }
+                        Err(error) => {
+                            exec_text = format!(
+                                "error: the commit was created but refused publication to \
+                                 branch '{branch}': {error}. No branch ref moved; retry the commit."
+                            );
+                        }
+                    }
+                }
+                // Always reattach, success or failure alike — an unpaired
+                // detach leaves the worktree stuck on a detached HEAD for
+                // every subsequent git command in this session.
+                if let Err(error) = crate::git_hardening::reattach_own_head(
+                    std::path::Path::new(workspace),
+                    branch,
+                ) {
+                    exec_text = format!(
+                        "{exec_text}\nwarning: could not restore branch '{branch}' as HEAD: {error}"
+                    );
+                }
+            }
+            let result = executed((exec_text, exec_outcome));
             // #2636 finding 1: use the typed out-param from the pre-exec denial
             // path — only a denial that fired BEFORE the child ran populates
             // fs_pre_exec_missing. Child stdout that happens to contain the
