@@ -3063,3 +3063,298 @@ fn setup_writes_the_sandbox_git_profile_through_settings() {
         console.transcript()
     );
 }
+
+/// #2660, red-first: appending `offer_caveat_pack` after `offer_sandbox_git`
+/// must not disturb every existing scripted test that stops providing
+/// answers once the backend write completes — `Script` returns a blank for
+/// every question asked after its queue runs dry, and "writes files: blank
+/// must not consent" (the same rule the backend-write confirm already uses)
+/// means a dry queue must decline both new prompts (exclude names, then
+/// sign-and-write) and leave `approve.toml` untouched.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_declines_on_blank_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    let console = ScriptedConsole::new(&[]);
+
+    offer_caveat_pack(&console.operator(), &config_path, Some("127.0.0.1"));
+
+    assert!(
+        !config_path
+            .with_file_name("ocap")
+            .join("approve.toml")
+            .exists(),
+        "a dry answer queue must decline the write, not default to it"
+    );
+}
+
+/// #2660: the standard pack signs the low-danger text tools and the
+/// configured host, names `awk`/`xargs`/`sh` as high-danger without ever
+/// signing them, and never lists `git`/`gh` at all. The signed result is
+/// verified back through the REAL gate question
+/// (`ocap_store::evaluate_request`) with the SAME root key the step just
+/// minted — proving a listed tool/host is granted and an unlisted one still
+/// falls through to the prompt, per #2660's acceptance contract.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_signs_low_danger_defers_high_danger_excludes_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+
+    offer_caveat_pack(&console.operator(), &config_path, Some("127.0.0.1"));
+
+    let transcript = console.transcript();
+    assert!(transcript.contains("exec  cat"), "{transcript}");
+    for high in ["awk", "xargs", "sh"] {
+        assert!(
+            transcript.contains(high),
+            "high-danger target named in the review: {transcript}"
+        );
+    }
+    assert!(!transcript.contains("exec  git"), "{transcript}");
+    assert!(!transcript.contains("exec  gh"), "{transcript}");
+
+    let key_path = newt_identity::default_key_path().unwrap();
+    let user = newt_identity::load_or_generate(&key_path).unwrap();
+    let (set, warnings) =
+        newt_core::ocap_store::load_store(&config_path, Some(user.public().as_bytes()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "cat"),
+        Some(newt_core::ocap_store::Verdict::Approve),
+        "a listed tool is durably granted"
+    );
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Net, "127.0.0.1"),
+        Some(newt_core::ocap_store::Verdict::Approve),
+        "the configured host is durably granted"
+    );
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "awk"),
+        None,
+        "a named high-danger target is never durably signed"
+    );
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "git"),
+        None,
+        "an unlisted tool still falls through to the interactive gate"
+    );
+}
+
+/// #2660: "every entry is visible and removable" — the operator can exclude
+/// one by name before anything is signed.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_exclude_prompt_removes_the_named_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    // exclude: "cat"; sign-and-write: y.
+    let console = ScriptedConsole::new(&["cat", "y"]);
+
+    offer_caveat_pack(&console.operator(), &config_path, None);
+
+    let approve_path = config_path.with_file_name("ocap").join("approve.toml");
+    let text = std::fs::read_to_string(&approve_path).unwrap();
+    let file = newt_core::ocap_store::PolicyFile::parse(&text).unwrap();
+    assert!(
+        !file.exec.iter().any(|e| e.target == "cat"),
+        "excluded entry was still signed: {file:?}"
+    );
+    assert!(
+        file.exec.iter().any(|e| e.target == "head"),
+        "a non-excluded entry was still written: {file:?}"
+    );
+}
+
+/// #2660 round 2, item 1 (P1), red-first: `try_offer_caveat_pack` used to
+/// pass the WHOLE merged approve file to `sign_approves`, which re-blesses
+/// every entry that passes the danger check — including a pre-existing
+/// entry the operator never saw in THIS review. Measured red: before the
+/// fix, this pre-seeded, unsigned, unrelated net entry came back signed
+/// after the operator confirmed only the displayed `127.0.0.1` addition.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_signs_only_the_reviewed_additions() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    let approve_path = config_path.with_file_name("ocap").join("approve.toml");
+    std::fs::create_dir_all(approve_path.parent().unwrap()).unwrap();
+    // A pre-existing, unsigned entry for a host unrelated to this run's
+    // review — never displayed, never confirmed.
+    std::fs::write(&approve_path, "[[net]]\nhost = \"unrelated.example\"\n").unwrap();
+
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+    offer_caveat_pack(&console.operator(), &config_path, Some("127.0.0.1"));
+
+    let text = std::fs::read_to_string(&approve_path).unwrap();
+    let file = newt_core::ocap_store::PolicyFile::parse(&text).unwrap();
+    let unrelated = file
+        .net
+        .iter()
+        .find(|e| e.host == "unrelated.example")
+        .expect("pre-existing entry must be preserved");
+    assert!(
+        unrelated.sig.is_none(),
+        "setup must sign only what the operator saw this run, not every \
+         existing entry: {unrelated:?}"
+    );
+    let reviewed = file
+        .net
+        .iter()
+        .find(|e| e.host == "127.0.0.1")
+        .expect("the reviewed addition must be written");
+    assert!(
+        reviewed.sig.is_some(),
+        "the displayed, confirmed addition must still be signed: {reviewed:?}"
+    );
+}
+
+/// #2660 round 2, item 3 / round 3, item 2: a drop-in's `exec` list can
+/// spell `git` as an absolute path. With narrowing-only drop-ins (round 3),
+/// this is caught even earlier than `drop_never_candidates`: `/usr/bin/git`
+/// isn't already in the built-in pool, so `narrow_candidates` treats it as
+/// an attempted addition and never merges it in at all — proven here
+/// through the real setup/signing path, not just the pure helpers' unit
+/// tests in `newt_core::caveat_pack`: never shown in the review, never
+/// durably signed.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_excludes_a_drop_in_git_path_spelling() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    std::fs::write(
+        config_path.with_file_name("caveat-pack.toml"),
+        "exec = [\"/usr/bin/git\"]\n",
+    )
+    .unwrap();
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+
+    offer_caveat_pack(&console.operator(), &config_path, None);
+
+    let transcript = console.transcript();
+    assert!(
+        !transcript.contains("exec  git") && !transcript.contains("exec  /usr/bin/git"),
+        "a drop-in git spelling must never reach the review: {transcript}"
+    );
+    assert!(
+        transcript.contains("/usr/bin/git") && transcript.contains("ignored"),
+        "the rejected addition attempt must be visibly reported: {transcript}"
+    );
+
+    let key_path = newt_identity::default_key_path().unwrap();
+    let user = newt_identity::load_or_generate(&key_path).unwrap();
+    let (set, warnings) =
+        newt_core::ocap_store::load_store(&config_path, Some(user.public().as_bytes()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "git"),
+        None,
+        "a drop-in git spelling must never be durably signed"
+    );
+}
+
+/// #2660 round 3, item 2 (P1), red-first: the exact bypass the review named
+/// — with the old merge-then-filter shape, a drop-in listing `sed`/`find`/
+/// `sort`/`git` reintroduced each of them to the review (only `git`/`gh`
+/// were ever filtered back out) and, on confirmation, to a durable
+/// signature. A drop-in may only narrow the built-in offer now: none of
+/// these four is already in it, so each is an attempted addition — reported
+/// with a visible notice, never merged in, never signed.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_drop_in_addition_attempt_is_ignored_with_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    std::fs::write(
+        config_path.with_file_name("caveat-pack.toml"),
+        "exec = [\"sed\", \"find\", \"sort\", \"git\"]\n",
+    )
+    .unwrap();
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+
+    offer_caveat_pack(&console.operator(), &config_path, None);
+
+    let transcript = console.transcript();
+    assert!(
+        transcript.contains("sed, find, sort, git") && transcript.contains("ignored"),
+        "the rejected addition attempt must be reported, not silently dropped: {transcript}"
+    );
+    for never in ["exec  sed", "exec  find", "exec  sort", "exec  git"] {
+        assert!(
+            !transcript.contains(never),
+            "an attempted addition must never reach the review: {transcript}"
+        );
+    }
+
+    let key_path = newt_identity::default_key_path().unwrap();
+    let user = newt_identity::load_or_generate(&key_path).unwrap();
+    let (set, warnings) =
+        newt_core::ocap_store::load_store(&config_path, Some(user.public().as_bytes()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    for never in ["sed", "find", "sort", "git"] {
+        assert_eq!(
+            newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, never),
+            None,
+            "an attempted drop-in addition must never be durably signed: {never}"
+        );
+    }
+}
+
+/// #2660 round 2, item 4: an unreadable existing approve file must refuse
+/// the write rather than treat the read error as "no file yet" and
+/// overwrite it. Injected via `chmod 000` (`#[cfg(unix)]` — POSIX
+/// permissions have no Windows equivalent): the atomic-replace step only
+/// needs write permission on the *directory*, so an unreadable-but-present
+/// file is a case where the OLD `Err(_) => PolicyFile::default()` code would
+/// have gone on to silently overwrite a file it could not read — unlike a
+/// missing *directory* or a locked path, which fail at other steps
+/// regardless of this fix and so would not discriminate old from new
+/// behavior.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_refuses_on_an_unreadable_approve_file_without_writing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    let approve_path = config_path.with_file_name("ocap").join("approve.toml");
+    std::fs::create_dir_all(approve_path.parent().unwrap()).unwrap();
+    std::fs::write(&approve_path, "[[net]]\nhost = \"unrelated.example\"\n").unwrap();
+    std::fs::set_permissions(&approve_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+    offer_caveat_pack(&console.operator(), &config_path, Some("127.0.0.1"));
+
+    // Restore read access before asserting, so the check itself can read it.
+    std::fs::set_permissions(&approve_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let text = std::fs::read_to_string(&approve_path).unwrap();
+    assert!(
+        text.contains("unrelated.example"),
+        "a refused write must leave the unreadable file's content untouched: {text}"
+    );
+    assert!(
+        !text.contains("127.0.0.1"),
+        "a refused read must not go on to write the new addition: {text}"
+    );
+    assert!(
+        console.transcript().contains("Standard caveat pack:"),
+        "the read error must be reported, not swallowed silently: {}",
+        console.transcript()
+    );
+}

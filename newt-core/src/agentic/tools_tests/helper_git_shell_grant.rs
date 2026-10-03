@@ -12,7 +12,9 @@ const FIXTURE_GIT: &str = "/usr/bin/git";
 /// `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_TEMPLATE_DIR` close the
 /// config and template sources that live outside the process environment
 /// (`/etc/gitconfig`, the operator's `~/.gitconfig`, `~/.config/git`).
-fn hermetic_git_env(home: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+pub(in crate::agentic::tools) fn hermetic_git_env(
+    home: &std::path::Path,
+) -> std::collections::BTreeMap<String, String> {
     let home = home.to_string_lossy();
     [
         ("HOME", home.as_ref()),
@@ -36,7 +38,14 @@ fn hermetic_git_env(home: &std::path::Path) -> std::collections::BTreeMap<String
 /// `GIT_OBJECT_DIRECTORY` or any other ambient git knob cannot leak in,
 /// because nothing is inherited. Proven by
 /// [`hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture`].
-fn hermetic_git(dir: &std::path::Path, home: &std::path::Path) -> std::process::Command {
+/// Widened to `pub(in crate::agentic::tools)` (#2681 round 3) so the
+/// `execute_tool_branch_tests::permissions` git-broker fixture reuses it
+/// too, rather than a second ad hoc git fixture that inherits the ambient
+/// `GIT_DIR`/`HOME`/hooks.
+pub(in crate::agentic::tools) fn hermetic_git(
+    dir: &std::path::Path,
+    home: &std::path::Path,
+) -> std::process::Command {
     assert!(
         std::path::Path::new(FIXTURE_GIT).exists(),
         "the fixture git {FIXTURE_GIT} is absent"
