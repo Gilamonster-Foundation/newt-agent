@@ -268,6 +268,18 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   unaffected: no Mach floor installed at all. Linux and Windows builds are unaffected (no Mach).
   Originally discovered by #1632; narrowed by #2673; reworded by agent-bridle#416 round 2. owner: —
   · review-by: #1599 / epic #749.
+- **Scope correction (newt-agent#2673 follow-up, agent-bridle#417, 2026-10-02):** the `net: none`
+  zero-floor promotion described above only ever applied to callers whose spawn declared the
+  AUDITED stdio shape (`ConfinedStdio::Piped`/`Null`) — `ConstrainedExecutor`
+  (`build_tool_request`/`workspace_confined_caveats`). The Brush engine's own trusted-worker spawn
+  (`run_command` under `ShellEngine::Brush`, `agent_bridle::BrushShellTool`) used a raw, unaudited
+  stdin (its one-shot control socket) and so could not reach THIS entry's zero-floor promotion at
+  all — it refused admission outright under any restricted net scope, including `net: none`, before
+  the Mach-deputy question was even reached. agent-bridle#417 (ADR 0015 amendment E7, backported in
+  this same commit) adds a named, audited `ConfinedStdio::WorkerControl` variant for that channel, so
+  `run_command`-via-Brush now ALSO reaches this entry's `net: none` zero-floor promotion — closing a
+  gap this entry did not previously name. Does not change this entry's residual (loopback/host-grant
+  net is still unaffected on either route); does not change its Status.
 
 ### windows-inheritable-handle-leak
 - **Invariant (ideal):** an attacker-exec child receives only explicitly granted capabilities; arbitrary

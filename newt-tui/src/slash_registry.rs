@@ -621,6 +621,19 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Missing,
     ),
     cmd(
+        // #2679: fold THIS session's flight-recorder capture into a reviewable
+        // approve.toml proposal. Keep — it PERFORMS (it reads the capture, it
+        // proposes, optionally saves candidates). Session-scoped: the global
+        // capture is narrowed to the current session before proposing. Receipt
+        // is Missing — the save path writes to the signed ocap store, and a
+        // durable `/ocap propose` journal is still owed.
+        "ocap",
+        &[],
+        Family::Session,
+        Disposition::Keep,
+        Receipt::Missing,
+    ),
+    cmd(
         // #2085 PR-E2: retitling the ACTIVE conversation — a different mutator
         // from `/resume rename`, which retitles one the operator NAMES. Both
         // are `ConversationOp`; the two rows are two mutators, not two doors.

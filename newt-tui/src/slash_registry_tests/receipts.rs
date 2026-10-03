@@ -188,6 +188,19 @@ fn workspace_editor_is_advertised_with_its_signed_policy_receipt() {
 /// count was not 27 because the debt was 27; it was 27 because this row
 /// was invisible.
 ///
+/// # 18 → 19: `/ocap` proposes this session (#2679)
+///
+/// `/ocap propose --save` persists candidate approvals to the signed
+/// `ocap/session-grants.age` store rather than to the settings or event
+/// journal. That is a durable write, but it is NOT a `settings_receipt` /
+/// `event_journal` row — the two writers both read the receipt column and
+/// neither reads the other's variant, so there is no honest destination here
+/// yet. It is therefore `Receipt::Missing` on the same honest basis as
+/// `/permissions` and `/mcp`: the state change lands in a store, but not one
+/// this instrument counts. Raising the ratchet names the item and says the
+/// debt is real rather than hiding it; a real receipt destination (a journal
+/// of proposals made) is still owed.
+///
 /// Q8's recommendation, taken: *"Approve. The alternative is a mutator
 /// that stays invisible because registering it would embarrass a number."*
 /// Raising a ratchet is allowed exactly when the growth is the plan and
@@ -200,7 +213,7 @@ fn the_receiptless_state_mutators_are_counted_and_only_shrink() {
         .filter(|c| matches!(c.receipt, Receipt::Missing))
         .count();
     assert!(
-        missing <= 18,
+        missing <= 19,
         "{missing} state-mutating commands record nothing durable — that \
          is more than when #1981 armed this. A new state mutator needs a \
          receipt destination, not another silent write"

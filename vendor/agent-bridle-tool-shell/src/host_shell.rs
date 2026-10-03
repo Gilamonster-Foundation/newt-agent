@@ -17,7 +17,6 @@
 //! be a lie (I9). Restricted-exec/net requests belong on the safe-subset engine.
 
 use std::collections::BTreeMap;
-use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 
 use agent_bridle_core::{
@@ -260,9 +259,9 @@ impl Tool for HostShellTool {
             .arg("-c")
             .arg(&cmd)
             .sandbox_policy(Arc::clone(&self.sandbox))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(agent_bridle_core::ConfinedStdio::Null)
+            .stdout(agent_bridle_core::ConfinedStdio::Piped)
+            .stderr(agent_bridle_core::ConfinedStdio::Piped);
         for (k, v) in &env {
             command = command.env(k, v);
         }

@@ -60,6 +60,14 @@ pub struct ShadowCaveat {
     pub command: String,
     /// How many times this (axis, target) was observed this session.
     pub count: u64,
+    /// The session this observation was recorded under. Stamped at record
+    /// time from [`crate::lifecycle::active_session`] so a session-scoped read
+    /// can exclude every past session's caveats from a shared capture file.
+    /// `None` for observations recorded before session-scoping (a bare caveat
+    /// line is treated as belonging to *every* session, i.e. it is never
+    /// excluded) — see the reader.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 /// A session's accumulated capture, deduplicated by (axis, target). The map
@@ -75,8 +83,19 @@ pub struct FlightCapture {
 impl FlightCapture {
     /// Record that an unconfined command exercised `axis` on `target`. Merges
     /// by (axis, target): bumps the count, keeps the first command as the
-    /// fixture. Empty targets are ignored (nothing to gate).
-    pub fn observe(&mut self, axis: ShadowAxis, target: &str, command: &str) {
+    /// fixture. Empty targets are ignored (nothing to gate). `session` stamps
+    /// the session this observation belongs to so a shared capture file can be
+    /// filtered back to one session at read time. Existing caveats keep their
+    /// original `session` (they were inserted first); a caveat recorded with no
+    /// session id stays session-less: an unscoped read keeps it, a
+    /// session-scoped read excludes it (see `read_capture_jsonl_sessioned`).
+    pub fn observe(
+        &mut self,
+        axis: ShadowAxis,
+        target: &str,
+        command: &str,
+        session: Option<&str>,
+    ) {
         let target = target.trim();
         if target.is_empty() {
             return;
@@ -90,6 +109,7 @@ impl FlightCapture {
                 target: target.to_string(),
                 command: command.to_string(),
                 count: 1,
+                session: session.map(str::to_string),
             });
     }
 
@@ -99,7 +119,8 @@ impl FlightCapture {
     /// logged here as the single most valuable axis first.
     pub fn observe_command(&mut self, command: &str) {
         if let Some(program) = exec_program(command) {
-            self.observe(ShadowAxis::Exec, program, command);
+            let session = crate::lifecycle::active_session();
+            self.observe(ShadowAxis::Exec, program, command, session.as_deref());
         }
     }
 
@@ -190,7 +211,8 @@ pub fn log_unconfined(command: &str) {
 /// recording is off or the target is empty.
 pub fn log_observed(axis: ShadowAxis, target: &str, command: &str) {
     let mut cap = FlightCapture::default();
-    cap.observe(axis, target, command);
+    let session = crate::lifecycle::active_session();
+    cap.observe(axis, target, command, session.as_deref());
     append_capture(&cap);
 }
 
@@ -224,12 +246,35 @@ fn append_capture(cap: &FlightCapture) {
 
 /// Read a JSONL capture file back into a folded [`FlightCapture`] (dedup by
 /// axis+target, summing counts) — the input to `newt ocap propose` (#1176).
+///
+/// Without `session` every caveat in `text` is folded in. With `session =
+/// Some(id)` only caveats recorded under that session are kept; a caveat
+/// recorded with no session id predates stamping and is dropped. This is what
+/// scopes the TUI's `/ocap propose` to the current session instead of seeing
+/// every past session's caveats in a shared capture file.
 pub fn read_capture_jsonl(text: &str) -> FlightCapture {
+    read_capture_jsonl_sessioned(text, None)
+}
+
+/// [`read_capture_jsonl`] with an explicit session filter.
+pub fn read_capture_jsonl_sessioned(text: &str, session: Option<&str>) -> FlightCapture {
     let mut cap = FlightCapture::default();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         if let Ok(c) = serde_json::from_str::<ShadowCaveat>(line) {
-            for _ in 0..c.count.max(1) {
-                cap.observe(c.axis, &c.target, &c.command);
+            // Session-scoped reads keep ONLY this session's caveats. A caveat
+            // recorded without a session id predates session stamping and could
+            // be from any past run (the 2026-10-02 retest found crontab and
+            // `curl | sh` in the global capture), so it is excluded; an unscoped
+            // read (`session == None`, the CLI's `newt ocap propose`) keeps all.
+            let belongs = match (&c.session, session) {
+                (_, None) => true,
+                (None, Some(_)) => false,
+                (Some(s), Some(id)) => s == id,
+            };
+            if belongs {
+                for _ in 0..c.count.max(1) {
+                    cap.observe(c.axis, &c.target, &c.command, c.session.as_deref());
+                }
             }
         }
     }
@@ -280,7 +325,7 @@ mod tests {
             "first command kept as fixture"
         );
         // Empty targets are ignored.
-        cap.observe(ShadowAxis::Exec, "  ", "   ");
+        cap.observe(ShadowAxis::Exec, "  ", "   ", Some("s"));
         assert_eq!(cap.caveats.len(), 2);
     }
 
@@ -375,7 +420,12 @@ mod tests {
         let mut cap = FlightCapture::default();
         cap.observe_command("cargo build");
         cap.observe_command("cargo build");
-        cap.observe(ShadowAxis::Net, "crates.io", "curl https://crates.io");
+        cap.observe(
+            ShadowAxis::Net,
+            "crates.io",
+            "curl https://crates.io",
+            Some("s"),
+        );
         let json = cap.to_json().unwrap();
         let back = FlightCapture::parse(&json).unwrap();
         assert_eq!(cap, back);
@@ -386,5 +436,42 @@ mod tests {
                 .class(),
             "net"
         );
+    }
+
+    #[test]
+    fn session_scope_excludes_caveats_recorded_under_other_sessions() {
+        // Shared capture file with two sessions' worth of caveats: the current
+        // session ("s1") must see only its own. Session-less caveats predate
+        // stamping and could be from any past run, so a scoped read drops them.
+        let s1 = r#"{"axis":"exec","target":"a","command":"a","count":1,"session":"s1"}"#;
+        let shared = r#"{"axis":"exec","target":"cargo","command":"bash -c x","count":1}"#;
+        let other = r#"{"axis":"exec","target":"b","command":"b","count":1,"session":"s2"}"#;
+        let lines = format!("{s1}\n{shared}\n{other}\n");
+
+        let scoped = read_capture_jsonl_sessioned(&lines, Some("s1"));
+        assert!(
+            scoped.caveats.contains_key(&(ShadowAxis::Exec, "a".into())),
+            "current session sees its own caveat"
+        );
+        assert!(
+            !scoped
+                .caveats
+                .contains_key(&(ShadowAxis::Exec, "cargo".into())),
+            "a session-less caveat is not this session's evidence: {scoped:?}"
+        );
+        assert!(
+            read_capture_jsonl_sessioned(&lines, None)
+                .caveats
+                .contains_key(&(ShadowAxis::Exec, "cargo".into())),
+            "an unscoped read (the CLI) still keeps it"
+        );
+        assert!(
+            !scoped.caveats.contains_key(&(ShadowAxis::Exec, "b".into())),
+            "another session's caveat is excluded: {scoped:?}"
+        );
+
+        // Unscoped read sees everything, preserving prior behaviour.
+        let all = read_capture_jsonl(&lines);
+        assert!(all.caveats.contains_key(&(ShadowAxis::Exec, "b".into())));
     }
 }
