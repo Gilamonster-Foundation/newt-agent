@@ -152,6 +152,12 @@ pub mod smart_harness;
 mod prompt_intake;
 mod prompt_read;
 mod recall;
+// Reasoning/thinking display + streaming helpers (thinking-mode config) —
+// split out of `mod.rs` (#2672) so the loop file stops carrying the
+// env/configured mode, the fold/stream render paths, and the multi-byte-safe
+// chunk decoder. Child module with `use super::*;`; the public entries are
+// re-exported at `agentic::` scope below.
+mod reasoning;
 // #952/#1669: operator steering submitted mid-turn, drained at the next
 // round boundary as a genuine operator message.
 mod steering;
@@ -306,6 +312,7 @@ pub use permissions::{
 pub use plan_mode::{
     plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,
 };
+pub use reasoning::{thinking_mode, thinking_stream_enabled};
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use send_budget::{initial_context_input_budget, is_truncation_suspect};
@@ -3493,7 +3500,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     (Some(native), Some(inline)) => Some(format!("{native}\n{inline}")),
                     (native, inline) => native.or(inline),
                 };
-                commit_reasoning_fold(
+                reasoning::commit_reasoning_fold(
                     reasoning,
                     probe_started.elapsed(),
                     completed_spill_renderer.as_deref(),
@@ -7936,7 +7943,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // Same fold as the streaming path and as a tool result: the first
         // `spill_lines` rows commit, the rest are retained behind
         // `/spill open <id>`, and one line says how long it took.
-        commit_reasoning_fold(
+        reasoning::commit_reasoning_fold(
             separate_reasoning
                 .map(str::to_string)
                 .or_else(|| inline_reasoning.clone()),
@@ -9299,7 +9306,7 @@ async fn anthropic_dispatch_round(
             } else {
                 0
             };
-        let mut anth_reason = ReasoningTrickle::default();
+        let mut anth_reason = reasoning::ReasoningTrickle::default();
         let mut started = false;
         let mut transport_break: Option<String> = None;
         let mut interrupted = false;
@@ -9317,7 +9324,7 @@ async fn anthropic_dispatch_round(
                     // Two rolling buffers: `decode_chunk` carries half a
                     // CHARACTER to the next chunk, and the accumulator carries
                     // half a `data:` LINE, since both straddle chunk boundaries.
-                    for action in acc.feed(&decode_chunk(&mut carry, &chunk)) {
+                    for action in acc.feed(&reasoning::decode_chunk(&mut carry, &chunk)) {
                         match action {
                             anthropic_wire::StreamAction::TextDelta(t) => {
                                 if !started {
@@ -13453,210 +13460,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     Ok((text, false, accumulated_usage, hallucination_count))
 }
 
-/// Whether the reasoning spinner is enabled: `NEWT_THINKING` (set by
-/// `/thinking`) overrides `[tui] thinking`; default on.
-///
-/// Public because `/settings thinking` must report what the setting IS, and
-/// this is the one function that owns the precedence. A second reading of
-/// `NEWT_THINKING` in the form would show `on` while `[tui] thinking = "off"`
-/// quietly won (#1981).
-#[must_use]
-pub fn thinking_mode(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> crate::ThinkingMode {
-    match std::env::var("NEWT_THINKING").ok().as_deref() {
-        Some("off") => return crate::ThinkingMode::Off,
-        // `stream` asks for the UNBOUNDED cargo-style trickle by name; plain
-        // `on` asks to see the reasoning and gets the bounded default.
-        Some("stream") => return crate::ThinkingMode::Stream,
-        Some("on" | "fold") => return crate::ThinkingMode::Fold,
-        _ => {}
-    }
-    crate::Config::resolve_unpublished(report)
-        .ok()
-        .and_then(|c| c.tui)
-        .map(|t| t.thinking)
-        .unwrap_or_default()
-}
-
-/// Whether reasoning is displayed AT ALL — the spinner gate.
-///
-/// Deliberately not `mode == Stream`. Both display modes show the live
-/// spinner; they differ only in how much of the body reaches scrollback. When
-/// `Fold` was added, leaving this as an equality against `Stream` would have
-/// turned the new DEFAULT into "no thinking spinner, ever" with no compile
-/// error anywhere — the gate-collapse this split exists to prevent.
-#[must_use]
-pub fn thinking_stream_enabled() -> bool {
-    display::with_migration_notices(thinking_mode) != crate::ThinkingMode::Off
-}
-
-/// Commit a complete reasoning body as a fold block.
-///
-/// The non-streaming half of the same treatment `ReasoningTrickle` gives a
-/// stream: a whole body arrives at once, so the budget is spent in one pass
-/// rather than line by line. Both end at the same closing line, and both route
-/// the count through [`display::Fold`], so the two wires cannot drift into two
-/// different ways of saying the same thing.
-fn commit_reasoning_fold(
-    reasoning: Option<String>,
-    elapsed: std::time::Duration,
-    retain: Option<&dyn CompletedSpillRenderer>,
-    color: bool,
-) {
-    if display::with_migration_notices(thinking_mode) == crate::ThinkingMode::Off {
-        return;
-    }
-    let Some(reasoning) = reasoning.filter(|r| !r.trim().is_empty()) else {
-        return;
-    };
-    let budget = if display::with_migration_notices(thinking_mode) == crate::ThinkingMode::Fold {
-        display::spill_lines()
-    } else {
-        0
-    };
-    let mut fold = display::ThinkingFold::default();
-    let mut shown: Vec<String> = Vec::new();
-    for line in reasoning.lines().filter(|l| !l.trim().is_empty()) {
-        if fold.offer(line, budget) {
-            shown.push(format!("  {line}"));
-        }
-    }
-    // Retain BEFORE printing the handle, so the id names a body that is already
-    // there rather than one that is about to be.
-    let retained = retain.and_then(|r| r.retain_completed(fold.body()));
-    let hint = retained
-        .zip(retain)
-        .map(|(id, renderer)| renderer.recovery_hint(id));
-    let recovery = hint
-        .as_deref()
-        .map_or_else(display::Recovery::default, display::Recovery::Command);
-    if let Some(closing) = fold.closing_line(elapsed, recovery) {
-        shown.push(closing);
-    }
-    if shown.is_empty() {
-        return;
-    }
-    let block = shown.join("\n");
-    emit_reasoning(&block, color);
-}
-
-fn emit_reasoning(text: &str, color: bool) {
-    let notice = crate::tty::Notice::new(crate::tty::Level::Thinking, "", text);
-    crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, notice.writer(color));
-}
-
-/// The streaming half of a [`ThinkingFold`]: it owns the partial-line buffer
-/// and the decision of what reaches the spinner.
-///
-/// The split matters because reasoning arrives in token-sized chunks with no
-/// respect for line boundaries, while the budget is counted in LINES. This
-/// holds the tail until its newline — the same shape `Spinner::detail` already
-/// uses internally, and the reason the two must not both buffer.
-#[derive(Default)]
-struct ReasoningTrickle {
-    fold: display::ThinkingFold,
-    /// Partial line awaiting its newline.
-    partial: String,
-}
-
-impl ReasoningTrickle {
-    /// Feed a chunk. Completed lines within the budget go to the spinner with
-    /// the thinking style; the rest are retained by the fold and never printed.
-    fn feed(&mut self, spinner: &crate::tty::Spinner, chunk: &str, budget: usize) {
-        self.partial.push_str(chunk);
-        while let Some(nl) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=nl).collect();
-            let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
-            if trimmed.trim().is_empty() {
-                continue;
-            }
-            if self.fold.offer(&trimmed, budget) {
-                // Hand back the newline `detail` splits on, so the spinner's
-                // own buffering sees exactly one complete line.
-                spinner.detail(&format!("{trimmed}\n"));
-            }
-        }
-    }
-
-    /// Commit the closing line, retaining the body so its handle is real.
-    ///
-    /// Written straight to stdout rather than through the spinner, because the
-    /// spinner is about to be torn down and this line is durable transcript,
-    /// not progress.
-    fn close(
-        &mut self,
-        elapsed: std::time::Duration,
-        retain: Option<&dyn CompletedSpillRenderer>,
-        color: bool,
-    ) {
-        if !self.partial.trim().is_empty() {
-            let tail = std::mem::take(&mut self.partial);
-            self.fold.offer(tail.trim_end(), 0);
-        }
-        if self.fold.is_empty() {
-            return;
-        }
-        // Retain FIRST: the handle the line prints has to name a body that is
-        // already there, or the offer is a lie for as long as the race lasts.
-        let retained = retain.and_then(|r| r.retain_completed(self.fold.body()));
-        let hint = retained
-            .zip(retain)
-            .map(|(id, renderer)| renderer.recovery_hint(id));
-        let recovery = hint
-            .as_deref()
-            .map_or_else(display::Recovery::default, display::Recovery::Command);
-        let Some(line) = self.fold.closing_line(elapsed, recovery) else {
-            return;
-        };
-        emit_reasoning(&line, color);
-    }
-}
-
-/// Decode one wire chunk, holding an INCOMPLETE trailing character back for
-/// the next one.
-///
-/// It replaces a per-chunk `String::from_utf8_lossy`, which was wrong for
-/// exactly the reason a per-chunk `lines()` split is wrong: `reqwest` splits
-/// where the socket did, not where the protocol did. A multi-byte character
-/// therefore straddles a chunk boundary whenever the boundary happens to fall
-/// inside it — and lossy decoding replaces the half that arrived with U+FFFD.
-/// That corruption is silent and permanent: the mangled text is what gets
-/// printed, returned, persisted, and re-sent to the model. Where the boundary
-/// falls is a function of machine load, so the same reply is clean on an idle
-/// box and mangled on a busy one; `café` arrives as `caf\u{FFFD}\u{FFFD}`.
-///
-/// Only a TRUNCATED tail is carried (`Utf8Error::error_len() == None`).
-/// Genuinely invalid bytes are consumed lossily and the loop continues, so a
-/// server emitting garbage cannot grow `carry` without bound or stall the
-/// stream waiting for a continuation that will never come.
-fn decode_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
-    carry.extend_from_slice(chunk);
-    let mut out = String::new();
-    loop {
-        let err = match std::str::from_utf8(carry) {
-            Ok(s) => {
-                out.push_str(s);
-                carry.clear();
-                return out;
-            }
-            Err(e) => e,
-        };
-        let good = err.valid_up_to();
-        // Valid by construction, so this is a decode and never a replacement.
-        out.push_str(&String::from_utf8_lossy(&carry[..good]));
-        match err.error_len() {
-            // Cut at the boundary: the rest is in the next chunk.
-            None => {
-                carry.drain(..good);
-                return out;
-            }
-            // Not a cut — actually invalid. Spend it and keep going.
-            Some(n) => {
-                carry.drain(..good + n);
-                out.push(char::REPLACEMENT_CHARACTER);
-            }
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Tool-call round cap + graceful cap-exit (issue: configurable max_tool_rounds)
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "mod_tests/repeat_call_guard_tests.rs"]
