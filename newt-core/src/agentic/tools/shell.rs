@@ -1059,11 +1059,13 @@ pub(super) async fn exec_confined_command_with_broker(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
-    // #2636 finding 1: typed signal for the pre-exec FS denial — set to the
-    // missing authority set when the denial fires BEFORE the child runs. Only
-    // this path produces a rerun-eligible slot; child stdout that happens to
-    // contain the denial string does not.
-    fs_pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
+    // #2636 finding 1 / #2681: typed signal for a structured pre-exec denial
+    // — set to the missing authority set whenever a STRUCTURED denial (a
+    // missing declared FS request, or an exec/net denial the confined shell
+    // reported) is what's returned to the model. Only these paths produce a
+    // rerun-eligible slot; child stdout that happens to contain the denial
+    // string does not.
+    pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
 ) -> (String, ExecOutcome) {
     // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
     // BEFORE either lane below runs anything — this is the single choke
@@ -1174,7 +1176,7 @@ pub(super) async fn exec_confined_command_with_broker(
                 Some(allowed)
             }
             _ => {
-                *fs_pre_exec_missing = Some(missing);
+                *pre_exec_missing = Some(missing);
                 return with_denial_context(
                     (UNGRANTED_FS_AUTHORITY_DENIAL.into(), ExecOutcome::Denied),
                     workspace,
@@ -1226,6 +1228,12 @@ pub(super) async fn exec_confined_command_with_broker(
                     &envelope,
                 );
                 if command_broker.is_some() {
+                    // #2681: broker-bearing commands are never replayed (see
+                    // this function's doc comment) — the caller's own
+                    // `commit_broker_used` guard discards this regardless,
+                    // mirroring the FS pre-flight check's unconditional
+                    // population above.
+                    *pre_exec_missing = exec_denial_requests(&envelope);
                     return with_denial_context(
                         (
                             denied_run_command_result(&envelope, color),
@@ -1310,6 +1318,16 @@ pub(super) async fn exec_confined_command_with_broker(
                             return with_denial_context(retried, workspace, cwd, Some(&widened));
                         }
                     }
+                }
+                // #2681: no gate, a non-exec-shaped denial, or the gate
+                // declined — the plain denial below is what the model
+                // receives, so an exec denial is replay-eligible exactly
+                // like the FS pre-flight check already is above. A `None`
+                // here (not exec-only, or no denials) leaves the slot
+                // untouched, matching the FS path's "only a real miss
+                // populates it" shape.
+                if let Some(requests) = exec_denial_requests(&envelope) {
+                    *pre_exec_missing = Some(requests);
                 }
             }
             confined_result(cmd, &envelope, caveats, color, |envelope| {
