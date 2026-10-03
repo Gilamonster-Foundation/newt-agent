@@ -11,8 +11,8 @@ use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
 use super::{
-    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled, resolve_tool_alias,
-    AliasOutcome,
+    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled,
+    permission_granted_result, resolve_tool_alias, AliasOutcome,
 };
 use crate::ExecOutcome;
 
@@ -1043,16 +1043,20 @@ pub(super) async fn exec_confined_command(
 /// Broker-bearing native commands use Brush's runtime external-command hook.
 ///
 /// #2689: a structured exec denial takes the operator to the SAME interactive
-/// `permission_gate.ask_with_caveats` prompt as any other exec denial, and an
-/// allow-once retries THIS SAME call with `command_broker` still attached —
-/// the attribution/signing policy applies to the replay exactly as it would
-/// have to the original attempt. This repeats whatever an earlier `&&`/`;`
-/// stage already did, same as the existing non-broker retry a few lines
-/// down — accepted here for the identical reason: before this fix an
-/// allow-once could never satisfy a broker-bearing denial at all. This is the
-/// model-synchronous retry inside one call; it is distinct from the
-/// model-driven `request_permissions`/`PendingRerun` replay in `tools.rs`,
-/// which still excludes a commit-broker command (`commit_broker_used`).
+/// `permission_gate.ask_with_caveats` prompt as any other exec denial. The
+/// retry below replays THIS SAME call — with `command_broker` still
+/// attached, so the attribution/signing policy applies to the replay exactly
+/// as it would have to the original attempt — ONLY when
+/// `is_safely_replayable` proves the denied command is a single simple
+/// command: no chain, substitution, pipeline, loop, or redirect that could
+/// already have run an earlier stage's effect, or would repeat one on
+/// replay (#2681 round 3's rule). Anything else records the call-local
+/// allow-once grant in the gate's pending-once queue and reports the grant
+/// without replaying, so the model's own retry picks it up with no second
+/// prompt. This is the model-synchronous retry inside one call; it is
+/// distinct from the model-driven `request_permissions`/`PendingRerun`
+/// replay in `tools.rs`, which still excludes a commit-broker command
+/// (`commit_broker_used`).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn exec_confined_command_with_broker(
     cmd: &str,
@@ -1069,11 +1073,13 @@ pub(super) async fn exec_confined_command_with_broker(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
-    // #2636 finding 1: typed signal for the pre-exec FS denial — set to the
-    // missing authority set when the denial fires BEFORE the child runs. Only
-    // this path produces a rerun-eligible slot; child stdout that happens to
-    // contain the denial string does not.
-    fs_pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
+    // #2636 finding 1 / #2681: typed signal for a structured pre-exec denial
+    // — set to the missing authority set whenever a STRUCTURED denial (a
+    // missing declared FS request, or an exec/net denial the confined shell
+    // reported) is what's returned to the model. Only these paths produce a
+    // rerun-eligible slot; child stdout that happens to contain the denial
+    // string does not.
+    pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
 ) -> (String, ExecOutcome) {
     // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
     // BEFORE either lane below runs anything — this is the single choke
@@ -1184,7 +1190,7 @@ pub(super) async fn exec_confined_command_with_broker(
                 Some(allowed)
             }
             _ => {
-                *fs_pre_exec_missing = Some(missing);
+                *pre_exec_missing = Some(missing);
                 return with_denial_context(
                     (UNGRANTED_FS_AUTHORITY_DENIAL.into(), ExecOutcome::Denied),
                     workspace,
@@ -1269,6 +1275,38 @@ pub(super) async fn exec_confined_command_with_broker(
                         if let PermissionDecision::Allow(widened) =
                             gate.ask_with_caveats(caveats, &requests)
                         {
+                            // #2689/#2681 round 3: this denial fired
+                            // mid-dispatch, so an earlier stage of `cmd` may
+                            // already have run a real effect, or may be the
+                            // ONE effect a whole-command replay would repeat
+                            // (see `is_safely_replayable`'s doc comment for
+                            // both measured shapes). Replay only when `cmd`
+                            // is provably a single simple command; otherwise
+                            // hold the grant in the gate's pending-once queue
+                            // for the model's own next matching call instead
+                            // of spending it on a replay that could duplicate
+                            // an effect.
+                            if !is_safely_replayable(cmd) {
+                                for request in &requests {
+                                    gate.queue_pending_once(request.kind, &request.target);
+                                }
+                                let granted = requests
+                                    .iter()
+                                    .map(|request| {
+                                        permission_granted_result(
+                                            request.kind.as_str(),
+                                            &request.target,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                return with_denial_context(
+                                    (granted, ExecOutcome::Denied),
+                                    workspace,
+                                    cwd,
+                                    Some(&widened),
+                                );
+                            }
                             if !filesystem_requests
                                 .iter()
                                 .all(|request| permits_filesystem_request(&widened, request))
@@ -1338,6 +1376,16 @@ pub(super) async fn exec_confined_command_with_broker(
                             return with_denial_context(retried, workspace, cwd, Some(&widened));
                         }
                     }
+                }
+                // #2681: no gate, a non-exec-shaped denial, or the gate
+                // declined — the plain denial below is what the model
+                // receives, so an exec denial is replay-eligible exactly
+                // like the FS pre-flight check already is above. A `None`
+                // here (not exec-only, or no denials) leaves the slot
+                // untouched, matching the FS path's "only a real miss
+                // populates it" shape.
+                if let Some(requests) = exec_denial_requests(&envelope) {
+                    *pre_exec_missing = Some(requests);
                 }
             }
             confined_result(cmd, &envelope, caveats, color, |envelope| {
@@ -2738,6 +2786,33 @@ fn is_structural_refusal(reason: &str) -> bool {
     reason.contains("refused by design:")
         || reason.contains("dynamic construct the confined shell")
         || reason.contains("not yet supported by the confined shell")
+}
+
+/// #2689/#2681 round 3: may `cmd` be auto-replayed whole after an operator
+/// grant? An exec/net denial fires mid-dispatch — unlike the FS pre-flight
+/// check, which runs before anything is dispatched at all — so an earlier
+/// stage in a `&&`/`;` chain, or an earlier stage of a pipeline, may already
+/// have run a real effect (a write, a commit) before the denied spawn was
+/// even attempted. Blindly re-dispatching the whole source on grant would
+/// repeat that effect (`echo x >> f && git commit -m m`), or — if the EARLIER
+/// stage is the one that already succeeded — repeat ITS effect instead
+/// (`git commit -m m && false-denied-prog`).
+///
+/// The simplest sound rule: replay only when `cmd` is PROVABLY a single
+/// simple command with nothing else that could have run or could run again —
+/// `agent_bridle::inspect_shell`'s flattened, non-executing inventory makes
+/// this checkable without executing anything. Fails closed (false) on an
+/// inspection error, more than one command, any dynamic construct (command
+/// substitution, backquotes, arithmetic), any redirect on that one command,
+/// or any topology warning (`&&`/`||`, `|`, `!`, `time`, `&` background, a
+/// `for` loop — see `agent_bridle_tool_shell::shell_inspect`'s warnings).
+fn is_safely_replayable(cmd: &str) -> bool {
+    agent_bridle::inspect_shell(cmd).is_ok_and(|inspection| {
+        inspection.commands.len() == 1
+            && inspection.constructs.is_empty()
+            && inspection.warnings.is_empty()
+            && inspection.commands[0].redirects.is_empty()
+    })
 }
 
 pub(super) fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRequest>> {
