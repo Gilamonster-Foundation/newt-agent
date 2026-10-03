@@ -2820,12 +2820,16 @@ mod governed_push_tests {
         git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
     }
 
-    /// SPEC-FINAL F5 through the REAL outer dispatch: under `Scope::All` net
-    /// a top-level `git push` gets the disclaimer and moves no ref — neither
-    /// the workspace's nor the destination's. The destination is a local
-    /// bare repository, so a push that escaped the broker would be visible.
+    /// SPEC-FINAL F5 through the REAL outer dispatch: under `Scope::All` net a
+    /// top-level `git push` moves no ref — neither the workspace's nor the
+    /// destination's. The destination is a local bare repository, so a push
+    /// that escaped the broker would be visible. As of #2700 the broker no
+    /// longer refuses Scope::All at preflight; the push still moves nothing
+    /// here because this repo is on the default branch (refused), so the
+    /// safety property holds for a DIFFERENT reason than the removed
+    /// `BroadNetScope` disclaim. #2700 removed that disclaim string.
     #[test]
-    fn f5_a_push_under_scope_all_net_is_refused_through_real_dispatch() {
+    fn f5_a_push_under_scope_all_net_moves_no_ref_through_real_dispatch() {
         let _env = BrokerEnv::new();
         let repo = repo_on_feature_branch();
         let dest = tempdir();
@@ -2851,9 +2855,15 @@ mod governed_push_tests {
         };
         let (result, _terminal) =
             dispatch_run_command(repo.path(), "git push origin task:task", &caveats);
-        assert!(result.contains("disclaimed"), "{result}");
+        // No ref escaped the broker into either repository.
         assert_eq!(refs(repo.path()), ws_before);
         assert_eq!(refs(dest.path()), dest_before);
+        // #2700: the Scope::All disclaim is gone; the refusal is for another
+        // reason (the default branch), never the old unrestricted-network text.
+        assert!(
+            !result.contains("unrestricted (Scope::All) network grant"),
+            "{result}"
+        );
     }
 
     /// F6 canary, PR side, through the REAL outer dispatch: gh prints an
@@ -3070,6 +3080,29 @@ mod governed_push_tests {
         assert!(
             !fd1.contains("chmod") && !fd1.contains("sudoers"),
             "repository bytes reached the operator sink: {fd1}"
+        );
+    }
+
+    /// Regression for #2700: under `Scope::All` net, `execute_governed_push`
+    /// must NOT return the old `BroadNetScope` refusal string. This fix removed
+    /// the `preflight_availability` Scope::All guard, so the push proceeds past
+    /// preflight (it fails later — cwd `/tmp` is outside the fs_read roots —
+    /// but never with the disclaimed/unrestricted-network message).
+    #[test]
+    fn execute_governed_push_does_not_refuse_scope_all_net() {
+        let caveats = Caveats {
+            net: Scope::All,
+            ..scoped_caveats()
+        };
+        let result = execute_governed_push(
+            "git push",
+            std::path::Path::new("/tmp"),
+            &caveats,
+            &mut None,
+        );
+        assert!(
+            !result.contains("unrestricted (Scope::All) network grant"),
+            "should not see BroadNetScope refusal: {result}"
         );
     }
 }

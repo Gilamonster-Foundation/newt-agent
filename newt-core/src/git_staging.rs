@@ -50,11 +50,6 @@ pub enum Unavailable {
     /// DESIGN-r4 residual 1: no native ownership/writability check on
     /// Windows, so the broker is refused unconditionally there.
     Windows,
-    /// DESIGN-r4 residual 2 / SPEC-FINAL F5: a descendant push from an opaque
-    /// launcher under `Scope::All` net cannot be governed — the model already
-    /// holds unrestricted network, so push governance is disclaimed entirely
-    /// rather than pretending to bound it.
-    BroadNetScope,
     /// SPEC-FINAL F4: the confined steps require a kernel-enforceable fs
     /// fence; without one the broker refuses rather than reading workspace
     /// objects unconfined.
@@ -65,22 +60,22 @@ impl std::fmt::Display for Unavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Windows => write!(f, "refused: governed push/PR-create is not available under Windows (no native ownership/writability check yet)"),
-            Self::BroadNetScope => write!(f, "refused: governed push/PR-create is unavailable under an unrestricted (Scope::All) network grant — the model already holds unrestricted network, so push governance is disclaimed for this session"),
             Self::NoConfinement => write!(f, "refused: this platform/kernel cannot kernel-enforce the confined fetch step (no Landlock/Seatbelt fs fence available)"),
         }
     }
 }
 
-/// Refuse the broker before any resolution when the platform or the net scope
-/// makes it impossible to govern (DESIGN-r4 residuals 1-2). Call this FIRST,
+/// Refuse the broker before any resolution when the platform makes it
+/// impossible to govern (DESIGN-r4 residual 1: no native check on Windows).
+/// Call this FIRST,
 /// before reading any ref, config, or filesystem state.
-pub fn preflight_availability(caveats: &Caveats) -> Result<(), Unavailable> {
+pub fn preflight_availability(_caveats: &Caveats) -> Result<(), Unavailable> {
     if cfg!(windows) {
         return Err(Unavailable::Windows);
     }
-    if matches!(caveats.net, Scope::All) {
-        return Err(Unavailable::BroadNetScope);
-    }
+    // Removed: Scope::All check. ensure_net_granted passes trivially for
+    // Scope::All (permits_net returns true), so the preflight refusal was
+    // blocking a valid use case without adding safety.
     Ok(())
 }
 
@@ -1860,13 +1855,10 @@ mod tests {
     }
 
     #[test]
-    fn preflight_refuses_scope_all_net() {
+    fn preflight_allows_scope_all_net() {
         let mut caveats = Caveats::top();
         caveats.net = Scope::All;
-        assert_eq!(
-            preflight_availability(&caveats),
-            Err(Unavailable::BroadNetScope)
-        );
+        assert!(preflight_availability(&caveats).is_ok());
     }
 
     #[test]

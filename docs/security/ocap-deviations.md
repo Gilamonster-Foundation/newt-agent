@@ -1125,9 +1125,12 @@ resolved in a later release:
 
 - Windows is refused outright — no native ownership/writability check exists
   yet for the trust predicate the broker relies on.
-- `Scope::All` (unrestricted network) is refused, and push governance is
+- ~~`Scope::All` (unrestricted network) is refused, and push governance is
   disclaimed there entirely — the model already holds unrestricted network
-  in that grant, so nothing this broker adds would bound it.
+  in that grant, so nothing this broker adds would bound it.~~ RESOLVED
+  (#2700): `Scope::All` no longer refuses at preflight — `ensure_net_granted`
+  passes trivially there — so a governed push/PR-create now proceeds under an
+  unrestricted net grant.
 - Credential-helper compatibility is limited to two forms: a bare name
   (resolved inside the trusted git's `--exec-path`) and the exact `gh
   setup-git` form (`!<trusted gh> auth git-credential`). Any other
