@@ -1521,18 +1521,28 @@ mod read_resource_tests {
 }
 
 /// The declared [`RuntimeClosure`] for a trusted worker transition — the only
-/// door by which the worker's executable reaches the mechanism's allow-list
+/// door by which the worker's executable reaches the mechanism's allow-lists
 /// (it then flows through [`AdmittedFence::admit`]'s scope check like any
 /// other closure entry; nothing widens the mechanism caveats silently).
 ///
 /// Landlock, Seatbelt, and the identity-closing stronger tiers need the fixed
-/// worker executable in their kernel execute allow-list so the boundary can
-/// launch it — those declare it. AppContainer is different: its launcher
-/// creates the worker as the initial confined process, and `exec: Only([])`
-/// must remain empty so `--no-child-process` is attached to that worker.
-/// Declaring the worker path there would silently turn deny-all into a
-/// non-empty allow-list, disable the kernel child-process mitigation, and
-/// leave an `exec → Kernel` report overclaiming — so it declares nothing.
+/// worker executable in their kernel execute **and** read allow-lists so the
+/// boundary can launch it — those declare it on both axes. Execute and read
+/// are separate Landlock rights: a caller that restricts `fs_read` while
+/// leaving `exec` ambient (`Scope::All`) never merges the worker's path into
+/// the mechanism's exec scope (only a restricted `Only(_)` exec axis gets the
+/// closure's exec entries), so without a matching `fs_read` declaration the
+/// worker's own ELF would be outside every read-allowed root and the kernel
+/// would refuse the worker's self-re-exec with `EACCES` (agent-bridle#418).
+/// `RuntimeClosure::fs_read` and `AdmittedFence::admit`'s merge onto that axis
+/// already exist here (added for `worker_read_resources`); this closure just
+/// needed to declare the worker's own path through that same door. AppContainer
+/// is different: its launcher creates the worker as the initial confined
+/// process, and `exec: Only([])` must remain empty so `--no-child-process` is
+/// attached to that worker. Declaring the worker path there would silently
+/// turn deny-all into a non-empty allow-list, disable the kernel child-process
+/// mitigation, and leave an `exec → Kernel` report overclaiming — so it
+/// declares nothing on either axis.
 ///
 /// A model-selected spawn declares nothing: the closure exists for internal
 /// transitions only, never for authority the model chose.
@@ -1552,7 +1562,13 @@ fn trusted_worker_closure(
         | SandboxKind::Seatbelt
         | SandboxKind::MinimalRootfs
         | SandboxKind::MicroVm => {
-            RuntimeClosure::empty().with_exec(crate::admitted::canonical_closure_program(program)?)
+            // agent-bridle#418: declare the worker image in BOTH `exec` and
+            // `fs_read` — the same canonical object. Narrowing-only: exactly
+            // this one file, on both axes.
+            let canonical = crate::admitted::canonical_closure_program(program)?;
+            RuntimeClosure::empty()
+                .with_exec(canonical.clone())?
+                .with_fs_read(canonical)
         }
         SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
     }
@@ -2792,6 +2808,109 @@ mod landlock_child_tests {
 
         let _ = fs::remove_dir_all(&admitted_dir);
         let _ = fs::remove_dir_all(&other_dir);
+    }
+
+    /// Copy a small, real executable to a fresh directory that is covered by
+    /// neither the default policy's `base_read_paths`/`bin_read_paths` nor any
+    /// granted `fs_read` scope — "a worker binary outside the base read
+    /// paths" (agent-bridle#418).
+    fn worker_binary_outside_base_read_paths() -> PathBuf {
+        let dir = unique_dir("worker-outside-base-read");
+        let source = ["/bin/echo", "/usr/bin/echo"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("echo(1) must exist for this test");
+        let worker = dir.join("worker-echo");
+        fs::copy(source, &worker).expect("copy worker binary (preserves the exec bit)");
+        worker
+    }
+
+    /// agent-bridle#418 (round 2, strace-rooted): `trusted_worker_closure` used
+    /// to add the worker's canonical path to the mechanism's **exec** allow-list
+    /// only, and only when `exec` itself was restricted
+    /// (`AdmittedFence::admit` folds a closure entry into an axis solely when
+    /// that axis is `Scope::Only(_)`). A caller that restricts `fs_read` but
+    /// leaves `exec` ambient (`Scope::All`) therefore never got the worker's
+    /// own ELF into any read-allowed root, and the worker's self-re-exec died
+    /// with a kernel `EACCES` (measured red on `main` before this fix, matching
+    /// the real `execve(...) = -1 EACCES` observed via
+    /// `strace -f -e trace=openat,open,execve`). The fix declares the worker
+    /// image in the closure's `fs_read` too, independent of `exec`'s scope.
+    /// `RuntimeClosure::fs_read` / `AdmittedFence::admit`'s merge already exist
+    /// here (added for `worker_read_resources`); only `trusted_worker_closure`
+    /// needed to declare the worker's own path on that axis.
+    #[test]
+    fn trusted_worker_starts_under_restricted_fs_read_and_ambient_exec() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let granted_read = unique_dir("granted-read");
+
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([granted_read.to_string_lossy().into_owned()]),
+            exec: Scope::All,
+            ..Caveats::top()
+        });
+        let effective = cx.caveats().clone();
+
+        let mut confined = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg("hi")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, effective, SpawnAuthority::TrustedWorker)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "trusted-worker spawn must survive restricted fs_read + ambient \
+                     exec with the worker binary outside the base read paths: {error}"
+                )
+            });
+        let status = confined.child.wait().expect("wait");
+        assert!(status.success(), "the worker must actually run: {status:?}");
+
+        let _ = fs::remove_dir_all(worker.parent().unwrap());
+        let _ = fs::remove_dir_all(&granted_read);
+    }
+
+    /// The companion case the fix must leave unchanged: `fs_read` AND `exec`
+    /// both restricted. This already worked (the worker's path reached
+    /// `mechanism_caveats.exec`, and `read_roots` adds the resolved exec
+    /// grants to the read allow-list when exec is confined) — proved here as a
+    /// real spawn, not just the closure-level unit test, so the #418 fix
+    /// (which also merges the closure into `fs_read`) is checked against it.
+    #[test]
+    fn trusted_worker_starts_under_restricted_fs_read_and_restricted_exec() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let granted_read = unique_dir("granted-read-both-restricted");
+
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([granted_read.to_string_lossy().into_owned()]),
+            exec: Scope::only([worker.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        let effective = cx.caveats().clone();
+
+        let mut confined = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg("hi")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, effective, SpawnAuthority::TrustedWorker)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "trusted-worker spawn must still succeed with both fs_read and \
+                     exec restricted (the pre-#418 working case): {error}"
+                )
+            });
+        let status = confined.child.wait().expect("wait");
+        assert!(status.success(), "the worker must actually run: {status:?}");
+
+        let _ = fs::remove_dir_all(worker.parent().unwrap());
+        let _ = fs::remove_dir_all(&granted_read);
     }
 }
 
