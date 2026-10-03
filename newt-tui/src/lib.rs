@@ -432,6 +432,7 @@ pub(crate) fn run_psyche_panel(
 }
 
 use std::io::{self, IsTerminal, Write as _};
+use std::path::{Path, PathBuf};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -2100,6 +2101,199 @@ fn audit_row(rec: &newt_core::PermissionRecord) -> String {
         "  {:<7} {:<9} {:<8} {} via {}",
         rec.decision, rec.scope, rec.kind, rec.target, rec.tool
     )
+}
+
+/// `/ocap propose` — fold this session's flight-recorder capture into a
+/// reviewable `approve.toml` proposal (issue #2679). The capture is GLOBAL
+/// across sessions, so it is narrowed to this session via the `session:`
+/// argument thread through [`newt_core::ocap_propose::propose_for`]: only the
+/// caveats recorded under the current session id survive (session-less
+/// caveats from before scoping existed are excluded), so a shared capture file never
+/// mixes one session's observed authority with another's. The proposer itself
+/// is shared with the CLI, so the panel cannot drift from the headless
+/// command. `save` records the low-danger candidates UNSIGNED (they are
+/// no-ops until `newt doctor --sign-ocap`).
+///
+/// Returns the rendered lines, or an error line.
+fn ocap_propose_command_lines(
+    capture_override: Option<PathBuf>,
+    config: Option<&Path>,
+    save: bool,
+    session: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    // The capture is global across sessions. With no owning session there is
+    // nothing that is provably THIS session's evidence, so propose nothing
+    // rather than fall back to an all-session read (that is the CLI's job).
+    let Some(session) = session else {
+        return Ok(vec![
+            "No active session, so there is no session-scoped evidence to propose from. \
+`newt ocap propose` (CLI) reviews the whole capture."
+                .to_string(),
+        ]);
+    };
+    let config_path = config
+        .map(Path::to_path_buf)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve the newt config directory"))?;
+
+    // No capture file means there is no observed authority to propose from —
+    // arm the recorder first. Never fabricate a proposal.
+    let capture_path = resolve_ocap_capture_path(capture_override, &config_path);
+    let capture_text = match std::fs::read_to_string(&capture_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(vec![
+                format!("No flight-recorder capture at {}.", capture_path.display()),
+                "Arm the recorder by running a task under `--full-access` (or set \
+`$NEWT_FLIGHT_RECORDER`); then `/ocap propose` turns that observed authority into a \
+reviewable proposal."
+                    .to_string(),
+            ]);
+        }
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", capture_path.display())),
+    };
+
+    // Read the four store files RAW (unverified) so already-written-but-unsigned
+    // candidates count as accounted-for and re-runs converge — same as the CLI.
+    let store_dir = config_path.with_file_name("ocap");
+    let store_files: Vec<(newt_core::ocap_store::Verdict, Option<String>)> =
+        newt_core::ocap_store::VERDICTS
+            .iter()
+            .map(|&v| {
+                (
+                    v,
+                    std::fs::read_to_string(store_dir.join(v.filename())).ok(),
+                )
+            })
+            .collect();
+    // The existing approve file is merged into, never replaced: every entry
+    // and signature in it survives a save. An unreadable file refuses the save
+    // rather than overwrite what could not be read.
+    let approve_path = store_dir.join(newt_core::ocap_store::Verdict::Approve.filename());
+    let existing = match std::fs::read_to_string(&approve_path) {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", approve_path.display())),
+    };
+
+    let now = crate::probe::today_local_date();
+    let (merged, proposal) = newt_core::ocap_propose::propose_for(
+        &capture_text,
+        &store_files,
+        existing.as_deref(),
+        crate::ocap_high_danger_predicate(),
+        &now,
+        Some(session),
+    )
+    .map_err(|e| anyhow::anyhow!("propose: {e}"))?;
+
+    if proposal.is_empty() {
+        return Ok(vec![
+            "This session's capture is fully accounted for by the current policy — nothing to propose."
+                .to_string(),
+        ]);
+    }
+
+    // `save` records the low-danger candidates UNSIGNED — they are no-ops until
+    // `newt doctor --sign-ocap`. Never write past the danger gate.
+    let wrote = save && proposal.additions_len() > 0;
+    if wrote {
+        let merged_toml = merged
+            .to_toml()
+            .map_err(|e| anyhow::anyhow!("serialize approve.toml: {e}"))?;
+        std::fs::create_dir_all(&store_dir)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", store_dir.display()))?;
+        std::fs::write(&approve_path, &merged_toml)
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", approve_path.display()))?;
+    }
+    Ok(render_ocap_proposal(&proposal, wrote))
+}
+
+/// Usage line for a malformed `/ocap` command.
+pub(crate) const OCAP_USAGE: &str = "usage: /ocap propose        show this session's grant candidates\n       /ocap propose save   also write them, unsigned, to approve.toml";
+
+/// Parse `/ocap propose [save]` (the slash body, without the leading `/`).
+/// `Some(save)` for the two accepted forms; `None` for anything else.
+pub(crate) fn parse_ocap_command(slash_body: &str) -> Option<bool> {
+    let words: Vec<&str> = slash_body.split_whitespace().collect();
+    match words.as_slice() {
+        ["ocap", "propose"] => Some(false),
+        ["ocap", "propose", "save"] => Some(true),
+        _ => None,
+    }
+}
+
+/// The human note on a proposed entry, or `"observed"` when none is present —
+/// mirrors the CLI's `note_of` (`newt-cli/src/ocap_cmd.rs`) so the panel and
+/// the headless command label entries the same way.
+fn note_of(note: &Option<String>) -> &str {
+    note.as_deref().unwrap_or("observed")
+}
+
+/// Pure render of a `/ocap propose` proposal — the low-danger additions, the
+/// deferred high-danger observations with reasons, and the next step. Mirrors
+/// `newt ocap propose`'s `render` (`newt-cli/src/ocap_cmd.rs`) so the panel and
+/// the headless command print the same shape.
+fn render_ocap_proposal(proposal: &newt_core::ocap_propose::Proposal, wrote: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(format!(
+        "Proposed {} durable candidate(s) from this session's capture:",
+        proposal.additions_len()
+    ));
+    for e in &proposal.additions.exec {
+        out.push(format!("  exec  {}   [{}]", e.target, note_of(&e.note)));
+    }
+    for e in &proposal.additions.fs {
+        let mode = if e.write { "rw" } else { "ro" };
+        out.push(format!(
+            "  fs    {} ({mode})   [{}]",
+            e.path,
+            note_of(&e.note)
+        ));
+    }
+    for e in &proposal.additions.net {
+        out.push(format!("  net   {}   [{}]", e.host, note_of(&e.note)));
+    }
+    out.push(String::new());
+    for d in &proposal.deferred {
+        out.push(format!("  deferred (review, high danger): {}", d.class));
+        out.push(format!(
+            "    {} — {}",
+            d.command,
+            d.reason.trim_start_matches("observed: ").trim()
+        ));
+    }
+    out.push(String::new());
+    if wrote {
+        out.push(String::from(
+            "Wrote the low-danger candidates to the approve store (UNSIGNED — \
+             these grants are no-ops until you `newt doctor --sign-ocap`).",
+        ));
+    } else {
+        out.push(String::from(
+            "This is a reviewable proposal only. To record the low-danger candidates \
+             UNSIGNED, run `/ocap propose save`, then `newt doctor --sign-ocap` to bless them.",
+        ));
+    }
+    out
+}
+
+/// Capture-path selection for `/ocap propose`, shared shape with the CLI's
+/// `resolve_capture_path`: an explicit `--capture`/file override wins, then a
+/// non-opt-out `$NEWT_FLIGHT_RECORDER`, then the default beside the config.
+fn resolve_ocap_capture_path(capture: Option<PathBuf>, config_path: &Path) -> PathBuf {
+    if let Some(p) = capture {
+        return p;
+    }
+    if let Some(v) = std::env::var_os(newt_core::flight_recorder::CAPTURE_PATH_ENV) {
+        let s = v.to_string_lossy();
+        if !(s.eq_ignore_ascii_case("off") || s == "0") {
+            return PathBuf::from(v);
+        }
+    }
+    config_path
+        .with_file_name("flight-recorder")
+        .join("unconfined.jsonl")
 }
 
 /// Render up to `limit` flat records as unchained-history rows, newest last
@@ -9908,6 +10102,11 @@ mod run_command_confinement_tests;
 #[cfg(test)]
 #[path = "lib_tests/disable_ocap_session_tests.rs"]
 mod disable_ocap_session_tests;
+
+/// `/ocap propose` (#2679): merge-on-save, exact grammar, session scope.
+#[cfg(test)]
+#[path = "lib_tests/ocap_propose_tests.rs"]
+mod ocap_propose_tests;
 
 // ---------------------------------------------------------------------------
 // ManagerNoteSink wiring (Step 19.3, #248) — `/remember` and the model's

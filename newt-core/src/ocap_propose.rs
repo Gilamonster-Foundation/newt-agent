@@ -28,7 +28,9 @@
 use std::collections::HashSet;
 
 use crate::flight_recorder::{FlightCapture, ShadowAxis};
-use crate::ocap_store::{CapabilityClass, ExecEntry, FsEntry, NetEntry, PolicyFile, PolicySet};
+use crate::ocap_store::{
+    CapabilityClass, ExecEntry, FsEntry, NetEntry, PolicyFile, PolicySet, Verdict,
+};
 
 /// The provenance stamped on every proposed entry's `by` field — mirrors the
 /// contract's free-form provenance (`human` / `seed` / a tool name). This value
@@ -194,6 +196,57 @@ pub fn propose_from_capture(
     proposal
 }
 
+/// The reusable entry point the CLI (`newt ocap propose`) AND the TUI
+/// (`/ocap propose`) both call. It is the SINGLE SOURCE OF TRUTH for folding a
+/// capture into a proposal — the TUI must not re-derive the grouping, the
+/// danger gate, or the provenance stamp. It reads the store files UNVERIFIED
+/// (an already-written-but-unsigned candidate counts as accounted-for, so a
+/// re-run never re-offers it), merges the low-danger additions on top of any
+/// existing entries, and returns both the merged file and the pure
+/// [`Proposal`]. `existing` is the raw text read from `approve.toml`, or `None`
+/// when no file is configured.
+///
+/// `session` scopes the capture to one session: when `Some`, caveats recorded
+/// under a different session are excluded from a shared capture file. The
+/// CLI and TUI both pass [`newt_core::lifecycle::active_session`]; when it is
+/// `None` the whole file is read (unscoped).
+///
+/// This is exactly the composition the CLI wires, so the TUI cannot drift from
+/// it: parse the store, build the in-policy pair set, call
+/// [`propose_from_capture`], then merge the additions on top of the existing
+/// file. Any other caller gets the same result for the same inputs.
+pub fn propose_for(
+    capture_text: &str,
+    store_files: &[(Verdict, Option<String>)],
+    existing: Option<&str>,
+    is_high_danger: impl Fn(CapabilityClass, &str) -> bool,
+    now: &str,
+    session: Option<&str>,
+) -> anyhow::Result<(PolicyFile, Proposal)> {
+    use crate::ocap_store::build_store;
+
+    let (set, _) = build_store(store_files);
+    let in_policy = in_policy_pairs(&set);
+    // Session-scoped read: with `session` set, caveats recorded under a
+    // different session are excluded (a shared capture file holds every
+    // session). `None` reads everything, preserving the unscoped behaviour.
+    let capture = crate::flight_recorder::read_capture_jsonl_sessioned(capture_text, session);
+    let proposal = propose_from_capture(&capture, &in_policy, is_high_danger, now);
+
+    // Append the proposed additions to the existing approve file, exactly as
+    // the CLI always has: every existing entry and signature is kept, and the
+    // proposer never re-proposes a target already in policy (`in_policy`).
+    let mut merged = match existing {
+        Some(text) => PolicyFile::parse(text).map_err(|e| anyhow::anyhow!("approve.toml: {e}"))?,
+        None => PolicyFile::default(),
+    };
+    merged.exec.extend(proposal.additions.exec.iter().cloned());
+    merged.fs.extend(proposal.additions.fs.iter().cloned());
+    merged.net.extend(proposal.additions.net.iter().cloned());
+
+    Ok((merged, proposal))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +385,31 @@ mod tests {
         assert!(pairs.contains(&("net".to_string(), "crates.io".to_string())));
         assert!(pairs.contains(&("fs".to_string(), "/ws".to_string())));
         assert_eq!(pairs.len(), 3);
+    }
+
+    /// The shared proposer appends, as the CLI always did: a same-path read
+    /// AND write addition both survive (round 1 retained-then-pushed by target,
+    /// which collapsed them), and existing entries are kept (#2687 review).
+    #[test]
+    fn propose_for_appends_and_keeps_same_path_read_and_write() {
+        let capture = concat!(
+            r#"{"axis":"fs_read","target":"data","command":"cat data/x","count":1}"#,
+            "\n",
+            r#"{"axis":"fs_write","target":"data","command":"cp a data/","count":1}"#,
+            "\n",
+        );
+        let existing = "[[exec]]\ntarget = \"rg\"\nsig = \"deadbeef\"\n";
+        let (merged, _) =
+            propose_for(capture, &[], Some(existing), danger, "2026-10-02", None).unwrap();
+        assert_eq!(
+            merged.fs.iter().filter(|e| e.path == "data").count(),
+            2,
+            "{:?}",
+            merged.fs
+        );
+        assert!(
+            merged.exec.iter().any(|e| e.target == "rg"),
+            "existing entry kept"
+        );
     }
 }
