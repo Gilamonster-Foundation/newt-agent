@@ -170,8 +170,8 @@ fn decode_chunk_reassembles_a_split_at_every_byte_offset() {
     let bytes = s.as_bytes();
     for cut in 0..=bytes.len() {
         let mut carry = Vec::new();
-        let mut got = decode_chunk(&mut carry, &bytes[..cut]);
-        got.push_str(&decode_chunk(&mut carry, &bytes[cut..]));
+        let mut got = reasoning::decode_chunk(&mut carry, &bytes[..cut]);
+        got.push_str(&reasoning::decode_chunk(&mut carry, &bytes[cut..]));
         assert_eq!(got, s, "split at byte {cut} corrupted the answer");
         assert!(carry.is_empty(), "nothing is left held at byte {cut}");
     }
@@ -187,7 +187,7 @@ fn decode_chunk_survives_one_byte_at_a_time() {
     let got: String = s
         .as_bytes()
         .iter()
-        .map(|b| decode_chunk(&mut carry, &[*b]))
+        .map(|b| reasoning::decode_chunk(&mut carry, &[*b]))
         .collect();
     assert_eq!(got, s);
     assert!(carry.is_empty());
@@ -199,7 +199,7 @@ fn decode_chunk_survives_one_byte_at_a_time() {
 #[test]
 fn decode_chunk_spends_invalid_bytes_instead_of_stalling_on_them() {
     let mut carry = Vec::new();
-    let got = decode_chunk(&mut carry, b"ok\xffthen");
+    let got = reasoning::decode_chunk(&mut carry, b"ok\xffthen");
     assert_eq!(got, "ok\u{FFFD}then");
     assert!(
         carry.is_empty(),

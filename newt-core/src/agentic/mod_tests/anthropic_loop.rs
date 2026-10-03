@@ -2000,7 +2000,7 @@ fn an_anthropic_text_delta_split_at_every_byte_offset_is_not_corrupted() {
         let mut acc = anthropic_wire::SseAccumulator::new();
         let mut text = String::new();
         for part in [&bytes[..cut], &bytes[cut..]] {
-            for action in acc.feed(&decode_chunk(&mut carry, part)) {
+            for action in acc.feed(&reasoning::decode_chunk(&mut carry, part)) {
                 if let anthropic_wire::StreamAction::TextDelta(t) = action {
                     text.push_str(&t);
                 }
