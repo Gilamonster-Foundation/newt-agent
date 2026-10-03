@@ -1945,6 +1945,24 @@ fn exec_denial_is_replay_safe(target: &str, cmd: &str) -> bool {
     only.program.as_deref() == Some(target) && !only.redirects.iter().any(redirect_has_effect)
 }
 
+/// #2689/#2691 round 3 (P1): `exec_denial_is_replay_safe` compares TEXT only
+/// — it says nothing about which AXIS was denied. A net denial's `target` is
+/// a HOST, not the denied command's executable, and a host label that
+/// happens to equal the program name (e.g. a CLI literally named after the
+/// service it calls, like the `host` DNS-lookup tool reaching a host named
+/// "host") would otherwise pass that string-equality check. Unlike an exec
+/// denial, a network refusal does NOT prove the program never ran or never
+/// produced an effect — the connection attempt happens mid-execution, after
+/// the process has already started. So every request must be `DenialKind::
+/// Exec` before the text predicate is even consulted; a net denial always
+/// falls through to the existing "granted; re-run your command" path (its
+/// manual retry), never an automatic replay.
+fn requests_are_replay_safe(requests: &[PermissionRequest], cmd: &str) -> bool {
+    requests.iter().all(|request| {
+        request.kind == DenialKind::Exec && exec_denial_is_replay_safe(&request.target, cmd)
+    })
+}
+
 /// A redirection that can mutate the filesystem independent of whether the
 /// command it decorates ever actually spawns — unlike a read, an fd
 /// duplication, or a here-doc/here-string, none of which touch anything
