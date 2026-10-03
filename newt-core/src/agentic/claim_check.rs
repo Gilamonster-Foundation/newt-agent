@@ -211,12 +211,32 @@ impl ObservedPaths {
     }
 }
 
-/// #1214: the observed local branch inventory, handed to
-/// [`annotate_action_claims`] as pure data. This is not execution evidence
-/// for commits, pushes, pull requests, or tests.
+/// #1214/#2683: the observed local branch inventory and commit evidence,
+/// handed to [`annotate_action_claims`] as pure data. This is not execution
+/// evidence for pushes, pull requests, or tests.
 pub(crate) struct TurnGitEvidence {
     /// Local branch names that exist right now.
     pub branches: Vec<String>,
+    /// #2683: HEAD's sha at the START of this turn (the baseline captured
+    /// before any of this turn's tool calls ran). `None` means no baseline
+    /// was captured (off-repo at turn start, or the read scope refused the
+    /// probe) — absence of a baseline must never manufacture a fact that was
+    /// never observed, so [`annotate_action_claims`] adds no commit-facts
+    /// note at all when this is `None`.
+    pub head_before: Option<String>,
+    /// HEAD's sha right now (end of turn) — always present once
+    /// [`collect_git_evidence`] returns `Some` at all, since reading it is
+    /// that function's own gating probe.
+    pub head_now: String,
+    /// #2683 round 2 (PR #2688 review): the workspace's CURRENT status
+    /// snapshot, when it could be read — reported verbatim by
+    /// [`annotate_action_claims`] as "uncommitted changes", never
+    /// cross-referenced against the files the claim's own text names (round
+    /// 3, PR #2688 review round 2, finding 1: that cross-reference is what
+    /// produced false "not committed" verdicts on a claim that correctly
+    /// scoped which file it committed — see [`commit_facts_note`]). `None`
+    /// means the probe failed; it is never treated as "nothing is dirty".
+    pub dirty_paths: Option<StatusSnapshot>,
 }
 
 /// Repo-relative path → two-character `git status --porcelain` code.
@@ -548,11 +568,140 @@ pub(crate) fn claimed_branches(text: &str) -> Vec<String> {
     out
 }
 
-/// #1214: append a refutation for a claimed local branch absent from the
-/// observed inventory, preserving the model's prose as an exact prefix.
-/// Git state cannot establish whether tests passed, an existing commit was
-/// pushed, or a pull request was opened. Do not turn a keyword in prose or
-/// an unchanged HEAD into an accusation about those actions.
+/// #2683: does `text` claim, somewhere, that a commit was just made? The
+/// verb form "committed" is the trigger (never the noun "commit" — "one
+/// commit ahead", "the existing commit", "pushed the existing commit" are
+/// never claims of having just performed a commit). Conservative, like
+/// [`claimed_branches`]: a negation, a future-tense auxiliary, a
+/// temporal-distancing word ("previously"/"earlier"), or the
+/// future/incomplete phrase "yet to" voids the match — scanned across the
+/// WHOLE clause (back to the nearest real sentence boundary, or the start of
+/// the line), never a fixed token count: "I have not, for safety reasons,
+/// been committed" has its negation 4 tokens before the verb, well outside a
+/// short window, and "Not staged; committed." has a negation that belongs to
+/// the PRIOR clause and must not bleed across the `;`. A quoted line (starts
+/// with `>`, markdown blockquote — someone else's words, not the model's
+/// own claim) is skipped entirely. Precision over recall: a spurious
+/// annotation on an honest "I have not committed" is worse than missing a
+/// real false claim — "already" is deliberately NOT a void word: "I have
+/// already committed the fix" is ordinary language for a just-finished
+/// action in THIS turn, not a claim about an earlier session.
+///
+/// #2683 round 3 (PR #2688 review round 2, finding 2): a clause boundary is
+/// a token that ENDS with `.`/`!`/`?`/`;`, never merely one that CONTAINS
+/// one — a period embedded mid-token (`src/a.rs`'s extension dot) is not a
+/// sentence boundary. Treating it as one discarded the negation preceding it
+/// in "I have not changed src/a.rs or committed anything", turning an
+/// honest non-claim into a false positive. [`CLAUSE_ABBREVIATIONS`] closes
+/// the matching gap at the OTHER end of a token: "e.g."/"etc." genuinely end
+/// with a period without ending the sentence.
+const COMMIT_VOID_WORDS: [&str; 5] = ["not", "never", "will", "previously", "earlier"];
+const CLAUSE_BOUNDARY: [char; 4] = ['.', '!', '?', ';'];
+
+/// Trailing-period abbreviations common enough in operator prose that a
+/// token ending in one must not be mistaken for the end of a clause —
+/// `ends_with` alone would still misread these the same way `contains` used
+/// to misread a path's embedded extension dot.
+const CLAUSE_ABBREVIATIONS: [&str; 6] = ["e.g.", "i.e.", "etc.", "vs.", "mr.", "dr."];
+
+/// Does `tok` genuinely end a clause: a trailing `.`/`!`/`?`/`;` that is not
+/// a known abbreviation? Checking the token's END (not merely whether it
+/// CONTAINS a boundary char anywhere) already excludes a path's embedded
+/// extension dot, since that dot is not the token's last character.
+fn ends_a_clause(tok: &str) -> bool {
+    tok.ends_with(CLAUSE_BOUNDARY)
+        && !CLAUSE_ABBREVIATIONS.contains(&tok.to_ascii_lowercase().as_str())
+}
+
+pub(crate) fn claims_committed(text: &str) -> bool {
+    let normalize = |t: &str| {
+        t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
+            .to_ascii_lowercase()
+    };
+    text.lines().any(|line| {
+        if line.trim_start().starts_with('>') {
+            return false; // a quoted line is not the model's own claim
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        toks.iter().enumerate().any(|(i, tok)| {
+            if normalize(tok) != "committed" {
+                return false;
+            }
+            let clause_start = toks[..i]
+                .iter()
+                .rposition(|t| ends_a_clause(t))
+                .map_or(0, |p| p + 1);
+            let clause: Vec<String> = toks[clause_start..i].iter().map(|t| normalize(t)).collect();
+            let voided = clause
+                .iter()
+                .any(|k| COMMIT_VOID_WORDS.contains(&k.as_str()) || k.contains("n't"))
+                || clause.windows(2).any(|w| w[0] == "yet" && w[1] == "to");
+            !voided
+        })
+    })
+}
+
+/// #2683 round 3 (PR #2688 review round 2, finding 1): the git FACTS for a
+/// claimed commit, with NO attempt to attribute them to any specific file
+/// the claim names. The prior design matched a commit claim anywhere in the
+/// text against EVERY path [`path_claims`] extracted from the SAME text and
+/// refuted the claim when one of them was still dirty — but "Committed
+/// src/a.rs. src/b.rs remains uncommitted." names exactly which file it
+/// committed, and that per-file check could not parse the distinction: it
+/// saw a commit claim and a dirty `src/b.rs` both present in the text and
+/// refuted the WHOLE claim, even though the claim never said b.rs was
+/// committed. Reporting the raw HEAD delta and the current `git status
+/// --porcelain` listing side by side, with no claim-to-file mapping at all,
+/// can never manufacture that false refutation — the operator reads the
+/// facts against their own claim text.
+fn commit_facts_note(before: &str, now: &str, dirty: Option<&StatusSnapshot>) -> String {
+    let head = if before == now {
+        "HEAD did not move".to_string()
+    } else {
+        format!(
+            "HEAD moved from `{}` to `{}`",
+            short_sha(before),
+            short_sha(now)
+        )
+    };
+    let changes = match dirty {
+        None => "not probed".to_string(),
+        Some(map) if map.is_empty() => "none".to_string(),
+        Some(map) => {
+            // Already lexicographic: `StatusSnapshot` is a `BTreeMap`.
+            let listed: Vec<_> = map
+                .keys()
+                .take(LISTED_CLAIMS)
+                .map(|p| format!("`{p}`"))
+                .collect();
+            let more = map.len() - listed.len();
+            if more > 0 {
+                format!("{} (+{more} more)", listed.join(", "))
+            } else {
+                listed.join(", ")
+            }
+        }
+    };
+    format!(
+        "repository state at the end of this turn: {head}; uncommitted changes: {changes} \
+         — verify the workspace state before trusting the summary above."
+    )
+}
+
+/// Short enough for prose; a sha already shorter than this (a test
+/// fixture's placeholder) passes through unchanged.
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+/// #1214/#2683: append a refutation for a claimed local branch absent from
+/// the observed inventory, and — when the text claims a commit and a HEAD
+/// baseline was captured for this turn — a neutral commit-FACTS note (round
+/// 3: no per-file verdict; see [`commit_facts_note`]), preserving the
+/// model's prose as an exact prefix. Git state still cannot establish
+/// whether tests passed, an existing commit was pushed, or a pull request
+/// was opened — do not turn a keyword in prose into an accusation about
+/// those.
 pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvidence>) -> String {
     let Some(ev) = evidence else { return text };
     let mut notes: Vec<String> = Vec::new();
@@ -561,24 +710,44 @@ pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvid
             notes.push(format!("claimed branch `{b}` does not exist"));
         }
     }
-    if notes.is_empty() {
-        return text;
+    // Recognize the commit claim against the model's ORIGINAL prose, never
+    // against a block this function itself appended.
+    let commit_claimed = claims_committed(&text);
+    let mut text = text;
+    if !notes.is_empty() {
+        text = format!(
+            "{text}\n\n⚠ claim check (#1214): {} — verify the workspace state before \
+             trusting the summary above.",
+            notes.join("; ")
+        );
     }
-    format!(
-        "{text}\n\n⚠ claim check (#1214): {} — verify the workspace state before \
-         trusting the summary above.",
-        notes.join("; ")
-    )
+    if commit_claimed {
+        if let Some(before) = ev.head_before.as_deref() {
+            text = format!(
+                "{text}\n\n⚠ claim check (#2683): {}",
+                commit_facts_note(before, &ev.head_now, ev.dirty_paths.as_ref())
+            );
+        }
+    }
+    text
 }
 
-/// Observe the branch inventory used by final-answer annotations. Preserve
-/// the existing no-evidence behavior for unborn HEADs and failed Git reads;
-/// no evidence means no refutation.
+/// Observe the branch and commit evidence used by final-answer annotations.
+/// Preserve the existing no-evidence behavior for unborn HEADs and failed
+/// Git reads; no evidence means no annotation. `head_before` is the HEAD sha
+/// captured once at the start of this turn ([`git_head`], before any of this
+/// turn's tool calls ran) — `None` when no baseline was captured, which
+/// leaves [`TurnGitEvidence::head_before`] `None` too rather than guessing.
+/// Also probes the CURRENT status snapshot (reusing [`SNAPSHOT_STATUS_ARGS`]
+/// / [`parse_porcelain_z`], the same machinery [`snapshot_workspace`] uses)
+/// for [`TurnGitEvidence::dirty_paths`] — a failed probe is `None`, never an
+/// implied "clean".
 pub(crate) fn collect_git_evidence(
     workspace: &str,
     read_scope: &crate::Scope<String>,
+    head_before: Option<&str>,
 ) -> Option<TurnGitEvidence> {
-    git_head(workspace, read_scope)?;
+    let head_now = git_head(workspace, read_scope)?;
     let branches = git_in(
         workspace,
         &["branch", "--format=%(refname:short)"],
@@ -588,7 +757,14 @@ pub(crate) fn collect_git_evidence(
     .map(|l| l.trim().to_string())
     .filter(|l| !l.is_empty())
     .collect();
-    Some(TurnGitEvidence { branches })
+    let dirty_paths =
+        git_in(workspace, &SNAPSHOT_STATUS_ARGS, read_scope).map(|out| parse_porcelain_z(&out));
+    Some(TurnGitEvidence {
+        branches,
+        head_before: head_before.map(str::to_string),
+        head_now,
+        dirty_paths,
+    })
 }
 
 /// Current HEAD sha of `workspace`, or `None` off-repo / on failure.
@@ -730,6 +906,43 @@ mod tests {
     fn evidence(branches: &[&str]) -> TurnGitEvidence {
         TurnGitEvidence {
             branches: branches.iter().map(|s| s.to_string()).collect(),
+            head_before: None,
+            head_now: "0000000000000000000000000000000000000000".to_string(),
+            dirty_paths: None,
+        }
+    }
+
+    /// Like [`evidence`], but with an explicit #2683 HEAD baseline/now pair
+    /// — `before == now` is the "did not move" case.
+    fn evidence_with_head(branches: &[&str], before: &str, now: &str) -> TurnGitEvidence {
+        TurnGitEvidence {
+            branches: branches.iter().map(|s| s.to_string()).collect(),
+            head_before: Some(before.to_string()),
+            head_now: now.to_string(),
+            dirty_paths: None,
+        }
+    }
+
+    /// Like [`evidence_with_head`], but also carrying a CURRENT dirty-status
+    /// snapshot — reported verbatim by the round-3 commit-facts note, never
+    /// cross-referenced against the claim's own text. The status code is
+    /// irrelevant to the check, so every dirty path shares a placeholder.
+    fn evidence_with_dirty(
+        branches: &[&str],
+        before: &str,
+        now: &str,
+        dirty: &[&str],
+    ) -> TurnGitEvidence {
+        TurnGitEvidence {
+            branches: branches.iter().map(|s| s.to_string()).collect(),
+            head_before: Some(before.to_string()),
+            head_now: now.to_string(),
+            dirty_paths: Some(
+                dirty
+                    .iter()
+                    .map(|p| (p.to_string(), " M".to_string()))
+                    .collect(),
+            ),
         }
     }
 
@@ -774,6 +987,11 @@ mod tests {
         assert_eq!(annotate_action_claims(claimy.clone(), None), claimy);
     }
 
+    /// The same fixtures that must never get a commit-facts note must ALSO
+    /// never get one manufactured by an unmoved-HEAD baseline, which is the
+    /// one evidence state where a careless recognizer would misfire on the
+    /// negated, future-tense, retrospective, or quoted "commit(ted)" mentions
+    /// below.
     #[test]
     fn git_state_does_not_refute_negated_or_unrelated_action_claims() {
         for text in [
@@ -787,6 +1005,12 @@ mod tests {
             "Previously, I committed the change.",
             "> committed the change",
             "The existing branch is one commit ahead of origin/main.",
+            "These changes are yet to be committed.",
+            "The files have not, for safety reasons, been committed.",
+            // #2683 round 3 (PR #2688 review round 2, finding 2): a path's
+            // own embedded extension dot is not a sentence boundary —
+            // treating it as one would strip the "not" preceding it.
+            "I have not changed src/a.rs or committed anything",
         ] {
             let ev = evidence(&["main"]);
             assert_eq!(
@@ -794,15 +1018,180 @@ mod tests {
                 text,
                 "Git metadata does not contradict this statement: {text}"
             );
+            let ev = evidence_with_head(&["main"], "aaa111", "aaa111");
+            assert_eq!(
+                annotate_action_claims(text.to_string(), Some(&ev)),
+                text,
+                "not a direct, present-tense commit claim, even with an unmoved-HEAD \
+                 baseline on hand: {text}"
+            );
         }
     }
 
-    /// A branch inventory cannot establish whether a commit was created.
+    /// A branch inventory ALONE (no commit/HEAD evidence collected this
+    /// turn) cannot establish whether a commit was created — absence of
+    /// evidence is not evidence of absence (#2683).
     #[test]
     fn branch_inventory_is_not_commit_execution_evidence() {
         let text = "I committed the change".to_string();
         let ev = evidence(&["main"]);
         assert_eq!(annotate_action_claims(text.clone(), Some(&ev)), text);
+    }
+
+    /// #2683, the measured retest bug (COMPARE.md, 2026-10-02): the model
+    /// reported "committed locally" when the change was only staged — HEAD
+    /// never moved. Round 3: this is now a neutral FACTS note, not a
+    /// verdict — the operator reads "HEAD did not move" against their own
+    /// judgment of the claim, appended after the model's prose, without
+    /// disturbing the branch-claim (#1214) channel.
+    #[test]
+    fn commit_claim_gets_a_facts_note_when_head_did_not_move() {
+        let text = "I committed the change locally. cargo check passes.".to_string();
+        let ev = evidence_with_head(&["main"], "aaa111", "aaa111");
+        let out = annotate_action_claims(text.clone(), Some(&ev));
+        assert!(out.starts_with(&text), "prose is an exact prefix: {out}");
+        assert!(out.contains("⚠ claim check (#2683)"), "got: {out}");
+        assert!(out.contains("HEAD did not move"), "got: {out}");
+    }
+
+    /// #2683 round 3 (PR #2688 review round 2): HEAD unmoved PLUS a staged
+    /// change reported in the SAME facts note — "uncommitted changes" is
+    /// read straight out of the current status snapshot, never matched
+    /// against the claim's own wording.
+    #[test]
+    fn head_unmoved_with_staged_changes_gets_the_facts_note() {
+        let text = "I committed the change locally.".to_string();
+        let ev = evidence_with_dirty(&["main"], "aaa111", "aaa111", &["src/a.rs"]);
+        let out = annotate_action_claims(text.clone(), Some(&ev));
+        assert!(out.contains("⚠ claim check (#2683)"), "got: {out}");
+        assert!(out.contains("HEAD did not move"), "got: {out}");
+        assert!(out.contains("`src/a.rs`"), "got: {out}");
+    }
+
+    /// Round 3: a TRUE commit claim, with evidence that HEAD actually moved,
+    /// now ALSO gets the facts note — it is informational, never an
+    /// accusation, so a true claim is not exempted from it; the note simply
+    /// corroborates what the model already said.
+    #[test]
+    fn a_true_committed_claim_gets_a_facts_note_showing_head_moved() {
+        let text = "I committed the change locally.".to_string();
+        let ev = evidence_with_head(&["main"], "aaa111", "bbb222");
+        let out = annotate_action_claims(text.clone(), Some(&ev));
+        assert!(out.starts_with(&text), "prose is an exact prefix: {out}");
+        assert!(out.contains("⚠ claim check (#2683)"), "got: {out}");
+        assert!(
+            out.contains("HEAD moved from `aaa111` to `bbb222`"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("uncommitted changes: not probed"),
+            "got: {out}"
+        );
+    }
+
+    /// #2683 round 3 (PR #2688 review round 2, finding 1): the fix
+    /// direction in full — stop mapping claim text to files. "Committed
+    /// src/a.rs. src/b.rs remains uncommitted." names exactly which file it
+    /// committed; the OLD per-file check could not parse that distinction
+    /// and refuted the WHOLE claim because b.rs (correctly named as
+    /// still-dirty, by the model's OWN prose) showed up in the dirty
+    /// snapshot. The facts note reports src/b.rs as a FACT, never as a
+    /// verdict against the claim — no "not committed" wording of ours
+    /// appears anywhere in the output.
+    #[test]
+    fn an_honest_partial_commit_claim_gets_facts_never_a_false_not_committed_verdict() {
+        let text = "Committed src/a.rs. src/b.rs remains uncommitted.".to_string();
+        let ev = evidence_with_dirty(&["main"], "aaa111", "bbb222", &["src/b.rs"]);
+        let out = annotate_action_claims(text.clone(), Some(&ev));
+        assert!(out.starts_with(&text), "prose is an exact prefix: {out}");
+        assert!(out.contains("⚠ claim check (#2683)"), "got: {out}");
+        assert!(
+            out.contains("HEAD moved from `aaa111` to `bbb222`"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("`src/b.rs`"),
+            "the dirty file is a FACT: {out}"
+        );
+        let annotation = out.strip_prefix(&text).expect("exact prefix");
+        assert!(
+            !annotation.to_lowercase().contains("not committed"),
+            "no claim-to-file verdict of ours: {out}"
+        );
+    }
+
+    /// Direct coverage of the recognizer: the trigger is the verb
+    /// "committed", never the noun "commit"; negation, future tense, a
+    /// temporal-distancing word, and a quoted line all void a match.
+    #[test]
+    fn claims_committed_recognizes_the_verb_but_not_voided_or_noun_forms() {
+        assert!(claims_committed(
+            "committed the fix on branch fix/x-1; tests pass"
+        ));
+        assert!(claims_committed("Committed the fix locally."));
+        assert!(!claims_committed("I have not committed these changes."));
+        assert!(!claims_committed(
+            "After approval, these files will be committed."
+        ));
+        assert!(!claims_committed("Previously, I committed the change."));
+        assert!(!claims_committed("> committed the change"));
+        assert!(!claims_committed("I pushed the existing commit to origin."));
+        assert!(!claims_committed(
+            "The existing branch is one commit ahead of origin/main."
+        ));
+    }
+
+    /// #2683 round 2 (PR #2688 review, finding 2): "ordinary language" cases
+    /// the fixed-token-window recognizer got wrong in both directions —
+    /// false negatives (a real claim wrongly voided) and a false positive (a
+    /// non-claim wrongly flagged).
+    #[test]
+    fn claims_committed_is_clause_aware_not_window_bounded() {
+        // False negative, precision gap: "already" is ordinary language for
+        // a just-finished action THIS turn, not a claim about an earlier
+        // session — must be recognized, not voided.
+        assert!(claims_committed("I have already committed the fix"));
+        // False negative, recall gap: the negation ("Not") belongs to the
+        // PRIOR clause ("staged") and must not bleed across the `;` to void
+        // the real claim that follows it.
+        assert!(claims_committed("Not staged; committed."));
+        // False positive: a future/incomplete construction, not a claim of
+        // having committed.
+        assert!(!claims_committed("These changes are yet to be committed."));
+        // Recall gap: the negation is 4 tokens before the verb — beyond any
+        // fixed short window — but still in the SAME clause as "committed".
+        assert!(!claims_committed(
+            "The files have not, for safety reasons, been committed."
+        ));
+        // #2683 round 3 (PR #2688 review round 2, finding 2): a path's own
+        // embedded period ("src/a.rs") is not a sentence boundary —
+        // treating it as one discarded the "not" preceding it and turned
+        // this honest non-claim into a false positive.
+        assert!(!claims_committed(
+            "I have not changed src/a.rs or committed anything"
+        ));
+        // The fix must not overcorrect: a path that genuinely ENDS a
+        // sentence (a real trailing period after the extension) still lets
+        // the NEXT clause claim a commit.
+        assert!(claims_committed("Verified src/a.rs. I committed the fix."));
+        // A trailing-period abbreviation mid-clause ("e.g.") must not be
+        // mistaken for the sentence boundary either — the same false-split
+        // shape as the path case, at the token's own end rather than its
+        // middle.
+        assert!(!claims_committed(
+            "The patch has not, e.g. for safety reasons, been committed."
+        ));
+    }
+
+    /// The clause-aware recognizer fix must reach the full annotation
+    /// pipeline (`annotate_action_claims`), not just the pure recognizer.
+    #[test]
+    fn ordinary_language_and_clause_boundary_commit_claims_are_also_refuted() {
+        for text in ["I have already committed the fix", "Not staged; committed."] {
+            let ev = evidence_with_head(&["main"], "aaa111", "aaa111");
+            let out = annotate_action_claims(text.to_string(), Some(&ev));
+            assert!(out.contains("⚠ claim check (#2683)"), "{text} -> {out}");
+        }
     }
 
     /// Prose after "branch" is not a ref; backticked refs unwrap.
