@@ -583,9 +583,10 @@ mod terminal {
     fn row_style(kind: RowKind) -> Style {
         match kind {
             // The spine is the primary content — default foreground, heads bold.
-            RowKind::PromptHead | RowKind::ReplyHead => {
-                Style::default().add_modifier(Modifier::BOLD)
-            }
+            RowKind::PromptHead => Style::default()
+                .fg(crate::theme::color(crate::theme::Role::HumanText))
+                .add_modifier(Modifier::BOLD),
+            RowKind::ReplyHead => Style::default().add_modifier(Modifier::BOLD),
             RowKind::Prompt | RowKind::Reply => Style::default(),
             // The grey is secondary — exactly the inline vocabulary.
             RowKind::ToolFold | RowKind::Tool => Style::default().fg(Color::DarkGray),
