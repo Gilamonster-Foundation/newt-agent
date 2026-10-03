@@ -866,9 +866,15 @@ impl AgentIdentity {
 /// Walk up from `start` (stopping before `home` and at the filesystem root)
 /// looking for a standalone `.newt/agent-identity.toml`. Innermost wins.
 fn find_identity_walkup(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    // Canonicalize home once so the stop-at-home check survives macOS's
+    // /var/folders → /private/var/folders symlink: current_dir() returns the
+    // physical path while $HOME holds the logical one.
+    let canonical_home: Option<PathBuf> = home.and_then(|h| h.canonicalize().ok());
     let mut dir = Some(start);
     while let Some(current) = dir {
-        if home == Some(current) {
+        let at_home = home == Some(current)
+            || canonical_home.as_deref().is_some_and(|ch| ch == current);
+        if at_home {
             break;
         }
         let candidate = current.join(".newt").join(AGENT_IDENTITY_FILENAME);
