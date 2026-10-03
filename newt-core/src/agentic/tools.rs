@@ -1924,10 +1924,11 @@ fn single_grant_covers_missing(
 /// (`inspect_shell` emits one for every `&&`/`||`/`;`-list member beyond the
 /// first, every pipeline, `!`, `time`, `&` background, and every for-loop —
 /// an empty list is itself proof none of those shapes are present), and no
-/// redirect that can mutate state (see [`redirect_has_effect`]) — regardless
-/// of whether THIS repo's admission check happens to make every one of
-/// those shapes safe today anyway (it does, for the plain compound case:
-/// see `approved_exec_replay_never_reruns_an_earlier_permitted_command`).
+/// redirect that can mutate state (see [`redirect_has_effect`]). This does
+/// not rely on any engine checking a whole command before running part of
+/// it: the safe-subset admission does in unit tests
+/// (`approved_exec_replay_never_reruns_an_earlier_permitted_command`), but
+/// that is not established for every production engine.
 /// Anything else returns `false` and the model is told to re-issue the
 /// command itself — the existing, always-safe fallback. Fails closed on an
 /// inspection error.
