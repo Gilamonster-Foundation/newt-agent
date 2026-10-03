@@ -1905,6 +1905,28 @@ fn single_grant_covers_missing(
     })
 }
 
+/// #2681 round 2 (P1): an exec denial replays safely ONLY when the denied
+/// spawn is the FIRST command in `cmd`'s source order. Unlike the FS
+/// pre-flight check (which runs before anything is dispatched at all), an
+/// exec denial fires mid-dispatch: an earlier command in the SAME
+/// `&&`/`;`-chain may already have run — a permitted external program, or a
+/// builtin, which bypasses the exec gate entirely and always runs — before
+/// the denied spawn was even attempted. Blindly re-dispatching the whole
+/// `cmd` string from scratch on grant would repeat that earlier effect.
+/// `agent_bridle::inspect_shell` (already used by `native_git::
+/// needs_commit_broker` for the same non-executing, source-order inventory)
+/// gives the one honest signal available without re-running anything:
+/// whether the denied target IS the first entry. Fails closed (false) on an
+/// inspection error or an empty command list — never claims safety it did
+/// not actually check.
+fn exec_denial_is_leading_spawn(target: &str, cmd: &str) -> bool {
+    agent_bridle::inspect_shell(cmd)
+        .ok()
+        .and_then(|inspection| inspection.commands.into_iter().next())
+        .and_then(|first| first.program)
+        .is_some_and(|program| program == target)
+}
+
 /// #721: the model-facing `request_permissions` tool — the capability-GRANT
 /// path. It builds a [`PermissionRequest`] from `{capability, target, reason}`
 /// and consults the SAME #263 [`PermissionGate`] a denial would: `Allow` reports
@@ -1976,8 +1998,15 @@ fn execute_request_permissions(
     // was denied on. A partial or unrelated request still clears the pending
     // slot (already taken by the caller) but gets ordinary access-grant
     // wording that says plainly no automatic replay will happen.
-    let eligible =
-        bound.filter(|pending| single_grant_covers_missing(kind, target, &pending.missing));
+    //
+    // #2681 round 2 (P1): for `Exec`, coverage alone is not consent to
+    // replay — `exec_denial_is_leading_spawn` additionally requires the
+    // denied spawn to be the FIRST command in `pending.cmd`, so replay can
+    // never repeat an earlier command's effect (see its doc comment).
+    let eligible = bound.filter(|pending| {
+        single_grant_covers_missing(kind, target, &pending.missing)
+            && (kind != DenialKind::Exec || exec_denial_is_leading_spawn(target, &pending.cmd))
+    });
 
     let request = PermissionRequest {
         tool: "request_permissions".to_string(),
