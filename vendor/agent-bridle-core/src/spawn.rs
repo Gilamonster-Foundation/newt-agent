@@ -411,11 +411,10 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
 /// audit covers — a descriptor this process just minted, which cannot already
 /// be a connected endpoint. [`Self::WorkerControl`] is the trusted-worker's
 /// one-shot authenticated control channel — audited for a DIFFERENT reason;
-/// see its own doc (ADR 0015 amendment E7, agent-bridle#417 / newt#2673).
-/// [`Self::Other`] is everything else (inherited, a redirected file, an
-/// existing fd) and is a legitimate, supported shape (shell redirects) — it
-/// just does not qualify a Seatbelt `net:none` spawn for the Kernel witness;
-/// see [`ConfinementMechanism::with_stdio_posture`].
+/// see its own doc. [`Self::Other`] is everything else (inherited, a
+/// redirected file, an existing fd) and is a legitimate, supported shape
+/// (shell redirects) — it just does not qualify a Seatbelt `net:none` spawn
+/// for the Kernel witness; see [`ConfinementMechanism::with_stdio_posture`].
 #[derive(Debug)]
 pub enum ConfinedStdio {
     /// `Stdio::piped()` — a pipe this process owns the opposite end of.
@@ -423,17 +422,23 @@ pub enum ConfinedStdio {
     /// `Stdio::null()` — `/dev/null`.
     Null,
     /// The trusted-worker's own half of a fresh `UnixStream::pair()`, wired as
-    /// its stdin and consumed by exactly one host-authored, signed frame
-    /// before the host drops its end (ADR 0015 E7). Audited for the same
-    /// reason `Piped`/`Null` are: by the time the worker executes a single
-    /// caveat-governed action, this descriptor carries no further traffic in
-    /// either direction — the host's end is gone, not merely half-closed. It
-    /// cannot be an ongoing XPC-style network deputy because the protocol
-    /// riding it has no worker→host request at all, let alone one that
-    /// performs I/O. Constructible only by
+    /// its stdin and consumed by exactly one host-authored, challenge-bound,
+    /// digest-verified frame (ADR 0015 E7, agent-bridle#416 round-3/
+    /// newt#2673) — not a cryptographic signature. Audited for the same
+    /// reason `Piped`/`Null` are: the **worker itself** retires this
+    /// descriptor (`retire_worker_stdin`, `agent-bridle-tool-shell/src/
+    /// private_control.rs:146,688-693` — dup2's `/dev/null` over its own
+    /// stdin) immediately after acknowledging the frame, before it begins a
+    /// single caveat-governed action. That is a guarantee of the worker's own
+    /// control flow, not a claim about when the host — a separate process —
+    /// happens to drop its own end; no ordering between the two is assumed or
+    /// required. It cannot be an ongoing XPC-style network deputy because the
+    /// protocol riding it has no worker→host request at all, let alone one
+    /// that performs I/O. Constructible only by
     /// [`SandboxedWorker::spawn_supported`] via [`WorkerControlHandle::new`]
-    /// (crate-private), so a model-selected or otherwise external caller
-    /// cannot claim this credit for an arbitrary fd.
+    /// (private to this module, round-2 review item 3 — narrower than merely
+    /// crate-private), so no other caller, in this crate or outside it, can
+    /// claim this credit for an arbitrary fd.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     WorkerControl(WorkerControlHandle),
     /// Any other descriptor: inherited, a redirected file, a raw or dup'd fd.
@@ -441,15 +446,16 @@ pub enum ConfinedStdio {
 }
 
 /// Opaque owner of the trusted-worker control descriptor, constructible only
-/// from this crate's own trusted-worker spawn path (crate-private
-/// constructor) — see [`ConfinedStdio::WorkerControl`].
+/// from this module's own trusted-worker spawn path (module-private
+/// constructor, narrower than crate-private — round-2 review item 3) — see
+/// [`ConfinedStdio::WorkerControl`].
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 pub struct WorkerControlHandle(std::os::fd::OwnedFd);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl WorkerControlHandle {
-    pub(crate) fn new(fd: std::os::fd::OwnedFd) -> Self {
+    fn new(fd: std::os::fd::OwnedFd) -> Self {
         Self(fd)
     }
 }
