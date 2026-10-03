@@ -333,15 +333,29 @@ mod native {
         .await;
 
         if out.contains(KNOWN_KERNEL_INTERCEPTOR_MISMATCH) {
-            eprintln!(
-                "known-finding: the hook handshake engaged (the maybe_dispatch gap is fixed) \
-                 but NativeGitBroker's own git dispatch demands a Kernel floor on every axis \
-                 (ExecOrigin::AgentInfluenced) while Landlock's exec axis can never report above \
-                 Interceptor for a restricted scope — see this file's module doc for the \
-                 root-caused mismatch and why no caveats shape here can route around it. Not \
-                 treated as this test's own pass/fail: {out}"
+            // This test CANNOT pass until the production fix lands in the
+            // broker (see issue #2693). That fix is a SEPARATE lane, so it must
+            // NOT be masked here as a pass by returning success on the
+            // refusal — doing so would let #2693 stay unshipped while this
+            // test stays green. A refusal is a FAILURE of this test, not a
+            // skip: it records the real state (the hook handshake engaged,
+            // proving the maybe_dispatch gap is fixed) while the still-unknown
+            // pass/fail of the trailer property is recorded by the failure.
+            // The test binary is still scheduled by CI (see the pipeline
+            // file's cross-reference), so #2693's resolution is visible as this
+            // test turning green; the harness never counts a known-blocked
+            // refusal as a pass.
+            panic!(
+                "blocker for issue #2693: the hook handshake engaged (the \
+                 maybe_dispatch gap is fixed) but NativeGitBroker's own git \
+                 dispatch demands a Kernel floor on every axis \
+                 (ExecOrigin::AgentInfluenced) while Landlock's exec axis can \
+                 never report above Interceptor for a restricted scope — this \
+                 file's module doc names the root-caused mismatch and why no \
+                 caveats shape here can route around it. Do NOT treat a \
+                 refusal as success: the trailer assertion is what #2693 \
+                 ships. Tool output was: {out}"
             );
-            return;
         }
 
         let message = real_git_output(&main, &["log", "-1", "--format=%B", "refs/heads/task"]);

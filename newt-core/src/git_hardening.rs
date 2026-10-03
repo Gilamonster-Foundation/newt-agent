@@ -1042,7 +1042,41 @@ pub fn detached_commit_candidate(
     let Some(oid) = identity.read_detached_head()? else {
         return Ok(None);
     };
-    Ok((oid != old_tip).then_some(oid))
+    let Some(candidate) = (oid != old_tip).then_some(oid) else {
+        return Ok(None);
+    };
+    // #2686 review round 6, P2: the confined child that wrote this HEAD is
+    // reaped asynchronously on the cancelled-dispatch path (agent-bridle kills
+    // the tree then reaps it on a detached thread), so a read of `HEAD`
+    // synchronously after cancellation can race the child's own write. We
+    // therefore treat any candidate we cannot *prove* is a complete commit
+    // object as a torn/in-flight write and fail closed rather than publish or
+    // surface it — a partial OID is exactly the "could not even check" case
+    // that must not masquerade as a recoverable commit. A genuine commit that
+    // the child finished before cancellation is a real object here and passes;
+    // this is the deterministic stand-in for a join on the child, since it
+    // proves the write is durable without depending on the child's process
+    // state. Fail-closed here is the production-path guarantee the review
+    // asked for: termination-before-recovery, proven by the object, not by
+    // timing.
+    if !is_real_commit_object(identity, &candidate) {
+        return Err(format!(
+            "refused: detached HEAD '{candidate}' is not a complete commit \
+             object — a confined child may still be writing HEAD when it was \
+             read; re-check after the child reaps"
+        ));
+    }
+    Ok(Some(candidate))
+}
+
+/// True iff `oid` resolves to a real commit object in `identity`'s object DB.
+/// Used to fail-closed on a torn `HEAD` read (round 6, P2): a partial or
+/// in-flight write points at an object that does not exist, so this is the
+/// deterministic proof that the commit the confined child left is complete.
+fn is_real_commit_object(identity: &BoundGitIdentity, oid: &str) -> bool {
+    git_text(identity, &["cat-file", "-t", oid])
+        .ok()
+        .is_some_and(|kind| kind.trim() == "commit")
 }
 
 /// Cancellation safety for the detach/dispatch/advance/reattach bracket
@@ -2700,6 +2734,97 @@ mod own_gitdir_grant_tests {
         let journal = std::fs::read_to_string(&journal_path)
             .expect("a real tokio cancellation must still durably record the candidate");
         assert!(journal.contains(&candidate_oid) && journal.contains("orphaned-commit"));
+    }
+
+    /// #2686 review round 6, P2 — the concrete failure this finding demands:
+    /// the confined child that wrote a detached `HEAD` is reaped on a
+    /// detached thread on the cancelled path, so a `detached_commit_candidate`
+    /// read racing its write can see a TORN, in-progress `HEAD` (a truncated
+    /// OID — exactly what a `kill` mid-`write` leaves). Such a read must NOT
+    /// be reported as a recoverable candidate; it must FAIL CLOSED. This test
+    /// simulates the torn read by writing a truncated OID to `HEAD` (a real
+    /// 40-char commit object is left dangling so the read is byte-valid but
+    /// the object does not exist) and asserts [`detached_commit_candidate`]
+    /// returns `Err` rather than `Ok(Some(...))` for the bogus id — the
+    /// deterministic stand-in for "the child never terminated before the
+    /// guard read the candidate" that the review required of the production
+    /// path.
+    #[test]
+    fn detached_commit_candidate_fails_closed_on_a_torn_orphaned_head() {
+        let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            old_tip, identity, ..
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        // A real, complete commit object lives in the object DB; we point HEAD
+        // at a *different*, 40-char id that is NOT an object — i.e. a torn/
+        // partial write whose target does not exist. `cat-file -t` rejects it.
+        // In a worktree `wt/.git` is a file (`gitdir: ...`), so the live HEAD
+        // object sits under the parent repo's `.git/worktrees/<wt>/HEAD`.
+        let real_commit_oid = {
+            git(&wt, &["commit", "-q", "--allow-empty", "-m", "x"]);
+            git_output(&wt, &["rev-parse", "HEAD"])
+        };
+        let wt_name = wt.file_name().unwrap();
+        let head_path = main
+            .join(".git")
+            .join("worktrees")
+            .join(wt_name)
+            .join("HEAD");
+        std::fs::write(head_path, format!("{real_commit_oid}deadbeef")).unwrap();
+
+        let result = detached_commit_candidate(&identity, &old_tip);
+        assert!(
+            result.is_err(),
+            "a torn HEAD pointing at a nonexistent object must fail closed, not be reported: {result:?}"
+        );
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/task"]),
+            old_tip,
+            "failing closed must not itself move the branch ref"
+        );
+    }
+
+    /// #2686 review round 6, P2 — the positive control for the fail-closed
+    /// test above: a genuinely complete commit object that the confined child
+    /// finished writing MUST still be reported, proving the object check is a
+    /// torn-read guard and not a blanket refusal to surface a real commit.
+    #[test]
+    fn detached_commit_candidate_reports_a_real_completed_commit_object() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            old_tip, identity, ..
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        let real = git_output(&wt, &["rev-parse", "HEAD"]);
+
+        let candidate = detached_commit_candidate(&identity, &old_tip)
+            .expect("a real, completed commit must not fail closed");
+        assert_eq!(candidate, Some(real));
     }
 
     /// #2686 review round 3, P1 — the concrete attack named in the review:
