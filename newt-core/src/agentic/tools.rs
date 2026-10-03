@@ -4355,19 +4355,36 @@ async fn execute_authorized_tool(
                             );
                         }
                     }
-                } else if let Some(candidate) = crate::git_hardening::detached_commit_candidate(
-                    &move_info.identity,
-                    &move_info.old_tip,
-                ) {
-                    // The dispatch itself did not exit 0 (e.g. a compound
-                    // `git commit … && false`) — never publish behind a
-                    // reported failure, but don't lose the commit silently
-                    // either: name its oid so it is recoverable.
-                    exec_text = format!(
-                        "{exec_text}\nnote: a commit was created on detached HEAD but left \
-                         unpublished because the dispatch did not succeed: {candidate}. It is \
-                         reachable only by this SHA until a retried commit publishes it."
-                    );
+                } else {
+                    // #2686 review round 5, P2: `detached_commit_candidate`
+                    // now distinguishes "verified: nothing to report" from
+                    // "could not even check" — surface the latter instead of
+                    // silently treating it as the former.
+                    match crate::git_hardening::detached_commit_candidate(
+                        &move_info.identity,
+                        &move_info.old_tip,
+                    ) {
+                        Ok(Some(candidate)) => {
+                            // The dispatch itself did not exit 0 (e.g. a
+                            // compound `git commit … && false`) — never
+                            // publish behind a reported failure, but don't
+                            // lose the commit silently either: name its oid
+                            // so it is recoverable.
+                            exec_text = format!(
+                                "{exec_text}\nnote: a commit was created on detached HEAD but \
+                                 left unpublished because the dispatch did not succeed: \
+                                 {candidate}. It is reachable only by this SHA until a retried \
+                                 commit publishes it."
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            exec_text = format!(
+                                "{exec_text}\nerror: could not check whether a commit landed \
+                                 on detached HEAD before reattaching: {error}"
+                            );
+                        }
+                    }
                 }
                 // Always reattach, success or failure alike — an unpaired
                 // detach leaves the worktree stuck on a detached HEAD for

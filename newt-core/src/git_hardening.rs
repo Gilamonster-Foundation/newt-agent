@@ -276,76 +276,110 @@ fn path_to_string(path: &Path) -> String {
 /// oid — is read as a raw file beneath the held descriptor instead
 /// ([`Self::read_detached_head`]), never through git's own resolution.
 pub struct BoundGitIdentity {
+    /// Read only by the linux/macos-only native-write machinery below
+    /// (`verify`, `hardened_git_common`), so gated the same way as that
+    /// machinery rather than left as dead code on another platform.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     common_dir: PathBuf,
     git_dir: PathBuf,
-    #[cfg(unix)]
+    /// Native beneath-safe opens ([`crate::fs_cap::WorkspaceDir`]) exist only
+    /// on Linux/macOS (`newt-core/src/lib.rs`'s `fs_cap` gate), so every
+    /// field below is gated to match that exactly — not the broader
+    /// `cfg(unix)` a round-4 draft used, which would also claim a
+    /// non-Linux/macOS Unix (e.g. a BSD) that has no `fs_cap` module either
+    /// (#2686 review round 5, P2: "gate the native implementation to
+    /// Linux/macOS, where fs_cap exists").
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     common_root: agent_bridle_fdguard::GrantedRoot,
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     git_root: agent_bridle_fdguard::GrantedRoot,
-    /// The SAME two directories as `common_root`/`git_root`, opened a second
-    /// time (by the same trusted pathname, in the same `bind()` call, before
-    /// the confined child ever runs — there is no TOCTOU window between two
-    /// opens the host itself performs back to back) as [`crate::fs_cap::WorkspaceDir`]
-    /// handles: `GrantedRoot` exposes only `open_read`/`open_write`, with no
-    /// `O_EXCL` create or `renameat` — both of which the native ref-update
-    /// protocol (#2686 review round 4, P1) needs and `WorkspaceDir` already
-    /// has. Two capability types over the same object, not duplicated
-    /// authority: `common_root`/`git_root` remain the sole source of
-    /// [`Self::verify`]'s identity check.
-    #[cfg(unix)]
+    /// The SAME two directory OBJECTS as `common_root`/`git_root` — never a
+    /// second, independent open of the intended pathname (#2686 review
+    /// round 5, P1: a round-4 draft opened these via
+    /// [`crate::fs_cap::WorkspaceDir::open_root`] against the same pathname
+    /// `common_root`/`git_root` had just been acquired from, which is two
+    /// opens of one intended object bound only by "nothing hostile ran in
+    /// between", not by a kernel guarantee). [`Self::bind`] derives these by
+    /// `dup`ing `common_root`/`git_root`'s own fd
+    /// ([`crate::fs_cap::WorkspaceDir::from_granted_root`]), so the object
+    /// identity [`Self::verify`] checks IS the object every write below
+    /// lands in, by construction — not merely by argument. Two capability
+    /// TYPES over the same object, not duplicated authority: `GrantedRoot`
+    /// exposes only `open_read`/`open_write`, with no `O_EXCL` create or
+    /// `renameat` — both of which the native ref-update protocol (round 4,
+    /// P1) needs and `WorkspaceDir` already has.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     common_workspace: crate::fs_cap::WorkspaceDir,
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     git_workspace: crate::fs_cap::WorkspaceDir,
 }
 
 impl BoundGitIdentity {
     /// Bind `common_dir`/`git_dir` — already [`verified_identity`]-checked
     /// against the session-start cache by the caller — as held descriptors.
+    /// Linux/macOS only (the one caller, [`own_branch_for_commit_ref_move`],
+    /// never reaches this on any other platform — see its own `cfg(not(...))`
+    /// arm, which returns `None` without calling this at all).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn bind(common_dir: PathBuf, git_dir: PathBuf) -> Result<Self, String> {
-        #[cfg(unix)]
-        {
-            let common_root =
-                agent_bridle_fdguard::GrantedRoot::acquire(&common_dir).map_err(|e| {
-                    format!(
-                        "refused: cannot bind the common git dir '{}' ({e})",
-                        common_dir.display()
-                    )
-                })?;
-            let git_root = agent_bridle_fdguard::GrantedRoot::acquire(&git_dir).map_err(|e| {
+        Self::bind_seamed(common_dir, git_dir, &|| {})
+    }
+
+    /// [`Self::bind`] plus a test-only seam: `between_acquire_and_derive`
+    /// fires, for each of the two directories, right after
+    /// [`agent_bridle_fdguard::GrantedRoot::acquire`] has resolved the
+    /// pathname and right before [`crate::fs_cap::WorkspaceDir::from_granted_root`]
+    /// derives the write handle from that SAME held fd — proving there is no
+    /// surviving window in which the two could end up bound to different
+    /// objects, because the second one is no longer a pathname resolution at
+    /// all (#2686 review round 5, P1's "deterministic seam test: replace and
+    /// restore the pathname between the two former opens"). A no-op in
+    /// production.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn bind_seamed(
+        common_dir: PathBuf,
+        git_dir: PathBuf,
+        between_acquire_and_derive: &dyn Fn(),
+    ) -> Result<Self, String> {
+        let common_root = agent_bridle_fdguard::GrantedRoot::acquire(&common_dir).map_err(|e| {
+            format!(
+                "refused: cannot bind the common git dir '{}' ({e})",
+                common_dir.display()
+            )
+        })?;
+        let git_root = agent_bridle_fdguard::GrantedRoot::acquire(&git_dir).map_err(|e| {
+            format!(
+                "refused: cannot bind the worktree admin dir '{}' ({e})",
+                git_dir.display()
+            )
+        })?;
+        between_acquire_and_derive();
+        // Derived by `dup`ing the ALREADY-HELD fd above — never a second
+        // `open()` of `common_dir`/`git_dir`'s pathname. Whatever
+        // `between_acquire_and_derive` just did to the pathname cannot
+        // affect this: there is no pathname resolution left to redirect.
+        let common_workspace = crate::fs_cap::WorkspaceDir::from_granted_root(&common_root)
+            .map_err(|e| {
+                format!(
+                    "refused: cannot bind the common git dir '{}' ({e})",
+                    common_dir.display()
+                )
+            })?;
+        let git_workspace =
+            crate::fs_cap::WorkspaceDir::from_granted_root(&git_root).map_err(|e| {
                 format!(
                     "refused: cannot bind the worktree admin dir '{}' ({e})",
                     git_dir.display()
                 )
             })?;
-            let common_workspace =
-                crate::fs_cap::WorkspaceDir::open_root(&common_dir).map_err(|e| {
-                    format!(
-                        "refused: cannot bind the common git dir '{}' ({e})",
-                        common_dir.display()
-                    )
-                })?;
-            let git_workspace = crate::fs_cap::WorkspaceDir::open_root(&git_dir).map_err(|e| {
-                format!(
-                    "refused: cannot bind the worktree admin dir '{}' ({e})",
-                    git_dir.display()
-                )
-            })?;
-            Ok(Self {
-                common_dir,
-                git_dir,
-                common_root,
-                git_root,
-                common_workspace,
-                git_workspace,
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(Self {
-                common_dir,
-                git_dir,
-            })
-        }
+        Ok(Self {
+            common_dir,
+            git_dir,
+            common_root,
+            git_root,
+            common_workspace,
+            git_workspace,
+        })
     }
 
     /// Re-check both held identities against a fresh `stat` of the SAME two
@@ -353,7 +387,7 @@ impl BoundGitIdentity {
     /// workspace. Fails closed: the directory at that exact path is no
     /// longer the object bound before the confined child ran.
     pub fn verify(&self) -> Result<(), String> {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::fs::MetadataExt;
             for (label, path, root) in [
@@ -394,7 +428,7 @@ impl BoundGitIdentity {
     /// `Ok(None)` for a symbolic ref (not detached) or an absent file.
     fn read_detached_head(&self) -> Result<Option<String>, String> {
         let text = {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 use std::io::Read;
                 match self.git_root.open_read(Path::new("HEAD")) {
@@ -408,7 +442,7 @@ impl BoundGitIdentity {
                     Err(e) => return Err(format!("refused: cannot read HEAD ({e})")),
                 }
             }
-            #[cfg(not(unix))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 match std::fs::read_to_string(self.git_dir.join("HEAD")) {
                     Ok(text) => text,
@@ -440,6 +474,10 @@ impl BoundGitIdentity {
 /// three now write natively through [`BoundGitIdentity`]'s held
 /// `WorkspaceDir` handles — `openat`/`renameat` relative to the ALREADY-OPEN
 /// descriptor — so there is no second pathname resolution left to redirect.
+/// Linux/macOS only — its only callers ([`rev_parse`], [`commit_parents_of`],
+/// [`git_text`]) all serve the native ref-move machinery above, which is
+/// itself gated the same way.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn hardened_git_common(identity: &BoundGitIdentity, args: &[&str]) -> io::Result<Command> {
     let mut cmd = hardened_git(&identity.common_dir, args)?;
     cmd.env("GIT_DIR", &identity.common_dir);
@@ -474,6 +512,7 @@ pub struct OwnBranchRefMove {
 /// failure to bind the identity (fd exhaustion, a symlink on the way) is
 /// the same narrowing, not a widening: the commit then fails exactly as it
 /// did with no ref-directory write at all, never with a wider grant.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn own_branch_for_commit_ref_move(workspace: &Path) -> Option<OwnBranchRefMove> {
     let (common_dir, git_dir) = verified_identity(workspace)?;
     let branch = own_branch(workspace)?;
@@ -489,10 +528,25 @@ pub fn own_branch_for_commit_ref_move(workspace: &Path) -> Option<OwnBranchRefMo
     })
 }
 
+/// This platform has no [`crate::fs_cap::WorkspaceDir`] (native beneath-safe
+/// writes are Linux/macOS only, matching `fs_cap`'s own gate) — `None`,
+/// exactly the same narrowing this function already documents for an
+/// unborn branch or a failed bind (#2686 review round 5, P2: "give other
+/// platforms an explicit fail-closed unsupported path"). A commit-creating
+/// dispatch then runs with `HEAD` attached and fails exactly as it did
+/// before this mechanism existed — no ref-directory write grant — never
+/// with a wider one; the retired pathname-`GIT_DIR` git spawn is not
+/// restored.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn own_branch_for_commit_ref_move(_workspace: &Path) -> Option<OwnBranchRefMove> {
+    None
+}
+
 /// `refs/heads/<branch>`'s current oid, or `None` for an unborn branch (no
 /// commits on it yet — `rev-parse --verify` exits non-zero rather than
 /// erroring, so this is the ordinary "nothing there yet" case, not a
 /// resolution failure).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn own_branch_tip(identity: &BoundGitIdentity, branch: &str) -> Option<String> {
     rev_parse(identity, &format!("refs/heads/{branch}"))
         .ok()
@@ -516,6 +570,7 @@ pub fn detach_own_head(identity: &BoundGitIdentity, tip: &str) -> Result<(), Str
 /// write — the point a test can replace the directory at `identity`'s
 /// pathname to prove the write still lands in the HELD object (#2686 review
 /// round 4, P1's "deterministic seam, not timing"). A no-op in production.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detach_own_head_seamed(
     identity: &BoundGitIdentity,
     tip: &str,
@@ -524,6 +579,23 @@ fn detach_own_head_seamed(
     identity.verify()?;
     between_verify_and_use();
     write_head_natively(identity, &format!("{tip}\n"))
+}
+
+/// This platform has no [`crate::fs_cap::WorkspaceDir`] — native beneath-safe
+/// writes are Linux/macOS only, matching `fs_cap`'s own gate (#2686 review
+/// round 5, P2). Fails closed rather than silently doing nothing or
+/// restoring the retired pathname-`GIT_DIR` git spawn (round 4, P2
+/// explicitly forbids resurrecting that). [`own_branch_for_commit_ref_move`]
+/// never binds a usable identity on this platform (its own cfg arm below),
+/// so nothing ever calls this with a real detach pending — it exists only so
+/// the crate compiles for this target.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn detach_own_head_seamed(
+    _identity: &BoundGitIdentity,
+    _tip: &str,
+    _between_verify_and_use: &dyn Fn(),
+) -> Result<(), String> {
+    Err(unsupported_native_write())
 }
 
 /// Reverses [`detach_own_head`]: `HEAD` becomes a symbolic ref to `branch`
@@ -537,6 +609,7 @@ pub fn reattach_own_head(identity: &BoundGitIdentity, branch: &str) -> Result<()
 }
 
 /// [`reattach_own_head`] plus the same test seam as [`detach_own_head_seamed`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reattach_own_head_seamed(
     identity: &BoundGitIdentity,
     branch: &str,
@@ -545,6 +618,27 @@ fn reattach_own_head_seamed(
     identity.verify()?;
     between_verify_and_use();
     write_head_natively(identity, &format!("ref: refs/heads/{branch}\n"))
+}
+
+/// See [`detach_own_head_seamed`]'s `cfg(not(...))` twin — same reasoning.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn reattach_own_head_seamed(
+    _identity: &BoundGitIdentity,
+    _branch: &str,
+    _between_verify_and_use: &dyn Fn(),
+) -> Result<(), String> {
+    Err(unsupported_native_write())
+}
+
+/// The shared refusal text for every native-write entry point on a platform
+/// with no [`crate::fs_cap::WorkspaceDir`] (`cfg(not(any(target_os = "linux",
+/// target_os = "macos")))`). One copy, so every stub says the same thing.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unsupported_native_write() -> String {
+    "refused: native ref/HEAD writes are Linux/macOS only on this build (no \
+     crate::fs_cap on this platform); the pathname-based git spawn this replaced is \
+     not restored (#2686 review round 4, P2)"
+        .to_string()
 }
 
 /// Write `content` to the worktree-local `HEAD` file natively — relative to
@@ -556,6 +650,7 @@ fn reattach_own_head_seamed(
 /// `HEAD` file, so there is no concurrent mover to race (real git's own
 /// `update-ref`/`symbolic-ref` take no `<oldvalue>` for `HEAD` either, absent
 /// one being passed explicitly).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_head_natively(identity: &BoundGitIdentity, content: &str) -> Result<(), String> {
     write_lockfile_natively(&identity.git_workspace, Path::new("HEAD"), content)
 }
@@ -566,6 +661,7 @@ fn write_head_natively(identity: &BoundGitIdentity, content: &str) -> Result<(),
 /// `rel`. Every step is relative to the descriptor `workspace` already
 /// holds — opened once, before any confined child ran — so a filesystem
 /// mutation at `rel`'s PATHNAME after that point cannot redirect any of it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_lockfile_natively(
     workspace: &crate::fs_cap::WorkspaceDir,
     rel: &Path,
@@ -593,7 +689,9 @@ fn write_lockfile_natively(
     })
 }
 
-/// `<rel>.lock`, git's own lockfile naming.
+/// `<rel>.lock`, git's own lockfile naming. Linux/macOS only — its callers
+/// ([`write_lockfile_natively`], [`advance_branch_ref_natively`]) are.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn lock_path(rel: &Path) -> PathBuf {
     let mut name = rel.as_os_str().to_owned();
     name.push(".lock");
@@ -650,6 +748,7 @@ pub fn advance_own_branch_ref(
 /// a content-addressed read a directory swap can only make FAIL, never
 /// return a wrong answer that passes the fast-forward/amend check (see the
 /// module's `advance_and_reattach_use_the_held_object…` test).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn advance_own_branch_ref_seamed(
     identity: &BoundGitIdentity,
     branch: &str,
@@ -705,6 +804,22 @@ fn advance_own_branch_ref_seamed(
     Ok(new_oid)
 }
 
+/// See [`detach_own_head_seamed`]'s `cfg(not(...))` twin — same reasoning:
+/// no [`crate::fs_cap::WorkspaceDir`] on this platform, so this exists only
+/// to compile, fails closed, and is never reached in practice.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn advance_own_branch_ref_seamed(
+    _identity: &BoundGitIdentity,
+    _branch: &str,
+    _old_tip: &str,
+    _between_verify_and_use: &dyn Fn(),
+) -> Result<String, AdvanceRefusal> {
+    Err(AdvanceRefusal {
+        candidate_oid: None,
+        reason: unsupported_native_write(),
+    })
+}
+
 /// The native CAS-write [`advance_own_branch_ref`] delegates to: lock
 /// `refs/heads/<branch>` exclusively (git's own lockfile protocol, via
 /// [`write_lockfile_natively`]'s shared primitive, inlined here because the
@@ -714,6 +829,17 @@ fn advance_own_branch_ref_seamed(
 /// the reflog line, and only then commit via `rename` — in that order, so a
 /// failure at any step (locked, moved tip, a reflog write failure) leaves
 /// `refs/heads/<branch>` completely untouched rather than partially applied.
+///
+/// #2686 review round 5, P2: a nested branch name (`feature/foo`) that has
+/// only ever been written to `packed-refs` has no loose `refs/heads/feature/`
+/// directory at all, so the lock create below needs its parent created
+/// first — real git's own `update-ref` does the same (`core.logAllRefUpdates`
+/// aside, a loose-ref write always creates whatever directories the branch's
+/// own path needs). Every failure path, including a failed `rename` AFTER
+/// the reflog append, now cleans up the owned `.lock` via `abort` and, for
+/// the rename case specifically, says so honestly: the reflog line already
+/// landed even though the ref itself did not move.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn advance_branch_ref_natively(
     identity: &BoundGitIdentity,
     branch: &str,
@@ -721,8 +847,33 @@ fn advance_branch_ref_natively(
     new_oid: &str,
     message: &str,
 ) -> Result<(), String> {
+    advance_branch_ref_natively_seamed(identity, branch, old_tip, new_oid, message, &|| {})
+}
+
+/// [`advance_branch_ref_natively`] plus a test-only seam:
+/// `between_reflog_and_rename` fires right after the reflog append
+/// succeeds and right before the commit-by-`rename` — the exact window a
+/// test needs to force a deterministic rename failure AFTER the reflog
+/// line has genuinely landed, to prove the honest-partial-effect wording
+/// above against a real failure rather than a narrative one (#2686 review
+/// round 5, P2: "test injected rename failure"). A no-op in production.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn advance_branch_ref_natively_seamed(
+    identity: &BoundGitIdentity,
+    branch: &str,
+    old_tip: &str,
+    new_oid: &str,
+    message: &str,
+    between_reflog_and_rename: &dyn Fn(),
+) -> Result<(), String> {
     use std::io::Write as _;
     let ref_rel = PathBuf::from(format!("refs/heads/{branch}"));
+    if let Some(parent) = ref_rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+        identity
+            .common_workspace
+            .create_dir_all(parent)
+            .map_err(|e| format!("refused: cannot create refs/heads/{branch}'s directory ({e})"))?;
+    }
     let lock_rel = lock_path(&ref_rel);
     let mut lock = identity
         .common_workspace
@@ -759,10 +910,18 @@ fn advance_branch_ref_natively(
         return Err(abort(e));
     }
 
+    between_reflog_and_rename();
+
     identity
         .common_workspace
         .rename(&lock_rel, &ref_rel)
-        .map_err(|e| format!("refused: cannot commit refs/heads/{branch} ({e})"))
+        .map_err(|e| {
+            abort(format!(
+                "refused: cannot commit refs/heads/{branch} ({e}) — the reflog line for this \
+             update was already appended to logs/refs/heads/{branch} before this failure, so \
+             that log now has an entry the ref itself never reflects"
+            ))
+        })
 }
 
 /// `refs/heads/<branch>`'s current on-disk value, read NATIVELY (relative to
@@ -770,6 +929,7 @@ fn advance_branch_ref_natively(
 /// spawn): the loose ref file if one exists, else a `packed-refs` line.
 /// `Ok(None)` means genuinely absent from both — an unborn branch, or (for
 /// the compare-and-swap above) a branch some other actor packed/deleted.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_ref_natively(identity: &BoundGitIdentity, branch: &str) -> Result<Option<String>, String> {
     use std::io::Read as _;
     let rel = PathBuf::from(format!("refs/heads/{branch}"));
@@ -788,6 +948,7 @@ fn read_ref_natively(identity: &BoundGitIdentity, branch: &str) -> Result<Option
 
 /// `packed-refs`' entry for `refs/heads/<branch>`, read NATIVELY. Skips
 /// comment (`#`) and peeled (`^`) lines, matching git's own format.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_packed_ref_natively(
     identity: &BoundGitIdentity,
     branch: &str,
@@ -810,18 +971,23 @@ fn read_packed_ref_natively(
     }
 }
 
-/// Append one reflog line to `logs/refs/heads/<branch>`, creating the
-/// `logs/refs/heads` directory first if this is the branch's first-ever
-/// reflog entry (git's own `update-ref` does the same when
-/// `core.logAllRefUpdates` is on, the non-bare default). The committer
-/// identity is newt's own harness identity, not the commit's real author:
-/// this reflog line is bookkeeping for `git reflog`, never consulted for any
-/// authorization decision here, so it is not worth a fourth git-spawn read
-/// to recover the commit's actual committer.
+/// Append one reflog line to `logs/refs/heads/<branch>`, creating every
+/// missing directory on that path first — not just the fixed
+/// `logs/refs/heads` prefix, but the BRANCH's own nested parent too
+/// (`logs/refs/heads/feature/` for a branch named `feature/foo`), matching
+/// git's own `update-ref` behavior when `core.logAllRefUpdates` is on (the
+/// non-bare default) and fixing #2686 review round 5, P2: a round-4 draft
+/// created only the fixed prefix, so a first reflog entry for a nested
+/// branch name failed. The committer identity is newt's own harness
+/// identity, not the commit's real author: this reflog line is bookkeeping
+/// for `git reflog`, never consulted for any authorization decision here, so
+/// it is not worth a fourth git-spawn read to recover the commit's actual
+/// committer.
 ///
 /// ponytail: harness identity, not the commit's own committer — upgrade to
 /// the real one if `git reflog show` on this branch ever needs to attribute
 /// a newt-made entry to a specific session/model rather than to newt itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn append_reflog_natively(
     identity: &BoundGitIdentity,
     branch: &str,
@@ -830,12 +996,15 @@ fn append_reflog_natively(
     message: &str,
 ) -> Result<(), String> {
     use std::io::Write as _;
-    let log_dir = Path::new("logs/refs/heads");
-    identity
-        .common_workspace
-        .create_dir_all(log_dir)
-        .map_err(|e| format!("refused: cannot create logs/refs/heads ({e})"))?;
-    let rel = log_dir.join(branch);
+    let rel = Path::new("logs/refs/heads").join(branch);
+    if let Some(parent) = rel.parent() {
+        identity
+            .common_workspace
+            .create_dir_all(parent)
+            .map_err(|e| {
+                format!("refused: cannot create the reflog directory for {branch} ({e})")
+            })?;
+    }
     let line = format!(
         "{old_tip} {new_oid} {} <{}> {} +0000\t{message}\n",
         crate::agent_identity::DEFAULT_AGENT_NAME,
@@ -855,14 +1024,25 @@ fn append_reflog_natively(
 /// `git commit … && false`): did a commit still land on the detached HEAD?
 /// Read-only — never publishes, so the caller can report the oid without
 /// moving the branch ref out from under a dispatch the model saw fail
-/// (#2686 review round 3, P2). `None` when `identity` no longer verifies,
-/// nothing was created, or `HEAD` cannot be read — the caller treats all
-/// three the same (nothing to report).
-#[must_use]
-pub fn detached_commit_candidate(identity: &BoundGitIdentity, old_tip: &str) -> Option<String> {
-    identity.verify().ok()?;
-    let oid = identity.read_detached_head().ok()??;
-    (oid != old_tip).then_some(oid)
+/// (#2686 review round 3, P2). `Ok(None)` means genuinely nothing to report
+/// (HEAD never moved off `old_tip`).
+///
+/// #2686 review round 5, P2: a round-4 draft collapsed a [`BoundGitIdentity::verify`]
+/// or [`BoundGitIdentity::read_detached_head`] FAILURE into the same `None`
+/// as "nothing happened" — indistinguishable from the caller's point of
+/// view, even though one means "there may be an unrecoverable commit and we
+/// could not even check" and the other means "there truly is nothing to
+/// recover". Returning `Result` lets every caller tell those apart and
+/// report the failure rather than silently treating it as success.
+pub fn detached_commit_candidate(
+    identity: &BoundGitIdentity,
+    old_tip: &str,
+) -> Result<Option<String>, String> {
+    identity.verify()?;
+    let Some(oid) = identity.read_detached_head()? else {
+        return Ok(None);
+    };
+    Ok((oid != old_tip).then_some(oid))
 }
 
 /// Cancellation safety for the detach/dispatch/advance/reattach bracket
@@ -925,20 +1105,37 @@ impl Drop for DetachedHeadGuard<'_> {
         // recoverable record is the only channel left for a real commit this
         // leaves stranded; `eprintln!` is the last-resort fallback for the
         // (rare) case even that record can't be written — never a silent
-        // `let _ =` on either.
-        if let Some(oid) = detached_commit_candidate(self.identity, &self.old_tip) {
-            let event = crate::event_journal::JournalEvent::new(
-                crate::event_journal::EventKind::OrphanedCommit,
-                &self.branch,
-                &oid,
-                "detached-head-guard-drop",
-            );
-            if crate::event_journal::record_event(event).is_none() {
+        // `let _ =` on either. #2686 review round 5, P2:
+        // `detached_commit_candidate` now distinguishes "verified: nothing to
+        // report" from "could not even check" (`Err`) — the latter can no
+        // longer be reported as if it were the former; `Drop` has no return
+        // channel for it, so `eprintln!` is the only honest place left.
+        match detached_commit_candidate(self.identity, &self.old_tip) {
+            Ok(Some(oid)) => {
+                let event = crate::event_journal::JournalEvent::new(
+                    crate::event_journal::EventKind::OrphanedCommit,
+                    &self.branch,
+                    &oid,
+                    "detached-head-guard-drop",
+                );
+                if crate::event_journal::record_event(event).is_none() {
+                    eprintln!(
+                        "newt: a commit ({oid}) landed on detached HEAD for branch '{}' but \
+                         the dispatch holding it was cancelled before publication, and it \
+                         could not be durably recorded either. Recover it with \
+                         `git branch {} {oid}`.",
+                        self.branch, self.branch
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
                 eprintln!(
-                    "newt: a commit ({oid}) landed on detached HEAD for branch '{}' but the \
-                     dispatch holding it was cancelled before publication, and it could not be \
-                     durably recorded either. Recover it with `git branch {} {oid}`.",
-                    self.branch, self.branch
+                    "newt: could not check whether a commit landed on detached HEAD for \
+                     branch '{}' before this dispatch was cancelled: {error}. If one exists, \
+                     it may be unreachable from any ref — recover it by inspecting the \
+                     worktree's reflog by hand.",
+                    self.branch
                 );
             }
         }
@@ -957,7 +1154,8 @@ impl Drop for DetachedHeadGuard<'_> {
 /// the worktree-local `HEAD` (see [`BoundGitIdentity::read_detached_head`]
 /// for that). `Ok(Some(oid))` on success, `Ok(None)` for "nothing there"
 /// (exit 1, e.g. an unborn branch), `Err` only for an actual failure to run
-/// git at all.
+/// git at all. Linux/macOS only — every caller is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rev_parse(identity: &BoundGitIdentity, rev: &str) -> Result<Option<String>, String> {
     let output = hardened_git_common(identity, &["rev-parse", "--verify", "--quiet", rev])
         .map_err(|e| e.to_string())?
@@ -970,6 +1168,7 @@ fn rev_parse(identity: &BoundGitIdentity, rev: &str) -> Result<Option<String>, S
     Ok((!oid.is_empty()).then_some(oid))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn commit_parents_of(identity: &BoundGitIdentity, oid: &str) -> Result<Vec<String>, String> {
     let output = hardened_git_common(identity, &["cat-file", "commit", oid])
         .map_err(|e| e.to_string())?
@@ -981,6 +1180,7 @@ fn commit_parents_of(identity: &BoundGitIdentity, oid: &str) -> Result<Vec<Strin
     crate::native_git_broker::commit_parents(&output.stdout)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn git_text(identity: &BoundGitIdentity, args: &[&str]) -> Result<String, String> {
     let output = hardened_git_common(identity, args)
         .map_err(|e| e.to_string())?
@@ -2347,6 +2547,7 @@ mod own_gitdir_grant_tests {
         git(&wt, &["commit", "-q", "-m", "task work"]); // the "git commit" half of "&& false"
 
         let candidate = detached_commit_candidate(&identity, &old_tip)
+            .expect("verify/read must succeed")
             .expect("a real commit was made and must be reported");
         assert_eq!(candidate, git_output(&wt, &["rev-parse", "HEAD"]));
         assert_eq!(
@@ -2721,6 +2922,278 @@ mod own_gitdir_grant_tests {
         let reattach_refusal = reattach_own_head(&identity, &branch)
             .expect_err("reattach must also refuse against the replaced admin dir");
         assert!(reattach_refusal.contains("no longer names the directory"));
+    }
+
+    /// #2686 review round 5, P1 — a round-4 draft bound `common_root` (the
+    /// object [`BoundGitIdentity::verify`] checks) via `GrantedRoot::acquire`,
+    /// then opened `common_workspace` (the handle every native write actually
+    /// goes through) via a SECOND, INDEPENDENT `WorkspaceDir::open_root` call
+    /// against the same pathname — bound only by "nothing hostile ran in the
+    /// back-to-back window between the two opens", not by a kernel guarantee.
+    ///
+    /// Measured red for that class, inline: swap the common dir for an empty
+    /// decoy right before [`BoundGitIdentity::bind_seamed`]'s
+    /// `between_acquire_and_derive` fires — exactly where a round-4-shaped
+    /// `bind` would have performed its second, independent open, so in that
+    /// shape it binds `common_workspace` to the decoy — then restore the
+    /// real common dir only AFTER `bind_seamed` returns (never inside the
+    /// hook, or the second open would never see the decoy at all). A rename
+    /// does not invalidate an already-open fd, so a round-4-shaped
+    /// `common_workspace` stays bound to the decoy's object even once the
+    /// decoy is moved out of `common_dir`'s pathname: a write through it
+    /// would report success while landing nowhere the real, visible repo
+    /// can see.
+    ///
+    /// This round's fix removes the second open entirely —
+    /// [`crate::fs_cap::WorkspaceDir::from_granted_root`] derives
+    /// `common_workspace` by `dup`ing `common_root`'s own fd, captured
+    /// BEFORE the swap — so there is no pathname resolution left for the
+    /// swap to catch: the real native write (through `advance_own_branch_ref`)
+    /// must land in the REAL, restored object, and the restored, visible
+    /// `refs/heads/task` must show it.
+    #[test]
+    fn bind_derives_the_write_handle_from_the_held_fd_not_a_second_pathname_open() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let old_tip = git_output(&main, &["rev-parse", "refs/heads/task"]);
+        let (common_dir, git_dir) = verified_identity(&wt).unwrap();
+        // `git_dir` nests under `common_dir` for a linked worktree
+        // (`<common_dir>/worktrees/<name>`), so swapping `common_dir` alone
+        // would ALSO make `git_dir`'s pathname vanish — an unrelated ENOENT
+        // that would obscure what THIS test means to exercise. Recreate
+        // just enough of the path inside the decoy for a round-4-shaped
+        // second open on `git_dir` to still succeed.
+        let git_dir_rel_to_common = git_dir.strip_prefix(&common_dir).unwrap().to_path_buf();
+
+        let moved_aside = root_path.join("common-moved-aside-at-bind-time");
+        let swap = || {
+            std::fs::rename(&common_dir, &moved_aside).unwrap();
+            std::fs::create_dir(&common_dir).unwrap(); // empty decoy, at common_dir's pathname
+            std::fs::create_dir_all(common_dir.join(&git_dir_rel_to_common)).unwrap();
+        };
+
+        let identity = BoundGitIdentity::bind_seamed(common_dir.clone(), git_dir, &swap).expect(
+            "acquire already completed before the swap; a decoy directory still opens fine",
+        );
+
+        // Restore ONLY NOW — after `bind_seamed` (and whichever "second
+        // open" it performed, old shape or new) has already returned. The
+        // decoy is moved OUT rather than deleted, so an old-shape
+        // `common_workspace`'s still-open fd keeps naming a real,
+        // inspectable (if orphaned-by-pathname) directory.
+        let decoy_relocated = root_path.join("common-decoy-after-restore");
+        std::fs::rename(&common_dir, &decoy_relocated).unwrap();
+        std::fs::rename(&moved_aside, &common_dir).unwrap();
+
+        identity
+            .verify()
+            .expect("the pathname is restored now — verify only ever checked common_root");
+
+        let branch = "task".to_string();
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+        let new_oid = git_output(&wt, &["rev-parse", "HEAD"]);
+
+        let published = advance_own_branch_ref(&identity, &branch, &old_tip).expect(
+            "the write must land in the REAL object, derived by dup — never a decoy that could \
+             only ever have been bound by an independent second open",
+        );
+        assert_eq!(published, new_oid);
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/task"]),
+            new_oid,
+            "the real, restored common dir must show the published commit"
+        );
+    }
+
+    /// #2686 review round 5, P2 — a nested branch name (`feature/foo`) that
+    /// has only ever been packed has no loose `refs/heads/feature/`
+    /// directory at all. Measured: `git pack-refs --all` removes both the
+    /// loose ref file AND the now-empty `refs/heads/feature/` directory, so
+    /// the lock create's parent genuinely does not exist beforehand — this
+    /// is not a belief about what packing does.
+    #[test]
+    fn advance_own_branch_ref_creates_missing_parents_for_a_packed_only_nested_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feature/foo",
+            ],
+        );
+        git(&main, &["pack-refs", "--all"]);
+        let common_dir = git_dirs(&wt).unwrap().0;
+        assert!(
+            !common_dir.join("refs/heads/feature").exists(),
+            "packing must leave no loose directory behind — otherwise this test exercises \
+             nothing new"
+        );
+
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+        assert_eq!(branch, "feature/foo");
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+        let new_oid = git_output(&wt, &["rev-parse", "HEAD"]);
+
+        let published = advance_own_branch_ref(&identity, &branch, &old_tip).expect(
+            "a packed-only nested branch must still publish — the lock's parent is created on \
+             demand",
+        );
+        assert_eq!(published, new_oid);
+        assert_eq!(
+            git_output(&main, &["rev-parse", "refs/heads/feature/foo"]),
+            new_oid,
+            "the new loose ref write must take effect over the stale packed-refs entry"
+        );
+        assert!(
+            std::fs::read_to_string(common_dir.join("logs/refs/heads/feature/foo"))
+                .unwrap()
+                .contains(&new_oid),
+            "the branch's own reflog must gain a first entry despite no pre-existing \
+             logs/refs/heads/feature directory either"
+        );
+    }
+
+    /// #2686 review round 5, P2 — a `rename` failure AFTER the reflog
+    /// append used to leave the owned `.lock` file behind and never said the
+    /// reflog line had already landed. Forced with an injected failure, not
+    /// a narrative one: replacing the destination (`refs/heads/<branch>`)
+    /// with a directory right before the rename forces `renameat` to fail
+    /// (a file can't be renamed onto a directory) without touching the
+    /// surrounding `refs/heads/` directory's own permissions, so the
+    /// cleanup unlink this test also checks is not itself blocked by the
+    /// same injected failure.
+    #[test]
+    fn advance_branch_ref_natively_cleans_up_and_reports_honestly_on_a_rename_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            branch,
+            old_tip,
+            identity,
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+        let new_oid = git_output(&wt, &["rev-parse", "HEAD"]);
+
+        let common_dir = identity.common_dir.clone();
+        let ref_path = common_dir.join(format!("refs/heads/{branch}"));
+        let lock_path_abs = common_dir.join(format!("refs/heads/{branch}.lock"));
+        let reflog_path = common_dir.join(format!("logs/refs/heads/{branch}"));
+        let force_rename_failure = || {
+            std::fs::remove_file(&ref_path).unwrap();
+            std::fs::create_dir(&ref_path).unwrap();
+        };
+
+        let refusal = advance_branch_ref_natively_seamed(
+            &identity,
+            &branch,
+            &old_tip,
+            &new_oid,
+            "commit: task work",
+            &force_rename_failure,
+        )
+        .expect_err("a rename failure must refuse, not silently succeed");
+        assert!(
+            refusal.contains("already appended"),
+            "the refusal must say the reflog line landed even though the ref never moved: \
+             {refusal}"
+        );
+        assert!(
+            !lock_path_abs.exists(),
+            "the owned .lock file must be cleaned up even when the failure happens AFTER the \
+             reflog append, not just on an earlier failure"
+        );
+        assert!(
+            std::fs::read_to_string(&reflog_path)
+                .unwrap()
+                .contains(&new_oid),
+            "the reflog append genuinely landed before the rename failed — the test's own \
+             setup, not a belief"
+        );
+
+        std::fs::remove_dir(&ref_path).unwrap();
+    }
+
+    /// #2686 review round 5, P2 — a round-4 draft collapsed a `verify()` (or
+    /// `read_detached_head`) FAILURE into the same `None` as "genuinely
+    /// nothing to report", so a caller could not tell "there may be an
+    /// unrecoverable commit and we could not even check" apart from "there
+    /// truly is nothing to recover". Forces the former the same way
+    /// [`bound_identity_refuses_once_the_admin_dir_itself_is_replaced`] does.
+    #[test]
+    fn detached_commit_candidate_propagates_a_verify_failure_instead_of_reporting_none() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        own_gitdir_grants(&wt);
+        let OwnBranchRefMove {
+            old_tip, identity, ..
+        } = own_branch_for_commit_ref_move(&wt).unwrap();
+
+        detach_own_head(&identity, &old_tip).unwrap();
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+
+        let admin_dir = identity.git_dir.clone();
+        std::fs::rename(&admin_dir, root_path.join("admin-dir-moved-aside")).unwrap();
+        std::fs::create_dir(&admin_dir).unwrap();
+
+        let result = detached_commit_candidate(&identity, &old_tip);
+        assert!(
+            result.is_err(),
+            "a verify() failure must be a reported Err, never the same Ok(None) as 'nothing to \
+             report': {result:?}"
+        );
     }
 }
 

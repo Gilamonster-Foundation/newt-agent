@@ -41,11 +41,44 @@
 //! in the weekly/release real-resource gate — ruled out as the cause, with
 //! evidence, during this round: the shell engine selection
 //! (`NEWT_SHELL_ENGINE`) and the tokio runtime flavor (current-thread vs
-//! multi-thread) — neither changed the outcome. Follow-up: trace why the
-//! governing backend's witness for a RESTRICTED (non-deny-all) exec
-//! allow-list classifies as `Interceptor` specifically on the path the real
-//! hook handshake takes, inside `agent-bridle-core`'s enforcement-strength
-//! computation (`vendor/agent-bridle-core/src/report.rs`).
+//! multi-thread) — neither changed the outcome.
+//!
+//! **Round 5 answers the follow-up this left open, and it is NOT what
+//! issue #2689's own `fs_read`-for-the-worker gap is** (that gap needs
+//! `exec` AMBIENT while `fs_read` is restricted — the opposite of this
+//! fixture's shape, `exec: Scope::only(["git"])`, restricted). Traced by
+//! reading, not guessing: `NativeGitBroker`'s own git re-dispatch
+//! (`newt_core::native_git_broker`, lines ~195/~447) mints its `ExecRequest`
+//! under [`newt_core::confined_exec::ExecOrigin::AgentInfluenced`], whose
+//! `gate()` applies a SCALAR `AxisEnforcement::Kernel` floor to every axis —
+//! including exec. `agent_bridle_core::report::enforcement_report`'s exec
+//! match is exhaustive over `SandboxKind` and has NO arm that reaches
+//! `Kernel` for `SandboxKind::Landlock`, for ANY restricted exec shape
+//! (narrow allow-list or even empty/deny-all — contrast `AppContainer`,
+//! which DOES get a `Kernel` arm when `exec_fully_denied`): the comment
+//! there names this a tracked, permanent limitation (agent-bridle#31/#57),
+//! and `agentic::tools::shell::dispatch_bridled_shell_with_floor`'s own doc
+//! comment independently names the identical mismatch for
+//! `dispatch_bridled_build_shell`'s blanket Kernel floor as "an ACTIVE
+//! deviation" needing a PER-AXIS floor (fs/net = Kernel, exec =
+//! Interceptor-OK) that does not exist yet. `NativeGitBroker` has the same
+//! defect, independently.
+//!
+//! Consequence, confirmed by reading the exhaustive match rather than by
+//! another live run: under Landlock, this specific dispatch refuses for
+//! EVERY restricted exec caveats shape, not just this fixture's. Per this
+//! round's brief ("make the test's caveats restrict exec too… so the
+//! closure path covers the worker") — `exec: Scope::only(["git"])` already
+//! IS restricted here (`is_restricted` is true for any `Scope::Only(_)`,
+//! including empty), so there is no "more restricted" shape to try that
+//! changes this outcome; the only shape that would is `Scope::All`
+//! (unrestricted exec), which is the widening this round's rules forbid
+//! outright. The fix is a PER-AXIS floor in `NativeGitBroker`'s own
+//! `ExecOrigin` choice (or a new origin variant), mirroring the existing,
+//! already-tracked deviation for the build-shell lane — vendor/production
+//! security-relevant code with its own review history, out of scope for
+//! this test file. Recorded here as the answer, not re-deferred as a
+//! question.
 //!
 //! Real-resource tier (see CLAUDE.md "Testing strategy"): Landlock and the
 //! root-owned fixture git, both present in CI:
@@ -262,13 +295,13 @@ mod native {
     /// message must carry the policy's trailer.
     ///
     /// If this instead hits [`KNOWN_KERNEL_INTERCEPTOR_MISMATCH`] — the
-    /// SECOND finding the module doc names — it reports that loudly and
-    /// returns rather than asserting a weaker property or panicking: the
-    /// `maybe_dispatch` gap this binary exists to close IS fixed (the hook
-    /// handshake visibly engages instead of running as a silent no-op), and
-    /// the newly-reachable refusal is a follow-up, not a reason to hide this
-    /// binary's own, real progress behind a passing assertion that proves
-    /// less than it claims.
+    /// SECOND finding the module doc names, and now root-caused there too —
+    /// it reports that loudly and returns rather than asserting a weaker
+    /// property or panicking: the `maybe_dispatch` gap this binary exists
+    /// to close IS fixed (the hook handshake visibly engages instead of
+    /// running as a silent no-op), and the newly-reachable refusal is a
+    /// production fix in `NativeGitBroker`'s choice of `ExecOrigin` (module
+    /// doc), not something this test's own caveats can route around.
     async fn governed_commit_carries_the_attribution_trailer() {
         let root = tempfile::tempdir().unwrap();
         let (main, wt) = init_worktree(root.path());
@@ -302,9 +335,11 @@ mod native {
         if out.contains(KNOWN_KERNEL_INTERCEPTOR_MISMATCH) {
             eprintln!(
                 "known-finding: the hook handshake engaged (the maybe_dispatch gap is fixed) \
-                 but the native commit broker's own Kernel-enforcement check refused the spawn \
-                 — see this file's module doc for the measured detail and the follow-up this \
-                 names. Not treated as this test's own pass/fail: {out}"
+                 but NativeGitBroker's own git dispatch demands a Kernel floor on every axis \
+                 (ExecOrigin::AgentInfluenced) while Landlock's exec axis can never report above \
+                 Interceptor for a restricted scope — see this file's module doc for the \
+                 root-caused mismatch and why no caveats shape here can route around it. Not \
+                 treated as this test's own pass/fail: {out}"
             );
             return;
         }

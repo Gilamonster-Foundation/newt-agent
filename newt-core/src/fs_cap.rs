@@ -87,6 +87,24 @@ impl WorkspaceDir {
         Ok(Self { root })
     }
 
+    /// Build a capability over an **already-held** directory descriptor —
+    /// `dup`'d from `root`'s own fd (`F_DUPFD_CLOEXEC`, via
+    /// [`std::os::fd::BorrowedFd::try_clone_to_owned`]), never by resolving
+    /// `root`'s pathname a second time (#2686 review round 5, P1). A prior
+    /// version of this capability independently opened its own
+    /// `WorkspaceDir` via [`Self::open_root`] against the SAME intended
+    /// pathname an [`agent_bridle_fdguard::GrantedRoot`] had just been
+    /// acquired from — two opens of one intended object, bound only by the
+    /// argument that nothing hostile ran between them, not by a kernel
+    /// guarantee. `dup` makes it structurally ONE object: the returned
+    /// handle's fd and `root`'s fd name the identical kernel directory, so
+    /// there is no second pathname resolution left for anything to redirect.
+    pub fn from_granted_root(root: &agent_bridle_fdguard::GrantedRoot) -> io::Result<Self> {
+        Ok(Self {
+            root: root.as_fd().try_clone_to_owned()?,
+        })
+    }
+
     /// The single choke point: resolve `rel` beneath the root fd and return the
     /// opened fd, or an error if resolution would escape. Every public method
     /// flows through here, so the containment property has one owner.

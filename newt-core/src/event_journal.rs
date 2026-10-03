@@ -461,6 +461,14 @@ pub fn resume(path: &Path) -> Journal {
 /// ref pointing at a line that was never written, which is indistinguishable
 /// from deletion. **Given a choice of which way to be wrong, be wrong in the
 /// direction that over-reports.**
+///
+/// The event file is `fsync`'d before this returns (#2686 review round 5,
+/// P2: "make the journal append durable before reporting success"). Without
+/// it, a caller that checks `Ok` and treats the event as durably recorded —
+/// `git_hardening::DetachedHeadGuard::drop`'s `eprintln!` fallback fires only
+/// when THIS call fails — was trusting an append the OS had buffered but not
+/// yet written; a crash in that window loses the "durable" record the same
+/// way the no-journal-at-all case does, just silently instead of honestly.
 pub fn append_to<T: Serialize>(
     journal: &mut Journal,
     path: &Path,
@@ -477,6 +485,7 @@ pub fn append_to<T: Serialize>(
         .append(true)
         .open(path)?;
     writeln!(file, "{rendered}")?;
+    file.sync_all()?;
     drop(file);
 
     crate::atomic_fs::atomic_write(&head_path(path), line.id.as_bytes())?;
