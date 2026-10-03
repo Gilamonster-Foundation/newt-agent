@@ -549,15 +549,9 @@ async fn broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution
         "a later commit must prompt the gate again, not silently reuse the \
          prior allow-once: {output}"
     );
-    assert_ne!(
-        git(repo, &["rev-parse", "HEAD"]).stdout,
-        before,
-        "{output}"
-    );
+    assert_ne!(git(repo, &["rev-parse", "HEAD"]).stdout, before, "{output}");
     assert_eq!(tool.drain_commit_success(), 1);
-    println!(
-        "test broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution ... ok"
-    );
+    println!("test broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution ... ok");
 }
 
 async fn denied_parent_keeps_child_authority(

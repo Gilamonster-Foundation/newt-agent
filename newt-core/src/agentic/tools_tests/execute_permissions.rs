@@ -2010,7 +2010,10 @@ async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
         std::sync::Arc::new(NoopBroker);
 
     let out = shell::exec_confined_command_with_broker(
-        &format!("/bin/echo x >> {} && /bin/git commit -m m", marker.display()),
+        &format!(
+            "/bin/echo x >> {} && /bin/git commit -m m",
+            marker.display()
+        ),
         &ws.path().to_string_lossy(),
         &ws.path().to_string_lossy(),
         false,
@@ -2077,11 +2080,13 @@ async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() 
     let _ns = super::disable_ocap_tests::EnvVar::set("GIT_CONFIG_NOSYSTEM", "1");
     let _gc = super::disable_ocap_tests::EnvVar::set("GIT_CONFIG_GLOBAL", "/dev/null");
 
-    assert!(super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
-        .args(["init", "-q"])
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
     assert!(
         !super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
             .args(["rev-parse", "--verify", "-q", "HEAD"])
