@@ -3218,10 +3218,13 @@ fn offer_caveat_pack_signs_only_the_reviewed_additions() {
     );
 }
 
-/// #2660 round 2, item 3: a drop-in's `exec` list can spell `git` as an
-/// absolute path — `drop_never_candidates` must still catch it, proven here
-/// through the real setup/signing path (not just the pure helper's unit
-/// test in `newt_core::caveat_pack`): never shown in the review, never
+/// #2660 round 2, item 3 / round 3, item 2: a drop-in's `exec` list can
+/// spell `git` as an absolute path. With narrowing-only drop-ins (round 3),
+/// this is caught even earlier than `drop_never_candidates`: `/usr/bin/git`
+/// isn't already in the built-in pool, so `narrow_candidates` treats it as
+/// an attempted addition and never merges it in at all — proven here
+/// through the real setup/signing path, not just the pure helpers' unit
+/// tests in `newt_core::caveat_pack`: never shown in the review, never
 /// durably signed.
 #[test]
 #[serial_test::serial(real_fs)]
@@ -3241,8 +3244,12 @@ fn offer_caveat_pack_excludes_a_drop_in_git_path_spelling() {
 
     let transcript = console.transcript();
     assert!(
-        !transcript.contains("/usr/bin/git") && !transcript.contains("exec  git"),
+        !transcript.contains("exec  git") && !transcript.contains("exec  /usr/bin/git"),
         "a drop-in git spelling must never reach the review: {transcript}"
+    );
+    assert!(
+        transcript.contains("/usr/bin/git") && transcript.contains("ignored"),
+        "the rejected addition attempt must be visibly reported: {transcript}"
     );
 
     let key_path = newt_identity::default_key_path().unwrap();
@@ -3255,6 +3262,55 @@ fn offer_caveat_pack_excludes_a_drop_in_git_path_spelling() {
         None,
         "a drop-in git spelling must never be durably signed"
     );
+}
+
+/// #2660 round 3, item 2 (P1), red-first: the exact bypass the review named
+/// — with the old merge-then-filter shape, a drop-in listing `sed`/`find`/
+/// `sort`/`git` reintroduced each of them to the review (only `git`/`gh`
+/// were ever filtered back out) and, on confirmation, to a durable
+/// signature. A drop-in may only narrow the built-in offer now: none of
+/// these four is already in it, so each is an attempted addition — reported
+/// with a visible notice, never merged in, never signed.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_drop_in_addition_attempt_is_ignored_with_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    std::fs::write(
+        config_path.with_file_name("caveat-pack.toml"),
+        "exec = [\"sed\", \"find\", \"sort\", \"git\"]\n",
+    )
+    .unwrap();
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+
+    offer_caveat_pack(&console.operator(), &config_path, None);
+
+    let transcript = console.transcript();
+    assert!(
+        transcript.contains("sed, find, sort, git") && transcript.contains("ignored"),
+        "the rejected addition attempt must be reported, not silently dropped: {transcript}"
+    );
+    for never in ["exec  sed", "exec  find", "exec  sort", "exec  git"] {
+        assert!(
+            !transcript.contains(never),
+            "an attempted addition must never reach the review: {transcript}"
+        );
+    }
+
+    let key_path = newt_identity::default_key_path().unwrap();
+    let user = newt_identity::load_or_generate(&key_path).unwrap();
+    let (set, warnings) =
+        newt_core::ocap_store::load_store(&config_path, Some(user.public().as_bytes()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    for never in ["sed", "find", "sort", "git"] {
+        assert_eq!(
+            newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, never),
+            None,
+            "an attempted drop-in addition must never be durably signed: {never}"
+        );
+    }
 }
 
 /// #2660 round 2, item 4: an unreadable existing approve file must refuse

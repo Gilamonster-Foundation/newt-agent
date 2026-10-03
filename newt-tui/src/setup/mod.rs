@@ -754,7 +754,11 @@ fn offer_sandbox_git(op: &Operator<'_>) {
 /// target, so there is no durable "opt in" that changes that today.
 ///
 /// Every candidate is visible before anything is written, and removable —
-/// the operator can exclude any by name before the pack is signed. Signing
+/// the operator can exclude any by name before the pack is signed. A
+/// `caveat-pack.toml` drop-in can only NARROW the built-in exec offer, never
+/// widen it (#2660 round 3, item 2) — an unrecognized name is an attempted
+/// addition and is reported, never merged in; see
+/// `newt_core::caveat_pack::narrow_candidates`. Signing
 /// touches ONLY the reviewed/retained additions (#2660 round 2, item 1):
 /// they are signed in an isolated `PolicyFile` BEFORE being merged into
 /// whatever is already on disk, so a pre-existing entry — unsigned, or
@@ -776,8 +780,8 @@ fn try_offer_caveat_pack(
     backend_host: Option<&str>,
 ) -> anyhow::Result<()> {
     use newt_core::caveat_pack::{
-        drop_never_candidates, merge_candidates, propose_standard_pack, CaveatPackDropIn,
-        STANDARD_TEXT_TOOLS,
+        drop_never_candidates, merge_candidates, narrow_candidates, propose_standard_pack,
+        CaveatPackDropIn, STANDARD_TEXT_TOOLS,
     };
     use newt_core::ocap_propose::in_policy_pairs;
     use newt_core::ocap_store::{build_store, lock_approve_file, PolicyFile, Verdict, VERDICTS};
@@ -808,11 +812,25 @@ fn try_offer_caveat_pack(
         },
         Err(_) => CaveatPackDropIn::default(),
     };
-    let exec_candidates = merge_candidates(STANDARD_TEXT_TOOLS, &drop_in.exec);
-    // #2660 round 2, item 3: enforce the git/gh exclusion AFTER the drop-in
-    // is merged in — the built-in pool never lists them, but a drop-in's
-    // `exec` list is operator/project data this step must not trust to omit
-    // them (and basename-matched, so an absolute-path spelling can't dodge it).
+    // #2660 round 3, item 2: a drop-in may only NARROW the built-in exec
+    // pool, never widen it — a name it lists that isn't already in
+    // `STANDARD_TEXT_TOOLS` is an attempted addition and comes back in
+    // `ignored_additions` instead of being merged in (the old merge-then-
+    // filter shape let a drop-in reintroduce `sed`/`find` or any other
+    // program under the same "can't run other programs" promise).
+    let (exec_candidates, ignored_additions) =
+        narrow_candidates(STANDARD_TEXT_TOOLS, &drop_in.exec);
+    if !ignored_additions.is_empty() {
+        op.say(&format!(
+            "\nStandard caveat pack: drop-in requested {} — a drop-in may only narrow this \
+             built-in offer, not add a program to it; ignored.",
+            ignored_additions.join(", ")
+        ));
+    }
+    // #2660 round 3, item 3: defense-in-depth only now — `exec_candidates`
+    // can never contain more than `STANDARD_TEXT_TOOLS` already does, and
+    // that never lists `git`/`gh`, but this still guards against the
+    // built-in list itself ever growing one of those entries by mistake.
     let exec_candidates = drop_never_candidates(&exec_candidates);
     let net_builtin: Vec<&str> = backend_host.into_iter().collect();
     let net_candidates = merge_candidates(&net_builtin, &drop_in.net);

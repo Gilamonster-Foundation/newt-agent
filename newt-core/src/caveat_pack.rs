@@ -20,20 +20,38 @@
 //!
 //! ## What is deliberately excluded
 //!
-//! - **`git`/`gh`** are never candidates — enforced TWICE: [`STANDARD_TEXT_TOOLS`]
-//!   never lists them, AND [`drop_never_candidates`] strips any basename match
-//!   (including an absolute-path spelling like `/usr/bin/git`) out of the pool
-//!   AFTER a drop-in's names are merged in, so a drop-in cannot reintroduce
-//!   them. Git authority already goes through its own governed paths — the
-//!   staging-repo push/PR broker (#2641, `crate::git_staging`, merged) and the
-//!   worktree-commit ref grant (#2682, open) — neither of which is a plain
-//!   exec-allowlist entry. A blanket `git` exec grant here would authorize
-//!   every invocation, INCLUDING push, through a path neither broker gates.
-//! - **`sed`/`find`** are not in the pool: their `e` command / `s///e` flag
-//!   (sed) and `-exec`/`-delete`/`-ok` (find) run another program, and that
+//! - **A drop-in can only NARROW the built-in exec pool, never widen it**
+//!   (#2660 round 3, item 2). [`CaveatPackDropIn::exec`] is read as a list of
+//!   built-in names to drop, by [`narrow_candidates`] — any entry that is not
+//!   already in [`STANDARD_TEXT_TOOLS`] is an attempted ADDITION, reported
+//!   back (never merged in). This closes the exact bypass the round-2 review
+//!   found: with the old merge-then-filter shape, a drop-in listing
+//!   `sed`/`find` (or any other command-runner) reintroduced them under the
+//!   same "can't run other programs" promise the built-in pool review
+//!   covers, and only `git`/`gh` were ever filtered back out. Offering an
+//!   operator-chosen program is a separate, explicitly-labelled feature with
+//!   its own confirmation flow — out of scope here.
+//! - **`git`/`gh`** are never candidates — [`STANDARD_TEXT_TOOLS`] never lists
+//!   them, and (now unreachable via a drop-in, since narrowing can't
+//!   introduce a name) [`drop_never_candidates`] still strips any basename
+//!   match — including an absolute-path spelling like `/usr/bin/git` or a
+//!   Windows spelling (`git.exe`, any case) — as a defense-in-depth backstop
+//!   against the built-in list itself ever growing a `git`/`gh` entry by
+//!   mistake. Git authority already goes through its own governed paths —
+//!   the staging-repo push/PR broker (#2641, `crate::git_staging`, merged)
+//!   and the worktree-commit ref grant (#2682, open) — neither of which is a
+//!   plain exec-allowlist entry. A blanket `git` exec grant here would
+//!   authorize every invocation, INCLUDING push, through a path neither
+//!   broker gates.
+//! - **`sed`/`find`/`sort`** are not in the pool: their `e` command / `s///e`
+//!   flag (sed), `-exec`/`-delete`/`-ok` (find), and `--compress-program=PROG`
+//!   (sort — #2660 round 3, item 1) each run another program, and that
 //!   descendant does not reliably re-enter Brush's exec interceptor
-//!   (`vendor/agent-bridle-tool-shell/src/brush_shell.rs`). newt's native
-//!   `grep` and `find` tools cover the same jobs without a spawn. The
+//!   (`vendor/agent-bridle-tool-shell/src/brush_shell.rs`). The production
+//!   danger table has no opinion on any of these three — they are ordinary
+//!   low-danger text tools to it — so the ONLY thing keeping them from being
+//!   signed is never offering them in the first place. newt's native `grep`
+//!   and `find` tools cover the jobs `sed`/`find` did without a spawn. The
 //!   contract for everything that remains is **"can't run other programs;
 //!   writes are still gated by `fs_write`"** — not "read-only" (`sed -i`
 //!   wasn't offered, but the thing that made `sed` worth dropping is the
@@ -67,14 +85,25 @@ const SETUP_PACK_COMMAND: &str = "newt setup: standard caveat pack";
 
 /// The standard pack's exec candidate pool — pure data (three-Cs): a POOL,
 /// not a grant. Every name here still goes through the same danger gate
-/// [`propose_standard_pack`] composes with.
+/// [`propose_standard_pack`] composes with. [`narrow_candidates`] is the
+/// ONLY way a drop-in may touch this list (remove an entry); nothing may be
+/// added to it outside this source file (#2660 round 3, item 2).
 ///
-/// Low-danger: POSIX-common text tools that **can't run other programs**
-/// (the exec-allowlist grant is name-based, not argument-scoped — the bar
-/// for inclusion is that no flag of the command spawns a child process; a
-/// tool that can, like `sed`'s `e`/`s///e` or `find`'s `-exec`, is left out
-/// rather than narrowed, since the grant can't see the flag): `cat`, `head`,
-/// `tail`, `grep`, `sort`, `wc`, `ls`.
+/// Low-danger: POSIX-common text tools **REVIEWED against their own manual
+/// for a flag that spawns another program, and confirmed clean** (the
+/// exec-allowlist grant is name-based, not argument-scoped, so the bar for
+/// inclusion is that NO flag of the command spawns a child process — a tool
+/// that has one, like `sed`'s `e`/`s///e`, `find`'s `-exec`, or `sort`'s
+/// `--compress-program`, is left out entirely rather than narrowed, since the
+/// grant can't see the flag):
+/// - `cat`  — no flag spawns a process (GNU/BSD/POSIX).
+/// - `head`/`tail` — no flag spawns a process; `tail -f` only polls the file,
+///   it never execs (GNU/BSD/POSIX).
+/// - `grep` — no flag spawns a process; `--include`/`--exclude` filter paths
+///   by glob, they don't invoke one (GNU/BSD/POSIX).
+/// - `wc`   — no flag spawns a process (GNU/BSD/POSIX).
+/// - `ls`   — no flag spawns a process; `--color` only reads env/terminfo
+///   (GNU/BSD/POSIX).
 ///
 /// High-danger (interpreter / command-runner, per
 /// `newt-tui::danger::INTERPRETER_EXEC`) — included here so the shared
@@ -82,43 +111,74 @@ const SETUP_PACK_COMMAND: &str = "newt setup: standard caveat pack";
 /// the pack silently never mentioning why they keep prompting: `awk`,
 /// `xargs`, `sh`.
 pub const STANDARD_TEXT_TOOLS: &[&str] = &[
-    "cat", "head", "tail", "grep", "sort", "wc", "ls", "awk", "xargs", "sh",
+    "cat", "head", "tail", "grep", "wc", "ls", "awk", "xargs", "sh",
 ];
 
 /// Names whose exec grant must never enter the candidate pool, no matter what
 /// a drop-in asks for — `git`/`gh` authority is mediated elsewhere (see the
 /// module docs' "What is deliberately excluded"). Matched on the command's
-/// file-name component (same convention as
-/// `newt_tui::danger::DangerTable::is_interpreter`), so an absolute-path
-/// spelling like `/usr/bin/git` is caught too.
+/// file-name component, normalized the way an executable's spelling varies
+/// across platforms (same convention as
+/// `newt_tui::danger::DangerTable::is_interpreter`, plus the normalization):
+/// lowercased, and a trailing `.exe` stripped, so `/usr/bin/git`, `git.exe`,
+/// `GIT.EXE`, and `C:/Program Files/Git/cmd/git.exe` are all caught (#2660
+/// round 3, item 3 — Windows resolves an executable case-insensitively and by
+/// that extension, which the bare POSIX spelling never needed).
+///
+/// With [`narrow_candidates`] in place, a drop-in can no longer introduce a
+/// name that isn't already in [`STANDARD_TEXT_TOOLS`] at all (see the module
+/// docs), so this filter is now defense-in-depth against the built-in list
+/// itself ever growing a `git`/`gh` entry by mistake — not the primary gate.
 const NEVER_CANDIDATES: &[&str] = &["git", "gh"];
 
-/// Strip any [`NEVER_CANDIDATES`] basename out of a merged candidate pool.
-/// Call this AFTER [`merge_candidates`] — the built-in pool never lists
-/// `git`/`gh`, but a drop-in's `exec` list is operator/project data this
-/// function must not trust to omit them.
+/// Normalize a candidate's possibly-platform-specific executable spelling to
+/// the bare lowercase basename [`NEVER_CANDIDATES`] matches against: strip a
+/// directory component (so `/usr/bin/git` matches `git`) and a trailing
+/// `.exe` (so `git.exe`/`GIT.EXE` match `git` too).
+fn never_candidate_key(name: &str) -> String {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    base.strip_suffix(".exe")
+        .map(str::to_string)
+        .unwrap_or(base)
+}
+
+/// Strip any [`NEVER_CANDIDATES`] basename out of a candidate pool — kept as
+/// a defense-in-depth backstop (#2660 round 3, item 3): since
+/// [`narrow_candidates`] can only ever return a subset of the built-in pool,
+/// and that pool never lists `git`/`gh`, a drop-in cannot reach this path
+/// today. It still guards against the built-in list itself ever growing a
+/// `git`/`gh` entry.
 pub fn drop_never_candidates<'a>(candidates: &[&'a str]) -> Vec<&'a str> {
     candidates
         .iter()
         .copied()
-        .filter(|name| {
-            let base = std::path::Path::new(name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(name);
-            !NEVER_CANDIDATES.contains(&base)
-        })
+        .filter(|name| !NEVER_CANDIDATES.contains(&never_candidate_key(name).as_str()))
         .collect()
 }
 
-/// An operator/project drop-in that ADDS exec/net candidate names to the
-/// built-in pool above — the same droppable-`.toml`-over-pure-data
+/// An operator/project drop-in — the same droppable-`.toml`-over-pure-data
 /// convention `LanguagePack` ([`crate::api_surface`]) already establishes.
-/// Ships at `<config dir>/caveat-pack.toml`. A duplicate of a built-in name
-/// is folded out by [`merge_candidates`]; this widens the candidate POOL
-/// only — every name, built-in or dropped-in, still goes through the same
-/// danger gate and the same per-run operator review before anything is
-/// signed.
+/// Ships at `<config dir>/caveat-pack.toml`.
+///
+/// `exec` NARROWS the built-in exec pool ONLY (#2660 round 3, item 2, via
+/// [`narrow_candidates`]): a listed name already in [`STANDARD_TEXT_TOOLS`]
+/// is dropped from what gets offered; a listed name that ISN'T already
+/// there is an attempted ADDITION and is reported back, never merged in.
+/// The "can't run other programs" promise is reviewed once, against the
+/// fixed built-in set — a drop-in that could widen it would let an
+/// unreviewed program reach a signature under that same promise, which is
+/// exactly how the round-2 fix (dropping `sed`/`find`) could have been
+/// undone by a drop-in alone. Offering an operator-chosen program is a
+/// separate, explicitly-labelled feature with its own confirmation flow —
+/// out of scope here.
+///
+/// `net` still WIDENS the net candidate pool via [`merge_candidates`] — a
+/// host is a network target, not a program, so the exec pool's "can't run
+/// other programs" promise doesn't apply to it.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 pub struct CaveatPackDropIn {
     #[serde(default)]
@@ -136,10 +196,12 @@ impl CaveatPackDropIn {
     }
 }
 
-/// Merge a drop-in's names onto the built-in pool: built-ins first, then
-/// any new drop-in name, no duplicates. Order otherwise stable — it affects
+/// Merge a drop-in's names onto a built-in pool: built-ins first, then any
+/// new drop-in name, no duplicates. Order otherwise stable — it affects
 /// display order only, never grant semantics (every candidate goes through
-/// the same gate regardless of position).
+/// the same gate regardless of position). Used for the NET pool only
+/// (#2660 round 3, item 2) — the exec pool uses [`narrow_candidates`]
+/// instead, since a drop-in may not widen it.
 pub fn merge_candidates<'a>(builtin: &[&'a str], extra: &'a [String]) -> Vec<&'a str> {
     let mut pool: Vec<&str> = Vec::with_capacity(builtin.len() + extra.len());
     pool.extend(builtin.iter().copied());
@@ -150,6 +212,37 @@ pub fn merge_candidates<'a>(builtin: &[&'a str], extra: &'a [String]) -> Vec<&'a
         }
     }
     pool
+}
+
+/// Narrow the built-in exec pool per a drop-in's requested removals — the
+/// ONLY operation a drop-in may perform on it (#2660 round 3, item 2; see
+/// [`CaveatPackDropIn::exec`]'s doc for why). Returns `(kept, ignored)`:
+/// `kept` is `builtin` with every requested name that's actually IN it
+/// removed; `ignored` is whatever was requested but matched nothing in
+/// `builtin` — an attempted addition, handed back so the caller can report
+/// it rather than let it silently do nothing. Blank entries are dropped
+/// without being reported (same whitespace tolerance [`merge_candidates`]
+/// has).
+pub fn narrow_candidates<'a>(
+    builtin: &[&'a str],
+    requested_removals: &[String],
+) -> (Vec<&'a str>, Vec<String>) {
+    let requested: Vec<&str> = requested_removals
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let ignored = requested
+        .iter()
+        .filter(|name| !builtin.contains(name))
+        .map(|name| name.to_string())
+        .collect();
+    let kept = builtin
+        .iter()
+        .copied()
+        .filter(|name| !requested.contains(name))
+        .collect();
+    (kept, ignored)
 }
 
 /// Fold the standard pack's candidate pool into a [`Proposal`] — the setup
@@ -225,7 +318,7 @@ mod tests {
             "2026-10-02",
         );
         let exec_targets: Vec<&str> = p.additions.exec.iter().map(|e| e.target.as_str()).collect();
-        for low in ["cat", "head", "tail", "grep", "sort", "wc", "ls"] {
+        for low in ["cat", "head", "tail", "grep", "wc", "ls"] {
             assert!(
                 exec_targets.contains(&low),
                 "{low} missing from {exec_targets:?}"
@@ -254,7 +347,7 @@ mod tests {
         }
         // High-danger targets are named in `deferred`, never signed into
         // `additions` — the "opt in" question is a no-op by construction.
-        for low in ["cat", "head", "tail", "grep", "sort", "wc", "ls"] {
+        for low in ["cat", "head", "tail", "grep", "wc", "ls"] {
             assert!(!deferred_targets.contains(&low));
         }
     }
@@ -270,6 +363,16 @@ mod tests {
         assert!(!STANDARD_TEXT_TOOLS.contains(&"find"));
     }
 
+    /// #2660 round 3, item 1 (P1), red-first: the production danger table has
+    /// no opinion on `sort` (it's an ordinary low-danger text tool to it), but
+    /// GNU/BSD `sort --compress-program=PROG` runs an arbitrary helper for
+    /// temporary compression — a name-wide exec grant can't restrict that
+    /// flag. Red before the fix: `sort` was still in [`STANDARD_TEXT_TOOLS`].
+    #[test]
+    fn standard_pack_drops_sort() {
+        assert!(!STANDARD_TEXT_TOOLS.contains(&"sort"));
+    }
+
     /// Re-running setup must not re-propose what a prior run (or a hand
     /// edit) already accounted for — same idempotence
     /// `ocap_propose::propose_from_capture` already guarantees for a
@@ -283,6 +386,9 @@ mod tests {
         assert_eq!(p.additions.exec[0].target, "head");
     }
 
+    /// #2660 round 3, item 2: this function is now used only for the NET
+    /// pool — the exec pool goes through [`narrow_candidates`] instead,
+    /// which cannot widen it. The merge/dedupe behavior itself is unchanged.
     #[test]
     fn merge_candidates_dedupes_and_keeps_builtins_first() {
         let builtin = ["cat", "ls"];
@@ -292,22 +398,67 @@ mod tests {
     }
 
     /// #2660 round 2, item 3: a drop-in can ask for `git`/`gh` by name, or by
-    /// an absolute-path spelling — `drop_never_candidates` must strip both
-    /// AFTER the merge, since the built-in pool alone never covers drop-in
-    /// input. Red before the fix: `merge_candidates` alone has no opinion on
-    /// `git`, and `git` is Low-danger in the production table, so nothing
-    /// downstream would have caught it.
+    /// an absolute-path spelling — `drop_never_candidates` must strip both.
+    /// Still exercised directly here (rather than through `merge_candidates`,
+    /// which no longer feeds the exec pool) as the defense-in-depth path the
+    /// module docs describe.
     #[test]
     fn drop_never_candidates_strips_git_and_gh_by_basename() {
-        let extra = [
-            "git".to_string(),
-            "/usr/bin/git".to_string(),
-            "gh".to_string(),
-            "rg".to_string(),
-        ];
-        let pool = merge_candidates(&["cat"], &extra);
+        let pool = ["cat", "git", "/usr/bin/git", "gh", "rg"];
         let filtered = drop_never_candidates(&pool);
         assert_eq!(filtered, vec!["cat", "rg"]);
+    }
+
+    /// #2660 round 3, item 3 (P2), red-first: Windows resolves an executable
+    /// case-insensitively and by a `.exe` suffix the POSIX spelling never
+    /// needed — `git.exe`, `GIT.EXE`, and an absolute Windows-style path all
+    /// have to match the same exclusion the bare `git` spelling already
+    /// catches. Red before the fix: the old basename-only, case-sensitive
+    /// compare let every one of these through (`"git.exe" != "git"`).
+    #[test]
+    fn drop_never_candidates_normalizes_windows_executable_spellings() {
+        let pool = [
+            "cat",
+            "git.exe",
+            "GIT.EXE",
+            "C:/Program Files/Git/cmd/git.exe",
+            "gh.exe",
+            "Gh.Exe",
+            "rg",
+        ];
+        let filtered = drop_never_candidates(&pool);
+        assert_eq!(filtered, vec!["cat", "rg"]);
+    }
+
+    /// #2660 round 3, item 2 (P1), red-first: a requested removal that IS in
+    /// the built-in pool is dropped; one that is NOT is an attempted
+    /// addition, reported back rather than silently accepted. Red before the
+    /// fix (when exec went through `merge_candidates`): `rg` would have been
+    /// silently ADDED to the pool instead of reported as ignored.
+    #[test]
+    fn narrow_candidates_drops_known_entries_and_reports_unknown_ones() {
+        let builtin = ["cat", "head", "tail"];
+        let requested = vec!["head".to_string(), "rg".to_string(), " ".to_string()];
+        let (kept, ignored) = narrow_candidates(&builtin, &requested);
+        assert_eq!(kept, vec!["cat", "tail"]);
+        assert_eq!(ignored, vec!["rg".to_string()]);
+    }
+
+    /// #2660 round 3, item 2: the exact scenario the review named — a
+    /// drop-in asking to ADD `sed`/`find`/`sort`/`git` must come back as four
+    /// ignored names, and the built-in pool must be untouched (none of the
+    /// four was ever in it to begin with).
+    #[test]
+    fn narrow_candidates_ignores_a_drop_in_addition_attempt() {
+        let requested = vec![
+            "sed".to_string(),
+            "find".to_string(),
+            "sort".to_string(),
+            "git".to_string(),
+        ];
+        let (kept, ignored) = narrow_candidates(STANDARD_TEXT_TOOLS, &requested);
+        assert_eq!(kept, STANDARD_TEXT_TOOLS);
+        assert_eq!(ignored, vec!["sed", "find", "sort", "git"]);
     }
 
     #[test]
