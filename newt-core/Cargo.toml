@@ -28,6 +28,18 @@ name = "brush_build_pipeline"
 path = "tests/brush_build_pipeline.rs"
 harness = false
 
+[[test]]
+name = "native_git_broker_pipeline"
+path = "tests/native_git_broker_pipeline.rs"
+harness = false
+# harness=false: its own `main()` calls `newt_core::maybe_dispatch` to answer a
+# hook handshake over a delegated fd. Without this declaration cargo treats a
+# `tests/` file with a `main()` as the default doctest harness (no `#[test]`
+# fns) and does NOT schedule the real confined-commits pipeline. Declaring it is
+# what makes CI run it — and it stays scheduled even while issue #2693 blocks
+# the trailer assertion, so #2693's resolution is observed as that test turning
+# green (see `governed_commit_carries_the_attribution_trailer`).
+
 [dependencies]
 agent-toolchain = { workspace = true, features = ["embedded-git"] }
 agent-harness.workspace = true

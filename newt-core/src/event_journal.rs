@@ -85,6 +85,14 @@ pub enum EventKind {
     Compression,
     /// A conversation was renamed, forked, or dropped.
     ConversationOp,
+    /// A commit landed on a detached `HEAD` but was never published to its
+    /// branch ref — e.g. the confined dispatch that made it was cancelled
+    /// before the host-side broker could decide whether to publish it
+    /// (`git_hardening::DetachedHeadGuard`, #2686 review round 4, P2). The
+    /// guard's `Drop` cannot return anything to any caller, so this is the
+    /// durable, recoverable record of the commit's oid; `subject` names the
+    /// branch it would have published to.
+    OrphanedCommit,
 }
 
 impl EventKind {
@@ -98,6 +106,7 @@ impl EventKind {
             Self::NoteAppend => "note-append",
             Self::Compression => "compression",
             Self::ConversationOp => "conversation-op",
+            Self::OrphanedCommit => "orphaned-commit",
         }
     }
 
@@ -112,6 +121,7 @@ impl EventKind {
             Self::NoteAppend,
             Self::Compression,
             Self::ConversationOp,
+            Self::OrphanedCommit,
         ]
     }
 }
@@ -451,6 +461,14 @@ pub fn resume(path: &Path) -> Journal {
 /// ref pointing at a line that was never written, which is indistinguishable
 /// from deletion. **Given a choice of which way to be wrong, be wrong in the
 /// direction that over-reports.**
+///
+/// The event file is `fsync`'d before this returns (#2686 review round 5,
+/// P2: "make the journal append durable before reporting success"). Without
+/// it, a caller that checks `Ok` and treats the event as durably recorded —
+/// `git_hardening::DetachedHeadGuard::drop`'s `eprintln!` fallback fires only
+/// when THIS call fails — was trusting an append the OS had buffered but not
+/// yet written; a crash in that window loses the "durable" record the same
+/// way the no-journal-at-all case does, just silently instead of honestly.
 pub fn append_to<T: Serialize>(
     journal: &mut Journal,
     path: &Path,
@@ -467,6 +485,7 @@ pub fn append_to<T: Serialize>(
         .append(true)
         .open(path)?;
     writeln!(file, "{rendered}")?;
+    file.sync_all()?;
     drop(file);
 
     crate::atomic_fs::atomic_write(&head_path(path), line.id.as_bytes())?;
@@ -774,8 +793,9 @@ mod tests {
         assert_eq!(tokens.len(), EventKind::all().len());
         assert_eq!(
             EventKind::all().len(),
-            6,
-            "the six mutator classes #2009 parked; adding one is a schema decision"
+            7,
+            "the six mutator classes #2009 parked plus OrphanedCommit (#2686 review \
+             round 4); adding one is a schema decision"
         );
     }
 
