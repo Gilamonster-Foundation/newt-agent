@@ -11,8 +11,8 @@ use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
 use super::{
-    denial_context, denial_recovery_hint, exec_denial_is_replay_safe, full_access_requested,
-    ocap_disabled, permission_granted_result, resolve_tool_alias, AliasOutcome,
+    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled,
+    permission_granted_result, requests_are_replay_safe, resolve_tool_alias, AliasOutcome,
 };
 use crate::ExecOutcome;
 
@@ -1047,11 +1047,12 @@ pub(super) async fn exec_confined_command(
 /// retry below replays THIS SAME call — with `command_broker` still
 /// attached, so the attribution/signing policy applies to the replay exactly
 /// as it would have to the original attempt — ONLY when
-/// `exec_denial_is_replay_safe` (reused from `tools.rs`, #2681 round 3)
-/// proves the denied command is a single simple command: no chain,
-/// substitution, pipeline, loop, or redirect that could already have run an
-/// earlier stage's effect, or would repeat one on replay. Anything else
-/// records the call-local
+/// `requests_are_replay_safe` (reused from `tools.rs`, #2691 round 3) proves
+/// every denied request is an EXEC denial AND the denied command is a
+/// single simple command: no chain, substitution, pipeline, loop, or
+/// redirect that could already have run an earlier stage's effect, or would
+/// repeat one on replay. A net denial is never replay-safe — its target is
+/// a host, not the command's executable. Anything else records the call-local
 /// allow-once grant in the gate's pending-once queue and reports the grant
 /// without replaying, so the model's own retry picks it up with no second
 /// prompt. This is the model-synchronous retry inside one call; it is
@@ -1171,6 +1172,27 @@ pub(super) async fn exec_confined_command_with_broker(
     };
     let caveats = refreshed.as_ref().unwrap_or(caveats);
 
+    // #2689/#2691 round 3 (P2): bind any pending-once grant already queued
+    // for a program THIS command statically needs, before dispatch — so a
+    // model's reissue of a held command (see this function's doc comment)
+    // succeeds on its first attempt instead of being denied all over again
+    // and looping through "granted…Retry the original operation now"
+    // forever. `apply_pending_once` is scoped per exact target (a no-op
+    // unless that exact target is queued), so an unrelated command cannot
+    // inherit a grant queued for a different retry. Skipped when inspection
+    // fails (dynamic/unsupported syntax): the reactive ask_with_caveats/
+    // take_pending_once path below still covers that case, just without
+    // this optimization.
+    let bound = permission_gate.as_deref_mut().and_then(|gate| {
+        let commands = agent_bridle::inspect_shell(cmd).ok()?.commands;
+        let mut current = caveats.clone();
+        for program in commands.iter().filter_map(|c| c.program.as_deref()) {
+            current = gate.apply_pending_once(DenialKind::Exec, program, &current);
+        }
+        Some(current)
+    });
+    let caveats = bound.as_ref().unwrap_or(caveats);
+
     let missing: Vec<_> = filesystem_requests
         .iter()
         .filter(|request| !permits_filesystem_request(caveats, request))
@@ -1276,23 +1298,24 @@ pub(super) async fn exec_confined_command_with_broker(
                         if let PermissionDecision::Allow(widened) =
                             gate.ask_with_caveats(caveats, &requests)
                         {
-                            // #2689/#2681 round 3: this denial fired
+                            // #2689/#2691 round 3: this denial fired
                             // mid-dispatch, so an earlier stage of `cmd` may
                             // already have run a real effect, or may be the
                             // ONE effect a whole-command replay would repeat
-                            // (see `exec_denial_is_replay_safe`'s doc comment
-                            // in `tools.rs` for both measured shapes — reused
+                            // (see `requests_are_replay_safe`'s doc comment in
+                            // `tools.rs` for both measured shapes — reused
                             // here rather than a second predicate). Replay
-                            // only when EVERY denied target is provably a
-                            // single simple command naming it; otherwise hold
-                            // the grant in the gate's pending-once queue for
-                            // the model's own next matching call instead of
+                            // only when EVERY denied request is an EXEC
+                            // denial AND provably a single simple command
+                            // naming it; a net denial's target is a host, not
+                            // the command's executable, and never auto-
+                            // replays even when it coincidentally shares a
+                            // name with the program. Otherwise hold the grant
+                            // in the gate's pending-once queue for the
+                            // model's own next matching call instead of
                             // spending it on a replay that could duplicate an
                             // effect.
-                            if !requests
-                                .iter()
-                                .all(|request| exec_denial_is_replay_safe(&request.target, cmd))
-                            {
+                            if !requests_are_replay_safe(&requests, cmd) {
                                 for request in &requests {
                                     gate.queue_pending_once(request.kind, &request.target);
                                 }

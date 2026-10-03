@@ -1973,6 +1973,55 @@ fn exec_denial_is_replay_safe_rejects_every_unsound_shape() {
     assert!(!exec_denial_is_replay_safe("/bin/echo", "/bin/true"));
 }
 
+/// #2689/#2691 round 3 (P1 measured red): `exec_denial_is_replay_safe`
+/// compares TEXT only, so a net denial whose host label happens to equal
+/// the command's program name (e.g. a CLI literally named after the
+/// service it calls, like the real `host` DNS-lookup tool reaching a host
+/// named "host") passes its string-equality check. `requests_are_replay_safe`
+/// must still refuse to replay it: unlike an exec admission refusal (which
+/// fires before the program ever spawns), a network refusal happens
+/// mid-execution and proves nothing about whether the program already ran
+/// or produced an effect. Measured red: calling `exec_denial_is_replay_safe`
+/// directly on the same target/cmd pair (the bare predicate this function
+/// replaces at the call site) returns `true` — the axis guard is the only
+/// thing standing between that and an unsound auto-replay.
+#[test]
+fn requests_are_replay_safe_excludes_a_same_name_net_host() {
+    use crate::agentic::tools::{exec_denial_is_replay_safe, requests_are_replay_safe};
+
+    let cmd = "host example.test";
+    // Setup: the coincidental name collision must exist, or this test would
+    // not exercise the axis guard at all.
+    assert!(
+        exec_denial_is_replay_safe("host", cmd),
+        "setup: the text-only predicate must call this pair replay-safe"
+    );
+
+    let net_request = PermissionRequest {
+        tool: "run_command".to_string(),
+        kind: DenialKind::Net,
+        target: "host".to_string(),
+        reason: "net does not permit 'host'".to_string(),
+        harness_bound: false,
+    };
+    assert!(
+        !requests_are_replay_safe(std::slice::from_ref(&net_request), cmd),
+        "a net denial must never auto-replay, even when its host label \
+         coincidentally equals the program name"
+    );
+
+    // Contrast: the identical target/cmd pair, but as an EXEC denial, IS
+    // replay-safe — the axis guard excludes net specifically, not everything.
+    let exec_request = PermissionRequest {
+        kind: DenialKind::Exec,
+        ..net_request
+    };
+    assert!(requests_are_replay_safe(
+        std::slice::from_ref(&exec_request),
+        cmd
+    ));
+}
+
 /// #2689/#2681 round 3 (P1 measured red 1): the inline interactive gate
 /// route in `shell.rs` (the SAME `exec_denial_is_replay_safe` predicate,
 /// reused from `tools.rs` — see that function's doc comment) must refuse
@@ -2048,6 +2097,176 @@ async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
         out.0.contains("granted"),
         "the grant must still be reported, so the model knows to retry: {}",
         out.0
+    );
+}
+
+/// #2691 round 3 (P2): "granted…Retry the original operation now" must
+/// actually work. The grant the test above queues (compound, not
+/// replay-safe) must bind into the model's OWN reissue of the IDENTICAL
+/// command before that reissue dispatches — not merely sit in the queue,
+/// get re-consulted, and get re-queued every single time with no forward
+/// progress (the reported symptom). First call: denied on `/bin/true`
+/// (compound, not replay-safe), grant queued, no replay. SECOND call — the
+/// model's reissue of the SAME command — must succeed in ONE dispatch with
+/// NO new gate consultation: `apply_pending_once` binds the queued grant
+/// into this dispatch's authority before it runs. THIRD call (the SAME
+/// command again): the grant was single-use and is now spent, so the
+/// command is denied again and the gate is consulted afresh.
+#[cfg(unix)]
+#[tokio::test]
+async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+
+    /// Like `MockGate`, but with a REAL `pending_once_grants`-style queue
+    /// backing `queue_pending_once`/`apply_pending_once`/`consume_pending_once`
+    /// — `MockGate` leaves those at the trait's no-op defaults, which cannot
+    /// exercise this fix at all.
+    struct QueueBackedGate {
+        base: Caveats,
+        queue: std::collections::BTreeSet<(DenialKind, String)>,
+        asks: usize,
+    }
+    impl super::PermissionGate for QueueBackedGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.asks += 1;
+            let grants: Vec<_> = requests
+                .iter()
+                .map(|r| (r.kind, r.target.clone()))
+                .collect();
+            super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn queue_pending_once(&mut self, kind: DenialKind, target: &str) {
+            self.queue.insert((kind, target.to_string()));
+        }
+        fn consume_pending_once(&mut self, kind: DenialKind, target: &str) {
+            self.queue.remove(&(kind, target.to_string()));
+        }
+        fn apply_pending_once(
+            &mut self,
+            kind: DenialKind,
+            target: &str,
+            baseline: &Caveats,
+        ) -> Caveats {
+            let key = (kind, target.to_string());
+            if self.queue.remove(&key) {
+                crate::agentic::widen_caveats(baseline, &[key])
+            } else {
+                baseline.clone()
+            }
+        }
+    }
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let marker = ws.path().join("f");
+    let denied = Caveats {
+        exec: Scope::only(["/bin/echo".to_string()]),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = QueueBackedGate {
+        base: denied.clone(),
+        queue: std::collections::BTreeSet::new(),
+        asks: 0,
+    };
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+    let cmd = format!("/bin/echo x >> {} && /bin/true", marker.display());
+
+    // ── CALL 1: denied on /bin/true — not replay-safe, grant queued ────────
+    let first = shell::exec_confined_command_with_broker(
+        &cmd,
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        None,
+        &mut None,
+    )
+    .await;
+    assert_eq!(gate.asks, 1, "{}", first.0);
+    assert!(
+        !marker.exists(),
+        "setup: the compound command must not auto-replay on grant: {}",
+        first.0
+    );
+    assert!(first.0.contains("granted"), "{}", first.0);
+
+    // ── CALL 2: the model's reissue of the IDENTICAL command — must
+    //    succeed in ONE dispatch, with NO new gate consultation ───────────
+    let second = shell::exec_confined_command_with_broker(
+        &cmd,
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        None,
+        &mut None,
+    )
+    .await;
+    assert_eq!(
+        gate.asks, 1,
+        "the reissue must succeed from the queued grant alone, with no \
+         second prompt: {}",
+        second.0
+    );
+    assert!(
+        marker.exists(),
+        "the reissue must actually run (both stages), not just report \
+         granted again: {}",
+        second.0
+    );
+    assert_ne!(second.1, ExecOutcome::Denied, "{}", second.0);
+
+    // ── CALL 3: the SAME command a third time — the grant is spent ────────
+    std::fs::remove_file(&marker).unwrap();
+    let third = shell::exec_confined_command_with_broker(
+        &cmd,
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        None,
+        &mut None,
+    )
+    .await;
+    assert_eq!(
+        gate.asks, 2,
+        "a third identical call must consult the gate afresh — one-shot \
+         authority must not become sticky: {}",
+        third.0
+    );
+    assert!(
+        !marker.exists(),
+        "the spent grant must not auto-replay a third time either: {}",
+        third.0
     );
 }
 

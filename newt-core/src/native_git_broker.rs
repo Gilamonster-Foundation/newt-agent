@@ -332,7 +332,23 @@ impl CommandBroker for NativeGitBroker {
             program: self.native_image.to_string_lossy().into_owned(),
             prefix,
             cwd: command.cwd.clone(),
-            caveats: context.caveats().clone(),
+            // #2691 round 3 (P3): exec stays unrestricted here, mirroring
+            // `git_staging::run_confined_git`'s established `AgentInfluenced`
+            // pattern — Landlock delivers exec confinement only at the
+            // interceptor tier, so the `AgentInfluenced` scalar Kernel floor
+            // refuses ANY restricted exec scope outright (`EnforcementFloor`'s
+            // doc: "a scalar Kernel floor wrongly rejects the exec axis on
+            // backends that enforce exec only at the interceptor tier").
+            // `check_exec` just above already gated this SPECIFIC program
+            // against the caller's real exec authority; these probes run the
+            // SAME admitted `git` binary with newt-core-constructed argv, so
+            // no model-controlled program can reach this axis. The real
+            // boundary for a probe's children is the kernel-enforced
+            // fs_read/fs_write this struct still carries unchanged.
+            caveats: crate::Caveats {
+                exec: crate::Scope::All,
+                ..context.caveats().clone()
+            },
             env,
         };
         let git_dir = PathBuf::from(probe.text(&["rev-parse", "--absolute-git-dir"], control)?);

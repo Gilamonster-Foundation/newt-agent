@@ -217,6 +217,20 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
     fn queue_pending_once(&mut self, kind: super::permissions::DenialKind, target: &str) {
         self.inner.queue_pending_once(kind, target);
     }
+
+    fn apply_pending_once(
+        &mut self,
+        kind: super::permissions::DenialKind,
+        target: &str,
+        baseline: &crate::caveats::Caveats,
+    ) -> crate::caveats::Caveats {
+        use super::permissions::PermissionDecision;
+        let widened = self.inner.apply_pending_once(kind, target, baseline);
+        match self.validate_decision(PermissionDecision::Allow(widened)) {
+            PermissionDecision::Allow(validated) => validated,
+            PermissionDecision::Deny => baseline.clone(),
+        }
+    }
 }
 
 /// Transport-free session plus a bounded, tool-less inference callback.

@@ -1873,6 +1873,29 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             .insert((kind, target.to_string()));
     }
 
+    fn apply_pending_once(
+        &mut self,
+        kind: newt_core::DenialKind,
+        target: &str,
+        baseline: &newt_core::Caveats,
+    ) -> newt_core::Caveats {
+        let key = (kind, target.to_string());
+        if !self.state.pending_once_grants.contains(&key) {
+            return baseline.clone();
+        }
+        match self.mint(baseline, std::slice::from_ref(&key)) {
+            Ok(policy) => {
+                self.state.pending_once_grants.remove(&key);
+                policy
+            }
+            // Mint can fail for reasons unrelated to this grant (e.g. key
+            // minting); never drop a queued grant the operator already
+            // approved just because this particular refresh could not apply
+            // it — leave it queued for the next attempt.
+            Err(_) => baseline.clone(),
+        }
+    }
+
     fn ask_with_caveats(
         &mut self,
         baseline: &newt_core::Caveats,
