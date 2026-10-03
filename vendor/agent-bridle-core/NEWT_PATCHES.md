@@ -100,6 +100,26 @@ SandboxPolicy option or a complete SBPL ruleset. This patch does not promote
 that partial projection to a ruleset-level filesystem proof. Inherited terminal
 descriptors and `/dev/tty` remain separate surfaces.
 
+## agent-bridle#418 backport (2026-10-03)
+
+`trusted_worker_closure` (`src/spawn.rs`) previously added the worker's
+canonical path to the mechanism's `exec` allow-list only. A caller that
+restricts `fs_read` but leaves `exec` ambient (`Scope::All`) never merged the
+worker's path into `exec` either (`AdmittedFence::admit` folds a closure entry
+into an axis only when that axis is itself `Scope::Only(_)`), so the worker's
+own ELF stayed outside every read-allowed root and Landlock refused the
+worker's self-re-exec with `EACCES`.
+
+This repo's `RuntimeClosure::fs_read` and the `AdmittedFence::admit` merge onto
+that axis already existed here, added for `worker_read_resources` (the
+read-only helper-resource aliases above) — this patch only extends
+`trusted_worker_closure` to declare the worker's own canonical path through
+that same existing door, on both axes, mirroring the `exec` declaration. No
+change to `RuntimeClosure`, `admit`, or the admission projection was needed;
+the machinery this crate already carries for `worker_read_resources` covers
+the worker's own image for free. Upstream fix:
+<https://github.com/Gilamonster-Foundation/agent-bridle/pull/419>.
+
 ## Backport of agent-bridle#407, pending rc.6
 
 Upstream commit `c6268667f4d1f7bf05253a20686217fabb460dd4` (merged
