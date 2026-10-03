@@ -308,7 +308,7 @@ cargo fmt --all -- --check
 # nextest's discovery model calls EVERY test binary with `--list [--format
 # terse] [--ignored]` to enumerate tests before running any of them. `cargo
 # test` never does this -- it invokes a harness=false binary directly and
-# lets its own main() decide what to do. This repo has six `harness = false`
+# lets its own main() decide what to do. This repo has seven `harness = false`
 # custom-main test binaries (`grep -rn "harness = false" --include=Cargo.toml`),
 # and #1098 is the first thing to ever run nextest against them. Two are
 # confirmed broken by this real push (2026-09-30): newt-git::native_git_commit
@@ -318,10 +318,12 @@ cargo fmt --all -- --check
 # runner; agent-harness::writer_inheritance ignores argv entirely and always
 # runs its fork-based test (tests/writer_inheritance.rs:149), which then hits
 # a broken pipe when nextest closes the child's stdout after the list request
-# it never asked for. newt-core::brush_build_pipeline is excluded alongside
-# them as a precaution -- same shape of custom main, not yet proven safe under
-# nextest's discovery pass either, and cheap to exclude versus expensive to
-# prove. The three vendored agent-bridle-tool-shell real-shell binaries
+# it never asked for. newt-core::brush_build_pipeline and (#2693)
+# newt-core::native_git_broker_pipeline are excluded alongside them as a
+# precaution -- same shape of custom main (both gate on an exact `--ignored`
+# match, same as the fix `native_git_commit` still needs), not yet proven safe
+# under nextest's discovery pass either, and cheap to exclude versus expensive
+# to prove. The three vendored agent-bridle-tool-shell real-shell binaries
 # (brush_real, carried_coreutils, named_host_root_real) need `required-features
 # = ["brush"]` / `["carried-coreutils"]` this hook never enables, so they are
 # never compiled here and must NOT be named in this filter -- nextest's
@@ -345,6 +347,10 @@ cargo fmt --all -- --check
 # -- `cargo test -p newt-git --test native_git_commit -- --ignored` and
 # `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
 # real-resource CI lane of their own (tracked separately; out of scope here).
+# newt-core::native_git_broker_pipeline gates the SAME way but is NOT a
+# disclosed gap (#2693): `.github/workflows/native-git-broker-real.yml` runs
+# `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
+# weekly and on release tags.
 #
 # The six newt-agent binaries are the real-`newt`-session / real-PTY tier;
 # newt-eval::mock_e2e (whole binary) and the two named newt-tui tests are the
@@ -352,6 +358,7 @@ cargo fmt --all -- --check
 # reason and where CI runs it. scripts/test_pre_push.py pins this list;
 # change both together.
 NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
+    and not binary_id(newt-core::native_git_broker_pipeline)
     and not binary_id(agent-harness::writer_inheritance)
     and not binary_id(newt-git::native_git_commit)
     and not binary_id(newt-agent::lean_surface_purity)

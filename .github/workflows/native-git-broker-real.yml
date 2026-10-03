@@ -1,0 +1,70 @@
+name: Native Git broker real tier (#2693)
+
+# Real-Landlock, real-git integration tier for the native commit broker's hook
+# round-trip (`newt-core/tests/native_git_broker_pipeline.rs`). It is a
+# `harness = false` binary (like `brush_build_pipeline.rs`) because it needs
+# its own `main()` to answer `newt_core::maybe_dispatch()` when git invokes it
+# as a hook — an ordinary libtest binary never calls that, so the hook would
+# run as an inert no-op under `cargo test`. It self-gates behind
+# `kernel_fs_fence_available()` (Landlock) + a real `/usr/bin/git`, and prints
+# "ignored" and exits 0 under a plain `cargo test --workspace` (no `--ignored`)
+# — so ci.yml's per-PR run never actually executes its content. That gap was
+# round-5 review finding 1 on PR #2686: this workflow is what runs it.
+#
+# Tiering (CLAUDE.md "Testing strategy"): a real kernel-fence + real-git
+# real-resource test is OUT of the per-PR unit run. It runs here in the
+# WEEKLY tier (schedule) and the RELEASE tier (on v* tags), never as a push
+# gate. Linux-only: the binary's own `main()` panics on any other OS (no
+# Landlock), so there is no matrix.
+#
+# HOOK PARITY EXCEPTION: like output-oracle-real.yml / mcp-import-real.yml,
+# this workflow is intentionally OUTSIDE pre-push-hook parity — a real
+# Landlock ruleset + real git subprocess is too slow/environmental for a
+# local push gate. The pre-push hook mirrors ci.yml (the per-PR unit tier)
+# only.
+
+on:
+  schedule:
+    # Weekly, Sunday 05:00 UTC — alongside the other real-resource tiers.
+    - cron: "0 5 * * 0"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-git-broker-real-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-tier:
+    name: native_git_broker_pipeline real Landlock + git tier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-git-broker-real
+
+      - name: Verify a real /usr/bin/git is present
+        run: test -x /usr/bin/git
+
+      # Single-threaded: the binary's own `main()` runs both fixtures
+      # sequentially in-process already, matching the repo's real-resource
+      # convention for a hook-handshake test that mutates real temp gitdirs.
+      - name: Run native_git_broker_pipeline real-resource tests
+        run: |
+          cargo test -p newt-core --test native_git_broker_pipeline \
+            -- --ignored --test-threads=1
