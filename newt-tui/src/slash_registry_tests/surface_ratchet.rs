@@ -130,6 +130,17 @@ use super::*;
 /// same honest raise as `/models` above: the guarded surface catching up to
 /// the surface that exists.
 ///
+/// # 45/56 → 46/57: `/ocap` proposes THIS session (Step 27.14 / #2679)
+///
+/// A genuine top-level command, not a field of `/settings`: it reads a
+/// capture, proposes an approve.toml, and optionally persists candidates. It
+/// is not a subcommand of `/permissions` because `/permissions` renders what
+/// is currently granted — `/ocap propose` asks what to GRANT next, from a
+/// different source. It is `Receipt::Missing` on purpose: the save writes to
+/// the signed `ocap/session-grants.age` store, and a `/ocap propose` journal
+/// is still owed (raised alongside the missing-receipt count). Both doors are
+/// honest about their own surface.
+///
 /// # 44/55 → 45/56: operator workspace profiles (Step 27.13)
 ///
 /// `/workspace` is restored as the explicit shortcut to the reviewed operator
@@ -140,14 +151,14 @@ use super::*;
 #[test]
 fn the_registered_surface_only_shrinks() {
     assert!(
-        slash_commands().count() <= 45,
+        slash_commands().count() <= 46,
         "the slash surface GREW to {} commands. #1981 is a reduction: a \
          new command needs an argument for why it is not a field of \
          /settings or a subcommand of an existing verb",
         slash_commands().count()
     );
     assert!(
-        slash_tokens().len() <= 56,
+        slash_tokens().len() <= 57,
         "the slash surface GREW to {} tokens",
         slash_tokens().len()
     );
