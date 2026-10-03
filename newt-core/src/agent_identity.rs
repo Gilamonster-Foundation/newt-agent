@@ -872,8 +872,8 @@ fn find_identity_walkup(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
     let canonical_home: Option<PathBuf> = home.and_then(|h| h.canonicalize().ok());
     let mut dir = Some(start);
     while let Some(current) = dir {
-        let at_home = home == Some(current)
-            || canonical_home.as_deref().is_some_and(|ch| ch == current);
+        let at_home =
+            home == Some(current) || canonical_home.as_deref().is_some_and(|ch| ch == current);
         if at_home {
             break;
         }
