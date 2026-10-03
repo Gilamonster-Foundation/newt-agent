@@ -1,5 +1,6 @@
 //! The first-run / `newt setup` **standard caveat pack** (#2660) — common
-//! read-only text tools (+ the configured backend's host) as reviewable,
+//! text tools that can't run other programs (+ the configured backend's
+//! host) as reviewable,
 //! unsigned `approve.toml` candidates, built with the SAME gap/danger-
 //! partition engine [`crate::ocap_propose::propose_from_capture`] already
 //! uses for a flight-recorder observation. There is no second policy format
@@ -19,12 +20,24 @@
 //!
 //! ## What is deliberately excluded
 //!
-//! - **`git`/`gh`** are never candidates. Git authority already goes through
-//!   its own governed paths — the staging-repo push/PR broker (#2641,
-//!   `crate::git_staging`, merged) and the worktree-commit ref grant (#2682,
-//!   open) — neither of which is a plain exec-allowlist entry. A blanket
-//!   `git` exec grant here would authorize every invocation, INCLUDING
-//!   push, through a path neither broker gates.
+//! - **`git`/`gh`** are never candidates — enforced TWICE: [`STANDARD_TEXT_TOOLS`]
+//!   never lists them, AND [`drop_never_candidates`] strips any basename match
+//!   (including an absolute-path spelling like `/usr/bin/git`) out of the pool
+//!   AFTER a drop-in's names are merged in, so a drop-in cannot reintroduce
+//!   them. Git authority already goes through its own governed paths — the
+//!   staging-repo push/PR broker (#2641, `crate::git_staging`, merged) and the
+//!   worktree-commit ref grant (#2682, open) — neither of which is a plain
+//!   exec-allowlist entry. A blanket `git` exec grant here would authorize
+//!   every invocation, INCLUDING push, through a path neither broker gates.
+//! - **`sed`/`find`** are not in the pool: their `e` command / `s///e` flag
+//!   (sed) and `-exec`/`-delete`/`-ok` (find) run another program, and that
+//!   descendant does not reliably re-enter Brush's exec interceptor
+//!   (`vendor/agent-bridle-tool-shell/src/brush_shell.rs`). newt's native
+//!   `grep` and `find` tools cover the same jobs without a spawn. The
+//!   contract for everything that remains is **"can't run other programs;
+//!   writes are still gated by `fs_write`"** — not "read-only" (`sed -i`
+//!   wasn't offered, but the thing that made `sed` worth dropping is the
+//!   execution hole, not the in-place edit).
 //! - **Interpreters / command-runners** (`awk`, `xargs`, `sh`, …) — per the
 //!   production danger table (`newt-tui::danger::INTERPRETER_EXEC`), granting
 //!   bare execution of one of these is equivalent to an open-ended shell
@@ -56,11 +69,12 @@ const SETUP_PACK_COMMAND: &str = "newt setup: standard caveat pack";
 /// not a grant. Every name here still goes through the same danger gate
 /// [`propose_standard_pack`] composes with.
 ///
-/// Low-danger (POSIX-common, read-only by convention; the exec-allowlist
-/// grant is name-based, not argument-scoped, so e.g. `sed`/`find` also cover
-/// `sed -i`/`find -delete` — a known limit of the model this pack cannot
-/// narrow further): `cat`, `head`, `tail`, `grep`, `sed`, `sort`, `wc`,
-/// `find`, `ls`.
+/// Low-danger: POSIX-common text tools that **can't run other programs**
+/// (the exec-allowlist grant is name-based, not argument-scoped — the bar
+/// for inclusion is that no flag of the command spawns a child process; a
+/// tool that can, like `sed`'s `e`/`s///e` or `find`'s `-exec`, is left out
+/// rather than narrowed, since the grant can't see the flag): `cat`, `head`,
+/// `tail`, `grep`, `sort`, `wc`, `ls`.
 ///
 /// High-danger (interpreter / command-runner, per
 /// `newt-tui::danger::INTERPRETER_EXEC`) — included here so the shared
@@ -68,8 +82,34 @@ const SETUP_PACK_COMMAND: &str = "newt setup: standard caveat pack";
 /// the pack silently never mentioning why they keep prompting: `awk`,
 /// `xargs`, `sh`.
 pub const STANDARD_TEXT_TOOLS: &[&str] = &[
-    "cat", "head", "tail", "grep", "sed", "sort", "wc", "find", "ls", "awk", "xargs", "sh",
+    "cat", "head", "tail", "grep", "sort", "wc", "ls", "awk", "xargs", "sh",
 ];
+
+/// Names whose exec grant must never enter the candidate pool, no matter what
+/// a drop-in asks for — `git`/`gh` authority is mediated elsewhere (see the
+/// module docs' "What is deliberately excluded"). Matched on the command's
+/// file-name component (same convention as
+/// `newt_tui::danger::DangerTable::is_interpreter`), so an absolute-path
+/// spelling like `/usr/bin/git` is caught too.
+const NEVER_CANDIDATES: &[&str] = &["git", "gh"];
+
+/// Strip any [`NEVER_CANDIDATES`] basename out of a merged candidate pool.
+/// Call this AFTER [`merge_candidates`] — the built-in pool never lists
+/// `git`/`gh`, but a drop-in's `exec` list is operator/project data this
+/// function must not trust to omit them.
+pub fn drop_never_candidates<'a>(candidates: &[&'a str]) -> Vec<&'a str> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|name| {
+            let base = std::path::Path::new(name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(name);
+            !NEVER_CANDIDATES.contains(&base)
+        })
+        .collect()
+}
 
 /// An operator/project drop-in that ADDS exec/net candidate names to the
 /// built-in pool above — the same droppable-`.toml`-over-pure-data
@@ -138,10 +178,10 @@ pub fn propose_standard_pack(
 ) -> Proposal {
     let mut capture = FlightCapture::default();
     for &target in exec_candidates {
-        capture.observe(ShadowAxis::Exec, target, SETUP_PACK_COMMAND);
+        capture.observe(ShadowAxis::Exec, target, SETUP_PACK_COMMAND, None);
     }
     for &host in net_candidates {
-        capture.observe(ShadowAxis::Net, host, SETUP_PACK_COMMAND);
+        capture.observe(ShadowAxis::Net, host, SETUP_PACK_COMMAND, None);
     }
     let mut proposal = propose_from_capture(&capture, in_policy, is_high_danger, now);
     for e in &mut proposal.additions.exec {
@@ -185,9 +225,7 @@ mod tests {
             "2026-10-02",
         );
         let exec_targets: Vec<&str> = p.additions.exec.iter().map(|e| e.target.as_str()).collect();
-        for low in [
-            "cat", "head", "tail", "grep", "sed", "sort", "wc", "find", "ls",
-        ] {
+        for low in ["cat", "head", "tail", "grep", "sort", "wc", "ls"] {
             assert!(
                 exec_targets.contains(&low),
                 "{low} missing from {exec_targets:?}"
@@ -216,11 +254,20 @@ mod tests {
         }
         // High-danger targets are named in `deferred`, never signed into
         // `additions` — the "opt in" question is a no-op by construction.
-        for low in [
-            "cat", "head", "tail", "grep", "sed", "sort", "wc", "find", "ls",
-        ] {
+        for low in ["cat", "head", "tail", "grep", "sort", "wc", "ls"] {
             assert!(!deferred_targets.contains(&low));
         }
+    }
+
+    /// #2660 round 2, item 2: `sed`/`find` are gone from the pool — their
+    /// execution flags (`sed`'s `e`/`s///e`, `find`'s `-exec`/`-delete`/
+    /// `-ok`) run another program whose descendant doesn't reliably re-enter
+    /// Brush's exec interceptor, and newt now has native `grep`/`find`
+    /// tools for the read-only job these covered.
+    #[test]
+    fn standard_pack_drops_sed_and_find() {
+        assert!(!STANDARD_TEXT_TOOLS.contains(&"sed"));
+        assert!(!STANDARD_TEXT_TOOLS.contains(&"find"));
     }
 
     /// Re-running setup must not re-propose what a prior run (or a hand
@@ -242,6 +289,25 @@ mod tests {
         let extra = vec!["rg".to_string(), "cat".to_string(), " ".to_string()];
         let merged = merge_candidates(&builtin, &extra);
         assert_eq!(merged, vec!["cat", "ls", "rg"]);
+    }
+
+    /// #2660 round 2, item 3: a drop-in can ask for `git`/`gh` by name, or by
+    /// an absolute-path spelling — `drop_never_candidates` must strip both
+    /// AFTER the merge, since the built-in pool alone never covers drop-in
+    /// input. Red before the fix: `merge_candidates` alone has no opinion on
+    /// `git`, and `git` is Low-danger in the production table, so nothing
+    /// downstream would have caught it.
+    #[test]
+    fn drop_never_candidates_strips_git_and_gh_by_basename() {
+        let extra = [
+            "git".to_string(),
+            "/usr/bin/git".to_string(),
+            "gh".to_string(),
+            "rg".to_string(),
+        ];
+        let pool = merge_candidates(&["cat"], &extra);
+        let filtered = drop_never_candidates(&pool);
+        assert_eq!(filtered, vec!["cat", "rg"]);
     }
 
     #[test]

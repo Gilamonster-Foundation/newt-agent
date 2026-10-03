@@ -737,13 +737,13 @@ fn offer_sandbox_git(op: &Operator<'_>) {
     }
 }
 
-/// Offer the first-run/setup **standard caveat pack** (#2660): common
-/// read-only text tools (+ the backend host just configured) as durable,
-/// SIGNED `approve.toml` candidates — so the routine "run_command wants to
-/// run `cat` — outside the granted exec allowlist" prompt stops firing every
-/// session for exactly these tools (the 2026-10-02 retest: 129 prompts in
-/// one run, mostly for `git`/`find`/`sort`/`head`/`grep`/`sed`/`awk`/
-/// `xargs`).
+/// Offer the first-run/setup **standard caveat pack** (#2660): common text
+/// tools that can't run other programs (+ the backend host just configured)
+/// as durable, SIGNED `approve.toml` candidates — so the routine
+/// "run_command wants to run `cat` — outside the granted exec allowlist"
+/// prompt stops firing every session for exactly these tools (the
+/// 2026-10-02 retest: 129 prompts in one run, mostly for
+/// `git`/`find`/`sort`/`head`/`grep`/`sed`/`awk`/`xargs`).
 ///
 /// `git`/`gh` are never offered — see `newt_core::caveat_pack`'s module docs
 /// for why: git authority already goes through the governed staging-repo
@@ -754,10 +754,16 @@ fn offer_sandbox_git(op: &Operator<'_>) {
 /// target, so there is no durable "opt in" that changes that today.
 ///
 /// Every candidate is visible before anything is written, and removable —
-/// the operator can exclude any by name before the pack is signed. A failure
-/// here (fs, parse, signing) is reported and swallowed, never propagated: a
-/// problem in this last, optional step must not make a successful backend
-/// write look like a failed `newt setup`.
+/// the operator can exclude any by name before the pack is signed. Signing
+/// touches ONLY the reviewed/retained additions (#2660 round 2, item 1):
+/// they are signed in an isolated `PolicyFile` BEFORE being merged into
+/// whatever is already on disk, so a pre-existing entry — unsigned, or
+/// signed under a since-rotated key — keeps exactly the signature state it
+/// already had; the operator's review and confirmation never extends to
+/// text they did not see. A failure here (fs, parse, signing) is reported
+/// and swallowed, never propagated: a problem in this last, optional step
+/// must not make a successful backend write look like a failed `newt
+/// setup`.
 fn offer_caveat_pack(op: &Operator<'_>, config_path: &Path, backend_host: Option<&str>) {
     if let Err(e) = try_offer_caveat_pack(op, config_path, backend_host) {
         op.say(&format!("\nStandard caveat pack: {e:#} — skipped."));
@@ -770,7 +776,8 @@ fn try_offer_caveat_pack(
     backend_host: Option<&str>,
 ) -> anyhow::Result<()> {
     use newt_core::caveat_pack::{
-        merge_candidates, propose_standard_pack, CaveatPackDropIn, STANDARD_TEXT_TOOLS,
+        drop_never_candidates, merge_candidates, propose_standard_pack, CaveatPackDropIn,
+        STANDARD_TEXT_TOOLS,
     };
     use newt_core::ocap_propose::in_policy_pairs;
     use newt_core::ocap_store::{build_store, lock_approve_file, PolicyFile, Verdict, VERDICTS};
@@ -802,6 +809,11 @@ fn try_offer_caveat_pack(
         Err(_) => CaveatPackDropIn::default(),
     };
     let exec_candidates = merge_candidates(STANDARD_TEXT_TOOLS, &drop_in.exec);
+    // #2660 round 2, item 3: enforce the git/gh exclusion AFTER the drop-in
+    // is merged in — the built-in pool never lists them, but a drop-in's
+    // `exec` list is operator/project data this step must not trust to omit
+    // them (and basename-matched, so an absolute-path spelling can't dodge it).
+    let exec_candidates = drop_never_candidates(&exec_candidates);
     let net_builtin: Vec<&str> = backend_host.into_iter().collect();
     let net_candidates = merge_candidates(&net_builtin, &drop_in.net);
 
@@ -819,9 +831,10 @@ fn try_offer_caveat_pack(
     }
 
     op.say(
-        "\nStandard caveat pack: common read-only text tools, plus the endpoint you just \
-         configured. Signing these now stops the routine permission prompt for each of them \
-         (`/permissions` edits this later; the model never can):",
+        "\nStandard caveat pack: common text tools that can't run other programs, plus the \
+         endpoint you just configured (writes are still gated by fs_write). Signing these now \
+         stops the routine permission prompt for each of them (`/permissions` edits this \
+         later; the model never can):",
     );
     for e in &proposal.additions.exec {
         op.say(&format!("  exec  {}", e.target));
@@ -886,20 +899,43 @@ fn try_offer_caveat_pack(
 
     let (destination, _lock) = lock_approve_file(config_path)?;
     let approve_path = destination.as_path().to_path_buf();
+    // #2660 round 2, item 4: an unreadable existing file is NOT the same as
+    // an absent one — default to empty only when there is truly nothing yet
+    // (`NotFound`); any other read error (permission denied, not a regular
+    // file, …) refuses the whole step before anything is written, rather
+    // than silently treating unreadable-and-therefore-unknown content as
+    // "no existing policy" and overwriting it.
     let mut merged = match std::fs::read_to_string(&approve_path) {
         Ok(text) => PolicyFile::parse(&text).map_err(|e| anyhow::anyhow!("approve.toml: {e}"))?,
-        Err(_) => PolicyFile::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PolicyFile::default(),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "cannot read {}: {e}",
+                approve_path.display()
+            ))
+        }
     };
-    merged.exec.extend(additions.exec);
-    merged.net.extend(additions.net);
 
+    // #2660 round 2, item 1: sign ONLY the reviewed/retained additions, in
+    // an isolated `PolicyFile`, BEFORE merging them into whatever is already
+    // on disk. `sign_approves` re-blesses every entry in the file it is
+    // handed — signing the already-merged file would re-sign every
+    // pre-existing entry too (an unsigned or invalidly-signed one for a
+    // target the operator never saw in THIS review), laundering it into a
+    // valid grant on the strength of a confirmation that covered only the
+    // displayed additions. Merging the signed result in afterward leaves
+    // every pre-existing entry exactly as signed (or not) as it already was.
     let key_path = newt_identity::default_key_path()?;
     let user = newt_identity::load_or_generate(&key_path)?;
+    let mut fresh = additions;
     let (signed, refused) = newt_core::ocap_store::sign_approves(
-        &mut merged,
+        &mut fresh,
         crate::ocap_high_danger_predicate(),
         |payload| user.sign(payload).to_bytes(),
     );
+    merged.exec.extend(fresh.exec);
+    merged.fs.extend(fresh.fs);
+    merged.net.extend(fresh.net);
     destination
         .atomic_write(merged.to_toml().map_err(|e| anyhow::anyhow!(e))?.as_bytes())
         .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", approve_path.display()))?;

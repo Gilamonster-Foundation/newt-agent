@@ -3172,3 +3172,133 @@ fn offer_caveat_pack_exclude_prompt_removes_the_named_entry() {
         "a non-excluded entry was still written: {file:?}"
     );
 }
+
+/// #2660 round 2, item 1 (P1), red-first: `try_offer_caveat_pack` used to
+/// pass the WHOLE merged approve file to `sign_approves`, which re-blesses
+/// every entry that passes the danger check — including a pre-existing
+/// entry the operator never saw in THIS review. Measured red: before the
+/// fix, this pre-seeded, unsigned, unrelated net entry came back signed
+/// after the operator confirmed only the displayed `127.0.0.1` addition.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_signs_only_the_reviewed_additions() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    let approve_path = config_path.with_file_name("ocap").join("approve.toml");
+    std::fs::create_dir_all(approve_path.parent().unwrap()).unwrap();
+    // A pre-existing, unsigned entry for a host unrelated to this run's
+    // review — never displayed, never confirmed.
+    std::fs::write(&approve_path, "[[net]]\nhost = \"unrelated.example\"\n").unwrap();
+
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+    offer_caveat_pack(&console.operator(), &config_path, Some("127.0.0.1"));
+
+    let text = std::fs::read_to_string(&approve_path).unwrap();
+    let file = newt_core::ocap_store::PolicyFile::parse(&text).unwrap();
+    let unrelated = file
+        .net
+        .iter()
+        .find(|e| e.host == "unrelated.example")
+        .expect("pre-existing entry must be preserved");
+    assert!(
+        unrelated.sig.is_none(),
+        "setup must sign only what the operator saw this run, not every \
+         existing entry: {unrelated:?}"
+    );
+    let reviewed = file
+        .net
+        .iter()
+        .find(|e| e.host == "127.0.0.1")
+        .expect("the reviewed addition must be written");
+    assert!(
+        reviewed.sig.is_some(),
+        "the displayed, confirmed addition must still be signed: {reviewed:?}"
+    );
+}
+
+/// #2660 round 2, item 3: a drop-in's `exec` list can spell `git` as an
+/// absolute path — `drop_never_candidates` must still catch it, proven here
+/// through the real setup/signing path (not just the pure helper's unit
+/// test in `newt_core::caveat_pack`): never shown in the review, never
+/// durably signed.
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_excludes_a_drop_in_git_path_spelling() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    std::fs::write(
+        config_path.with_file_name("caveat-pack.toml"),
+        "exec = [\"/usr/bin/git\"]\n",
+    )
+    .unwrap();
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+
+    offer_caveat_pack(&console.operator(), &config_path, None);
+
+    let transcript = console.transcript();
+    assert!(
+        !transcript.contains("/usr/bin/git") && !transcript.contains("exec  git"),
+        "a drop-in git spelling must never reach the review: {transcript}"
+    );
+
+    let key_path = newt_identity::default_key_path().unwrap();
+    let user = newt_identity::load_or_generate(&key_path).unwrap();
+    let (set, warnings) =
+        newt_core::ocap_store::load_store(&config_path, Some(user.public().as_bytes()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "git"),
+        None,
+        "a drop-in git spelling must never be durably signed"
+    );
+}
+
+/// #2660 round 2, item 4: an unreadable existing approve file must refuse
+/// the write rather than treat the read error as "no file yet" and
+/// overwrite it. Injected via `chmod 000` (`#[cfg(unix)]` — POSIX
+/// permissions have no Windows equivalent): the atomic-replace step only
+/// needs write permission on the *directory*, so an unreadable-but-present
+/// file is a case where the OLD `Err(_) => PolicyFile::default()` code would
+/// have gone on to silently overwrite a file it could not read — unlike a
+/// missing *directory* or a locked path, which fail at other steps
+/// regardless of this fix and so would not discriminate old from new
+/// behavior.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(real_fs)]
+fn offer_caveat_pack_refuses_on_an_unreadable_approve_file_without_writing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    let config_path = Config::user_config_path().unwrap();
+    let approve_path = config_path.with_file_name("ocap").join("approve.toml");
+    std::fs::create_dir_all(approve_path.parent().unwrap()).unwrap();
+    std::fs::write(&approve_path, "[[net]]\nhost = \"unrelated.example\"\n").unwrap();
+    std::fs::set_permissions(&approve_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // exclude: blank (keep all); sign-and-write: y.
+    let console = ScriptedConsole::new(&["", "y"]);
+    offer_caveat_pack(&console.operator(), &config_path, Some("127.0.0.1"));
+
+    // Restore read access before asserting, so the check itself can read it.
+    std::fs::set_permissions(&approve_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let text = std::fs::read_to_string(&approve_path).unwrap();
+    assert!(
+        text.contains("unrelated.example"),
+        "a refused write must leave the unreadable file's content untouched: {text}"
+    );
+    assert!(
+        !text.contains("127.0.0.1"),
+        "a refused read must not go on to write the new addition: {text}"
+    );
+    assert!(
+        console.transcript().contains("Standard caveat pack:"),
+        "the read error must be reported, not swallowed silently: {}",
+        console.transcript()
+    );
+}
