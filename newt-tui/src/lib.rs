@@ -2119,8 +2119,18 @@ fn ocap_propose_command_lines(
     capture_override: Option<PathBuf>,
     config: Option<&Path>,
     save: bool,
-    _active_conversation_id: &str,
+    session: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
+    // The capture is global across sessions. With no owning session there is
+    // nothing that is provably THIS session's evidence, so propose nothing
+    // rather than fall back to an all-session read (that is the CLI's job).
+    let Some(session) = session else {
+        return Ok(vec![
+            "No active session, so there is no session-scoped evidence to propose from. \
+`newt ocap propose` (CLI) reviews the whole capture."
+                .to_string(),
+        ]);
+    };
     let config_path = config
         .map(Path::to_path_buf)
         .or_else(newt_core::Config::user_config_path)
@@ -2129,34 +2139,19 @@ fn ocap_propose_command_lines(
     // No capture file means there is no observed authority to propose from —
     // arm the recorder first. Never fabricate a proposal.
     let capture_path = resolve_ocap_capture_path(capture_override, &config_path);
-    let capture_text = if let Ok(t) = std::fs::read_to_string(&capture_path) {
-        t
-    } else if let Err(e) = std::fs::read_to_string(&capture_path) {
-        if e.kind() == std::io::ErrorKind::NotFound {
+    let capture_text = match std::fs::read_to_string(&capture_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(vec![
                 format!("No flight-recorder capture at {}.", capture_path.display()),
-                "Confined run_command refusals are recorded there. Arm the recorder by running a \
- task under `--full-access` (or set `$NEWT_FLIGHT_RECORDER`); then `/ocap propose` turns \
- that observed authority into a reviewable proposal."
+                "Arm the recorder by running a task under `--full-access` (or set \
+`$NEWT_FLIGHT_RECORDER`); then `/ocap propose` turns that observed authority into a \
+reviewable proposal."
                     .to_string(),
             ]);
         }
-        return Err(anyhow::anyhow!("read {}: {e}", capture_path.display()));
-    } else {
-        // unreachable: read either succeeds or errors
-        String::new()
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", capture_path.display())),
     };
-
-    // `active_session()` is the id stamped on every caveat the recorder
-    // observed this run. Thread it into `propose_for` so the capture is
-    // narrowed to THIS session — a shared capture file never mixes another
-    // session's observed authority. A no-op when no session is known (a
-    // non-TUI context), which leaves the read unscoped.
-    let active = newt_core::lifecycle::active_session();
-    let session_id = active.map(|id| {
-        let leaked: &str = Box::leak(id.into_boxed_str());
-        leaked
-    });
 
     // Read the four store files RAW (unverified) so already-written-but-unsigned
     // candidates count as accounted-for and re-runs converge — same as the CLI.
@@ -2171,51 +2166,61 @@ fn ocap_propose_command_lines(
                 )
             })
             .collect();
+    // The existing approve file is merged into, never replaced: every entry
+    // and signature in it survives a save. An unreadable file refuses the save
+    // rather than overwrite what could not be read.
+    let approve_path = store_dir.join(newt_core::ocap_store::Verdict::Approve.filename());
+    let existing = match std::fs::read_to_string(&approve_path) {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", approve_path.display())),
+    };
 
     let now = crate::probe::today_local_date();
-    let (_, proposal) = newt_core::ocap_propose::propose_for(
+    let (merged, proposal) = newt_core::ocap_propose::propose_for(
         &capture_text,
         &store_files,
-        None,
+        existing.as_deref(),
         crate::ocap_high_danger_predicate(),
         &now,
-        session_id,
+        Some(session),
     )
     .map_err(|e| anyhow::anyhow!("propose: {e}"))?;
 
     if proposal.is_empty() {
-        return Ok(vec![format!(
-            "The capture at {} is fully accounted for by the current policy — nothing to propose.",
-            capture_path.display()
-        )]);
+        return Ok(vec![
+            "This session's capture is fully accounted for by the current policy — nothing to propose."
+                .to_string(),
+        ]);
     }
 
     // `save` records the low-danger candidates UNSIGNED — they are no-ops until
     // `newt doctor --sign-ocap`. Never write past the danger gate.
-    let wrote = if save && proposal.additions_len() > 0 {
-        let (merged, _) = newt_core::ocap_propose::propose_for(
-            &capture_text,
-            &store_files,
-            None,
-            crate::ocap_high_danger_predicate(),
-            &now,
-            session_id,
-        )
-        .map_err(|e| anyhow::anyhow!("propose: {e}"))?;
+    let wrote = save && proposal.additions_len() > 0;
+    if wrote {
         let merged_toml = merged
             .to_toml()
             .map_err(|e| anyhow::anyhow!("serialize approve.toml: {e}"))?;
-        if let Err(e) = std::fs::create_dir_all(&store_dir) {
-            return Err(anyhow::anyhow!("create {}: {e}", store_dir.display()));
-        }
-        let approve_path = store_dir.join(newt_core::ocap_store::Verdict::Approve.filename());
+        std::fs::create_dir_all(&store_dir)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", store_dir.display()))?;
         std::fs::write(&approve_path, &merged_toml)
             .map_err(|e| anyhow::anyhow!("write {}: {e}", approve_path.display()))?;
-        true
-    } else {
-        false
-    };
+    }
     Ok(render_ocap_proposal(&proposal, wrote))
+}
+
+/// Usage line for a malformed `/ocap` command.
+pub(crate) const OCAP_USAGE: &str = "usage: /ocap propose        show this session's grant candidates\n       /ocap propose save   also write them, unsigned, to approve.toml";
+
+/// Parse `/ocap propose [save]` (the slash body, without the leading `/`).
+/// `Some(save)` for the two accepted forms; `None` for anything else.
+pub(crate) fn parse_ocap_command(slash_body: &str) -> Option<bool> {
+    let words: Vec<&str> = slash_body.split_whitespace().collect();
+    match words.as_slice() {
+        ["ocap", "propose"] => Some(false),
+        ["ocap", "propose", "save"] => Some(true),
+        _ => None,
+    }
 }
 
 /// The human note on a proposed entry, or `"observed"` when none is present —
@@ -10097,6 +10102,11 @@ mod run_command_confinement_tests;
 #[cfg(test)]
 #[path = "lib_tests/disable_ocap_session_tests.rs"]
 mod disable_ocap_session_tests;
+
+/// `/ocap propose` (#2679): merge-on-save, exact grammar, session scope.
+#[cfg(test)]
+#[path = "lib_tests/ocap_propose_tests.rs"]
+mod ocap_propose_tests;
 
 // ---------------------------------------------------------------------------
 // ManagerNoteSink wiring (Step 19.3, #248) — `/remember` and the model's

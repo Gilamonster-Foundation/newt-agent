@@ -3996,16 +3996,20 @@ fn session_body(
                     // recorded under THIS session survive, so a shared capture
                     // never mixes one session's observed authority with another's.
                     if slash_body == "ocap" || slash_body.starts_with("ocap ") {
-                        let tail = slash_body.strip_prefix("ocap").unwrap_or("").trim();
-                        let sub = tail.split_whitespace().next().unwrap_or("");
-                        let save = sub == "save";
+                        let Some(save) = crate::parse_ocap_command(slash_body) else {
+                            print_newt(crate::OCAP_USAGE, color, verbose);
+                            println!();
+                            continue;
+                        };
+                        let _ = &active_conversation_id;
                         let user_config = newt_core::Config::user_config_path();
                         let config_path = user_config.as_deref();
+                        let session = newt_core::lifecycle::active_session();
                         let lines = match crate::ocap_propose_command_lines(
                             None,
                             config_path,
                             save,
-                            &active_conversation_id,
+                            session.as_deref(),
                         ) {
                             Ok(lines) => lines,
                             Err(error) => {

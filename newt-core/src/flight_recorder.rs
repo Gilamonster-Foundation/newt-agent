@@ -119,7 +119,8 @@ impl FlightCapture {
     /// logged here as the single most valuable axis first.
     pub fn observe_command(&mut self, command: &str) {
         if let Some(program) = exec_program(command) {
-            self.observe(ShadowAxis::Exec, program, command, active_session_id());
+            let session = crate::lifecycle::active_session();
+            self.observe(ShadowAxis::Exec, program, command, session.as_deref());
         }
     }
 
@@ -210,20 +211,9 @@ pub fn log_unconfined(command: &str) {
 /// recording is off or the target is empty.
 pub fn log_observed(axis: ShadowAxis, target: &str, command: &str) {
     let mut cap = FlightCapture::default();
-    cap.observe(axis, target, command, active_session_id());
+    let session = crate::lifecycle::active_session();
+    cap.observe(axis, target, command, session.as_deref());
     append_capture(&cap);
-}
-
-/// The current session's id, borrowed for the lifetime of the call so it can
-/// be stamped on the next recorded caveat. Returns `None` when recording
-/// outside any session (e.g. a test); the caveat then keeps `session = None`,
-/// which the reader treats as belonging to every session.
-fn active_session_id() -> Option<&'static str> {
-    use crate::lifecycle::active_session;
-    active_session().map(|id| {
-        let leaked: &'static str = Box::leak(id.into_boxed_str());
-        leaked
-    })
 }
 
 /// Append every caveat in `cap` to the armed capture file as JSONL (one
@@ -258,10 +248,10 @@ fn append_capture(cap: &FlightCapture) {
 /// axis+target, summing counts) — the input to `newt ocap propose` (#1176).
 ///
 /// Without `session` every caveat in `text` is folded in. With `session =
-/// Some(id)` only caveats recorded under that session (or recorded with no
-/// session at all, which are treated as belonging to every session) are kept —
-/// this is what scopes `newt ocap propose` to the current session instead of
-/// seeing every past session's caveats in a shared capture file.
+/// Some(id)` only caveats recorded under that session are kept; a caveat
+/// recorded with no session id predates stamping and is dropped. This is what
+/// scopes the TUI's `/ocap propose` to the current session instead of seeing
+/// every past session's caveats in a shared capture file.
 pub fn read_capture_jsonl(text: &str) -> FlightCapture {
     read_capture_jsonl_sessioned(text, None)
 }

@@ -233,26 +233,16 @@ pub fn propose_for(
     let capture = crate::flight_recorder::read_capture_jsonl_sessioned(capture_text, session);
     let proposal = propose_from_capture(&capture, &in_policy, is_high_danger, now);
 
-    // Merge the proposed additions on top of any existing entries. An entry
-    // that is already present (same class+target) is left as-is except that a
-    // plain existing approve is annotated with the flight-recorder provenance;
-    // a pre-existing candidate or signed grant is left untouched (idempotent).
+    // Append the proposed additions to the existing approve file, exactly as
+    // the CLI always has: every existing entry and signature is kept, and the
+    // proposer never re-proposes a target already in policy (`in_policy`).
     let mut merged = match existing {
-        Some(text) => PolicyFile::parse(text).map_err(|e| anyhow::anyhow!("{e}"))?,
+        Some(text) => PolicyFile::parse(text).map_err(|e| anyhow::anyhow!("approve.toml: {e}"))?,
         None => PolicyFile::default(),
     };
-    for e in &proposal.additions.exec {
-        merged.exec.retain(|x| x.target != e.target);
-        merged.exec.push(e.clone());
-    }
-    for e in &proposal.additions.fs {
-        merged.fs.retain(|x| x.path != e.path);
-        merged.fs.push(e.clone());
-    }
-    for e in &proposal.additions.net {
-        merged.net.retain(|x| x.host != e.host);
-        merged.net.push(e.clone());
-    }
+    merged.exec.extend(proposal.additions.exec.iter().cloned());
+    merged.fs.extend(proposal.additions.fs.iter().cloned());
+    merged.net.extend(proposal.additions.net.iter().cloned());
 
     Ok((merged, proposal))
 }
@@ -395,5 +385,31 @@ mod tests {
         assert!(pairs.contains(&("net".to_string(), "crates.io".to_string())));
         assert!(pairs.contains(&("fs".to_string(), "/ws".to_string())));
         assert_eq!(pairs.len(), 3);
+    }
+
+    /// The shared proposer appends, as the CLI always did: a same-path read
+    /// AND write addition both survive (round 1 retained-then-pushed by target,
+    /// which collapsed them), and existing entries are kept (#2687 review).
+    #[test]
+    fn propose_for_appends_and_keeps_same_path_read_and_write() {
+        let capture = concat!(
+            r#"{"axis":"fs_read","target":"data","command":"cat data/x","count":1}"#,
+            "\n",
+            r#"{"axis":"fs_write","target":"data","command":"cp a data/","count":1}"#,
+            "\n",
+        );
+        let existing = "[[exec]]\ntarget = \"rg\"\nsig = \"deadbeef\"\n";
+        let (merged, _) =
+            propose_for(capture, &[], Some(existing), danger, "2026-10-02", None).unwrap();
+        assert_eq!(
+            merged.fs.iter().filter(|e| e.path == "data").count(),
+            2,
+            "{:?}",
+            merged.fs
+        );
+        assert!(
+            merged.exec.iter().any(|e| e.target == "rg"),
+            "existing entry kept"
+        );
     }
 }
