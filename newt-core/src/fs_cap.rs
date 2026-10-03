@@ -234,6 +234,19 @@ impl WorkspaceDir {
         )?))
     }
 
+    /// Create `rel` exclusively, contained beneath the root — `EEXIST` if it is
+    /// already there. The lockfile half of git's own ref-update protocol
+    /// (`<ref>.lock`): a bounded `create` would silently truncate a lock another
+    /// writer already holds, so this is a distinct flag, not `create` with a
+    /// different argument.
+    pub fn create_new(&self, rel: &Path) -> io::Result<File> {
+        Ok(File::from(self.resolve(
+            rel,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+            Mode::from_raw_mode(0o644),
+        )?))
+    }
+
     /// Create `rel` and any missing parent directories, each contained beneath
     /// the root. The walk opens (or creates) one component at a time on a fd
     /// resolved *beneath* the previous one, so a symlink or `..` in any component

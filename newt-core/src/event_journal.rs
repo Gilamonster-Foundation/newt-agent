@@ -85,6 +85,14 @@ pub enum EventKind {
     Compression,
     /// A conversation was renamed, forked, or dropped.
     ConversationOp,
+    /// A commit landed on a detached `HEAD` but was never published to its
+    /// branch ref — e.g. the confined dispatch that made it was cancelled
+    /// before the host-side broker could decide whether to publish it
+    /// (`git_hardening::DetachedHeadGuard`, #2686 review round 4, P2). The
+    /// guard's `Drop` cannot return anything to any caller, so this is the
+    /// durable, recoverable record of the commit's oid; `subject` names the
+    /// branch it would have published to.
+    OrphanedCommit,
 }
 
 impl EventKind {
@@ -98,6 +106,7 @@ impl EventKind {
             Self::NoteAppend => "note-append",
             Self::Compression => "compression",
             Self::ConversationOp => "conversation-op",
+            Self::OrphanedCommit => "orphaned-commit",
         }
     }
 
@@ -112,6 +121,7 @@ impl EventKind {
             Self::NoteAppend,
             Self::Compression,
             Self::ConversationOp,
+            Self::OrphanedCommit,
         ]
     }
 }
@@ -774,8 +784,9 @@ mod tests {
         assert_eq!(tokens.len(), EventKind::all().len());
         assert_eq!(
             EventKind::all().len(),
-            6,
-            "the six mutator classes #2009 parked; adding one is a schema decision"
+            7,
+            "the six mutator classes #2009 parked plus OrphanedCommit (#2686 review \
+             round 4); adding one is a schema decision"
         );
     }
 
