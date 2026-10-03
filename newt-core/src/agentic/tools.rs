@@ -1905,26 +1905,62 @@ fn single_grant_covers_missing(
     })
 }
 
-/// #2681 round 2 (P1): an exec denial replays safely ONLY when the denied
-/// spawn is the FIRST command in `cmd`'s source order. Unlike the FS
-/// pre-flight check (which runs before anything is dispatched at all), an
-/// exec denial fires mid-dispatch: an earlier command in the SAME
-/// `&&`/`;`-chain may already have run — a permitted external program, or a
-/// builtin, which bypasses the exec gate entirely and always runs — before
-/// the denied spawn was even attempted. Blindly re-dispatching the whole
-/// `cmd` string from scratch on grant would repeat that earlier effect.
-/// `agent_bridle::inspect_shell` (already used by `native_git::
-/// needs_commit_broker` for the same non-executing, source-order inventory)
-/// gives the one honest signal available without re-running anything:
-/// whether the denied target IS the first entry. Fails closed (false) on an
-/// inspection error or an empty command list — never claims safety it did
-/// not actually check.
-fn exec_denial_is_leading_spawn(target: &str, cmd: &str) -> bool {
-    agent_bridle::inspect_shell(cmd)
-        .ok()
-        .and_then(|inspection| inspection.commands.into_iter().next())
-        .and_then(|first| first.program)
-        .is_some_and(|program| program == target)
+/// #2681 round 3 (P1): an exec denial replays safely ONLY when `cmd`, in
+/// its entirety, is a single simple command with no dynamic content and no
+/// redirect that can itself mutate state. Round 2's "denied spawn is the
+/// FIRST command in source order" check conflated SOURCE order with
+/// EXECUTION order: `agent_bridle::inspect_shell` is a non-executing,
+/// source-order inventory, and source order is not a safety witness for
+/// several shapes it still has to represent faithfully —
+/// a command substitution's inner command expands (and can run arbitrary
+/// effects, e.g. `/bin/echo "$(touch marker)"`) before the outer command it
+/// decorates ever spawns; a pipeline's stages are not sequenced the way a
+/// flattened list suggests (e.g. `/bin/echo denied | /bin/true` inventories
+/// `/bin/echo` first even though both stages start together); and a
+/// for-loop's single flattened body entry can run once per iteration, not
+/// once. The SIMPLEST rule this inspection can honestly support is: exactly
+/// one inventoried command, no `constructs` (command/backquote substitution,
+/// arithmetic expansion — the dynamic-content axis), no `warnings` at all
+/// (`inspect_shell` emits one for every `&&`/`||`/`;`-list member beyond the
+/// first, every pipeline, `!`, `time`, `&` background, and every for-loop —
+/// an empty list is itself proof none of those shapes are present), and no
+/// redirect that can mutate state (see [`redirect_has_effect`]) — regardless
+/// of whether THIS repo's admission check happens to make every one of
+/// those shapes safe today anyway (it does, for the plain compound case:
+/// see `approved_exec_replay_never_reruns_an_earlier_permitted_command`).
+/// Anything else returns `false` and the model is told to re-issue the
+/// command itself — the existing, always-safe fallback. Fails closed on an
+/// inspection error.
+fn exec_denial_is_replay_safe(target: &str, cmd: &str) -> bool {
+    let Ok(inspection) = agent_bridle::inspect_shell(cmd) else {
+        return false;
+    };
+    if !inspection.warnings.is_empty() || !inspection.constructs.is_empty() {
+        return false;
+    }
+    let [only] = inspection.commands.as_slice() else {
+        return false;
+    };
+    only.program.as_deref() == Some(target) && !only.redirects.iter().any(redirect_has_effect)
+}
+
+/// A redirection that can mutate the filesystem independent of whether the
+/// command it decorates ever actually spawns — unlike a read, an fd
+/// duplication, or a here-doc/here-string, none of which touch anything
+/// outside the command's own input. This crate does not control WHEN a
+/// shell engine opens a redirect relative to its exec-authority check, so
+/// [`exec_denial_is_replay_safe`] treats a write-shaped redirect as
+/// disqualifying on principle rather than assuming today's engine order.
+fn redirect_has_effect(redirect: &agent_bridle::InspectedRedirect) -> bool {
+    matches!(
+        redirect.operation,
+        agent_bridle::RedirectOperation::Write
+            | agent_bridle::RedirectOperation::Append
+            | agent_bridle::RedirectOperation::ReadWrite
+            | agent_bridle::RedirectOperation::Clobber
+            | agent_bridle::RedirectOperation::OutputAndError
+            | agent_bridle::RedirectOperation::AppendOutputAndError
+    )
 }
 
 /// #721: the model-facing `request_permissions` tool — the capability-GRANT
@@ -1999,13 +2035,15 @@ fn execute_request_permissions(
     // slot (already taken by the caller) but gets ordinary access-grant
     // wording that says plainly no automatic replay will happen.
     //
-    // #2681 round 2 (P1): for `Exec`, coverage alone is not consent to
-    // replay — `exec_denial_is_leading_spawn` additionally requires the
-    // denied spawn to be the FIRST command in `pending.cmd`, so replay can
-    // never repeat an earlier command's effect (see its doc comment).
+    // #2681 round 3 (P1): for `Exec`, coverage alone is not consent to
+    // replay — `exec_denial_is_replay_safe` additionally requires
+    // `pending.cmd` to be a single simple command with no dynamic content
+    // or mutating redirect, so replay can never repeat an earlier
+    // construct's, pipeline sibling's, or loop iteration's effect (see its
+    // doc comment).
     let eligible = bound.filter(|pending| {
         single_grant_covers_missing(kind, target, &pending.missing)
-            && (kind != DenialKind::Exec || exec_denial_is_leading_spawn(target, &pending.cmd))
+            && (kind != DenialKind::Exec || exec_denial_is_replay_safe(target, &pending.cmd))
     });
 
     let request = PermissionRequest {
