@@ -1298,6 +1298,21 @@ pub(super) async fn exec_confined_command_with_broker(
                         if let PermissionDecision::Allow(widened) =
                             gate.ask_with_caveats(caveats, &requests)
                         {
+                            // #2691: Allow is not evidence that every requested axis/target
+                            // was granted. Never mint a pending grant from an insufficient reply.
+                            use crate::caveats::CaveatsExt as _;
+                            if !requests.iter().all(|request| match request.kind {
+                                DenialKind::Exec => widened.permits_exec(&request.target),
+                                DenialKind::Net => widened.permits_net(&request.target),
+                                _ => false,
+                            }) {
+                                return with_denial_context(
+                                    ("capability denied: returned authority does not cover the requested targets".into(), ExecOutcome::Denied),
+                                    workspace,
+                                    cwd,
+                                    Some(caveats),
+                                );
+                            }
                             // #2689/#2691 round 3: this denial fired
                             // mid-dispatch, so an earlier stage of `cmd` may
                             // already have run a real effect, or may be the

@@ -1461,8 +1461,10 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
 /// A command broker that changes nothing — stands in for `NativeGitBroker`
 /// so this test exercises the real `CommandBroker`-bearing dispatch path
 /// without needing a real repository or signing key.
+#[cfg(not(windows))]
 struct NoopBroker;
 
+#[cfg(not(windows))]
 impl agent_bridle_tool_shell::CommandBroker for NoopBroker {
     fn prepare(
         &self,
@@ -1930,6 +1932,26 @@ fn exec_denial_is_replay_safe_rejects_every_unsound_shape() {
 
     // Sound: a single simple command naming exactly the denied target.
     assert!(exec_denial_is_replay_safe("/bin/echo", "/bin/echo hello"));
+    // #2689: Brush reports the resolved executable for a bare-name command.
+    #[cfg(unix)]
+    {
+        assert!(exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "./git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "/other/git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "git commit -m first; git commit -m second"
+        ));
+    }
     // A harmless read redirect/fd duplication is not a mutating effect.
     assert!(exec_denial_is_replay_safe(
         "/bin/echo",
@@ -2112,6 +2134,8 @@ async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
 /// into this dispatch's authority before it runs. THIRD call (the SAME
 /// command again): the grant was single-use and is now spent, so the
 /// command is denied again and the gate is consulted afresh.
+/// #2691 insufficient-Allow control: an unrelated returned exec grant must
+/// never enter the pending queue or authorize the later reissue.
 #[cfg(unix)]
 #[tokio::test]
 async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() {
@@ -2126,10 +2150,14 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
         base: Caveats,
         queue: std::collections::BTreeSet<(DenialKind, String)>,
         asks: usize,
+        sufficient: bool,
     }
     impl super::PermissionGate for QueueBackedGate {
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.asks += 1;
+            if !self.sufficient {
+                return super::PermissionDecision::Allow(self.base.clone());
+            }
             let grants: Vec<_> = requests
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
@@ -2160,114 +2188,141 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
         }
     }
 
-    let ws = tempfile::TempDir::new().unwrap();
-    let marker = ws.path().join("f");
-    let denied = Caveats {
-        exec: Scope::only(["/bin/echo".to_string()]),
-        #[cfg(target_os = "macos")]
-        net: Scope::All,
-        ..caveats_rw(ws.path())
-    };
-    let mut gate = QueueBackedGate {
-        base: denied.clone(),
-        queue: std::collections::BTreeSet::new(),
-        asks: 0,
-    };
-    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
-    let cmd = format!("/bin/echo x >> {} && /bin/true", marker.display());
+    // #2691: an unrelated Allow must not be converted into queued exec authority.
+    for sufficient in [false, true] {
+        let ws = tempfile::TempDir::new().unwrap();
+        let marker = ws.path().join("f");
+        let denied = Caveats {
+            exec: Scope::only(["/bin/echo".to_string()]),
+            #[cfg(target_os = "macos")]
+            net: Scope::All,
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = QueueBackedGate {
+            base: denied.clone(),
+            queue: std::collections::BTreeSet::new(),
+            asks: 0,
+            sufficient,
+        };
+        let mut display =
+            crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+        let cmd = format!("/bin/echo x >> {} && /bin/true", marker.display());
 
-    // ── CALL 1: denied on /bin/true — not replay-safe, grant queued ────────
-    let first = shell::exec_confined_command_with_broker(
-        &cmd,
-        &ws.path().to_string_lossy(),
-        &ws.path().to_string_lossy(),
-        false,
-        20,
-        &denied,
-        &[],
-        None,
-        &mut Some(&mut gate as &mut dyn super::PermissionGate),
-        false,
-        None,
-        None,
-        &mut display,
-        None,
-        &mut None,
-    )
-    .await;
-    assert_eq!(gate.asks, 1, "{}", first.0);
-    assert!(
-        !marker.exists(),
-        "setup: the compound command must not auto-replay on grant: {}",
-        first.0
-    );
-    assert!(first.0.contains("granted"), "{}", first.0);
+        // ── CALL 1: denied on /bin/true — not replay-safe, grant queued ────────
+        let first = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            &mut None,
+        )
+        .await;
+        assert_eq!(gate.asks, 1, "{}", first.0);
+        assert!(
+            !marker.exists(),
+            "setup: the compound command must not auto-replay on grant: {}",
+            first.0
+        );
+        if sufficient {
+            assert!(first.0.contains("granted"), "{}", first.0);
+        } else {
+            assert!(
+                gate.queue.is_empty(),
+                "insufficient Allow queued authority: {}",
+                first.0
+            );
+            assert!(!first.0.contains("granted"), "{}", first.0);
+        }
 
-    // ── CALL 2: the model's reissue of the IDENTICAL command — must
-    //    succeed in ONE dispatch, with NO new gate consultation ───────────
-    let second = shell::exec_confined_command_with_broker(
-        &cmd,
-        &ws.path().to_string_lossy(),
-        &ws.path().to_string_lossy(),
-        false,
-        20,
-        &denied,
-        &[],
-        None,
-        &mut Some(&mut gate as &mut dyn super::PermissionGate),
-        false,
-        None,
-        None,
-        &mut display,
-        None,
-        &mut None,
-    )
-    .await;
-    assert_eq!(
-        gate.asks, 1,
-        "the reissue must succeed from the queued grant alone, with no \
+        // ── CALL 2: the model's reissue of the IDENTICAL command — must
+        //    succeed in ONE dispatch, with NO new gate consultation ───────────
+        let second = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            &mut None,
+        )
+        .await;
+        if !sufficient {
+            assert_eq!(gate.asks, 2, "insufficient Allow must prompt afresh");
+            assert!(
+                gate.queue.is_empty(),
+                "insufficient Allow queued authority on retry"
+            );
+            assert_eq!(second.1, ExecOutcome::Denied, "{}", second.0);
+            assert!(
+                !marker.exists(),
+                "insufficient Allow authorized later execution"
+            );
+            continue;
+        }
+        assert_eq!(
+            gate.asks, 1,
+            "the reissue must succeed from the queued grant alone, with no \
          second prompt: {}",
-        second.0
-    );
-    assert!(
-        marker.exists(),
-        "the reissue must actually run (both stages), not just report \
+            second.0
+        );
+        assert!(
+            marker.exists(),
+            "the reissue must actually run (both stages), not just report \
          granted again: {}",
-        second.0
-    );
-    assert_ne!(second.1, ExecOutcome::Denied, "{}", second.0);
+            second.0
+        );
+        assert_ne!(second.1, ExecOutcome::Denied, "{}", second.0);
 
-    // ── CALL 3: the SAME command a third time — the grant is spent ────────
-    std::fs::remove_file(&marker).unwrap();
-    let third = shell::exec_confined_command_with_broker(
-        &cmd,
-        &ws.path().to_string_lossy(),
-        &ws.path().to_string_lossy(),
-        false,
-        20,
-        &denied,
-        &[],
-        None,
-        &mut Some(&mut gate as &mut dyn super::PermissionGate),
-        false,
-        None,
-        None,
-        &mut display,
-        None,
-        &mut None,
-    )
-    .await;
-    assert_eq!(
-        gate.asks, 2,
-        "a third identical call must consult the gate afresh — one-shot \
+        // ── CALL 3: the SAME command a third time — the grant is spent ────────
+        std::fs::remove_file(&marker).unwrap();
+        let third = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            &mut None,
+        )
+        .await;
+        assert_eq!(
+            gate.asks, 2,
+            "a third identical call must consult the gate afresh — one-shot \
          authority must not become sticky: {}",
-        third.0
-    );
-    assert!(
-        !marker.exists(),
-        "the spent grant must not auto-replay a third time either: {}",
-        third.0
-    );
+            third.0
+        );
+        assert!(
+            !marker.exists(),
+            "the spent grant must not auto-replay a third time either: {}",
+            third.0
+        );
+    }
 }
 
 /// #2689/#2681 round 3 (P1 measured red 2): the inverse shape — the denied

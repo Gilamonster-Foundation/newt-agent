@@ -1942,7 +1942,21 @@ fn exec_denial_is_replay_safe(target: &str, cmd: &str) -> bool {
     let [only] = inspection.commands.as_slice() else {
         return false;
     };
-    only.program.as_deref() == Some(target) && !only.redirects.iter().any(redirect_has_effect)
+    let Some(program) = only.program.as_deref() else {
+        return false;
+    };
+    // Brush denies the resolved path, even when source names a bare executable.
+    // This only establishes that the single command did not launch; it grants
+    // nothing. The retry retains the exact path authority returned by the gate
+    // and is checked again before spawning, even if PATH resolves differently.
+    let names_target = program == target
+        || (!program.contains(['/', '\\'])
+            && std::path::Path::new(target).is_absolute()
+            && std::path::Path::new(target)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(program));
+    names_target && !only.redirects.iter().any(redirect_has_effect)
 }
 
 /// #2689/#2691 round 3 (P1): `exec_denial_is_replay_safe` compares TEXT only

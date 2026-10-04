@@ -178,7 +178,13 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
         "cd newt-core && git branch --show-current && git commit -m \"$(cat <<'EOF'\n{body}\nEOF\n)\" 2>&1 | tail -5"
     );
     let before = git(&repo, &["rev-parse", "HEAD"]).stdout;
-    let output = execute(&repo, &tool, &authority, &command).await;
+    // This separate fixture intentionally executes cat and tail as well as git.
+    // Grant those exact programs here; the denied-commit fixture stays exec:none.
+    let heredoc_authority = newt_core::Caveats {
+        exec: newt_core::Scope::only(["git".into(), "cat".into(), "tail".into()]),
+        ..authority.clone()
+    };
+    let output = execute(&repo, &tool, &heredoc_authority, &command).await;
     assert_succeeded(&output);
     assert_ne!(
         git(&repo, &["rev-parse", "HEAD"]).stdout,
@@ -265,8 +271,19 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
         let hook = hooks.join("pre-commit");
         std::fs::write(&hook, "#!/bin/sh\nset -eu\nif (printf leaked >&198) 2>/dev/null; then echo 'private broker fd leaked' >&2; exit 70; fi\nhooks=$(git config --get core.hooksPath)\nif rm \"$hooks/reference-transaction\" 2>/dev/null; then echo 'protected helper was writable' >&2; exit 71; fi\ntest -L \"$hooks/reference-transaction\"\nprintf 'protected; no delegated fd\\n' > .git/hook-audit\n").unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Repository hooks are executable code too; this hook-preservation
+        // fixture grants each hook, its interpreter, and its external commands.
+        let hook_authority = newt_core::Caveats {
+            exec: newt_core::Scope::only([
+                "git".into(),
+                "sh".into(),
+                "rm".into(),
+                hook.to_string_lossy().into_owned(),
+            ]),
+            ..authority.clone()
+        };
         let command = "git -c core.hooksPath=.git/operator-hooks commit --allow-empty --author='Requested Author <requested@example.invalid>' -m 'hook and author preserved'";
-        let output = execute(&repo, &tool, &authority, command).await;
+        let output = execute(&repo, &tool, &hook_authority, command).await;
         assert_succeeded(&output);
         assert_eq!(
             std::fs::read_to_string(repo.join(".git/hook-audit")).unwrap_or_default(),
@@ -396,13 +413,25 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
             "#!/bin/sh\nprintf 'index hook ran\\n' > .git/index-hook-audit\n",
         )
         .unwrap();
-        std::fs::set_permissions(index_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&index_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hook_authority = newt_core::Caveats {
+            exec: newt_core::Scope::only([
+                "git".into(),
+                "sh".into(),
+                "rm".into(),
+                repo.join(".git/operator-hooks/pre-commit")
+                    .to_string_lossy()
+                    .into_owned(),
+                index_hook.to_string_lossy().into_owned(),
+            ]),
+            ..authority.clone()
+        };
         std::fs::remove_file(repo.join(".git/hook-audit")).unwrap();
         std::fs::write(repo.join("README.md"), "changed by native commit -a\n").unwrap();
         let output = execute(
             &subdir,
             &tool,
-            &authority,
+            &hook_authority,
             "git -c core.hooksPath=.git/operator-hooks commit -am 'relative hooks preserved'",
         )
         .await;
@@ -485,47 +514,11 @@ impl newt_core::PermissionGate for CountingAllowGate {
 /// a durable exec grant that would let a second, separately-unreviewed
 /// commit through silently.
 ///
-/// **Not measured — this scenario is currently BLOCKED, not green.** Round 2
-/// could not reach this function at all (agent-bridle #418: the trusted
-/// worker's own image was never covered by `fs_read`, so the Brush worker
-/// failed `EACCES` at startup for any real-resource caveats set this narrow).
-/// #418's workaround (restricting `exec` so the worker's own canonical path
-/// is added to the admitted closure — this round's `authority` fixture change,
-/// and the matching `native_git_broker.rs` `RepositoryProbe` fix for the
-/// `AgentInfluenced` Kernel-floor/Landlock-Interceptor-ceiling conflict it
-/// then exposes) gets `composed_commit_is_native_attributed_and_signed`'s own
-/// scenarios running real and green — confirmed: that function's native,
-/// attributed, signed commit now actually publishes under real Brush.
-///
-/// This function's OWN scenario — a `git commit` denied on `exec: none()`,
-/// with `NativeGitBroker` already attached — still fails, with a DIFFERENT
-/// and NOT PREVIOUSLY DIAGNOSED symptom: isolated directly (bypassing every
-/// other scenario in this file), the very first attempt returns
-/// `error: denied: brush worker refused request: denied: brush run
-/// terminated: i/o error: denied: denied: exec of "/usr/bin/git" is not
-/// within the granted authority` — the RAW denial text, never newt-core's
-/// structured `{denied: true, denials: [...]}` envelope that
-/// `exec_denial_requests`/the #2689 gate-consult retry depend on. Ruled out
-/// by direct measurement: a bare `CommandBroker` (`NoopBroker`) attached to
-/// an identically-denied exec under real Brush DOES produce the clean
-/// structured envelope and DOES retry correctly (see
-/// `a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_
-/// broker`, run once with `NEWT_SHELL_ENGINE=brush` to confirm) — so this is
-/// not "Brush can't report a broker-bearing exec denial" in general.
-///
-/// Best-supported (not confirmed) hypothesis: `NativeGitBroker::prepare`'s own
-/// `context.check_exec(&command.program...)` call (`native_git_broker.rs`)
-/// propagates its `Err` through Brush's broker-invocation path as an opaque,
-/// "terminating" shell error rather than the structured denial Brush's
-/// ordinary (non-broker) interceptor produces for the exact same caveats —
-/// so the FIRST (intentionally denied) attempt never reaches newt-core's
-/// gate at all. A candidate fix (returning `Ok(None)` there to let Brush's
-/// own interceptor deny it cleanly, mirroring the `Ok(None)` a few lines
-/// above for "not the admitted Git image") is a plausible next step, but
-/// touches this broker's core admission decision and was NOT attempted here
-/// — it needs its own review, separate from this fix-first round. Filed as a
-/// new, follow-up blocker; not agent-bridle #418, and not in scope for P1/P2
-/// of this PR.
+/// #2697 supplies the per-axis probe floor without widening exec. An unauthorized
+/// broker preparation leaves the command for Brush's final authorization check,
+/// which records the typed denial needed by this gate. The first control refuses
+/// that request and proves no publication; Allow then retries with the broker,
+/// and the later call asks again rather than inheriting one-shot authority.
 async fn broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution(
     repo: &std::path::Path,
     tool: &newt_git::LocalGitTool,
@@ -537,6 +530,26 @@ async fn broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution
         fs_write: newt_core::Scope::only([repo.to_string_lossy().into_owned()]),
         ..newt_core::Caveats::top()
     };
+    let before_denial = git(repo, &["rev-parse", "HEAD"]).stdout;
+    let mut deny_gate = DenyingParentGate::default();
+    let denied = execute_gated(
+        repo,
+        tool,
+        &narrow_exec,
+        "run_command",
+        &serde_json::json!({"command": "git commit --allow-empty -m 'denied fixture commit'"}),
+        &mut deny_gate,
+    )
+    .await;
+    assert_eq!(
+        deny_gate.requests.len(),
+        1,
+        "first denial must reach the gate: {denied}"
+    );
+    assert_eq!(deny_gate.requests[0].0, newt_core::DenialKind::Exec);
+    assert_eq!(git(repo, &["rev-parse", "HEAD"]).stdout, before_denial);
+    assert_eq!(tool.drain_commit_success(), 0);
+
     let mut gate = CountingAllowGate::default();
 
     let before = git(repo, &["rev-parse", "HEAD"]).stdout;
@@ -598,6 +611,21 @@ async fn broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution
     );
     assert_ne!(git(repo, &["rev-parse", "HEAD"]).stdout, before, "{output}");
     assert_eq!(tool.drain_commit_success(), 1);
+    let message = String::from_utf8(git(repo, &["log", "-1", "--format=%B"]).stdout).unwrap();
+    assert!(
+        message.contains("second gated commit") && message.contains("fixture-model"),
+        "{message}"
+    );
+    assert!(message.contains("Co-authored-by:"), "{message}");
+    git(
+        repo,
+        &[
+            "-c",
+            &format!("gpg.ssh.allowedSignersFile={}", allowed_signers.display()),
+            "verify-commit",
+            "HEAD",
+        ],
+    );
     println!("test broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution ... ok");
 }
 
