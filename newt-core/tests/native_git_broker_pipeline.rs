@@ -109,6 +109,8 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    #[cfg(target_os = "linux")]
+    native::required_kernel_gate_regression();
     if !std::env::args().any(|arg| arg == "--ignored") {
         eprintln!(
             "test native_git_broker_pipeline ... ignored (real toolchain, Landlock, \
@@ -162,8 +164,8 @@ mod native {
             }
             governed_commit_carries_the_attribution_trailer().await;
             disabling_the_broker_refuses_the_commit_entirely().await;
+            println!("{MARKER}");
         });
-        println!("{MARKER}");
     }
 
     const FIXTURE_GIT: &str = "/usr/bin/git";
@@ -172,16 +174,37 @@ mod native {
     /// this binary needs the identical real-kernel-fence + fixture-git
     /// preconditions, and a silent `return` here would make a quietly-green
     /// local run indistinguishable from one that measured nothing.
+    fn kernel_gate(available: bool, required: bool) -> Result<bool, &'static str> {
+        if required && !available {
+            return Err("required native Git broker proof needs Landlock + /usr/bin/git");
+        }
+        Ok(available)
+    }
+
+    /// #2697: a required proof must reject missing prerequisites, not pass a skip.
+    pub fn required_kernel_gate_regression() {
+        assert_eq!(kernel_gate(true, false), Ok(true));
+        assert_eq!(kernel_gate(true, true), Ok(true));
+        assert_eq!(kernel_gate(false, false), Ok(false));
+        assert!(
+            kernel_gate(false, true).is_err(),
+            "required kernel proof must fail when unavailable"
+        );
+    }
+
     fn skip_without_real_kernel_fence() -> bool {
         let available = newt_core::confined_exec::kernel_fs_fence_available()
             && Path::new(FIXTURE_GIT).exists();
-        if !available {
+        let required = std::env::var_os("NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL").is_some();
+        let ready =
+            kernel_gate(available, required).expect("native Git broker proof prerequisites");
+        if !ready {
             eprintln!(
-                "skip: real-kernel-fence test requires Landlock + {FIXTURE_GIT}, neither of \
-                 which is available on this host"
+                "skip: real-kernel-fence test requires Landlock + {FIXTURE_GIT}, one or both of \
+                 which are unavailable on this host"
             );
         }
-        !available
+        !ready
     }
 
     fn hermetic_git_env(home: &Path) -> Vec<(&'static str, String)> {
@@ -303,7 +326,7 @@ mod native {
     }
 
     /// `native_commit_policy` keeps the trait's DEFAULT (`None`) — the
-    /// mutation: no policy means no broker, which `tools.rs`'s `run_command`
+    /// negative control: no policy means no broker, which `tools.rs`'s `run_command`
     /// arm refuses outright rather than falling back to an unmanaged commit
     /// (`run_command_creates_shell_git_commit(cmd) && commit_broker.is_none()`).
     struct NoBrokerGitTool;
@@ -387,12 +410,12 @@ mod native {
         );
     }
 
-    /// The mutation: with NO commit policy supplied at all (the broker is
+    /// Negative control: with NO commit policy supplied at all (the broker is
     /// never constructed — `NativeGitBroker::new` is called only when
     /// `git_tool.native_commit_policy()` is `Some`), the SAME commit command
     /// must be refused outright rather than landing unmanaged, so the
-    /// trailer assertion above genuinely depends on the broker running,
-    /// not on `git commit` alone always stamping it.
+    /// missing-policy admission is tested separately from broker mediation
+    /// on the admitted positive path.
     async fn disabling_the_broker_refuses_the_commit_entirely() {
         let root = tempfile::tempdir().unwrap();
         let (main, wt) = init_worktree(root.path());
