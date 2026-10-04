@@ -184,6 +184,21 @@ pub trait Sandbox: Send + Sync {
         )))
     }
 
+    /// Apply with a held regular worker image replacing its read/exec pathname
+    /// entries, together with any vendor-held read roots. Both bindings are
+    /// installed in one ruleset; unsupported backends refuse.
+    fn apply_with_worker(
+        &self,
+        _effective: &Caveats,
+        _program: &str,
+        _image: &std::fs::File,
+        _held: &[HeldReadRoot],
+    ) -> ToolResult<()> {
+        Err(crate::ToolError::denied(
+            "sandbox cannot bind worker rules to a held image",
+        ))
+    }
+
     /// The argv prefix that wraps a child so a *wrapper-based* L3 backend
     /// confines it (macOS `sandbox-exec`). The returned vector, prepended to a
     /// `(program, args…)`, is the argv that must actually be spawned.
@@ -1657,24 +1672,11 @@ pub(crate) mod landlock_impl {
         })
     }
 
-    impl Sandbox for LandlockSandbox {
-        fn kind(&self) -> SandboxKind {
-            SandboxKind::Landlock
-        }
-
-        fn exec_boundary(&self) -> crate::ExecBoundary {
-            self.exec_boundary
-        }
-
-        fn apply(&self, effective: &Caveats) -> ToolResult<()> {
-            self.apply_with_held_roots(effective, &[])
-        }
-
-        /// Each `held` root is anchored on its descriptor and its path form is
-        /// dropped from the read rules; `apply` passes none.
-        fn apply_with_held_roots(
+    impl LandlockSandbox {
+        fn apply_rules(
             &self,
             effective: &Caveats,
+            worker: Option<(&str, &std::fs::File)>,
             held: &[super::HeldReadRoot],
         ) -> ToolResult<()> {
             let write = AccessFs::from_write(fs_abi_floor(&self.policy));
@@ -1708,6 +1710,22 @@ pub(crate) mod landlock_impl {
             // devices — when confined.) Built via the shared routine so the
             // resolved-authority projection anchors on the identical set.
             let write_roots = self.write_roots(effective);
+            // Remove the worker name BEFORE exec-path canonicalization (a
+            // replacement symlink may resolve to a directory). Only its held
+            // descriptor supplies the read/exec exception below.
+            let mut path_caveats = effective.clone();
+            if let Some((program, image)) = worker {
+                if !image.metadata()?.is_file() {
+                    return Err(ToolError::denied(
+                        "worker read/exec rule requires a regular file",
+                    ));
+                }
+                for scope in [&mut path_caveats.fs_read, &mut path_caveats.exec] {
+                    if let Scope::Only(paths) = scope {
+                        paths.remove(program);
+                    }
+                }
+            }
             // Build the ruleset: fs axes first (V3 floor), then optionally the
             // net axis (V4+). BestEffort means handle_access silently skips
             // access types the kernel doesn't know — so on pre-6.7 kernels the
@@ -1739,7 +1757,7 @@ pub(crate) mod landlock_impl {
                 // routine so the resolved-authority projection anchors on the
                 // identical set (ADR 0011 D3: confined-exec keeps bin dirs OUT of
                 // the trampoline corpus).
-                let mut read_roots = self.read_roots(effective, confine_exec);
+                let mut read_roots = self.read_roots(&path_caveats, confine_exec);
                 // A held root is anchored on its descriptor below; its path
                 // form is dropped so nothing re-opens that root by name after
                 // the caller's check. (The resolved-authority projection still
@@ -1761,7 +1779,7 @@ pub(crate) mod landlock_impl {
                 // expose `/usr/lib`'s interpreters). A permitted binary still runs
                 // (its own execve + the loader + .so reads), but cannot DIRECTLY
                 // execve a different, un-granted program.
-                let exec_roots = self.exec_roots(effective);
+                let exec_roots = self.exec_roots(&path_caveats);
                 ruleset
                     .add_rules(path_beneath_rules(&exec_roots, AccessFs::Execute))
                     .map_err(landlock_denied)?
@@ -1769,6 +1787,18 @@ pub(crate) mod landlock_impl {
                 ruleset
             };
 
+            let ruleset = if let Some((_, image)) = worker {
+                let access = handled & (AccessFs::ReadFile | AccessFs::Execute);
+                if access.is_empty() {
+                    ruleset
+                } else {
+                    ruleset
+                        .add_rule(landlock::PathBeneath::new(image, access))
+                        .map_err(landlock_denied)?
+                }
+            } else {
+                ruleset
+            };
             let status = ruleset.restrict_self().map_err(landlock_denied)?;
 
             // Fail closed: if the kernel did not actually enforce the ruleset,
@@ -1789,6 +1819,38 @@ pub(crate) mod landlock_impl {
                 install_seccomp_egress_deny()?;
             }
             Ok(())
+        }
+    }
+
+    impl Sandbox for LandlockSandbox {
+        fn kind(&self) -> SandboxKind {
+            SandboxKind::Landlock
+        }
+
+        fn exec_boundary(&self) -> crate::ExecBoundary {
+            self.exec_boundary
+        }
+
+        fn apply(&self, effective: &Caveats) -> ToolResult<()> {
+            self.apply_rules(effective, None, &[])
+        }
+
+        fn apply_with_held_roots(
+            &self,
+            effective: &Caveats,
+            held: &[super::HeldReadRoot],
+        ) -> ToolResult<()> {
+            self.apply_rules(effective, None, held)
+        }
+
+        fn apply_with_worker(
+            &self,
+            effective: &Caveats,
+            program: &str,
+            image: &std::fs::File,
+            held: &[super::HeldReadRoot],
+        ) -> ToolResult<()> {
+            self.apply_rules(effective, Some((program, image)), held)
         }
 
         fn resolved_authority(
@@ -4967,7 +5029,10 @@ mod landlock_kernel_tests {
         })
         .join()
         .unwrap();
-        assert!(held_read.is_err(), "control: the renamed-aside object is ungranted");
+        assert!(
+            held_read.is_err(),
+            "control: the renamed-aside object is ungranted"
+        );
         assert_eq!(
             swapped_read.expect("control: the path rule admits the swapped-in directory"),
             b"swapped"

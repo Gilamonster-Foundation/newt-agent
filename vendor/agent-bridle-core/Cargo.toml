@@ -168,7 +168,7 @@ version = "0.8.0-rc.5"
 
 [target."cfg(unix)".dependencies.rustix]
 version = "1"
-features = ["process", "net"]
+features = ["process", "net", "fs"]
 
 [lints.rust]
 unsafe_code = "forbid"

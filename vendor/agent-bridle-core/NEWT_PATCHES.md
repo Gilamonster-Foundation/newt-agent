@@ -100,25 +100,56 @@ SandboxPolicy option or a complete SBPL ruleset. This patch does not promote
 that partial projection to a ruleset-level filesystem proof. Inherited terminal
 descriptors and `/dev/tty` remain separate surfaces.
 
-## agent-bridle#418 backport (2026-10-03)
+## Final agent-bridle#419 backport (2026-10-04)
 
-`trusted_worker_closure` (`src/spawn.rs`) previously added the worker's
-canonical path to the mechanism's `exec` allow-list only. A caller that
-restricts `fs_read` but leaves `exec` ambient (`Scope::All`) never merged the
-worker's path into `exec` either (`AdmittedFence::admit` folds a closure entry
-into an axis only when that axis is itself `Scope::Only(_)`), so the worker's
-own ELF stayed outside every read-allowed root and Landlock refused the
-worker's self-re-exec with `EACCES`.
-
-This repo's `RuntimeClosure::fs_read` and the `AdmittedFence::admit` merge onto
-that axis already existed here, added for `worker_read_resources` (the
-read-only helper-resource aliases above) — this patch only extends
-`trusted_worker_closure` to declare the worker's own canonical path through
-that same existing door, on both axes, mirroring the `exec` declaration. No
-change to `RuntimeClosure`, `admit`, or the admission projection was needed;
-the machinery this crate already carries for `worker_read_resources` covers
-the worker's own image for free. Upstream fix:
+Backports merged upstream commit
+`48ecd0e8d827a9d2c6057f381f531befa2b1497c`:
 <https://github.com/Gilamonster-Foundation/agent-bridle/pull/419>.
+This replaces the original #418/#419 pathname-read backport. Landlock binds a
+regular worker image once through the existing held-root resolver, installs
+read/exec rules on that descriptor, and executes the same inode. Binding or
+descriptor execution failures refuse; there is no pathname fallback. Seatbelt,
+MinimalRootfs and MicroVm retain exec-only worker closures; AppContainer and
+Noop retain empty worker closures. The image's contents are not immutable.
+
+File-by-file adaptations against that upstream commit:
+
+- `src/spawn/worker_image.rs`: identical upstream content.
+- `README.md`: identical #419 worker-binding paragraphs; retain the existing
+  vendor README elsewhere (its older Mach-network discussion is pre-existing
+  documentation drift outside this backport).
+- `src/admitted.rs`: no new changes needed. The existing vendor `fs_read`
+  set, builder, emptiness check and admission merge already implement the
+  upstream additions for helper resources. Preserve the vendor's narrower
+  builder visibility, Windows path-separator normalization, and existing
+  admission/projection integration.
+- `src/spawn.rs`: retain trusted worker-control/broker and validated helper
+  read resources, adding their roots after the bound-image closure. Preserve
+  held-root scope validation and wrapper refusal. Pass the held roots alongside
+  the worker descriptor at apply; ordinary spawns retain `apply_with_held_roots`.
+  All upstream startup, replacement, sibling/directory/symlink and non-Landlock
+  closure regressions are retained. One vendor-only regression replaces both
+  worker and held-root paths after admission and requires the original image
+  to read the original held directory.
+- `src/sandbox.rs`: the vendor's `HeldReadRoot` API remains. Extend upstream
+  `apply_with_worker`/`apply_rules` with a held-root slice so one Landlock
+  ruleset installs both bindings. Remove the worker label before pathname
+  derivation, and retain held-root pathname removal before read rules. Keep
+  the vendor's other existing policy adaptations, including private PTYs.
+- `Cargo.toml`: retain the crates.io-normalized manifest, protocol 0.7 pin and
+  existing dependencies/features; add only upstream's rustix `fs` feature.
+- `src/lib.rs`: rustfmt-only wrapping of existing exports; no API change.
+- `Cargo.lock`: align standalone `async-trait` to the workspace
+  `0.1.92` pin (and its `syn` dependency). The old standalone `0.1.89`
+  macro triggers Rust 1.99 `double_must_use` errors under clippy -D warnings.
+  The workspace lockfile is unchanged.
+
+The vendored crate is excluded from the workspace, and workspace CI does not
+run its unit/integration tests. Validate directly with `cargo test
+--manifest-path vendor/agent-bridle-core/Cargo.toml` in both feature modes;
+workspace dependent tests are additional evidence, not a substitute. Remove
+this section when the vendor is replaced by a release containing #419 and
+its remaining Newt-specific integrations.
 
 ## Backport of agent-bridle#407, pending rc.6
 
