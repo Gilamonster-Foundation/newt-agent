@@ -17,8 +17,12 @@ use std::time::Duration;
 /// resolve back to the shared Cargo target and retain its real web sibling.
 /// A hard link avoids a writable copy racing concurrent subprocess spawns
 /// (ETXTBSY); placing the directory beside the source keeps it on one filesystem.
+fn built_newt() -> std::path::PathBuf {
+    assert_cmd::cargo::cargo_bin("newt")
+}
+
 fn isolated_newt_binary() -> (tempfile::TempDir, std::path::PathBuf) {
-    let source = assert_cmd::cargo::cargo_bin("newt");
+    let source = built_newt();
     let dir = tempfile::tempdir_in(source.parent().unwrap()).unwrap();
     let path = dir.path().join("newt");
     std::fs::hard_link(source, &path).unwrap();
@@ -31,7 +35,7 @@ fn isolated_newt_binary() -> (tempfile::TempDir, std::path::PathBuf) {
 fn isolated_launcher_reuses_the_read_only_executable_inode() {
     use std::os::unix::fs::MetadataExt as _;
 
-    let source = assert_cmd::cargo::cargo_bin("newt");
+    let source = built_newt();
     let (_dir, isolated) = isolated_newt_binary();
     let original = std::fs::metadata(&source).unwrap();
     let installed = std::fs::metadata(&isolated).unwrap();
