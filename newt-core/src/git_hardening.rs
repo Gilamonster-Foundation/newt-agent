@@ -1073,10 +1073,24 @@ pub fn detached_commit_candidate(
 /// Used to fail-closed on a torn `HEAD` read (round 6, P2): a partial or
 /// in-flight write points at an object that does not exist, so this is the
 /// deterministic proof that the commit the confined child left is complete.
+///
+/// `git_text` only exists where the native ref-move machinery does (Linux/
+/// macOS); on any other platform there is no supported way to run the git
+/// query at all, so this FAILS CLOSED — it can never *prove* a commit object,
+/// and fail-closed means the caller treats the candidate as torn rather than
+/// publishing or surfacing it. That is the exact guarantee the review asked
+/// for (round 6, P2): the unsupported platform is refused, not bypassed. A
+/// pathname-`GIT_DIR` spawn is deliberately NOT restored as a workaround.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_real_commit_object(identity: &BoundGitIdentity, oid: &str) -> bool {
     git_text(identity, &["cat-file", "-t", oid])
         .ok()
         .is_some_and(|kind| kind.trim() == "commit")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_real_commit_object(_identity: &BoundGitIdentity, _oid: &str) -> bool {
+    false
 }
 
 /// Cancellation safety for the detach/dispatch/advance/reattach bracket
