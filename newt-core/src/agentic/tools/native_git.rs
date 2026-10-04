@@ -1703,9 +1703,8 @@ mod governed_push_tests {
     /// An unregistered, non-URL secret the fake helper prints on stderr.
     const CANARY: &str = "NEWT-2641-CANARY-4f9e1c";
 
-    /// Full authority except: net narrowed to github.com (F5 refuses
-    /// `Scope::All`) and fs_write narrowed away from the fixtures (F1 refuses
-    /// anything model-writable).
+    /// Full authority except: net narrowed to github.com and fs_write
+    /// narrowed away from the fixtures (F1 refuses anything model-writable).
     fn scoped_caveats() -> Caveats {
         Caveats {
             fs_write: Scope::only([NO_WRITE_ROOT.to_string()]),
@@ -2820,12 +2819,15 @@ mod governed_push_tests {
         git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
     }
 
-    /// SPEC-FINAL F5 through the REAL outer dispatch: under `Scope::All` net
-    /// a top-level `git push` gets the disclaimer and moves no ref — neither
-    /// the workspace's nor the destination's. The destination is a local
-    /// bare repository, so a push that escaped the broker would be visible.
+    /// Regression for #2700 through the real outer dispatch: `Scope::All`
+    /// does not permit a local-path remote through the governed push broker.
+    /// This repo is on `task`, not the default branch. Planning refuses the
+    /// unsupported remote URL scheme, and neither repository's refs move.
     #[test]
-    fn f5_a_push_under_scope_all_net_is_refused_through_real_dispatch() {
+    fn scope_all_push_to_a_local_path_is_refused_through_real_dispatch() {
+        if !fence() {
+            return;
+        }
         let _env = BrokerEnv::new();
         let repo = repo_on_feature_branch();
         let dest = tempdir();
@@ -2849,11 +2851,20 @@ mod governed_push_tests {
             ),
             ..scoped_caveats()
         };
+        let error = plan_push_test(
+            "git push origin task:task",
+            repo.path(),
+            &caveats,
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(error.contains("unsupported remote URL scheme"), "{error}");
         let (result, _terminal) =
             dispatch_run_command(repo.path(), "git push origin task:task", &caveats);
-        assert!(result.contains("disclaimed"), "{result}");
+        // No ref escaped the broker into either repository.
         assert_eq!(refs(repo.path()), ws_before);
         assert_eq!(refs(dest.path()), dest_before);
+        assert!(result.contains("failed(refused_by_harness)"), "{result}");
     }
 
     /// F6 canary, PR side, through the REAL outer dispatch: gh prints an
@@ -3071,5 +3082,100 @@ mod governed_push_tests {
             !fd1.contains("chmod") && !fd1.contains("sudoers"),
             "repository bytes reached the operator sink: {fd1}"
         );
+    }
+
+    /// Regression for #2700: an All grant must complete the staging broker's
+    /// push, not merely pass preflight. Reuse the loopback receive-pack fixture
+    /// to observe the exact destination, commit and ref without publishing.
+    #[test]
+    fn scope_all_push_succeeds_at_the_approved_destination() {
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let caveats = with_net(Scope::All);
+        let approved = git(repo.path(), &["rev-parse", "task"]);
+        let mut plan = plan_push_test("git push", repo.path(), &caveats, &mut None).unwrap();
+        assert_eq!(plan.url, "https://github.com/o/r.git");
+        // Same transport substitution as plan_for_endpoint: only the dial URL
+        // changes; planning and the confined staging/push path are real.
+        let (port, endpoint) = receive_pack_endpoint(false);
+        plan.url = format!("http://127.0.0.1:{port}/o/r.git");
+        let outcome = run_push_test(&plan, &caveats);
+        let seen = stop(port, endpoint);
+        assert_eq!(
+            seen.update.as_deref(),
+            Some(format!("{} {approved} refs/heads/task", "0".repeat(40)).as_str()),
+            "{seen:?} / {outcome:?}"
+        );
+        assert!(
+            seen.requests
+                .iter()
+                .any(|r| r.starts_with("POST /o/r.git/git-receive-pack ")),
+            "{seen:?}"
+        );
+        assert_eq!(
+            outcome.unwrap().to_string(),
+            format!("pushed {approved} → github.com/o/r:task")
+        );
+    }
+
+    /// Regression for #2700: All must permit a successful PR-create through
+    /// real dispatch. A fake gh records the actual destination and branch
+    /// arguments; no live GitHub operation is performed.
+    #[test]
+    fn scope_all_pr_create_succeeds_at_the_approved_destination() {
+        if !fence() {
+            return;
+        }
+        let env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let argv = env.home.path().join("pr-argv");
+        std::fs::write(
+            env.gh(),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n\
+                 echo 'https://github.com/o/r/pull/7'\n",
+                argv.display()
+            ),
+        )
+        .unwrap();
+        let (result, _) = dispatch_run_command(
+            repo.path(),
+            "gh pr create --title t --body b",
+            &with_net(Scope::All),
+        );
+        assert!(
+            result.contains("pr_created https://github.com/o/r/pull/7"),
+            "{result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(argv).unwrap(),
+            "pr\ncreate\n--repo\ngithub.com/o/r\n--base\nmain\n--head\ntask\n--title\nt\n--body\nb\n"
+        );
+    }
+
+    /// Negative control for #2700: removing the All preflight refusal must
+    /// not let a restricted grant publish to an ungranted destination.
+    #[test]
+    fn restricted_net_still_refuses_push_and_pr_create() {
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let caveats = with_net(Scope::only(["other.example".to_string()]));
+        let push = plan_push_test("git push", repo.path(), &caveats, &mut None).unwrap_err();
+        let pr = plan_pr_create_test(
+            "gh pr create --title t --body b",
+            repo.path(),
+            &caveats,
+            &mut None,
+        )
+        .unwrap_err();
+        for error in [push, pr] {
+            assert_eq!(
+                error,
+                "refused: no network authority for 'github.com' and no operator to ask"
+            );
+        }
     }
 }
