@@ -447,6 +447,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+      # rust-toolchain.toml is authoritative for dtolnay/rust-toolchain@stable;
+      # extra `targets:` in the step's `with:` block may be ignored when a pin
+      # file is present. Make the musl target install explicit and unconditional.
+      - run: rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       # Regression guard for the Alpine/static build. The libc crate exposes
       # some wrappers for glibc only (`close_range` broke newt-core once), and
