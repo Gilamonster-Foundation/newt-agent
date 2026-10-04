@@ -815,6 +815,7 @@ pub(super) fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, 
 /// and render the envelope. Shared by the `run_command` and `lifecycle` (#891)
 /// arms so both honor **identical** exec caveats; the central presenter owns
 /// the tool-call and completed-result block.
+#[cfg(all(test, any(not(windows), feature = "windows-appcontainer")))]
 pub(super) async fn dispatch_bridled_shell(
     args: serde_json::Value,
     caveats: &crate::caveats::Caveats,
@@ -1035,6 +1036,7 @@ pub(super) async fn exec_confined_command(
         live_tool_output,
         presentation,
         None,
+        None,
         &mut None,
     )
     .await
@@ -1059,6 +1061,7 @@ pub(super) async fn exec_confined_command_with_broker(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    execution_lease: Option<agent_bridle_tool_shell::ExecutionLease>,
     // #2636 finding 1 / #2681: typed signal for a structured pre-exec denial
     // — set to the missing authority set whenever a STRUCTURED denial (a
     // missing declared FS request, or an exec/net denial the confined shell
@@ -1094,8 +1097,10 @@ pub(super) async fn exec_confined_command_with_broker(
     // command's leading token; else it falls through to the confined shell,
     // which enforces the already-clamped `caveats`. `None` keeps the bypass
     // bit-for-bit.
-    let host_bypass =
-        command_broker.is_none() && ocap_disabled() && exec_floor_permits(exec_floor, cmd);
+    let host_bypass = command_broker.is_none()
+        && execution_lease.is_none()
+        && ocap_disabled()
+        && exec_floor_permits(exec_floor, cmd);
 
     // #1176: shadow-OCAP — record the authority a leash WOULD have gated on
     // whenever this command runs UNCONFINED: the yolo/disable-ocap host bypass
@@ -1201,7 +1206,7 @@ pub(super) async fn exec_confined_command_with_broker(
         caveats,
         live_tool_output.clone(),
         None,
-        None,
+        execution_lease.clone(),
         command_broker.clone(),
     )
     .await
@@ -1286,10 +1291,13 @@ pub(super) async fn exec_confined_command_with_broker(
                             {
                                 return (format!("error: {refusal}"), ExecOutcome::Unavailable);
                             }
-                            let retried = match dispatch_bridled_shell(
+                            let retried = match dispatch_bridled_shell_with_floor(
                                 dispatch_args,
                                 &widened,
                                 live_tool_output,
+                                None,
+                                execution_lease.clone(),
+                                None,
                             )
                             .await
                             {

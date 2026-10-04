@@ -44,7 +44,8 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Filesystem grants for the session workspace's **own** git metadata (F32,
 /// #2537): the extra read/write roots that let the model commit and move the
@@ -479,6 +480,10 @@ impl BoundGitIdentity {
 /// itself gated the same way.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn hardened_git_common(identity: &BoundGitIdentity, args: &[&str]) -> io::Result<Command> {
+    // Residual: these read queries reacquire common_dir by pathname; they do
+    // not read through the held object-database descriptor. Identity checks do
+    // not close that check-to-use window. Native ref/HEAD writes are separately
+    // descriptor-bound. See docs/security/ocap-deviations.md.
     let mut cmd = hardened_git(&identity.common_dir, args)?;
     cmd.env("GIT_DIR", &identity.common_dir);
     Ok(cmd)
@@ -490,7 +495,7 @@ fn hardened_git_common(identity: &BoundGitIdentity, args: &[&str]) -> io::Result
 pub struct OwnBranchRefMove {
     pub branch: String,
     pub old_tip: String,
-    pub identity: BoundGitIdentity,
+    pub identity: Arc<BoundGitIdentity>,
 }
 
 /// #2682 round 2 (#2686 review): is this workspace eligible for the
@@ -524,7 +529,7 @@ pub fn own_branch_for_commit_ref_move(workspace: &Path) -> Option<OwnBranchRefMo
     Some(OwnBranchRefMove {
         branch,
         old_tip,
-        identity,
+        identity: Arc::new(identity),
     })
 }
 
@@ -1045,20 +1050,10 @@ pub fn detached_commit_candidate(
     let Some(candidate) = (oid != old_tip).then_some(oid) else {
         return Ok(None);
     };
-    // #2686 review round 6, P2: the confined child that wrote this HEAD is
-    // reaped asynchronously on the cancelled-dispatch path (agent-bridle kills
-    // the tree then reaps it on a detached thread), so a read of `HEAD`
-    // synchronously after cancellation can race the child's own write. We
-    // therefore treat any candidate we cannot *prove* is a complete commit
-    // object as a torn/in-flight write and fail closed rather than publish or
-    // surface it — a partial OID is exactly the "could not even check" case
-    // that must not masquerade as a recoverable commit. A genuine commit that
-    // the child finished before cancellation is a real object here and passes;
-    // this is the deterministic stand-in for a join on the child, since it
-    // proves the write is durable without depending on the child's process
-    // state. Fail-closed here is the production-path guarantee the review
-    // asked for: termination-before-recovery, proven by the object, not by
-    // timing.
+    // Object existence is only a candidate sanity check. It proves neither
+    // durability nor worker termination. Recovery ordering comes from retaining
+    // DetachedHeadGuard in the shell execution lease; escaped descendants remain
+    // an explicit residual in docs/security/ocap-deviations.md.
     if !is_real_commit_object(identity, &candidate) {
         return Err(format!(
             "refused: detached HEAD '{candidate}' is not a complete commit \
@@ -1069,18 +1064,10 @@ pub fn detached_commit_candidate(
     Ok(Some(candidate))
 }
 
-/// True iff `oid` resolves to a real commit object in `identity`'s object DB.
-/// Used to fail-closed on a torn `HEAD` read (round 6, P2): a partial or
-/// in-flight write points at an object that does not exist, so this is the
-/// deterministic proof that the commit the confined child left is complete.
-///
-/// `git_text` only exists where the native ref-move machinery does (Linux/
-/// macOS); on any other platform there is no supported way to run the git
-/// query at all, so this FAILS CLOSED — it can never *prove* a commit object,
-/// and fail-closed means the caller treats the candidate as torn rather than
-/// publishing or surfacing it. That is the exact guarantee the review asked
-/// for (round 6, P2): the unsupported platform is refused, not bypassed. A
-/// pathname-`GIT_DIR` spawn is deliberately NOT restored as a workaround.
+/// Whether Git resolves this candidate to a commit object. This is not a
+/// termination or durability proof, nor strict full-OID validation. The read
+/// query reacquires common_dir by pathname (see hardened_git_common).
+/// Unsupported platforms fail closed without restoring pathname publication.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_real_commit_object(identity: &BoundGitIdentity, oid: &str) -> bool {
     git_text(identity, &["cat-file", "-t", oid])
@@ -1093,51 +1080,42 @@ fn is_real_commit_object(_identity: &BoundGitIdentity, _oid: &str) -> bool {
     false
 }
 
-/// Cancellation safety for the detach/dispatch/advance/reattach bracket
-/// (#2686 review round 3, P2; round 4 tightened what `Drop` is allowed to
-/// do): if the future awaiting the confined dispatch is dropped between
-/// [`detach_own_head`] and the caller's own explicit advance+reattach,
-/// nothing would otherwise ever run them again — the worktree stays stuck
-/// detached, and any commit the child made before cancellation is
-/// unreachable by any ref AND unrecorded. Construct right after a
-/// successful detach; call [`Self::resolve`] once the normal path has run
-/// its own advance/reattach (whatever the outcome) so `Drop` does not
-/// repeat it.
+/// Owned recovery state for the detach/dispatch/advance/reattach bracket.
+/// Share this guard with the shell's execution lease before awaiting dispatch,
+/// so cancelling the waiter cannot recover HEAD before owner shutdown. The
+/// normal path calls resolve after its explicit publication/reattachment.
 ///
-/// `Drop` NEVER publishes (round 4, P2): a cancelled dispatch has no
-/// confirmed success, so advancing the branch ref here would be the exact
-/// cosmetic-success bug round 3 closed for the normal path, reintroduced on
-/// the cancelled one. It reattaches `HEAD` (idempotent, not a publish) and,
-/// if a commit really was left behind, records its oid durably — see the
-/// `impl Drop` for where.
-pub struct DetachedHeadGuard<'a> {
-    identity: &'a BoundGitIdentity,
+/// Drop never publishes a cancelled commit: it records any orphan candidate
+/// and reattaches HEAD. Lease shutdown does not prove all descendants exited;
+/// see the residual in docs/security/ocap-deviations.md.
+pub struct DetachedHeadGuard {
+    identity: Arc<BoundGitIdentity>,
     branch: String,
     old_tip: String,
-    resolved: bool,
+    resolved: AtomicBool,
 }
 
-impl<'a> DetachedHeadGuard<'a> {
+impl DetachedHeadGuard {
     #[must_use]
-    pub fn new(identity: &'a BoundGitIdentity, branch: String, old_tip: String) -> Self {
+    pub fn new(identity: Arc<BoundGitIdentity>, branch: String, old_tip: String) -> Self {
         Self {
             identity,
             branch,
             old_tip,
-            resolved: false,
+            resolved: AtomicBool::new(false),
         }
     }
 
     /// The normal path already ran its own advance/reattach (success or
     /// refusal alike) — skip `Drop`'s best-effort recovery.
-    pub fn resolve(&mut self) {
-        self.resolved = true;
+    pub fn resolve(&self) {
+        self.resolved.store(true, Ordering::Release);
     }
 }
 
-impl Drop for DetachedHeadGuard<'_> {
+impl Drop for DetachedHeadGuard {
     fn drop(&mut self) {
-        if self.resolved {
+        if self.resolved.load(Ordering::Acquire) {
             return;
         }
         // #2686 review round 4, P2: a cancelled dispatch has NO confirmed
@@ -1158,7 +1136,7 @@ impl Drop for DetachedHeadGuard<'_> {
         // report" from "could not even check" (`Err`) — the latter can no
         // longer be reported as if it were the former; `Drop` has no return
         // channel for it, so `eprintln!` is the only honest place left.
-        match detached_commit_candidate(self.identity, &self.old_tip) {
+        match detached_commit_candidate(&self.identity, &self.old_tip) {
             Ok(Some(oid)) => {
                 let event = crate::event_journal::JournalEvent::new(
                     crate::event_journal::EventKind::OrphanedCommit,
@@ -1187,7 +1165,7 @@ impl Drop for DetachedHeadGuard<'_> {
                 );
             }
         }
-        if let Err(error) = reattach_own_head(self.identity, &self.branch) {
+        if let Err(error) = reattach_own_head(&self.identity, &self.branch) {
             eprintln!(
                 "newt: could not restore branch '{}' as HEAD after a cancelled dispatch: \
                  {error}. The worktree may still be on a detached HEAD.",
@@ -2605,19 +2583,9 @@ mod own_gitdir_grant_tests {
         );
     }
 
-    /// #2686 review round 3, P2 (round 4 tightened it): cancellation between
-    /// detach and the normal advance+reattach must not strand the worktree
-    /// detached, lose a commit that was actually made, OR publish it — a
-    /// cancelled dispatch has no confirmed success, so `Drop` publishing the
-    /// candidate would be exactly the cosmetic-success bug round 3 closed for
-    /// the NORMAL path, reintroduced on this one. Simulated by dropping
-    /// [`DetachedHeadGuard`] without ever resolving it — exactly what
-    /// happens when the future awaiting the confined dispatch is cancelled
-    /// mid-await, since Rust drops live locals (this guard included) when an
-    /// async fn's state machine is torn down. The `tokio::select!`-driven
-    /// real-cancellation path is covered separately in
-    /// `detached_head_guard_survives_an_actual_cancelled_async_dispatch`,
-    /// per the review's "an actual cancelled dispatch, not a direct drop".
+    /// Recovery records an orphan and reattaches without publishing it. This
+    /// direct-drop unit test checks recovery contents; the real leased-dispatch
+    /// ordering regression lives in native_git_broker_pipeline/cancellation.rs.
     #[test]
     fn detached_head_guard_never_publishes_on_drop_but_reattaches_and_records_the_candidate() {
         // Isolates NEWT_EVENT_JOURNAL (never the developer's own
@@ -2651,7 +2619,7 @@ mod own_gitdir_grant_tests {
         detach_own_head(&identity, &old_tip).unwrap();
         let candidate_oid;
         {
-            let _guard = DetachedHeadGuard::new(&identity, branch.clone(), old_tip.clone());
+            let _guard = DetachedHeadGuard::new(identity.clone(), branch.clone(), old_tip.clone());
             std::fs::write(wt.join("f.txt"), "hi").unwrap();
             git(&wt, &["add", "f.txt"]);
             git(&wt, &["commit", "-q", "-m", "task work"]);
@@ -2677,15 +2645,11 @@ mod own_gitdir_grant_tests {
         );
     }
 
-    /// The review's own instruction: "Test the cancel path with an actual
-    /// cancelled dispatch, not a direct drop." Drives the SAME
-    /// `tokio::select!` shape `agentic::tools::dispatch::execute_tool_with_collaborators`
-    /// uses to cancel a tool call — racing a future holding
-    /// [`DetachedHeadGuard`] against an immediately-ready cancellation signal
-    /// — so the guard is dropped by a REAL tokio cancellation, not a bare
-    /// drop of a local the test controls directly.
+    /// An unleased guard still recovers if cancellation occurs before dispatch
+    /// transfers ownership to a worker. Live leased dispatch is covered by the
+    /// native_git_broker_pipeline cancellation handshake fixture.
     #[tokio::test]
-    async fn detached_head_guard_survives_an_actual_cancelled_async_dispatch() {
+    async fn detached_head_guard_recovers_when_an_unleased_future_is_cancelled() {
         let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
         let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path().join("events.jsonl");
@@ -2718,7 +2682,7 @@ mod own_gitdir_grant_tests {
         let candidate_oid = git_output(&wt, &["rev-parse", "HEAD"]);
 
         let dispatch = async {
-            let _guard = DetachedHeadGuard::new(&identity, branch.clone(), old_tip.clone());
+            let _guard = DetachedHeadGuard::new(identity.clone(), branch.clone(), old_tip.clone());
             // Never resolves on its own — only cancellation ends this future,
             // exactly like a confined child's real process that outlives the
             // model's patience. `select!` below drops it mid-await.
@@ -2750,19 +2714,8 @@ mod own_gitdir_grant_tests {
         assert!(journal.contains(&candidate_oid) && journal.contains("orphaned-commit"));
     }
 
-    /// #2686 review round 6, P2 — the concrete failure this finding demands:
-    /// the confined child that wrote a detached `HEAD` is reaped on a
-    /// detached thread on the cancelled path, so a `detached_commit_candidate`
-    /// read racing its write can see a TORN, in-progress `HEAD` (a truncated
-    /// OID — exactly what a `kill` mid-`write` leaves). Such a read must NOT
-    /// be reported as a recoverable candidate; it must FAIL CLOSED. This test
-    /// simulates the torn read by writing a truncated OID to `HEAD` (a real
-    /// 40-char commit object is left dangling so the read is byte-valid but
-    /// the object does not exist) and asserts [`detached_commit_candidate`]
-    /// returns `Err` rather than `Ok(Some(...))` for the bogus id — the
-    /// deterministic stand-in for "the child never terminated before the
-    /// guard read the candidate" that the review required of the production
-    /// path.
+    /// A nonexistent commit object is not a recoverable candidate. This is
+    /// an object-lookup check only, not a worker-termination regression.
     #[test]
     fn detached_commit_candidate_fails_closed_on_a_torn_orphaned_head() {
         let _settings = crate::test_guard::GlobalSettingsGuard::acquire();

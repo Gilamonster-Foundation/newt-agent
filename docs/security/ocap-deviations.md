@@ -1227,6 +1227,35 @@ resolved in a later release:
   descriptors (`agent_bridle::HeldReadRoot`), which closes the window;
   `verify_identities` stays as defence in depth.
 
+### Native commit cancellation: lease shutdown is not tree completion (#2686)
+
+**Open residual, operator-accepted 2026-10-04; completion contract tracked
+upstream as agent-bridle#TBD.** Cancelled native commit recovery now retains its
+owned identity and guard through the shell execution lease. It records an orphan
+candidate and reattaches HEAD after the owner's shutdown path; cancellation
+never authorizes publication of the branch ref.
+
+The shell supervisor kills the process group and direct child only:
+`vendor/agent-bridle-tool-shell/src/lib.rs:99` (`kill_child_tree`) explicitly
+excludes descendants that leave the group; `brush_shell.rs:582`
+(`OwnedWorker::terminate`) waits for the direct child, and `brush_shell.rs:596`
+(`OwnedWorker::drop`) discards a termination error. A descendant that leaves the
+process group can survive cancellation and write repository state after
+recovery. Lease release is not an acknowledgement that every descendant exited.
+
+The deterministic native Git regression blocks an actual broker hook callback,
+cancels its waiter, and proves HEAD stays detached until that shutdown path is
+released. It does not close the escaped-descendant residual. Closure requires an
+upstream completion contract covering all admitted descendants, explicit cleanup
+failure handling, and live-dispatch tests proving no writes after recovery.
+
+A separate remaining read limitation: `git_hardening::hardened_git_common`
+reacquires `common_dir` by pathname when spawning Git queries. These are not
+queries through the held object-database descriptor; identity verification does
+not close that check-to-use window. Native ref/HEAD writes remain descriptor-
+bound. Resolving a candidate as a commit object proves neither process shutdown
+nor durability, and is not strict full-OID validation.
+
 ## 5. How to use this (for the practical-caveat moments)
 
 When you must cut a corner to get function:

@@ -4370,15 +4370,10 @@ async fn execute_authorized_tool(
                     ))
                 })
                 .flatten();
-            // #2686 review round 3, P1: `ref_move.identity` is bound ONCE,
-            // here, before the confined child runs — every host-side
-            // operation below (detach, advance, reattach) binds to THESE
-            // held paths and never re-derives them through the workspace,
-            // which the child could have rewritten by the time any of them
-            // runs. P2: `detach_guard` recovers (publish-if-possible, then
-            // reattach) even if this async call is CANCELLED mid-dispatch —
-            // without it, a dropped future between detach and the explicit
-            // reattach below would strand the worktree detached forever.
+            // Bind identity before dispatch. Recovery shares the execution
+            // owner's lease, so dropping this async waiter does not reattach
+            // while that owner's shutdown path is still running. Recovery
+            // never publishes; escaped descendants remain a documented residual.
             let mut detach_guard = None;
             if let Some(move_info) = &ref_move {
                 if let Err(error) =
@@ -4389,10 +4384,12 @@ async fn execute_authorized_tool(
                         move_info.branch
                     ));
                 }
-                detach_guard = Some(crate::git_hardening::DetachedHeadGuard::new(
-                    &move_info.identity,
-                    move_info.branch.clone(),
-                    move_info.old_tip.clone(),
+                detach_guard = Some(std::sync::Arc::new(
+                    crate::git_hardening::DetachedHeadGuard::new(
+                        move_info.identity.clone(),
+                        move_info.branch.clone(),
+                        move_info.old_tip.clone(),
+                    ),
                 ));
             }
             let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
@@ -4411,6 +4408,9 @@ async fn execute_authorized_tool(
                 live_tool_output.clone(),
                 presentation,
                 commit_broker,
+                detach_guard
+                    .as_ref()
+                    .map(|guard| guard.clone() as agent_bridle_tool_shell::ExecutionLease),
                 &mut fs_pre_exec_missing,
             )
             .await;
