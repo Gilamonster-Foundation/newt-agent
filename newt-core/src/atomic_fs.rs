@@ -407,9 +407,9 @@ thread_local! {
     /// spawn/kill/wait, scheduler contention), the broken branch's age check
     /// would ALSO be satisfied on attempt 1, matching the correct
     /// implementation's attempt count for the wrong reason. Pinning `now` to
-    /// a value captured close to when the lock was written makes `age()`
-    /// small regardless of how long the surrounding test machinery actually
-    /// takes in real time, closing that gap.
+    /// the lock file's modification timestamp makes `age()` exactly zero
+    /// regardless of how long the surrounding test machinery actually takes
+    /// in real time, closing that gap.
     static PINNED_NOW: std::cell::Cell<Option<std::time::SystemTime>> =
         const { std::cell::Cell::new(None) };
 }
@@ -1317,7 +1317,7 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + crate::test_guard::HANG_GUARD;
         while !ready.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1326,32 +1326,16 @@ mod tests {
             let _ = child.wait();
             panic!("lock-holder child did not become ready");
         }
-        // Captured the moment the lock is known fresh (the child just
-        // published readiness, immediately after acquiring it) — pinned
-        // below so `age()` reflects THIS instant, not whatever real time
-        // `kill`/`wait`/the retry loop happen to take.
-        let lock_is_fresh_at = std::time::SystemTime::now();
+        // Readiness proves existence, not freshness: the parent may have been
+        // descheduled before observing it. Pin to the lock's own timestamp so
+        // its age is exactly zero regardless of any delay before this read.
+        let lock_is_fresh_at = std::fs::metadata(&lock).unwrap().modified().unwrap();
         child.kill().unwrap();
         let exit_status = child.wait().unwrap();
 
-        // No stopwatch: count reclaim attempts instead of timing the call.
-        // Owner-aware reclaim (a live PID check, no sleep) succeeds on the
-        // FIRST attempt; falling through to the legacy age path would need
-        // many — `reclaimable_lock` only returns `true` for an undecodable
-        // owner once the file is older than `LEGACY_LOCK_STALE` (30s), so
-        // `acquire_lock`'s retry loop (`LOCK_RETRIES` × `LOCK_RETRY_DELAY`)
-        // would sleep and recheck repeatedly rather than succeed at once. A
-        // wall-clock bound here is unreliable in EITHER direction: too tight
-        // and a loaded box's own scheduling delay (not a regression) trips it;
-        // too loose and, measured on this lane's box under load average 39,
-        // `LOCK_RETRY_DELAY`'s real sleeps stretched far enough that even a
-        // DELIBERATELY broken owner-aware path (mutated to also require the
-        // age threshold) happened to cross `LEGACY_LOCK_STALE` and reclaim
-        // anyway — see the measured red below. Attempt count alone is not
-        // enough either, if the broken implementation folds age INTO the
-        // owner branch: pin `now` to when the lock was known fresh, so
-        // `age()` cannot pick up a real delay between then and whenever
-        // `acquire_lock` actually runs below, no matter how long that is.
+        // Count reclaim attempts with the lock's age pinned to zero. A dead
+        // owner must be reclaimed on the first attempt; requiring the legacy
+        // age threshold must fail even if real scheduling delays exceed it.
         reset_reclaim_attempts_for_test();
         let _unpin = pin_now_for_test(lock_is_fresh_at);
         let _guard = acquire_lock(&lock).expect("dead owner's lock is reclaimable");
