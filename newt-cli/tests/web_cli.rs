@@ -15,10 +15,35 @@ use std::time::Duration;
 
 /// Give the real launcher its own installation directory. A symlink would
 /// resolve back to the shared Cargo target and retain its real web sibling.
-fn isolated_newt_binary(dir: &std::path::Path) -> std::path::PathBuf {
-    let path = dir.join("newt");
-    std::fs::copy(assert_cmd::cargo::cargo_bin("newt"), &path).unwrap();
-    path
+/// A hard link avoids a writable copy racing concurrent subprocess spawns
+/// (ETXTBSY); placing the directory beside the source keeps it on one filesystem.
+fn isolated_newt_binary() -> (tempfile::TempDir, std::path::PathBuf) {
+    let source = assert_cmd::cargo::cargo_bin("newt");
+    let dir = tempfile::tempdir_in(source.parent().unwrap()).unwrap();
+    let path = dir.path().join("newt");
+    std::fs::hard_link(source, &path).unwrap();
+    (dir, path)
+}
+
+/// Grounds the launcher fixtures in the real filesystem: isolation must not
+/// open a writable executable that concurrent subprocesses can inherit.
+#[test]
+fn isolated_launcher_reuses_the_read_only_executable_inode() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let source = assert_cmd::cargo::cargo_bin("newt");
+    let (_dir, isolated) = isolated_newt_binary();
+    let original = std::fs::metadata(&source).unwrap();
+    let installed = std::fs::metadata(&isolated).unwrap();
+    assert_eq!(
+        (installed.dev(), installed.ino()),
+        (original.dev(), original.ino()),
+        "the isolated launcher must share the executable inode without copying"
+    );
+    assert!(!std::fs::symlink_metadata(&isolated)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 /// A stub "newt-web" that records its argv and exits 0, so the launcher's
@@ -46,8 +71,7 @@ fn web_launches_the_env_override_binary_and_passes_args_through() {
 
 #[test]
 fn web_missing_binary_error_names_every_escape_hatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let newt = isolated_newt_binary(dir.path());
+    let (dir, newt) = isolated_newt_binary();
 
     let root = common::isolated_root();
     let mut cmd = Command::new(&newt);
@@ -72,8 +96,7 @@ fn web_missing_binary_error_names_every_escape_hatch() {
 
 #[test]
 fn web_finds_the_isolated_sibling_when_override_and_path_are_absent() {
-    let dir = tempfile::tempdir().unwrap();
-    let newt = isolated_newt_binary(dir.path());
+    let (dir, newt) = isolated_newt_binary();
     stub_web_binary(dir.path());
 
     let root = common::isolated_root();
