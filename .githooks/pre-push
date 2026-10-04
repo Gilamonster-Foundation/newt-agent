@@ -109,6 +109,9 @@
 #   - the `windows` and `musl` jobs (ci.yml) -- no Windows dev box / musl
 #     cross-target+musl-tools on a typical dev box; ci.yml's own top comment
 #     names these as the same kind of exception
+#   - rust-stable-canary.yml (weekly floating-stable clippy; warns of an
+#     upcoming pin bump before it blocks PRs — never a push gate; see that
+#     workflow's own HOOK PARITY comment)
 #   - every workflow that provides its own non-standard checkout or
 #     toolchain and says so in its own HOOK PARITY comment: newt-web.yml /
 #     newt-web-drive.yml (excluded newt-mesh crate + browser install),

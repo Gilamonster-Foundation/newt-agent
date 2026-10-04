@@ -1,0 +1,37 @@
+name: rust-stable-canary
+# HOOK PARITY: CI-only (weekly schedule + workflow_dispatch) — named in
+# .githooks/pre-push's CI-ONLY list. Never a per-push or per-PR gate.
+# Its job is to warn us that a new stable Rust release breaks clippy -D warnings
+# BEFORE it reaches the pinned toolchain and blocks every PR.
+#
+# To bump the pin: update `channel` in rust-toolchain.toml, run
+# `rustup toolchain install <version>` on dev boxes, confirm this canary passes
+# with the new version, then close the tracking issue.
+#
+# PIPELINE PARITY: This workflow is NOT mirrored by .githooks/pre-push.
+# It is named in the pre-push hook's CI-ONLY list. Every edit still requires
+# the standard CRAFT-14 hook audit; keep that list in sync with changes to
+# the job name or schedule here.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * 1'  # Monday 08:00 UTC
+
+jobs:
+  clippy-floating-stable:
+    name: clippy (floating stable — canary only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Install floating stable; the explicit +stable commands below
+          # select it instead of rust-toolchain.toml's pin.
+          toolchain: stable
+          components: clippy
+      - name: Show the canary toolchain
+        run: |
+          cargo +stable --version
+          rustup toolchain list
+      - run: cargo +stable clippy --workspace --all-targets -- -D warnings
