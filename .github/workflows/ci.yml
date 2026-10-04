@@ -418,7 +418,8 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
-      # PIPELINE PARITY: mirrored by `just msrv` + .githooks/pre-push. Verifies the
+      # PIPELINE PARITY: CI-only, named in .githooks/pre-push; `just msrv`
+      # is the local equivalent. Verifies the
       # declared `rust-version` ([workspace.package] in Cargo.toml) actually
       # compiles — a dep bump can't silently raise the floor (it drifted once
       # under stable-only CI; see the Cargo.toml MSRV comment block).
@@ -435,8 +436,15 @@ jobs:
       # The feature flags match every other workspace gate in this file. A
       # kernel- or schema-gated dependency is a third way for the floor to
       # drift unseen: without them it is never resolved here at all.
+      - name: Verify the MSRV toolchain
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          version=$(rustup run "$MSRV" rustc --version)
+          echo "$version"
+          [[ "$version" == "rustc ${MSRV}."* || "$version" == "rustc ${MSRV} "* ]]
       - name: cargo check (declared MSRV, all targets)
-        run: cargo check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
+        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
 
   musl:
     name: musl build (x86_64-unknown-linux-musl)
@@ -447,9 +455,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
-      # rust-toolchain.toml is authoritative for dtolnay/rust-toolchain@stable;
-      # extra `targets:` in the step's `with:` block may be ignored when a pin
-      # file is present. Make the musl target install explicit and unconditional.
+      # dtolnay installs the target on its selected stable toolchain. Later
+      # cargo/rustup commands use rust-toolchain.toml, so also install the
+      # musl target on that pinned toolchain explicitly.
       - run: rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       # Regression guard for the Alpine/static build. The libc crate exposes
