@@ -436,34 +436,6 @@ mod wait_for_after_tests {
         writer.join().expect("writer thread");
     }
 
-    /// A needle that never arrives times out and returns `false` rather than
-    /// hanging — the timeout is a real bound, not decoration.
-    #[test]
-    fn times_out_and_returns_false_when_the_needle_never_arrives() {
-        // `false` alone is not the proof: an implementation that always
-        // returns `false` on its FIRST check (never actually polling across
-        // the deadline) would also pass. Count iterations instead of timing
-        // them — more than one pass is the event-free, count-based proof that
-        // the loop genuinely ran out the deadline rather than bailing early.
-        let buf = Mutex::new(b"before after".to_vec());
-        let polls = std::sync::atomic::AtomicUsize::new(0);
-        let seen = tests_pty::wait_for_bytes_instrumented(
-            &buf,
-            7,
-            "SHOWN",
-            Duration::from_millis(100),
-            || {
-                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            },
-        );
-        assert!(!seen, "a needle that never arrives must return false");
-        assert!(
-            polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
-            "must actually poll more than once before giving up, not return \
-             false on the first check"
-        );
-    }
-
     /// `polls > 1` alone cannot tell a real deadline-driven loop from one that
     /// hardcodes a small fixed number of checks and quits — both satisfy it.
     /// Scripting the deadline clock itself closes that: it says "not yet" for
