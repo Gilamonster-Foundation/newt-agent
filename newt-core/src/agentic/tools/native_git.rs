@@ -2783,7 +2783,7 @@ mod governed_push_tests {
                 Ok(())
             }
         }
-        let _ocap = crate::agentic::tools::disable_ocap_tests::ENV_LOCK.blocking_lock();
+        let _ocap = crate::process_env::lock();
         let _ocap_off =
             crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
         let terminal = Shared::default();
