@@ -338,14 +338,22 @@ fn watcher_read_token_blocks_prompt_entry_until_the_read_finishes() {
         let _ = entered_tx.send(());
     });
 
-    assert!(
-        entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-        "prompt entered during the watcher's protected read"
-    );
+    // Wait for whichever happens first: the prompt thread PARKS in `acquire`
+    // (correct; the event this proof needs) or it ENTERS (the bug, caught at
+    // once). A 50 ms `recv_timeout(..).is_err()` only ever proved the thread
+    // had not been scheduled yet.
+    while super::STDIN_TOKEN_WAITERS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "prompt entered during the watcher's protected read"
+        );
+        std::thread::yield_now();
+    }
     drop(watcher);
-    entered_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("prompt enters once the watcher releases stdin");
+    crate::test_guard::recv_guarded(
+        &entered_rx,
+        "the prompt entering once the watcher releases stdin",
+    );
     prompt.join().unwrap();
 }
 

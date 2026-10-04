@@ -580,12 +580,16 @@ mod terminal {
         }
     }
 
-    fn row_style(kind: RowKind) -> Style {
+    fn row_style(kind: RowKind, theme: &newt_core::tty::theme::Theme) -> Style {
         match kind {
-            // The spine is the primary content — default foreground, heads bold.
-            RowKind::PromptHead | RowKind::ReplyHead => {
-                Style::default().add_modifier(Modifier::BOLD)
-            }
+            // The spine uses default foreground except HumanText on human headers;
+            // both human and model headers stay bold.
+            RowKind::PromptHead => Style::default()
+                .fg(crate::theme::to_ratatui(
+                    theme.color(crate::theme::Role::HumanText),
+                ))
+                .add_modifier(Modifier::BOLD),
+            RowKind::ReplyHead => Style::default().add_modifier(Modifier::BOLD),
             RowKind::Prompt | RowKind::Reply => Style::default(),
             // The grey is secondary — exactly the inline vocabulary.
             RowKind::ToolFold | RowKind::Tool => Style::default().fg(Color::DarkGray),
@@ -630,11 +634,12 @@ mod terminal {
             // the view in a position no keystroke can produce.
             state.clamp_scroll(page_rows);
             let rows = state.rows();
+            let theme = crate::theme::active();
             let visible = rows
                 .iter()
                 .skip(state.scroll)
                 .take(page_rows)
-                .map(|row| Line::from(Span::styled(row.text.clone(), row_style(row.kind))))
+                .map(|row| Line::from(Span::styled(row.text.clone(), row_style(row.kind, &theme))))
                 .collect::<Vec<_>>();
             f.render_widget(Paragraph::new(visible), body);
         })?;
@@ -796,6 +801,34 @@ mod terminal {
                 }
                 _ => {}
             }
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// #2701: human headers must not share the model header's bold default foreground.
+        #[test]
+        fn human_header_uses_human_text_while_reply_header_keeps_default_foreground() {
+            use newt_core::tty::theme::{Role, Theme};
+            let theme = Theme::builtin().overlaid(
+                "pager-test",
+                &[(
+                    Role::HumanText,
+                    crossterm::style::Color::Rgb {
+                        r: 12,
+                        g: 34,
+                        b: 56,
+                    },
+                )],
+            );
+            let human = row_style(RowKind::PromptHead, &theme);
+            let reply = row_style(RowKind::ReplyHead, &theme);
+
+            assert_eq!(human.fg, Some(Color::Rgb(12, 34, 56)));
+            assert!(human.add_modifier.contains(Modifier::BOLD));
+            assert_eq!(reply.fg, None);
+            assert!(reply.add_modifier.contains(Modifier::BOLD));
         }
     }
 } // mod terminal (rich-tui only)

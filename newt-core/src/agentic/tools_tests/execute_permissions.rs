@@ -1458,6 +1458,1100 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
     );
 }
 
+/// A command broker that changes nothing — stands in for `NativeGitBroker`
+/// so this test exercises the real `CommandBroker`-bearing dispatch path
+/// without needing a real repository or signing key.
+#[cfg(not(windows))]
+struct NoopBroker;
+
+#[cfg(not(windows))]
+impl agent_bridle_tool_shell::CommandBroker for NoopBroker {
+    fn prepare(
+        &self,
+        _command: &agent_bridle_tool_shell::BrokerCommand,
+        _context: &agent_bridle::ToolContext,
+        _control: &agent_bridle_tool_shell::BrokerControl,
+    ) -> agent_bridle::ToolResult<Option<agent_bridle_tool_shell::PreparedBrokerCommand>> {
+        Ok(None)
+    }
+}
+
+/// #2689 regression: a broker-bearing exec denial (a `git commit` command,
+/// which installs the attribution/signing broker — see `needs_commit_broker`)
+/// must take the SAME operator-prompt path as any other exec denial. Before
+/// the fix, `exec_confined_command_with_broker` returned the denial the
+/// moment `command_broker.is_some()`, before `permission_gate.ask_with_caveats`
+/// was ever called — so an operator's "allow once" had nothing to land on and
+/// a broker-bearing commit could never be let through without a durable
+/// grant (the reported symptom: repeated "capability denied" for `git`).
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_broker() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let denied = Caveats {
+        exec: Scope::none(),
+        // Isolate the exec-retry lifecycle from macOS's unsupported network floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+    let broker: std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker> =
+        std::sync::Arc::new(NoopBroker);
+
+    let out = shell::exec_confined_command_with_broker(
+        "/bin/echo broker-retry-visible",
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        Some(broker),
+        None,
+        &mut None,
+    )
+    .await;
+
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "a broker-bearing exec denial must consult the gate exactly like any \
+         other exec denial: {}",
+        out.0
+    );
+    assert!(
+        out.0.contains("broker-retry-visible"),
+        "the operator's allow-once must let the broker-bearing command \
+         through on retry, broker still attached: {}",
+        out.0
+    );
+    assert_eq!(out.1, ExecOutcome::Passed, "{}", out.0);
+}
+
+/// #2681 regression: an exec denial is #2628/#2636-replay-eligible exactly
+/// like an FS denial already is. Before the fix, `single_grant_covers_missing`
+/// and `pending_rerun` population were wired for `FsRead`/`FsWrite` only (see
+/// `approved_request_permissions_reruns_denied_run_command` above) — an exec
+/// denial never populated `pending_rerun` at all, so an operator's `AllowOnce`
+/// answer to the model's `request_permissions(capability="exec", …)` could
+/// only ever produce "Retry the original operation now", forcing the model to
+/// reissue the identical `run_command` call itself. Each such manual re-issue
+/// is a FRESH, independent denial/grant round-trip — exactly the "intermittent
+/// denial" pattern #2681 reports (a retest transcript: 129 prompts, 14+ for
+/// `git`, before the model gave up).
+///
+/// Round 1 pinned the issue's literal ask against a `&&`-chained command
+/// that execs the SAME out-of-scope program TWICE. Round 3 (P1) narrows
+/// replay-eligibility to a single simple command only (see
+/// `exec_denial_is_replay_safe`'s doc comment) — a `&&`-chain is no longer
+/// eligible regardless of which target is denied or repeated, so that
+/// scenario moved to `exec_replay_excluded_for_compound_and_pipeline_shapes`
+/// below, which proves it now gets "Retry the original operation" instead.
+/// This test keeps the single-command case: the fix this issue is actually
+/// about (an exec denial getting a `pending_rerun` slot at all).
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_request_permissions_reruns_denied_run_command_for_exec() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    let ws = tempfile::tempdir().unwrap();
+    let workspace = ws.path().canonicalize().unwrap();
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    // `/bin/echo` is an external program under every engine (bare `echo` is a
+    // Brush builtin and needs no exec grant) — denied by an empty exec scope.
+    let base = Caveats {
+        exec: Scope::none(),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(&workspace)
+    };
+
+    // ── Step 1: run_command denied — exec not granted ───────────────────────
+    let mut deny_gate = MockGate::new(false, &base);
+    let mut pending_rerun: Option<crate::agentic::tools::PendingRerun> = None;
+    let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result1 = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "/bin/echo hello"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut deny_gate as &mut dyn PermissionGate),
+            execution: Some(&execution1),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        execution1.get(),
+        Some(&ExecOutcome::Denied),
+        "run_command must be denied: {result1}"
+    );
+    assert!(
+        pending_rerun.is_some(),
+        "#2681: an exec denial must be stored in pending_rerun exactly like an \
+         FS denial already is: {result1}"
+    );
+
+    // ── Step 2: request_permissions approved for the ACTUAL bound target ────
+    let mut allow_gate = MockGate::new(true, &base);
+    let execution2 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result2 = execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({
+            "capability": "exec",
+            "target": "/bin/echo",
+            "reason": "#2681 regression test",
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut allow_gate as &mut dyn PermissionGate),
+            execution: Some(&execution2),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        pending_rerun.is_none(),
+        "#2681: pending_rerun must be consumed after approval: {result2}"
+    );
+    assert!(
+        !result2.contains("Retry the original operation"),
+        "#2681: harness must re-run the command directly, not instruct the model \
+         to retry it itself: {result2}"
+    );
+    assert_eq!(
+        execution2.get(),
+        Some(&ExecOutcome::Passed),
+        "#2681: the replay must actually succeed: {result2}"
+    );
+    assert!(result2.contains("hello"), "{result2}");
+}
+
+/// #2681 round 2/3 (P1): a returned exec denial does not mean nothing ran —
+/// an earlier command in the SAME `&&`/`;`-chain may already have taken
+/// effect (a permitted external program, or a builtin, which always runs
+/// regardless of exec caveats) before the denied spawn was even attempted.
+/// Measured directly: `/bin/mkdir {dir} && /bin/echo external`, denied on
+/// `/bin/echo`, does NOT create `{dir}` even though `/bin/mkdir` is
+/// permitted — newt's own exec-authority admission validates the WHOLE
+/// command before dispatch, so nothing here partially executes (confirmed
+/// with `created_dir.is_dir() == false` after the denial). That atomicity is
+/// an engine property, not a guarantee `single_grant_covers_missing` can see
+/// or rely on — if a future engine or dispatch path ever weakens it, blindly
+/// replaying the whole command on grant would silently re-run `/bin/mkdir`.
+///
+/// Round 3 (P2 review finding): this test no longer claims to have measured
+/// that atomicity across BOTH the `safe-subset` and `brush` engines — round
+/// 2's three throwaway probes exercised only `safe-subset` (every unit test
+/// forces it; `brush_cwd_error_preserves_denied_execution_class` is the one
+/// test that reaches a real `BrushShellTool` directly, by constructing its
+/// own registry rather than going through this module's dispatch), so an
+/// "equally atomic under brush" claim was never actually established. It
+/// does not need to be: `exec_denial_is_replay_safe`'s round-3 rule rejects
+/// ANY multi-command shape outright (`/bin/echo` here is the SECOND of TWO
+/// inventoried commands, full stop), so this test's outcome does not depend
+/// on which engine ran it or on any atomicity property of either one.
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_exec_replay_never_reruns_an_earlier_permitted_command() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    let ws = tempfile::tempdir().unwrap();
+    let workspace = ws.path().canonicalize().unwrap();
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    let created_dir = workspace.join("created_once");
+    let created_dir_str = created_dir.to_string_lossy().into_owned();
+
+    // `/bin/mkdir` is PERMITTED; `/bin/echo` (the second, denied command) is not.
+    let base = Caveats {
+        exec: Scope::only(["/bin/mkdir".to_string()]),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(&workspace)
+    };
+    let cmd = format!("/bin/mkdir {created_dir_str} && /bin/echo external");
+
+    // ── Step 1: run_command denied on /bin/echo — /bin/mkdir already ran ───
+    let mut deny_gate = MockGate::new(false, &base);
+    let mut pending_rerun: Option<crate::agentic::tools::PendingRerun> = None;
+    let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result1 = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": cmd}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut deny_gate as &mut dyn PermissionGate),
+            execution: Some(&execution1),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        execution1.get(),
+        Some(&ExecOutcome::Denied),
+        "run_command must be denied: {result1}"
+    );
+    assert!(
+        pending_rerun.is_some(),
+        "setup: an exec denial must still populate pending_rerun: {result1}"
+    );
+    assert!(
+        !created_dir.is_dir(),
+        "ground truth: newt's own admission check already refuses the WHOLE \
+         command when any of its exec targets lacks authority, so /bin/mkdir \
+         never partially ran here — this is what makes exec_denial_is_replay_safe's \
+         multi-command exclusion a defensive narrowing rather than today's \
+         load-bearing fix: {result1}"
+    );
+
+    // ── Step 2: request_permissions approved for the ACTUAL bound target ────
+    let mut allow_gate = MockGate::new(true, &base);
+    let execution2 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result2 = execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({
+            "capability": "exec",
+            "target": "/bin/echo",
+            "reason": "#2681 round 2 regression test",
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut allow_gate as &mut dyn PermissionGate),
+            execution: Some(&execution2),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        pending_rerun.is_none(),
+        "the pending slot must still be consumed even when replay is declined: {result2}"
+    );
+    assert!(
+        result2.contains("Retry the original operation"),
+        "#2681: a compound (non-single-command) exec denial must NOT \
+         auto-replay — the model must reissue run_command itself: {result2}"
+    );
+    assert_ne!(
+        execution2.get(),
+        Some(&ExecOutcome::Passed),
+        "the harness must not have executed a replay at all: {result2}"
+    );
+}
+
+/// #2681 round 3 (P1 review finding): round 2's leading-spawn check kept TWO
+/// shapes wrongly replay-eligible as long as the denied target was the
+/// textually-first command — both measured here as eligible under round 2's
+/// code and confirmed NOT eligible under round 3's single-simple-command
+/// rule:
+/// - a `&&`-chained command that execs the SAME target TWICE (round 1's own
+///   fixture — `approved_request_permissions_reruns_denied_run_command_for_exec`
+///   used to pin this as the issue's literal ask; see that test's doc
+///   comment for where the claim moved);
+/// - a pipeline whose FIRST stage is the denied target (the review's named
+///   "pipeline sibling": pipeline stages start together, not in sequence,
+///   so "first in the flattened inventory" says nothing about what the
+///   OTHER stage has already done by the time the first one is denied).
+///
+/// Both deny on exactly `{Exec, "/bin/echo"}` — asserted directly against
+/// `pending_rerun.missing` — so `single_grant_covers_missing` ALONE would
+/// already say a grant for `/bin/echo` covers the denial; only
+/// `exec_denial_is_replay_safe`'s multi-command rejection stands between
+/// that and an unsound auto-replay.
+#[cfg(unix)]
+#[tokio::test]
+async fn exec_replay_excluded_for_compound_and_pipeline_shapes() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    for cmd in [
+        "/bin/echo one && /bin/echo two",
+        "/bin/echo denied | /bin/true",
+    ] {
+        let ws = tempfile::tempdir().unwrap();
+        let workspace = ws.path().canonicalize().unwrap();
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let base = Caveats {
+            exec: Scope::none(),
+            #[cfg(target_os = "macos")]
+            net: Scope::All,
+            ..caveats_rw(&workspace)
+        };
+
+        // ── run_command denied — exec not granted ───────────────────────────
+        let mut deny_gate = MockGate::new(false, &base);
+        let mut pending_rerun: Option<crate::agentic::tools::PendingRerun> = None;
+        let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
+        execute_tool_with_collaborators(
+            "run_command",
+            &serde_json::json!({"command": cmd}),
+            &workspace_str,
+            false,
+            20,
+            &base,
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut deny_gate as &mut dyn PermissionGate),
+                execution: Some(&execution1),
+                pending_rerun: Some(&mut pending_rerun),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(execution1.get(), Some(&ExecOutcome::Denied), "{cmd}");
+        let missing = &pending_rerun
+            .as_ref()
+            .expect("setup: the denial must populate pending_rerun")
+            .missing;
+        assert_eq!(
+            missing
+                .iter()
+                .map(|r| (r.kind, r.target.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(DenialKind::Exec, "/bin/echo")],
+            "setup: {cmd:?} must deny on exactly /bin/echo, not a narrower or \
+             wider set — otherwise this case does not exercise \
+             exec_denial_is_replay_safe at all: {missing:?}"
+        );
+
+        // ── request_permissions approved for the ACTUAL bound target ───────
+        let mut allow_gate = MockGate::new(true, &base);
+        let execution2 = std::sync::OnceLock::<ExecOutcome>::new();
+        let result2 = execute_tool_with_collaborators(
+            "request_permissions",
+            &serde_json::json!({
+                "capability": "exec",
+                "target": "/bin/echo",
+                "reason": "#2681 round 3 regression test",
+            }),
+            &workspace_str,
+            false,
+            20,
+            &base,
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut allow_gate as &mut dyn PermissionGate),
+                execution: Some(&execution2),
+                pending_rerun: Some(&mut pending_rerun),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(pending_rerun.is_none(), "{cmd:?}: {result2}");
+        assert!(
+            result2.contains("Retry the original operation"),
+            "{cmd:?} must NOT auto-replay under the single-simple-command rule: {result2}"
+        );
+        assert_ne!(
+            execution2.get(),
+            Some(&ExecOutcome::Passed),
+            "{cmd:?}: {result2}"
+        );
+    }
+}
+
+/// #2681 round 3 (P1): a direct, fully-mocked unit test of
+/// `exec_denial_is_replay_safe` itself, covering shapes the end-to-end
+/// dispatch cannot reach under the test harness's `safe-subset` engine — in
+/// particular the review's OTHER named measured red, command substitution
+/// (`/bin/echo "$(touch marker)"`), which `safe-subset` refuses outright as
+/// an unsupported construct before any capability check even runs (so
+/// `pending_rerun` is never populated at all under the real dispatch — see
+/// `exec_replay_excluded_for_compound_and_pipeline_shapes` for the two
+/// shapes that ARE reachable there). Exercising the predicate directly is
+/// cheaper and more precise than contriving an end-to-end path for every
+/// shape it has to reject.
+#[test]
+fn exec_denial_is_replay_safe_rejects_every_unsound_shape() {
+    use crate::agentic::tools::exec_denial_is_replay_safe;
+
+    // Sound: a single simple command naming exactly the denied target.
+    assert!(exec_denial_is_replay_safe("/bin/echo", "/bin/echo hello"));
+    // #2689: Brush reports the resolved executable for a bare-name command.
+    #[cfg(unix)]
+    {
+        assert!(exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "./git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "/other/git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "git commit -m first; git commit -m second"
+        ));
+    }
+    // A harmless read redirect/fd duplication is not a mutating effect.
+    assert!(exec_denial_is_replay_safe(
+        "/bin/echo",
+        "/bin/echo hello < /dev/null 2>&1"
+    ));
+
+    // Unsound: dynamic content (the review's other named measured red).
+    assert!(!exec_denial_is_replay_safe(
+        "/bin/echo",
+        r#"/bin/echo "$(touch marker)""#
+    ));
+    // Unsound: a pipeline (stages start together, not in source order).
+    assert!(!exec_denial_is_replay_safe(
+        "/bin/echo",
+        "/bin/echo denied | /bin/true"
+    ));
+    // Unsound: a `&&`-chain, even when both stages name the SAME target.
+    assert!(!exec_denial_is_replay_safe(
+        "/bin/echo",
+        "/bin/echo one && /bin/echo two"
+    ));
+    // Unsound: a for-loop's single flattened body entry runs once PER
+    // iteration, not once.
+    assert!(!exec_denial_is_replay_safe(
+        "/bin/echo",
+        "for x in a b c; do /bin/echo \"$x\"; done"
+    ));
+    // Unsound: `&` backgrounding — only a `warnings` entry marks it, with
+    // `commands.len() == 1` otherwise, so this pins that `warnings` alone
+    // (not just command count) must gate eligibility.
+    assert!(!exec_denial_is_replay_safe("/bin/echo", "/bin/echo hi &"));
+    // Unsound: a write-shaped redirect can mutate state independent of
+    // whether the command it decorates ever actually spawns.
+    assert!(!exec_denial_is_replay_safe(
+        "/bin/echo",
+        "/bin/echo hello > /tmp/marker"
+    ));
+    // Unsound: malformed shell syntax fails closed, not open.
+    assert!(!exec_denial_is_replay_safe("/bin/echo", "/bin/echo '"));
+    // Unsound: the inventoried program is not the denied target at all.
+    assert!(!exec_denial_is_replay_safe("/bin/echo", "/bin/true"));
+}
+
+/// #2689/#2691 round 3 (P1 measured red): `exec_denial_is_replay_safe`
+/// compares TEXT only, so a net denial whose host label happens to equal
+/// the command's program name (e.g. a CLI literally named after the
+/// service it calls, like the real `host` DNS-lookup tool reaching a host
+/// named "host") passes its string-equality check. `requests_are_replay_safe`
+/// must still refuse to replay it: unlike an exec admission refusal (which
+/// fires before the program ever spawns), a network refusal happens
+/// mid-execution and proves nothing about whether the program already ran
+/// or produced an effect. Measured red: calling `exec_denial_is_replay_safe`
+/// directly on the same target/cmd pair (the bare predicate this function
+/// replaces at the call site) returns `true` — the axis guard is the only
+/// thing standing between that and an unsound auto-replay.
+#[test]
+fn requests_are_replay_safe_excludes_a_same_name_net_host() {
+    use crate::agentic::tools::{exec_denial_is_replay_safe, requests_are_replay_safe};
+
+    let cmd = "host example.test";
+    // Setup: the coincidental name collision must exist, or this test would
+    // not exercise the axis guard at all.
+    assert!(
+        exec_denial_is_replay_safe("host", cmd),
+        "setup: the text-only predicate must call this pair replay-safe"
+    );
+
+    let net_request = PermissionRequest {
+        tool: "run_command".to_string(),
+        kind: DenialKind::Net,
+        target: "host".to_string(),
+        reason: "net does not permit 'host'".to_string(),
+        harness_bound: false,
+    };
+    assert!(
+        !requests_are_replay_safe(std::slice::from_ref(&net_request), cmd),
+        "a net denial must never auto-replay, even when its host label \
+         coincidentally equals the program name"
+    );
+
+    // Contrast: the identical target/cmd pair, but as an EXEC denial, IS
+    // replay-safe — the axis guard excludes net specifically, not everything.
+    let exec_request = PermissionRequest {
+        kind: DenialKind::Exec,
+        ..net_request
+    };
+    assert!(requests_are_replay_safe(
+        std::slice::from_ref(&exec_request),
+        cmd
+    ));
+}
+
+/// #2689/#2681 round 3 (P1 measured red 1): the inline interactive gate
+/// route in `shell.rs` (the SAME `exec_denial_is_replay_safe` predicate,
+/// reused from `tools.rs` — see that function's doc comment) must refuse
+/// to auto-replay a compound command. `/bin/git` is denied, so the
+/// structured denial fires on the SECOND stage of `echo x >> f && git
+/// commit -m m`; agent-bridle's own exec-authority admission refuses the
+/// WHOLE source before either stage runs (measured directly below, and
+/// already established by `approved_exec_replay_never_reruns_an_earlier_
+/// permitted_command` above for the non-broker case) — so `f` does not
+/// exist yet when the operator is asked. Before this fix, an allow-once
+/// here unconditionally re-dispatched the whole source, which — now fully
+/// authorized — would have run BOTH stages for real, creating `f`. This
+/// fix must instead hold the grant and report it without replaying, so `f`
+/// still does not exist after the grant; only the model's own reissue
+/// creates it. Verified against the pre-round-3 code path: temporarily
+/// forcing the predicate to return `true` (restoring the old
+/// unconditional-replay behavior) makes this assertion fail, because the
+/// grant then DOES create `f`.
+#[cfg(unix)]
+#[tokio::test]
+async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let marker = ws.path().join("f");
+    let denied = Caveats {
+        exec: Scope::only(["/bin/echo".to_string()]),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+    let broker: std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker> =
+        std::sync::Arc::new(NoopBroker);
+
+    let out = shell::exec_confined_command_with_broker(
+        &format!(
+            "/bin/echo x >> {} && /bin/git commit -m m",
+            marker.display()
+        ),
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        Some(broker),
+        None,
+        &mut None,
+    )
+    .await;
+
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "a broker-bearing exec denial must still consult the gate exactly \
+         once: {}",
+        out.0
+    );
+    assert!(
+        !marker.exists(),
+        "a compound command must not be auto-replayed on grant — only the \
+         model's own reissue may create `f`: {}",
+        out.0
+    );
+    assert!(
+        out.0.contains("granted"),
+        "the grant must still be reported, so the model knows to retry: {}",
+        out.0
+    );
+}
+
+/// #2691 round 3 (P2): "granted…Retry the original operation now" must
+/// actually work. The grant the test above queues (compound, not
+/// replay-safe) must bind into the model's OWN reissue of the IDENTICAL
+/// command before that reissue dispatches — not merely sit in the queue,
+/// get re-consulted, and get re-queued every single time with no forward
+/// progress (the reported symptom). First call: denied on `/bin/true`
+/// (compound, not replay-safe), grant queued, no replay. SECOND call — the
+/// model's reissue of the SAME command — must succeed in ONE dispatch with
+/// NO new gate consultation: `apply_pending_once` binds the queued grant
+/// into this dispatch's authority before it runs. THIRD call (the SAME
+/// command again): the grant was single-use and is now spent, so the
+/// command is denied again and the gate is consulted afresh.
+/// #2691 insufficient-Allow control: an unrelated returned exec grant must
+/// never enter the pending queue or authorize the later reissue.
+#[cfg(unix)]
+#[tokio::test]
+async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+
+    /// Like `MockGate`, but with a REAL `pending_once_grants`-style queue
+    /// backing `queue_pending_once`/`apply_pending_once`/`consume_pending_once`
+    /// — `MockGate` leaves those at the trait's no-op defaults, which cannot
+    /// exercise this fix at all.
+    struct QueueBackedGate {
+        base: Caveats,
+        queue: std::collections::BTreeSet<(DenialKind, String)>,
+        asks: usize,
+        sufficient: bool,
+    }
+    impl super::PermissionGate for QueueBackedGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.asks += 1;
+            if !self.sufficient {
+                return super::PermissionDecision::Allow(self.base.clone());
+            }
+            let grants: Vec<_> = requests
+                .iter()
+                .map(|r| (r.kind, r.target.clone()))
+                .collect();
+            super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn queue_pending_once(&mut self, kind: DenialKind, target: &str) {
+            self.queue.insert((kind, target.to_string()));
+        }
+        fn consume_pending_once(&mut self, kind: DenialKind, target: &str) {
+            self.queue.remove(&(kind, target.to_string()));
+        }
+        fn apply_pending_once(
+            &mut self,
+            kind: DenialKind,
+            target: &str,
+            baseline: &Caveats,
+        ) -> Caveats {
+            let key = (kind, target.to_string());
+            if self.queue.remove(&key) {
+                crate::agentic::widen_caveats(baseline, &[key])
+            } else {
+                baseline.clone()
+            }
+        }
+    }
+
+    // #2691: an unrelated Allow must not be converted into queued exec authority.
+    for sufficient in [false, true] {
+        let ws = tempfile::TempDir::new().unwrap();
+        let marker = ws.path().join("f");
+        let denied = Caveats {
+            exec: Scope::only(["/bin/echo".to_string()]),
+            #[cfg(target_os = "macos")]
+            net: Scope::All,
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = QueueBackedGate {
+            base: denied.clone(),
+            queue: std::collections::BTreeSet::new(),
+            asks: 0,
+            sufficient,
+        };
+        let mut display =
+            crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+        let cmd = format!("/bin/echo x >> {} && /bin/true", marker.display());
+
+        // ── CALL 1: denied on /bin/true — not replay-safe, grant queued ────────
+        let first = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            None,
+            &mut None,
+        )
+        .await;
+        assert_eq!(gate.asks, 1, "{}", first.0);
+        assert!(
+            !marker.exists(),
+            "setup: the compound command must not auto-replay on grant: {}",
+            first.0
+        );
+        if sufficient {
+            assert!(first.0.contains("granted"), "{}", first.0);
+        } else {
+            assert!(
+                gate.queue.is_empty(),
+                "insufficient Allow queued authority: {}",
+                first.0
+            );
+            assert!(!first.0.contains("granted"), "{}", first.0);
+        }
+
+        // ── CALL 2: the model's reissue of the IDENTICAL command — must
+        //    succeed in ONE dispatch, with NO new gate consultation ───────────
+        let second = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            None,
+            &mut None,
+        )
+        .await;
+        if !sufficient {
+            assert_eq!(gate.asks, 2, "insufficient Allow must prompt afresh");
+            assert!(
+                gate.queue.is_empty(),
+                "insufficient Allow queued authority on retry"
+            );
+            assert_eq!(second.1, ExecOutcome::Denied, "{}", second.0);
+            assert!(
+                !marker.exists(),
+                "insufficient Allow authorized later execution"
+            );
+            continue;
+        }
+        assert_eq!(
+            gate.asks, 1,
+            "the reissue must succeed from the queued grant alone, with no \
+         second prompt: {}",
+            second.0
+        );
+        assert!(
+            marker.exists(),
+            "the reissue must actually run (both stages), not just report \
+         granted again: {}",
+            second.0
+        );
+        assert_ne!(second.1, ExecOutcome::Denied, "{}", second.0);
+
+        // ── CALL 3: the SAME command a third time — the grant is spent ────────
+        std::fs::remove_file(&marker).unwrap();
+        let third = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            None,
+            &mut None,
+        )
+        .await;
+        assert_eq!(
+            gate.asks, 2,
+            "a third identical call must consult the gate afresh — one-shot \
+         authority must not become sticky: {}",
+            third.0
+        );
+        assert!(
+            !marker.exists(),
+            "the spent grant must not auto-replay a third time either: {}",
+            third.0
+        );
+    }
+}
+
+/// #2689/#2681 round 3 (P1 measured red 2): the inverse shape — the denied
+/// spawn is SECOND (`/bin/true`) and the FIRST stage is the one with the
+/// real effect (`git commit`). Same reasoning as the test above: agent-
+/// bridle's admission refuses the WHOLE source atomically before either
+/// stage runs, so the repository has no commit beyond its initial one when
+/// the operator is asked. Before this fix, an allow-once would have
+/// unconditionally re-dispatched the whole source, publishing a commit the
+/// operator never separately authorized. This fix must hold the grant
+/// instead, so the commit count is unchanged after the grant.
+#[cfg(unix)]
+#[tokio::test]
+async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    // The confined dispatch below has no "env" override seam (unlike
+    // `dispatch_bridled_shell`'s own callers) — it inherits this test
+    // process's environment, so the git identity has to travel as process
+    // env vars rather than through `hermetic_git_env`'s Command wrapper.
+    let home_str = home.path().to_string_lossy().into_owned();
+    let _home = super::disable_ocap_tests::EnvVar::set("HOME", &home_str);
+    let _an = super::disable_ocap_tests::EnvVar::set("GIT_AUTHOR_NAME", "t");
+    let _ae = super::disable_ocap_tests::EnvVar::set("GIT_AUTHOR_EMAIL", "t@example.invalid");
+    let _cn = super::disable_ocap_tests::EnvVar::set("GIT_COMMITTER_NAME", "t");
+    let _ce = super::disable_ocap_tests::EnvVar::set("GIT_COMMITTER_EMAIL", "t@example.invalid");
+    let _ns = super::disable_ocap_tests::EnvVar::set("GIT_CONFIG_NOSYSTEM", "1");
+    let _gc = super::disable_ocap_tests::EnvVar::set("GIT_CONFIG_GLOBAL", "/dev/null");
+
+    assert!(
+        super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .status()
+            .unwrap()
+            .success(),
+        "setup: a fresh repository has no commit yet (an unborn HEAD)"
+    );
+
+    // `/bin/git` is pre-authorized; `/bin/true` (the second, denied stage) is not.
+    let denied = Caveats {
+        exec: Scope::only(["/bin/git".to_string()]),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+    let broker: std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker> =
+        std::sync::Arc::new(NoopBroker);
+
+    let out = shell::exec_confined_command_with_broker(
+        "/bin/git commit --allow-empty -m m && /bin/true",
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        Some(broker),
+        None,
+        &mut None,
+    )
+    .await;
+
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "the denial on `/bin/true` must still consult the gate exactly once: {}",
+        out.0
+    );
+    assert!(
+        !super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .status()
+            .unwrap()
+            .success(),
+        "a compound command must not be auto-replayed on grant — the \
+         already-authorized `git commit` must not run via a replay the \
+         operator never separately saw: {}",
+        out.0
+    );
+}
+
+/// #2689 regression, through the `GitTool`/`PendingRerun` collaborator path:
+/// a denied `git add -A && git commit -q -m probe` (which installs a real
+/// `CommitPolicy`-backed broker, per `native_git::needs_commit_broker`) must
+/// now consult the SAME gate as any other exec denial — this replaces a
+/// round-2 (#2681) test that pinned the OPPOSITE as expected ("the broker
+/// early return must never consult the permission gate"), which was this
+/// exact bug, explicitly scoped out of #2681 as "needs a newt-tui-side fix
+/// … out of scope for this newt-core-only PR" and left for #2689 to close.
+///
+/// `pending_rerun` must still stay `None`: this is the SEPARATE model-driven
+/// `request_permissions`/`PendingRerun` replay in `tools.rs`, which still
+/// excludes every commit-broker command (`commit_broker_used`) regardless of
+/// whether the interactive gate above was consulted.
+#[cfg(unix)]
+#[tokio::test]
+async fn broker_bearing_commit_denial_now_consults_the_gate() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    struct NoSignPolicy;
+    impl agent_toolchain::native_git::CommitPolicy for NoSignPolicy {
+        fn finalize_message(&self, message: &str) -> Result<String, String> {
+            Ok(message.to_string())
+        }
+        fn signing_required(&self) -> bool {
+            false
+        }
+        fn sign_commit(&self, _payload: &[u8]) -> Result<String, String> {
+            Err("signing not required by this test".into())
+        }
+        fn committed(&self) {}
+    }
+
+    struct StubGitTool;
+    impl crate::agentic::git_tool::GitTool for StubGitTool {
+        fn native_commit_policy(
+            &self,
+        ) -> Option<std::sync::Arc<dyn agent_toolchain::native_git::CommitPolicy>> {
+            Some(std::sync::Arc::new(NoSignPolicy))
+        }
+        fn dispatch(
+            &self,
+            _op: &str,
+            _args: &serde_json::Value,
+            _caveats: &crate::git_caveats::GitCaveats,
+            _session: &Caveats,
+        ) -> Result<String, String> {
+            Err("not used by this test".into())
+        }
+    }
+
+    let ws = tempfile::tempdir().unwrap();
+    let workspace = ws.path().canonicalize().unwrap();
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    // #2681 round 3: the hermetic constructor (env_clear + a private HOME),
+    // not a bare `git` that inherits this process's GIT_DIR/HOME/hooks.
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        super::super::tests::git_shell_grant::hermetic_git(&workspace, home.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(workspace.join("file.txt"), b"hello").unwrap();
+
+    let base = Caveats {
+        exec: Scope::none(),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(&workspace)
+    };
+    let git_tool = StubGitTool;
+
+    // ── A broker-bearing (git commit) denial never asks the gate ───────────
+    let mut deny_gate = MockGate::new(false, &base);
+    let mut pending_rerun: Option<crate::agentic::tools::PendingRerun> = None;
+    let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result1 = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "git add -A && git commit -q -m probe"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut deny_gate as &mut dyn PermissionGate),
+            execution: Some(&execution1),
+            pending_rerun: Some(&mut pending_rerun),
+            git_tool: Some(&git_tool),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(execution1.get(), Some(&ExecOutcome::Denied), "{result1}");
+    assert!(
+        pending_rerun.is_none(),
+        "a broker-bearing exec denial must never populate pending_rerun \
+         (commit_broker_used excludes it, by design): {result1}"
+    );
+    assert_eq!(
+        deny_gate.asks.len(),
+        1,
+        "a broker-bearing exec denial must now consult the permission gate, \
+         exactly like any other exec denial: asks={:?}",
+        deny_gate.asks
+    );
+    let staged = super::super::tests::git_shell_grant::hermetic_git(&workspace, home.path())
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(
+        staged.stdout.is_empty(),
+        "the gate declined, so nothing ran either — `git add` never staged \
+         anything: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+}
+
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
 /// A harmless test executable is reached through temporary non-system symlinks;
 /// granting one must launch it without granting its same-named sibling.
@@ -3696,4 +4790,280 @@ async fn eligible_pre_prompt_but_insufficient_allow_neither_executes_nor_consume
         "#2636 round5: an eligible-but-insufficient Allow must not consume the once-grant \
          either — the operator's grant was never actually spent on anything"
     );
+}
+
+/// #2681 round 2/3 (P3): a REAL queue-owning gate (mirrors the SHAPE of
+/// newt-tui's `pending_once_grants`/`danger` policy — see
+/// `broker_bearing_commit_denial_never_consults_the_gate`'s doc comment for
+/// the queue's real shape — but this gate's own `high_danger` set and its
+/// refusal are a stand-in this test writes itself, NOT a test of newt-tui's
+/// actual danger policy, which lives in a different crate) proves the EXEC
+/// axis's once-grant lifetime end to end, where `execute_permissions_
+/// reruns_denied_run_command_for_exec` (stateless `MockGate`, always allows)
+/// could not: that test stops after one successful replay, so it cannot show
+/// a spent grant staying spent, an unrelated target staying ungranted, or a
+/// simulated high-danger target never getting a durable grant at all.
+///
+/// One gate instance owns the queue across the whole sequence:
+/// 1. `run_command` with a single simple `/bin/echo hello` (exec:none) —
+///    denied, and (per `exec_denial_is_replay_safe`'s rule) replay-eligible:
+///    exactly one inventoried command, no constructs, no warnings, no
+///    mutating redirect.
+/// 2. `request_permissions` approves exec for `/bin/echo` — the bound
+///    replay runs the command exactly once under that ONE grant
+///    (`result.contains("hello")`) — the once-grant is then consumed. (A
+///    `&&`-chained command that execs the SAME target twice is no longer
+///    eligible at all under round 3's rule — see
+///    `exec_replay_excluded_for_compound_and_pipeline_shapes`.)
+/// 3. A FRESH, separate `run_command` for the SAME target afterward is
+///    DENIED — the spent grant does not carry over to a new invocation.
+/// 4. Control — unrelated target: granting `/bin/echo` never queues
+///    `/bin/mkdir`; a separate `run_command` for `/bin/mkdir` is denied too.
+/// 5. Control — simulated high danger: `request_permissions(exec,
+///    "/bin/rm")` against THIS gate's own hardcoded `high_danger` set is
+///    refused outright and never reaches the queue — proven by `ask_count`
+///    rising with no corresponding queue entry and no replay. This is a
+///    stand-in for an operator declining a high-danger target, not a
+///    regression test of newt-tui's production danger policy.
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_owning_gate_proves_exec_once_grant_lifetime_and_danger_controls() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
+
+    struct ExecQueueGate {
+        queue: Rc<RefCell<BTreeSet<(DenialKind, String)>>>,
+        high_danger: BTreeSet<String>,
+        ask_count: Rc<Cell<usize>>,
+        consume_count: Rc<Cell<usize>>,
+    }
+    impl PermissionGate for ExecQueueGate {
+        fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+            self.ask_count.set(self.ask_count.get() + 1);
+            let req = &requests[0];
+            let key = (req.kind, req.target.clone());
+            if req.tool != "request_permissions" {
+                if self.queue.borrow_mut().remove(&key) {
+                    // Auto-approved from the queued once-grant: no fresh
+                    // operator decision for this call.
+                    return PermissionDecision::Allow(Caveats::top());
+                }
+                // Nothing queued for this target — no grant was given.
+                return PermissionDecision::Deny;
+            }
+            if self.high_danger.contains(&req.target) {
+                // Stand-in for an operator declining a high-danger target
+                // outright, mirroring the SHAPE of newt-tui's danger policy
+                // (never this gate's own production logic) — it never
+                // reaches the queue at all.
+                return PermissionDecision::Deny;
+            }
+            self.queue.borrow_mut().insert(key);
+            PermissionDecision::Allow(Caveats::top())
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn consume_pending_once(&mut self, kind: DenialKind, target: &str) {
+            self.consume_count.set(self.consume_count.get() + 1);
+            self.queue.borrow_mut().remove(&(kind, target.to_string()));
+        }
+    }
+
+    let ws = tempfile::tempdir().unwrap();
+    let workspace = ws.path().canonicalize().unwrap();
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    let base = Caveats {
+        exec: Scope::none(),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(&workspace)
+    };
+
+    let queue = Rc::new(RefCell::new(BTreeSet::new()));
+    let ask_count = Rc::new(Cell::new(0usize));
+    let consume_count = Rc::new(Cell::new(0usize));
+    let mut gate = ExecQueueGate {
+        queue: queue.clone(),
+        high_danger: BTreeSet::from(["/bin/rm".to_string()]),
+        ask_count: ask_count.clone(),
+        consume_count: consume_count.clone(),
+    };
+
+    // ── STEP 1: run_command denied — /bin/echo not granted ──────────────────
+    let mut pending_rerun: Option<crate::agentic::tools::PendingRerun> = None;
+    let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result1 = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "/bin/echo hello"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            execution: Some(&execution1),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(execution1.get(), Some(&ExecOutcome::Denied), "{result1}");
+    assert!(
+        pending_rerun.is_some(),
+        "setup: the denial must populate pending_rerun: {result1}"
+    );
+    assert!(
+        queue.borrow().is_empty(),
+        "setup: nothing is queued before any request_permissions call"
+    );
+
+    // ── STEP 2: bound approval replays the command exactly once ─────────────
+    let execution2 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result2 = execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({"capability": "exec", "target": "/bin/echo", "reason": "test"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            execution: Some(&execution2),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        execution2.get(),
+        Some(&ExecOutcome::Passed),
+        "the bound replay must actually run: {result2}"
+    );
+    assert!(result2.contains("hello"), "{result2}");
+    assert_eq!(
+        consume_count.get(),
+        1,
+        "the replay must consume the once-grant exactly once"
+    );
+    assert!(
+        queue.borrow().is_empty(),
+        "nothing must be left queued after the replay consumed it"
+    );
+    assert!(pending_rerun.is_none());
+
+    // ── STEP 3: a FRESH, separate run_command for the SAME target is denied ─
+    let execution3 = std::sync::OnceLock::<ExecOutcome>::new();
+    let _ = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "/bin/echo three"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            execution: Some(&execution3),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        execution3.get(),
+        Some(&ExecOutcome::Denied),
+        "#2681 round 2: the spent once-grant must NOT carry over to a fresh, \
+         separate invocation of the same target"
+    );
+
+    // ── Control: an unrelated target never got queued, and stays denied ────
+    let execution4 = std::sync::OnceLock::<ExecOutcome>::new();
+    let _ = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "/bin/mkdir /nonexistent-control-path"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            execution: Some(&execution4),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        execution4.get(),
+        Some(&ExecOutcome::Denied),
+        "control: granting /bin/echo must never leak exec authority to an \
+         unrelated target"
+    );
+
+    // ── Control: a high-danger target never gets a durable/queued grant ────
+    let asks_before = ask_count.get();
+    let execution5 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result5 = execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({"capability": "exec", "target": "/bin/rm", "reason": "test"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            execution: Some(&execution5),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        ask_count.get() > asks_before,
+        "control: the gate must actually have been consulted for the \
+         high-danger target"
+    );
+    assert!(
+        result5.contains("denied"),
+        "control: a high-danger exec target must be refused outright: {result5}"
+    );
+    assert!(
+        !queue
+            .borrow()
+            .contains(&(DenialKind::Exec, "/bin/rm".to_string())),
+        "control: a refused high-danger request must never reach the queue"
+    );
+    assert_ne!(execution5.get(), Some(&ExecOutcome::Passed));
 }

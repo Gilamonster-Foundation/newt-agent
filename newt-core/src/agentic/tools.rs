@@ -1823,24 +1823,29 @@ pub(super) fn permission_grant_succeeded(
         || execution == Some(crate::ExecOutcome::Passed)
 }
 
-/// #2628/#2636: a `run_command` denied purely for undeclared filesystem
-/// authority, remembered for ONE immediate `request_permissions` reply — see
-/// `UNGRANTED_FS_AUTHORITY_DENIAL` for the exact denial shape eligible here.
+/// #2628/#2636/#2681: a `run_command` denied purely for undeclared filesystem
+/// authority, OR for an exec target outside the granted authority, remembered
+/// for ONE immediate `request_permissions` reply — see
+/// `UNGRANTED_FS_AUTHORITY_DENIAL` and `exec_denial_requests` for the exact
+/// denial shapes eligible here.
 ///
-/// Binding (round1 finding 1): `missing` is the exact set of filesystem
-/// requests this command was denied on, captured at denial time. Replay is
-/// permitted only when the operator's grant now covers every one of them —
-/// an unrelated or narrower approval does not authorize replaying this
-/// invocation. The slot is cleared on ANY tool call other than the
-/// `request_permissions` that consumes it (see `execute_authorized_tool`),
-/// so an unrelated intervening command — successful, failed, or a
-/// replacement for this one — invalidates a stale rerun.
+/// Binding (round1 finding 1): `missing` is the exact set of requests this
+/// command was denied on, captured at denial time. Replay is permitted only
+/// when the operator's grant now covers every one of them — an unrelated or
+/// narrower approval does not authorize replaying this invocation. The slot
+/// is cleared on ANY tool call other than the `request_permissions` that
+/// consumes it (see `execute_authorized_tool`), so an unrelated intervening
+/// command — successful, failed, or a replacement for this one — invalidates
+/// a stale rerun.
 pub(crate) struct PendingRerun {
     cmd: String,
     cwd: String,
     declared: Vec<PermissionRequest>,
-    /// The subset of `declared` NOT covered by caveats at denial time — what
-    /// the operator's grant must cover for replay to proceed.
+    /// What the operator's grant must cover for replay to proceed: for an FS
+    /// denial, the subset of `declared` not covered by caveats at denial
+    /// time; for an exec denial (#2681), the exec target(s) the confined
+    /// shell reported as denied — independent of `declared`, which a plain
+    /// `run_command` call rarely populates at all.
     missing: Vec<PermissionRequest>,
 }
 
@@ -1863,14 +1868,19 @@ impl EligibleReplay {
     }
 }
 
-/// #2636 round3 blocker 1: does a single grant of `kind` for `target` cover
-/// EVERY request in `missing`? Checked BEFORE asking the operator, using only
-/// the requested capability/target — never the widened caveats the gate
+/// #2636 round3 blocker 1 / #2681: does a single grant of `kind` for `target`
+/// cover EVERY request in `missing`? Checked BEFORE asking the operator, using
+/// only the requested capability/target — never the widened caveats the gate
 /// eventually returns, which don't exist yet — so the prompt shown to the
 /// operator can honestly say whether this approval alone would replay the
-/// bound command. A single-target grant only ever produces one path-scope
-/// root, so this mirrors `permits_filesystem_request` against that one-root
-/// scope: an unrelated target, the wrong axis, or a grant that covers only
+/// bound command. For `FsRead`/`FsWrite` a single-target grant only ever
+/// produces one path-scope root, so this mirrors `permits_filesystem_request`
+/// against that one-root scope. For `Exec` there is no path hierarchy to
+/// widen into — coverage is the EXACT target string the command was denied
+/// on, deliberately no more tolerant than that (a bare name and its resolved
+/// absolute path are different targets, same as the narrowing already pinned
+/// in newt-tui's `bare_pending_once_exec_grant_survives_an_absolute_request_
+/// denial`). An unrelated target, the wrong axis, or a grant that covers only
 /// part of `missing` (e.g. one of two denied paths) all return `false`.
 fn single_grant_covers_missing(
     kind: DenialKind,
@@ -1880,12 +1890,110 @@ fn single_grant_covers_missing(
     if missing.is_empty() {
         return false;
     }
-    let scope = crate::caveats::Scope::only([target.to_string()]);
     missing.iter().all(|request| {
-        request.kind == kind
-            && matches!(kind, DenialKind::FsRead | DenialKind::FsWrite)
-            && crate::caveats::permits_path(&scope, &request.target)
+        if request.kind != kind {
+            return false;
+        }
+        match kind {
+            DenialKind::FsRead | DenialKind::FsWrite => {
+                let scope = crate::caveats::Scope::only([target.to_string()]);
+                crate::caveats::permits_path(&scope, &request.target)
+            }
+            DenialKind::Exec => request.target == target,
+            _ => false,
+        }
     })
+}
+
+/// #2681 round 3 (P1): an exec denial replays safely ONLY when `cmd`, in
+/// its entirety, is a single simple command with no dynamic content and no
+/// redirect that can itself mutate state. Round 2's "denied spawn is the
+/// FIRST command in source order" check conflated SOURCE order with
+/// EXECUTION order: `agent_bridle::inspect_shell` is a non-executing,
+/// source-order inventory, and source order is not a safety witness for
+/// several shapes it still has to represent faithfully —
+/// a command substitution's inner command expands (and can run arbitrary
+/// effects, e.g. `/bin/echo "$(touch marker)"`) before the outer command it
+/// decorates ever spawns; a pipeline's stages are not sequenced the way a
+/// flattened list suggests (e.g. `/bin/echo denied | /bin/true` inventories
+/// `/bin/echo` first even though both stages start together); and a
+/// for-loop's single flattened body entry can run once per iteration, not
+/// once. The SIMPLEST rule this inspection can honestly support is: exactly
+/// one inventoried command, no `constructs` (command/backquote substitution,
+/// arithmetic expansion — the dynamic-content axis), no `warnings` at all
+/// (`inspect_shell` emits one for every `&&`/`||`/`;`-list member beyond the
+/// first, every pipeline, `!`, `time`, `&` background, and every for-loop —
+/// an empty list is itself proof none of those shapes are present), and no
+/// redirect that can mutate state (see [`redirect_has_effect`]). This does
+/// not rely on any engine checking a whole command before running part of
+/// it: the safe-subset admission does in unit tests
+/// (`approved_exec_replay_never_reruns_an_earlier_permitted_command`), but
+/// that is not established for every production engine.
+/// Anything else returns `false` and the model is told to re-issue the
+/// command itself — the existing, always-safe fallback. Fails closed on an
+/// inspection error.
+fn exec_denial_is_replay_safe(target: &str, cmd: &str) -> bool {
+    let Ok(inspection) = agent_bridle::inspect_shell(cmd) else {
+        return false;
+    };
+    if !inspection.warnings.is_empty() || !inspection.constructs.is_empty() {
+        return false;
+    }
+    let [only] = inspection.commands.as_slice() else {
+        return false;
+    };
+    let Some(program) = only.program.as_deref() else {
+        return false;
+    };
+    // Brush denies the resolved path, even when source names a bare executable.
+    // This only establishes that the single command did not launch; it grants
+    // nothing. The retry retains the exact path authority returned by the gate
+    // and is checked again before spawning, even if PATH resolves differently.
+    let names_target = program == target
+        || (!program.contains(['/', '\\'])
+            && std::path::Path::new(target).is_absolute()
+            && std::path::Path::new(target)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(program));
+    names_target && !only.redirects.iter().any(redirect_has_effect)
+}
+
+/// #2689/#2691 round 3 (P1): `exec_denial_is_replay_safe` compares TEXT only
+/// — it says nothing about which AXIS was denied. A net denial's `target` is
+/// a HOST, not the denied command's executable, and a host label that
+/// happens to equal the program name (e.g. a CLI literally named after the
+/// service it calls, like the `host` DNS-lookup tool reaching a host named
+/// "host") would otherwise pass that string-equality check. Unlike an exec
+/// denial, a network refusal does NOT prove the program never ran or never
+/// produced an effect — the connection attempt happens mid-execution, after
+/// the process has already started. So every request must be `DenialKind::
+/// Exec` before the text predicate is even consulted; a net denial always
+/// falls through to the existing "granted; re-run your command" path (its
+/// manual retry), never an automatic replay.
+fn requests_are_replay_safe(requests: &[PermissionRequest], cmd: &str) -> bool {
+    requests.iter().all(|request| {
+        request.kind == DenialKind::Exec && exec_denial_is_replay_safe(&request.target, cmd)
+    })
+}
+
+/// A redirection that can mutate the filesystem independent of whether the
+/// command it decorates ever actually spawns — unlike a read, an fd
+/// duplication, or a here-doc/here-string, none of which touch anything
+/// outside the command's own input. This crate does not control WHEN a
+/// shell engine opens a redirect relative to its exec-authority check, so
+/// [`exec_denial_is_replay_safe`] treats a write-shaped redirect as
+/// disqualifying on principle rather than assuming today's engine order.
+fn redirect_has_effect(redirect: &agent_bridle::InspectedRedirect) -> bool {
+    matches!(
+        redirect.operation,
+        agent_bridle::RedirectOperation::Write
+            | agent_bridle::RedirectOperation::Append
+            | agent_bridle::RedirectOperation::ReadWrite
+            | agent_bridle::RedirectOperation::Clobber
+            | agent_bridle::RedirectOperation::OutputAndError
+            | agent_bridle::RedirectOperation::AppendOutputAndError
+    )
 }
 
 /// #721: the model-facing `request_permissions` tool — the capability-GRANT
@@ -1959,8 +2067,17 @@ fn execute_request_permissions(
     // was denied on. A partial or unrelated request still clears the pending
     // slot (already taken by the caller) but gets ordinary access-grant
     // wording that says plainly no automatic replay will happen.
-    let eligible =
-        bound.filter(|pending| single_grant_covers_missing(kind, target, &pending.missing));
+    //
+    // #2681 round 3 (P1): for `Exec`, coverage alone is not consent to
+    // replay — `exec_denial_is_replay_safe` additionally requires
+    // `pending.cmd` to be a single simple command with no dynamic content
+    // or mutating redirect, so replay can never repeat an earlier
+    // construct's, pipeline sibling's, or loop iteration's effect (see its
+    // doc comment).
+    let eligible = bound.filter(|pending| {
+        single_grant_covers_missing(kind, target, &pending.missing)
+            && (kind != DenialKind::Exec || exec_denial_is_replay_safe(target, &pending.cmd))
+    });
 
     let request = PermissionRequest {
         tool: "request_permissions".to_string(),
@@ -2002,10 +2119,13 @@ fn execute_request_permissions(
                 // once-grant: report plainly (via the caller's fallback
                 // message) that the command was not re-run.
                 let covers_missing = eligible.is_some_and(|pending| {
-                    pending
-                        .missing
-                        .iter()
-                        .all(|r| permits_filesystem_request(&widened, r))
+                    pending.missing.iter().all(|r| match r.kind {
+                        // #2681: an exec entry is checked against the actual
+                        // enforcement predicate, not `permits_filesystem_request`
+                        // (which returns `false` for every non-FS kind by design).
+                        DenialKind::Exec => widened.permits_exec(&r.target),
+                        _ => permits_filesystem_request(&widened, r),
+                    })
                 });
                 let replay_auth = EligibleReplay::new(covers_missing);
                 if replay_auth.is_some() {
@@ -3905,11 +4025,11 @@ async fn execute_authorized_tool(
         // of a "Retry the original operation now" instruction.
         //
         // Binding (round1 finding 1): replay proceeds ONLY when the grant
-        // just obtained covers EVERY filesystem request the command was
-        // denied on (`pending.missing`) — an approval for a different
-        // capability, target, or axis is not consent to replay this
-        // invocation, and the model's own retry path (a fresh `run_command`
-        // call) is unaffected either way.
+        // just obtained covers EVERY request the command was denied on
+        // (`pending.missing`, FS or — #2681 — exec) — an approval for a
+        // different capability, target, or axis is not consent to replay
+        // this invocation, and the model's own retry path (a fresh
+        // `run_command` call) is unaffected either way.
         "request_permissions" => {
             let rerun = pending_rerun.and_then(|slot| slot.take());
             let (granted, replay_auth, msg) = execute_request_permissions(
@@ -3927,13 +4047,16 @@ async fn execute_authorized_tool(
             // independently as a caller-side belt-and-suspenders, not because
             // the token could otherwise be forged: an ineligible or
             // insufficient approval never reaches `Some(_auth)` in the first
-            // place.
+            // place. #2681: an exec entry is checked against the SAME minted
+            // caveats via `permits_exec` (which is exactly what the confined
+            // shell's own enforcement checks), not `permits_filesystem_request`
+            // (which returns `false` for every non-FS kind by design).
             match (granted, replay_auth, rerun) {
                 (Some(widened), Some(_auth), Some(pending))
-                    if pending
-                        .missing
-                        .iter()
-                        .all(|request| permits_filesystem_request(&widened, request)) =>
+                    if pending.missing.iter().all(|request| match request.kind {
+                        DenialKind::Exec => widened.permits_exec(&request.target),
+                        _ => permits_filesystem_request(&widened, request),
+                    }) =>
                 {
                     executed(
                         exec_confined_command(
@@ -4260,30 +4383,148 @@ async fn execute_authorized_tool(
             // F32/#2537 round 3: a bare `git …` in this session's own repo, on
             // a non-default branch, gets kernel WRITE on its own gitdir +
             // `objects/` for THIS dispatch only — see
-            // `dispatch_caveats_for_git_shell`'s doc comment.
+            // `dispatch_caveats_for_git_shell`'s doc comment. #2682 round 2
+            // (#2686 review round 2): the common dir's `refs/heads/`/
+            // `logs/refs/heads/` are NEVER granted here anymore — a
+            // commit-creating command instead runs with HEAD DETACHED (so it
+            // only ever touches `objects/` + this worktree's own admin dir,
+            // both still granted below) and a host-side, bounded
+            // `update-ref` publishes the result afterward. See
+            // `git_hardening::own_branch_for_commit_ref_move`'s doc comment
+            // for the full mechanism and why the old directory-wide grant
+            // was a hole, not an accepted trade-off.
             let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
             let commit_broker_used = commit_broker.is_some();
+            let ref_move = commit_requested
+                .then(|| {
+                    crate::git_hardening::own_branch_for_commit_ref_move(std::path::Path::new(
+                        workspace,
+                    ))
+                })
+                .flatten();
+            // Bind identity before dispatch. Recovery shares the execution
+            // owner's lease, so dropping this async waiter does not reattach
+            // while that owner's shutdown path is still running. Recovery
+            // never publishes; escaped descendants remain a documented residual.
+            let mut detach_guard = None;
+            if let Some(move_info) = &ref_move {
+                if let Err(error) =
+                    crate::git_hardening::detach_own_head(&move_info.identity, &move_info.old_tip)
+                {
+                    return host_return(format!(
+                        "error: could not prepare branch '{}' for a governed commit: {error}",
+                        move_info.branch
+                    ));
+                }
+                detach_guard = Some(std::sync::Arc::new(
+                    crate::git_hardening::DetachedHeadGuard::new(
+                        move_info.identity.clone(),
+                        move_info.branch.clone(),
+                        move_info.old_tip.clone(),
+                    ),
+                ));
+            }
             let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
-            let result = executed(
-                shell::exec_confined_command_with_broker(
-                    cmd,
-                    &run_cwd,
-                    workspace,
-                    color,
-                    tool_output_lines,
-                    &git_shell_caveats,
-                    &filesystem_requests,
-                    exec_floor,
-                    &mut permission_gate,
-                    tool_offload,
-                    spill_store,
-                    live_tool_output.clone(),
-                    presentation,
-                    commit_broker,
-                    &mut fs_pre_exec_missing,
-                )
-                .await,
-            );
+            let (mut exec_text, mut exec_outcome) = shell::exec_confined_command_with_broker(
+                cmd,
+                &run_cwd,
+                workspace,
+                color,
+                tool_output_lines,
+                &git_shell_caveats,
+                &filesystem_requests,
+                exec_floor,
+                &mut permission_gate,
+                tool_offload,
+                spill_store,
+                live_tool_output.clone(),
+                presentation,
+                commit_broker,
+                detach_guard
+                    .as_ref()
+                    .map(|guard| guard.clone() as agent_bridle_tool_shell::ExecutionLease),
+                &mut fs_pre_exec_missing,
+            )
+            .await;
+            if let Some(move_info) = &ref_move {
+                let branch = &move_info.branch;
+                // Only once the confined child actually exited 0 — a denial
+                // or a failing hook leaves the checked-out branch untouched,
+                // same as before this command ran.
+                if exec_outcome == crate::ExecOutcome::Passed {
+                    match crate::git_hardening::advance_own_branch_ref(
+                        &move_info.identity,
+                        branch,
+                        &move_info.old_tip,
+                    ) {
+                        Ok(_new_oid) => {
+                            exec_text = exec_text.replace("detached HEAD ", &format!("{branch} "));
+                        }
+                        Err(refusal) => {
+                            // #2686 review round 3, P2: a refused publication
+                            // is a FAILURE of this tool call, not a passed
+                            // one with different text — the model's requested
+                            // branch update did not happen.
+                            exec_outcome = crate::ExecOutcome::Failed;
+                            let candidate = refusal
+                                .candidate_oid
+                                .as_deref()
+                                .map(|oid| format!(" The commit exists, unpublished, as {oid}."))
+                                .unwrap_or_default();
+                            exec_text = format!(
+                                "error: the commit was created but refused publication to \
+                                 branch '{branch}': {refusal}.{candidate} No branch ref moved; \
+                                 retry the commit."
+                            );
+                        }
+                    }
+                } else {
+                    // #2686 review round 5, P2: `detached_commit_candidate`
+                    // now distinguishes "verified: nothing to report" from
+                    // "could not even check" — surface the latter instead of
+                    // silently treating it as the former.
+                    match crate::git_hardening::detached_commit_candidate(
+                        &move_info.identity,
+                        &move_info.old_tip,
+                    ) {
+                        Ok(Some(candidate)) => {
+                            // The dispatch itself did not exit 0 (e.g. a
+                            // compound `git commit … && false`) — never
+                            // publish behind a reported failure, but don't
+                            // lose the commit silently either: name its oid
+                            // so it is recoverable.
+                            exec_text = format!(
+                                "{exec_text}\nnote: a commit was created on detached HEAD but \
+                                 left unpublished because the dispatch did not succeed: \
+                                 {candidate}. It is reachable only by this SHA until a retried \
+                                 commit publishes it."
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            exec_text = format!(
+                                "{exec_text}\nerror: could not check whether a commit landed \
+                                 on detached HEAD before reattaching: {error}"
+                            );
+                        }
+                    }
+                }
+                // Always reattach, success or failure alike — an unpaired
+                // detach leaves the worktree stuck on a detached HEAD for
+                // every subsequent git command in this session.
+                if let Err(error) =
+                    crate::git_hardening::reattach_own_head(&move_info.identity, branch)
+                {
+                    exec_outcome = crate::ExecOutcome::Failed;
+                    exec_text = format!(
+                        "{exec_text}\nerror: could not restore branch '{branch}' as HEAD: {error}"
+                    );
+                }
+                if let Some(guard) = detach_guard.as_mut() {
+                    guard.resolve();
+                }
+            }
+            let result = executed((exec_text, exec_outcome));
             // #2636 finding 1: use the typed out-param from the pre-exec denial
             // path — only a denial that fired BEFORE the child ran populates
             // fs_pre_exec_missing. Child stdout that happens to contain the

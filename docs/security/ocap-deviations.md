@@ -76,6 +76,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `unconfined-fallback-on-missing-backend` | attacker-exec refuses (never runs advisory) when the native fs/net backend is unavailable | 🟠 ACTIVE | (run_command advisory-fallback; fixed by a per-axis bridle strength floor) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
+| `native-git-broker-exec-floor` | `NativeGitBroker`'s own `git` re-dispatch exec axis is kernel-enforced | 🟡 BOUNDED | (narrowed to `ExecOrigin::BrokerMediated`'s two call sites; fs/net stay Kernel — #2693) |
 | `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`; macOS `O_NOFOLLOW` fd walk) | 🟢 closed (Linux) / 🟡 partial (macOS) | (macOS: `find_root_contained` and the `newt-tools` applier stay lexical; other platforms: lexical fallback) |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
 | `mcp-under-leash` | every MCP call mediated at call time (witness-typed leash; authority = structural grant, never the tool name; no-persona ≠ unrestricted) | 🟢 closed | (credential broker → `b1`; per-call budget = follow-on) |
@@ -1087,6 +1088,55 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   child did not already hold. CLOSES to a kernel-granularity exec fence with `b1`'s OS floor. owner: —
   · review-by: with `b1` / epic #749.
 
+### native-git-broker-exec-floor
+- **Invariant (ideal):** every attacker/host-influenced confined spawn's `exec` axis is kernel-enforced
+  (`AxisEnforcement::Kernel`) before it is trusted — never admitted at a weaker tier.
+- **Practical caveat (now):** `NativeGitBroker`'s own `git` re-dispatch (`RepositoryProbe::output`,
+  `original_hooks` — `newt-core/src/native_git_broker.rs`) mints its `ExecRequest` under
+  `confined_exec::ExecOrigin::BrokerMediated`, which raises the gate's floor via
+  `agent_bridle::EnforcementFloor::CONFINED` instead of the scalar `AxisEnforcement::Kernel`:
+  `fs_read`/`fs_write`/`net` still require `Kernel` (unchanged — a restricted fs/net axis the governing
+  backend cannot kernel-enforce still refuses, #10 untouched), but `exec` is accepted at the
+  `Interceptor` tier. Under Landlock a restricted `exec` axis can never report above `Interceptor` — the
+  loader/interpreter trampoline is the same documented, permanent residual `exec-behavior-bound` above
+  already names (agent-bridle ADR 0011 D7) — so the PRIOR scalar `ExecOrigin::AgentInfluenced` `Kernel`
+  floor refused this dispatch UNCONDITIONALLY on every Linux host, making a governed commit through the
+  broker impossible in a default-permission session (#2693). `BrokerMediated` is minted ONLY at these two
+  call sites: a host-side, fixed-program (`git`), policy-mediated re-dispatch — never a raw model
+  `run_command`, which keeps the stricter `AgentInfluenced` scalar floor unchanged.
+- **Residual:** 🟡 — this is a relaxation of the exec enforcement requirement: the broker's
+  `git` re-dispatch accepts Interceptor enforcement instead of Kernel. The loader/interpreter
+  trampoline residual remains. The floor preserves the request's existing fs/net authority; it does
+  not turn granted access into deny-all authority or make a trampolined process harmless.
+- **Disabled while open:** raw model `run_command` spawns retain the stricter `AgentInfluenced`
+  floor. The two broker probe sites accept the weaker exec tier so governed commits can proceed.
+- **Compensating controls:** `EnforcementFloor::CONFINED` still demands `Kernel` for restricted
+  fs/net axes (fail-closed unchanged). The two current `BrokerMediated` call sites are inside
+  `NativeGitBroker`. The executable is host-selected and the appended probe operation is
+  host-constructed, but `RepositoryProbe` copies the command's global-option prefix, environment,
+  and cwd; these inputs are not wholly host-controlled. The broker also checks message/signature/
+  object policy. The attribution-only fixture proves its trailer policy reached the commit through
+  the hook handshake; it does not establish general commit unforgeability or exercise signing.
+- **Closure criterion:** the SAME kernel-granularity exec fence `exec-behavior-bound` already names
+  (Tier-2, `b1` / #57 — W^X + a micro-VM rootfs, or seccomp `execve` argument binding) that makes the
+  loader trampoline unrepresentable, OR evidence that Landlock's `Execute` rule is a complete identity
+  boundary for THIS broker's spawn shape (ADR 0011 D7 says it is not, today).
+- **Ratchet guard:** `newt-core/tests/native_git_broker_pipeline.rs`
+  (`governed_commit_carries_the_attribution_trailer`, real-resource, Landlock + fixture-`git`-gated)
+  asserts the Kernel/Interceptor refusal text ABSENT and requires the attribution trailer. Reverting
+  the broker probes to `AgentInfluenced` fails this test; adding an unrelated `BrokerMediated` caller
+  is not detected. The fixture explicitly grants common-gitdir writes to isolate the exec floor;
+  it does not prove the default linked-worktree write repair tracked by #2686. Run with
+  `NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL=1 cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
+  to reject missing prerequisites rather than skip. The weekly/release workflow requires this mode.
+- **Bounded-by:** `p4-constrained-executor`, `fs-canonical-containment` — these CLOSED invariants
+  keep requests routed through the confined executor and fs authority canonical-path object-bound.
+  A trampolined process retains the request's existing fs/net grants within that envelope, which may
+  permit access. (`exec-behavior-bound` is itself BOUNDED, not CLOSED, so it cannot anchor this chain.)
+- **Status:** BOUNDED — a governed commit with Interceptor exec enforcement is reachable. The
+  remaining bounds are the unchanged fs/net enforcement floor, the current two broker probe sites,
+  and the broker's policy checks, subject to the residual above. owner:
+  — · review-by: with `exec-behavior-bound` / `b1`.
 
 ### dependency-fetch-egress
 - **Invariant (ideal):** a child granted network for named hosts can reach only those hosts, enforced by the kernel.
@@ -1125,9 +1175,13 @@ resolved in a later release:
 
 - Windows is refused outright — no native ownership/writability check exists
   yet for the trust predicate the broker relies on.
-- `Scope::All` (unrestricted network) is refused, and push governance is
-  disclaimed there entirely — the model already holds unrestricted network
-  in that grant, so nothing this broker adds would bound it.
+- Availability defect REPAIRED (#2700): standalone intercepted `git push`
+  and `gh pr create` now use the sanctioned broker under `Scope::All`.
+  The broker still checks filesystem and exec authority, trusted tools,
+  staging, and the destination's network grant.
+- Governance residual OPEN: an opaque descendant with unrestricted network
+  can bypass the broker. Removing the `Scope::All` preflight refusal does
+  not constrain that descendant; it remains outside the guarantee above.
 - Credential-helper compatibility is limited to two forms: a bare name
   (resolved inside the trusted git's `--exec-path`) and the exact `gh
   setup-git` form (`!<trusted gh> auth git-credential`). Any other
@@ -1176,6 +1230,35 @@ resolved in a later release:
   confined fetch may read. On Linux the fence anchors on the held
   descriptors (`agent_bridle::HeldReadRoot`), which closes the window;
   `verify_identities` stays as defence in depth.
+
+### Native commit cancellation: lease shutdown is not tree completion (#2686)
+
+**Open residual, operator-accepted 2026-10-04; completion contract tracked
+upstream as Gilamonster-Foundation/agent-bridle#420.** Cancelled native commit recovery now retains its
+owned identity and guard through the shell execution lease. It records an orphan
+candidate and reattaches HEAD after the owner's shutdown path; cancellation
+never authorizes publication of the branch ref.
+
+The shell supervisor kills the process group and direct child only:
+`vendor/agent-bridle-tool-shell/src/lib.rs:99` (`kill_child_tree`) explicitly
+excludes descendants that leave the group; `brush_shell.rs:582`
+(`OwnedWorker::terminate`) waits for the direct child, and `brush_shell.rs:596`
+(`OwnedWorker::drop`) discards a termination error. A descendant that leaves the
+process group can survive cancellation and write repository state after
+recovery. Lease release is not an acknowledgement that every descendant exited.
+
+The deterministic native Git regression blocks an actual broker hook callback,
+cancels its waiter, and proves HEAD stays detached until that shutdown path is
+released. It does not close the escaped-descendant residual. Closure requires an
+upstream completion contract covering all admitted descendants, explicit cleanup
+failure handling, and live-dispatch tests proving no writes after recovery.
+
+A separate remaining read limitation: `git_hardening::hardened_git_common`
+reacquires `common_dir` by pathname when spawning Git queries. These are not
+queries through the held object-database descriptor; identity verification does
+not close that check-to-use window. Native ref/HEAD writes remain descriptor-
+bound. Resolving a candidate as a commit object proves neither process shutdown
+nor durability, and is not strict full-OID validation.
 
 ## 5. How to use this (for the practical-caveat moments)
 

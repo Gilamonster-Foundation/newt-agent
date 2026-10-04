@@ -136,6 +136,38 @@ fn create_writes_only_beneath_the_root() {
     );
 }
 
+/// `create_new` is the EXCLUSIVE half `create` deliberately is not: a second
+/// caller racing the same lockfile name must see `EEXIST`, never a silent
+/// truncation of the first caller's still-unpublished content (git's own
+/// `<ref>.lock` protocol, which `git_hardening`'s native ref writer reuses
+/// this method for).
+#[test]
+#[serial]
+fn create_new_refuses_an_existing_file_and_create_does_not() {
+    let ws = tempdir().unwrap();
+    let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+    let mut f = dir.create_new(Path::new("ref.lock")).unwrap();
+    f.write_all(b"first").unwrap();
+    drop(f);
+
+    let err = dir
+        .create_new(Path::new("ref.lock"))
+        .expect_err("a second exclusive create on the same name must refuse");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("ref.lock")).unwrap(),
+        "first",
+        "a refused create_new must not touch the existing content"
+    );
+
+    // The ordinary `create` this is NOT a replacement for: it still truncates.
+    dir.create(Path::new("ref.lock")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("ref.lock")).unwrap(),
+        ""
+    );
+}
+
 #[test]
 #[serial]
 fn open_dir_traverses_a_contained_subtree() {

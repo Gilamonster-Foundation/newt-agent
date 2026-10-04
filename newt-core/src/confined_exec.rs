@@ -43,12 +43,38 @@
 //! ([`ExecOrigin::TrustedInfra`] carries the default floor for the small set of
 //! fixed-argv internal helpers that are *not* attacker-influenced; it is here
 //! for signature completeness and is not used by the agent-exec paths.)
+//!
+//! # The per-axis exception (`ExecOrigin::BrokerMediated`, issue #2693)
+//!
+//! `AgentInfluenced`'s **scalar** `Kernel` floor demands `Kernel` on *every*
+//! axis, including `exec`. Under Landlock a restricted `exec` axis can only
+//! ever report `Interceptor` — the loader/interpreter trampoline is a
+//! documented, permanent residual (agent-bridle `exec-behavior-bound` /
+//! ADR 0011 D7), not a bug — so an `AgentInfluenced` spawn with a restricted
+//! `exec` scope refuses unconditionally on Linux, for every caller, forever.
+//! [`NativeGitBroker`](crate::native_git_broker) hit exactly this: its own
+//! host-side re-dispatch of `git` (`exec: Scope::only(["git"])`) always
+//! refused, so a governed commit could never land in a default-permission
+//! session (#2693).
+//!
+//! [`ExecOrigin::BrokerMediated`] is the honest per-axis floor for that case:
+//! `agent_bridle::EnforcementFloor::CONFINED` (`fs_read`/`fs_write`/`net` =
+//! `Kernel`, `exec` = `Interceptor`). It is **not** a widening of
+//! `AgentInfluenced` — the filesystem and network axes still fail closed
+//! exactly as before. It accepts the Interceptor-level exec residual ONLY
+//! where a host-side broker (not the model) already decides, by its own
+//! policy, which fixed program and argv may run — `NativeGitBroker`'s
+//! `RepositoryProbe` re-dispatch, never a model-chosen command. Recorded as a
+//! named deviation: `docs/security/ocap-deviations.md` §
+//! `native-git-broker-exec-floor`.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agent_bridle::{AxisEnforcement, ConfinedCommand, Gate, Tool, ToolContext, ToolError};
+use agent_bridle::{
+    AxisEnforcement, ConfinedCommand, EnforcementFloor, Gate, Tool, ToolContext, ToolError,
+};
 
 use crate::caveats::{Caveats, Scope};
 
@@ -67,15 +93,27 @@ pub enum ExecOrigin {
     /// spawn inventory classifies `trusted-*`; the attacker-influenced paths
     /// always use [`ExecOrigin::AgentInfluenced`].
     TrustedInfra,
+    /// A fixed-program, policy-mediated re-dispatch issued by a HOST-SIDE
+    /// broker that already bounds which program/argv may run — not a raw
+    /// model `run_command` (see the module doc's "per-axis exception").
+    /// Minted under [`agent_bridle::EnforcementFloor::CONFINED`]: `fs`/`net`
+    /// still require `Kernel` (fail-closed, #10 unchanged), `exec` accepts
+    /// the `Interceptor` tier Landlock actually provides. Currently used only
+    /// by [`crate::native_git_broker::NativeGitBroker`]'s own `git`
+    /// re-dispatch.
+    BrokerMediated,
 }
 
 impl ExecOrigin {
     /// The `Gate` an origin authorizes through — `AgentInfluenced` raises the
-    /// enforcement floor to `Kernel` so an un-kernel-enforceable fence refuses.
+    /// enforcement floor to `Kernel` so an un-kernel-enforceable fence refuses;
+    /// `BrokerMediated` raises it to the per-axis `CONFINED` floor instead,
+    /// which keeps fs/net at `Kernel` but accepts `Interceptor` for exec.
     fn gate(self) -> Gate {
         match self {
             Self::AgentInfluenced => Gate::new(0).with_strength_floor(AxisEnforcement::Kernel),
             Self::TrustedInfra => Gate::new(0),
+            Self::BrokerMediated => Gate::new(0).with_enforcement_floor(EnforcementFloor::CONFINED),
         }
     }
 }
@@ -2003,6 +2041,45 @@ mod tests {
         let trusted_cx = mint_context(ExecOrigin::TrustedInfra, &caveats).unwrap();
         assert_ne!(trusted_cx.strength_floor().exec(), AxisEnforcement::Kernel);
         assert_ne!(trusted_cx.strength_floor().net(), AxisEnforcement::Kernel);
+    }
+
+    /// #2693: `BrokerMediated` is the per-axis fix for `NativeGitBroker`'s own
+    /// git re-dispatch — fs/net stay at the SAME `Kernel` floor `AgentInfluenced`
+    /// requires (no widening there), but exec is accepted at `Interceptor`
+    /// instead of demanding `Kernel` (which Landlock's restricted-exec axis can
+    /// never report — see the module doc). Mutation: if this ever regressed to
+    /// `AgentInfluenced`'s scalar floor, `exec()` here would equal `Kernel` and
+    /// this assertion would fail.
+    #[test]
+    fn broker_mediated_mints_under_the_per_axis_confined_floor() {
+        let caveats = workspace_confined_caveats(Path::new("/ws"));
+        let agent_cx = mint_context(ExecOrigin::AgentInfluenced, &caveats).unwrap();
+        let broker_cx = mint_context(ExecOrigin::BrokerMediated, &caveats).unwrap();
+        assert_eq!(
+            broker_cx.strength_floor().fs_read(),
+            agent_cx.strength_floor().fs_read()
+        );
+        assert_eq!(
+            broker_cx.strength_floor().fs_write(),
+            agent_cx.strength_floor().fs_write()
+        );
+        assert_eq!(
+            broker_cx.strength_floor().net(),
+            agent_cx.strength_floor().net()
+        );
+        assert_eq!(
+            broker_cx.strength_floor().fs_read(),
+            AxisEnforcement::Kernel
+        );
+        assert_eq!(broker_cx.strength_floor().net(), AxisEnforcement::Kernel);
+        assert_eq!(
+            broker_cx.strength_floor().exec(),
+            AxisEnforcement::Interceptor
+        );
+        assert_ne!(
+            broker_cx.strength_floor().exec(),
+            agent_cx.strength_floor().exec()
+        );
     }
 
     #[test]

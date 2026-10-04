@@ -17,6 +17,7 @@ pub mod attribution;
 pub mod backend_probe;
 pub mod build_info;
 pub mod card_catalog;
+pub mod caveat_pack;
 pub mod caveats;
 pub mod classifiers;
 /// The cognition session dial — the `/cognition` override resolved over a

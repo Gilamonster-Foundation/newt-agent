@@ -326,6 +326,38 @@ pub trait PermissionGate {
     /// such queue have nothing to drop.
     fn consume_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
 
+    /// #2689/#2681 round 3: the inverse of [`Self::consume_pending_once`] —
+    /// a caller that just received `Allow(kind, target)` but is NOT spending
+    /// it on an immediate, one-shot action (because replaying the denied
+    /// command is not provably safe) tells the gate to hold the grant for
+    /// the model's own next matching call instead, exactly as the ordinary
+    /// request→retry flow already does for `request_permissions`. Default
+    /// no-op: gates with no such queue have nothing to hold.
+    fn queue_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
+
+    /// #2691 round 3 (P2): called BEFORE a dispatch runs (`shell.rs`,
+    /// `exec_confined_command_with_broker`'s top), once per exec target the
+    /// about-to-run command statically needs. When `(kind, target)` is
+    /// already sitting in the gate's pending-once queue — put there by
+    /// [`Self::queue_pending_once`] because an earlier denial of THIS SAME
+    /// target was not provably safe to auto-replay (e.g. a compound `git add
+    /// -A && git commit …`) — binds it into `baseline` and consumes it
+    /// (one-shot), so the model's re-issue of the held command succeeds on
+    /// its first attempt instead of being denied all over again and looping
+    /// through "granted…Retry the original operation now" forever. Scoped to
+    /// the exact target named: an unrelated command must never inherit a
+    /// grant queued for a different retry. Returns `baseline` unchanged, and
+    /// consumes nothing, when no match is queued. Default no-op: gates with
+    /// no such queue have nothing to bind.
+    fn apply_pending_once(
+        &mut self,
+        _kind: DenialKind,
+        _target: &str,
+        baseline: &Caveats,
+    ) -> Caveats {
+        baseline.clone()
+    }
+
     /// Ask for additions to this invocation's authority, retaining its caller
     /// bounds and prior one-shot grants. Legacy gates may conservatively drop
     /// prior call-only authority, but cannot restore unrelated broader authority.

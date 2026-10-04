@@ -149,10 +149,13 @@ fn sse_replay(text: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
 }
 
-/// How long a raw-stream test may take. A reader whose interrupt arm is
-/// broken never sees EOF from `serve_stream_parts`, so without a bound the test
-/// would hang instead of failing.
-pub(super) const RAW_STREAM_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+/// The hang guard on a raw-stream test. A reader whose interrupt arm is broken
+/// never sees EOF from `serve_stream_parts`, so without a guard the test would
+/// hang instead of failing. It is the shared guard, not a budget: the test
+/// completes on the stream's own event (EOF, `message_stop`, or the interrupt),
+/// and the former 10 s bound was crossed by machine load alone — 16 MiB of
+/// loopback padding under a 32-thread nextest run beside a build.
+pub(super) const RAW_STREAM_TEST_BOUND: std::time::Duration = crate::test_guard::HANG_GUARD;
 
 /// A raw HTTP/1.1 stream for what wiremock cannot drive: chunk boundaries, and
 /// an interrupt that lands inside a stream's read loop rather than its send.

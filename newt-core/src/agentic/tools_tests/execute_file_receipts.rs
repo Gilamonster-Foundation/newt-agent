@@ -319,20 +319,30 @@ fn file_mutations_refuse_a_fifo_before_the_legacy_reads_can_block() {
         .env(CHILD, &done)
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "FIFO tool child failed: {status}");
-            assert!(done.exists(), "the exact FIFO child test did not run");
-            break;
+    // The child's exit is the event; a mutation blocked on the FIFO never
+    // produces it, and the shared hang guard names that. The former 10 s
+    // deadline also had to cover exec of this whole test binary under load,
+    // and called a slow start a FIFO block.
+    let pid = child.id();
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = exited_tx.send(child.wait().unwrap());
+    });
+    let status = match exited_rx.recv_timeout(crate::test_guard::HANG_GUARD) {
+        Ok(status) => status,
+        Err(_) => {
+            // SAFETY: `pid` is the child this test spawned and still owns
+            // through the waiter thread, so the signal cannot reach another
+            // process's reused id.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            panic!(
+                "a file mutation blocked on a FIFO with no writer: the child ran past the {}s hang guard",
+                crate::test_guard::HANG_GUARD.as_secs()
+            );
         }
-        if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("a file mutation blocked on a FIFO with no writer");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    };
+    assert!(status.success(), "FIFO tool child failed: {status}");
+    assert!(done.exists(), "the exact FIFO child test did not run");
 }
 
 struct ChangeWhileConfirming {

@@ -376,7 +376,7 @@ async fn responses_smart_gate_sees_a_check_the_model_already_ran() {
             .mount(&server)
             .await;
         let harness = SmartHarness::new(
-            agent_harness::Session::new(Default::default()).unwrap(),
+            agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(|_| Box::pin(async { Ok(("\"answer\"".to_string(), None)) })),
             AdjudicationSettings::default(),
         )

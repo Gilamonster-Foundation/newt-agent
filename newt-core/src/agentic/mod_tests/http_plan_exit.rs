@@ -150,7 +150,7 @@ async fn check_approval_handoff(wire: &'static str, smart: bool, reject_exit: bo
     let draft = DraftSlot::default();
     let ledger = crate::agentic::scheduled::SessionStepLedger::default();
     let harness = crate::agentic::smart_harness::SmartHarness::new(
-        agent_harness::Session::new(Default::default()).unwrap(),
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
         Arc::new(|_| Box::pin(async { Ok(("\"answer\"".to_string(), None)) })),
         Default::default(),
     )

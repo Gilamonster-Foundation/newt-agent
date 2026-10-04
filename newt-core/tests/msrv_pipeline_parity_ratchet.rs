@@ -103,11 +103,12 @@ fn sole_cargo_command(block: &str, what: &str) -> String {
     found.remove(0)
 }
 
-/// Strip a `+<toolchain>` selector: the justfile picks the toolchain inline,
-/// the workflow picks it with `dtolnay/rust-toolchain@`. Everything after that
-/// difference must match.
+/// Strip the explicit selector used by each MSRV gate. GitHub expressions
+/// contain spaces, so remove that complete selector before tokenizing.
+/// Everything after the toolchain selection must match.
 fn without_toolchain_selector(cmd: &str) -> String {
-    cmd.split_whitespace()
+    cmd.replace("+${{ steps.msrv.outputs.version }}", "")
+        .split_whitespace()
         .filter(|w| !w.starts_with('+'))
         .collect::<Vec<_>>()
         .join(" ")
@@ -173,7 +174,7 @@ fn the_ci_msrv_command_equals_the_justfile_msrv_command() {
     let job = ci_msrv_job().expect("the msrv job exists");
     let recipe = justfile_msrv_recipe().expect("the msrv recipe exists");
 
-    let ci_cmd = sole_cargo_command(job, "ci.yml msrv job");
+    let ci_cmd = without_toolchain_selector(&sole_cargo_command(job, "ci.yml msrv job"));
     let just_cmd = without_toolchain_selector(&sole_cargo_command(recipe, "justfile msrv recipe"));
 
     assert_eq!(
@@ -219,6 +220,12 @@ fn every_msrv_gate_reads_the_declared_floor_instead_of_restating_it() {
     assert!(
         job.contains("toolchain: ${{ steps.msrv.outputs.version }}"),
         "ci.yml msrv job: the toolchain must be the read step's output"
+    );
+    // PR #2711: installing the floor does not override rust-toolchain.toml.
+    assert!(
+        sole_cargo_command(job, "ci.yml msrv job")
+            .starts_with("cargo +${{ steps.msrv.outputs.version }} check "),
+        "ci.yml msrv job: cargo must explicitly select the declared floor, not the pin"
     );
     assert!(
         recipe.contains("cargo +\"${msrv}\""),

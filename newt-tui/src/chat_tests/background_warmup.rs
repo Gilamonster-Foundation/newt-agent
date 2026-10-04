@@ -24,13 +24,17 @@ async fn repository_navigator_warms_in_background_and_joins_complete() {
     let mut nav = newt_core::NavigatorSession::default();
 
     // Iteration #3 contract: adoption happens only once the build is done —
-    // wait for readiness (bounded), then adopt. A still-running warm-up is
-    // covered by `unfinished_warmup_is_left_running_and_the_turn_degrades`.
-    for _ in 0..200 {
-        if warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // wait for the build to finish (the event; only the shared hang guard
+    // bounds it), then adopt. A still-running warm-up is covered by
+    // `unfinished_warmup_is_left_running_and_the_turn_degrades`. The former
+    // 200 × 50 ms loop was a 10 s budget that a loaded box crossed.
+    let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
+    while !warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the warm-up build never finished"
+        );
+        tokio::task::yield_now().await;
     }
     finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
 
@@ -71,7 +75,6 @@ async fn semantic_indexing_never_blocks_the_turn() {
     let index = std::sync::Arc::new(newt_core::SessionSemanticIndex::default());
     let files = vec![("main.rs".to_string(), "pub fn f() {}".to_string())];
 
-    let started = std::time::Instant::now();
     let mut warmup = Some(spawn_semantic_indexing(
         &rt,
         files,
@@ -79,10 +82,9 @@ async fn semantic_indexing_never_blocks_the_turn() {
         std::sync::Arc::clone(&index),
         newt_core::OnEmbedFailure::default(),
     ));
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "spawning the embed must never block the turn"
-    );
+    // No stopwatch: the embedder is gated on a Notify nothing has released
+    // yet, so a spawn that blocked on it would never return, and reaching
+    // this line is the proof that spawning never blocks the turn.
     assert!(
         poll_semantic_indexing(&rt, &mut warmup).is_none(),
         "an unfinished embed is never joined"
@@ -94,14 +96,18 @@ async fn semantic_indexing_never_blocks_the_turn() {
     }
 
     // Release the gated forward; the build finishes and a later poll
-    // adopts it.
-    release.notify_waiters();
-    for _ in 0..200 {
-        if warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
-            break;
-        }
-        release.notify_waiters();
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    // adopts it. `notify_one` stores a permit if the embed has not reached
+    // its `notified()` yet, so one call suffices (the former loop re-notified
+    // every 25 ms because `notify_waiters` wakes only parked tasks); the
+    // build finishing is the event, bounded only by the hang guard.
+    release.notify_one();
+    let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
+    while !warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the released embed never finished"
+        );
+        tokio::task::yield_now().await;
     }
     let adopted = poll_semantic_indexing(&rt, &mut warmup);
     assert!(warmup.is_none(), "a finished embed is consumed");
@@ -132,12 +138,9 @@ async fn unfinished_warmup_is_left_running_and_the_turn_degrades() {
     let mut where_is = None;
     let mut nav = newt_core::NavigatorSession::default();
 
-    let started = std::time::Instant::now();
+    // No stopwatch: a `finish` that joined the gated build would never return
+    // (the gate is only released below), so returning at all is the proof.
     finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "finish must return promptly, never join an unfinished build"
-    );
     assert!(
         warmup.is_some(),
         "a still-running warm-up must be left running for a later turn"
@@ -147,13 +150,16 @@ async fn unfinished_warmup_is_left_running_and_the_turn_degrades() {
         "nothing adopted from an unfinished build"
     );
 
-    // Release the build; a later turn adopts it.
+    // Release the build; a later turn adopts it once it has finished (the
+    // event), bounded only by the hang guard.
     release.send(()).unwrap();
-    for _ in 0..200 {
-        if warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
+    while !warmup.as_ref().is_some_and(|w| w.handle.is_finished()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the released build never finished"
+        );
+        tokio::task::yield_now().await;
     }
     finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
     assert!(warmup.is_none(), "the finished build is adopted next turn");

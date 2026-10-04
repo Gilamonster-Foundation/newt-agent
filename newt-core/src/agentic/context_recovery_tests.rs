@@ -134,7 +134,7 @@ async fn overflow_smart_projection_cannot_skip_elision_due_to_per_message_roundi
     let navigation_calls = Arc::new(AtomicUsize::new(0));
     let counted_calls = navigation_calls.clone();
     let harness = smart_harness::SmartHarness::new(
-        agent_harness::Session::new(Default::default()).unwrap(),
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
         Arc::new(move |prompt| {
             counted_calls.fetch_add(1, Ordering::SeqCst);
             let catalog: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
@@ -195,7 +195,7 @@ async fn overflow_smart_responses_projection_cannot_skip_elision_due_to_rounding
     let before = trim::estimate_tokens(&input, est);
     assert!(serde_json::to_vec(&input).unwrap().len() <= est.chars_for_tokens(before - 1));
     let harness = smart_harness::SmartHarness::new(
-        agent_harness::Session::new(Default::default()).unwrap(),
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
         std::sync::Arc::new(|prompt| {
             let catalog: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
             let selected = catalog["candidates"]

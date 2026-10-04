@@ -9,6 +9,21 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Fixed — a governed commit is no longer refused in a default-permission Linux session (#2693)
+
+- The native commit broker's own `git` re-dispatch (`NativeGitBroker`) minted
+  under a scalar `Kernel` strength floor that demanded `Kernel` on every
+  axis, including `exec`. Under Landlock a restricted `exec` axis can only
+  ever report `Interceptor` (the loader-trampoline residual is a documented,
+  permanent limitation, not a bug), so the dispatch refused unconditionally
+  on every Linux host, and a governed commit could never land. It now mints
+  under a new `ExecOrigin::BrokerMediated`, a per-axis floor
+  (`agent_bridle::EnforcementFloor::CONFINED`) that keeps `fs`/`net` at
+  `Kernel` (unchanged, fail-closed) while accepting `Interceptor` for `exec`
+  — used only at this broker's two fixed-program re-dispatch sites, never by
+  a raw model `run_command`. Recorded as a named deviation:
+  `docs/security/ocap-deviations.md` § `native-git-broker-exec-floor`.
+
 ### Changed — prompt-draw readers no longer republish runtime settings (#2488)
 
 - A hand edit to `config.toml` is no longer picked up by the next prompt
