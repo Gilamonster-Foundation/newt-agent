@@ -703,7 +703,10 @@ fn old_ref_matches(head: Option<&str>, old: &str) -> bool {
     }
 }
 
-fn commit_parents(commit: &[u8]) -> Result<Vec<String>, String> {
+/// #2682 round 2 (`git_hardening::advance_own_branch_ref`): also reused
+/// host-side to verify the fast-forward/amend shape of a commit landed with
+/// HEAD detached, before the bounded `update-ref` that publishes it.
+pub(crate) fn commit_parents(commit: &[u8]) -> Result<Vec<String>, String> {
     let boundary = commit
         .windows(2)
         .position(|window| window == b"\n\n")

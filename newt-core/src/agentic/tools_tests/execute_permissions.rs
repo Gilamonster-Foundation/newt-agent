@@ -1517,6 +1517,7 @@ async fn a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_b
         None,
         &mut display,
         Some(broker),
+        None,
         &mut None,
     )
     .await;
@@ -2098,6 +2099,7 @@ async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
         None,
         &mut display,
         Some(broker),
+        None,
         &mut None,
     )
     .await;
@@ -2224,6 +2226,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             &mut display,
             None,
+            None,
             &mut None,
         )
         .await;
@@ -2260,6 +2263,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             None,
             &mut display,
+            None,
             None,
             &mut None,
         )
@@ -2307,6 +2311,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             None,
             &mut display,
+            None,
             None,
             &mut None,
         )
@@ -2397,6 +2402,7 @@ async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() 
         None,
         &mut display,
         Some(broker),
+        None,
         &mut None,
     )
     .await;

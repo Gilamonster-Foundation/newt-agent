@@ -125,6 +125,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "native_git_broker_pipeline/cancellation.rs"]
+mod cancellation;
+
+#[cfg(target_os = "linux")]
 mod native {
     use std::path::Path;
     use std::sync::Arc;
@@ -139,6 +143,13 @@ mod native {
         "Co-Authored-By: native-git-broker-pipeline-fixture <fixture@example.invalid>";
 
     pub fn run() {
+        // Cancellation may leave an orphan candidate; never journal fixtures
+        // into the operator's event stream. Set this before starting any runtime.
+        let journal = tempfile::tempdir().unwrap();
+        newt_core::process_env::set_var(
+            "NEWT_EVENT_JOURNAL",
+            journal.path().join("events.jsonl").to_str().unwrap(),
+        );
         // Matches the pub(crate) in-tree fixtures
         // (`agentic::tools_tests::helper_git_shell_grant`), which force this
         // for every real-kernel-fence test. Measured NOT to change the
@@ -164,6 +175,7 @@ mod native {
             }
             governed_commit_carries_the_attribution_trailer().await;
             disabling_the_broker_refuses_the_commit_entirely().await;
+            super::cancellation::run().await;
             println!("{MARKER}");
         });
     }
@@ -234,14 +246,14 @@ mod native {
         assert!(status.success(), "git {args:?} failed");
     }
 
-    fn real_git_output(dir: &Path, args: &[&str]) -> String {
+    pub(super) fn real_git_output(dir: &Path, args: &[&str]) -> String {
         let home = tempfile::tempdir().unwrap();
         let output = hermetic_git(dir, home.path()).args(args).output().unwrap();
         assert!(output.status.success(), "git {args:?} failed");
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
-    fn init_worktree(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    pub(super) fn init_worktree(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let main = root.join("main");
         std::fs::create_dir(&main).unwrap();
         real_git(&main, &["init", "-q"]);
@@ -256,7 +268,7 @@ mod native {
         (main, wt)
     }
 
-    fn session_caveats(wt: &Path) -> Caveats {
+    pub(super) fn session_caveats(wt: &Path) -> Caveats {
         let own_git = newt_core::git_hardening::own_gitdir_grants(wt);
         let mut read_roots = vec![wt.to_string_lossy().into_owned()];
         read_roots.extend(own_git.read.clone());
