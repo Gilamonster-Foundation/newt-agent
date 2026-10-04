@@ -6,6 +6,19 @@ plumbing, and the `ToolEnvelope` result type. It re-exports the canonical
 authority types (`Caveats`, `Scope`, `CountBound`) from `agent-mesh-protocol`
 so every host and tool speaks one lattice.
 
+Trusted-worker image binding (PR #419) is specific to the Linux Landlock
+backend. The worker is opened once through the held-root resolver and must be
+a regular file. Landlock read/exec exceptions use that descriptor, and execution
+uses its `/proc/self/fd` operand with close-on-exec retained. Path replacement
+cannot change the launched object or widen the exception to a directory; this
+pins an inode, not immutable contents. Missing procfs or unsupported descriptor
+execution refuses the Landlock launch, without falling back to the pathname.
+
+Seatbelt, MinimalRootfs, and MicroVm retain their pre-PR exec-only worker
+closure: no worker image read grant is added. AppContainer and Noop declare
+no worker closure. These backends retain their platform launch routes without
+Linux's descriptor-execution path or its image-binding guarantee.
+
 The non-bypassable invariant: a `Tool` can only act through a `ToolContext`,
 and a `ToolContext` can only be minted inside `Gate::authorize`. The tool
 receives the *meet* of granted-and-required authority — least authority by

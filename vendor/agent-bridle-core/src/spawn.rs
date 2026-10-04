@@ -41,6 +41,9 @@ use crate::{
     ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy, Scope,
     ToolContext, ToolError, ToolResult,
 };
+mod worker_image;
+use worker_image::WorkerImage;
+
 use agent_mesh_protocol::Fingerprint;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -699,6 +702,19 @@ impl ConfinedCommand {
         effective: Caveats,
         authority: SpawnAuthority,
     ) -> ToolResult<ConfinedChild> {
+        self.spawn_authorized_observed(cx, effective, authority, || {}, || {})
+    }
+
+    // Private continuation seam: deterministic namespace-mutation controls exercise
+    // the real admission/apply/exec sequence without timers or racing threads.
+    fn spawn_authorized_observed(
+        self,
+        cx: &ToolContext,
+        effective: Caveats,
+        authority: SpawnAuthority,
+        after_admission: impl FnOnce(),
+        after_apply: impl FnOnce() + Send + 'static,
+    ) -> ToolResult<ConfinedChild> {
         // (1) Admission: model-selected programs must be in the exec grant.
         // A trusted worker transition is not model-selected; its fixed program
         // is added only to the mechanism policy below.
@@ -761,7 +777,19 @@ impl ConfinedCommand {
         // instead preserve exec deny-all so its launcher applies the
         // child-process block — so it declares nothing. Neither changes the
         // reported/effective authority.
-        let mut closure = trusted_worker_closure(kind, authority, &self.program)?;
+        // #418/#419 addresses Landlock's separate image read/exec rules.
+        // Other backends keep their own launch protocol; this is backend
+        // dispatch, never a pathname fallback after a failed Landlock bind.
+        let worker_image =
+            if authority == SpawnAuthority::TrustedWorker && kind == SandboxKind::Landlock {
+                Some(WorkerImage::bind(kind, &self.program)?)
+            } else {
+                None
+            };
+        let closure_program = worker_image
+            .as_ref()
+            .map_or(self.program.as_str(), |image| image.program.as_str());
+        let mut closure = trusted_worker_closure(kind, authority, closure_program)?;
         for root in &self.worker_read_resources {
             closure = closure.with_fs_read(root.clone())?;
         }
@@ -850,6 +878,7 @@ impl ConfinedCommand {
             }
             other => other,
         })?;
+        after_admission();
         let mechanism_effective = admitted.mechanism_caveats().clone();
 
         // #2674 P1: a held root's LABEL must be a member of the fs_read scope
@@ -926,12 +955,21 @@ impl ConfinedCommand {
             // supports only Landlock (no wrapper), so the actual program operand
             // is the root; unsupported wrappers refuse rather than guessing at
             // a second target string. Verification consumes fresh backend state.
-            let (spawn_program, spawn_args) = wrap_argv(&prefix, &program, &args);
+            let exec_operand = match &worker_image {
+                Some(image) => image.exec_operand()?,
+                None => program.clone(),
+            };
+            let (spawn_program, spawn_args) = wrap_argv(&prefix, &exec_operand, &args);
 
             // Wrap the child in the backend's command prefix when it confines via
             // a wrapper (Seatbelt, AppContainer); otherwise spawn the program directly.
             let mut cmd = Command::new(&spawn_program);
             cmd.args(&spawn_args);
+            #[cfg(unix)]
+            if let Some(image) = &worker_image {
+                use std::os::unix::process::CommandExt;
+                cmd.arg0(&image.program);
+            }
             cmd.env_clear(); // no ambient environment crosses the boundary …
             for (k, v) in &envs {
                 cmd.env(k, v); // … only the explicitly-granted vars.
@@ -990,9 +1028,14 @@ impl ConfinedCommand {
             // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
             // non-empty. The held roots stay alive here, past `restrict_self`.
             if prefix.is_empty() {
-                sandbox.apply_with_held_roots(&mechanism_effective, &held_read_roots)?;
+                if let Some(image) = &worker_image {
+                    sandbox.apply_with_worker(&mechanism_effective, &image.program, &image.file, &held_read_roots)?;
+                } else {
+                    sandbox.apply_with_held_roots(&mechanism_effective, &held_read_roots)?;
+                }
             }
 
+            after_apply();
             cmd.spawn().map_err(ToolError::from)
         })
         .join()
@@ -1521,18 +1564,28 @@ mod read_resource_tests {
 }
 
 /// The declared [`RuntimeClosure`] for a trusted worker transition — the only
-/// door by which the worker's executable reaches the mechanism's allow-list
+/// door by which the worker's executable reaches the mechanism's allow-lists
 /// (it then flows through [`AdmittedFence::admit`]'s scope check like any
 /// other closure entry; nothing widens the mechanism caveats silently).
 ///
-/// Landlock, Seatbelt, and the identity-closing stronger tiers need the fixed
-/// worker executable in their kernel execute allow-list so the boundary can
-/// launch it — those declare it. AppContainer is different: its launcher
-/// creates the worker as the initial confined process, and `exec: Only([])`
-/// must remain empty so `--no-child-process` is attached to that worker.
-/// Declaring the worker path there would silently turn deny-all into a
-/// non-empty allow-list, disable the kernel child-process mitigation, and
-/// leave an `exec → Kernel` report overclaiming — so it declares nothing.
+/// Seatbelt and the identity-closing stronger tiers declare only the fixed
+/// worker executable on the exec axis. Landlock additionally declares the
+/// worker on the read axis, binding both rules to its held descriptor.
+/// Execute and read are separate Landlock rights: a caller that restricts `fs_read` while
+/// leaving `exec` ambient (`Scope::All`) never merges the worker's path into
+/// the mechanism's exec scope (only a restricted `Only(_)` exec axis gets the
+/// closure's exec entries), so without a matching `fs_read` declaration the
+/// worker's own ELF would be outside every read-allowed root and the kernel
+/// would refuse the worker's self-re-exec with `EACCES` (agent-bridle#418).
+/// `RuntimeClosure::fs_read` and `AdmittedFence::admit`'s merge onto that axis
+/// already exist here (added for `worker_read_resources`); this closure just
+/// needed to declare the worker's own path through that same door. AppContainer
+/// is different: its launcher creates the worker as the initial confined
+/// process, and `exec: Only([])` must remain empty so `--no-child-process` is
+/// attached to that worker. Declaring the worker path there would silently
+/// turn deny-all into a non-empty allow-list, disable the kernel child-process
+/// mitigation, and leave an `exec → Kernel` report overclaiming — so it
+/// declares nothing on either axis.
 ///
 /// A model-selected spawn declares nothing: the closure exists for internal
 /// transitions only, never for authority the model chose.
@@ -1548,10 +1601,17 @@ fn trusted_worker_closure(
         return Ok(RuntimeClosure::empty());
     }
     match kind {
-        SandboxKind::Landlock
-        | SandboxKind::Seatbelt
-        | SandboxKind::MinimalRootfs
-        | SandboxKind::MicroVm => {
+        SandboxKind::Landlock => {
+            // WorkerImage already bound and validated this label. Landlock
+            // replaces it with rules on the held file and executes that object.
+            // Never re-resolve the name after binding.
+            RuntimeClosure::empty()
+                .with_exec(program.to_owned())?
+                .with_fs_read(program.to_owned())
+        }
+        SandboxKind::Seatbelt | SandboxKind::MinimalRootfs | SandboxKind::MicroVm => {
+            // Preserve the pre-#419 exec-only wrapper/domain declaration.
+            // The additional worker read authority belongs only to Landlock.
             RuntimeClosure::empty().with_exec(crate::admitted::canonical_closure_program(program)?)
         }
         SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
@@ -2112,6 +2172,32 @@ mod tests {
             .expect("authorize")
     }
 
+    /// #419 round 2: Linux descriptor execution must not replace another
+    /// backend's worker route. A script exposes the erroneous CLOEXEC/proc-fd
+    /// route on Noop; on macOS the old unconditional bind refuses outright.
+    #[cfg(all(unix, not(all(target_os = "linux", feature = "linux-landlock"))))]
+    #[test]
+    fn non_landlock_trusted_worker_still_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("bridle-non-landlock-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = dir.join("worker");
+        std::fs::write(&worker, "#!/bin/sh\nprintf 'worker-started'\n").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cx = ctx(Caveats::top());
+        let result = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_authorized(&cx, cx.caveats().clone(), SpawnAuthority::TrustedWorker)
+            .and_then(|child| child.child.wait_with_output().map_err(ToolError::from));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let output = result.expect("the non-Landlock worker route must remain available");
+        assert!(output.status.success(), "worker failed: {:?}", output);
+        assert_eq!(output.stdout, b"worker-started");
+    }
+
     /// Core freezes authority at worker spawn and exposes only a one-shot
     /// payload sender. Payload fields that merely *look* authority-bearing do
     /// not replace the captured caveats, and a second send is structurally
@@ -2429,6 +2515,49 @@ mod tests {
             Some(AxisEnforcement::Kernel),
             "the preserved mechanism matches the reported kernel guarantee"
         );
+    }
+
+    /// #419 round 3: non-Landlock workers must retain the pre-PR exec-only
+    /// closure, without adding their image to a restricted read allowance.
+    #[test]
+    fn non_landlock_worker_closure_preserves_restricted_reads() {
+        let current = std::env::current_exe()
+            .expect("current executable")
+            .canonicalize()
+            .expect("canonical current executable")
+            .to_string_lossy()
+            .into_owned();
+        let delegated = Caveats {
+            exec: Scope::only([] as [String; 0]),
+            fs_read: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        };
+        for kind in [
+            SandboxKind::Seatbelt,
+            SandboxKind::MinimalRootfs,
+            SandboxKind::MicroVm,
+        ] {
+            let closure = trusted_worker_closure(kind, SpawnAuthority::TrustedWorker, &current)
+                .expect("non-Landlock worker closure");
+            assert_eq!(
+                closure,
+                RuntimeClosure::empty().with_exec(current.clone()).unwrap(),
+                "{kind:?} must declare exec only, with no worker read grant"
+            );
+            let admitted = AdmittedFence::admit(
+                &delegated,
+                closure,
+                ConfinementMechanism::new(kind, crate::ChildNetworkPolicy::LandlockOnly),
+                EnforcementFloor::from_scalar(AxisEnforcement::Advisory),
+                worker_admitting_projection,
+            )
+            .expect("non-Landlock admission");
+            assert_eq!(admitted.mechanism_caveats().fs_read, delegated.fs_read);
+            assert_eq!(
+                admitted.mechanism_caveats().exec,
+                Scope::only([current.clone()])
+            );
+        }
     }
 
     /// Backends whose wrapper/domain must execute the trusted worker still get
@@ -2792,6 +2921,292 @@ mod landlock_child_tests {
 
         let _ = fs::remove_dir_all(&admitted_dir);
         let _ = fs::remove_dir_all(&other_dir);
+    }
+
+    /// Copy a small, real executable to a fresh directory that is covered by
+    /// neither the default policy's `base_read_paths`/`bin_read_paths` nor any
+    /// granted `fs_read` scope — "a worker binary outside the base read
+    /// paths" (agent-bridle#418).
+    fn worker_binary_outside_base_read_paths() -> PathBuf {
+        let dir = unique_dir("worker-outside-base-read");
+        let source = ["/bin/echo", "/usr/bin/echo"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("echo(1) must exist for this test");
+        let worker = dir.join("worker-echo");
+        fs::copy(source, &worker).expect("copy worker binary (preserves the exec bit)");
+        worker
+    }
+
+    /// agent-bridle#418 (round 2, strace-rooted): `trusted_worker_closure` used
+    /// to add the worker's canonical path to the mechanism's **exec** allow-list
+    /// only, and only when `exec` itself was restricted
+    /// (`AdmittedFence::admit` folds a closure entry into an axis solely when
+    /// that axis is `Scope::Only(_)`). A caller that restricts `fs_read` but
+    /// leaves `exec` ambient (`Scope::All`) therefore never got the worker's
+    /// own ELF into any read-allowed root, and the worker's self-re-exec died
+    /// with a kernel `EACCES` (measured red on `main` before this fix, matching
+    /// the real `execve(...) = -1 EACCES` observed via
+    /// `strace -f -e trace=openat,open,execve`). The fix declares the worker
+    /// image in the closure's `fs_read` too, independent of `exec`'s scope.
+    /// `RuntimeClosure::fs_read` / `AdmittedFence::admit`'s merge already exist
+    /// here (added for `worker_read_resources`); only `trusted_worker_closure`
+    /// needed to declare the worker's own path on that axis.
+    #[test]
+    fn trusted_worker_starts_under_restricted_fs_read_and_ambient_exec() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let granted_read = unique_dir("granted-read");
+
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([granted_read.to_string_lossy().into_owned()]),
+            exec: Scope::All,
+            ..Caveats::top()
+        });
+        let effective = cx.caveats().clone();
+
+        let mut confined = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg("hi")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, effective, SpawnAuthority::TrustedWorker)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "trusted-worker spawn must survive restricted fs_read + ambient \
+                     exec with the worker binary outside the base read paths: {error}"
+                )
+            });
+        let status = confined.child.wait().expect("wait");
+        assert!(status.success(), "the worker must actually run: {status:?}");
+
+        let _ = fs::remove_dir_all(worker.parent().unwrap());
+        let _ = fs::remove_dir_all(&granted_read);
+    }
+
+    /// The companion case the fix must leave unchanged: `fs_read` AND `exec`
+    /// both restricted. This already worked (the worker's path reached
+    /// `mechanism_caveats.exec`, and `read_roots` adds the resolved exec
+    /// grants to the read allow-list when exec is confined) — proved here as a
+    /// real spawn, not just the closure-level unit test, so the #418 fix
+    /// (which also merges the closure into `fs_read`) is checked against it.
+    #[test]
+    fn trusted_worker_starts_under_restricted_fs_read_and_restricted_exec() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let granted_read = unique_dir("granted-read-both-restricted");
+
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([granted_read.to_string_lossy().into_owned()]),
+            exec: Scope::only([worker.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        let effective = cx.caveats().clone();
+
+        let mut confined = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg("hi")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, effective, SpawnAuthority::TrustedWorker)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "trusted-worker spawn must still succeed with both fs_read and \
+                     exec restricted (the pre-#418 working case): {error}"
+                )
+            });
+        let status = confined.child.wait().expect("wait");
+        assert!(status.success(), "the worker must actually run: {status:?}");
+
+        let _ = fs::remove_dir_all(worker.parent().unwrap());
+        let _ = fs::remove_dir_all(&granted_read);
+    }
+
+    /// #2692: composing the vendor's held roots with #419's worker binding
+    /// must keep both original objects after their pathnames are replaced.
+    #[test]
+    fn worker_image_and_held_read_root_survive_replacement_together() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let dir = unique_dir("worker-and-held-root");
+        let worker = dir.join("worker");
+        let read_root = dir.join("read-root");
+        let moved_root = dir.join("original-root");
+        fs::copy("/bin/cat", &worker).unwrap();
+        fs::create_dir(&read_root).unwrap();
+        fs::write(read_root.join("value"), "original-root").unwrap();
+        let held = crate::HeldReadRoot::bind(
+            read_root.to_string_lossy().into_owned(),
+            fs::File::open(&read_root).unwrap().into(),
+        )
+        .unwrap();
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([read_root.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        let swap_worker = worker.clone();
+        let output = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg(moved_root.join("value"))
+            .held_read_roots([held])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_authorized_observed(
+                &cx,
+                cx.caveats().clone(),
+                SpawnAuthority::TrustedWorker,
+                move || {
+                    fs::rename(&read_root, &moved_root).unwrap();
+                    fs::create_dir(&read_root).unwrap();
+                    fs::write(read_root.join("value"), "replacement-root").unwrap();
+                    fs::rename(&swap_worker, swap_worker.with_extension("original")).unwrap();
+                    fs::copy("/bin/false", &swap_worker).unwrap();
+                },
+                || {},
+            )
+            .expect("bound worker and read root must compose")
+            .child
+            .wait_with_output()
+            .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"original-root");
+    }
+
+    /// #419: replacing the admitted path must not execute the replacement.
+    #[test]
+    fn worker_image_replacement_keeps_the_admitted_object() {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let worker = worker_binary_outside_base_read_paths();
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([] as [String; 0]),
+            ..Caveats::top()
+        });
+        let swap = worker.clone();
+        let spawned = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_authorized_observed(
+                &cx,
+                cx.caveats().clone(),
+                SpawnAuthority::TrustedWorker,
+                move || {
+                    fs::rename(&swap, swap.with_extension("original")).unwrap();
+                    fs::copy("/bin/false", &swap).unwrap();
+                },
+                || {},
+            );
+        let safe = match spawned {
+            Err(_) => true,
+            Ok(mut child) => child.child.wait().unwrap().success(),
+        };
+        fs::remove_dir_all(worker.parent().unwrap()).unwrap();
+        assert!(
+            safe,
+            "replacement image ran instead of the admitted echo image"
+        );
+    }
+
+    // Hold an independent hard link to the original cat image in the delegated
+    // read scope. This keeps exec possible on the old implementation after we
+    // restore the pathname: failure to read the IMAGE cannot mask an overbroad
+    // directory grant. Mutations occur synchronously at both stage boundaries.
+    fn worker_read_substitution(symlink_to_parent: bool) {
+        if !landlock_is_supported() {
+            eprintln!("skipping: kernel lacks Landlock");
+            return;
+        }
+        let dir = unique_dir("worker-substitution");
+        let worker = dir.join("worker");
+        let original = dir.join("original");
+        fs::copy("/bin/cat", &worker).unwrap();
+        fs::hard_link(&worker, &original).unwrap();
+        let secret = if symlink_to_parent {
+            dir.join("sibling")
+        } else {
+            dir.join("widened/secret")
+        };
+        if symlink_to_parent {
+            fs::write(&secret, "sibling-secret").unwrap();
+        }
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([original.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+        // Positive startup + ordinary sibling denial control, before substitution.
+        let control = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg(&secret)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn_authorized(&cx, cx.caveats().clone(), SpawnAuthority::TrustedWorker)
+            .expect("control worker starts")
+            .child
+            .wait_with_output()
+            .unwrap();
+        assert!(!control.status.success());
+        assert!(control.stdout.is_empty());
+
+        let before = worker.clone();
+        let after = worker.clone();
+        let restore = original.clone();
+        let spawned = ConfinedCommand::new(worker.to_string_lossy().into_owned())
+            .arg(&secret)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn_authorized_observed(
+                &cx,
+                cx.caveats().clone(),
+                SpawnAuthority::TrustedWorker,
+                move || {
+                    fs::remove_file(&before).unwrap();
+                    if symlink_to_parent {
+                        std::os::unix::fs::symlink(before.parent().unwrap(), &before).unwrap();
+                    } else {
+                        fs::create_dir(&before).unwrap();
+                        fs::write(before.join("secret"), "directory-secret").unwrap();
+                    }
+                },
+                move || {
+                    if symlink_to_parent {
+                        fs::remove_file(&after).unwrap();
+                    } else {
+                        fs::rename(&after, after.parent().unwrap().join("widened")).unwrap();
+                    }
+                    fs::hard_link(&restore, &after).unwrap();
+                },
+            );
+        let safe = match spawned {
+            Err(_) => true,
+            Ok(child) => {
+                let out = child.child.wait_with_output().unwrap();
+                !out.status.success() && out.stdout.is_empty()
+            }
+        };
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            safe,
+            "worker closure widened to a directory and disclosed an ungranted file"
+        );
+    }
+
+    /// #419: substituting a directory during rule construction never grants it.
+    #[test]
+    fn worker_image_directory_substitution_never_grants_directory_read() {
+        worker_read_substitution(false);
+    }
+
+    /// #419: a symlink to the worker's parent must not make its sibling readable.
+    #[test]
+    fn worker_image_symlink_substitution_never_grants_sibling_read() {
+        worker_read_substitution(true);
     }
 }
 
