@@ -80,6 +80,24 @@
 //! this test file. Recorded here as the answer, not re-deferred as a
 //! question.
 //!
+//! **#2693 implements this fix.** `NativeGitBroker`'s two `ExecRequest` call
+//! sites now mint under [`newt_core::confined_exec::ExecOrigin::BrokerMediated`],
+//! whose `gate()` raises the floor via `agent_bridle::EnforcementFloor::CONFINED`
+//! instead of the scalar `AxisEnforcement::Kernel`: `fs_read`/`fs_write`/`net`
+//! still require `Kernel` (unchanged, fail-closed — #10 is not touched), `exec`
+//! now accepts the `Interceptor` tier Landlock actually provides. This is NOT
+//! option (a) from issue #2693 (claiming Landlock enforces exec at `Kernel`
+//! strength) — the loader-trampoline residual this module doc already named is
+//! real and stays open (agent-bridle `exec-behavior-bound`); this is option (b),
+//! a named, non-silent per-axis deviation:
+//! `docs/security/ocap-deviations.md` § `native-git-broker-exec-floor`.
+//! [`governed_commit_carries_the_attribution_trailer`] below no longer
+//! returns early when it sees [`KNOWN_KERNEL_INTERCEPTOR_MISMATCH`] — it
+//! asserts the refusal absent instead, so it fails loudly (quoting the
+//! refusal text) rather than passing quietly. Measured red against the
+//! pre-#2693 `AgentInfluenced` origin, green with `BrokerMediated`, so a
+//! future revert of the floor fails this test rather than passing silently.
+//!
 //! Real-resource tier (see CLAUDE.md "Testing strategy"): Landlock and the
 //! root-owned fixture git, both present in CI:
 //! `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
@@ -91,6 +109,8 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    #[cfg(target_os = "linux")]
+    native::required_kernel_gate_regression();
     if !std::env::args().any(|arg| arg == "--ignored") {
         eprintln!(
             "test native_git_broker_pipeline ... ignored (real toolchain, Landlock, \
@@ -144,8 +164,8 @@ mod native {
             }
             governed_commit_carries_the_attribution_trailer().await;
             disabling_the_broker_refuses_the_commit_entirely().await;
+            println!("{MARKER}");
         });
-        println!("{MARKER}");
     }
 
     const FIXTURE_GIT: &str = "/usr/bin/git";
@@ -154,16 +174,37 @@ mod native {
     /// this binary needs the identical real-kernel-fence + fixture-git
     /// preconditions, and a silent `return` here would make a quietly-green
     /// local run indistinguishable from one that measured nothing.
+    fn kernel_gate(available: bool, required: bool) -> Result<bool, &'static str> {
+        if required && !available {
+            return Err("required native Git broker proof needs Landlock + /usr/bin/git");
+        }
+        Ok(available)
+    }
+
+    /// #2697: a required proof must reject missing prerequisites, not pass a skip.
+    pub fn required_kernel_gate_regression() {
+        assert_eq!(kernel_gate(true, false), Ok(true));
+        assert_eq!(kernel_gate(true, true), Ok(true));
+        assert_eq!(kernel_gate(false, false), Ok(false));
+        assert!(
+            kernel_gate(false, true).is_err(),
+            "required kernel proof must fail when unavailable"
+        );
+    }
+
     fn skip_without_real_kernel_fence() -> bool {
         let available = newt_core::confined_exec::kernel_fs_fence_available()
             && Path::new(FIXTURE_GIT).exists();
-        if !available {
+        let required = std::env::var_os("NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL").is_some();
+        let ready =
+            kernel_gate(available, required).expect("native Git broker proof prerequisites");
+        if !ready {
             eprintln!(
-                "skip: real-kernel-fence test requires Landlock + {FIXTURE_GIT}, neither of \
-                 which is available on this host"
+                "skip: real-kernel-fence test requires Landlock + {FIXTURE_GIT}, one or both of \
+                 which are unavailable on this host"
             );
         }
-        !available
+        !ready
     }
 
     fn hermetic_git_env(home: &Path) -> Vec<(&'static str, String)> {
@@ -218,10 +259,21 @@ mod native {
     fn session_caveats(wt: &Path) -> Caveats {
         let own_git = newt_core::git_hardening::own_gitdir_grants(wt);
         let mut read_roots = vec![wt.to_string_lossy().into_owned()];
-        read_roots.extend(own_git.read);
+        read_roots.extend(own_git.read.clone());
+        // #2693: this fixture isolates the EXEC axis (the Kernel/Interceptor
+        // mismatch this issue fixes). The production write floor
+        // (`own_gitdir_shell_write_grant`, `objects/` only — never `refs/`)
+        // is deliberately narrower; a non-default-branch commit through it
+        // refuses on the ref-write axis regardless of exec, which is
+        // issue #2682/#2686's own (separate, already-tracked) fix, not this
+        // one's. Granting the common gitdir here too is a TEST-ONLY widening
+        // so that axis cannot masquerade as this test's result — an
+        // "admitted configuration" for fs/net, so only the exec floor is
+        // under test.
+        let fs_write_roots = std::iter::once(wt.to_string_lossy().into_owned()).chain(own_git.read);
         Caveats {
             fs_read: Scope::only(read_roots),
-            fs_write: Scope::only([wt.to_string_lossy().into_owned()]),
+            fs_write: Scope::only(fs_write_roots),
             exec: Scope::only(["git".to_string()]),
             net: Scope::none(),
             ..Caveats::top()
@@ -253,6 +305,15 @@ mod native {
     struct TrailerPolicy;
     impl CommitPolicy for TrailerPolicy {
         fn finalize_message(&self, message: &str) -> Result<String, String> {
+            // #2693: `CommitPolicy::finalize_message`'s doc contract requires
+            // "canonical, IDEMPOTENT attribution" — `CommitBroker::check_message`
+            // re-applies it to the already-finalized message and demands the
+            // identical result (`native_git.rs`). A non-idempotent policy that
+            // always appends was never reached before this fixture's governed
+            // commit got past the #2693 exec-floor refusal.
+            if message.contains(TRAILER) {
+                return Ok(message.to_owned());
+            }
             Ok(format!("{message}\n\n{TRAILER}\n"))
         }
         fn signing_required(&self) -> bool {
@@ -265,7 +326,7 @@ mod native {
     }
 
     /// `native_commit_policy` keeps the trait's DEFAULT (`None`) — the
-    /// mutation: no policy means no broker, which `tools.rs`'s `run_command`
+    /// negative control: no policy means no broker, which `tools.rs`'s `run_command`
     /// arm refuses outright rather than falling back to an unmanaged commit
     /// (`run_command_creates_shell_git_commit(cmd) && commit_broker.is_none()`).
     struct NoBrokerGitTool;
@@ -281,9 +342,12 @@ mod native {
         }
     }
 
-    /// The known, named finding this round surfaced (see the module doc):
-    /// the native commit broker's own fail-closed Kernel-enforcement check,
-    /// reached only once the hook handshake actually engages.
+    /// The #2693 ratchet guard, not an expected outcome: the native commit
+    /// broker's own fail-closed Kernel/Interceptor exec-floor mismatch (see
+    /// the module doc), reached only once the hook handshake actually
+    /// engages. Asserted ABSENT below — a regression in
+    /// `ExecOrigin::BrokerMediated`, or a revert to `AgentInfluenced`, must
+    /// fail this test loudly rather than return a quiet "pass".
     const KNOWN_KERNEL_INTERCEPTOR_MISMATCH: &str = "Exec axis requires Kernel";
 
     /// The primary proof: a REAL confined `git commit`, through
@@ -294,14 +358,11 @@ mod native {
     /// of running as an inert `cargo test` process. The published commit's
     /// message must carry the policy's trailer.
     ///
-    /// If this instead hits [`KNOWN_KERNEL_INTERCEPTOR_MISMATCH`] — the
-    /// SECOND finding the module doc names, and now root-caused there too —
-    /// it reports that loudly and returns rather than asserting a weaker
-    /// property or panicking: the `maybe_dispatch` gap this binary exists
-    /// to close IS fixed (the hook handshake visibly engages instead of
-    /// running as a silent no-op), and the newly-reachable refusal is a
-    /// production fix in `NativeGitBroker`'s choice of `ExecOrigin` (module
-    /// doc), not something this test's own caveats can route around.
+    /// #2693: this no longer treats [`KNOWN_KERNEL_INTERCEPTOR_MISMATCH`] as
+    /// an acceptable outcome to report-and-return on — the governed commit
+    /// MUST land on an admitted configuration. Measured red against the
+    /// pre-#2693 `ExecOrigin::AgentInfluenced` origin (this assertion fails
+    /// with the refusal text quoted); green with `ExecOrigin::BrokerMediated`.
     async fn governed_commit_carries_the_attribution_trailer() {
         let root = tempfile::tempdir().unwrap();
         let (main, wt) = init_worktree(root.path());
@@ -332,31 +393,13 @@ mod native {
         )
         .await;
 
-        if out.contains(KNOWN_KERNEL_INTERCEPTOR_MISMATCH) {
-            // This test CANNOT pass until the production fix lands in the
-            // broker (see issue #2693). That fix is a SEPARATE lane, so it must
-            // NOT be masked here as a pass by returning success on the
-            // refusal — doing so would let #2693 stay unshipped while this
-            // test stays green. A refusal is a FAILURE of this test, not a
-            // skip: it records the real state (the hook handshake engaged,
-            // proving the maybe_dispatch gap is fixed) while the still-unknown
-            // pass/fail of the trailer property is recorded by the failure.
-            // The test binary is still scheduled by CI (see the pipeline
-            // file's cross-reference), so #2693's resolution is visible as this
-            // test turning green; the harness never counts a known-blocked
-            // refusal as a pass.
-            panic!(
-                "blocker for issue #2693: the hook handshake engaged (the \
-                 maybe_dispatch gap is fixed) but NativeGitBroker's own git \
-                 dispatch demands a Kernel floor on every axis \
-                 (ExecOrigin::AgentInfluenced) while Landlock's exec axis can \
-                 never report above Interceptor for a restricted scope — this \
-                 file's module doc names the root-caused mismatch and why no \
-                 caveats shape here can route around it. Do NOT treat a \
-                 refusal as success: the trailer assertion is what #2693 \
-                 ships. Tool output was: {out}"
-            );
-        }
+        assert!(
+            !out.contains(KNOWN_KERNEL_INTERCEPTOR_MISMATCH),
+            "the native commit broker refused the governed commit on the Kernel/Interceptor \
+             exec-floor mismatch #2693 fixed (see this file's module doc) — a regression in \
+             `ExecOrigin::BrokerMediated`, or a revert to `AgentInfluenced`, in \
+             native_git_broker.rs: {out}"
+        );
 
         let message = real_git_output(&main, &["log", "-1", "--format=%B", "refs/heads/task"]);
         assert!(
@@ -367,12 +410,12 @@ mod native {
         );
     }
 
-    /// The mutation: with NO commit policy supplied at all (the broker is
+    /// Negative control: with NO commit policy supplied at all (the broker is
     /// never constructed — `NativeGitBroker::new` is called only when
     /// `git_tool.native_commit_policy()` is `Some`), the SAME commit command
     /// must be refused outright rather than landing unmanaged, so the
-    /// trailer assertion above genuinely depends on the broker running,
-    /// not on `git commit` alone always stamping it.
+    /// missing-policy admission is tested separately from broker mediation
+    /// on the admitted positive path.
     async fn disabling_the_broker_refuses_the_commit_entirely() {
         let root = tempfile::tempdir().unwrap();
         let (main, wt) = init_worktree(root.path());

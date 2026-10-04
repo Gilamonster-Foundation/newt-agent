@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned to the version the Rust 1.99 lint-compat PR (#2708/#2709) was green on.
+# To bump: update `channel`, run `rustup toolchain install <version>` on dev boxes,
+# confirm `rust-stable-canary.yml` passes with the new version, then close the
+# tracking issue.
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

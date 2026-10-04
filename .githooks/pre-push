@@ -109,6 +109,9 @@
 #   - the `windows` and `musl` jobs (ci.yml) -- no Windows dev box / musl
 #     cross-target+musl-tools on a typical dev box; ci.yml's own top comment
 #     names these as the same kind of exception
+#   - rust-stable-canary.yml (weekly floating-stable clippy; warns of an
+#     upcoming pin bump before it blocks PRs — never a push gate; see that
+#     workflow's own HOOK PARITY comment)
 #   - every workflow that provides its own non-standard checkout or
 #     toolchain and says so in its own HOOK PARITY comment: newt-web.yml /
 #     newt-web-drive.yml (excluded newt-mesh crate + browser install),
@@ -308,7 +311,7 @@ cargo fmt --all -- --check
 # nextest's discovery model calls EVERY test binary with `--list [--format
 # terse] [--ignored]` to enumerate tests before running any of them. `cargo
 # test` never does this -- it invokes a harness=false binary directly and
-# lets its own main() decide what to do. This repo has six `harness = false`
+# lets its own main() decide what to do. This repo has seven `harness = false`
 # custom-main test binaries (`grep -rn "harness = false" --include=Cargo.toml`),
 # and #1098 is the first thing to ever run nextest against them. Two are
 # confirmed broken by this real push (2026-09-30): newt-git::native_git_commit
@@ -318,16 +321,12 @@ cargo fmt --all -- --check
 # runner; agent-harness::writer_inheritance ignores argv entirely and always
 # runs its fork-based test (tests/writer_inheritance.rs:149), which then hits
 # a broken pipe when nextest closes the child's stdout after the list request
-# it never asked for. newt-core::brush_build_pipeline is excluded alongside
-# them as a precaution -- same shape of custom main, not yet proven safe under
-# nextest's discovery pass either, and cheap to exclude versus expensive to
-# prove. newt-core::native_git_broker_pipeline (#2686 review round 4) is the
-# SAME shape and is excluded for the same reason -- confirmed broken the same
-# way by this real push (2026-10-03): its discovery-time `--list --format
-# terse --ignored` invocation hit the literal "--ignored" presence check and
-# ran the real (multi-minute, real-git, real-Landlock) body during nextest's
-# listing pass, with no sandboxed CI runner context to contain it. The three
-# vendored agent-bridle-tool-shell real-shell binaries
+# it never asked for. newt-core::brush_build_pipeline and (#2693)
+# newt-core::native_git_broker_pipeline are excluded alongside them as a
+# precaution -- same shape of custom main (both gate on an exact `--ignored`
+# match, same as the fix `native_git_commit` still needs), not yet proven safe
+# under nextest's discovery pass either, and cheap to exclude versus expensive
+# to prove. The three vendored agent-bridle-tool-shell real-shell binaries
 # (brush_real, carried_coreutils, named_host_root_real) need `required-features
 # = ["brush"]` / `["carried-coreutils"]` this hook never enables, so they are
 # never compiled here and must NOT be named in this filter -- nextest's
@@ -343,16 +342,20 @@ cargo fmt --all -- --check
 # hook's own no-nextest fallback above. Under that no-arg invocation,
 # writer_inheritance always runs its real fork test (its main() ignores argv
 # entirely) -- so CI's plain `cargo test --workspace` genuinely covers it.
-# native_git_commit, brush_build_pipeline and native_git_broker_pipeline
-# instead gate their real body on an exact `--ignored` match and print a
-# one-line "... ignored" stub without it; grepping every workflow in
-# .github/workflows/ for their test-binary names or an `-- --ignored`
-# invocation that reaches them finds NONE. Their real bodies are therefore
-# DISCLOSED GAPS, not covered anywhere in CI today -- `cargo test -p newt-git
-# --test native_git_commit -- --ignored`, `cargo test -p newt-core --test
-# brush_build_pipeline -- --ignored` and `cargo test -p newt-core --test
-# native_git_broker_pipeline -- --ignored` each need a real-resource CI lane
-# of their own (tracked separately; out of scope here).
+# native_git_commit and brush_build_pipeline instead gate their real body on
+# an exact `--ignored` match and print a one-line "... ignored" stub without
+# it; grepping every workflow in .github/workflows/ for their test-binary
+# names or an `-- --ignored` invocation that reaches them finds NONE. Their
+# real bodies are therefore DISCLOSED GAPS, not covered anywhere in CI today
+# -- `cargo test -p newt-git --test native_git_commit -- --ignored` and
+# `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
+# real-resource CI lane of their own (tracked separately; out of scope here).
+# newt-core::native_git_broker_pipeline gates the SAME way but is NOT a
+# disclosed gap (#2693): `.github/workflows/native-git-broker-real.yml` runs
+# `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
+# weekly and on release tags, with NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL=1
+# so missing Landlock/git fails instead of silently skipping. This remains
+# a CI-only real-resource proof, excluded from the local pre-flight.
 #
 # The six newt-agent binaries are the real-`newt`-session / real-PTY tier;
 # newt-eval::mock_e2e (whole binary) and the two named newt-tui tests are the
