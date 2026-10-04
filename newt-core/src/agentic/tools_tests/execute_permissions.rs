@@ -1458,6 +1458,85 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
     );
 }
 
+/// A command broker that changes nothing — stands in for `NativeGitBroker`
+/// so this test exercises the real `CommandBroker`-bearing dispatch path
+/// without needing a real repository or signing key.
+#[cfg(not(windows))]
+struct NoopBroker;
+
+#[cfg(not(windows))]
+impl agent_bridle_tool_shell::CommandBroker for NoopBroker {
+    fn prepare(
+        &self,
+        _command: &agent_bridle_tool_shell::BrokerCommand,
+        _context: &agent_bridle::ToolContext,
+        _control: &agent_bridle_tool_shell::BrokerControl,
+    ) -> agent_bridle::ToolResult<Option<agent_bridle_tool_shell::PreparedBrokerCommand>> {
+        Ok(None)
+    }
+}
+
+/// #2689 regression: a broker-bearing exec denial (a `git commit` command,
+/// which installs the attribution/signing broker — see `needs_commit_broker`)
+/// must take the SAME operator-prompt path as any other exec denial. Before
+/// the fix, `exec_confined_command_with_broker` returned the denial the
+/// moment `command_broker.is_some()`, before `permission_gate.ask_with_caveats`
+/// was ever called — so an operator's "allow once" had nothing to land on and
+/// a broker-bearing commit could never be let through without a durable
+/// grant (the reported symptom: repeated "capability denied" for `git`).
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_broker() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let denied = Caveats {
+        exec: Scope::none(),
+        // Isolate the exec-retry lifecycle from macOS's unsupported network floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+    let broker: std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker> =
+        std::sync::Arc::new(NoopBroker);
+
+    let out = shell::exec_confined_command_with_broker(
+        "/bin/echo broker-retry-visible",
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        Some(broker),
+        &mut None,
+    )
+    .await;
+
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "a broker-bearing exec denial must consult the gate exactly like any \
+         other exec denial: {}",
+        out.0
+    );
+    assert!(
+        out.0.contains("broker-retry-visible"),
+        "the operator's allow-once must let the broker-bearing command \
+         through on retry, broker still attached: {}",
+        out.0
+    );
+    assert_eq!(out.1, ExecOutcome::Passed, "{}", out.0);
+}
+
 /// #2681 regression: an exec denial is #2628/#2636-replay-eligible exactly
 /// like an FS denial already is. Before the fix, `single_grant_covers_missing`
 /// and `pending_rerun` population were wired for `FsRead`/`FsWrite` only (see
@@ -1853,6 +1932,26 @@ fn exec_denial_is_replay_safe_rejects_every_unsound_shape() {
 
     // Sound: a single simple command naming exactly the denied target.
     assert!(exec_denial_is_replay_safe("/bin/echo", "/bin/echo hello"));
+    // #2689: Brush reports the resolved executable for a bare-name command.
+    #[cfg(unix)]
+    {
+        assert!(exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "./git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "/other/git commit -m fixture"
+        ));
+        assert!(!exec_denial_is_replay_safe(
+            "/usr/bin/git",
+            "git commit -m first; git commit -m second"
+        ));
+    }
     // A harmless read redirect/fd duplication is not a mutating effect.
     assert!(exec_denial_is_replay_safe(
         "/bin/echo",
@@ -1896,41 +1995,447 @@ fn exec_denial_is_replay_safe_rejects_every_unsound_shape() {
     assert!(!exec_denial_is_replay_safe("/bin/echo", "/bin/true"));
 }
 
-/// #2681 round 2 (P2): the retest's actual `git add`/`git commit` loop (a
-/// retest transcript: an exact `request_permissions(exec, "/usr/bin/git")`
-/// grant followed immediately by the SAME denial, repeatedly) is NOT this
-/// PR's mechanism.
-/// Reproduced here through the real dispatch with a `GitTool` collaborator
-/// whose `native_commit_policy()` is `Some` (exactly what makes
-/// `tools.rs`'s `commit_requested`/`commit_broker` detection real, per
-/// `native_git::needs_commit_broker`): a denied `git commit`-shaped command
-/// takes `shell.rs:1230`'s broker early return, which reports the structured
-/// denial WITHOUT ever calling `PermissionGate::ask`/`ask_with_caveats` —
-/// contrast the plain (non-broker) exec denial below, which DOES consult the
-/// gate inline (the pre-existing #263/#905 path, unrelated to #2681).
-///
-/// This matters because newt-tui's `pending_once_grants` queue (what an
-/// operator's `AllowOnce` answer to `request_permissions` populates, per
-/// `newt-tui/src/permissions.rs:2125-2133`) is consumed ONLY from inside
-/// `ask`/`ask_with_caveats`'s `take_pending_once` call — never from
-/// `refresh_caveats`/`mint` (`newt-tui/src/permissions.rs:1853-1858`, which
-/// folds in only `recalled_grants`, i.e. session/durable grants). A
-/// broker-bearing command's manual retry takes the SAME never-asks-the-gate
-/// branch, so an `AllowOnce` grant for it is queued and then structurally
-/// unreachable — which is exactly "granted… Retry the original operation
-/// now" followed by the identical denial, repeated, in the retest.
-///
-/// This is a PRE-EXISTING (#905-era) newt-tui/newt-core interaction, not
-/// #2681/#2636's `PendingRerun` cross-call machinery (which this PR's other
-/// tests cover), and not #2682 (that issue is the FS-write axis — a
-/// worktree's common `.git` dir outside `fs_write` — a different mechanism
-/// again). It needs a newt-tui-side fix (`refresh_caveats`/`mint` folding in
-/// `pending_once_grants`, or the broker branch consulting the gate before
-/// its early return) that is out of scope for this newt-core-only PR; see
-/// RESULT.md. `Fixes #2681` does NOT cover this retest failure.
+/// #2689/#2691 round 3 (P1 measured red): `exec_denial_is_replay_safe`
+/// compares TEXT only, so a net denial whose host label happens to equal
+/// the command's program name (e.g. a CLI literally named after the
+/// service it calls, like the real `host` DNS-lookup tool reaching a host
+/// named "host") passes its string-equality check. `requests_are_replay_safe`
+/// must still refuse to replay it: unlike an exec admission refusal (which
+/// fires before the program ever spawns), a network refusal happens
+/// mid-execution and proves nothing about whether the program already ran
+/// or produced an effect. Measured red: calling `exec_denial_is_replay_safe`
+/// directly on the same target/cmd pair (the bare predicate this function
+/// replaces at the call site) returns `true` — the axis guard is the only
+/// thing standing between that and an unsound auto-replay.
+#[test]
+fn requests_are_replay_safe_excludes_a_same_name_net_host() {
+    use crate::agentic::tools::{exec_denial_is_replay_safe, requests_are_replay_safe};
+
+    let cmd = "host example.test";
+    // Setup: the coincidental name collision must exist, or this test would
+    // not exercise the axis guard at all.
+    assert!(
+        exec_denial_is_replay_safe("host", cmd),
+        "setup: the text-only predicate must call this pair replay-safe"
+    );
+
+    let net_request = PermissionRequest {
+        tool: "run_command".to_string(),
+        kind: DenialKind::Net,
+        target: "host".to_string(),
+        reason: "net does not permit 'host'".to_string(),
+        harness_bound: false,
+    };
+    assert!(
+        !requests_are_replay_safe(std::slice::from_ref(&net_request), cmd),
+        "a net denial must never auto-replay, even when its host label \
+         coincidentally equals the program name"
+    );
+
+    // Contrast: the identical target/cmd pair, but as an EXEC denial, IS
+    // replay-safe — the axis guard excludes net specifically, not everything.
+    let exec_request = PermissionRequest {
+        kind: DenialKind::Exec,
+        ..net_request
+    };
+    assert!(requests_are_replay_safe(
+        std::slice::from_ref(&exec_request),
+        cmd
+    ));
+}
+
+/// #2689/#2681 round 3 (P1 measured red 1): the inline interactive gate
+/// route in `shell.rs` (the SAME `exec_denial_is_replay_safe` predicate,
+/// reused from `tools.rs` — see that function's doc comment) must refuse
+/// to auto-replay a compound command. `/bin/git` is denied, so the
+/// structured denial fires on the SECOND stage of `echo x >> f && git
+/// commit -m m`; agent-bridle's own exec-authority admission refuses the
+/// WHOLE source before either stage runs (measured directly below, and
+/// already established by `approved_exec_replay_never_reruns_an_earlier_
+/// permitted_command` above for the non-broker case) — so `f` does not
+/// exist yet when the operator is asked. Before this fix, an allow-once
+/// here unconditionally re-dispatched the whole source, which — now fully
+/// authorized — would have run BOTH stages for real, creating `f`. This
+/// fix must instead hold the grant and report it without replaying, so `f`
+/// still does not exist after the grant; only the model's own reissue
+/// creates it. Verified against the pre-round-3 code path: temporarily
+/// forcing the predicate to return `true` (restoring the old
+/// unconditional-replay behavior) makes this assertion fail, because the
+/// grant then DOES create `f`.
 #[cfg(unix)]
 #[tokio::test]
-async fn broker_bearing_commit_denial_never_consults_the_gate() {
+async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let marker = ws.path().join("f");
+    let denied = Caveats {
+        exec: Scope::only(["/bin/echo".to_string()]),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+    let broker: std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker> =
+        std::sync::Arc::new(NoopBroker);
+
+    let out = shell::exec_confined_command_with_broker(
+        &format!(
+            "/bin/echo x >> {} && /bin/git commit -m m",
+            marker.display()
+        ),
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        Some(broker),
+        &mut None,
+    )
+    .await;
+
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "a broker-bearing exec denial must still consult the gate exactly \
+         once: {}",
+        out.0
+    );
+    assert!(
+        !marker.exists(),
+        "a compound command must not be auto-replayed on grant — only the \
+         model's own reissue may create `f`: {}",
+        out.0
+    );
+    assert!(
+        out.0.contains("granted"),
+        "the grant must still be reported, so the model knows to retry: {}",
+        out.0
+    );
+}
+
+/// #2691 round 3 (P2): "granted…Retry the original operation now" must
+/// actually work. The grant the test above queues (compound, not
+/// replay-safe) must bind into the model's OWN reissue of the IDENTICAL
+/// command before that reissue dispatches — not merely sit in the queue,
+/// get re-consulted, and get re-queued every single time with no forward
+/// progress (the reported symptom). First call: denied on `/bin/true`
+/// (compound, not replay-safe), grant queued, no replay. SECOND call — the
+/// model's reissue of the SAME command — must succeed in ONE dispatch with
+/// NO new gate consultation: `apply_pending_once` binds the queued grant
+/// into this dispatch's authority before it runs. THIRD call (the SAME
+/// command again): the grant was single-use and is now spent, so the
+/// command is denied again and the gate is consulted afresh.
+/// #2691 insufficient-Allow control: an unrelated returned exec grant must
+/// never enter the pending queue or authorize the later reissue.
+#[cfg(unix)]
+#[tokio::test]
+async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+
+    /// Like `MockGate`, but with a REAL `pending_once_grants`-style queue
+    /// backing `queue_pending_once`/`apply_pending_once`/`consume_pending_once`
+    /// — `MockGate` leaves those at the trait's no-op defaults, which cannot
+    /// exercise this fix at all.
+    struct QueueBackedGate {
+        base: Caveats,
+        queue: std::collections::BTreeSet<(DenialKind, String)>,
+        asks: usize,
+        sufficient: bool,
+    }
+    impl super::PermissionGate for QueueBackedGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.asks += 1;
+            if !self.sufficient {
+                return super::PermissionDecision::Allow(self.base.clone());
+            }
+            let grants: Vec<_> = requests
+                .iter()
+                .map(|r| (r.kind, r.target.clone()))
+                .collect();
+            super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn queue_pending_once(&mut self, kind: DenialKind, target: &str) {
+            self.queue.insert((kind, target.to_string()));
+        }
+        fn consume_pending_once(&mut self, kind: DenialKind, target: &str) {
+            self.queue.remove(&(kind, target.to_string()));
+        }
+        fn apply_pending_once(
+            &mut self,
+            kind: DenialKind,
+            target: &str,
+            baseline: &Caveats,
+        ) -> Caveats {
+            let key = (kind, target.to_string());
+            if self.queue.remove(&key) {
+                crate::agentic::widen_caveats(baseline, &[key])
+            } else {
+                baseline.clone()
+            }
+        }
+    }
+
+    // #2691: an unrelated Allow must not be converted into queued exec authority.
+    for sufficient in [false, true] {
+        let ws = tempfile::TempDir::new().unwrap();
+        let marker = ws.path().join("f");
+        let denied = Caveats {
+            exec: Scope::only(["/bin/echo".to_string()]),
+            #[cfg(target_os = "macos")]
+            net: Scope::All,
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = QueueBackedGate {
+            base: denied.clone(),
+            queue: std::collections::BTreeSet::new(),
+            asks: 0,
+            sufficient,
+        };
+        let mut display =
+            crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+        let cmd = format!("/bin/echo x >> {} && /bin/true", marker.display());
+
+        // ── CALL 1: denied on /bin/true — not replay-safe, grant queued ────────
+        let first = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            &mut None,
+        )
+        .await;
+        assert_eq!(gate.asks, 1, "{}", first.0);
+        assert!(
+            !marker.exists(),
+            "setup: the compound command must not auto-replay on grant: {}",
+            first.0
+        );
+        if sufficient {
+            assert!(first.0.contains("granted"), "{}", first.0);
+        } else {
+            assert!(
+                gate.queue.is_empty(),
+                "insufficient Allow queued authority: {}",
+                first.0
+            );
+            assert!(!first.0.contains("granted"), "{}", first.0);
+        }
+
+        // ── CALL 2: the model's reissue of the IDENTICAL command — must
+        //    succeed in ONE dispatch, with NO new gate consultation ───────────
+        let second = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            &mut None,
+        )
+        .await;
+        if !sufficient {
+            assert_eq!(gate.asks, 2, "insufficient Allow must prompt afresh");
+            assert!(
+                gate.queue.is_empty(),
+                "insufficient Allow queued authority on retry"
+            );
+            assert_eq!(second.1, ExecOutcome::Denied, "{}", second.0);
+            assert!(
+                !marker.exists(),
+                "insufficient Allow authorized later execution"
+            );
+            continue;
+        }
+        assert_eq!(
+            gate.asks, 1,
+            "the reissue must succeed from the queued grant alone, with no \
+         second prompt: {}",
+            second.0
+        );
+        assert!(
+            marker.exists(),
+            "the reissue must actually run (both stages), not just report \
+         granted again: {}",
+            second.0
+        );
+        assert_ne!(second.1, ExecOutcome::Denied, "{}", second.0);
+
+        // ── CALL 3: the SAME command a third time — the grant is spent ────────
+        std::fs::remove_file(&marker).unwrap();
+        let third = shell::exec_confined_command_with_broker(
+            &cmd,
+            &ws.path().to_string_lossy(),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &[],
+            None,
+            &mut Some(&mut gate as &mut dyn super::PermissionGate),
+            false,
+            None,
+            None,
+            &mut display,
+            None,
+            &mut None,
+        )
+        .await;
+        assert_eq!(
+            gate.asks, 2,
+            "a third identical call must consult the gate afresh — one-shot \
+         authority must not become sticky: {}",
+            third.0
+        );
+        assert!(
+            !marker.exists(),
+            "the spent grant must not auto-replay a third time either: {}",
+            third.0
+        );
+    }
+}
+
+/// #2689/#2681 round 3 (P1 measured red 2): the inverse shape — the denied
+/// spawn is SECOND (`/bin/true`) and the FIRST stage is the one with the
+/// real effect (`git commit`). Same reasoning as the test above: agent-
+/// bridle's admission refuses the WHOLE source atomically before either
+/// stage runs, so the repository has no commit beyond its initial one when
+/// the operator is asked. Before this fix, an allow-once would have
+/// unconditionally re-dispatched the whole source, publishing a commit the
+/// operator never separately authorized. This fix must hold the grant
+/// instead, so the commit count is unchanged after the grant.
+#[cfg(unix)]
+#[tokio::test]
+async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    // The confined dispatch below has no "env" override seam (unlike
+    // `dispatch_bridled_shell`'s own callers) — it inherits this test
+    // process's environment, so the git identity has to travel as process
+    // env vars rather than through `hermetic_git_env`'s Command wrapper.
+    let home_str = home.path().to_string_lossy().into_owned();
+    let _home = super::disable_ocap_tests::EnvVar::set("HOME", &home_str);
+    let _an = super::disable_ocap_tests::EnvVar::set("GIT_AUTHOR_NAME", "t");
+    let _ae = super::disable_ocap_tests::EnvVar::set("GIT_AUTHOR_EMAIL", "t@example.invalid");
+    let _cn = super::disable_ocap_tests::EnvVar::set("GIT_COMMITTER_NAME", "t");
+    let _ce = super::disable_ocap_tests::EnvVar::set("GIT_COMMITTER_EMAIL", "t@example.invalid");
+    let _ns = super::disable_ocap_tests::EnvVar::set("GIT_CONFIG_NOSYSTEM", "1");
+    let _gc = super::disable_ocap_tests::EnvVar::set("GIT_CONFIG_GLOBAL", "/dev/null");
+
+    assert!(
+        super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .status()
+            .unwrap()
+            .success(),
+        "setup: a fresh repository has no commit yet (an unborn HEAD)"
+    );
+
+    // `/bin/git` is pre-authorized; `/bin/true` (the second, denied stage) is not.
+    let denied = Caveats {
+        exec: Scope::only(["/bin/git".to_string()]),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+    let broker: std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker> =
+        std::sync::Arc::new(NoopBroker);
+
+    let out = shell::exec_confined_command_with_broker(
+        "/bin/git commit --allow-empty -m m && /bin/true",
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut Some(&mut gate as &mut dyn super::PermissionGate),
+        false,
+        None,
+        None,
+        &mut display,
+        Some(broker),
+        &mut None,
+    )
+    .await;
+
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "the denial on `/bin/true` must still consult the gate exactly once: {}",
+        out.0
+    );
+    assert!(
+        !super::super::tests::git_shell_grant::hermetic_git(ws.path(), home.path())
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .status()
+            .unwrap()
+            .success(),
+        "a compound command must not be auto-replayed on grant — the \
+         already-authorized `git commit` must not run via a replay the \
+         operator never separately saw: {}",
+        out.0
+    );
+}
+
+/// #2689 regression, through the `GitTool`/`PendingRerun` collaborator path:
+/// a denied `git add -A && git commit -q -m probe` (which installs a real
+/// `CommitPolicy`-backed broker, per `native_git::needs_commit_broker`) must
+/// now consult the SAME gate as any other exec denial — this replaces a
+/// round-2 (#2681) test that pinned the OPPOSITE as expected ("the broker
+/// early return must never consult the permission gate"), which was this
+/// exact bug, explicitly scoped out of #2681 as "needs a newt-tui-side fix
+/// … out of scope for this newt-core-only PR" and left for #2689 to close.
+///
+/// `pending_rerun` must still stay `None`: this is the SEPARATE model-driven
+/// `request_permissions`/`PendingRerun` replay in `tools.rs`, which still
+/// excludes every commit-broker command (`commit_broker_used`) regardless of
+/// whether the interactive gate above was consulted.
+#[cfg(unix)]
+#[tokio::test]
+async fn broker_bearing_commit_denial_now_consults_the_gate() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
@@ -2022,12 +2527,11 @@ async fn broker_bearing_commit_denial_never_consults_the_gate() {
         "a broker-bearing exec denial must never populate pending_rerun \
          (commit_broker_used excludes it, by design): {result1}"
     );
-    assert!(
-        deny_gate.asks.is_empty(),
-        "the broker early return (shell.rs:1230) must never consult the \
-         permission gate on denial — an AllowOnce grant queued elsewhere \
-         (newt-tui's pending_once_grants) has no path to be consumed here: \
-         asks={:?}",
+    assert_eq!(
+        deny_gate.asks.len(),
+        1,
+        "a broker-bearing exec denial must now consult the permission gate, \
+         exactly like any other exec denial: asks={:?}",
         deny_gate.asks
     );
     let staged = super::super::tests::git_shell_grant::hermetic_git(&workspace, home.path())
@@ -2036,39 +2540,9 @@ async fn broker_bearing_commit_denial_never_consults_the_gate() {
         .unwrap();
     assert!(
         staged.stdout.is_empty(),
-        "nothing partially ran either — `git add` never staged anything: {}",
+        "the gate declined, so nothing ran either — `git add` never staged \
+         anything: {}",
         String::from_utf8_lossy(&staged.stdout)
-    );
-
-    // ── Contrast: a plain (non-broker) exec denial DOES ask the gate ───────
-    let mut plain_deny_gate = MockGate::new(false, &base);
-    let execution2 = std::sync::OnceLock::<ExecOutcome>::new();
-    let _ = execute_tool_with_collaborators(
-        "run_command",
-        &serde_json::json!({"command": "/bin/echo plain"}),
-        &workspace_str,
-        false,
-        20,
-        &base,
-        &mut NoMcp,
-        ToolCollaborators {
-            permission_gate: Some(&mut plain_deny_gate as &mut dyn PermissionGate),
-            execution: Some(&execution2),
-            ..Default::default()
-        },
-        false,
-        PromptDisposition::Act,
-        None,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(execution2.get(), Some(&ExecOutcome::Denied));
-    assert!(
-        !plain_deny_gate.asks.is_empty(),
-        "the pre-existing #263/#905 inline path DOES consult the gate for a \
-         non-broker exec denial — the asymmetry above is specific to the \
-         broker branch, not a general 'the gate is never asked' fact"
     );
 }
 

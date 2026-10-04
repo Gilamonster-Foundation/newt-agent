@@ -307,7 +307,17 @@ impl CommandBroker for NativeGitBroker {
             .policy
             .snapshot_for_commit()
             .unwrap_or_else(|| self.policy.clone());
-        context.check_exec(&command.program.to_string_lossy())?;
+        if context
+            .check_exec(&command.program.to_string_lossy())
+            .is_err()
+        {
+            // No broker preparation or probe may run without exec authority.
+            // Leave the command unchanged so Brush's mandatory final exec
+            // check refuses it into the structured denial sink. Returning an
+            // error here crosses the broker RPC as an opaque terminating error,
+            // which cannot reach the operator's permission gate (#2689).
+            return Ok(None);
+        }
         context.check_path_read(&command.cwd)?;
         let prefix = command.args[..position]
             .iter()
@@ -336,6 +346,8 @@ impl CommandBroker for NativeGitBroker {
             program: self.native_image.to_string_lossy().into_owned(),
             prefix,
             cwd: command.cwd.clone(),
+            // BrokerMediated supplies the reviewed per-axis enforcement floor;
+            // it does not grant any authority beyond this invocation's caveats.
             caveats: context.caveats().clone(),
             env,
         };
