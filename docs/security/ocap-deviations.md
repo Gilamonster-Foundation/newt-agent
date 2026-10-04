@@ -1104,40 +1104,38 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   broker impossible in a default-permission session (#2693). `BrokerMediated` is minted ONLY at these two
   call sites: a host-side, fixed-program (`git`), policy-mediated re-dispatch — never a raw model
   `run_command`, which keeps the stricter `AgentInfluenced` scalar floor unchanged.
-- **Residual:** 🟡 — the exec axis for this one broker's `git` re-dispatch is Interceptor-bounded, not
-  kernel-bounded: a granted `git` could in principle `ld.so`-trampoline a different program's bytes
-  (the same residual `exec-behavior-bound` already names, applied to one more call site). Bounded
-  identically: fs/net stay object-bound and kernel-fenced regardless of which program trampolines, and
-  `agent_toolchain::native_git::CommitBroker` independently verifies the exact message/signature/object
-  that lands (`check_message`, `prepare_ref_update`, `committed`), so a trampolined process gains no new
-  authority and cannot forge an accepted commit.
-- **Disabled while open:** nothing new — this closes a refusal (a governed commit landing at all); it
-  does not newly enable one. The dangerous capability this entry bounds is `BrokerMediated` ever being
-  reused for a WIDER grant than `EnforcementFloor::CONFINED` or applied to a model-chosen program — not
-  the two call sites it names today.
-- **Compensating controls:** `EnforcementFloor::CONFINED` still demands `Kernel` for fs/net (fail-closed
-  unchanged); `BrokerMediated` is a narrow `ExecOrigin` variant used at exactly two call sites, both
-  inside `NativeGitBroker`, both a host-resolved `git` program with host-constructed argv (never raw
-  model argv); `CommitBroker`'s independent message/signature/object verification bounds what a
-  trampolined exec could do to the commit content even in principle.
+- **Residual:** 🟡 — this is a relaxation of the exec enforcement requirement: the broker's
+  `git` re-dispatch accepts Interceptor enforcement instead of Kernel. The loader/interpreter
+  trampoline residual remains. The floor preserves the request's existing fs/net authority; it does
+  not turn granted access into deny-all authority or make a trampolined process harmless.
+- **Disabled while open:** raw model `run_command` spawns retain the stricter `AgentInfluenced`
+  floor. The two broker probe sites accept the weaker exec tier so governed commits can proceed.
+- **Compensating controls:** `EnforcementFloor::CONFINED` still demands `Kernel` for restricted
+  fs/net axes (fail-closed unchanged). The two current `BrokerMediated` call sites are inside
+  `NativeGitBroker`. The executable is host-selected and the appended probe operation is
+  host-constructed, but `RepositoryProbe` copies the command's global-option prefix, environment,
+  and cwd; these inputs are not wholly host-controlled. The broker also checks message/signature/
+  object policy. The attribution-only fixture proves its trailer policy reached the commit through
+  the hook handshake; it does not establish general commit unforgeability or exercise signing.
 - **Closure criterion:** the SAME kernel-granularity exec fence `exec-behavior-bound` already names
   (Tier-2, `b1` / #57 — W^X + a micro-VM rootfs, or seccomp `execve` argument binding) that makes the
   loader trampoline unrepresentable, OR evidence that Landlock's `Execute` rule is a complete identity
   boundary for THIS broker's spawn shape (ADR 0011 D7 says it is not, today).
 - **Ratchet guard:** `newt-core/tests/native_git_broker_pipeline.rs`
-  (`governed_commit_carries_the_attribution_trailer`, real-resource, Landlock + fixture-`git`-gated):
-  asserts the Kernel/Interceptor refusal text ABSENT rather than tolerating it, so reverting
-  `BrokerMediated` to `AgentInfluenced` (or widening its use to a non-`NativeGitBroker` caller) fails
-  this test. `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`.
-- **Bounded-by:** `p4-constrained-executor`, `fs-canonical-containment` — the CLOSED invariants that
-  make the residual harmless: `BrokerMediated` requests still route through the one confined executor
-  (kernel-backed, fail-closed) and fs authority stays canonical-path object-bound, so a trampolined
-  process inherits that same (denied) fs/net envelope. (`exec-behavior-bound` above names the identical
-  residual for the general case but is itself BOUNDED, not CLOSED, so it cannot anchor this chain —
-  `ocap-check` enforces that a `Bounded-by` target must be CLOSED.)
-- **Status:** BOUNDED — the capability (a governed commit landing through a broker whose exec axis is
-  Interceptor, not Kernel) IS reachable; it is bounded by the fs/net Kernel floor (unchanged) plus the
-  broker's own narrow, two-call-site scope plus its independent message/signature verification. owner:
+  (`governed_commit_carries_the_attribution_trailer`, real-resource, Landlock + fixture-`git`-gated)
+  asserts the Kernel/Interceptor refusal text ABSENT and requires the attribution trailer. Reverting
+  the broker probes to `AgentInfluenced` fails this test; adding an unrelated `BrokerMediated` caller
+  is not detected. The fixture explicitly grants common-gitdir writes to isolate the exec floor;
+  it does not prove the default linked-worktree write repair tracked by #2686. Run with
+  `NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL=1 cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
+  to reject missing prerequisites rather than skip. The weekly/release workflow requires this mode.
+- **Bounded-by:** `p4-constrained-executor`, `fs-canonical-containment` — these CLOSED invariants
+  keep requests routed through the confined executor and fs authority canonical-path object-bound.
+  A trampolined process retains the request's existing fs/net grants within that envelope, which may
+  permit access. (`exec-behavior-bound` is itself BOUNDED, not CLOSED, so it cannot anchor this chain.)
+- **Status:** BOUNDED — a governed commit with Interceptor exec enforcement is reachable. The
+  remaining bounds are the unchanged fs/net enforcement floor, the current two broker probe sites,
+  and the broker's policy checks, subject to the residual above. owner:
   — · review-by: with `exec-behavior-bound` / `b1`.
 
 ### dependency-fetch-egress
