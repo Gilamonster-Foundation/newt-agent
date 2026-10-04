@@ -192,7 +192,11 @@ impl RepositoryProbe {
             .deadline()
             .saturating_duration_since(std::time::Instant::now());
         let mut request = crate::confined_exec::ExecRequest::new(
-            crate::confined_exec::ExecOrigin::AgentInfluenced,
+            // #2693: this broker's own fixed-program, policy-mediated `git`
+            // re-dispatch — not a model-chosen command — accepts the
+            // per-axis `BrokerMediated` floor (exec: Interceptor; fs/net
+            // stay Kernel). See `confined_exec`'s module doc.
+            crate::confined_exec::ExecOrigin::BrokerMediated,
             &self.program,
             argv,
             &self.cwd,
@@ -460,7 +464,8 @@ fn original_hooks(
     plain.prefix.clear();
     // A config query does not execute hooks. It still runs inside the fence.
     let mut request = crate::confined_exec::ExecRequest::new(
-        crate::confined_exec::ExecOrigin::AgentInfluenced,
+        // #2693: same fixed-program broker re-dispatch as `RepositoryProbe::output`.
+        crate::confined_exec::ExecOrigin::BrokerMediated,
         &plain.program,
         args,
         &plain.cwd,

@@ -226,10 +226,234 @@ fn cap_exit_finalizer_applies_workspace_claim_checks() {
         &crate::Scope::All,
         &capability_check::Evidence::default(),
         None,
+        None,
     );
     assert!(
         text.contains("⚠ claim check (#867)"),
         "cap handoffs must use the same path grounding gate on every provider: {text}"
+    );
+}
+
+/// #2683 round 2 (PR #2688 review, finding 3): a bare git subprocess with
+/// only `current_dir` set inherits this process's FULL
+/// environment — an operator shell's `GIT_DIR`/`GIT_WORK_TREE` (the dotfiles
+/// idiom: `GIT_DIR=~/.dotfiles GIT_WORK_TREE=~`) or a `~/.gitconfig` naming
+/// `core.hooksPath` would otherwise redirect the fixture's `init`/`add`/
+/// `commit` outside the tempdir, or run a hook. `env_clear()` plus an
+/// explicit, minimal env — mirroring `agentic::tools_tests`'s
+/// `hermetic_git_env` (the Landlock-confinement proof's own fixture) —
+/// closes every ambient git/HOME knob instead of denylisting the ones
+/// remembered. Proven isolated by
+/// [`hermetic_git_ignores_a_hostile_inherited_git_dir_and_work_tree`]. The
+/// author/committer identity is passed as env, not `git config`, so no
+/// config write is needed before the first commit.
+fn hermetic_git(dir: &std::path::Path, home: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(dir).env_clear().envs([
+        ("HOME", home.to_string_lossy().into_owned()),
+        ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("GIT_AUTHOR_NAME", "t".to_string()),
+        ("GIT_AUTHOR_EMAIL", "t@example.invalid".to_string()),
+        ("GIT_COMMITTER_NAME", "t".to_string()),
+        ("GIT_COMMITTER_EMAIL", "t@example.invalid".to_string()),
+        ("GIT_CONFIG_NOSYSTEM", "1".to_string()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null".to_string()),
+        ("GIT_TEMPLATE_DIR", "/dev/null".to_string()),
+    ]);
+    cmd
+}
+
+/// Env var whose presence makes a re-execution of this test binary run as
+/// the dedicated hostile-environment subprocess of
+/// [`hermetic_git_ignores_a_hostile_inherited_git_dir_and_work_tree`] (its
+/// value is the fixture dir). Set ONLY on the `Command` that spawns that one
+/// child, never on this process — PR #2688 round 2 review, finding 3: a
+/// process-global `crate::process_env::set_var` races every OTHER test
+/// sharing this binary (the mutex it took only protects callers that also
+/// take the same lock; a plain `std::env::var` read elsewhere does not).
+/// Same pattern as `tools_tests::helper_git_shell_grant`'s
+/// `HOSTILE_ENV_SUBPROCESS_ROOT`.
+const HOSTILE_ENV_SUBPROCESS_DIR: &str = "NEWT_2683_HOSTILE_ENV_SUBPROCESS_DIR";
+
+/// #2683 round 2 (PR #2688 review, finding 3): proves [`hermetic_git`] is
+/// actually hermetic. A hostile `GIT_DIR`/`GIT_WORK_TREE` — the dotfiles
+/// idiom a developer shell exports — must never redirect `git init` into
+/// the directory those vars name.
+///
+/// Round 3 (PR #2688 latest review, finding 3): the hostile vars are set
+/// only on the `Command` that re-executes this SAME test as a dedicated
+/// child process — this process's own environment is never mutated, so no
+/// other test sharing this binary can observe a hostile value. The child's
+/// re-entry branch (below) runs [`hermetic_git`] for real, with the hostile
+/// vars genuinely present in ITS OWN ambient environment; `env_clear()`
+/// means that environment never reaches the grandchild `git` process.
+/// Confirmed red against the pre-fix bare git subprocess (only
+/// `current_dir` set, no `env_clear`): with the same hostile vars set,
+/// `init` created `.git` under the HOSTILE `GIT_DIR` instead of inside `dir`.
+#[test]
+fn hermetic_git_ignores_a_hostile_inherited_git_dir_and_work_tree() {
+    // Re-entry: run as the dedicated hostile subprocess. `dir` already
+    // exists (the parent created it); `home` is this child's own, since no
+    // state about it needs to flow back to the parent.
+    if let Ok(dir) = std::env::var(HOSTILE_ENV_SUBPROCESS_DIR) {
+        let home = tempfile::TempDir::new().expect("fixture home");
+        let ok = hermetic_git(std::path::Path::new(&dir), home.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("git init")
+            .success();
+        assert!(ok, "git init must succeed under the hermetic fixture");
+        return;
+    }
+
+    let hostile = tempfile::TempDir::new().expect("hostile root");
+    let hostile_gitdir = hostile.path().join(".git");
+    let dir = tempfile::TempDir::new().expect("fixture repo");
+
+    let this_test = format!(
+        "{}::hermetic_git_ignores_a_hostile_inherited_git_dir_and_work_tree",
+        module_path!().split_once("::").map_or("", |(_, rest)| rest)
+    );
+    let exe = std::env::current_exe().expect("current_exe must resolve for the re-exec proof");
+    let output = std::process::Command::new(&exe)
+        .args(["--exact", &this_test, "--nocapture", "--test-threads=1"])
+        // Explicit, minimal: this Command's env is what the child inherits.
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env(HOSTILE_ENV_SUBPROCESS_DIR, dir.path())
+        .env("GIT_DIR", &hostile_gitdir)
+        .env("GIT_WORK_TREE", hostile.path())
+        .output()
+        .expect("spawn hostile-env subprocess");
+
+    assert!(
+        output.status.success(),
+        "hostile-env subprocess fixture failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.path().join(".git").exists(),
+        "init must create .git INSIDE the fixture dir, never the hostile GIT_DIR"
+    );
+    assert!(
+        !hostile_gitdir.exists(),
+        "the hostile GIT_DIR must never be touched"
+    );
+}
+
+/// #2683, through the REAL dispatch path (`finalize_final_text`, real `git`
+/// subprocess calls via `claim_check::git_in`), not just the pure
+/// `annotate_action_claims` unit tests: a real repo whose HEAD genuinely did
+/// not move since `head_before` was captured — the exact retest shape
+/// (COMPARE.md, 2026-10-02) where the model reported "committed locally" on
+/// a change that was only staged. Round 3: the annotation is a neutral facts
+/// note, not a verdict.
+#[test]
+fn cap_exit_finalizer_adds_a_facts_note_when_head_did_not_move_in_a_real_repo() {
+    let workspace = tempfile::TempDir::new().expect("temp workspace");
+    let home = tempfile::TempDir::new().expect("temp HOME");
+    let git = |args: &[&str]| {
+        assert!(
+            hermetic_git(workspace.path(), home.path())
+                .args(args)
+                .output()
+                .expect("git")
+                .status
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    let head_before =
+        claim_check::git_head(&workspace.path().to_string_lossy(), &crate::Scope::All)
+            .expect("HEAD exists after the initial commit");
+    // The turn only staged a further edit — exactly the measured bug — so
+    // HEAD at finalize time is IDENTICAL to `head_before`.
+    std::fs::write(workspace.path().join("a.txt"), "one\ntwo\n").unwrap();
+    git(&["add", "a.txt"]);
+
+    let text = finalize_final_text(
+        "I committed the change locally.".to_string(),
+        &workspace.path().to_string_lossy(),
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        Some(&head_before),
+    );
+    assert!(
+        text.contains("⚠ claim check (#2683)"),
+        "a staged-not-committed claim must get a facts note through the real dispatch path: {text}"
+    );
+    assert!(text.contains("HEAD did not move"), "got: {text}");
+}
+
+/// #2683 round 3 (PR #2688 review round 2, finding 1), through the REAL
+/// dispatch path: the claim names a specific file (`src/a.txt`) that is
+/// still dirty while HEAD moved for an UNRELATED reason (`other.txt`) in the
+/// same turn — exactly the shape a bare HEAD-moved check cannot distinguish
+/// from the claimed file actually being committed. The facts note reports
+/// `src/a.txt` as still uncommitted, as a FACT read off `git status
+/// --porcelain`, never as a per-claim verdict (round 2's per-file matching
+/// is gone entirely; see `claim_check::commit_facts_note`).
+#[test]
+fn cap_exit_finalizer_facts_note_names_a_file_still_dirty_when_head_moved_in_a_real_repo() {
+    let workspace = tempfile::TempDir::new().expect("temp workspace");
+    let home = tempfile::TempDir::new().expect("temp HOME");
+    let git = |args: &[&str]| {
+        assert!(
+            hermetic_git(workspace.path(), home.path())
+                .args(args)
+                .output()
+                .expect("git")
+                .status
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::create_dir(workspace.path().join("src")).unwrap();
+    std::fs::write(workspace.path().join("src/a.txt"), "one\n").unwrap();
+    git(&["add", "src/a.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    let head_before =
+        claim_check::git_head(&workspace.path().to_string_lossy(), &crate::Scope::All)
+            .expect("HEAD exists after the initial commit");
+
+    // The turn's actual edit: staged but never committed.
+    std::fs::write(workspace.path().join("src/a.txt"), "one\ntwo\n").unwrap();
+    git(&["add", "src/a.txt"]);
+    // An unrelated commit moves HEAD away from `head_before` — the shape a
+    // bare `head_moved` check cannot distinguish from the claimed file
+    // actually being committed. Committed by PATHSPEC (`-- other.txt`), not
+    // a bare `git commit`, so it does not sweep the already-staged
+    // `src/a.txt` edit in with it: that edit must stay in the index,
+    // uncommitted, after this.
+    std::fs::write(workspace.path().join("other.txt"), "unrelated\n").unwrap();
+    git(&["add", "other.txt"]);
+    git(&["commit", "-q", "-m", "unrelated", "--", "other.txt"]);
+
+    let text = finalize_final_text(
+        "I committed src/a.txt.".to_string(),
+        &workspace.path().to_string_lossy(),
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        Some(&head_before),
+    );
+    assert!(
+        text.contains("⚠ claim check (#2683)"),
+        "a claimed file still staged must get a facts note even though HEAD moved \
+         (for an unrelated reason), through the real dispatch path: {text}"
+    );
+    assert!(text.contains("`src/a.txt`"), "got: {text}");
+    assert!(text.contains("moved from"), "HEAD DID move: {text}");
+    assert!(
+        !text.contains("HEAD did not move"),
+        "HEAD DID move in this scenario: {text}"
     );
 }
 
