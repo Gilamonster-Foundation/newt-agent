@@ -1230,7 +1230,7 @@ resolved in a later release:
 ### Native commit cancellation: lease shutdown is not tree completion (#2686)
 
 **Open residual, operator-accepted 2026-10-04; completion contract tracked
-upstream as agent-bridle#TBD.** Cancelled native commit recovery now retains its
+upstream as Gilamonster-Foundation/agent-bridle#420.** Cancelled native commit recovery now retains its
 owned identity and guard through the shell execution lease. It records an orphan
 candidate and reattaches HEAD after the owner's shutdown path; cancellation
 never authorizes publication of the branch ref.
