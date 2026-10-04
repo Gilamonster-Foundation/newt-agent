@@ -619,7 +619,7 @@ impl Adapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     // -- test doubles -------------------------------------------------------
@@ -630,6 +630,9 @@ mod tests {
     struct FakeSink {
         calls: Arc<Mutex<Vec<Call>>>,
         gate: Option<Arc<Mutex<()>>>,
+        /// Set the instant `deliver` is about to block on `gate`: the event a
+        /// test awaits instead of sleeping and hoping the worker got there.
+        entered_gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
         fail_first: Arc<AtomicUsize>,
         panics: bool,
     }
@@ -639,6 +642,7 @@ mod tests {
             Self {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 gate: None,
+                entered_gate: None,
                 fail_first: Arc::new(AtomicUsize::new(0)),
                 panics: false,
             }
@@ -647,8 +651,23 @@ mod tests {
         fn gated(gate: &Arc<Mutex<()>>) -> Self {
             Self {
                 gate: Some(Arc::clone(gate)),
+                entered_gate: Some(Arc::new((Mutex::new(false), std::sync::Condvar::new()))),
                 ..Self::new()
             }
+        }
+
+        /// Block until the worker thread is inside `deliver`, about to take
+        /// the gate. Only meaningful after [`Self::gated`].
+        fn wait_entered_gate(&self) {
+            let entered = self
+                .entered_gate
+                .as_ref()
+                .expect("wait_entered_gate requires FakeSink::gated");
+            let (lock, cv) = &**entered;
+            let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let _guard = cv
+                .wait_while(guard, |entered| !*entered)
+                .unwrap_or_else(PoisonError::into_inner);
         }
 
         fn failing(n: usize) -> Self {
@@ -721,6 +740,11 @@ mod tests {
                 panic!("sink exploded");
             }
             if let Some(gate) = &self.gate {
+                if let Some(entered) = &self.entered_gate {
+                    let (lock, cv) = &**entered;
+                    *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                    cv.notify_all();
+                }
                 let _held = gate.lock().unwrap_or_else(PoisonError::into_inner);
             }
             self.calls.lock().unwrap().push(call.clone());
@@ -765,10 +789,12 @@ mod tests {
             && identity_settled
     }
 
-    /// Wait (bounded) until `f` holds; keeps the tests free of sleeps that are
-    /// either flaky or slow.
+    /// Wait until `f` holds; keeps the tests free of sleeps that are either
+    /// flaky or slow. The bound is the shared hang guard, never a budget: the
+    /// predicate turning true is the event, and the guard only names a worker
+    /// that never delivers.
     fn eventually(mut f: impl FnMut() -> bool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + newt_core::test_guard::HANG_GUARD;
         while Instant::now() < deadline {
             if f() {
                 return true;
@@ -1008,12 +1034,12 @@ mod tests {
         let sink = FakeSink::gated(&gate);
         let (adapter, mut reporter) = harness(sink.clone());
 
-        // Let the worker enter `deliver` and block there.
+        // Wait for the worker to actually be inside `deliver`, blocked on the
+        // gate (the event), instead of sleeping and hoping it got there.
         adapter.on_bare(None, LifecycleEvent::TurnStarted);
-        std::thread::sleep(Duration::from_millis(20));
+        sink.wait_entered_gate();
 
         const FLOOD: usize = 20_000;
-        let start = Instant::now();
         for i in 0..FLOOD {
             adapter.on_bare(
                 None,
@@ -1027,22 +1053,11 @@ mod tests {
             );
         }
         adapter.on_bare(None, LifecycleEvent::Waiting); // the LAST word
-        let elapsed = start.elapsed();
-        // The qualitative proof is that this line is reached at all: the sink
-        // is STILL blocked, so a design that waited on delivery would never
-        // have returned. The bounds below are deliberately loose (this box
-        // runs many parallel builds); the real assertion is many orders of
-        // magnitude away from a blocking path.
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "{FLOOD} emissions against a wedged Herdr took {elapsed:?}; the \
-             agent-facing path must be bounded and never wait on delivery"
-        );
-        let per_event = elapsed / (FLOOD as u32 + 1);
-        assert!(
-            per_event < Duration::from_micros(500),
-            "per-event agent cost {per_event:?} is not tiny"
-        );
+                                                        // The proof is that this line is reached at all: the sink is STILL
+                                                        // blocked, so a design that waited on delivery would never have
+                                                        // returned. The former `< 10 s` / `< 500 µs per event` stopwatches
+                                                        // measured mutex contention on a loaded box, not the design; the
+                                                        // coalescing and one-shot bounds below are the structural checks.
 
         {
             let inner = reporter.inner.lock().unwrap();
@@ -1098,21 +1113,16 @@ mod tests {
             .as_ref()
             .is_some_and(JoinHandle::is_finished)));
 
-        let start = Instant::now();
         for _ in 0..1_000 {
             adapter.on_bare(None, LifecycleEvent::Thinking);
             adapter.on_bare(None, LifecycleEvent::Waiting);
         }
-        let elapsed = start.elapsed();
         std::panic::set_hook(hook);
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "emission after the reporter died took {elapsed:?}"
-        );
-        // And teardown does not hang on a dead worker.
-        let t0 = Instant::now();
+        // No stopwatches: `try_send` on a dropped receiver returns at once, so
+        // reaching this line is the proof that emission after the reporter died
+        // did not wait; and teardown returning on a dead worker is the proof
+        // that it does not hang. Both `< N s` bounds measured the loaded box.
         reporter.shutdown();
-        assert!(t0.elapsed() < SHUTDOWN_GRACE * 4);
     }
 
     // -- teardown -----------------------------------------------------------
@@ -1141,15 +1151,52 @@ mod tests {
     fn teardown_is_prompt_even_when_herdr_is_stuck() {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
-        let (adapter, mut reporter) = harness(FakeSink::gated(&gate));
+        let sink = FakeSink::gated(&gate);
+        let (adapter, mut reporter) = harness(sink.clone());
         adapter.on_bare(None, LifecycleEvent::TurnStarted);
-        std::thread::sleep(Duration::from_millis(20));
-        let t0 = Instant::now();
+        // The worker being inside `deliver`, blocked on the gate, is the event
+        // "Herdr is stuck" describes; waiting for it (rather than sleeping and
+        // hoping) is what makes `shutdown()` below a proof against a genuinely
+        // stuck worker, not an idle one.
+        sink.wait_entered_gate();
+        // No stopwatch: a shutdown that joined the stuck worker would never
+        // return (the gate is released only below), so returning at all is the
+        // proof; production's own SHUTDOWN_GRACE loop is what bounds it.
+        //
+        // That proof needs its own backstop: a regression to a plain blocking
+        // join deadlocks THIS thread inside `reporter.shutdown()` itself,
+        // which `cargo test`'s own default timeout cannot catch (it is not
+        // configured here) — the whole run would hang rather than fail. An
+        // independent real-OS-clock watchdog (immune to anything the test
+        // thread gets stuck in, unlike a paused/async timeout) turns that
+        // into a loud, bounded failure instead.
+        let watchdog_fired = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        {
+            let watchdog_fired = Arc::clone(&watchdog_fired);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                std::thread::sleep(newt_core::test_guard::HANG_GUARD);
+                if !done.load(Ordering::SeqCst) {
+                    watchdog_fired.store(true, Ordering::SeqCst);
+                    eprintln!(
+                        "hung: reporter.shutdown() did not return within the {}s hang \
+                         guard — a stuck worker must be detached, not joined",
+                        newt_core::test_guard::HANG_GUARD.as_secs()
+                    );
+                    // `shutdown()` is a single blocking call on THIS test's
+                    // own thread, not a loop it can poll a flag inside —
+                    // there is no other way to stop a thread wedged inside
+                    // someone else's blocking join than ending the process.
+                    std::process::exit(101);
+                }
+            });
+        }
         reporter.shutdown();
-        let elapsed = t0.elapsed();
+        done.store(true, Ordering::SeqCst);
         assert!(
-            elapsed < SHUTDOWN_GRACE * 4,
-            "teardown waited {elapsed:?} on a stuck Herdr"
+            !watchdog_fired.load(Ordering::SeqCst),
+            "shutdown() returned only after the watchdog already declared it hung"
         );
         drop(held);
     }

@@ -393,38 +393,89 @@ mod wait_for_after_tests {
 
     /// The race this exists to close: the needle is not there yet, but a
     /// concurrent writer appends it shortly after the wait begins. A
-    /// snapshot-only check (no poll) would have missed this.
+    /// snapshot-only check (no poll) would have missed this — but ONLY if the
+    /// writer is actually made to wait for polling to begin. The former
+    /// unsynchronized writer could (and under a fast box, would) append before
+    /// `wait_for_bytes` ever checked the buffer, so a snapshot-only
+    /// implementation could pass by racing the writer, having proven nothing
+    /// about the poll loop. An "entered poll" handshake closes that: the
+    /// writer blocks until the loop has made its first pass, guaranteeing the
+    /// needle is observed on a LATER iteration, never the first.
     #[test]
     fn observes_a_needle_appended_after_the_wait_begins() {
         let buf = Arc::new(Mutex::new(b"before ".to_vec()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         let writer = std::thread::spawn({
             let buf = Arc::clone(&buf);
             move || {
-                std::thread::sleep(Duration::from_millis(30));
+                newt_core::test_guard::recv_guarded(
+                    &entered_rx,
+                    "wait_for_bytes entering its poll loop",
+                );
                 buf.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(b"SHOWN after");
             }
         });
-        assert!(wait_for_after(&buf, 7, "SHOWN", Duration::from_secs(1)));
-        writer.join().expect("writer thread");
-    }
-
-    /// A needle that never arrives times out and returns `false` rather than
-    /// hanging — the timeout is a real bound, not decoration.
-    #[test]
-    fn times_out_and_returns_false_when_the_needle_never_arrives() {
-        let buf = Mutex::new(b"before after".to_vec());
-        let start = std::time::Instant::now();
-        assert!(!wait_for_after(
+        let mut signaled = false;
+        assert!(tests_pty::wait_for_bytes_instrumented(
             &buf,
             7,
             "SHOWN",
-            Duration::from_millis(100)
+            newt_core::test_guard::HANG_GUARD,
+            move || {
+                // Only the first pass is the "entered" event; later sends
+                // would hit a receiver the writer already consumed and stopped
+                // listening on.
+                if !signaled {
+                    signaled = true;
+                    let _ = entered_tx.send(());
+                }
+            },
         ));
-        assert!(
-            start.elapsed() >= Duration::from_millis(100),
-            "must actually wait out the timeout, not return early"
+        writer.join().expect("writer thread");
+    }
+
+    /// `polls > 1` alone cannot tell a real deadline-driven loop from one that
+    /// hardcodes a small fixed number of checks and quits — both satisfy it.
+    /// Scripting the deadline clock itself closes that: it says "not yet" for
+    /// a fixed, known number of checks and "expired" on the next, so the
+    /// EXPECTED poll count is derived from the script rather than assumed. A
+    /// premature-return implementation that ignores the injected clock (loops
+    /// a hardcoded count, or bails before consulting it) produces a different
+    /// count and fails here, with no real timeout to wait out or race.
+    #[test]
+    fn consults_the_injected_clock_rather_than_a_hardcoded_poll_count() {
+        let buf = Mutex::new(b"before after".to_vec()); // the needle never arrives
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let clock_calls = std::sync::atomic::AtomicUsize::new(0);
+        let anchor = std::time::Instant::now();
+        let step = Duration::from_millis(10);
+        // The script: 5 "not yet expired" deadline checks, then expired on
+        // the 6th — chosen so the window (call_index * step) straddles
+        // `timeout` at exactly that boundary.
+        const NOT_EXPIRED_CHECKS: usize = 5;
+        let timeout = step * u32::try_from(NOT_EXPIRED_CHECKS).unwrap() + Duration::from_millis(5);
+        let seen = tests_pty::wait_for_bytes_with_clock(
+            &buf,
+            7,
+            "SHOWN",
+            timeout,
+            || {
+                let call = clock_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anchor + step * u32::try_from(call).unwrap()
+            },
+            || {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        assert!(!seen, "a needle that never arrives must return false");
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            NOT_EXPIRED_CHECKS + 1,
+            "must poll exactly as many times as the scripted clock says \"not \
+             yet\" plus the one check that observes expiry — a hardcoded \
+             iteration count diverges from this script"
         );
     }
 }

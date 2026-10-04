@@ -73,6 +73,12 @@ mod unix {
         /// before starting another, so hung connects cannot pile up.
         pending: Option<Receiver<std::io::Result<std::os::unix::net::UnixStream>>>,
         next_id: u64,
+        /// How long [`Self::reconnect`] waits before abandoning an attempt.
+        /// Always [`CONNECT_WAIT`] in production; a test shrinks it via
+        /// [`Self::with_wait`] so the hung-connect proof is an injected,
+        /// near-instant wait rather than a real-time stopwatch on the
+        /// production constant.
+        connect_wait: std::time::Duration,
     }
 
     impl SocketSink {
@@ -87,7 +93,16 @@ mod unix {
                 conn: None,
                 pending: None,
                 next_id: 0,
+                connect_wait: CONNECT_WAIT,
             }
+        }
+
+        /// Override the connect wait. Test-only: production always uses
+        /// [`CONNECT_WAIT`].
+        #[cfg(test)]
+        pub(super) fn with_wait(mut self, wait: std::time::Duration) -> Self {
+            self.connect_wait = wait;
+            self
         }
 
         /// A live connection, or `None` — never a wait longer than
@@ -130,7 +145,7 @@ mod unix {
             {
                 return;
             }
-            match rx.recv_timeout(CONNECT_WAIT) {
+            match rx.recv_timeout(self.connect_wait) {
                 Ok(Ok(stream)) => self.conn = Some(stream),
                 Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {}
                 // Hung or merely slow: abandon the wait, keep the receiver.
@@ -398,14 +413,23 @@ mod tests {
     #[test]
     fn a_missing_socket_fails_fast() {
         let dir = scratch("missing");
-        let mut sink = SocketSink::new(dir.join("nope.sock"));
-        let t0 = Instant::now();
+        // The property is that an absent socket costs no connect attempt, so
+        // count the attempts instead of timing them: the former `< 500 ms`
+        // stopwatch (versus a 200 ms CONNECT_WAIT) proved it only on an idle
+        // box.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let connect: Connector = Arc::new(move |p: &std::path::Path| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            super::unix::connect_socket(p)
+        });
+        let mut sink = SocketSink::with_connector(dir.join("nope.sock"), connect);
         assert!(!sink.deliver(&working()));
         assert!(!sink.deliver(&working()));
-        assert!(
-            t0.elapsed() < Duration::from_millis(500),
-            "absent Herdr must not cost a connect attempt: {:?}",
-            t0.elapsed()
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "an absent socket must not cost a connect attempt"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -479,24 +503,24 @@ mod tests {
         let dir = scratch("silent");
         let path = dir.join("api.sock");
         let listener = UnixListener::bind(&path).unwrap();
+        // The server stays connected and silent until the test says it is done
+        // (the event), so a slow cold connect under load cannot turn into a
+        // closed-peer race; the former fixed 1.5 s was a bet on that.
+        let (hangup_tx, hangup_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (conn, _) = listener.accept().unwrap();
-            // Stay connected and silent for longer than the test needs, so a
-            // slow cold connect cannot turn into a closed-peer race.
-            std::thread::sleep(Duration::from_millis(1500));
+            let _ = hangup_rx.recv();
             drop(conn);
         });
         let mut sink = SocketSink::new(path);
         assert!(deliver_eventually(&mut sink, &working()));
         // Warm connection, server still silent: delivery is immediate because
         // the reply is never awaited.
-        let t0 = Instant::now();
+        // No stopwatch: production drains the peer non-blocking, so a
+        // regression (a blocking read on a silent peer) hangs rather than runs
+        // slow, and `deliver` returning at all is the proof.
         assert!(sink.deliver(&working()));
-        assert!(
-            t0.elapsed() < Duration::from_secs(1),
-            "no response wait: {:?}",
-            t0.elapsed()
-        );
+        hangup_tx.send(()).unwrap();
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -548,6 +572,7 @@ mod tests {
         let release = Arc::new(std::sync::Mutex::new(()));
         let held = release.lock().unwrap();
         let gate = Arc::clone(&release);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         // Keep the far end of the socketpair alive, or the "connection" would
         // be born already hung up and prove nothing.
         let peers: Arc<std::sync::Mutex<Vec<UnixStream>>> =
@@ -555,38 +580,52 @@ mod tests {
         let peer_sink = Arc::clone(&peers);
         let connect: Connector = Arc::new(move |_p: &std::path::Path| {
             counter.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(()); // the connector thread has genuinely run
             let _wait = gate.lock().unwrap(); // blocks until the test releases
             let (near, far) = UnixStream::pair()?;
             peer_sink.lock().unwrap().push(far);
             Ok(near)
         });
-        let mut sink = SocketSink::with_connector(path, connect);
+        // The connect wait is injected to near-zero: production's own
+        // CONNECT_WAIT is a real timer firing on a real `recv_timeout`, and a
+        // test asserting on how long that took (even a lower bound — load can
+        // only lengthen it) is still a wall-clock stopwatch. Shrinking the
+        // wait removes the need to measure it at all; the structural proof —
+        // one attempt stays outstanding no matter how many calls follow — is
+        // `attempts == 1` below, not timing. The shrunken wait only bounds how
+        // long THIS thread blocks in `recv_timeout`; it says nothing about
+        // when the spawned "herdr-connect" thread is actually scheduled, so
+        // it is not the synchronization — the handshake below is.
+        let mut sink =
+            SocketSink::with_connector(path, connect).with_wait(Duration::from_millis(1));
 
-        let t0 = Instant::now();
         assert!(!sink.deliver(&working()));
-        let first = t0.elapsed();
-        assert!(
-            first >= CONNECT_WAIT && first < CONNECT_WAIT * 10,
-            "the first attempt waits about one CONNECT_WAIT: {first:?}"
-        );
+        // Wait for the connector thread to have ENTERED connect() (past the
+        // counter increment) before trusting the counter at all — a delayed
+        // thread that hasn't run yet would otherwise read as zero attempts,
+        // not one.
+        newt_core::test_guard::recv_guarded(&entered_rx, "herdr-connect thread entering connect()");
         for _ in 0..5 {
             assert!(!sink.deliver(&working()));
         }
-        assert!(
-            t0.elapsed() < CONNECT_WAIT * 12,
-            "later calls must not each pay the wait: {:?}",
-            t0.elapsed()
-        );
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,
             "exactly one connect attempt stays outstanding"
         );
         drop(held); // the hung connect completes
-        let collected = (0..50).any(|_| {
-            std::thread::sleep(Duration::from_millis(20));
-            sink.deliver(&working())
-        });
+                    // The released connector thread building its socketpair is the event;
+                    // the former 50 × 20 ms loop was a 1 s budget on its scheduling.
+        let deadline = Instant::now() + newt_core::test_guard::HANG_GUARD;
+        let collected = loop {
+            if sink.deliver(&working()) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
         assert!(collected, "the abandoned attempt is collected, not leaked");
         let _ = std::fs::remove_dir_all(&dir);
     }

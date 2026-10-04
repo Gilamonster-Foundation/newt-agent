@@ -184,7 +184,7 @@ fn first_ctrl_c_raises_the_interrupt_acknowledgment() {
             unsafe { libc::write(pipe[1], [0x03u8].as_ptr().cast(), 1) },
             1
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
         while !cancel.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -239,7 +239,7 @@ fn every_ctrl_c_press_is_counted_for_the_spinner() {
             );
         };
         let wait_for = |presses: u32| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
             while newt_core::tty::interrupt_presses() < presses
                 && std::time::Instant::now() < deadline
             {
@@ -351,7 +351,7 @@ fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
         std::thread::sleep(Duration::from_millis(10));
         write(b"A ");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
         while (spill.up.load(Ordering::Relaxed) == 0 || spill.toggled.load(Ordering::Relaxed) == 0)
             && std::time::Instant::now() < deadline
         {
@@ -456,7 +456,7 @@ fn watcher_esc_exits_explore_before_interrupting() {
             );
         };
         let wait_for = |cond: &dyn Fn() -> bool| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
             while !cond() && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }

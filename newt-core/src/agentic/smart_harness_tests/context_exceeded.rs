@@ -6,7 +6,7 @@ use agent_harness::store::FrameStore;
 
 fn durable_harness(directory: &std::path::Path) -> SmartHarness {
     SmartHarness::new(
-        Session::open(directory, Default::default()).unwrap(),
+        Session::open(directory, crate::test_guard::unbudgeted_session_config()).unwrap(),
         Arc::new(|_| Box::pin(async { panic!("overflow never needs adjudication") })),
         Default::default(),
     )

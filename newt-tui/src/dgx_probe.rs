@@ -351,7 +351,7 @@ mod tests {
         // promptly; reading is instant. The generous timeout only guards against
         // a starved timer under heavy parallel-test load (the publish itself is
         // sub-millisecond) — it is a liveness check, not a latency assertion.
-        tokio::time::timeout(std::time::Duration::from_secs(10), rx.changed())
+        tokio::time::timeout(newt_core::test_guard::HANG_GUARD, rx.changed())
             .await
             .expect("sampler published a snapshot")
             .expect("sender alive");

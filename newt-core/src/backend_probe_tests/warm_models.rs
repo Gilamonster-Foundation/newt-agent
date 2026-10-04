@@ -216,14 +216,22 @@ fn launch_declaration_reads_args_and_preset_for_the_named_model() {
 #[tokio::test]
 async fn launch_probe_distinguishes_absent_unsupported_refused_and_timed_out() {
     use std::time::Duration;
-    let probe = |server: &MockServer, timeout: Duration| {
+    // `None`: no client timeout, so the wiremock reply is the event and a slow
+    // reply under load stays the reply instead of becoming `TimedOut`. Only the
+    // `slow` case, where the timeout firing IS the behaviour, sets one.
+    let probe = |server: &MockServer, timeout: Option<Duration>| {
         let url = server.uri();
         async move {
-            let client = reqwest::Client::builder().timeout(timeout).build().unwrap();
+            let builder = reqwest::Client::builder();
+            let builder = match timeout {
+                Some(timeout) => builder.timeout(timeout),
+                None => builder,
+            };
+            let client = builder.build().unwrap();
             LaunchProbe::from_result(fetch_llamacpp_launch(&client, &url, None, "m").await)
         }
     };
-    let long = Duration::from_secs(5);
+    let long = None;
     let respond = |template: ResponseTemplate| async move {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -259,7 +267,7 @@ async fn launch_probe_distinguishes_absent_unsupported_refused_and_timed_out() {
     );
     let slow = respond(ResponseTemplate::new(200).set_delay(Duration::from_millis(500))).await;
     assert_eq!(
-        probe(&slow, Duration::from_millis(50)).await,
+        probe(&slow, Some(Duration::from_millis(50))).await,
         LaunchProbe::TimedOut
     );
 }

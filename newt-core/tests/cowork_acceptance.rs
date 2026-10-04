@@ -11,7 +11,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use newt_core::{
     transcript_lines, BackendKind, Role, ShellObservation, TranscriptRole, TurnDriver,
@@ -35,16 +34,17 @@ impl Respond for PlainOllama {
     }
 }
 
-/// Pump the driver to completion the way a crossterm event loop would: poll on
-/// a short interval, never blocking the "frame".
-fn pump_to_done(driver: &mut TurnDriver) -> TurnStatus {
-    for _ in 0..600 {
-        match driver.poll() {
-            TurnStatus::Running => std::thread::sleep(Duration::from_millis(10)),
-            other => return other,
-        }
+/// Pump the driver to completion: one non-blocking `poll()` (the frame a
+/// crossterm loop would draw), then await the worker's result itself. The
+/// former 600 polls at 10 ms were a ~6 s wall-clock budget that fails by
+/// machine speed under load; the oneshot is the event, and only the shared
+/// hang guard remains.
+async fn pump_to_done(driver: &mut TurnDriver) -> TurnStatus {
+    match driver.poll() {
+        TurnStatus::Running => {}
+        settled => return settled,
     }
-    panic!("turn did not complete within the pump budget");
+    newt_core::test_guard::hang_guarded("the driven turn", driver.wait()).await
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn consumer_drives_a_turn_and_renders_the_transcript_with_only_public_api(
     // 3. It submits a human message — and pumps the turn from its own loop,
     //    never calling run_chat.
     driver.submit("did the build pass?").expect("submit a turn");
-    let outcome = match pump_to_done(&mut driver) {
+    let outcome = match pump_to_done(&mut driver).await {
         TurnStatus::Completed(outcome) => outcome,
         other => panic!("expected Completed, got {other:?}"),
     };

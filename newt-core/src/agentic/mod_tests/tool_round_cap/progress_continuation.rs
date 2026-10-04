@@ -87,7 +87,7 @@ async fn complete_read_assignment(
     let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
     let uri = server.uri();
     let harness = crate::agentic::smart_harness::SmartHarness::new(
-        agent_harness::Session::new(Default::default()).unwrap(),
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
         Arc::new(|_| Box::pin(async { Ok(("\"answer\"".into(), None)) })),
         crate::agentic::smart_harness::AdjudicationSettings::default(),
     )
