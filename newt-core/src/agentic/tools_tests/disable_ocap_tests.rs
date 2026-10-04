@@ -1,17 +1,34 @@
 use super::super::NoMcp;
 use super::*;
 use crate::caveats::{Caveats, CountBound, Scope};
-use tokio::sync::{Mutex, MutexGuard};
 
 /// Serializes every test that reads or writes `NEWT_DISABLE_OCAP` (and
-/// the venv vars the bypass forwards): the process environment is shared
-/// across the parallel test runner. Async-aware (tokio) so the guard may
-/// be held across the `execute_tool` awaits; no poisoning — the `EnvVar`
-/// guards below restore the environment even on panic.
-pub(crate) static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+/// the venv vars the bypass forwards) with settings and denial journaling.
+/// A separate mutex inverts the order when settings-owning loop fixtures
+/// await it while an ocap fixture journals a denial under `process_env`.
+/// Keep the async call surface, but share the one reentrant lock. Its guard
+/// is thread-affine: hold it on the test's root future, never move it to a worker.
+pub(crate) async fn env_lock() -> crate::process_env::EnvGuard {
+    crate::process_env::lock()
+}
 
-pub(crate) async fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().await
+/// The real fixture guard must be the settings/journal lock, not a second
+/// mutex: otherwise a denial holding it can deadlock a verification fixture
+/// that already owns GlobalSettingsGuard. Check ownership on this thread so
+/// an unrelated sibling holding the global lock cannot make the test pass.
+#[tokio::test]
+async fn ocap_env_guard_shares_the_settings_and_denial_journal_lock() {
+    let _env = env_lock().await;
+    assert!(
+        crate::process_env::held_by_current_thread(),
+        "the ocap fixture must own the process environment lock"
+    );
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    assert!(
+        std::thread::spawn(|| crate::process_env::try_lock().is_none())
+            .join()
+            .unwrap()
+    );
 }
 
 /// RAII env override: set/unset `key` for the test body, restore the
@@ -218,7 +235,7 @@ async fn run_tool_with_floor(
 /// env var are one mechanism (`--disable-ocap` just exports the var).
 #[test]
 fn ocap_disabled_requires_exactly_1() {
-    let _l = ENV_LOCK.blocking_lock();
+    let _l = crate::process_env::lock();
     {
         let _unset = EnvVar::unset("NEWT_DISABLE_OCAP");
         assert!(!ocap_disabled(), "absent ⇒ confinement stays on");
@@ -245,7 +262,7 @@ fn ocap_disabled_requires_exactly_1() {
 /// mechanism — `--full-access` just exports the var).
 #[test]
 fn full_access_requested_requires_exactly_1() {
-    let _l = ENV_LOCK.blocking_lock();
+    let _l = crate::process_env::lock();
     {
         let _unset = EnvVar::unset("NEWT_FULL_ACCESS");
         assert!(!full_access_requested(), "absent ⇒ configured preset rules");
@@ -1232,7 +1249,7 @@ async fn run_command_with_legacy_git_and_gate(
 /// `routing_disabled`. The two switches can never alias.
 #[test]
 fn routing_disabled_requires_exactly_1_and_is_independent_of_ocap() {
-    let _l = ENV_LOCK.blocking_lock();
+    let _l = crate::process_env::lock();
     let _no_ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
     {
         let _unset = EnvVar::unset("NEWT_NO_ROUTE");
