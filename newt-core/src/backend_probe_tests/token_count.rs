@@ -196,13 +196,16 @@ async fn chat_token_count_transport_disconnect_retains_transient_retry_classific
         drain_count_request(&mut socket).await;
         socket.shutdown().await.unwrap();
     });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let error = count_chat_tokens(&client, &endpoint, MODEL, Some(KEY), &chat())
-        .await
-        .unwrap_err();
+    // No client timeout: the in-runtime peer always closes the socket, and that
+    // close is the event. A 5 s budget turned a starved peer into a reqwest
+    // timeout, which is a different classification.
+    let client = reqwest::Client::new();
+    let error = crate::test_guard::hang_guarded(
+        "the peer closing the socket",
+        count_chat_tokens(&client, &endpoint, MODEL, Some(KEY), &chat()),
+    )
+    .await
+    .unwrap_err();
     server.await.unwrap();
     assert_eq!(
         crate::retry::classify(&error),
@@ -225,13 +228,16 @@ async fn chat_token_count_partial_rejection_retains_observed_context_evidence() 
         socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 500\r\nConnection: close\r\n\r\nContext size has been exceeded").await.unwrap();
         socket.shutdown().await.unwrap();
     });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let error = count_chat_tokens(&client, &endpoint, MODEL, Some(KEY), &chat())
-        .await
-        .unwrap_err();
+    // No client timeout: the in-runtime peer always closes the socket, and that
+    // close is the event. A 5 s budget turned a starved peer into a reqwest
+    // timeout, which is a different classification.
+    let client = reqwest::Client::new();
+    let error = crate::test_guard::hang_guarded(
+        "the peer closing the socket",
+        count_chat_tokens(&client, &endpoint, MODEL, Some(KEY), &chat()),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
         crate::retry::classify(&error),
         crate::retry::Retryability::ContextExceeded

@@ -67,7 +67,7 @@ async fn run_overflow(
     let mut observations = observability::SolveObservation::default();
     let harness = smart.then(|| {
         crate::agentic::smart_harness::SmartHarness::new(
-            agent_harness::Session::new(Default::default()).unwrap(),
+            agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(|prompt| {
                 let evidence: serde_json::Value =
                     serde_json::from_str(prompt.lines().last().unwrap()).unwrap();

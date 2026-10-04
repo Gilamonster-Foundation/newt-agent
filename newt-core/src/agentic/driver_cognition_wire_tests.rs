@@ -61,7 +61,7 @@ async fn cognition_capture_and_projection_agree_on_all_wires_with_smart_on_or_of
                 let observed = observed.clone();
                 config.smart_harness = Some(Arc::new(
                     super::super::smart_harness::SmartHarness::new(
-                        agent_harness::Session::new(Default::default()).unwrap(),
+                        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
                         Arc::new(move |_| {
                             observed
                                 .lock()

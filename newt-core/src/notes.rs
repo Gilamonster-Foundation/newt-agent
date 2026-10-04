@@ -943,6 +943,9 @@ mod tests {
         // Keep the test fast: don't wait the full default retry budget.
         b.lock_retries = 3;
         b.lock_retry_delay = Duration::from_millis(5);
+        // Staleness must stay unreachable here: a stall between A taking the
+        // lock and B's attempt must never let B take it over as "stale".
+        b.lock_stale = Duration::MAX;
 
         // A holds the lock (simulating a write in progress).
         let guard = a.acquire_lock().unwrap();
@@ -970,9 +973,17 @@ mod tests {
         let mut ns = store_at(&path, 2_200).await;
         ns.lock_stale = Duration::from_millis(50);
 
-        // A leftover lock from a "crashed" process.
-        std::fs::write(dir.path().join(".NOTES.md.lock"), "").unwrap();
-        std::thread::sleep(Duration::from_millis(120));
+        // A leftover lock from a "crashed" process, aged explicitly rather than
+        // by sleeping, so scheduler latency and mtime granularity cannot decide
+        // the outcome (the atomic_fs tests do the same).
+        let stale_lock = dir.path().join(".NOTES.md.lock");
+        std::fs::write(&stale_lock, "").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(1))
+            .unwrap();
 
         ns.add("fact after takeover").unwrap();
         assert!(

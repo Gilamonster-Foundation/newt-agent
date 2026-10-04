@@ -5,7 +5,7 @@ fn harness() -> (SmartHarness, Arc<Mutex<Vec<String>>>) {
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&prompts);
     let harness = SmartHarness::new(
-        Session::new(Default::default()).unwrap(),
+        Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
         Arc::new(move |prompt| {
             captured.lock().unwrap().push(prompt);
             Box::pin(async { Ok(("\"narration\"".into(), None)) })
@@ -64,7 +64,7 @@ async fn missing_turn_boundary_reports_unknown_instead_of_zero() {
 }
 
 fn evidence_session(count: usize) -> (Session, Vec<content_addressable::ContentId>) {
-    let mut session = Session::new(Default::default()).unwrap();
+    let mut session = Session::new(crate::test_guard::unbudgeted_session_config()).unwrap();
     session.start_turn();
     let user = json!({"role":"user","content":"Run project checks"});
     let request = session

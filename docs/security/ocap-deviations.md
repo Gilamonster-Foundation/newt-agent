@@ -1175,9 +1175,13 @@ resolved in a later release:
 
 - Windows is refused outright — no native ownership/writability check exists
   yet for the trust predicate the broker relies on.
-- `Scope::All` (unrestricted network) is refused, and push governance is
-  disclaimed there entirely — the model already holds unrestricted network
-  in that grant, so nothing this broker adds would bound it.
+- Availability defect REPAIRED (#2700): standalone intercepted `git push`
+  and `gh pr create` now use the sanctioned broker under `Scope::All`.
+  The broker still checks filesystem and exec authority, trusted tools,
+  staging, and the destination's network grant.
+- Governance residual OPEN: an opaque descendant with unrestricted network
+  can bypass the broker. Removing the `Scope::All` preflight refusal does
+  not constrain that descendant; it remains outside the guarantee above.
 - Credential-helper compatibility is limited to two forms: a bare name
   (resolved inside the trusted git's `--exec-path`) and the exact `gh
   setup-git` form (`!<trusted gh> auth git-credential`). Any other

@@ -356,7 +356,10 @@ mod tests {
         });
         tokio::task::yield_now().await;
         cancel.store(true, Ordering::Relaxed);
-        let error = tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+        // The worker noticing the flag (through its 25 ms poll) is the event;
+        // the shared guard only names a hang. A 1 s budget expired under load
+        // before the task was even scheduled.
+        let error = tokio::time::timeout(newt_core::test_guard::HANG_GUARD, worker)
             .await
             .unwrap()
             .unwrap()

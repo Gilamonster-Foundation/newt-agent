@@ -870,6 +870,14 @@ struct StdinToken {
     restore: Option<libc::termios>,
 }
 
+/// How many threads are parked in [`StdinToken::acquire`] right now. A test
+/// that must prove "the prompt did NOT enter while the watcher read" waits for
+/// this to reach one before asserting, instead of sleeping and hoping the
+/// prompt thread had reached the wait in time.
+#[cfg(test)]
+pub(super) static STDIN_TOKEN_WAITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl StdinToken {
     fn acquire() -> Self {
         let thread = std::thread::current().id();
@@ -881,9 +889,13 @@ impl StdinToken {
                 .as_ref()
                 .is_some_and(|owner| *owner != thread)
         {
+            #[cfg(test)]
+            STDIN_TOKEN_WAITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             state = cv
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            STDIN_TOKEN_WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
         state.prompt_owner = Some(thread);
         state.prompt_depth += 1;

@@ -994,19 +994,15 @@ async fn stalling_issuer_candidates_cannot_outlive_the_discovery_budget() {
     }
 
     let budget = DiscoveryBudget::new(std::time::Duration::from_millis(300));
-    let started = std::time::Instant::now();
     let error = discover_oauth_meta_within_budget(&resource, true, &budget)
         .await
         .expect_err("stalling candidates must not stall discovery forever");
-    let elapsed = started.elapsed();
     let rendered = format!("{error:#}");
     assert!(rendered.contains("budget"), "unexpected error: {rendered}");
     // Aggregate, not per-request: the second candidate never gets its own
-    // fresh timeout once the shared budget is gone.
-    assert!(
-        elapsed < std::time::Duration::from_secs(20),
-        "discovery ran {elapsed:?}, far past its 300ms budget"
-    );
+    // fresh timeout once the shared budget is gone. The error text and the
+    // request counts below carry that; a `< 20 s` stopwatch on a 300 ms
+    // budget asserted nothing and kept a clock in the unit tier.
     assert!(
         second_server
             .received_requests()

@@ -11,8 +11,8 @@ use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
 use super::{
-    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled, resolve_tool_alias,
-    AliasOutcome,
+    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled,
+    permission_granted_result, requests_are_replay_safe, resolve_tool_alias, AliasOutcome,
 };
 use crate::ExecOutcome;
 
@@ -1043,8 +1043,24 @@ pub(super) async fn exec_confined_command(
 }
 
 /// Broker-bearing native commands use Brush's runtime external-command hook.
-/// They retain the complete source and grant and are never replayed after a
-/// runtime denial: an earlier stage may already have changed the repository.
+///
+/// #2689: a structured exec denial takes the operator to the SAME interactive
+/// `permission_gate.ask_with_caveats` prompt as any other exec denial. The
+/// retry below replays THIS SAME call — with `command_broker` still
+/// attached, so the attribution/signing policy applies to the replay exactly
+/// as it would have to the original attempt — ONLY when
+/// `requests_are_replay_safe` (reused from `tools.rs`, #2691 round 3) proves
+/// every denied request is an EXEC denial AND the denied command is a
+/// single simple command: no chain, substitution, pipeline, loop, or
+/// redirect that could already have run an earlier stage's effect, or would
+/// repeat one on replay. A net denial is never replay-safe — its target is
+/// a host, not the command's executable. Anything else records the call-local
+/// allow-once grant in the gate's pending-once queue and reports the grant
+/// without replaying, so the model's own retry picks it up with no second
+/// prompt. This is the model-synchronous retry inside one call; it is
+/// distinct from the model-driven `request_permissions`/`PendingRerun`
+/// replay in `tools.rs`, which still excludes a commit-broker command
+/// (`commit_broker_used`).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn exec_confined_command_with_broker(
     cmd: &str,
@@ -1161,6 +1177,27 @@ pub(super) async fn exec_confined_command_with_broker(
     };
     let caveats = refreshed.as_ref().unwrap_or(caveats);
 
+    // #2689/#2691 round 3 (P2): bind any pending-once grant already queued
+    // for a program THIS command statically needs, before dispatch — so a
+    // model's reissue of a held command (see this function's doc comment)
+    // succeeds on its first attempt instead of being denied all over again
+    // and looping through "granted…Retry the original operation now"
+    // forever. `apply_pending_once` is scoped per exact target (a no-op
+    // unless that exact target is queued), so an unrelated command cannot
+    // inherit a grant queued for a different retry. Skipped when inspection
+    // fails (dynamic/unsupported syntax): the reactive ask_with_caveats/
+    // take_pending_once path below still covers that case, just without
+    // this optimization.
+    let bound = permission_gate.as_deref_mut().and_then(|gate| {
+        let commands = agent_bridle::inspect_shell(cmd).ok()?.commands;
+        let mut current = caveats.clone();
+        for program in commands.iter().filter_map(|c| c.program.as_deref()) {
+            current = gate.apply_pending_once(DenialKind::Exec, program, &current);
+        }
+        Some(current)
+    });
+    let caveats = bound.as_ref().unwrap_or(caveats);
+
     let missing: Vec<_> = filesystem_requests
         .iter()
         .filter(|request| !permits_filesystem_request(caveats, request))
@@ -1232,23 +1269,16 @@ pub(super) async fn exec_confined_command_with_broker(
                     crate::denial_journal::DenialStage::Initial,
                     &envelope,
                 );
-                if command_broker.is_some() {
-                    // #2681: broker-bearing commands are never replayed (see
-                    // this function's doc comment) — the caller's own
-                    // `commit_broker_used` guard discards this regardless,
-                    // mirroring the FS pre-flight check's unconditional
-                    // population above.
-                    *pre_exec_missing = exec_denial_requests(&envelope);
-                    return with_denial_context(
-                        (
-                            denied_run_command_result(&envelope, color),
-                            ExecOutcome::Denied,
-                        ),
-                        workspace,
-                        cwd,
-                        Some(caveats),
-                    );
-                }
+                // #2689: a broker-bearing command (a native Git commit — see
+                // `needs_commit_broker`) takes the SAME operator-prompt path
+                // as any other exec denial below. It used to return here
+                // unconditionally, before `permission_gate.ask_with_caveats`
+                // was ever called — so an operator's "allow once" had nothing
+                // to land on and a broker-bearing commit could never be let
+                // through without a durable grant. The retry a few lines down
+                // carries `command_broker` along, so the broker's
+                // attribution/signing policy still applies to the replay.
+                //
                 // #263: an interactive gate may turn this denial into a human grant.
                 // ONE consult + ONE re-execution per call: a second denial (a
                 // different target reached on the re-run) surfaces as the standard
@@ -1273,6 +1303,59 @@ pub(super) async fn exec_confined_command_with_broker(
                         if let PermissionDecision::Allow(widened) =
                             gate.ask_with_caveats(caveats, &requests)
                         {
+                            // #2691: Allow is not evidence that every requested axis/target
+                            // was granted. Never mint a pending grant from an insufficient reply.
+                            use crate::caveats::CaveatsExt as _;
+                            if !requests.iter().all(|request| match request.kind {
+                                DenialKind::Exec => widened.permits_exec(&request.target),
+                                DenialKind::Net => widened.permits_net(&request.target),
+                                _ => false,
+                            }) {
+                                return with_denial_context(
+                                    ("capability denied: returned authority does not cover the requested targets".into(), ExecOutcome::Denied),
+                                    workspace,
+                                    cwd,
+                                    Some(caveats),
+                                );
+                            }
+                            // #2689/#2691 round 3: this denial fired
+                            // mid-dispatch, so an earlier stage of `cmd` may
+                            // already have run a real effect, or may be the
+                            // ONE effect a whole-command replay would repeat
+                            // (see `requests_are_replay_safe`'s doc comment in
+                            // `tools.rs` for both measured shapes — reused
+                            // here rather than a second predicate). Replay
+                            // only when EVERY denied request is an EXEC
+                            // denial AND provably a single simple command
+                            // naming it; a net denial's target is a host, not
+                            // the command's executable, and never auto-
+                            // replays even when it coincidentally shares a
+                            // name with the program. Otherwise hold the grant
+                            // in the gate's pending-once queue for the
+                            // model's own next matching call instead of
+                            // spending it on a replay that could duplicate an
+                            // effect.
+                            if !requests_are_replay_safe(&requests, cmd) {
+                                for request in &requests {
+                                    gate.queue_pending_once(request.kind, &request.target);
+                                }
+                                let granted = requests
+                                    .iter()
+                                    .map(|request| {
+                                        permission_granted_result(
+                                            request.kind.as_str(),
+                                            &request.target,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                return with_denial_context(
+                                    (granted, ExecOutcome::Denied),
+                                    workspace,
+                                    cwd,
+                                    Some(&widened),
+                                );
+                            }
                             if !filesystem_requests
                                 .iter()
                                 .all(|request| permits_filesystem_request(&widened, request))
@@ -1291,13 +1374,15 @@ pub(super) async fn exec_confined_command_with_broker(
                             {
                                 return (format!("error: {refusal}"), ExecOutcome::Unavailable);
                             }
+                            // Preserve both the broker policy and recovery lease on
+                            // retry: approval does not remove either ownership boundary.
                             let retried = match dispatch_bridled_shell_with_floor(
                                 dispatch_args,
                                 &widened,
                                 live_tool_output,
                                 None,
                                 execution_lease.clone(),
-                                None,
+                                command_broker,
                             )
                             .await
                             {

@@ -140,8 +140,11 @@ fn migration_notice_child() {
 #[test]
 #[serial_test::serial(tty_arbiter)]
 fn migration_notice_clears_the_live_spinner_and_returns_the_terminal() {
-    let (screen, exited) =
-        run_scenario_bounded("migration-spinner", CHILD_NAME, Duration::from_secs(20));
+    let (screen, exited) = run_scenario_bounded(
+        "migration-spinner",
+        CHILD_NAME,
+        crate::test_guard::HANG_GUARD,
+    );
     assert!(exited, "{screen:?}");
     let start = screen
         .find(MARKER)
@@ -163,8 +166,11 @@ fn migration_notice_clears_the_live_spinner_and_returns_the_terminal() {
 #[test]
 #[serial_test::serial(tty_arbiter)]
 fn migration_notice_preserves_an_owned_permission_question() {
-    let (screen, exited) =
-        run_scenario_bounded("migration-prompt", CHILD_NAME, Duration::from_secs(20));
+    let (screen, exited) = run_scenario_bounded(
+        "migration-prompt",
+        CHILD_NAME,
+        crate::test_guard::HANG_GUARD,
+    );
     assert!(exited, "{screen:?}");
     let start = screen.find(QUESTION).unwrap() + QUESTION.len();
     let notice = screen[start..].find(MARKER).unwrap() + start;
@@ -178,7 +184,8 @@ fn migration_notice_preserves_an_owned_permission_question() {
 #[serial_test::serial(tty_arbiter)]
 fn migration_refused_windows_do_not_consume_or_silence_reports() {
     for scenario in ["migration-protocol", "migration-refused"] {
-        let (screen, exited) = run_scenario_bounded(scenario, CHILD_NAME, Duration::from_secs(20));
+        let (screen, exited) =
+            run_scenario_bounded(scenario, CHILD_NAME, crate::test_guard::HANG_GUARD);
         assert!(exited, "{scenario}: {screen:?}");
         assert!(!screen.contains(QUESTION), "{scenario}: {screen:?}");
         assert_eq!(screen.matches(MARKER).count(), 1, "{scenario}: {screen:?}");
@@ -193,7 +200,7 @@ fn migration_refused_windows_do_not_consume_or_silence_reports() {
 #[serial_test::serial(tty_arbiter)]
 fn migration_actual_modal_keeps_columns_after_layered_notices() {
     let (screen, exited) =
-        run_scenario_bounded("migration-modal", CHILD_NAME, Duration::from_secs(20));
+        run_scenario_bounded("migration-modal", CHILD_NAME, crate::test_guard::HANG_GUARD);
     assert!(exited, "{screen:?}");
     let prompt = screen.find(QUESTION).expect("actual modal prompt");
     let before = &screen[..prompt];
@@ -222,7 +229,7 @@ fn migration_actual_modal_keeps_redirected_stderr_separate() {
     let (screen, exited) = run_scenario_bounded(
         "migration-modal-redirected",
         CHILD_NAME,
-        Duration::from_secs(20),
+        crate::test_guard::HANG_GUARD,
     );
     assert!(exited, "{screen:?}");
     assert!(screen.contains(QUESTION), "{screen:?}");
