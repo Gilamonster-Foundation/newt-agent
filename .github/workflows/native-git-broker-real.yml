@@ -18,7 +18,7 @@ name: Native Git broker real tier (#2693)
 # Landlock), so there is no matrix.
 #
 # HOOK PARITY EXCEPTION: like output-oracle-real.yml / mcp-import-real.yml,
-# this workflow is intentionally OUTSIDE pre-push-hook parity — a real
+# this workflow is intentionally OUTSIDE .githooks/pre-push parity — a real
 # Landlock ruleset + real git subprocess is too slow/environmental for a
 # local push gate. The pre-push hook mirrors ci.yml (the per-PR unit tier)
 # only.
@@ -40,6 +40,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL: "1"
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
 
