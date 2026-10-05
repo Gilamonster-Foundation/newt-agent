@@ -810,7 +810,7 @@ fn ensure_net_granted(
     }
 }
 
-fn is_git(program: &str) -> bool {
+pub(super) fn is_git(program: &str) -> bool {
     let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
     name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
 }
@@ -906,7 +906,7 @@ pub(super) fn windows_appcontainer_native_git_refusal(
 
 /// Reuse Bridle's static executable-word resolution for a single literal
 /// argument. No shell is run; expansions, multiple words, and redirects fail.
-fn literal(word: &str) -> Option<String> {
+pub(super) fn literal(word: &str) -> Option<String> {
     let parsed = inspect_shell(word).ok()?;
     let command = parsed.commands.first()?;
     (parsed.commands.len() == 1
@@ -920,7 +920,7 @@ fn literal(word: &str) -> Option<String> {
 
 /// Find the native verb without translating argv. Repository/config selectors
 /// remain usable for reads, but mutation cannot rely on the caller's cwd then.
-fn invocation(argv: &[String]) -> Result<(&str, &[String], bool), String> {
+pub(super) fn invocation(argv: &[String]) -> Result<(&str, &[String], bool), String> {
     let mut index = 1;
     let mut same_repository = true;
     while let Some(word) = argv.get(index) {

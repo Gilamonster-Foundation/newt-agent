@@ -946,6 +946,8 @@ pub struct ChatCtx<'a> {
     pub workspace: &'a str,
     /// Operator-selected default for commands only; never changes workspace identity or grants.
     pub default_command_cwd: Option<&'a std::path::Path>,
+    /// Session-owned worktree adoption, retained across turns.
+    pub worktree_session: Option<&'a crate::worktree_adoption::WorktreeSession>,
     pub color: bool,
     /// Render assistant Markdown as ANSI in the live stream (Step 25.4, #568).
     /// Resolved by the caller as `[tui].markdown` (∧ `/markdown` override) ∧
@@ -1954,6 +1956,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         task,
         workspace,
         default_command_cwd,
+        worktree_session,
         color,
         markdown: _,
         tool_offload,
@@ -4008,6 +4011,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     tools::ToolCollaborators {
                         read_history: Some(&mut read_history),
                         default_command_cwd,
+                        worktree_session,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
@@ -6835,6 +6839,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         task,
         workspace,
         default_command_cwd,
+        worktree_session,
         color,
         // #2372: the host renders the accepted reply, markdown included.
         markdown: _,
@@ -8921,6 +8926,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     tools::ToolCollaborators {
                         read_history: Some(&mut read_history),
                         default_command_cwd,
+                        worktree_session,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
@@ -9584,6 +9590,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         task,
         workspace,
         default_command_cwd,
+        worktree_session,
         color,
         // Like the OpenAI-compatible path, this loop streams natively —
         // the caller-resolved markdown decision drives the live writer.
@@ -11443,6 +11450,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     tools::ToolCollaborators {
                         read_history: Some(&mut read_history),
                         default_command_cwd,
+                        worktree_session,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
@@ -11992,6 +12000,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         task,
         workspace,
         default_command_cwd,
+        worktree_session,
         color,
         markdown: _,
         tool_offload,
@@ -13172,6 +13181,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     tools::ToolCollaborators {
                         read_history: Some(&mut read_history),
                         default_command_cwd,
+                        worktree_session,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),

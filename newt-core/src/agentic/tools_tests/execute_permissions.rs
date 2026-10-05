@@ -3380,6 +3380,7 @@ async fn command_cwd_fixture_call(
         &mut NoMcp,
         ToolCollaborators {
             default_command_cwd: default_cwd,
+            worktree_session: None,
             execution: Some(&execution),
             ..Default::default()
         },
@@ -3531,6 +3532,7 @@ async fn command_cwd_does_not_change_file_tools_or_baseline_read_routing() {
             &mut NoMcp,
             ToolCollaborators {
                 default_command_cwd: default_cwd,
+                worktree_session: None,
                 ..Default::default()
             },
             false,

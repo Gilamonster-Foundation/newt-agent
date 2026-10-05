@@ -35,6 +35,7 @@ fn ctx<'a>(
         task: TASK,
         workspace,
         default_command_cwd: None,
+        worktree_session: None,
         color: false,
         markdown: false,
         tool_offload: false,

@@ -373,6 +373,7 @@ struct InFlight {
 /// dedicated worker thread.
 #[derive(Clone)]
 struct HeadlessRuntimePosture {
+    worktree_session: Arc<crate::worktree_adoption::WorktreeSession>,
     cognition: Option<crate::role_profile::Cognition>,
     tenacity: crate::tenacity::Tenacity,
     initiative: crate::initiative::Initiative,
@@ -384,6 +385,7 @@ struct HeadlessRuntimePosture {
 impl HeadlessRuntimePosture {
     fn capture() -> Self {
         Self {
+            worktree_session: Arc::default(),
             cognition: crate::cognition::effective_cognition(),
             tenacity: crate::tenacity::effective_tenacity(),
             initiative: crate::initiative::effective_initiative(),
@@ -428,6 +430,11 @@ impl TurnDriver {
             transcript,
             in_flight: None,
         }
+    }
+
+    /// Explicit operator action; never exposed as a model tool.
+    pub fn lift_worktree_restriction(&self) {
+        self.runtime.worktree_session.lift();
     }
 
     /// The current transcript — every message the model has seen plus the
@@ -715,6 +722,7 @@ async fn run_one_turn(
         task,
         workspace: &config.workspace,
         default_command_cwd: None,
+        worktree_session: Some(&runtime.worktree_session),
         // The driver is headless: the loop's inline progress prints are
         // suppressed so nothing fights the consumer's ratatui frame.
         color: false,

@@ -33,6 +33,7 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     pub(crate) read_history: Option<&'a mut super::ReadHistory>,
     /// Call-local command default supplied by the operator, without granting authority.
     pub(crate) default_command_cwd: Option<&'a std::path::Path>,
+    pub(crate) worktree_session: Option<&'a crate::worktree_adoption::WorktreeSession>,
     pub(crate) invocation: Option<&'a agentic::smart_harness::ToolInvocation<'a>>,
     pub(crate) build_check_cmd: Option<&'a str>,
     /// #1947: the turn's tool ledger, distilled — what `render_report`'s

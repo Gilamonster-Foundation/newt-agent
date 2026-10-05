@@ -487,7 +487,11 @@ impl HeldRoots {
 
     /// [`HeldRoots::open_read`] plus a UTF-8 read of the whole file.
     #[cfg(unix)]
-    fn read_to_string(&self, anchor: &Path, rel: &Path) -> Result<Option<String>, Refusal> {
+    pub(crate) fn read_to_string(
+        &self,
+        anchor: &Path,
+        rel: &Path,
+    ) -> Result<Option<String>, Refusal> {
         use std::io::Read;
         let Some(mut file) = self.open_read(anchor, rel)? else {
             return Ok(None);
@@ -510,7 +514,11 @@ impl HeldRoots {
     }
 
     #[cfg(not(unix))]
-    fn read_to_string(&self, anchor: &Path, rel: &Path) -> Result<Option<String>, Refusal> {
+    pub(crate) fn read_to_string(
+        &self,
+        anchor: &Path,
+        rel: &Path,
+    ) -> Result<Option<String>, Refusal> {
         self.open_read(anchor, rel).map(|_| None)
     }
 
