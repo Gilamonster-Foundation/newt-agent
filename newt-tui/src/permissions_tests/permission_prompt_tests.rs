@@ -4434,3 +4434,98 @@ fn model_forged_bound_prefix_is_still_model_authored() {
          suppress the unverified label; reason_is_model_authored returned false"
     );
 }
+
+/// #2720: proactive requests for ambient exec authority must not prompt,
+/// consume a once-grant, or override an explicit denial.
+#[test]
+fn full_access_proactive_permissions_are_silent_but_denials_win() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut request = exec_request("git");
+    request.tool = "request_permissions".into();
+    {
+        let mut gate = scripted_gate(
+            &mut state,
+            Caveats::top(),
+            None,
+            None,
+            vec![],
+            prompts.clone(),
+        );
+        assert!(matches!(
+            gate.ask(&[request.clone()]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+    }
+    assert_eq!(prompts.get(), 0);
+    assert!(state.pending_once_grants.is_empty());
+    assert!(state.session_grants.is_empty());
+    state
+        .session_denials
+        .insert((DenialKind::Exec, "git".into()));
+    let mut gate = scripted_gate(
+        &mut state,
+        Caveats::top(),
+        None,
+        None,
+        vec![],
+        prompts.clone(),
+    );
+    assert!(matches!(
+        gate.ask(&[request]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert_eq!(prompts.get(), 0);
+}
+
+/// #2720: a model's proactive request is not evidence of a policy denial.
+#[test]
+fn proactive_permission_prompt_does_not_claim_an_exec_denial() {
+    let mut request = exec_request("git");
+    request.tool = "request_permissions".into();
+    let (definition, _) = permission_definition_with_default(
+        &request,
+        &danger::DangerTable::builtin(),
+        Audience::Terminal,
+        PromptChoice::Deny,
+    );
+    let text = plain::render(&definition);
+    assert!(
+        !text.contains("outside the granted exec allowlist"),
+        "{text}"
+    );
+}
+
+/// #2720: suppressing redundant requests cannot suppress actual write consent,
+/// replay consent, or requests above the current preset ceiling.
+#[test]
+fn full_access_permission_shortcut_preserves_consent_and_ceilings() {
+    for mode in ["write", "replay", "ceiling"] {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let mut request = exec_request("git");
+        request.tool = "request_permissions".into();
+        let mut gate = scripted_gate(
+            &mut state,
+            Caveats::top(),
+            None,
+            None,
+            vec![PromptChoice::Deny],
+            prompts.clone(),
+        );
+        match mode {
+            "write" => {
+                request.tool = "write_file".into();
+                request.kind = DenialKind::FsWrite;
+                request.target = "/fixture/file".into();
+            }
+            "replay" => request.harness_bound = true,
+            _ => gate.preset_clamp = Some(base_caveats("/fixture")),
+        }
+        assert!(matches!(
+            gate.ask(&[request]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 1, "{mode}");
+    }
+}
