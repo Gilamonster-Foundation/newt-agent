@@ -563,6 +563,7 @@ pub(super) fn execute_governed_pr_create(
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
+    observed: Option<&std::sync::OnceLock<crate::git_staging::Outcome>>,
 ) -> String {
     if let Err(unavailable) = broker_available(caveats) {
         return unavailable.to_string();
@@ -572,6 +573,9 @@ pub(super) fn execute_governed_pr_create(
         let plan = plan_governed_pr_create(source, cwd, caveats, gate, &held)?;
         run_staged_pr_create(&plan)
     })();
+    if let (Some(slot), Ok(outcome)) = (observed, &result) {
+        let _ = slot.set(outcome.clone());
+    }
     fixed_form_with_notice(result, std::io::stdout())
 }
 
@@ -2948,6 +2952,8 @@ mod governed_push_tests {
             .enable_all()
             .build()
             .unwrap();
+        let governed_pr = std::sync::OnceLock::new();
+        let command_directory = std::sync::OnceLock::new();
         let result = runtime
             .block_on(super::super::execute_tool_with_display_cancellable(
                 &mut display,
@@ -2960,6 +2966,8 @@ mod governed_push_tests {
                 &mut crate::agentic::NoMcp,
                 super::super::ToolCollaborators {
                     permission_gate: gate,
+                    governed_pr: Some(&governed_pr),
+                    command_directory: Some(&command_directory),
                     ..Default::default()
                 },
                 false,
@@ -2968,6 +2976,17 @@ mod governed_push_tests {
             ))
             .unwrap()
             .unwrap();
+        // #2741: existing hermetic PR-create tests ground the typed receipt
+        // in real dispatch, not in parsing its model-facing rendering.
+        if needs_pr_create_broker(command) && result.starts_with("pr_created ") {
+            assert!(
+                matches!(governed_pr.get(), Some(crate::git_staging::Outcome::PrCreated { url })
+                if result == format!("pr_created {url}"))
+            );
+            assert_eq!(command_directory.get().map(|p| p.as_path()), Some(ws));
+        } else if !needs_pr_create_broker(command) {
+            assert!(governed_pr.get().is_none());
+        }
         drop(display);
         let text = String::from_utf8_lossy(&terminal.0.lock().unwrap()).into_owned();
         (result, text)
