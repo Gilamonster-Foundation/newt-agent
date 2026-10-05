@@ -191,6 +191,7 @@ pub(super) async fn run_scenario_for(
         task: prompt,
         workspace: &ws,
         default_command_cwd: None,
+        worktree_session: None,
         color: false,
         markdown: false,
         tool_offload: false,
