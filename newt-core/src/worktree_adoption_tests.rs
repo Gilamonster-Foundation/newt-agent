@@ -248,17 +248,3 @@ fn adoption_fences_common_metadata_outside_the_original_checkout() {
         ));
     }
 }
-
-/// #2753: optional adoption metadata must not turn bounded read authority into
-/// an ambient Git scan, or describe an unavailable count as a clean checkout.
-#[cfg(unix)]
-#[test]
-fn worktree_notice_change_count_is_unknown_under_bounded_reads() {
-    let (temp, policy, _) = fixture(false);
-    let caveats = Caveats {
-        fs_read: Scope::only([temp.path().to_string_lossy().into_owned()]),
-        ..Caveats::top()
-    };
-    let candidate = Creation::before(&policy.original, &policy.worktree, &caveats).unwrap();
-    assert_eq!(candidate.uncommitted_changes(&caveats), None);
-}

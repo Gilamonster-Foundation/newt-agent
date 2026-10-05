@@ -64,8 +64,7 @@
 //! exactly as before. It accepts the Interceptor-level exec residual ONLY
 //! where a host-side broker (not the model) already decides, by its own
 //! policy, which fixed program and argv may run — `NativeGitBroker`'s
-//! `RepositoryProbe` re-dispatch or the read-only worktree-adoption status probe,
-//! never a model-chosen command. Recorded as a
+//! `RepositoryProbe` re-dispatch, never a model-chosen command. Recorded as a
 //! named deviation: `docs/security/ocap-deviations.md` §
 //! `native-git-broker-exec-floor`.
 
@@ -99,8 +98,9 @@ pub enum ExecOrigin {
     /// model `run_command` (see the module doc's "per-axis exception").
     /// Minted under [`agent_bridle::EnforcementFloor::CONFINED`]: `fs`/`net`
     /// still require `Kernel` (fail-closed, #10 unchanged), `exec` accepts
-    /// the `Interceptor` tier Landlock actually provides. Used by native Git
-    /// re-dispatch and the read-only worktree-adoption status probe.
+    /// the `Interceptor` tier Landlock actually provides. Currently used only
+    /// by [`crate::native_git_broker::NativeGitBroker`]'s own `git`
+    /// re-dispatch.
     BrokerMediated,
 }
 

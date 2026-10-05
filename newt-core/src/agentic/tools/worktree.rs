@@ -16,6 +16,69 @@ fn worktree_add_args(words: &[String]) -> Option<&[String]> {
     (verb == "worktree" && action == "add").then_some(args)
 }
 
+/// #2753: advice only, never authority. Inspect the dispatched standalone Git
+/// shape and its stderr separately from stdout, before output is combined/spilled.
+/// Unrecognized option shapes deliberately receive no error-specific advice.
+pub(super) fn creation_failure_hint(
+    source: &str,
+    envelope: &serde_json::Value,
+) -> Option<&'static str> {
+    if shell::envelope_outcome(envelope) != crate::ExecOutcome::Failed {
+        return None;
+    }
+    let inspection = agent_bridle::inspect_shell(source).ok()?;
+    let [command] = inspection.commands.as_slice() else {
+        return None;
+    };
+    if !inspection.constructs.is_empty()
+        || !inspection.warnings.is_empty()
+        || !command.descendant_execs.is_empty()
+        || !command.redirects.is_empty()
+        || source.trim() != command.source.trim()
+        || !command.program.as_deref().is_some_and(resembles_git)
+    {
+        return None;
+    }
+    let mut remaining = command.source.as_str();
+    for word in &command.argv {
+        remaining = remaining.trim_start().strip_prefix(word)?;
+    }
+    if !remaining.trim().is_empty() {
+        return None;
+    }
+    let words = command
+        .argv
+        .iter()
+        .map(|word| literal(word))
+        .collect::<Option<Vec<_>>>()?;
+    if words.iter().any(|word| word.contains(['\n', '\r'])) {
+        return None;
+    }
+    // Admission allows only -C before the subcommand, not config overrides.
+    let mut global = words.iter().skip(1);
+    let mut word = global.next()?;
+    while word == "-C" {
+        global.next()?;
+        word = global.next()?;
+    }
+    if word != "worktree" {
+        return None;
+    }
+    // Reuse the admission parser's Git/subcommand interpretation. Limit the
+    // hint to explicit branch operands, avoiding guesses about HEAD or -d.
+    let args = worktree_add_args(&words)?;
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let branch = match args.as_slice() {
+        [path, branch] if !path.starts_with('-') => *branch,
+        ["-b" | "-B", branch, _] | ["-b" | "-B", branch, _, _] => *branch,
+        _ => return None,
+    };
+    let prefix = format!("fatal: '{branch}' is already used by worktree at ");
+    envelope.get("stderr")?.as_str()?.lines().any(|line| line.starts_with(&prefix)).then_some(
+        "\nWorktree hint: if you switched the original to that branch, switch it back with `git switch -`. To create a new task branch, pick a new branch name and run `git worktree add -b <new-branch> <path> [<start>]` as a standalone command."
+    )
+}
+
 /// A conservative refusal trigger, NEVER evidence authorizing adoption. Scan
 /// every command independently of cwd/operand resolution and inspect children.
 fn possible_creation(source: &str) -> bool {
@@ -292,6 +355,25 @@ impl PermissionGate for Guard<'_, '_> {
     }
 }
 
+/// Verified creation can only arm a fence when the executor honors it. The
+/// bypass is frozen launch policy; broad grants alone do not disable adoption.
+fn record_verified_creation(
+    session: &crate::worktree_adoption::WorktreeSession,
+    adopted: AdoptedWorktree,
+    bypass: bool,
+) -> String {
+    if bypass {
+        format!("Task worktree created: {}. Warning: worktree protection is not armed because OCAP is disabled; the original checkout remains writable under existing permissions. Use a confined session for automatic original-checkout protection.", adopted.worktree.display())
+    } else {
+        let notice = format!(
+            "Adopted task worktree: {}. The original checkout and shared config are now read-only for this task. Use git -c user.name=… -c user.email=… for per-command identity. Any uncommitted changes in the original checkout are now read-only; copy them into the new worktree and commit there, or ask the operator for /permissions worktree-lift.",
+            adopted.worktree.display()
+        );
+        session.adopt(adopted);
+        notice
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     presentation: &mut dyn ToolPresentation,
@@ -306,6 +388,7 @@ pub(super) async fn execute(
     tool_offload: bool,
     disposition: PromptDisposition,
 ) -> String {
+    let bypass = ocap_disabled();
     let session = collab.worktree_session;
     let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);
     let mut normalized =
@@ -328,7 +411,12 @@ pub(super) async fn execute(
         if let Some(slot) = collab.execution {
             let _ = slot.set(crate::ExecOutcome::Denied);
         }
-        return "capability denied: cannot verify this worktree creation and its surrounding commands; run `git worktree add -b <new-branch> <path> [<start>]` as a standalone literal command in the original checkout. Do not create the branch in the original checkout first; -b creates it for the new worktree".into();
+        let protection = if bypass {
+            "; OCAP is disabled, so automatic worktree protection will not be armed"
+        } else {
+            " so it can become read-only before other mutations run"
+        };
+        return format!("capability denied: cannot verify this worktree creation and its surrounding commands; run `git worktree add -b <new-branch> <path> [<start>]` as a standalone literal command in the original checkout{protection}. Do not create the branch in the original checkout first; -b creates it for the new worktree");
     };
     let candidate = candidate.map(|(candidate, source)| {
         normalized.to_mut()["command"] = source.into();
@@ -359,9 +447,6 @@ pub(super) async fn execute(
         }
         candidate
     });
-    let original_changes = candidate
-        .as_ref()
-        .and_then(|c| c.uncommitted_changes(caveats));
     let args = if candidate.is_some() {
         normalized.as_ref()
     } else {
@@ -388,7 +473,7 @@ pub(super) async fn execute(
         if refuse_git
             || !policy.valid(caveats)
             || refuse
-            || (ocap_disabled() && matches!(name, "run_command" | "lifecycle" | "build_exec"))
+            || (bypass && matches!(name, "run_command" | "lifecycle" | "build_exec"))
         {
             if let Some(invocation) = collab.invocation {
                 invocation.host();
@@ -436,12 +521,6 @@ pub(super) async fn execute(
         )
         .await
     };
-    if candidate.is_some()
-        && execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Failed)
-        && result.contains("is already used by worktree at")
-    {
-        result.push_str("\nWorktree hint: if you just created the branch in the original checkout, switch that checkout back with `git switch -`. To create a new task branch, pick a new branch name and run `git worktree add -b <new-branch> <path> [<start>]` as a standalone command.");
-    }
     if let (Some(session), Some(candidate)) = (session, candidate) {
         if matches!(
             execution.and_then(|slot| slot.get()),
@@ -451,13 +530,13 @@ pub(super) async fn execute(
                 // Reuse the existing bind-once identity cache for later native
                 // Git dispatch; never replace an identity another call pinned.
                 let _ = crate::git_hardening::ambient_gitdir_write_grant(&adopted.worktree);
-                result.push_str(&format!("\nAdopted task worktree: {}. The original checkout and shared config are now read-only for this task. Use git -c user.name=… -c user.email=… for per-command identity.", adopted.worktree.display()));
-                match original_changes {
-                    Some(0) => {}
-                    Some(count) => result.push_str(&format!("\nThe original has {count} uncommitted changes, now read-only. Copy them into the new worktree and commit there, or ask the operator to /permissions worktree-lift.")),
-                    None => result.push_str("\nOriginal uncommitted changes could not be counted; any existing changes are now read-only. Copy needed changes into the new worktree and commit there, or ask the operator to /permissions worktree-lift."),
+                let notice = record_verified_creation(session, adopted, bypass);
+                if bypass {
+                    // Visible to the operator even when shell output has an
+                    // independently folded/overridden result presentation.
+                    presentation.preview(&notice, 0);
                 }
-                session.adopt(adopted);
+                result.push_str(&format!("\n{notice}"));
             }
         }
     }
@@ -493,6 +572,10 @@ mod round5_tests;
 #[cfg(test)]
 #[path = "../tools_tests/worktree_adoption_round6.rs"]
 mod round6_tests;
+
+#[cfg(test)]
+#[path = "../tools_tests/worktree_adoption_fullaccess.rs"]
+mod fullaccess_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tools_tests/worktree_adoption_refs.rs"]

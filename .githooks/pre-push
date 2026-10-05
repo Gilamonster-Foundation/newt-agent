@@ -33,6 +33,9 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - ambient worktree dispatch proof (#2750), .github/workflows/ci.yml test job:
+#     explicitly runs the exact ignored fullaccess_tests::adoption_2750_full_access_creation_then_task_command
+#     in newt-core's worktree module. Real Git/host shell, Linux CI only.
 #   - checked move_from native proof (#2724), .github/workflows/ci.yml test job:
 #     builds newt-net-guard with ast, then explicitly runs the exact ignored
 #     newt-core::agentic::tools::move_from::tests::real_move_from_fixture_compiles_and_failed_check_restores

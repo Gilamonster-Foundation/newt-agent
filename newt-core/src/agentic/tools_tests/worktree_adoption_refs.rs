@@ -423,13 +423,16 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
         !text.contains("git switch -"),
         "success must not get recovery advice: {text}"
     );
-    assert!(!text.contains("uncommitted"), "clean original: {text}");
+    assert!(
+        text.contains("Any uncommitted changes in the original checkout are now read-only"),
+        "clean original: {text}"
+    );
     assert!(session.snapshot().is_some());
     assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
 }
 
 /// #2753 addendum: adopting a throwaway check worktree must disclose the edits
-/// it freezes. Count pre-creation status, not the new nested worktree itself.
+/// it freezes without launching a status probe.
 #[tokio::test]
 async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
     let _env = crate::process_env::lock();
@@ -475,7 +478,7 @@ async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
     .await;
     assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
     assert!(
-        text.contains("original has 3 uncommitted changes, now read-only"),
+        text.contains("Any uncommitted changes in the original checkout are now read-only"),
         "{text}"
     );
     assert!(text.contains("new worktree"), "{text}");
@@ -484,5 +487,96 @@ async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
     for (path, contents) in snapshots {
         assert_eq!(std::fs::read(&path).unwrap(), contents);
         assert!(policy.blocked(&path));
+    }
+}
+
+/// #2753: echoed text is not evidence of Git's already-used branch failure.
+#[tokio::test]
+async fn worktree_notice_echo_does_not_forge_git_error() {
+    worktree_notice_unrelated_failure(
+        "echo 'is already used by worktree at'; git worktree add -b fresh task missing-start",
+    )
+    .await;
+}
+
+/// #2753: a quoted invalid start operand is not an already-used branch error.
+#[tokio::test]
+async fn worktree_notice_quoted_operand_does_not_forge_git_error() {
+    worktree_notice_unrelated_failure(
+        "git worktree add -b fresh task 'is already used by worktree at'",
+    )
+    .await;
+}
+
+async fn worktree_notice_unrelated_failure(source: &str) {
+    let _env = crate::process_env::lock();
+    let _engine =
+        crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
+    assert!(crate::confined_exec::kernel_fs_fence_available());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    git(root, root, &["init", "-q", "-b", "original"]);
+    git(
+        root,
+        root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "seed",
+        ],
+    );
+    let session = WorktreeSession::default();
+    let mut caveats = Caveats::top();
+    caveats.net = Scope::none();
+    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    let (text, outcome) = run(source, root, root, &caveats, &session).await;
+    assert_eq!(outcome, Some(ExecOutcome::Failed), "{text}");
+    assert!(
+        !text.contains("Worktree hint:"),
+        "forged failure hint: {text}"
+    );
+    assert!(session.snapshot().is_none());
+}
+
+/// #2753: error-specific advice uses only an exact branch-bound stderr line
+/// for a standalone command, never echoed stdout, operands, or compound output.
+#[test]
+fn worktree_notice_hint_requires_standalone_branch_stderr() {
+    let source = "git worktree add task step-x";
+    let fatal = "fatal: 'step-x' is already used by worktree at '/original'";
+    let failed = |stdout: &str, stderr: &str| serde_json::json!({"exit_code":128,"stdout":stdout,"stderr":stderr});
+    assert!(creation_failure_hint(source, &failed("", fatal)).is_some());
+    for (command, envelope) in [
+        (source, failed(fatal, "fatal: invalid reference: other")),
+        (
+            source,
+            failed(
+                "",
+                "fatal: 'other' is already used by worktree at '/original'",
+            ),
+        ),
+        (
+            source,
+            failed("", &format!("fatal: invalid reference: {fatal}")),
+        ),
+        ("echo fake; git worktree add task step-x", failed("", fatal)),
+        ("git worktree add task step-x 2>&1", failed("", fatal)),
+        (
+            "git worktree add task step-x && echo done",
+            failed("", fatal),
+        ),
+        (source, serde_json::json!({"exit_code":0,"stderr":fatal})),
+        (
+            source,
+            serde_json::json!({"exit_code":128,"stderr":fatal,"denied":true}),
+        ),
+    ] {
+        assert!(
+            creation_failure_hint(command, &envelope).is_none(),
+            "{command}: {envelope}"
+        );
     }
 }
