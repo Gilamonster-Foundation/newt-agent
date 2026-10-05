@@ -158,6 +158,41 @@ pub(crate) fn parse_rust(source: &str) -> Result<tree_sitter::Tree, String> {
         .ok_or_else(|| "Rust parser did not produce a tree".into())
 }
 
+/// A fragment can start with the closing tokens of an item outside the page.
+/// Those tokens can derail tree-sitter's recovery (including doc-comment lexing)
+/// when the other end of the page is also cut (#2735). Discard only a contiguous
+/// prefix of actual unnamed closing delimiters and following statement
+/// terminators, separated by whitespace. A comment, literal, macro, or any other
+/// token ends this narrow adjustment.
+/// Complete-source parsing for structural edits remains untouched.
+fn leading_closing_delimiters(source: &str) -> usize {
+    if !source.trim_start().starts_with([')', ']', '}']) {
+        return 0;
+    }
+    let Ok(tree) = parse_rust(source) else {
+        return 0;
+    };
+    let mut end = 0;
+    loop {
+        let start = source.len() - source[end..].trim_start().len();
+        if start == source.len() {
+            break;
+        }
+        let Some(node) = tree.root_node().descendant_for_byte_range(start, start + 1) else {
+            break;
+        };
+        if node.is_named()
+            || !matches!(node.kind(), ")" | "]" | "}" | ";")
+            || node.start_byte() != start
+            || node.end_byte() != start + 1
+        {
+            break;
+        }
+        end = node.end_byte();
+    }
+    end
+}
+
 /// The page-cut counterpart of tags-based recovery (#2638 fix item 1): a
 /// definition whose CLOSE never arrives inside this fragment leaves an
 /// unbalanced brace count with no `is_definition` tag of its own. Recovery
@@ -213,6 +248,9 @@ fn trailing_truncated_definition(
 /// fragment yields no tags at all (e.g. the tags query can't be built) — a
 /// caller falls back to the plain one-liner, never to a regex parser.
 pub fn outline_rust(source: &str, first_line: usize) -> Option<Vec<OutlineEntry>> {
+    let prefix = leading_closing_delimiters(source);
+    let first_line = first_line + source[..prefix].bytes().filter(|&b| b == b'\n').count();
+    let source = &source[prefix..];
     let mut ctx = TagsContext::new();
     let (tags, _) = ctx.generate_tags(config(), source.as_bytes(), None).ok()?;
     // `Tag::span` is the SPAN OF THE NAME NODE ONLY (tags.rs computes it from
@@ -794,3 +832,6 @@ pub(crate) enum ResponsesCompaction {
         );
     }
 }
+
+#[cfg(test)]
+mod page_tests;
