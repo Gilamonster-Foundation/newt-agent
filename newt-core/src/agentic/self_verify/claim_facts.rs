@@ -321,6 +321,25 @@ mod tests {
         assert_eq!(text.matches("⚠ claim check (#2718):").count(), 1, "{text}");
     }
 
+    /// #2750: an old annotation must not suppress facts from a changed ledger.
+    #[tokio::test]
+    async fn adoption_2750_changed_ledger_keeps_fresh_claim_facts() {
+        let mut ledger = VerificationLedger::for_turn("refactor", false);
+        let initial = ledger.annotate_cargo_claim("Cargo check passed".into());
+        run(&mut ledger, "cargo check", Passed, "/task").await;
+        let passed = ledger.annotate_cargo_claim(initial.clone());
+        assert!(passed.starts_with(&initial));
+        assert!(passed.contains(&in_dir("Passed", "/task")), "{passed}");
+        assert_eq!(passed.matches("⚠ claim check (#2718):").count(), 2);
+
+        run(&mut ledger, "cargo check", Failed, "/task").await;
+        let failed = ledger.annotate_cargo_claim(passed.clone());
+        assert!(failed.starts_with(&passed));
+        assert!(failed.contains(&in_dir("Failed", "/task")), "{failed}");
+        assert_eq!(failed.matches("⚠ claim check (#2718):").count(), 3);
+        assert_eq!(ledger.annotate_cargo_claim(failed.clone()), failed);
+    }
+
     use crate::ExecOutcome::{Failed, Passed};
 
     fn in_dir(status: &str, directory: &str) -> String {

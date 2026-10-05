@@ -16,22 +16,29 @@ impl PermissionGate for Approve {
 /// #2750: the reserved operator action must never produce a fake exec grant.
 #[test]
 fn adoption_2750_permission_target_does_not_pretend_to_lift() {
-    let mut gate = Approve { asked: false };
-    let (granted, replay, text) = execute_request_permissions(
-        &Caveats::top(),
-        &serde_json::json!({"capability":"exec", "target":"worktree-lift", "reason":"unblock task"}),
-        Some(&mut gate),
-        false,
-        20,
-        ".",
-        None,
-    );
-    assert!(granted.is_none() && replay.is_none(), "{text}");
-    assert!(
-        !gate.asked,
-        "a prompt cannot approve this non-capability target"
-    );
-    assert!(text.contains("/permissions worktree-lift"), "{text}");
+    for target in [
+        "worktree-lift",
+        "/permissions worktree-lift",
+        "  worktree-lift\t\n",
+        "\n /permissions worktree-lift \t",
+    ] {
+        let mut gate = Approve { asked: false };
+        let (granted, replay, text) = execute_request_permissions(
+            &Caveats::top(),
+            &serde_json::json!({"capability":"exec", "target":target, "reason":"unblock task"}),
+            Some(&mut gate),
+            false,
+            20,
+            ".",
+            None,
+        );
+        assert!(granted.is_none() && replay.is_none(), "{text}");
+        assert!(
+            !gate.asked,
+            "a prompt cannot approve this non-capability target"
+        );
+        assert!(text.contains("/permissions worktree-lift"), "{text}");
+    }
 }
 
 #[cfg(unix)]
@@ -49,6 +56,7 @@ impl ToolPresentation for Notices {
 /// #2750: ground the adoption decision in real Git creation followed by actual
 /// host-shell execution in the task worktree. No kernel fence is available in
 /// this explicit bypass mode; arming one must not strand the session.
+/// Selected explicitly by ci.yml's Linux `test` job (ambient worktree proof).
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "real Git and host shell; explicit full-access adoption proof"]
