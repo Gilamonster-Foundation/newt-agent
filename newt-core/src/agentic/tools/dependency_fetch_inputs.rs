@@ -20,17 +20,15 @@ impl FetchInputs {
         let relative = cwd
             .strip_prefix(root)
             .map_err(|_| "fetch directory is outside the workspace")?;
-        let directory = tempfile::Builder::new()
-            .prefix("newt-fetch-")
-            .tempdir()
-            .map_err(|e| format!("cannot create private fetch inputs: {e}"))?;
+        let directory =
+            private_tempdir().map_err(|e| format!("cannot create private fetch inputs: {e}"))?;
         let private = directory.path().canonicalize().map_err(|e| e.to_string())?;
         let source = root.canonicalize().map_err(|e| e.to_string())?;
         if private.starts_with(&source) {
             return Err("private fetch inputs must be outside the mutable workspace; configure an external temporary directory".into());
         }
         let copy = private.join("workspace");
-        std::fs::create_dir(&copy).map_err(|e| e.to_string())?;
+        create_private_dir(&copy).map_err(|e| e.to_string())?;
         copy_workspace(&source, &copy).map_err(|e| format!("cannot pin fetch inputs: {e}"))?;
         let copied_cwd = copy.join(relative);
         let read = |path: &Path| std::fs::read_to_string(path).ok();
@@ -73,6 +71,8 @@ impl FetchInputs {
     /// This is an early, explicit refusal for prompt-time edits. Safety after
     /// this check comes from using the private copy, never reopening source.
     pub fn verify_source(&self, read: impl Fn(&Path) -> Option<String>) -> Result<(), String> {
+        verify_private_tree(self._directory.path())
+            .map_err(|e| format!("fetch inputs are not owner-only: {e}"))?;
         if self.screened.iter().any(|(path, expected)| {
             read(path).map(|bytes| RawContentId::from_content(bytes.as_bytes())) != *expected
         }) {
@@ -82,13 +82,77 @@ impl FetchInputs {
     }
 }
 
+/// Permissions are supplied to creation itself: a permissive umask cannot
+/// open a group-readable/writable window before a later chmod.
+fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .prefix("newt-fetch-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::other(
+            "owner-only fetch copies require Unix permissions",
+        ))
+    }
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::other(
+            "owner-only fetch copies require Unix permissions",
+        ))
+    }
+}
+
+/// Called before approval and again immediately before returning the approved
+/// request for execution. Never follow a substituted link while checking modes.
+fn verify_private_tree(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.permissions().mode() & 0o077 != 0 || !(metadata.is_dir() || metadata.is_file())
+        {
+            return Err(std::io::Error::other(
+                "copy permits non-owner access or contains a non-regular entry",
+            ));
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                verify_private_tree(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::other(
+            "owner-only fetch copies require Unix permissions",
+        ))
+    }
+}
+
 /// Reuse descriptor-relative WorkspaceDir reads: source renames or escaping
 /// links cannot make the harness copy a file outside its workspace authority.
 /// No hardlinks are shared with the source. Limits bound hostile/huge trees.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn copy_workspace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use crate::fs_cap::WorkspaceDir;
-    use std::io::{Error, Read};
+    use std::io::{Error, Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
     fn copy(
         dir: WorkspaceDir,
         destination: &Path,
@@ -115,7 +179,12 @@ fn copy_workspace(source: &Path, destination: &Path) -> std::io::Result<()> {
                         .1
                         .checked_sub(bytes.len())
                         .ok_or_else(|| Error::other("fetch snapshot exceeds 128 MiB"))?;
-                    std::fs::write(destination.join(&name), bytes)?;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(destination.join(&name))?
+                        .write_all(&bytes)?;
                 }
                 // Symlinks are never materialized. If Cargo needs one, the
                 // isolated fetch fails closed rather than following live input.
@@ -123,7 +192,7 @@ fn copy_workspace(source: &Path, destination: &Path) -> std::io::Result<()> {
                 Err(_) => {
                     let child = dir.open_dir(relative)?;
                     let target = destination.join(&name);
-                    std::fs::create_dir(&target)?;
+                    create_private_dir(&target)?;
                     copy(child, &target, remaining, depth + 1)?;
                 }
             }
@@ -148,6 +217,96 @@ fn copy_workspace(_: &Path, _: &Path) -> std::io::Result<()> {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    /// #2731 round 3: a permissive process umask must never expose the
+    /// outer directory, copied directories or copied files to another user.
+    /// Change umask only in a fresh subprocess, never in the parallel runner.
+    #[test]
+    fn copy_is_owner_only_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "NEWT_FETCH_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", "umask 002; exec \"$@\"", "fetch-umask-test"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "agentic::tools::dependency_fetch::inputs::tests::copy_is_owner_only_under_permissive_umask", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let source = tempfile::tempdir().unwrap();
+        let root = source.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "[[package]]\nname='app'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        let inputs = FetchInputs::capture(&root, &root).unwrap();
+        for path in [
+            inputs._directory.path().to_path_buf(),
+            inputs.root.clone(),
+            inputs.root.join("Cargo.lock"),
+            inputs.root.join("src"),
+            inputs.root.join("src/lib.rs"),
+        ] {
+            let mode = std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "copy exposed at {}: mode {mode:o}",
+                path.display()
+            );
+        }
+    }
+
+    /// #2731 round 3: permission widening anywhere in the retained copy
+    /// must fail the same verification called after approval and before launch.
+    #[test]
+    fn changed_copy_permissions_refuse_before_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = tempfile::tempdir().unwrap();
+        let root = source.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "[[package]]\nname='app'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        let inputs = FetchInputs::capture(&root, &root).unwrap();
+        let read = |p: &Path| std::fs::read_to_string(p).ok();
+        inputs.verify_source(read).unwrap();
+        for path in [
+            inputs._directory.path().to_path_buf(),
+            inputs.root.clone(),
+            inputs.root.join("src"),
+            inputs.root.join("src/lib.rs"),
+        ] {
+            let original = std::fs::metadata(&path).unwrap().permissions();
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(original.mode() | 0o060),
+            )
+            .unwrap();
+            assert!(inputs
+                .verify_source(read)
+                .is_err_and(|e| e.contains("not owner-only")));
+            std::fs::set_permissions(&path, original).unwrap();
+        }
+        inputs.verify_source(read).unwrap();
+    }
 
     /// #2731: a private copy, not a second source-name check, binds input bytes
     /// through use. Source edits after verification cannot affect the copy.
