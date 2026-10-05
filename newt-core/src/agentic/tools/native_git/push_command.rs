@@ -5,7 +5,7 @@ use super::{inspect_shell, literal};
 
 pub(super) const RETRY: &str = "Retry with run_command using the worktree as cwd and command `git push origin` (or `git push --dry-run origin` for a dry run).";
 
-pub(super) struct GovernedCommand {
+pub(in crate::agentic::tools) struct GovernedCommand {
     pub argv: Vec<String>,
     head: Option<usize>,
     echo: Vec<String>,

@@ -933,7 +933,7 @@ pub fn is_default_branch(common_dir: &Path, branch: &str, held: &HeldRoots) -> b
 /// A conservative subset of `git check-ref-format`: the name is later used
 /// as a path under `refs/heads/` and as a refspec destination, so traversal
 /// or refspec syntax must be impossible.
-fn validate_branch_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_branch_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && !name.ends_with('/')
         && !name.ends_with(".lock")
@@ -990,7 +990,7 @@ pub fn read_branch_oid(git_dir: &Path, branch: &str, held: &HeldRoots) -> Result
     .into())
 }
 
-fn is_hex_oid(s: &str) -> bool {
+pub(crate) fn is_hex_oid(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 

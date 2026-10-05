@@ -39,6 +39,9 @@
 //! Model commands already run under the command's filesystem/exec fence and
 //! omit that override so ordinary native diffs retain their meaning.
 
+mod branch;
+pub(crate) use branch::create_worktree_branch;
+
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
@@ -865,7 +868,7 @@ fn advance_branch_ref_natively(
     new_oid: &str,
     message: &str,
 ) -> Result<(), String> {
-    advance_branch_ref_natively_seamed(identity, branch, old_tip, new_oid, message, &|| {})
+    advance_branch_ref_natively_seamed(identity, branch, Some(old_tip), new_oid, message, &|| {})
 }
 
 /// [`advance_branch_ref_natively`] plus a test-only seam:
@@ -879,7 +882,7 @@ fn advance_branch_ref_natively(
 fn advance_branch_ref_natively_seamed(
     identity: &BoundGitIdentity,
     branch: &str,
-    old_tip: &str,
+    old_tip: Option<&str>,
     new_oid: &str,
     message: &str,
     between_reflog_and_rename: &dyn Fn(),
@@ -907,9 +910,9 @@ fn advance_branch_ref_natively_seamed(
         Ok(current) => current,
         Err(e) => return Err(abort(e)),
     };
-    if current.as_deref() != Some(old_tip) {
+    if current.as_deref() != old_tip {
         return Err(abort(format!(
-            "refused: refs/heads/{branch} is no longer at {old_tip} (now {current:?}) — \
+            "refused: refs/heads/{branch} is no longer at {old_tip:?} (now {current:?}) — \
              a concurrent mover won the race"
         )));
     }
@@ -924,7 +927,13 @@ fn advance_branch_ref_natively_seamed(
         )));
     }
 
-    if let Err(e) = append_reflog_natively(identity, branch, old_tip, new_oid, message) {
+    if let Err(e) = append_reflog_natively(
+        identity,
+        branch,
+        old_tip.unwrap_or(&"0".repeat(new_oid.len())),
+        new_oid,
+        message,
+    ) {
         return Err(abort(e));
     }
 
@@ -3260,7 +3269,7 @@ mod own_gitdir_grant_tests {
         let refusal = advance_branch_ref_natively_seamed(
             &identity,
             &branch,
-            &old_tip,
+            Some(&old_tip),
             &new_oid,
             "commit: task work",
             &force_rename_failure,
