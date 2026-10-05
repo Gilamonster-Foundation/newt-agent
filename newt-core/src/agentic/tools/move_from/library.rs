@@ -35,19 +35,10 @@ fn verify(
         }
         // Inner cfg/path transformations can disable or relocate this entire file.
         let mut walk = root.walk();
-        if root.named_children(&mut walk).any(|n| {
-            n.kind() == "inner_attribute_item" && {
-                let value = &text[n.byte_range()];
-                matches!(
-                    value
-                        .trim_start_matches("#![")
-                        .trim_start()
-                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                        .next(),
-                    Some("cfg" | "cfg_attr" | "path")
-                )
-            }
-        }) {
+        if root
+            .named_children(&mut walk)
+            .any(|node| node.kind() == "inner_attribute_item" && disables_module(node, &text))
+        {
             return Err("conditional/relocated library modules are not supported".into());
         }
         if current == source {
@@ -82,6 +73,30 @@ fn verify(
         };
         directory = directory.join(name);
     }
+}
+
+fn disables_module(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let Some(attribute) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "attribute")
+    else {
+        return true;
+    };
+    let mut cursor = attribute.walk();
+    let Some(name) = attribute
+        .named_children(&mut cursor)
+        .find(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+    else {
+        return true;
+    };
+    // Read the syntax node, not the #![ prefix: comments and raw identifiers
+    // are valid spellings. Qualified/unknown paths are conservative refusals.
+    name.kind() != "identifier"
+        || matches!(
+            source[name.byte_range()].trim_start_matches("r#"),
+            "cfg" | "cfg_attr" | "path"
+        )
 }
 
 fn declared_child(text: &str, name: &str) -> Result<(), String> {
@@ -125,6 +140,33 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    /// #2724: raw identifiers/comments cannot hide a disabled library module.
+    #[test]
+    fn inner_cfg_spelling_cannot_hide_an_uncompiled_source() {
+        for attribute in [
+            "#![r#cfg(any())]",
+            "#![/* explanation */ cfg(any())]",
+            "#![r#cfg_attr(all(), cfg(any()))]",
+        ] {
+            let source = format!("{attribute}\nfn selected() {{}}");
+            let path = Path::new("src/lib.rs");
+            assert!(
+                verify(path, path, |_| Ok(source.clone())).is_err(),
+                "{attribute}"
+            );
+        }
+    }
+
+    /// #2724: documentation mentioning cfg is not a conditional module.
+    #[test]
+    fn inner_docs_and_lints_are_not_conditionals() {
+        let path = Path::new("src/lib.rs");
+        verify(path, path, |_| {
+            Ok("#![doc = \"cfg docs\"]\n#![r#allow(dead_code)]\nfn selected() {}".into())
+        })
+        .unwrap();
+    }
+
     /// #2724: --lib must actually reach the selected source, not just exit zero.
     #[test]
     fn only_unconditional_library_paths_count() {
