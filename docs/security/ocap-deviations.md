@@ -1165,8 +1165,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   or alternate registry could receive a credential or steer the fetch), and when a repository `.cargo/config`
   sits between the build directory and the workspace root (it can replace the crates.io source or name a
   credential-provider program). Before approval, descriptor-relative reads copy the workspace into
-  an owner-only temporary directory outside the source workspace. No hardlinks or symlinks to source
-  inputs are carried into the copy. The copied lock/config inputs are screened, and their content IDs
+  an owner-only temporary directory outside the source workspace. Its outer and copied directories
+  are created with explicit mode 0700 and copied files with mode 0600, atomically at creation rather
+  than by a later chmod; permissive umasks cannot expose them. The complete copy's modes are checked
+  before approval and again before launch; non-owner access or non-regular entries refuse execution.
+  No hardlinks or symlinks to source inputs are carried into the copy. The copied lock/config inputs are screened, and their content IDs
   are compared with the source before and after approval; a prompt-time lock/config change refuses.
   Cargo runs against the private copy, so source changes after comparison cannot substitute its inputs.
   The copy stays alive through execution and is then removed. Git/build artifacts are excluded; copies
