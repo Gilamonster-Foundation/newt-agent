@@ -2028,6 +2028,7 @@ fn redirect_has_effect(redirect: &agent_bridle::InspectedRedirect) -> bool {
 ///   `reason` cannot be trusted to disclose that, since the tool call is
 ///   model-selected and unverified.
 fn execute_request_permissions(
+    caveats: &crate::Caveats,
     args: &serde_json::Value,
     gate: Option<&mut dyn PermissionGate>,
     _color: bool,
@@ -2151,6 +2152,17 @@ fn execute_request_permissions(
         // to finish and burns rounds. Tell it to stop re-asking and proceed
         // within the authority it already has; only report the blocker if the
         // target is genuinely essential and out of scope.
+        // A redundant headless request needs neither a new grant nor replay
+        // consent. Bound denials still require the explicit approval path.
+        None if bound.is_none() && match kind {
+            DenialKind::Exec => caveats.permits_exec(target),
+            DenialKind::Net => caveats.permits_net(target),
+            _ => permits_filesystem_request(caveats, &request),
+        } => (
+            None,
+            None,
+            format!("already granted: {capability} for {quoted_target}. Retry the original operation now."),
+        ),
         None => (
             None,
             None,
@@ -4033,6 +4045,7 @@ async fn execute_authorized_tool(
         "request_permissions" => {
             let rerun = pending_rerun.and_then(|slot| slot.take());
             let (granted, replay_auth, msg) = execute_request_permissions(
+                caveats,
                 args,
                 permission_gate,
                 color,
@@ -4393,12 +4406,31 @@ async fn execute_authorized_tool(
             // `git_hardening::own_branch_for_commit_ref_move`'s doc comment
             // for the full mechanism and why the old directory-wide grant
             // was a hole, not an accepted trade-off.
-            let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
+            // #2720: full access authorizes the operation, while the broker's
+            // child must still be unable to overwrite its signing mechanism.
+            let commit_workspace = if commit_broker.is_some()
+                && matches!(caveats.fs_write, crate::Scope::All)
+            {
+                run_cwd.as_str()
+            } else {
+                workspace
+            };
+            let invocation_caveats = if commit_broker.is_some() {
+                match crate::native_git_broker::NativeGitBroker::invocation_caveats(
+                    caveats, std::path::Path::new(commit_workspace),
+                ) {
+                    Ok(invocation) => invocation,
+                    Err(error) => return host_return(format!("error: native Git commit broker: {error}")),
+                }
+            } else {
+                caveats.clone()
+            };
+            let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, commit_workspace, &invocation_caveats);
             let commit_broker_used = commit_broker.is_some();
             let ref_move = commit_requested
                 .then(|| {
                     crate::git_hardening::own_branch_for_commit_ref_move(std::path::Path::new(
-                        workspace,
+                        commit_workspace,
                     ))
                 })
                 .flatten();

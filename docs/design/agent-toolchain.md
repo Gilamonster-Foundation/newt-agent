@@ -253,10 +253,16 @@ resolver and runtime read closure.
 
 Helpers run from a flat read-only directory outside all granted write roots.
 The directory contains only aliases to the current executable. A filesystem
-`All` write grant, overlapping scratch root, or authority able to relocate
-the helper directory cannot protect that mechanism and is refused. The
-supported operator choice is directory-scoped workspace authority. Keys remain
-host-held and outside the child's filesystem read grant.
+`All` session write grant is narrowed for the commit invocation to the worktree
+and its own Git metadata. Overlapping scratch roots or authority able to relocate
+the helper directory are still refused. The session retains its ambient grant;
+scoped sessions retain their bound repository identity. Signing remains host-held.
+Ambient read authority does not promise to hide filesystem credentials.
+
+For governed pushes, ambient filesystem-write authority trusts the host's current
+installation and configuration, subject to the existing ownership, mode, symlink,
+and destination checks. Unlike scoped mode, it cannot promise that these files
+were never writable by an earlier model action.
 
 Git's [message and reference transaction hooks](https://git-scm.com/docs/githooks)
 invoke the existing finalizer and validate the exact candidate before

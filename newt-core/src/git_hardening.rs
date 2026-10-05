@@ -203,6 +203,19 @@ fn cached_identity(workspace: &Path) -> Option<GitDirPair> {
         .flatten()
 }
 
+/// #2720: bind an ambient caller's repository only if no session has bound
+/// this workspace yet. Never replace an existing identity (including a cached
+/// refusal), since scoped siblings rely on it to detect rewritten Git pointers.
+pub(crate) fn ambient_gitdir_write_grant(workspace: &Path) -> Vec<String> {
+    let resolved = git_dirs(workspace);
+    identity_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(workspace.to_path_buf())
+        .or_insert(resolved);
+    own_gitdir_shell_write_grant(workspace)
+}
+
 /// Per-dispatch write grant for the confined-shell `git` lane
 /// (`dispatch_caveats_for_git_shell`, PR #2577 round 3/4). Re-runs `rev-parse`
 /// on EVERY `git` dispatch, but the write grant is bound to the identity
@@ -2057,6 +2070,24 @@ mod own_gitdir_grant_tests {
         std::fs::write(dir.join("seed"), "x").unwrap();
         git(dir, &["add", "seed"]);
         git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// #2720: ambient commit setup must not replace a scoped session's cached
+    /// refusal/identity. The global cache can be shared by sibling sessions.
+    #[test]
+    fn full_access_commit_does_not_rebind_an_existing_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        init_repo(&workspace);
+        git(&workspace, &["checkout", "-q", "-b", "task"]);
+        prime_identity_cache(&workspace, None);
+        let _ = crate::native_git_broker::NativeGitBroker::invocation_caveats(
+            &crate::Caveats::top(),
+            &workspace,
+        )
+        .unwrap();
+        assert!(own_gitdir_shell_write_grant(&workspace).is_empty());
+        assert!(cached_identity(&workspace).is_none());
     }
 
     /// Would have failed before F32/#2537: no grants existed at all, so

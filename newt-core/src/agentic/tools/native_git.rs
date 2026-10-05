@@ -3051,6 +3051,16 @@ mod governed_push_tests {
     /// unsupported remote URL scheme, and neither repository's refs move.
     #[test]
     fn scope_all_push_to_a_local_path_is_refused_through_real_dispatch() {
+        push_to_a_local_path_is_refused(false);
+    }
+
+    /// #2720: full filesystem and network authority cannot bypass destination policy.
+    #[test]
+    fn full_access_push_to_a_local_path_is_refused() {
+        push_to_a_local_path_is_refused(true);
+    }
+
+    fn push_to_a_local_path_is_refused(full_access: bool) {
         if !fence() {
             return;
         }
@@ -3070,12 +3080,16 @@ mod governed_push_tests {
         let (ws_before, dest_before) = (refs(repo.path()), refs(dest.path()));
         // Write authority over both trees: were the push to escape the
         // broker into the confined shell, it could really move `dest`.
-        let caveats = Caveats {
-            net: Scope::All,
-            fs_write: Scope::only(
-                [repo.path(), dest.path()].map(|p| p.to_string_lossy().into_owned()),
-            ),
-            ..scoped_caveats()
+        let caveats = if full_access {
+            Caveats::top()
+        } else {
+            Caveats {
+                net: Scope::All,
+                fs_write: Scope::only(
+                    [repo.path(), dest.path()].map(|p| p.to_string_lossy().into_owned()),
+                ),
+                ..scoped_caveats()
+            }
         };
         let error = plan_push_test(
             "git push origin task:task",
@@ -3316,12 +3330,22 @@ mod governed_push_tests {
     /// to observe the exact destination, commit and ref without publishing.
     #[test]
     fn scope_all_push_succeeds_at_the_approved_destination() {
+        push_succeeds_at_the_approved_destination(with_net(Scope::All));
+    }
+
+    /// #2720: exercise actual staging and receive-pack with ambient fs_write,
+    /// rather than only an unrestricted network grant.
+    #[test]
+    fn full_access_push_succeeds_at_the_approved_destination() {
+        push_succeeds_at_the_approved_destination(Caveats::top());
+    }
+
+    fn push_succeeds_at_the_approved_destination(caveats: Caveats) {
         if !fence() {
             return;
         }
         let _env = BrokerEnv::new();
         let repo = repo_on_feature_branch();
-        let caveats = with_net(Scope::All);
         let approved = git(repo.path(), &["rev-parse", "task"]);
         let mut plan = plan_push_test("git push", repo.path(), &caveats, &mut None).unwrap();
         assert_eq!(plan.url, "https://github.com/o/r.git");

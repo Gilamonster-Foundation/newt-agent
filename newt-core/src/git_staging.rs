@@ -177,9 +177,16 @@ impl TrustContext {
     /// # Errors
     /// When a root exists but cannot be resolved ([`bind_canonical_paths`]).
     pub fn bind(fs_write: &Scope<String>) -> Result<Self, Refusal> {
+        // #2720: ambient authority explicitly trusts the host environment.
+        // There is no outside-of-model-write tree in this mode; ownership,
+        // mode, symlink, helper, and destination validation still apply.
+        let write_scope = match fs_write {
+            Scope::All => Scope::none(),
+            scoped => scoped.clone(),
+        };
         Ok(Self {
-            write_scope: fs_write.clone(),
-            write_roots: bind_canonical_paths(fs_write)?,
+            write_roots: bind_canonical_paths(&write_scope)?,
+            write_scope,
             clt_git: false,
         })
     }
@@ -1869,6 +1876,17 @@ mod tests {
             env: Vec::new(),
             ctx: ctx(write_roots),
         }
+    }
+
+    /// #2720: ambient authority trusts the host, but never loose file modes.
+    #[test]
+    fn full_access_trust_retains_mode_checks() {
+        let dir = tempdir();
+        let file = owned_file(dir.path(), "credential", 0o600);
+        let ambient = ctx_from(&Scope::All);
+        assert!(trust_check(&file, &ambient).is_ok());
+        chmod(&file, 0o666);
+        assert!(trust_check(&file, &ambient).is_err());
     }
 
     #[test]
