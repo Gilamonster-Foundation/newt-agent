@@ -3,6 +3,9 @@
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:15 EDT | Date: 2026-08-12
 
+mod worktree;
+use worktree::execute as execute_tool_inner;
+
 use super::artifact_read::{execute_artifact_read_silent, ArtifactReadContext};
 #[cfg(test)]
 use super::content_spill::{self, SpillStore};
@@ -3471,7 +3474,7 @@ fn artifact_postcondition_warning(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_tool_inner(
+async fn execute_tool_unadopted(
     presentation: &mut dyn ToolPresentation,
     name: &str,
     args: &serde_json::Value,
@@ -3571,6 +3574,7 @@ async fn execute_authorized_tool(
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
         default_command_cwd,
+        worktree_session,
         invocation,
         build_check_cmd,
         tool_evidence,
@@ -3614,6 +3618,10 @@ async fn execute_authorized_tool(
             *slot = None;
         }
         slot
+    });
+    let adopted = worktree_session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);
+    let build_workspace = adopted.as_ref().map_or(workspace, |policy| {
+        policy.worktree.to_str().unwrap_or(workspace)
     });
     let smart_harness = invocation.map(|call| call.harness());
     // #2315: hand the shell's execution class to the funnel, return the text.
@@ -4400,7 +4408,13 @@ async fn execute_authorized_tool(
             // was a hole, not an accepted trade-off.
             // #2720: full access authorizes the operation, while the broker's
             // child must still be unable to overwrite its signing mechanism.
-            let commit_workspace = if commit_broker.is_some()
+            let adopted_git_workspace = adopted.as_ref().filter(|policy| {
+                std::path::Path::new(&run_cwd).canonicalize().ok()
+                    .is_some_and(|cwd| cwd.starts_with(&policy.worktree))
+            });
+            let commit_workspace = if let Some(policy) = adopted_git_workspace {
+                policy.worktree.to_str().unwrap_or(workspace)
+            } else if commit_broker.is_some()
                 && matches!(caveats.fs_write, crate::Scope::All)
             {
                 run_cwd.as_str()
@@ -5181,7 +5195,7 @@ async fn execute_authorized_tool(
                             }
                         };
                         let check = build_check_cmd
-                            .map(|cmd| run_build_check(cmd, workspace, &caveats.net))
+                            .map(|cmd| run_build_check(cmd, build_workspace, &caveats.net))
                             .unwrap_or_default();
                         receipt.present_success(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
@@ -5306,7 +5320,7 @@ async fn execute_authorized_tool(
                         }
                     };
                     let check = build_check_cmd
-                        .map(|cmd| run_build_check(cmd, workspace, &caveats.net))
+                        .map(|cmd| run_build_check(cmd, build_workspace, &caveats.net))
                         .unwrap_or_default();
                     receipt.present_success(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
@@ -5516,7 +5530,7 @@ async fn execute_authorized_tool(
                         }
                     };
                     let check = build_check_cmd
-                        .map(|cmd| run_build_check(cmd, workspace, &caveats.net))
+                        .map(|cmd| run_build_check(cmd, build_workspace, &caveats.net))
                         .unwrap_or_default();
                     let escape_warning = literal_newline_escape_warning(old_string, new_string)
                         .map(|w| format!("\n{w}"))
