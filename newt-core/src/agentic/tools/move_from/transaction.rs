@@ -10,7 +10,7 @@ pub(super) enum File {
 
 pub(super) trait Files {
     fn read(&self, file: File) -> Result<Option<String>, String>;
-    /// Check expected bytes immediately before publishing a complete replacement.
+    /// Capture and compare expected bytes before publishing without overwriting a new entry.
     /// An error may occur after publication (e.g. a durability failure).
     fn change(&self, file: File, expected: Option<&str>, next: Option<&str>) -> Result<(), String>;
 }
@@ -51,8 +51,9 @@ pub(super) fn run(
             Err(format!(
                 "{error}; {}",
                 match restored {
-                    Ok(()) => "original files restored".into(),
-                    Err(e) => format!("rollback incomplete; preserve and inspect both files: {e}"),
+                    Ok(()) if error.contains("CONFLICT") => "rollback observed original paths; CONFLICT recovery entries still require inspection".into(),
+                    Ok(()) => "original files restored; displaced entries retained as .newt-move-*.saved".into(),
+                    Err(e) => format!("rollback incomplete; preserve and inspect both files and .newt-move-*.saved recovery entries: {e}"),
                 }
             ))
         }
