@@ -59,6 +59,8 @@ mod grep_tool;
 mod live_output;
 mod native_git;
 pub(crate) mod output_budget;
+mod read_history;
+pub(crate) use read_history::ReadHistory;
 mod shell;
 /// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
 /// silent tool is never a blank row, and the first live byte takes the row
@@ -3590,6 +3592,7 @@ async fn execute_authorized_tool(
 ) -> String {
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
+        read_history,
         default_command_cwd,
         invocation,
         build_check_cmd,
@@ -4961,7 +4964,10 @@ async fn execute_authorized_tool(
                         Ok(v) => v,
                         Err(e) => return format!("error: read_file: {e}"),
                     };
-                    read_file_page(path, &contents, offset, limit, char_offset, tool_offload)
+                    match read_history {
+                        Some(history) => history.read(path, &contents, offset, limit, char_offset, tool_offload),
+                        None => read_file_page(path, &contents, offset, limit, char_offset, tool_offload),
+                    }
                 }
                 Err(tool_output) => tool_output,
             }
