@@ -1738,7 +1738,11 @@ pub fn trusted_gh_program(path: Option<&OsStr>) -> io::Result<PathBuf> {
 /// dominant native-Git host-execution risk on that platform
 /// (`windows_appcontainer_native_git_refusal`).
 #[cfg(unix)]
-fn resolve_trusted_program(cwd: &Path, path: Option<&OsStr>, name: &str) -> io::Result<PathBuf> {
+pub(crate) fn resolve_trusted_program(
+    cwd: &Path,
+    path: Option<&OsStr>,
+    name: &str,
+) -> io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let _ = cwd;
     path.into_iter()
@@ -1759,7 +1763,11 @@ fn resolve_trusted_program(cwd: &Path, path: Option<&OsStr>, name: &str) -> io::
 }
 
 #[cfg(not(unix))]
-fn resolve_trusted_program(cwd: &Path, path: Option<&OsStr>, name: &str) -> io::Result<PathBuf> {
+pub(crate) fn resolve_trusted_program(
+    cwd: &Path,
+    path: Option<&OsStr>,
+    name: &str,
+) -> io::Result<PathBuf> {
     let _ = (cwd, path);
     Ok(PathBuf::from(name))
 }
