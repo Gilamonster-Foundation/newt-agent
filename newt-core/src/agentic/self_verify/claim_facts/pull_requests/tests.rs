@@ -162,3 +162,88 @@ async fn issue_2741_plain_shell_success_cannot_certify_a_pr() {
     let got = ledger.annotate_pr_claim("Opened PR #7.".into());
     assert!(got.contains("Unverified"), "{got}");
 }
+
+fn final_claim(ledger: &VerificationLedger, text: &str) -> String {
+    let root = tempfile::tempdir().unwrap();
+    crate::agentic::finalize_final_text(
+        text.into(),
+        root.path().to_str().unwrap(),
+        &crate::Scope::All,
+        &crate::agentic::capability_check::Evidence::default(),
+        None,
+        None,
+        ledger,
+    )
+}
+
+/// #2741 round 2: each coordinated creation has its own governed receipt.
+#[test]
+fn issue_2741_round2_multiple_created_prs_pass_finalizer() {
+    let mut ledger = created();
+    ledger.record_pr_outcome(&Outcome::PrCreated {
+        url: "https://github.com/o/r/pull/8".into(),
+    });
+    for text in [
+        "Opened PR #7 and PR #8.",
+        "Created PR #7 to replace PR #6 and opened PR #8.",
+        "Created pull request #7 and pull request #8.",
+        "Opened PR #7: https://github.com/o/r/pull/7 and PR #8: https://github.com/o/r/pull/8",
+    ] {
+        assert_eq!(final_claim(&ledger, text), text);
+    }
+}
+
+/// #2741 round 2: a replaced or compared PR is not claimed newly created.
+#[test]
+fn issue_2741_round2_comparison_reference_is_not_a_creation() {
+    for text in [
+        "Created PR #7 to replace PR #6.",
+        "Created PR #7 to replace https://github.com/o/r/pull/6",
+        "Opened PR #7 and closed PR #6.",
+        "Created PR #7 unlike PR #6.",
+    ] {
+        assert_eq!(final_claim(&created(), text), text);
+    }
+}
+
+/// #2741 round 2: independent receipts must not hide a false creation or
+/// lend different receipts to one PR's inconsistent number/URL pair.
+#[test]
+fn issue_2741_round2_false_creation_among_true_ones_is_refuted() {
+    let mut ledger = created();
+    ledger.record_pr_outcome(&Outcome::PrCreated {
+        url: "https://github.com/o/r/pull/8".into(),
+    });
+    for text in [
+        "Opened PR #7 and PR #9.",
+        "Opened PR #7 and PR #8 and PR #9.",
+        "Created PR #7 to replace PR #6 and opened PR #9.",
+        "Opened PR #7: https://github.com/o/r/pull/8",
+    ] {
+        let got = final_claim(&ledger, text);
+        assert!(got.starts_with(text));
+        assert!(got.contains("Refuted"), "{got}");
+    }
+}
+
+/// #2741 round 2: an object list need not repeat the PR noun; retain its
+/// separators so each creation is checked, including a false later member.
+#[test]
+fn issue_2741_round2_coordinated_bare_references() {
+    let mut ledger = created();
+    ledger.record_pr_outcome(&Outcome::PrCreated {
+        url: "https://github.com/o/r/pull/8".into(),
+    });
+    for text in [
+        "Opened PR #7, #8.",
+        "Opened PR #7 and #8.",
+        "Created PR #7,#8.",
+        "Created PR https://github.com/o/r/pull/7 and https://github.com/o/r/pull/8",
+    ] {
+        assert_eq!(final_claim(&ledger, text), text);
+    }
+    for text in ["Opened PR #7 and #9.", "Opened PR #7, #8, #9."] {
+        let got = final_claim(&ledger, text);
+        assert!(got.contains("Refuted"), "{got}");
+    }
+}
