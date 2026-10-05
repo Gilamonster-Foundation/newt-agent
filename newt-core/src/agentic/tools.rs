@@ -51,6 +51,7 @@ mod file_change;
 #[cfg(feature = "ast")]
 mod move_from;
 mod navigation;
+mod path_suggest;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
 pub use dispatch::{
@@ -1678,6 +1679,7 @@ pub(super) fn authorized_read(
     } else {
         std::fs::read_to_string(&full).map_err(|e| format!("error: reading {path}: {e}"))
     }
+    .map_err(|error| path_suggest::on_error(error, path, workspace, &caveats.fs_read))
 }
 
 fn fs_gate_allows(
@@ -5264,7 +5266,7 @@ async fn execute_authorized_tool(
                             .unwrap_or_default();
                         receipt.present_success(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
-                    Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                    Err(tool_output) => receipt.present(file_capture::failure(path_suggest::on_error(tool_output, path, workspace, &caveats.fs_read), ""), "", presentation),
                 }
             } else {
                 format!("user declined to write {path}")
@@ -5299,7 +5301,7 @@ async fn execute_authorized_tool(
             let meta = match std::fs::symlink_metadata(&full) {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return format!("error: deleting {path}: file does not exist");
+                    return path_suggest::on_error(format!("error: deleting {path}: file does not exist"), path, workspace, &caveats.fs_read);
                 }
                 Err(e) => return format!("error: deleting {path}: {e}"),
             };
@@ -5389,7 +5391,7 @@ async fn execute_authorized_tool(
                         .unwrap_or_default();
                     receipt.present_success(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                Err(tool_output) => receipt.present(file_capture::failure(path_suggest::on_error(tool_output, path, workspace, &caveats.fs_read), ""), "", presentation),
             }
         }
 
@@ -5461,7 +5463,7 @@ async fn execute_authorized_tool(
             let read = file_capture::read_for_edit(mutation_scope, &full, path);
             let existing = match read {
                 Ok(s) => s,
-                Err(tool_output) => return tool_output,
+                Err(tool_output) => return path_suggest::on_error(tool_output, path, workspace, &caveats.fs_read),
             };
             let count = existing.matches(old_string).count();
             if count == 0 {
@@ -5602,7 +5604,7 @@ async fn execute_authorized_tool(
                         .unwrap_or_default();
                     receipt.present_success(format!("edited {path} ({delta_str} lines, now {new_lines} total){escape_warning}"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                Err(tool_output) => receipt.present(file_capture::failure(path_suggest::on_error(tool_output, path, workspace, &caveats.fs_read), ""), "", presentation),
             }
         }
 
@@ -5644,7 +5646,7 @@ async fn execute_authorized_tool(
                     names.sort();
                     names.join("\n")
                 }
-                Err(tool_output) => tool_output,
+                Err(tool_output) => path_suggest::on_error(tool_output, path, workspace, &caveats.fs_read),
             }
         }
 
@@ -5692,7 +5694,7 @@ async fn execute_authorized_tool(
                     Err(error) => return format!("error: {error}"),
                 };
             if !full.exists() {
-                return format!("error: no such path '{path}'");
+                return path_suggest::on_error(format!("error: no such path '{path}'"), path, workspace, &caveats.fs_read);
             }
             // Recheck workspace containment after any human prompt. The legacy
             // walk still reopens this path; smart sessions refuse this adapter.
@@ -5737,7 +5739,7 @@ async fn execute_authorized_tool(
                     }
                     listing
                 }
-                Err(e) => format!("error: {e}"),
+                Err(e) => path_suggest::on_error(format!("error: {e}"), path, workspace, &caveats.fs_read),
             }
         }
 
@@ -5783,7 +5785,7 @@ async fn execute_authorized_tool(
                 Err(e) => return format!("error: grep: {e}"),
             };
             if !full.exists() {
-                return format!("error: no such path '{path}'");
+                return path_suggest::on_error(format!("error: no such path '{path}'"), path, workspace, &caveats.fs_read);
             }
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
                 return WORKSPACE_ONLY.to_string();
@@ -5815,7 +5817,7 @@ async fn execute_authorized_tool(
                     }
                     out
                 }
-                Err(e) => format!("error: grep: {e}"),
+                Err(e) => path_suggest::on_error(format!("error: grep: {e}"), path, workspace, &caveats.fs_read),
             }
         }
 

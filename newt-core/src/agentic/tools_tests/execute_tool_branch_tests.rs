@@ -337,3 +337,6 @@ mod web_recovery;
 #[cfg(test)]
 #[path = "execute_memory.rs"]
 mod memory;
+
+#[path = "path_suggest.rs"]
+mod path_suggest;
