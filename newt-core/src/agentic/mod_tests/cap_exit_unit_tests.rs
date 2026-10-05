@@ -227,6 +227,7 @@ fn cap_exit_finalizer_applies_workspace_claim_checks() {
         &capability_check::Evidence::default(),
         None,
         None,
+        &self_verify::VerificationLedger::default(),
     );
     assert!(
         text.contains("⚠ claim check (#867)"),
@@ -383,6 +384,7 @@ fn cap_exit_finalizer_adds_a_facts_note_when_head_did_not_move_in_a_real_repo() 
         &capability_check::Evidence::default(),
         None,
         Some(&head_before),
+        &self_verify::VerificationLedger::default(),
     );
     assert!(
         text.contains("⚠ claim check (#2683)"),
@@ -443,6 +445,7 @@ fn cap_exit_finalizer_facts_note_names_a_file_still_dirty_when_head_moved_in_a_r
         &capability_check::Evidence::default(),
         None,
         Some(&head_before),
+        &self_verify::VerificationLedger::default(),
     );
     assert!(
         text.contains("⚠ claim check (#2683)"),
@@ -920,4 +923,42 @@ fn pending_plan_nudge_does_not_promote_agent_claims_to_runtime_facts() {
         plan_block(&ledger).unwrap().contains(claim),
         "the source plan remains inspectable"
     );
+}
+
+/// #2718: the shared normal/cap-exit finalizer must append actual Cargo facts,
+/// even with optional verification disabled and after another command succeeds.
+#[tokio::test]
+async fn finalizer_refutes_cargo_success_with_observed_failure() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().to_str().unwrap();
+    let mut ledger = self_verify::VerificationLedger::for_turn("refactor", false);
+    ledger
+        .observe(
+            "run_command",
+            &serde_json::json!({"command":"cargo check"}),
+            false,
+            Some(crate::ExecOutcome::Failed),
+            root,
+        )
+        .await;
+    ledger
+        .observe(
+            "run_command",
+            &serde_json::json!({"command":"git status"}),
+            true,
+            Some(crate::ExecOutcome::Passed),
+            root,
+        )
+        .await;
+    let text = finalize_final_text(
+        "Cargo check green".into(),
+        root,
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        None,
+        &ledger,
+    );
+    assert!(text.contains("claim check (#2718)"), "{text}");
+    assert!(text.contains("Failed in"), "{text}");
 }

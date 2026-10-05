@@ -56,6 +56,34 @@ pub(crate) fn path_claims(text: &str) -> Vec<String> {
     out
 }
 
+/// #2718: proposed files in a remaining-work list are not existence claims.
+fn asserted_path_claims(text: &str) -> Vec<String> {
+    let mut planning = false;
+    let mut claims = Vec::new();
+    for line in text.lines() {
+        let lower = line.trim().trim_matches('#').trim().to_ascii_lowercase();
+        if lower.starts_with("remaining work") || lower.starts_with("next steps") {
+            planning = true;
+        } else if lower.starts_with("current state") || lower.starts_with("completed") {
+            planning = false;
+        }
+        if planning
+            || lower.starts_with('>')
+            || lower.starts_with("planned:")
+            || lower.starts_with("will ")
+            || lower.starts_with("i will ")
+        {
+            continue;
+        }
+        for claim in path_claims(line) {
+            if !claims.contains(&claim) {
+                claims.push(claim);
+            }
+        }
+    }
+    claims
+}
+
 /// Cap on how many refuted paths the annotation lists verbatim — beyond it
 /// the count is summarized, so a pathological summary can't bloat the reply.
 const LISTED_CLAIMS: usize = 8;
@@ -66,7 +94,7 @@ const LISTED_CLAIMS: usize = 8;
 fn annotate_path_claims(mut text: String, mut resolve: impl FnMut(&str) -> Option<bool>) -> String {
     let mut missing = Vec::new();
     let mut unverified = Vec::new();
-    for claim in path_claims(&text) {
+    for claim in asserted_path_claims(&text) {
         match resolve(&claim) {
             Some(true) => {}
             Some(false) => missing.push(claim),
@@ -144,9 +172,17 @@ fn workspace_claim_resolver(
             }
             in_workspace = true;
             if exists(&norm) {
-                if let Some(parent) = norm.parent().map(std::path::Path::to_path_buf) {
-                    if extra_bases.len() < EXTRA_BASES_CAP && !extra_bases.contains(&parent) {
-                        extra_bases.push(parent);
+                // #2718: a later crate-relative `agentic/mod.rs` needs the
+                // earlier citation's src/ ancestor, not src/agentic/agentic/.
+                for parent in norm
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|p| p.starts_with(&root))
+                {
+                    if extra_bases.len() < EXTRA_BASES_CAP
+                        && !extra_bases.iter().any(|p| p == parent)
+                    {
+                        extra_bases.push(parent.to_path_buf());
                     }
                 }
                 return Some(true);
@@ -169,6 +205,40 @@ pub(crate) fn annotate_against_workspace(text: String, workspace: &str) -> Strin
         text,
         workspace_claim_resolver(workspace, std::path::Path::exists),
     )
+}
+
+/// #2718: observed call directories supply context, never authority. A sibling
+/// worktree is inspected only when the turn's read scope permits that root.
+pub(crate) fn annotate_in_context(
+    text: String,
+    workspace: &str,
+    directories: &[std::path::PathBuf],
+    read_scope: &crate::Scope<String>,
+) -> String {
+    if directories.is_empty() && matches!(read_scope, crate::Scope::All) {
+        return annotate_against_workspace(text, workspace);
+    }
+    let mut roots = directories.to_vec();
+    roots.push(std::path::PathBuf::from(workspace));
+    let uninspected = roots
+        .iter()
+        .any(|root| !crate::caveats::permits_path(read_scope, &root.to_string_lossy()));
+    roots.retain(|root| crate::caveats::permits_path(read_scope, &root.to_string_lossy()));
+    let mut resolvers: Vec<_> = roots
+        .iter()
+        .map(|root| workspace_claim_resolver(&root.to_string_lossy(), std::path::Path::exists))
+        .collect();
+    annotate_path_claims(text, |claim| {
+        let mut inspected = false;
+        for resolve in &mut resolvers {
+            match resolve(claim) {
+                Some(true) => return Some(true),
+                Some(false) => inspected = true,
+                None => {}
+            }
+        }
+        (inspected && !uninspected).then_some(false)
+    })
 }
 
 /// Ledger cap: enough to name every file a real investigation touches while
@@ -540,28 +610,48 @@ pub fn snapshot_workspace_subtree(
 pub(crate) fn claimed_branches(text: &str) -> Vec<String> {
     const WINDOW: usize = 4;
     let mut out = Vec::new();
-    let toks: Vec<&str> = text.split_whitespace().collect();
-    for (i, tok) in toks.iter().enumerate() {
-        let key = tok
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-            .to_lowercase();
-        if key != "branch" && key != "branches" {
-            continue;
-        }
-        for cand in toks.iter().skip(i + 1).take(WINDOW) {
-            let cand = cand.trim_matches(|c: char| "`'\"()[],;:!?*".contains(c));
-            let cand = cand.trim_end_matches('.');
-            let refy = cand.contains('/') || cand.chars().any(|c| c.is_ascii_digit());
-            if !cand.is_empty()
-                && refy
-                && cand
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "/-_.".contains(c))
-            {
-                if !out.contains(&cand.to_string()) {
-                    out.push(cand.to_string());
+    for line in text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('>'))
+    {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        for (i, tok) in toks.iter().enumerate() {
+            let key = tok
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_lowercase();
+            if key != "branch" && key != "branches" {
+                continue;
+            }
+            for (offset, cand) in toks.iter().skip(i + 1).take(WINDOW).enumerate() {
+                if offset > 0 && ends_a_clause(toks[i + offset]) {
+                    break;
                 }
-                break; // one claim per mention; keep scanning after it
+                if matches!(*cand, "☐" | "✓" | "→" | "•") {
+                    break;
+                }
+                let wrapped = cand.starts_with(['`', '\'', '"']);
+                let numbered = cand.ends_with('.')
+                    && cand
+                        .trim_end_matches('.')
+                        .chars()
+                        .all(|c| c.is_ascii_digit());
+                let cand = cand
+                    .trim_end_matches('.')
+                    .trim_matches(|c: char| "`'\"()[],;:!?*".contains(c));
+                let cand = cand.trim_end_matches('.');
+                let refy = cand.contains('/') || cand.chars().any(|c| c.is_ascii_digit());
+                if !cand.is_empty()
+                    && (!numbered || wrapped)
+                    && refy
+                    && cand
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "/-_.".contains(c))
+                {
+                    if !out.contains(&cand.to_string()) {
+                        out.push(cand.to_string());
+                    }
+                    break; // one claim per mention; keep scanning after it
+                }
             }
         }
     }
@@ -1647,5 +1737,63 @@ mod tests {
         let (files, unprobed) = nested_files_changed_between(&before, &after);
         assert!(files.is_empty(), "{files:?}");
         assert_eq!(unprobed, vec!["gone".to_string()], "{unprobed:?}");
+    }
+}
+
+#[cfg(test)]
+mod issue_2718_tests {
+    use super::*;
+
+    /// #2718: the retest's plan numbers 1 and 7 are not branch names.
+    #[test]
+    fn plan_steps_do_not_become_branches() {
+        assert!(claimed_branches("Worktree + branch created. Extraction 1 done.\n6. Push the branch to origin ☐ 7. Open PR").is_empty());
+        assert_eq!(claimed_branches("Created branch `123`."), ["123"]);
+        assert_eq!(claimed_branches("Branch is clean on fix/a-1"), ["fix/a-1"]);
+    }
+
+    /// #2718: a verified full path supplies the base for a shorter crate-relative citation.
+    #[test]
+    fn shortened_path_and_future_path_are_not_refuted() {
+        let mut resolve = workspace_claim_resolver("/repo", |p| {
+            p == std::path::Path::new("/repo/newt-core/src/agentic/mod.rs")
+        });
+        assert_eq!(resolve("newt-core/src/agentic/mod.rs"), Some(true));
+        assert_eq!(resolve("agentic/mod.rs"), Some(true));
+        let text = "Remaining work:\n1. Extract newt-core/src/agentic/loop_infer.rs\n\nCurrent state:\nUpdated src/missing.rs";
+        let got = annotate_path_claims(text.into(), |_| Some(false));
+        let note = got.strip_prefix(text).unwrap();
+        assert!(!note.contains("loop_infer"), "{got}");
+        assert!(note.contains("src/missing.rs"), "{got}");
+    }
+
+    /// #2718: actual sibling worktree paths resolve only with observed context
+    /// and read authority. Grounds the pure resolver in a real filesystem.
+    #[test]
+    fn observed_worktree_context_stays_inside_read_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::write(tree.join("src/new.rs"), "// present").unwrap();
+        let text = "Updated src/new.rs";
+        assert_eq!(
+            annotate_in_context(
+                text.into(),
+                launch.to_str().unwrap(),
+                std::slice::from_ref(&tree),
+                &crate::Scope::All
+            ),
+            text
+        );
+        let denied = annotate_in_context(
+            text.into(),
+            launch.to_str().unwrap(),
+            &[tree],
+            &crate::Scope::only([launch.to_string_lossy().into_owned()]),
+        );
+        assert!(denied.contains("unverified"));
+        assert!(!denied.contains("not found"));
     }
 }

@@ -3227,6 +3227,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 harness.outcome(reason, &text)?;
                 return Ok((text, false, accumulated_usage, hallucination_count));
@@ -3274,6 +3275,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
@@ -3775,6 +3777,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             return Ok((probe_content, false, accumulated_usage, hallucination_count));
         }
@@ -4106,7 +4109,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 tool_t0,
             );
             verification
-                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .observe_routed(
+                    name,
+                    &args,
+                    ok,
+                    execution.get().copied(),
+                    workspace,
+                    routed_to.get(),
+                )
                 .await;
             record_phantom_reach(
                 &mut phantom_reaches,
@@ -4199,6 +4209,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             &capability_evidence,
             disclosure,
             head_before.as_deref(),
+            &verification,
         );
         harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
@@ -4239,6 +4250,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         &capability_evidence,
         disclosure,
         head_before.as_deref(),
+        &verification,
     );
     if let Some(slot) = &mut end_reason {
         **slot = Some(cap_reason);
@@ -5593,6 +5605,7 @@ fn readonly_completion_handoff(
     capability_evidence: &capability_check::Evidence,
     disclosure: Option<&crate::ocap::DisclosureFilter>,
     head_before: Option<&str>,
+    verification: &self_verify::VerificationLedger,
 ) -> String {
     if let Some(slot) = end_reason {
         **slot = Some(if more_rounds {
@@ -5611,6 +5624,7 @@ fn readonly_completion_handoff(
         capability_evidence,
         disclosure,
         head_before,
+        verification,
     )
 }
 
@@ -6275,13 +6289,20 @@ fn finalize_final_text(
     // #2683: HEAD captured before this turn's tool calls ran, so a
     // "committed" claim can be checked against whether HEAD actually moved.
     head_before: Option<&str>,
+    verification: &self_verify::VerificationLedger,
 ) -> String {
     let text = capability_check::annotate_unobserved_probe(text, capability_evidence);
-    let text = claim_check::annotate_against_workspace(text, workspace);
+    let text = claim_check::annotate_in_context(
+        text,
+        workspace,
+        verification.claim_directories(),
+        read_scope,
+    );
     let text = claim_check::annotate_action_claims(
         text,
         claim_check::collect_git_evidence(workspace, read_scope, head_before).as_ref(),
     );
+    let text = verification.annotate_cargo_claim(text);
     redact_model_facing(disclosure, text)
 }
 
@@ -8235,6 +8256,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 harness.outcome(reason, &text)?;
                 return Ok((text, false, accumulated_usage, hallucination_count));
@@ -8278,6 +8300,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
@@ -8594,6 +8617,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             return Ok((out, false, accumulated_usage, hallucination_count));
         }
@@ -8991,7 +9015,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 tool_t0,
             );
             verification
-                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .observe_routed(
+                    name,
+                    &args,
+                    ok,
+                    execution.get().copied(),
+                    workspace,
+                    routed_to.get(),
+                )
                 .await;
             record_phantom_reach(
                 &mut phantom_reaches,
@@ -9083,6 +9114,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             &capability_evidence,
             disclosure,
             head_before.as_deref(),
+            &verification,
         );
         harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
@@ -9141,6 +9173,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         &capability_evidence,
         disclosure,
         head_before.as_deref(),
+        &verification,
     );
     if let Some(slot) = &mut end_reason {
         **slot = Some(cap_reason);
@@ -10534,6 +10567,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             // Finalization can append evidence warnings or redact content;
             // the live stream did not display that finalized answer.
@@ -10783,6 +10817,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 harness.outcome(reason, &text)?;
                 return Ok((text, false, accumulated_usage, hallucination_count));
@@ -10825,6 +10860,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
@@ -11109,6 +11145,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             let streamed = streamed && out == oa_content;
             return Ok((out, streamed, accumulated_usage, hallucination_count));
@@ -11479,7 +11516,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 tool_t0,
             );
             verification
-                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .observe_routed(
+                    name,
+                    &args,
+                    ok,
+                    execution.get().copied(),
+                    workspace,
+                    routed_to.get(),
+                )
                 .await;
             record_phantom_reach(
                 &mut phantom_reaches,
@@ -11571,6 +11615,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             &capability_evidence,
             disclosure,
             head_before.as_deref(),
+            &verification,
         );
         harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
@@ -11621,6 +11666,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         &capability_evidence,
         disclosure,
         head_before.as_deref(),
+        &verification,
     );
     if let Some(slot) = &mut end_reason {
         **slot = Some(cap_reason);
@@ -12642,6 +12688,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
@@ -12747,6 +12794,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 harness.outcome(reason, &text)?;
                 return Ok((text, false, accumulated_usage, hallucination_count));
@@ -12778,6 +12826,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &capability_evidence,
                     disclosure,
                     head_before.as_deref(),
+                    &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
@@ -12822,6 +12871,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -13186,7 +13236,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 tool_t0,
             );
             verification
-                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .observe_routed(
+                    name,
+                    &args,
+                    ok,
+                    execution.get().copied(),
+                    workspace,
+                    routed_to.get(),
+                )
                 .await;
             record_phantom_reach(
                 &mut phantom_reaches,
@@ -13265,6 +13322,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             &capability_evidence,
             disclosure,
             head_before.as_deref(),
+            &verification,
         );
         harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
@@ -13372,6 +13430,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             if let Some(slot) = &mut end_reason {
                 **slot = Some(cap_reason);
@@ -13425,6 +13484,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             if let Some(slot) = &mut end_reason {
                 **slot = Some(cap_reason);
@@ -13456,6 +13516,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             if let Some(slot) = &mut end_reason {
                 **slot = Some(cap_reason);
@@ -13479,6 +13540,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &capability_evidence,
                 disclosure,
                 head_before.as_deref(),
+                &verification,
             );
             if let Some(slot) = &mut end_reason {
                 **slot = Some(cap_reason);
@@ -13500,6 +13562,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &capability_evidence,
         disclosure,
         head_before.as_deref(),
+        &verification,
     );
     if let Some(slot) = &mut end_reason {
         **slot = Some(cap_reason);

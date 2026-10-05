@@ -29,6 +29,8 @@
 //! annoys, so detection favours HIGH-CONFIDENCE signals and treats a check as
 //! satisfied on any plausible run marker.
 
+mod claim_facts;
+
 /// A verification the workspace affords that the model could run before
 /// concluding. Data only — the loop turns it into a nudge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,6 +721,7 @@ enum Observed {
         command: String,
         outcome: ExecOutcome,
         tree: Option<ContentId>,
+        directory: Option<std::path::PathBuf>,
     },
     /// A successful workspace write through a write tool.
     Write,
@@ -731,6 +734,8 @@ enum Observed {
 #[derive(Debug, Default, Clone)]
 pub struct VerificationLedger {
     entries: Vec<Observed>,
+    /// #2718: observed directory locators, not identities or additional grants.
+    claim_directories: Vec<std::path::PathBuf>,
     /// The instruction checks are detected against, so only a check's own pass
     /// pays for a tree hash.
     task: String,
@@ -745,14 +750,15 @@ pub struct VerificationLedger {
 }
 
 impl VerificationLedger {
-    /// A ledger for a turn whose instruction is `task`; it observes nothing
-    /// unless `result_aware`.
+    /// A ledger for a turn whose instruction is `task`. Final claim facts are
+    /// always collected; only the optional gate scans and hashes the tree.
     pub(crate) fn for_turn(task: &str, result_aware: bool) -> Self {
         Self {
             entries: Vec::new(),
             task: task.to_string(),
             result_aware,
             checks: None,
+            claim_directories: Vec::new(),
         }
     }
 
@@ -772,10 +778,11 @@ impl VerificationLedger {
                 || requested
                     .iter()
                     .any(|command| check.invocation(command).is_some())
-                || self.entries.iter().any(|entry| {
-                    matches!(entry,
+                || (self.result_aware
+                    && self.entries.iter().any(|entry| {
+                        matches!(entry,
                     Observed::Exec { command, .. } if check.invocation(command).is_some())
-                })
+                    }))
         });
         Some(checks)
     }
@@ -800,6 +807,7 @@ impl VerificationLedger {
             command: command.to_string(),
             outcome,
             tree,
+            directory: None,
         });
     }
 
@@ -810,8 +818,8 @@ impl VerificationLedger {
         self.entries.push(Observed::Write);
     }
 
-    /// The funnel's single call. A no-op unless result-aware mode is on, so the
-    /// default path does no extra work and no workspace scan.
+    /// The funnel's single call. Retain execution facts even without the
+    /// optional gate; the default path performs no workspace scan.
     pub(crate) async fn observe(
         &mut self,
         name: &str,
@@ -820,18 +828,11 @@ impl VerificationLedger {
         execution: Option<ExecOutcome>,
         workspace: &str,
     ) {
-        if !self.result_aware {
-            return;
-        }
-        let _ = ok;
+        self.observe_directory(name, args, ok, workspace);
         match execution {
             Some(outcome) => {
-                let command = match args["command"].as_str() {
-                    Some(command) if super::dispatched_tool_name(name) == Some("run_command") => {
-                        command.to_string()
-                    }
-                    _ => format!("{name} {args}"),
-                };
+                let command = claim_facts::observed_command(name, args);
+                let directory = claim_facts::command_directory(&command, args, workspace);
                 // A command other than a read or a plain run of a known check
                 // may have created a check (`cargo new`, a new test file).
                 let plain = self.checks.as_ref().is_some_and(|checks| {
@@ -844,7 +845,8 @@ impl VerificationLedger {
                 }
                 // Hash only pass evidence for a detected check; any other
                 // command's tree is never read.
-                let evidence = outcome == ExecOutcome::Passed
+                let evidence = self.result_aware
+                    && outcome == ExecOutcome::Passed
                     && self
                         .checks(workspace)
                         .await
@@ -856,6 +858,13 @@ impl VerificationLedger {
                     None
                 };
                 self.record_exec(&command, outcome, tree);
+                if let Some(Observed::Exec {
+                    directory: observed,
+                    ..
+                }) = self.entries.last_mut()
+                {
+                    *observed = directory;
+                }
             }
             // Every call that is not read-only may have changed the tree, ok or
             // not (a failed write can still leave partial bytes).
@@ -1142,6 +1151,7 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
                 command,
                 outcome,
                 tree,
+                ..
             } = entry
             else {
                 continue;
