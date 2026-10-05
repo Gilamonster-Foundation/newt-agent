@@ -1936,6 +1936,7 @@ fn session_body(
             (None, newt_core::durable_grants::GrantSet::new())
         }
     };
+    let worktree_session = newt_core::worktree_adoption::WorktreeSession::default();
     let mut workspace_settings =
         crate::workspace_launch::WorkspaceSession::load(std::path::Path::new(workspace))?;
     let workspace_permissions = resolve_tui(&cfg)
@@ -2956,6 +2957,7 @@ fn session_body(
                 {
                     use newt_core::ScratchpadStore;
                     scratchpad_store.clear();
+                    worktree_session.lift();
                 }
                 {
                     use newt_core::StepLedger;
@@ -4022,6 +4024,11 @@ fn session_body(
                             println!("{line}");
                         }
                         println!();
+                        continue;
+                    }
+                    if slash_body == "permissions worktree-lift" {
+                        worktree_session.lift();
+                        print_newt("Worktree write restriction lifted for this task; ordinary permissions still apply.", color, verbose);
                         continue;
                     }
                     // #263: review surface for prompted permission decisions.
@@ -5417,6 +5424,7 @@ fn session_body(
                         {
                             use newt_core::ScratchpadStore;
                             scratchpad_store.clear();
+                            worktree_session.lift();
                         }
                         // Step 26.5.4 (#582): drop the semantic index + re-arm
                         // indexing so the next task re-indexes (picks up edits).
@@ -8624,6 +8632,7 @@ fn session_body(
                                         // changes the default for commands in this turn.
                                         default_command_cwd: (session_cwd != std::path::Path::new(workspace))
                                             .then_some(session_cwd.as_path()),
+                                        worktree_session: Some(&worktree_session),
                                         color,
                                         // Step 25.4 (#568): `[tui].markdown` ∧
                                         // `/markdown` override ∧ color.
