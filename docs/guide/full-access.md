@@ -88,9 +88,12 @@ in the kernel where the OS allows.
 leash, and the exec allowlist are all removed; `write_file` still asks. It is
 the `full_access` preset applied to this invocation only.
 
-The native commit adapter requires its helpers to remain outside every writable
-root, so it refuses a global filesystem-write grant. Use directory-scoped
-authority for supported native commits.
+Native commits still use the attribution and signing broker. For the commit
+invocation only, writes are confined to the worktree and its own Git metadata,
+keeping the broker helpers immutable. Hooks that write elsewhere need scoped
+authority. Governed pushes trust the ambient host installation under full
+access, while retaining ownership, file-mode, and destination checks.
+Proactive requests for authority already held do not open another prompt.
 
 ## Why have it at all
 
