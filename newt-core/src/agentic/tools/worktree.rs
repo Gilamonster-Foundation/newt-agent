@@ -13,6 +13,69 @@ fn worktree_add_args(words: &[String]) -> Option<&[String]> {
     (verb == "worktree" && action == "add").then_some(args)
 }
 
+/// A conservative refusal trigger, NEVER evidence authorizing adoption. Scan
+/// every command independently of cwd/operand resolution and inspect children.
+fn possible_creation(source: &str) -> bool {
+    fn words(program: Option<&str>, argv: &[String]) -> bool {
+        program.is_some_and(is_git)
+            && argv.windows(2).any(|pair| {
+                literal(&pair[0]).as_deref() == Some("worktree")
+                    && literal(&pair[1]).as_deref() == Some("add")
+            })
+    }
+    fn contains(inspection: &agent_bridle::ShellInspection) -> bool {
+        inspection.commands.iter().any(|command| {
+            words(command.program.as_deref(), &command.argv)
+                || command
+                    .descendant_execs
+                    .iter()
+                    .any(|child| words(Some(&child.program), &child.argv))
+        }) || inspection
+            .constructs
+            .iter()
+            .any(|construct| construct.inspection.as_deref().is_some_and(contains))
+    }
+    match agent_bridle::inspect_shell(source) {
+        Ok(inspection) => contains(&inspection),
+        Err(_) => {
+            // An opaque sibling or malformed syntax can prevent ANY inventory.
+            // Text can only force refusal here; it can never mint a candidate.
+            static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                regex::Regex::new(r"(?is)\bgit(?:\.exe)?\b.*\bworktree\b.*\badd\b")
+                    .expect("fixed creation marker")
+            });
+            let text: String = source
+                .replace("\\\n", "")
+                .chars()
+                .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+                .collect();
+            MARKER.is_match(&text)
+        }
+    }
+}
+
+/// Keep absence distinct from an unresolved attempt. Once creation appears,
+/// neither an ambiguous sibling nor failed candidate resolution may fall open.
+fn creation_admission(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    caveats: &Caveats,
+) -> Result<Option<Creation>, ()> {
+    if name != "run_command"
+        || !args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(possible_creation)
+    {
+        return Ok(None);
+    }
+    if !creation_batch_is_read_only_after_add(args) {
+        return Err(());
+    }
+    creation(name, args, workspace, caveats).map(Some).ok_or(())
+}
+
 fn creation(
     name: &str,
     args: &serde_json::Value,
@@ -94,6 +157,9 @@ fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
     let Ok(inspection) = agent_bridle::inspect_shell(&command) else {
         return false;
     };
+    if !inspection.constructs.is_empty() {
+        return false; // Nested evaluation is not an exact read-only sibling.
+    }
     let mut additions = 0;
     let safe = inspection.commands.iter().all(|c| {
         if c.redirects.iter().any(redirect_has_effect) {
@@ -231,18 +297,18 @@ pub(super) async fn execute(
     let normalized =
         shell::command_args_with_default_cwd(name, args, workspace, collab.default_command_cwd)
             .unwrap_or(std::borrow::Cow::Borrowed(args));
-    let candidate = session
-        .filter(|_| policy.is_none())
-        .and_then(|_| creation(name, &normalized, workspace, caveats));
-    if candidate.is_some() && !creation_batch_is_read_only_after_add(&normalized) {
+    let admission = session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
+        creation_admission(name, &normalized, workspace, caveats)
+    });
+    let Ok(candidate) = admission else {
         if let Some(invocation) = collab.invocation {
             invocation.host();
         }
         if let Some(slot) = collab.execution {
             let _ = slot.set(crate::ExecOutcome::Denied);
         }
-        return "capability denied: run git worktree add separately before other mutations so the original checkout can become read-only before they run".into();
-    }
+        return "capability denied: cannot verify this worktree creation and its surrounding commands; run git worktree add as a standalone literal command in the original checkout so it can become read-only before other mutations run".into();
+    };
     let execution = collab.execution;
     let mut collab = collab;
     let mut result = if let Some(policy) = &policy {
@@ -346,3 +412,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tools_tests/worktree_adoption_round2.rs"]
 mod round2_tests;
+
+#[cfg(test)]
+#[path = "../tools_tests/worktree_adoption_round3.rs"]
+mod round3_tests;

@@ -97,6 +97,7 @@ pub(crate) fn link(policy: &AdoptedWorktree) {
 
 /// #2733: only a new linked checkout of the same repository can be adopted;
 /// existing worktrees and failed commands leave the session alone.
+#[cfg(unix)]
 #[test]
 fn verified_creation_requires_new_matching_git_metadata() {
     let (_temp, policy, _) = fixture(false);
@@ -113,6 +114,7 @@ fn verified_creation_requires_new_matching_git_metadata() {
 }
 
 /// #2733: forged reverse links do not establish creation evidence.
+#[cfg(unix)]
 #[test]
 fn creation_rejects_wrong_reverse_link() {
     let (_temp, policy, _) = fixture(false);
@@ -174,6 +176,7 @@ fn adoption_preserves_deny_all_and_unrelated_only_authority() {
 }
 
 /// #2733: a new Git checkout from a different repository is not adoption.
+#[cfg(unix)]
 #[test]
 fn creation_rejects_a_foreign_repository() {
     let (temp, policy, _) = fixture(false);
@@ -187,4 +190,15 @@ fn creation_rejects_a_foreign_repository() {
     )
     .unwrap();
     assert!(candidate.verify().is_none());
+}
+
+/// #2733: platforms without held, symlink-safe metadata reads cannot mint or
+/// validate adoption evidence. A plausible Git layout cannot bypass that floor.
+#[cfg(not(unix))]
+#[test]
+fn unsupported_metadata_reads_refuse_adoption() {
+    let (_temp, policy, _) = fixture(false);
+    assert!(Creation::before(&policy.original, &policy.worktree, &Caveats::top()).is_none());
+    link(&policy);
+    assert!(!policy.valid(&Caveats::top()));
 }

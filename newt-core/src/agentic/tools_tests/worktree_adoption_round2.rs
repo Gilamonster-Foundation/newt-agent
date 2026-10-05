@@ -27,7 +27,7 @@ impl PermissionGate for BuildGate {
     }
 }
 
-async fn dispatch(
+pub(super) async fn dispatch(
     args: serde_json::Value,
     original: &Path,
     caveats: &Caveats,
@@ -145,17 +145,23 @@ async fn adopted_build_dispatch(source: &str) {
                 Some(&mut gate),
             )
             .await;
-            assert_eq!(gate.0.len(), 1, "nested={nested}: {text}");
-            let (fence, target) = &gate.0[0];
-            assert_eq!(target, policy.worktree.to_str().unwrap());
-            assert!(crate::caveats::permits_path(
-                &fence.fs_write,
-                policy.worktree.to_str().unwrap()
-            ));
-            assert!(!crate::caveats::permits_path(
-                &fence.fs_write,
-                original.to_str().unwrap()
-            ));
+            if cfg!(unix) {
+                assert_eq!(gate.0.len(), 1, "nested={nested}: {text}");
+                let (fence, target) = &gate.0[0];
+                assert_eq!(target, policy.worktree.to_str().unwrap());
+                assert!(crate::caveats::permits_path(
+                    &fence.fs_write,
+                    policy.worktree.to_str().unwrap()
+                ));
+                assert!(!crate::caveats::permits_path(
+                    &fence.fs_write,
+                    original.to_str().unwrap()
+                ));
+            } else {
+                // No verified policy exists on Windows: reject before Build approval.
+                assert!(gate.0.is_empty(), "{text}");
+                assert!(text.contains("capability denied"), "{text}");
+            }
             assert_eq!(outcome, Some(crate::ExecOutcome::Denied));
         }
         let mut gate = BuildGate::default();
@@ -266,7 +272,7 @@ fn worktree_adoption_round2_siblings_cannot_hide_creation() {
     ] {
         let args =
             serde_json::json!({"command":format!("git worktree add ../task -b task; {suffix}")});
-        assert!(
+        assert_eq!(
             creation(
                 "run_command",
                 &args,
@@ -274,6 +280,7 @@ fn worktree_adoption_round2_siblings_cannot_hide_creation() {
                 &Caveats::top()
             )
             .is_some(),
+            cfg!(unix),
             "{suffix}: {:?}",
             agent_bridle::inspect_shell(args["command"].as_str().unwrap())
         );

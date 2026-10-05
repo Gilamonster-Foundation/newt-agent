@@ -23,6 +23,7 @@ impl PermissionGate for BroadGate {
 
 /// #2733: creation parsing recognizes real command input, not child output;
 /// a listed, existing, failed, dynamic, or unrelated worktree never adopts.
+#[cfg(unix)]
 #[test]
 fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
     let (_temp, policy, _) = fixture(false);
@@ -125,6 +126,7 @@ fn request_fixture() -> PermissionRequest {
 
 /// #2733: actual file-tool dispatch refuses stray writes before permission
 /// prompts, retains reads, and accepts the same path after explicit lift.
+#[cfg(unix)]
 #[tokio::test]
 async fn worktree_adoption_guards_file_dispatch_across_calls_and_lift() {
     let (_temp, policy, _) = fixture(false);
@@ -326,4 +328,31 @@ fn worktree_adoption_creation_is_an_execution_boundary() {
     assert!(creation_batch_is_read_only_after_add(
         &serde_json::json!({"command":"git worktree add -b task ../task 2>&1 | tail -5; git branch --show-current"})
     ));
+}
+
+/// #2733: an injected policy cannot authorize dispatch where its Git metadata
+/// cannot be verified. Windows keeps the existing fail-closed runtime boundary.
+#[cfg(not(unix))]
+#[tokio::test]
+async fn worktree_adoption_unverifiable_policy_refuses_dispatch() {
+    let (temp, policy, _) = fixture(false);
+    link(&policy);
+    let original = temp.path().join("main");
+    std::fs::write(original.join("source.rs"), "sentinel").unwrap();
+    let session = WorktreeSession::default();
+    session.adopt(policy);
+    for name in ["read_file", "write_file", "delete_file"] {
+        let text = call(
+            name,
+            &serde_json::json!({"path":"source.rs", "content":"changed"}),
+            &original,
+            &session,
+        )
+        .await;
+        assert!(text.contains("capability denied"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(original.join("source.rs")).unwrap(),
+            "sentinel"
+        );
+    }
 }
