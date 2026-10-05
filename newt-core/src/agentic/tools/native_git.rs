@@ -102,28 +102,6 @@ pub(super) fn needs_pr_create_broker(source: &str) -> bool {
     inspect_shell(source).is_ok_and(|inspection| contains(&inspection))
 }
 
-/// Is `source` a single, literal, standalone command (no compound/redirect/
-/// descendant-exec/dynamic-argv shape)? Strictness gate for the governed
-/// PR-create broker — anything else is refused rather than guessed at,
-/// same posture as `inspect_commands`'s "composed or redirected Git mutation"
-/// refusal.
-fn standalone_literal_argv(source: &str) -> Result<Vec<String>, String> {
-    let inspection =
-        inspect_shell(source).map_err(|e| unresolved(&format!("shell inspection failed: {e}")))?;
-    if inspection.commands.len() != 1 || !inspection.constructs.is_empty() {
-        return Err(unresolved("composed or redirected Git/gh invocation"));
-    }
-    let command = &inspection.commands[0];
-    if !command.redirects.is_empty() || !command.descendant_execs.is_empty() {
-        return Err(unresolved("composed or redirected Git/gh invocation"));
-    }
-    command
-        .argv
-        .iter()
-        .map(|arg| literal(arg).ok_or_else(|| unresolved("dynamic Git/gh arguments")))
-        .collect()
-}
-
 /// issue-1188 amendment A1/A2: the exact push this broker will execute —
 /// never taken verbatim from the model's argv, only VALIDATED against it. The
 /// remote name is the only thing the model's command may choose; the branch
@@ -212,7 +190,7 @@ pub(super) fn execute_governed_push(
     if let Err(unavailable) = broker_available(caveats) {
         return format!("{unavailable}. {}", push_command::RETRY);
     }
-    let command = match push_command::PushCommand::parse(source) {
+    let command = match push_command::GovernedCommand::parse(source) {
         Ok(command) => command,
         Err(reason) => return format!("refused: {reason}. {}", push_command::RETRY),
     };
@@ -228,6 +206,16 @@ pub(super) fn execute_governed_push(
         let plan = plan_governed_push(source, cwd, caveats, gate, &held)?;
         run_staged_push(&plan, caveats, &held)
     })();
+    render_governed_result(&command, result, push_command::RETRY)
+}
+
+/// Only harness-authored reasons cross the fixed-form boundary; raw config
+/// and child diagnostics remain private for both governed publication paths.
+fn render_governed_result(
+    command: &push_command::GovernedCommand,
+    result: Result<crate::git_staging::Outcome, crate::git_staging::Refusal>,
+    retry: &str,
+) -> String {
     let success = result
         .as_ref()
         .is_ok_and(|outcome| !matches!(outcome, crate::git_staging::Outcome::Failed { .. }));
@@ -235,7 +223,7 @@ pub(super) fn execute_governed_push(
         "trusted staging checks failed; the operator must check tool/config ownership and repository read authority"));
     let mut output = fixed_form_with_notice(result, std::io::stdout());
     if let Some(reason) = reason {
-        output.push_str(&format!(": {reason}. {}", push_command::RETRY));
+        output.push_str(&format!(": {reason}. {retry}"));
     }
     command.render(output, success)
 }
@@ -302,7 +290,7 @@ fn plan_governed_push(
     use crate::git_staging as staging;
     staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
 
-    let command = push_command::PushCommand::parse(source).map_err(str::to_owned)?;
+    let command = push_command::GovernedCommand::parse(source).map_err(str::to_owned)?;
     let request = parse_governed_push(&command.argv)?;
 
     // Finding 6 (issue-1188 review #2641): the broker runs outside the
@@ -517,50 +505,73 @@ fn classify_failure(stderr: &[u8]) -> crate::git_staging::FailureCategory {
     }
 }
 
-/// issue-1188 amendment A4: the exact `gh pr create` this broker will
-/// execute. Only `--title`/`-t` and `--body`/`-b` are accepted from the
-/// model's argv; `--repo`, `--base`, and `--head` are always resolved by the
-/// broker itself so `gh` never infers (or is told to use) anything else.
+/// #2740: requested branches are assertions, never authority to select a
+/// different destination. Planning resolves both branches independently.
 struct GovernedPrCreate {
     title: String,
     body: String,
+    requested_base: Option<String>,
+    requested_head: Option<String>,
 }
 
-fn parse_governed_pr_create(argv: &[String]) -> Result<GovernedPrCreate, String> {
-    // argv[0] = "gh", argv[1] = "pr", argv[2] = "create", rest are flags.
-    let mut title = None;
-    let mut body = None;
+const PR_CREATE_RETRY: &str = "Retry with run_command using the worktree as cwd and command `gh pr create --base <default-branch> --head <current-branch> --title '<title>' --body '<body>'`.";
+
+fn parse_governed_pr_create(argv: &[String]) -> Result<GovernedPrCreate, &'static str> {
+    if !argv.first().is_some_and(|arg| is_gh(arg))
+        || argv.get(1).map(String::as_str) != Some("pr")
+        || argv.get(2).map(String::as_str) != Some("create")
+    {
+        return Err("expected a literal gh pr create command");
+    }
+    let (mut title, mut body, mut requested_base, mut requested_head) = (None, None, None, None);
     let mut i = 3;
     while i < argv.len() {
         let word = argv[i].as_str();
         let (flag, inline_value) = match word.split_once('=') {
-            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            Some((f, v)) if f.starts_with("--") => (f, Some(v)),
             _ => (word, None),
         };
-        let mut take_value = || -> Result<String, String> {
-            if let Some(v) = &inline_value {
-                return Ok(v.clone());
-            }
-            i += 1;
-            argv.get(i)
-                .cloned()
-                .ok_or_else(|| unresolved("gh pr create flag missing its value"))
+        let (slot, requirement) = match flag {
+            "--title" | "-t" => (&mut title, "--title is required with a value"),
+            "--body" | "-b" => (&mut body, "--body is required with a value"),
+            "--base" => (&mut requested_base, "--base requires a branch value"),
+            "--head" => (&mut requested_head, "--head requires a branch value"),
+            _ => return Err("unsupported gh pr create flag; only --title, --body, --base and --head are supported"),
         };
-        match flag {
-            "--title" | "-t" => title = Some(take_value()?),
-            "--body" | "-b" => body = Some(take_value()?),
-            _ => {
-                return Err(unresolved(&format!(
-                    "unsupported `gh pr create` flag '{flag}' — only --title/--body are \
-                     accepted; --repo/--base/--head are resolved automatically"
-                )))
-            }
+        if slot.is_some() {
+            return Err("duplicate gh pr create flags are unsupported");
         }
+        let value = match inline_value {
+            Some(value) => value,
+            None => {
+                i += 1;
+                argv.get(i)
+                    .map(String::as_str)
+                    // A missing value must not consume the next supported flag.
+                    // Other literal text (including Markdown list markers)
+                    // is data; gh receives it as this option's value.
+                    .filter(|value| {
+                        !matches!(
+                            *value,
+                            "--title" | "-t" | "--body" | "-b" | "--base" | "--head"
+                        )
+                    })
+                    .ok_or(requirement)?
+            }
+        };
+        *slot = Some(value.to_string());
         i += 1;
     }
-    let title = title.ok_or_else(|| unresolved("gh pr create: --title is required"))?;
-    let body = body.ok_or_else(|| unresolved("gh pr create: --body is required"))?;
-    Ok(GovernedPrCreate { title, body })
+    let title = title
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("--title is required with a nonempty value")?;
+    let body = body.ok_or("--body is required with a value")?;
+    Ok(GovernedPrCreate {
+        title,
+        body,
+        requested_base,
+        requested_head,
+    })
 }
 
 /// issue-1188 #2641 design round 4: execute a governed `gh pr create` from a
@@ -574,14 +585,21 @@ pub(super) fn execute_governed_pr_create(
     gate: &mut Option<&mut dyn PermissionGate>,
 ) -> String {
     if let Err(unavailable) = broker_available(caveats) {
-        return unavailable.to_string();
+        return format!("{unavailable}. {PR_CREATE_RETRY}");
+    }
+    let command = match push_command::GovernedCommand::parse(source) {
+        Ok(command) => command,
+        Err(reason) => return format!("refused: {reason}. {PR_CREATE_RETRY}"),
+    };
+    if let Err(reason) = parse_governed_pr_create(&command.argv) {
+        return format!("refused: {reason}. {PR_CREATE_RETRY}");
     }
     let result = (|| {
         let held = crate::git_staging::HeldRoots::bind(&caveats.fs_read)?;
         let plan = plan_governed_pr_create(source, cwd, caveats, gate, &held)?;
         run_staged_pr_create(&plan)
     })();
-    fixed_form_with_notice(result, std::io::stdout())
+    render_governed_result(&command, result, PR_CREATE_RETRY)
 }
 
 /// Phase 2/4/5 for `gh pr create`: a bare staging dir (no objects needed —
@@ -658,30 +676,31 @@ fn plan_governed_pr_create(
     use crate::git_staging as staging;
     staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
 
-    let argv = standalone_literal_argv(source)?;
-    let request = parse_governed_pr_create(&argv)?;
+    let syntax_refusal =
+        |reason: &'static str| staging::Refusal::from(reason.to_string()).with_reason(reason);
+    let command = push_command::GovernedCommand::parse(source).map_err(syntax_refusal)?;
+    let request = parse_governed_pr_create(&command.argv).map_err(syntax_refusal)?;
 
     // Finding 6: same cwd authority/exec binding as the push broker.
     // Prefix (containment) semantics, as at every fs enforcement site:
     // `permits_fs_read` is exact-match and would refuse a subdirectory.
     let cwd_str = cwd.to_string_lossy();
     if !crate::caveats::permits_path(&caveats.fs_read, &cwd_str) {
-        return Err(format!(
-            "refused: '{cwd_str}' is outside this session's filesystem read authority"
-        )
-        .into());
+        return Err(syntax_refusal(
+            "worktree read authority is missing; grant read access before retrying",
+        ));
     }
     if !caveats.permits_exec("gh") {
-        return Err("refused: no exec authority for 'gh'".to_string().into());
+        return Err(syntax_refusal(
+            "no exec authority for gh; grant gh execution before retrying",
+        ));
     }
 
     // F1/F2: authenticate BEFORE any planning subprocess; gh is required.
     let tools =
         staging::TrustedTools::authenticate(staging::TrustContext::bind(&caveats.fs_write)?)?;
     if tools.gh_path().is_none() {
-        return Err("refused: no trusted gh executable is installed"
-            .to_string()
-            .into());
+        return Err(syntax_refusal("no trusted gh executable is installed"));
     }
     let (common_dir, git_dir) = staging::discover_git_dirs(cwd, held)?;
 
@@ -689,22 +708,39 @@ fn plan_governed_pr_create(
     // repo-local config gadget has nothing to reach.
     let url = staging::literal_remote_url(&tools, &common_dir, "origin", held)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
-        return Err(format!(
-            "refused: gh pr create is only supported for a github.com 'origin' remote (got {url})"
-        )
-        .into());
+        return Err(syntax_refusal(
+            "gh pr create requires a github.com origin remote",
+        ));
     };
     let host = "github.com".to_string();
 
-    let head = staging::read_head_branch(&git_dir, held)
-        .map_err(|_| "refused: detached HEAD has no branch to open a PR from".to_string())?;
-    let base =
-        staging::origin_default_branch(&common_dir, held).unwrap_or_else(|| "main".to_string());
-    if head == base {
-        return Err(format!(
-            "refused: cannot open a PR from the default branch '{base}' to itself"
+    let head = staging::read_head_branch(&git_dir, held).map_err(|error| {
+        error.with_reason(
+            "a verified checked-out branch is required; detached HEAD cannot open a PR",
         )
-        .into());
+    })?;
+    let base = staging::origin_default_branch(&common_dir, held)
+        .ok_or_else(|| syntax_refusal("repository default branch is unknown; the operator must establish a valid origin/HEAD before retrying"))?;
+    if request
+        .requested_base
+        .as_ref()
+        .is_some_and(|requested| requested != &base)
+    {
+        return Err(syntax_refusal(
+            "--base must match the repository default branch",
+        ));
+    }
+    if request
+        .requested_head
+        .as_ref()
+        .is_some_and(|requested| requested != &head)
+    {
+        return Err(syntax_refusal("--head must match the checked-out branch"));
+    }
+    if head == base {
+        return Err(syntax_refusal(
+            "cannot open a PR from the default branch to itself; switch to a feature branch",
+        ));
     }
 
     ensure_net_granted(
@@ -712,7 +748,12 @@ fn plan_governed_pr_create(
         gate,
         &host,
         &format!("open a PR on {owner}/{name}"),
-    )?;
+    )
+    .map_err(|detail| {
+        staging::Refusal::from(detail).with_reason(
+            "destination network permission was not granted; an operator must approve PR creation",
+        )
+    })?;
 
     Ok(GovernedPrCreatePlan {
         repo: format!("{owner}/{name}"),
@@ -1947,6 +1988,14 @@ mod governed_push_tests {
             repo.path(),
             &["remote", "add", "origin", "https://github.com/o/r.git"],
         );
+        git(
+            repo.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
         git(repo.path(), &["checkout", "-q", "-b", "task"]);
         commit(repo.path(), "f.txt", "two\n");
         repo
@@ -3150,6 +3199,8 @@ mod governed_push_tests {
         }
     }
 
+    include!("native_git/pr_create_tests.rs");
+
     // -- gh pr create planning ----------------------------------------------
 
     #[test]
@@ -3185,7 +3236,7 @@ mod governed_push_tests {
         let _env = BrokerEnv::new();
         let repo = repo_on_feature_branch();
         let err = plan_pr_create_test(
-            "gh pr create --title t --body b --base other",
+            "gh pr create --title t --body b --repo other/repo",
             repo.path(),
             &scoped_caveats(),
             &mut None,

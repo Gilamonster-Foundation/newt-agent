@@ -115,3 +115,4 @@
 # #2739: doctor/setup query only an authenticated git, from / with a scrubbed
 # environment. Fixed read-only config/exec-path argv; helpers are never executed.
 "newt-core/src/git_staging/tool_diagnostics.rs" = { count = 1, class = "trusted-infra" }
+"newt-core/src/agentic/tools/dependency_fetch_inputs.rs" = { count = 1, class = "test", note = "#2731 owner-only fetch-copy regression: a fixed /bin/sh command sets umask 002 and execs the current test binary with one exact test filter. The executable is passed as a positional argument, not shell interpolation. Test-only, no model/repository-controlled argv or network; subprocess isolation keeps the process-global umask out of the parallel test runner." }

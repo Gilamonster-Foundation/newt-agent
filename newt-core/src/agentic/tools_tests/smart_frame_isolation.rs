@@ -943,3 +943,69 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
     assert!(denied.contains("denied"), "{denied}");
     assert!(!denied.contains("outside authority"));
 }
+
+/// #2731: forward operation approval only where durable-frame isolation is
+/// supported. Windows must refuse before prompting, even for a narrow fence;
+/// widening the fence must never expose private frame storage on any platform.
+#[test]
+fn cold_cache_fetch_frame_gate_preserves_protection() {
+    use crate::agentic::smart_harness::FramePermissionGate;
+    struct FetchGate(usize);
+    impl PermissionGate for FetchGate {
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            panic!("host path")
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn ask_dependency_fetch(
+            &mut self,
+            prepared: &Caveats,
+            _: &PermissionRequest,
+        ) -> PermissionDecision {
+            self.0 += 1;
+            PermissionDecision::Allow(prepared.clone())
+        }
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let (h, _) = harness(directory.path());
+    let mut inner = FetchGate(0);
+    let request = PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Net,
+        target: "one locked fetch".into(),
+        reason: "unrestricted fetch egress".into(),
+        harness_bound: true,
+    };
+    let mut prepared = crate::confined_exec::workspace_confined_caveats(workspace.path());
+    prepared.net = crate::Scope::All;
+    {
+        let mut gate = FramePermissionGate {
+            harness: &h,
+            workspace: workspace.path(),
+            inner: &mut inner,
+            refusal: None,
+        };
+        let decision = gate.ask_dependency_fetch(&prepared, &request);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(matches!(decision, PermissionDecision::Allow(_)));
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            assert!(matches!(decision, PermissionDecision::Deny));
+            assert!(gate.refusal.as_deref().is_some_and(|reason| reason.contains(
+                "durable smart harness requires object-bound filesystem tools and a supported kernel sandbox"
+            )));
+        }
+        prepared.fs_read = crate::Scope::All;
+        assert!(matches!(
+            gate.ask_dependency_fetch(&prepared, &request),
+            PermissionDecision::Deny
+        ));
+        assert!(gate.refusal.is_some());
+    }
+    assert_eq!(
+        inner.0,
+        usize::from(cfg!(any(target_os = "linux", target_os = "macos")))
+    );
+}
