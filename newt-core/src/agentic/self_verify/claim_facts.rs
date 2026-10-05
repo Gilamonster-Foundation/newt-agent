@@ -22,45 +22,43 @@ pub(super) fn observed_command(name: &str, args: &serde_json::Value) -> String {
 }
 
 fn literal_path(word: &str) -> bool {
-    !word.is_empty() && !word.contains(['\'', '"', '$', '`', '~', '\\', '*', '?', '[', ']'])
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-:".contains(c))
 }
 
-/// Deliberately refuse ambiguous shell context rather than assigning a pass to
-/// the launch directory. Reuse the gate's command segment splitter.
+/// Attribute only a direct Cargo invocation, optionally preceded by plain
+/// `cd <literal path> &&` segments. All other shell context is unknown.
 pub(super) fn command_directory(
     command: &str,
     args: &serde_json::Value,
     workspace: &str,
 ) -> Option<PathBuf> {
+    let segments = split_command(command);
+    let ((cargo, separator), leading) = segments.split_last()?;
+    if cargo.split_whitespace().next() != Some("cargo") || !separator.is_empty() {
+        return None;
+    }
     let cwd = args["cwd"].as_str().unwrap_or(".");
-    // The structured cwd field is already a literal path (including Windows
-    // separators); only shell cd operands need conservative token handling.
+    // Structured cwd is a literal path; shell cd operands use the narrower
+    // allowlist below to exclude quoting, expansion, options and shell syntax.
     let mut dir = Path::new(workspace).join(cwd);
-    let mut leading = true;
-    for (segment, separator) in split_command(command) {
+    for (segment, separator) in leading {
         let words: Vec<_> = segment.split_whitespace().collect();
-        if words.first() != Some(&"cd") {
-            leading = false;
-            // Shell builtins hidden behind wrappers and env's chdir options
-            // need execution-layer cwd evidence, not the inferred launch cwd.
-            if words.iter().any(|word| {
-                matches!(*word, "cd" | "pushd" | "popd")
-                    || word.starts_with("--chdir")
-                    || word.starts_with("-C")
-            }) {
-                return None;
-            }
-            continue;
-        }
-        if !leading || words.len() != 2 || separator != "&&" || !literal_path(words[1]) {
+        let ["cd", path] = words.as_slice() else {
+            return None;
+        };
+        if *separator != "&&" || !literal_path(path) {
             return None;
         }
-        dir = dir.join(words[1]);
+        dir = dir.join(path);
     }
     // Explicit manifests select a different package tree; do not mislabel it
     // as the cwd. Cargo -C and shell substitutions likewise need richer evidence.
     if command.contains("--manifest-path")
-        || command.contains(" -C ")
+        || cargo.split_whitespace().any(|word| word.starts_with("-C"))
         || command.contains(['$', '`'])
     {
         return None;
@@ -164,10 +162,12 @@ impl VerificationLedger {
         let mut facts = Vec::new();
         for directory in directories.iter().rev().take(8) {
             let mut ledger = self.clone();
-            // Other directories cannot pay for this one's check. Conservatively
-            // retain their potential mutations so unrelated runs cannot refresh it.
+            // Other directories cannot pay for this one's check. Preserve known
+            // read-only commands; all other runs retain their potential mutations.
             for entry in &mut ledger.entries {
-                if matches!(entry, Observed::Exec { directory: dir, .. } if dir != directory) {
+                if matches!(entry, Observed::Exec { command, directory: dir, .. }
+                    if dir != directory && !super::super::is_verification_read_command(command))
+                {
                     *entry = Observed::Write;
                 }
             }
@@ -229,6 +229,38 @@ mod tests {
                 "/launch",
             )
             .await;
+    }
+
+    async fn assert_unknown_directory(command: &str) {
+        let mut ledger = VerificationLedger::for_turn("refactor", false);
+        run(&mut ledger, command, Passed, "/launch").await;
+        let text = ledger.annotate_cargo_claim("Cargo check green".into());
+        assert!(
+            text.contains("Unverified in `unknown directory`"),
+            "{command}: {text}"
+        );
+        assert!(!text.contains("Passed in"), "{command}: {text}");
+    }
+
+    /// #2718 round 3: shell quoting cannot hide cwd changes before Cargo.
+    #[tokio::test]
+    async fn round3_quoted_cd_has_unknown_directory() {
+        assert_unknown_directory("true && 'cd' /other && cargo check").await;
+    }
+
+    /// #2718 round 3: escaped commands cannot establish an inferred cwd.
+    #[tokio::test]
+    async fn round3_escaped_cd_has_unknown_directory() {
+        assert_unknown_directory(r"true && c\d /other && cargo check").await;
+    }
+
+    /// #2718 round 3: only plain leading cd segments are allowed before Cargo,
+    /// even when another prefix looks harmless or transparent.
+    #[tokio::test]
+    async fn round3_other_commands_and_wrappers_have_unknown_directory() {
+        assert_unknown_directory("true && cargo check").await;
+        assert_unknown_directory("env cargo check").await;
+        assert_unknown_directory("MODE=test cargo check").await;
     }
 
     /// #2718 round 2: a denied different scope cannot inherit an earlier pass;
