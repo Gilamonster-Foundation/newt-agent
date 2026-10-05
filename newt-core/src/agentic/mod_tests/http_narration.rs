@@ -520,6 +520,7 @@ fn readonly_completion_handoff_preserves_the_disclosure_boundary() {
         &capability_check::Evidence::default(),
         Some(&filter),
         None,
+        &self_verify::VerificationLedger::default(),
     );
     assert!(reply.contains("Let me check the current implementation"));
     assert!(reply.contains("[REDACTED]"), "{reply}");
