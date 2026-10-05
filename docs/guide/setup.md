@@ -55,7 +55,10 @@ uses `chmod g-w`; world write is removed separately when needed.
 Setup offers to apply the displayed fixes only after a separate explicit yes.
 A blank answer, unavailable terminal, or the backend setup's `--yes` flag does
 not authorize permission changes. You can decline and run the commands yourself;
-Newt does not elevate privileges. Homebrew operations can restore group write,
+Newt does not elevate privileges. Repairs stay bound to the diagnosed filesystem
+objects while the prompt is open. If an object is replaced or its ownership
+changes, Newt refuses that repair; rerun `newt doctor` to inspect the new state.
+Homebrew operations can restore group write,
 so run `newt doctor` again if a later governed push refuses a tool path.
 
 ## Credentials — encrypted at rest
