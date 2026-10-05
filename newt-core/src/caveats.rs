@@ -248,10 +248,10 @@ pub fn permits_path(scope: &Scope<String>, full_path: &str) -> bool {
 /// ⇒ `Kernel`).
 ///
 /// **Measured on Linux** (Landlock + `DenyDirect` → `Kernel`-decidable after
-/// this narrowing). On macOS, Seatbelt still refuses a restricted `net` scope
-/// — including `none` — independently; a separate agent-bridle fix is under
-/// way. On Windows, AppContainer can bind `net:none`, but other axes (e.g.
-/// restricted exec) can still refuse; behaviour is unvalidated here.
+/// this narrowing). On macOS, Seatbelt can also bind `net:none`; a non-empty
+/// host list remains undecidable (#2729). On Windows, AppContainer can bind
+/// `net:none`, but other axes (e.g. restricted exec) can still refuse;
+/// behaviour is unvalidated here.
 ///
 /// `Scope::All` and `Scope::none()` pass through unchanged: `All` is already
 /// unrestricted (nothing to narrow), and `none()` is already the bindable
