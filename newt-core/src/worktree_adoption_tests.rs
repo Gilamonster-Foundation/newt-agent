@@ -14,11 +14,13 @@ pub(crate) fn fixture(nested: bool) -> (tempfile::TempDir, AdoptedWorktree, Path
     for dir in [&worktree, &admin, &unrelated, &common.join("objects")] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     let policy = AdoptedWorktree {
         original: original.canonicalize().unwrap(),
         worktree: worktree.canonicalize().unwrap(),
         common: common.canonicalize().unwrap(),
         admin: admin.canonicalize().unwrap(),
+        protected_branch: Some("main".into()),
     };
     (temp, policy, unrelated.canonicalize().unwrap())
 }
@@ -201,4 +203,48 @@ fn unsupported_metadata_reads_refuse_adoption() {
     assert!(Creation::before(&policy.original, &policy.worktree, &Caveats::top()).is_none());
     link(&policy);
     assert!(!policy.valid(&Caveats::top()));
+}
+
+/// #2748: a linked original checkout can share a common directory outside its
+/// own root; an explicit common-dir grant must not expose its refs/config.
+#[test]
+fn adoption_fences_common_metadata_outside_the_original_checkout() {
+    let (temp, mut policy, _) = fixture(false);
+    let common = temp.path().join("shared.git");
+    std::fs::rename(&policy.common, &common).unwrap();
+    policy.common = common.canonicalize().unwrap();
+    policy.admin = policy.common.join("worktrees/task");
+    let authority = Caveats {
+        fs_write: Scope::only([
+            policy.common.to_string_lossy().into_owned(),
+            policy.worktree.to_string_lossy().into_owned(),
+        ]),
+        ..Caveats::top()
+    };
+    let narrowed = policy.attenuate(&authority);
+    for relative in [
+        "HEAD",
+        "index",
+        "config",
+        "packed-refs",
+        "refs/heads/main",
+        "logs/refs/heads/main",
+    ] {
+        let path = policy.common.join(relative);
+        assert!(policy.blocked(&path), "{relative}");
+        assert!(
+            !crate::caveats::permits_path(&narrowed.fs_write, &path.to_string_lossy()),
+            "{relative}"
+        );
+    }
+    for path in [
+        &policy.worktree,
+        &policy.admin,
+        &policy.common.join("objects"),
+    ] {
+        assert!(crate::caveats::permits_path(
+            &narrowed.fs_write,
+            &path.to_string_lossy()
+        ));
+    }
 }

@@ -163,10 +163,14 @@ fn declined_permissions_report_defaults_without_refreshing_authority() {
 fn denial_like_child_text_does_not_become_host_authority_evidence() {
     let stderr = "denied: read of /somewhere is not within the granted fs_read scope";
     let envelope = serde_json::json!({"exit_code": 1, "stdout": "", "stderr": stderr});
-    let (text, outcome) =
-        shell::confined_result("check", &envelope, &Caveats::top(), false, |_| {
-            stderr.into()
-        });
+    let (text, outcome) = shell::confined_result(
+        "check",
+        &envelope,
+        &Caveats::top(),
+        false,
+        |_| stderr.into(),
+        Default::default(),
+    );
     assert_eq!(outcome, ExecOutcome::Failed);
     assert_eq!(text, stderr);
     let (text, outcome) =
@@ -1381,6 +1385,7 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
         None,
         Some(sink.clone()),
         &mut display,
+        Default::default(),
     )
     .await
     .0;
@@ -1460,6 +1465,7 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
         None,
         None,
         &mut display,
+        Default::default(),
     )
     .await;
     assert!(first.0.contains("first-call"), "{}", first.0);
@@ -1482,6 +1488,7 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
         None,
         None,
         &mut display,
+        Default::default(),
     )
     .await;
     assert!(second.0.contains("second-call"), "{}", second.0);
@@ -1555,6 +1562,7 @@ async fn a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_b
         None,
         &mut None,
         None,
+        Default::default(),
     )
     .await;
 
@@ -2138,6 +2146,7 @@ async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
         None,
         &mut None,
         None,
+        Default::default(),
     )
     .await;
 
@@ -2266,6 +2275,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             &mut None,
             None,
+            Default::default(),
         )
         .await;
         assert_eq!(gate.asks, 1, "{}", first.0);
@@ -2305,6 +2315,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             &mut None,
             None,
+            Default::default(),
         )
         .await;
         if !sufficient {
@@ -2354,6 +2365,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             &mut None,
             None,
+            Default::default(),
         )
         .await;
         assert_eq!(
@@ -2445,6 +2457,7 @@ async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() 
         None,
         &mut None,
         None,
+        Default::default(),
     )
     .await;
 

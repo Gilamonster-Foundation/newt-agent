@@ -6,6 +6,12 @@ const FILE_PATH_DESCRIPTION: &str = "Absolute or workspace-relative file path. \
     Preserve an operator-supplied absolute path. The target must be within granted file access.";
 
 pub fn tool_definitions() -> serde_json::Value {
+    tool_definitions_with_budget(Default::default())
+}
+
+pub(crate) fn tool_definitions_with_budget(
+    command_budget: crate::RunCommandBudget,
+) -> serde_json::Value {
     serde_json::json!([
         {
             "type": "function",
@@ -16,7 +22,7 @@ pub fn tool_definitions() -> serde_json::Value {
                                 File access, execution, and networking are governed by the session's \
                                 OCAP grants. Needed authority is approved before execution. \
                                 Optional fs_read/fs_write arrays declare additional absolute paths \
-                                needed by this invocation.", super::shell::run_command_limit_sentence()),
+                                needed by this invocation.", super::shell::run_command_limit_sentence(command_budget)),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -358,8 +364,9 @@ pub(crate) fn merged_tool_definitions(
     with_operating_mode_control: bool,
     with_plan_mode_control: bool,
     with_plan_mode_active: bool,
+    command_budget: crate::RunCommandBudget,
 ) -> serde_json::Value {
-    let mut defs = match tool_definitions() {
+    let mut defs = match tool_definitions_with_budget(command_budget) {
         serde_json::Value::Array(a) => a,
         other => vec![other],
     };

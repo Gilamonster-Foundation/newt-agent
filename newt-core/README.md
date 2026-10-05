@@ -198,8 +198,10 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:45 
 ## Command time budgets
 
 `run_command` has a 60-second wall-clock budget. Set
-`NEWT_RUN_COMMAND_TIMEOUT_SECS` to change its default, or pass `timeout_secs`
-for one call; both are capped at 300 seconds. Invalid or zero defaults fall
+`NEWT_RUN_COMMAND_TIMEOUT_SECS` before session setup to change its default.
+The session captures that value once for both the tool description and execution.
+Embedders can supply `RunCommandBudget` through `TurnDriverConfig` or `ChatCtx`
+without mutating the process environment. Pass `timeout_secs` for one call; both are capped at 300 seconds. Invalid or zero defaults fall
 back to 60 seconds, and a zero per-call value uses the configured default.
 On expiry the executor terminates the command group and returns an explicit
 `TimedOut` result naming the applied budget, with bounded partial output.

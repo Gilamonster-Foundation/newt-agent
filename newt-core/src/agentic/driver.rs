@@ -98,6 +98,8 @@ impl std::fmt::Debug for HeadlessCodeSearch {
 /// separately by the driver and shared across its submitted turns.
 #[derive(Debug, Clone)]
 pub struct TurnDriverConfig {
+    /// Resolved once; callers may supply a deterministic budget.
+    pub command_budget: crate::RunCommandBudget,
     /// Shared accounted session and independent narration adjudicator.
     pub smart_harness: Option<Arc<super::smart_harness::SmartHarness>>,
     /// Inference endpoint base URL.
@@ -200,6 +202,7 @@ impl TurnDriverConfig {
         workspace: impl Into<String>,
     ) -> Self {
         Self {
+            command_budget: crate::RunCommandBudget::from_env(),
             smart_harness: None,
             url: url.into(),
             model: model.into(),
@@ -702,6 +705,7 @@ async fn run_one_turn(
         .run_allowance
         .map(super::run_allowance::RunAllowance::new);
     let ctx = ChatCtx {
+        command_budget: config.command_budget,
         run_allowance: run_allowance.as_ref(),
         verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),
         round_cap_hit: None,

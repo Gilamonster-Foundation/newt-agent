@@ -16,6 +16,7 @@ fn msgs() -> Vec<MemMessage> {
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        command_budget: Default::default(),
         overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,

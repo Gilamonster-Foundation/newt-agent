@@ -1011,7 +1011,7 @@ impl agent_toolchain::native_git::CommitPolicy for QuietCommitPolicy {
     fn committed(&self) {}
 }
 
-struct FixtureGitTool;
+pub(in crate::agentic::tools) struct FixtureGitTool;
 impl crate::agentic::git_tool::GitTool for FixtureGitTool {
     fn native_commit_policy(
         &self,

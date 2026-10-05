@@ -5,6 +5,7 @@ use crate::Caveats;
 use std::path::{Path, PathBuf};
 
 use super::native_git::{invocation, is_git as resembles_git, literal};
+pub(super) mod branch;
 #[path = "worktree_git.rs"]
 mod git_identity;
 
@@ -302,7 +303,7 @@ fn record_verified_creation(
         format!("Task worktree created: {}. Warning: worktree protection is not armed because OCAP is disabled; the original checkout remains writable under existing permissions. Use a confined session for automatic original-checkout protection.", adopted.worktree.display())
     } else {
         let notice = format!(
-            "Adopted task worktree: {}. The original checkout is now read-only for this task.",
+            "Adopted task worktree: {}. The original checkout and shared config are now read-only for this task. Use git -c user.name=… -c user.email=… for per-command identity.",
             adopted.worktree.display()
         );
         session.adopt(adopted);
@@ -356,6 +357,31 @@ pub(super) async fn execute(
     };
     let candidate = candidate.map(|(candidate, source)| {
         normalized.to_mut()["command"] = source.into();
+        // #2748: Git's destination is known before execution. Feed it through
+        // the existing manifest preflight instead of waiting for kernel EACCES.
+        // An absent destination requires its existing parent, not a grant on
+        // the nonexistent child. The prompt names that real scope explicitly.
+        let destination = candidate
+            .creation_write_root()
+            .to_string_lossy()
+            .into_owned();
+        if !crate::caveats::permits_path(&caveats.fs_write, &destination) {
+            let manifest = normalized
+                .to_mut()
+                .as_object_mut()
+                .expect("command arguments");
+            let writes = manifest
+                .entry("fs_write")
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(writes) = writes.as_array_mut() {
+                if !writes
+                    .iter()
+                    .any(|value| value.as_str() == Some(&destination))
+                {
+                    writes.push(destination.into());
+                }
+            }
+        }
         candidate
     });
     let args = if candidate.is_some() {
@@ -487,3 +513,7 @@ mod round6_tests;
 #[cfg(test)]
 #[path = "../tools_tests/worktree_adoption_fullaccess.rs"]
 mod fullaccess_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tools_tests/worktree_adoption_refs.rs"]
+mod refs_tests;

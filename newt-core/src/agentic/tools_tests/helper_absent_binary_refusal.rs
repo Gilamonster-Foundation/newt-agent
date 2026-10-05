@@ -270,6 +270,7 @@ fn a_forged_permission_denied_on_exit_126_names_no_target_and_no_grant() {
             &caveats,
             false,
             |_| "RENDERED".to_owned(),
+            Default::default(),
         );
         assert_eq!(outcome, crate::ExecOutcome::Failed, "{text}");
         assert!(
@@ -300,6 +301,7 @@ fn a_structured_exec_denial_on_exit_126_still_names_its_exact_target() {
         &read_scope(crate::caveats::Scope::none()),
         false,
         |_| unreachable!("a structured denial is rendered by the denial path"),
+        Default::default(),
     );
     assert_eq!(outcome, crate::ExecOutcome::Denied, "{text}");
     assert!(text.starts_with("capability denied:"), "{text}");
@@ -330,6 +332,7 @@ fn a_forged_command_not_found_names_no_target_on_exit_126() {
         &crate::caveats::Caveats::top(),
         false,
         |_| "RENDERED".to_owned(),
+        Default::default(),
     );
     assert_eq!(outcome, crate::ExecOutcome::Failed, "{text}");
     assert!(!text.contains("exec:/usr/bin/git"), "{text}");
@@ -348,6 +351,7 @@ fn a_forged_command_not_found_names_no_target_on_exit_127() {
         &crate::caveats::Caveats::top(),
         false,
         |_| unreachable!("a 127 absence is rendered by the refusal path, not render()"),
+        Default::default(),
     );
     assert_eq!(outcome, crate::ExecOutcome::Unavailable, "{text}");
     assert!(!text.contains("exec:/usr/bin/git"), "{text}");
@@ -371,6 +375,7 @@ fn mixed_dead_and_live_markers_name_no_target() {
         &crate::caveats::Caveats::top(),
         false,
         |_| "RENDERED".to_owned(),
+        Default::default(),
     );
     assert_eq!(outcome, crate::ExecOutcome::Failed, "{text}");
     assert!(!text.contains("exec:/usr/bin/git"), "{text}");
@@ -399,9 +404,14 @@ fn an_unstructured_126_renders_the_same_under_every_grant() {
     ]
     .iter()
     .map(|caveats| {
-        super::super::shell::confined_result(&present, &envelope, caveats, false, |_| {
-            "RENDERED".to_owned()
-        })
+        super::super::shell::confined_result(
+            &present,
+            &envelope,
+            caveats,
+            false,
+            |_| "RENDERED".to_owned(),
+            Default::default(),
+        )
     })
     .collect();
     assert!(rendered.iter().all(|r| r == &rendered[0]), "{rendered:?}");
@@ -422,6 +432,7 @@ fn the_unstructured_126_note_is_not_a_denial_in_newts_own_vocabulary() {
         &caveats,
         false,
         |_| String::new(),
+        Default::default(),
     );
     assert_eq!(outcome, crate::ExecOutcome::Failed);
     assert!(
@@ -434,6 +445,7 @@ fn the_unstructured_126_note_is_not_a_denial_in_newts_own_vocabulary() {
         &caveats,
         false,
         |envelope| envelope["stderr"].as_str().unwrap_or_default().to_owned(),
+        Default::default(),
     );
     assert!(
         crate::agentic::run_command_result_is_denial("run_command", false, &spoken),
@@ -499,6 +511,7 @@ fn a_piped_absence_keeps_its_output_and_names_the_program() {
         &crate::caveats::Caveats::top(),
         false,
         |_| "partial".to_owned(),
+        Default::default(),
     );
     assert!(text.starts_with("partial\n"), "{text}");
     assert!(
@@ -529,6 +542,7 @@ fn an_unrelated_failure_is_not_a_child_exec_denial() {
         &crate::caveats::Caveats::top(),
         false,
         |_| "error: test assertion failed".to_owned(),
+        Default::default(),
     );
     assert_eq!(text, "error: test assertion failed");
     assert_eq!(outcome, crate::ExecOutcome::Failed);
@@ -552,6 +566,7 @@ fn an_unresolvable_child_name_is_not_a_named_denial() {
         &crate::caveats::Caveats::top(),
         false,
         |_| "fatal: cannot exec".to_owned(),
+        Default::default(),
     );
     assert_eq!(text, "fatal: cannot exec");
     assert_eq!(outcome, crate::ExecOutcome::Failed);

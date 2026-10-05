@@ -39,6 +39,11 @@
 //! Model commands already run under the command's filesystem/exec fence and
 //! omit that override so ordinary native diffs retain their meaning.
 
+mod branch;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod ref_namespace;
+pub(crate) use branch::create_worktree_branch;
+
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
@@ -865,7 +870,7 @@ fn advance_branch_ref_natively(
     new_oid: &str,
     message: &str,
 ) -> Result<(), String> {
-    advance_branch_ref_natively_seamed(identity, branch, old_tip, new_oid, message, &|| {})
+    advance_branch_ref_natively_seamed(identity, branch, Some(old_tip), new_oid, message, &|| {})
 }
 
 /// [`advance_branch_ref_natively`] plus a test-only seam:
@@ -879,12 +884,16 @@ fn advance_branch_ref_natively(
 fn advance_branch_ref_natively_seamed(
     identity: &BoundGitIdentity,
     branch: &str,
-    old_tip: &str,
+    old_tip: Option<&str>,
     new_oid: &str,
     message: &str,
     between_reflog_and_rename: &dyn Fn(),
 ) -> Result<(), String> {
     use std::io::Write as _;
+    let _namespace = old_tip
+        .is_none()
+        .then(|| ref_namespace::NewRefNamespace::lock(identity, branch))
+        .transpose()?;
     let ref_rel = PathBuf::from(format!("refs/heads/{branch}"));
     if let Some(parent) = ref_rel.parent().filter(|p| !p.as_os_str().is_empty()) {
         identity
@@ -903,13 +912,18 @@ fn advance_branch_ref_natively_seamed(
         reason
     };
 
+    if old_tip.is_none() {
+        if let Err(e) = ref_namespace::check(identity, branch) {
+            return Err(abort(e));
+        }
+    }
     let current = match read_ref_natively(identity, branch) {
         Ok(current) => current,
         Err(e) => return Err(abort(e)),
     };
-    if current.as_deref() != Some(old_tip) {
+    if current.as_deref() != old_tip {
         return Err(abort(format!(
-            "refused: refs/heads/{branch} is no longer at {old_tip} (now {current:?}) — \
+            "refused: refs/heads/{branch} is no longer at {old_tip:?} (now {current:?}) — \
              a concurrent mover won the race"
         )));
     }
@@ -924,7 +938,13 @@ fn advance_branch_ref_natively_seamed(
         )));
     }
 
-    if let Err(e) = append_reflog_natively(identity, branch, old_tip, new_oid, message) {
+    if let Err(e) = append_reflog_natively(
+        identity,
+        branch,
+        old_tip.unwrap_or(&"0".repeat(new_oid.len())),
+        new_oid,
+        message,
+    ) {
         return Err(abort(e));
     }
 
@@ -957,7 +977,10 @@ fn read_ref_natively(identity: &BoundGitIdentity, branch: &str) -> Result<Option
             file.read_to_string(&mut text)
                 .map_err(|e| format!("refused: cannot read refs/heads/{branch} ({e})"))?;
             let oid = text.trim();
-            Ok((!oid.is_empty()).then(|| oid.to_string()))
+            if !crate::git_staging::is_hex_oid(oid) || oid.bytes().all(|b| b == b'0') {
+                return Err(format!("refused: invalid loose refs/heads/{branch}"));
+            }
+            Ok(Some(oid.to_owned()))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => read_packed_ref_natively(identity, branch),
         Err(e) => Err(format!("refused: cannot read refs/heads/{branch} ({e})")),
@@ -971,20 +994,31 @@ fn read_packed_ref_natively(
     identity: &BoundGitIdentity,
     branch: &str,
 ) -> Result<Option<String>, String> {
-    use std::io::Read as _;
     let suffix = format!(" refs/heads/{branch}");
+    let text = read_packed_refs_natively(identity)?;
+    let oid = text
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
+        .find_map(|line| line.strip_suffix(&suffix));
+    match oid {
+        Some(oid) if !crate::git_staging::is_hex_oid(oid) || oid.bytes().all(|b| b == b'0') => {
+            Err(format!("refused: invalid packed refs/heads/{branch}"))
+        }
+        _ => Ok(oid.map(str::to_owned)),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_packed_refs_natively(identity: &BoundGitIdentity) -> Result<String, String> {
+    use std::io::Read as _;
     match identity.common_root.open_read(Path::new("packed-refs")) {
         Ok(mut file) => {
             let mut text = String::new();
             file.read_to_string(&mut text)
                 .map_err(|e| format!("refused: cannot read packed-refs ({e})"))?;
-            Ok(text
-                .lines()
-                .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
-                .find_map(|line| line.strip_suffix(&suffix))
-                .map(str::to_owned))
+            Ok(text)
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(format!("refused: cannot read packed-refs ({e})")),
     }
 }
@@ -2011,6 +2045,7 @@ mod subdir_discovery_tests {
 /// inline rather than being split into the weekly suite.
 #[cfg(all(test, unix))]
 mod own_gitdir_grant_tests {
+    include!("git_hardening/branch_tests.rs");
     use super::*;
     use std::process::Command;
 
@@ -3260,7 +3295,7 @@ mod own_gitdir_grant_tests {
         let refusal = advance_branch_ref_natively_seamed(
             &identity,
             &branch,
-            &old_tip,
+            Some(&old_tip),
             &new_oid,
             "commit: task work",
             &force_rename_failure,

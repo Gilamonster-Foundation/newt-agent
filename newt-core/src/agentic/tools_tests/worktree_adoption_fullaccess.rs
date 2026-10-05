@@ -167,7 +167,11 @@ fn adoption_2750_decision_keeps_confined_protection() {
             bypass
         );
         assert_eq!(
-            notice.contains("original checkout is now read-only"),
+            notice.contains("original checkout and shared config are now read-only"),
+            !bypass
+        );
+        assert_eq!(
+            notice.contains("git -c user.name=… -c user.email=…"),
             !bypass
         );
     }

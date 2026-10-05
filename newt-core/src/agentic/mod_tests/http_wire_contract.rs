@@ -555,3 +555,17 @@ async fn openai_chat_output_allowance_is_sent_without_a_cognition_dial() {
         assert_eq!(capped, unset, "only `max_tokens` may differ");
     }
 }
+
+/// #2747: a neighboring turn's one-second budget must not change this catalog.
+/// Repeats the actual wire assertion beside the real timeout verification fixture.
+#[cfg(unix)]
+#[test]
+fn command_budget_2747_concurrent_wire_contract() {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(super::verification_outcomes::every_verification_case_ends_within_its_allowance);
+        for _ in 0..30 {
+            openai_chat_output_allowance_varies_only_the_cap_field();
+        }
+    });
+}

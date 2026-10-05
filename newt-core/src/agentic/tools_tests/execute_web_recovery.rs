@@ -429,7 +429,20 @@ fn merged_model_catalog_scrubs_affinity_but_recovery_catalog_retains_it() {
     );
 
     let model_catalog = merged_tool_definitions(
-        &mcp, false, false, false, None, false, false, false, false, false, false, false, false,
+        &mcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     let remote = model_catalog
         .as_array()

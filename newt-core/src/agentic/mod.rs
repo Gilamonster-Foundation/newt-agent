@@ -932,6 +932,8 @@ impl Drop for CompletedSpillDismissGuard<'_> {
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
 pub struct ChatCtx<'a> {
+    /// Captured session budget shared by tool schemas and execution.
+    pub command_budget: crate::RunCommandBudget,
     /// Optional accounted projection and auxiliary completion adjudication.
     pub smart_harness: Option<&'a smart_harness::SmartHarness>,
     pub url: &'a str,
@@ -1946,6 +1948,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .await;
     }
     let ChatCtx {
+        command_budget,
         verify_outcomes,
         smart_harness,
         url,
@@ -2212,6 +2215,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         advertise_operating_mode,
         advertise_plan_mode,
         advertise_plan_mode_active,
+        command_budget,
     );
     // Put the persona's preferred tools first without removing other tools.
     // Dispatch separately checks explicit permissions and delegation authority.
@@ -4009,6 +4013,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        command_budget,
                         read_history: Some(&mut read_history),
                         default_command_cwd,
                         worktree_session,
@@ -6829,6 +6834,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        command_budget,
         verify_outcomes,
         smart_harness,
         url,
@@ -7114,6 +7120,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         advertise_operating_mode,
         advertise_plan_mode,
         advertise_plan_mode_active,
+        command_budget,
     );
     // Put the persona's preferred tools first without removing other tools.
     // Dispatch separately checks explicit permissions and delegation authority.
@@ -8924,6 +8931,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        command_budget,
                         read_history: Some(&mut read_history),
                         default_command_cwd,
                         worktree_session,
@@ -9580,6 +9588,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        command_budget,
         verify_outcomes,
         smart_harness,
         url,
@@ -9884,6 +9893,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         advertise_operating_mode,
         advertise_plan_mode,
         advertise_plan_mode_active,
+        command_budget,
     );
     let tools = filter_advertised_tools(tools, persona_tools);
     let tools = filter_tools_for_disposition(
@@ -11448,6 +11458,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        command_budget,
                         read_history: Some(&mut read_history),
                         default_command_cwd,
                         worktree_session,
@@ -11990,6 +12001,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        command_budget,
         verify_outcomes,
         smart_harness,
         url,
@@ -12192,6 +12204,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         advertise_operating_mode,
         advertise_plan_mode,
         advertise_plan_mode_active,
+        command_budget,
     );
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona
     // (Responses wire). No-op when `persona_tools` is `None`.
@@ -13179,6 +13192,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        command_budget,
                         read_history: Some(&mut read_history),
                         default_command_cwd,
                         worktree_session,
@@ -13881,8 +13895,20 @@ mod cap_exit_unit_tests;
 pub(crate) fn builtin_catalog_tokens(disposition: PromptDisposition) -> usize {
     let tools = filter_tools_for_disposition(
         merged_tool_definitions(
-            &NoMcp, false, false, false, None, false, false, false, false, false, false, false,
+            &NoMcp,
             false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Default::default(),
         ),
         disposition,
     );

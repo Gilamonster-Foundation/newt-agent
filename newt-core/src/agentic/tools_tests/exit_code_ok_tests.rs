@@ -211,7 +211,7 @@ fn confined_with(
     envelope: serde_json::Value,
     caveats: &crate::caveats::Caveats,
 ) -> (String, ExecOutcome) {
-    super::shell::confined_result(cmd, &envelope, caveats, false, render)
+    super::shell::confined_result(cmd, &envelope, caveats, false, render, Default::default())
 }
 
 fn confined(cmd: &str, envelope: serde_json::Value) -> (String, ExecOutcome) {
