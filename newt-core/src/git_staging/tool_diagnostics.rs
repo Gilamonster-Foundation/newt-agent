@@ -1,11 +1,15 @@
 //! Operator preflight for the same tool-path policy enforced by staging.
 use super::*;
+#[cfg(unix)]
+mod repair;
 
 /// Ephemeral diagnostic output; never grants authority to a broker call.
 #[derive(Default)]
 pub struct ToolTrustReport {
     pub lines: Vec<String>,
     pub hints: Vec<TrustHint>,
+    #[cfg(unix)]
+    repairs: std::collections::BTreeMap<PathBuf, Result<repair::BoundRepair, String>>,
 }
 
 impl ToolTrustReport {
@@ -20,6 +24,15 @@ impl ToolTrustReport {
                     .push(format!("{}: writable tool path", path.display()));
                 for hint in hints {
                     if !self.hints.contains(&hint) {
+                        let bound = repair::BoundRepair::capture(&hint, &repair::Host)
+                            .map_err(|e| format!("{e}; re-run `newt doctor`"));
+                        if let Err(error) = &bound {
+                            self.lines.push(format!(
+                                "Automatic repair unavailable for {}: {error}",
+                                hint.path.display()
+                            ));
+                        }
+                        self.repairs.insert(hint.path.clone(), bound);
                         self.lines.push(hint.render());
                         self.hints.push(hint);
                     }
@@ -32,7 +45,27 @@ impl ToolTrustReport {
     /// Apply only the displayed write-bit removals, after explicit consent.
     /// An absent operator, blank answer, or generic setup `--yes` is not consent.
     pub fn repair(&self, consent: bool) -> Vec<String> {
-        self.repair_with(consent, repair_one)
+        self.repair_with(consent, |hint| {
+            #[cfg(unix)]
+            {
+                let bound = self
+                    .repairs
+                    .get(&hint.path)
+                    .ok_or_else(|| {
+                        std::io::Error::other("no diagnosed object; re-run `newt doctor`")
+                    })?
+                    .as_ref()
+                    .map_err(|e| std::io::Error::other(e.clone()))?;
+                bound.apply(hint, &repair::Host)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = hint;
+                Err(std::io::Error::other(
+                    "Unix tool permissions are unsupported on this platform",
+                ))
+            }
+        })
     }
 
     fn repair_with(
@@ -46,36 +79,14 @@ impl ToolTrustReport {
         self.hints
             .iter()
             .map(|h| match repair(h) {
-                Ok(()) => format!("Applied: {}", h.render()),
-                Err(e) => format!("Could not repair {}: {e}; {}", h.path.display(), h.render()),
+                Ok(()) => format!("Repaired tool permissions: {}", h.path.display()),
+                Err(e) => format!(
+                    "Could not repair {}: {e}; re-run `newt doctor`",
+                    h.path.display()
+                ),
             })
             .collect()
     }
-}
-
-#[cfg(unix)]
-fn repair_one(hint: &TrustHint) -> std::io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    // Hold the object while changing its mode; never follow a substituted final symlink.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&hint.path)?;
-    let mut permissions = file.metadata()?.permissions();
-    let remove = match hint.chmod_arg {
-        "g-w" => 0o020,
-        "o-w" => 0o002,
-        _ => 0o022,
-    };
-    permissions.set_mode(permissions.mode() & !remove);
-    file.set_permissions(permissions)
-}
-
-#[cfg(not(unix))]
-fn repair_one(_: &TrustHint) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "Unix tool permissions are unsupported on this platform",
-    ))
 }
 
 /// Check PATH tools and configured credential helpers without executing any helper.
@@ -270,6 +281,7 @@ mod tests {
                 mode: 0o775,
                 chmod_arg: "g-w",
             }],
+            ..Default::default()
         };
         let mut calls = 0;
         report.repair_with(false, |_| {
