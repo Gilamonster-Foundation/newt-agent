@@ -123,6 +123,52 @@ pub(crate) struct Creation {
     protected_branch: Option<String>,
 }
 impl Creation {
+    /// Optional pre-creation observation: do not count a new nested worktree as
+    /// an untracked change. Status failure is unknown, never evidence of clean.
+    pub(crate) fn uncommitted_changes(&self, caveats: &Caveats) -> Option<usize> {
+        use crate::confined_exec::{ConstrainedExecutor, ExecOrigin, ExecRequest};
+        let command = crate::git_hardening::metadata_git(
+            &self.original,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+            ],
+            &self.read,
+        )
+        .ok()?;
+        // Reuse Git's hardened metadata environment and the existing confined
+        // broker probe. Repository filters must not gain writes or networking.
+        let request = ExecRequest::new(
+            ExecOrigin::BrokerMediated,
+            command.get_program().to_str()?,
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+            &self.original,
+            Caveats {
+                fs_write: Scope::none(),
+                net: Scope::none(),
+                ..caveats.clone()
+            },
+        )
+        .envs(command.get_envs().filter_map(|(key, value)| {
+            Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned()))
+        }))
+        .timeout(std::time::Duration::from_secs(5));
+        let output = ConstrainedExecutor::run(&request).ok()?;
+        // --no-renames guarantees one NUL-delimited status entry per path,
+        // including staged/unstaged combinations and filenames with newlines.
+        output.success.then(|| {
+            output
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .count()
+        })
+    }
     /// Creating an absent directory needs write authority on its existing
     /// parent. A kernel grant naming the absent child alone cannot create it.
     pub(crate) fn creation_write_root(&self) -> &Path {

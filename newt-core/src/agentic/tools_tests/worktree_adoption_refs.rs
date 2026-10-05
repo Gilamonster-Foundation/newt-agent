@@ -311,3 +311,178 @@ async fn adoption_refs_approved_external_destination_is_adopted() {
         );
     }
 }
+
+/// #2753: refusing a compound must teach creation in the worktree, rather than
+/// splitting checkout -b into a mutation of the original checkout first.
+#[tokio::test]
+async fn worktree_notice_compound_refusal_teaches_standalone_b_form() {
+    let _env = crate::process_env::lock();
+    let temp = tempfile::tempdir().unwrap();
+    let session = WorktreeSession::default();
+    let (text, outcome) = run(
+        "git checkout -b step-x && git worktree add task step-x",
+        temp.path(),
+        temp.path(),
+        &Caveats::top(),
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Denied), "{text}");
+    assert!(
+        text.contains("git worktree add -b <new-branch> <path> [<start>]"),
+        "{text}"
+    );
+    assert!(text.contains("standalone"), "{text}");
+    assert!(
+        text.contains("Do not create the branch in the original checkout first"),
+        "{text}"
+    );
+    assert!(session.snapshot().is_none());
+}
+
+/// #2753: ground the recovery notice in Git's actual checked-out-branch error
+/// through the same dispatch that would otherwise adopt a successful worktree.
+#[tokio::test]
+async fn worktree_notice_already_used_branch_gets_recovery_hint() {
+    let _env = crate::process_env::lock();
+    let _engine =
+        crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
+    assert!(crate::confined_exec::kernel_fs_fence_available());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    git(root, root, &["init", "-q", "-b", "original"]);
+    git(
+        root,
+        root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "seed",
+        ],
+    );
+    git(root, root, &["checkout", "-b", "step-x"]);
+    let head = std::fs::read(root.join(".git/HEAD")).unwrap();
+    let session = WorktreeSession::default();
+    let mut caveats = Caveats::top();
+    caveats.net = Scope::none();
+    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    let (text, outcome) = run(
+        "git worktree add task step-x",
+        root,
+        root,
+        &caveats,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Failed), "{text}");
+    assert!(
+        text.contains("is already used by worktree at"),
+        "expected real Git error: {text}"
+    );
+    assert!(
+        text.contains("git switch -"),
+        "missing recovery hint: {text}"
+    );
+    assert!(text.contains("new branch name"), "{text}");
+    assert!(
+        text.contains("git worktree add -b <new-branch> <path> [<start>]"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
+    assert!(session.snapshot().is_none());
+    assert!(!root.join("task").exists());
+
+    let (text, outcome) = run(
+        "git worktree add -b fresh task missing-start",
+        root,
+        root,
+        &caveats,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Failed), "{text}");
+    assert!(
+        !text.contains("git switch -"),
+        "unrelated error must not get recovery advice: {text}"
+    );
+    assert!(session.snapshot().is_none());
+
+    let (text, outcome) = run(
+        "git worktree add -b fresh task HEAD",
+        root,
+        root,
+        &caveats,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
+    assert!(
+        !text.contains("git switch -"),
+        "success must not get recovery advice: {text}"
+    );
+    assert!(!text.contains("uncommitted"), "clean original: {text}");
+    assert!(session.snapshot().is_some());
+    assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
+}
+
+/// #2753 addendum: adopting a throwaway check worktree must disclose the edits
+/// it freezes. Count pre-creation status, not the new nested worktree itself.
+#[tokio::test]
+async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
+    let _env = crate::process_env::lock();
+    let _engine =
+        crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
+    assert!(crate::confined_exec::kernel_fs_fence_available());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    git(root, root, &["init", "-q", "-b", "original"]);
+    std::fs::write(root.join("tracked"), "seed").unwrap();
+    git(root, root, &["add", "tracked"]);
+    git(
+        root,
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "seed"],
+    );
+    std::fs::write(root.join("tracked"), "unstaged work").unwrap();
+    std::fs::write(root.join("staged"), "staged work").unwrap();
+    git(root, root, &["add", "staged"]);
+    std::fs::write(root.join("untracked\nfile"), "untracked work").unwrap();
+    let snapshots: Vec<_> = [
+        "tracked",
+        "staged",
+        "untracked\nfile",
+        ".git/index",
+        ".git/HEAD",
+    ]
+    .iter()
+    .map(|p| (root.join(p), std::fs::read(root.join(p)).unwrap()))
+    .collect();
+    let session = WorktreeSession::default();
+    let mut caveats = Caveats::top();
+    caveats.exec = Scope::only(["git".to_owned()]);
+    caveats.net = Scope::none();
+    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    let (text, outcome) = run(
+        "git worktree add --detach .main-check-main HEAD",
+        root,
+        root,
+        &caveats,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
+    assert!(
+        text.contains("original has 3 uncommitted changes, now read-only"),
+        "{text}"
+    );
+    assert!(text.contains("new worktree"), "{text}");
+    assert!(text.contains("/permissions worktree-lift"), "{text}");
+    let policy = session.snapshot().expect("adoption still arms");
+    for (path, contents) in snapshots {
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        assert!(policy.blocked(&path));
+    }
+}

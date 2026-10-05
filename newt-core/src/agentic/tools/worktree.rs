@@ -328,7 +328,7 @@ pub(super) async fn execute(
         if let Some(slot) = collab.execution {
             let _ = slot.set(crate::ExecOutcome::Denied);
         }
-        return "capability denied: cannot verify this worktree creation and its surrounding commands; run git worktree add as a standalone literal command in the original checkout so it can become read-only before other mutations run".into();
+        return "capability denied: cannot verify this worktree creation and its surrounding commands; run `git worktree add -b <new-branch> <path> [<start>]` as a standalone literal command in the original checkout. Do not create the branch in the original checkout first; -b creates it for the new worktree".into();
     };
     let candidate = candidate.map(|(candidate, source)| {
         normalized.to_mut()["command"] = source.into();
@@ -359,6 +359,9 @@ pub(super) async fn execute(
         }
         candidate
     });
+    let original_changes = candidate
+        .as_ref()
+        .and_then(|c| c.uncommitted_changes(caveats));
     let args = if candidate.is_some() {
         normalized.as_ref()
     } else {
@@ -433,6 +436,12 @@ pub(super) async fn execute(
         )
         .await
     };
+    if candidate.is_some()
+        && execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Failed)
+        && result.contains("is already used by worktree at")
+    {
+        result.push_str("\nWorktree hint: if you just created the branch in the original checkout, switch that checkout back with `git switch -`. To create a new task branch, pick a new branch name and run `git worktree add -b <new-branch> <path> [<start>]` as a standalone command.");
+    }
     if let (Some(session), Some(candidate)) = (session, candidate) {
         if matches!(
             execution.and_then(|slot| slot.get()),
@@ -443,6 +452,11 @@ pub(super) async fn execute(
                 // Git dispatch; never replace an identity another call pinned.
                 let _ = crate::git_hardening::ambient_gitdir_write_grant(&adopted.worktree);
                 result.push_str(&format!("\nAdopted task worktree: {}. The original checkout and shared config are now read-only for this task. Use git -c user.name=… -c user.email=… for per-command identity.", adopted.worktree.display()));
+                match original_changes {
+                    Some(0) => {}
+                    Some(count) => result.push_str(&format!("\nThe original has {count} uncommitted changes, now read-only. Copy them into the new worktree and commit there, or ask the operator to /permissions worktree-lift.")),
+                    None => result.push_str("\nOriginal uncommitted changes could not be counted; any existing changes are now read-only. Copy needed changes into the new worktree and commit there, or ask the operator to /permissions worktree-lift."),
+                }
                 session.adopt(adopted);
             }
         }
