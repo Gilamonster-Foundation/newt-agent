@@ -4974,7 +4974,7 @@ async fn execute_authorized_tool(
                         artifacts.push_str(&record_governed_file_change(artifact_sink, artifact_context, label, "write_file",
                             Some(before), super::artifact_hooks::ArtifactFileState::from_bytes(after.as_bytes()), color, tool_output_lines));
                     }
-                    return format!("Moved functions from {} into {}; confined cargo check --lib exited 0. Parent: {} lines; child: {} lines.{}",
+                    return format!("Moved functions from {} into {}; confined cargo check --lib exited 0. Parent: {} lines; child: {} lines. Displaced entries retained as .newt-move-*.saved beside changed files; inspect before removing.{}",
                         file_capture::display_text(&moved.source), file_capture::display_text(path),
                         moved.parent.lines().count(), moved.child.lines().count(), artifacts);
                 }
