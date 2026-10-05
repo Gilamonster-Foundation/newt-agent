@@ -139,6 +139,7 @@ fn openai_loop_recovers_from_context_window_400() {
                     task: "do the thing",
                     workspace: ".",
                     default_command_cwd: None,
+                    worktree_session: None,
                     color: false,
                     markdown: false,
                     tool_offload: false,
