@@ -99,7 +99,13 @@ pub(super) async fn fetch_locked_dependencies(
     if let Some(refusal) = fetch_refusal(root, cwd, read) {
         return Err(refusal.to_owned());
     }
-    let network = fetch_network_scope(cwd, caveats, permission_gate)?;
+    let network = fetch_network_scope_for_platform(
+        root,
+        cwd,
+        caveats,
+        permission_gate,
+        cfg!(target_os = "macos"),
+    )?;
     match ConstrainedExecutor::run_async(
         dependency_fetch_request(root, cwd, &network).timeout(FETCH_TIMEOUT),
     )
@@ -117,11 +123,33 @@ pub(super) async fn fetch_locked_dependencies(
 }
 
 /// Resolve the authority carried by the fetch request before spawning cargo.
-fn fetch_network_scope(
+fn fetch_network_scope_for_platform(
+    root: &Path,
     cwd: &Path,
     caveats: &Caveats,
     permission_gate: &mut Option<&mut dyn PermissionGate>,
+    macos: bool,
 ) -> Result<crate::Scope<String>, String> {
+    if macos && caveats.net != crate::Scope::All {
+        let request = dependency_fetch_request(root, cwd, &crate::Scope::All);
+        let permission = PermissionRequest {
+            tool: "lifecycle".into(),
+            kind: DenialKind::Net,
+            target: "all destinations for one cargo fetch --locked".into(),
+            reason: format!(
+                "Fetch the crates Cargo.lock pins in {} using the fixed `cargo fetch --locked`. macOS cannot enforce a crates.io host allowlist: this ONE fetch needs unrestricted network egress. Cargo.lock sources/checksums are checked; only the cache and confined workspace are writable. No compilation or build scripts. This does NOT grant network access to builds or the session.",
+                cwd.display(),
+            ),
+            harness_bound: true,
+        };
+        let gate = permission_gate.as_deref_mut().ok_or_else(|| {
+            "no operator is present to approve operation-scoped dependency-fetch egress".to_owned()
+        })?;
+        return match gate.ask_dependency_fetch(request.caveats(), &permission) {
+            PermissionDecision::Allow(granted) if request.caveats().leq(&granted) => Ok(crate::Scope::All),
+            _ => Err("the operator declined operation-scoped dependency-fetch egress or its authority ceiling forbids it".into()),
+        };
+    }
     let ungranted: Vec<&str> = CRATES_IO_FETCH_HOSTS
         .iter()
         .copied()
@@ -297,6 +325,78 @@ checksum = "00"
         }
     }
 
+    struct FetchApproval {
+        allow: bool,
+        calls: usize,
+    }
+    impl PermissionGate for FetchApproval {
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            panic!("#2731 macOS must ask for the exact fetch, not host grants")
+        }
+        fn ask_dependency_fetch(
+            &mut self,
+            prepared: &Caveats,
+            request: &PermissionRequest,
+        ) -> PermissionDecision {
+            self.calls += 1;
+            assert_eq!(request.tool, "lifecycle");
+            assert_eq!(request.kind, DenialKind::Net);
+            assert!(request.reason.contains("unrestricted"));
+            assert!(request.reason.contains("cargo fetch --locked"));
+            if self.allow {
+                PermissionDecision::Allow(prepared.clone())
+            } else {
+                PermissionDecision::Deny
+            }
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+    }
+
+    /// #2731: approving a default-permission Mac fetch must produce a runnable
+    /// operation fence without replacing the invocation's host-only authority.
+    #[test]
+    fn macos_fetch_approval_is_operation_scoped() {
+        let invocation = no_net();
+        let before = invocation.clone();
+        let mut gate = FetchApproval {
+            allow: true,
+            calls: 0,
+        };
+        let mut slot: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let network = fetch_network_scope_for_platform(
+            Path::new("/ws"),
+            Path::new("/ws/sub"),
+            &invocation,
+            &mut slot,
+            true,
+        )
+        .unwrap();
+        assert_eq!(network, crate::Scope::All);
+        assert_eq!(invocation, before);
+        assert_eq!(gate.calls, 1);
+    }
+
+    /// #2731: declining the explicit operation approval never reaches fetch.
+    #[test]
+    fn macos_fetch_denial_does_not_fall_back_to_host_grants() {
+        let mut gate = FetchApproval {
+            allow: false,
+            calls: 0,
+        };
+        let mut slot: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        assert!(fetch_network_scope_for_platform(
+            Path::new("/ws"),
+            Path::new("/ws"),
+            &no_net(),
+            &mut slot,
+            true
+        )
+        .is_err());
+        assert_eq!(gate.calls, 1);
+    }
+
     fn no_net() -> Caveats {
         crate::confined_exec::build_tool_caveats(Path::new("/ws"))
     }
@@ -313,7 +413,14 @@ checksum = "00"
         ]);
         let mut gate = Answer(true, 0);
         let mut slot: Option<&mut dyn PermissionGate> = Some(&mut gate);
-        let network = fetch_network_scope(Path::new("/ws"), &invocation, &mut slot).unwrap();
+        let network = fetch_network_scope_for_platform(
+            Path::new("/ws"),
+            Path::new("/ws"),
+            &invocation,
+            &mut slot,
+            false,
+        )
+        .unwrap();
         let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws"), &network);
         assert_eq!(
             request.caveats().net,
@@ -330,7 +437,14 @@ checksum = "00"
         invocation.net = crate::Scope::All;
         let mut gate = Answer(false, 0);
         let mut slot: Option<&mut dyn PermissionGate> = Some(&mut gate);
-        let network = fetch_network_scope(Path::new("/ws"), &invocation, &mut slot).unwrap();
+        let network = fetch_network_scope_for_platform(
+            Path::new("/ws"),
+            Path::new("/ws"),
+            &invocation,
+            &mut slot,
+            false,
+        )
+        .unwrap();
         let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws"), &network);
         assert_eq!(request.caveats().net, crate::Scope::All);
         assert_eq!(gate.1, 0);
@@ -351,9 +465,9 @@ checksum = "00"
         .await;
         assert_eq!(
             result,
-            Err("the operator declined network access to crates.io".into())
+            Err(if cfg!(target_os = "macos") { "the operator declined operation-scoped dependency-fetch egress or its authority ceiling forbids it" } else { "the operator declined network access to crates.io" }.into())
         );
-        assert_eq!(gate.1, 1);
+        assert_eq!(gate.1, usize::from(!cfg!(target_os = "macos")));
     }
 
     #[tokio::test]
@@ -399,5 +513,87 @@ checksum = "00"
         assert!(note.contains("Request the needed permission or report the setup failure"));
         assert!(!note.contains("Nothing run from inside the sandbox can fix this"));
         assert!(!note.contains("Stop and tell the operator"));
+    }
+    /// #2731 real-resource proof of the mocked approval contract: Seatbelt
+    /// admits the approved fixed fetch, fills a missing crate archive, and an
+    /// offline Cargo check then succeeds. Run the compiled test binary with a
+    /// disposable CARGO_HOME containing only a copied public registry index.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "native macOS, explicit scratch CARGO_HOME, crates.io downloads"]
+    async fn native_macos_cold_cache_fetch_and_offline_rebuild() {
+        let cache = std::env::var("CARGO_HOME").expect("isolated CARGO_HOME");
+        assert_eq!(std::env::var("NEWT_COLD_CACHE_PROOF").unwrap(), cache);
+        assert!(Path::new(&cache).is_absolute());
+        assert!(!Path::new(&cache).join("registry/cache").exists());
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn value() -> String { itoa::Buffer::new().format(42).to_owned() }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"fetch-proof\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nitoa=\"=1.0.18\"\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            r#"version = 4
+[[package]]
+name = "fetch-proof"
+version = "0.1.0"
+dependencies = ["itoa"]
+[[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+"#,
+        )
+        .unwrap();
+        let invocation = crate::confined_exec::build_tool_caveats(&root);
+        let build = crate::confined_exec::build_tool_request(
+            &root,
+            &root,
+            "cargo",
+            ["check", "--locked", "--offline"],
+            &invocation.net,
+        )
+        .timeout(std::time::Duration::from_secs(90));
+        let before = ConstrainedExecutor::run_async(build.clone()).await.unwrap();
+        assert!(!before.success);
+        assert!(
+            needs_dependency_fetch(&before.stderr),
+            "{}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+        let mut denied = FetchApproval {
+            allow: false,
+            calls: 0,
+        };
+        let mut slot: Option<&mut dyn PermissionGate> = Some(&mut denied);
+        assert!(
+            fetch_locked_dependencies(&root, &root, &invocation, &mut slot, |p| {
+                std::fs::read_to_string(p).ok()
+            })
+            .await
+            .is_err()
+        );
+        assert!(!Path::new(&cache).join("registry/cache").exists());
+        let mut approved = FetchApproval {
+            allow: true,
+            calls: 0,
+        };
+        let mut slot: Option<&mut dyn PermissionGate> = Some(&mut approved);
+        fetch_locked_dependencies(&root, &root, &invocation, &mut slot, |p| {
+            std::fs::read_to_string(p).ok()
+        })
+        .await
+        .expect("approved fetch must actually spawn and download");
+        let after = ConstrainedExecutor::run_async(build).await.unwrap();
+        assert!(after.success, "{}", String::from_utf8_lossy(&after.stderr));
+        assert_eq!(approved.calls, 1);
+        assert_eq!(denied.calls, 1);
+        assert_eq!(invocation.net, crate::Scope::none());
+        println!("cold offline check failed; denied fetch wrote no archives; approved locked fetch downloaded itoa; offline rebuild passed; session net unchanged");
     }
 }
