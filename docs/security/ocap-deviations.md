@@ -1143,18 +1143,21 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Practical caveat (now):** when the offline build lane fails because the Cargo cache lacks a crate
   `Cargo.lock` pins, the harness runs `cargo fetch --locked` (`dependency_fetch_request`,
   `newt-core/src/confined_exec.rs`) with the existing operator network grant. An explicit `All` grant
-  remains `All`; otherwise fetch is narrowed to `index.crates.io, static.crates.io` after approval.
-  A fresh approval must remain bounded by the invocation and the requested hosts, even if the session's
-  base authority is broader. The `TrustedInfra` label does not bypass platform admission: current Bridle
-  refuses restricted networking on macOS before spawn. On backends that admit the host list without a
-  kernel destination boundary, the network residual remains open. Its fs fence stays kernel-enforced: reads are the
+  remains `All`. On macOS, #2731 asks explicitly for unrestricted egress for this ONE fixed fetch,
+  because Seatbelt cannot enforce the crates.io host list. The prepared fence is checked against frame,
+  delegation and preset ceilings; host/session/durable approvals cannot pre-answer it. Only a fresh
+  allow-once authorizes this operation, without changing session or build authority. Gates that do not
+  implement this approval fail closed. Other platforms retain the approved `index.crates.io,
+  static.crates.io` scope. The `TrustedInfra` label never bypasses platform admission.
+  The network residual remains open. Its fs fence stays kernel-enforced: reads are the
   calibrated toolchain set (no `credentials.toml`), writes are the workspace plus `$CARGO_HOME/registry` and
   cargo's package-cache lock files.
 - **Residual:** 🟠 ACTIVE while a fetch runs. The child is the operator's `cargo`, its argv is fixed, it compiles
   nothing and runs no build script, and `--locked` binds each download to a lockfile checksum. The repository
   still steers it through `Cargo.lock` and `.cargo/config`, which is why both are screened below.
-- **Disabled while open:** the fetch without the operator's `net` grant for both crates.io hosts
-  (`fetch_locked_dependencies`, `OCAP-GATE: dependency-fetch-egress`); it fails closed with no operator present.
+- **Disabled while open:** the fetch without the operator's applicable network grant: both crates.io hosts,
+  existing unrestricted authority, or the explicit macOS operation-only egress approval
+  (`fetch_locked_dependencies`, `OCAP-GATE: dependency-fetch-egress`). No operator means no new grant.
 - **Compensating controls:** refused when any `Cargo.lock` package names a source other than crates.io (a git
   or alternate registry could receive a credential or steer the fetch), and when a repository `.cargo/config`
   sits between the build directory and the workspace root (it can replace the crates.io source or name a
