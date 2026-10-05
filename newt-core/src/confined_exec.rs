@@ -1146,8 +1146,8 @@ pub fn workspace_confined_caveats(workspace: &Path) -> Caveats {
 /// compiler-cache authority are inherited. Cargo build scripts and tests inherit
 /// the same kernel fence as the compiler.
 /// `network` is the caller's existing operator-granted scope, never authority
-/// acquired by approving a build. Restricted scopes remain subject to Bridle's
-/// admission checks; an unsupported host boundary is refused, not widened.
+/// acquired by approving a build. Host lists narrow to deny-all for the child,
+/// just as in ordinary dispatch; the caller's session authority is unchanged.
 #[must_use]
 pub fn build_tool_request(
     workspace: &Path,
@@ -1157,7 +1157,12 @@ pub fn build_tool_request(
     network: &Scope<String>,
 ) -> ExecRequest {
     let mut caveats = build_tool_caveats(workspace);
-    caveats.net = network.clone();
+    caveats.net = crate::caveats::spawn_net_scope(network);
+    let net_grant = if caveats.net == Scope::none() {
+        NetGrant::DenyAll
+    } else {
+        NetGrant::Unrestricted
+    };
     toolchain_request(
         ExecOrigin::AgentInfluenced,
         workspace,
@@ -1166,11 +1171,7 @@ pub fn build_tool_request(
         args,
         caveats,
     )
-    .net_grant(if network == &Scope::none() {
-        NetGrant::DenyAll
-    } else {
-        NetGrant::Unrestricted
-    })
+    .net_grant(net_grant)
     .env("CARGO_NET_OFFLINE", "true")
 }
 
@@ -1433,7 +1434,7 @@ fn selected_macos_sdk() -> Option<String> {
 ///
 /// Writes cover the workspace and its private build scratch partition, never
 /// the shared cache or shared temporary parent. The baseline denies networking;
-/// build requests retain the caller's separately authorized network scope.
+/// build requests narrow the caller's network scope using ordinary spawn policy.
 /// Descendants inherit the same filesystem fence.
 #[must_use]
 pub fn build_tool_caveats(workspace: &Path) -> Caveats {
@@ -1911,24 +1912,25 @@ mod tests {
     }
 
     #[test]
-    fn build_network_authority_preserves_granted_scope_and_filesystem_fence() {
+    fn build_network_authority_narrows_hosts_and_preserves_filesystem_fence() {
         let _env = crate::process_env::lock();
         let ws = Path::new("/ws");
         let baseline = build_tool_caveats(ws);
-        for network in [
-            Scope::none(),
-            Scope::only(["example.test".into()]),
-            Scope::All,
+        // #2729: derive the native grant from the effective child scope.
+        for (network, expected) in [
+            (Scope::none(), Scope::none()),
+            (Scope::only(["example.test".into()]), Scope::none()),
+            (Scope::All, Scope::All),
         ] {
             let request = build_tool_request(ws, ws, "cargo", ["test"], &network);
-            assert_eq!(request.caveats.net, network);
+            assert_eq!(request.caveats.net, expected);
             assert_eq!(request.caveats.fs_read, baseline.fs_read);
             assert_eq!(request.caveats.fs_write, baseline.fs_write);
             assert_eq!(request.caveats.exec, baseline.exec);
             assert_eq!(request.origin, ExecOrigin::AgentInfluenced);
             assert_eq!(
                 request.net_grant,
-                if network == Scope::none() {
+                if expected == Scope::none() {
                     NetGrant::DenyAll
                 } else {
                     NetGrant::Unrestricted

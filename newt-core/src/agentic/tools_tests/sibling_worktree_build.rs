@@ -208,3 +208,31 @@ async fn relative_grant_does_not_authorize_a_sibling_build() {
         assert!(gate.0.is_empty());
     }
 }
+
+/// #2729: host-scoped session authority must narrow before Build admission on
+/// both routes, without modifying the session or bypassing a denied Build gate.
+async fn host_scoped_build_child_narrows_network(shell_route: bool) {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let mut session = grants(&root);
+    session.net = Scope::only(["example.com:443".to_owned()]);
+    let original = session.clone();
+    let mut gate = BuildGate::default();
+    let (text, outcome) = build(shell_route, &root, &root, &session, &mut gate).await;
+    assert_eq!(gate.0.len(), 1, "route={shell_route}: {text}");
+    assert_eq!(gate.0[0].0.net, Scope::none(), "route={shell_route}");
+    assert_eq!(outcome, crate::ExecOutcome::Denied);
+    assert_eq!(session, original);
+}
+
+/// #2729: argv builds narrow host authority before admission.
+#[tokio::test]
+async fn host_scoped_build_children_narrow_network_argv() {
+    host_scoped_build_child_narrows_network(false).await;
+}
+
+/// #2729: build-bearing shell commands use the same network narrowing.
+#[tokio::test]
+async fn host_scoped_build_children_narrow_network_shell() {
+    host_scoped_build_child_narrows_network(true).await;
+}
