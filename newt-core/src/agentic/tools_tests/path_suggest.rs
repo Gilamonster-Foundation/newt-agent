@@ -115,7 +115,12 @@ fn path_suggest_bounded_suffix_and_plain_error_controls() {
     touch(ws.path(), "item.rs");
     let root = ws.path().to_str().unwrap();
     let hint = |path: &str, scope: &Scope<String>| {
-        super::super::path_suggest::on_error("error: missing".into(), path, root, scope)
+        super::super::FileIoError::io(
+            &std::io::ErrorKind::NotFound.into(),
+            std::path::Path::new(path),
+            "error: missing".into(),
+        )
+        .render(root, scope)
     };
     assert_eq!(
         hint("one/two/src/item.rs", &Scope::All),
@@ -134,12 +139,8 @@ fn path_suggest_bounded_suffix_and_plain_error_controls() {
         "error: missing"
     );
     assert_eq!(
-        super::super::path_suggest::on_error(
-            "capability denied: fs_read".into(),
-            "wrong/src/item.rs",
-            root,
-            &Scope::All
-        ),
+        super::super::FileIoError::from("capability denied: fs_read".to_string())
+            .render(root, &Scope::All),
         "capability denied: fs_read"
     );
 }
@@ -154,12 +155,12 @@ fn path_suggest_symlink_escape_is_not_a_candidate() {
     touch(outside.path(), "secret.rs");
     std::os::unix::fs::symlink(outside.path(), ws.path().join("escape")).unwrap();
     let hint = |path: &str, scope: &Scope<String>| {
-        super::super::path_suggest::on_error(
+        super::super::FileIoError::io(
+            &std::io::ErrorKind::NotFound.into(),
+            std::path::Path::new(path),
             "error: missing".into(),
-            path,
-            ws.path().to_str().unwrap(),
-            scope,
         )
+        .render(ws.path().to_str().unwrap(), scope)
     };
     assert_eq!(
         hint("wrong/escape/secret.rs", &Scope::All),
@@ -173,4 +174,60 @@ fn path_suggest_symlink_escape_is_not_a_candidate() {
         hint("wrong/allowed/link/secret.rs", &scope),
         "error: missing"
     );
+}
+
+/// #2755 round 2: swapping a missing authorized parent for an external symlink
+/// after the failed object-bound read must not make decoration an existence oracle.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn path_suggest_failure_then_symlink_swap_has_identical_output() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    touch(ws.path(), "src/item.rs");
+    std::fs::create_dir(ws.path().join("allowed")).unwrap();
+    let scope =
+        Scope::only(["allowed", "src"].map(|p| ws.path().join(p).to_string_lossy().into_owned()));
+    let requested = "allowed/wrong/src/item.rs";
+    let full = ws.path().join(requested);
+    let failure = super::super::object_bound_read(
+        &scope,
+        "fs_read",
+        requested,
+        &full,
+        &full.to_string_lossy(),
+    )
+    .unwrap_err();
+    // Deterministic race seam: the read is finished, but decoration has not run.
+    std::os::unix::fs::symlink(outside.path(), ws.path().join("allowed/wrong")).unwrap();
+    let absent = failure.clone().render(ws.path().to_str().unwrap(), &scope);
+    touch(outside.path(), "src/item.rs");
+    let present = failure.render(ws.path().to_str().unwrap(), &scope);
+    assert_eq!(
+        absent, present,
+        "external existence must not influence output"
+    );
+    assert!(absent.contains("did you mean src/item.rs?"), "{absent}");
+}
+
+/// #2755 round 2: a non-NotFound read failure must not become a missing-path
+/// suggestion merely because the operand is deleted before formatting.
+#[test]
+fn path_suggest_non_not_found_stays_plain_after_deletion() {
+    let ws = tempfile::tempdir().unwrap();
+    touch(ws.path(), "src/item.rs");
+    touch(ws.path(), "wrong/src/item.rs");
+    let requested = "wrong/src/item.rs";
+    let full = ws.path().join(requested);
+    std::fs::write(&full, [0xff]).unwrap();
+    let failure = super::super::object_bound_read(
+        &Scope::All,
+        "fs_read",
+        requested,
+        &full,
+        &full.to_string_lossy(),
+    )
+    .unwrap_err();
+    std::fs::remove_file(&full).unwrap();
+    let out = failure.render(ws.path().to_str().unwrap(), &Scope::All);
+    assert!(!out.contains("did you mean"), "{out}");
 }

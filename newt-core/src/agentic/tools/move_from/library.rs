@@ -16,7 +16,7 @@ pub(super) fn read_source(path: &Path, caveats: &Caveats) -> Result<String, Stri
     if !super::super::tui_permits_path(&caveats.fs_read, &target) {
         return Err(super::super::denied_fs_result("fs_read", &target));
     }
-    super::super::file_capture::read_for_edit(&caveats.fs_read, path, &target)
+    super::super::file_capture::read_for_edit(&caveats.fs_read, path, &target).map_err(String::from)
 }
 
 fn verify(
