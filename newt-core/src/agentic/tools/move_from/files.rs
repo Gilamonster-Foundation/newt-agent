@@ -1,7 +1,6 @@
 //! Complete-file publication through existing bounded directory capabilities.
 use super::transaction::{File, Files};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::io::Write;
+mod publication;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -16,7 +15,7 @@ struct Entry {
 
 impl DiskFiles {
     // The caller has authorized both parent directories (staging needs a sibling)
-    // and constrained both paths to the canonical session workspace.
+    // and constrained both paths to the selected build root.
     pub fn open(root: &Path, source: &Path, child: &Path) -> Result<Self, String> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let workspace = crate::fs_cap::WorkspaceDir::open_root(root).map_err(error)?;
@@ -59,20 +58,11 @@ fn error(e: impl std::fmt::Display) -> String {
 
 impl Entry {
     fn read(&self) -> Result<Option<String>, String> {
-        self.check_parent()?;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let opened = self
-            .parent
-            .open_regular(Path::new(self.path.file_name().unwrap()), true);
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let opened = {
-            self.check_parent()?;
-            match std::fs::symlink_metadata(&self.path) {
-                Ok(m) if !m.file_type().is_file() => return Err("nonregular target refused".into()),
-                _ => {}
-            }
-            std::fs::File::open(&self.path)
-        };
+        self.read_name(Path::new(self.path.file_name().unwrap()))
+    }
+
+    fn read_name(&self, name: &Path) -> Result<Option<String>, String> {
+        let opened = self.open_name(name);
         match opened {
             Ok(mut file) => {
                 let mut s = String::new();
@@ -95,71 +85,6 @@ impl Entry {
         }
         Ok(())
     }
-
-    fn change(&self, expected: Option<&str>, next: Option<&str>) -> Result<(), String> {
-        if self.read()?.as_deref() != expected {
-            return Err("stale file; refusing replacement/rollback".into());
-        }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            let name = Path::new(self.path.file_name().unwrap());
-            let Some(next) = next else {
-                return self.parent.unlink(name).map_err(error);
-            };
-            let temp = PathBuf::from(format!(
-                ".newt-move-{}.tmp",
-                crate::atomic_fs::unique_suffix()
-            ));
-            let mut staged = self.parent.create_new(&temp).map_err(error)?;
-            let result = (|| {
-                if expected.is_some() {
-                    staged.set_permissions(
-                        self.parent
-                            .open_regular(name, true)?
-                            .metadata()?
-                            .permissions(),
-                    )?;
-                }
-                staged.write_all(next.as_bytes())?;
-                staged.sync_all()?;
-                if self.read().map_err(io::Error::other)?.as_deref() != expected {
-                    return Err(io::Error::other("stale file before publication"));
-                }
-                if expected.is_none() {
-                    self.parent.link_new(&temp, name)
-                } else {
-                    self.parent.rename(&temp, name)
-                }
-            })();
-            let _ = self.parent.unlink(&temp);
-            result.map_err(error)
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            self.check_parent()?;
-            let Some(next) = next else {
-                return std::fs::remove_file(&self.path).map_err(error);
-            };
-            let target = crate::atomic_fs::ResolvedPath::resolve(&self.path).map_err(error)?;
-            let permissions = std::fs::metadata(&self.path).ok().map(|m| m.permissions());
-            let staged = target
-                .stage_with_permissions(next.as_bytes(), permissions.as_ref(), false)
-                .map_err(error)?;
-            let result = (|| {
-                self.check_parent()?;
-                if self.read()?.as_deref() != expected {
-                    return Err("stale file before publication".into());
-                }
-                if expected.is_none() {
-                    target.durable_create(&staged).map_err(error)
-                } else {
-                    target.durable_replace(&staged).map_err(error)
-                }
-            })();
-            let _ = std::fs::remove_file(staged);
-            result
-        }
-    }
 }
 
 impl Files for DiskFiles {
@@ -170,3 +95,6 @@ impl Files for DiskFiles {
         self.paths[file as usize].change(expected, next)
     }
 }
+
+#[cfg(test)]
+mod tests;
