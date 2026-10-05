@@ -1155,14 +1155,18 @@ pub(super) async fn exec_confined_command_with_broker(
         }
         return match run {
             Ok(envelope) => host_result(&envelope, |envelope| {
-                shell_envelope_output(
+                let mut text = shell_envelope_output(
                     envelope,
                     tool_output_lines,
                     color,
                     tool_offload,
                     spill_store,
                     Some(&mut *presentation),
-                )
+                );
+                if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope) {
+                    text.push_str(hint);
+                }
+                text
             }),
             Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
         };
@@ -1568,6 +1572,9 @@ pub(super) fn confined_result(
     // this can be rendered as a named denial.
     let outcome = envelope_outcome(envelope);
     let mut text = render(envelope);
+    if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope) {
+        text.push_str(hint);
+    }
     if let Some(note) = absent {
         text.push('\n');
         text.push_str(&note);

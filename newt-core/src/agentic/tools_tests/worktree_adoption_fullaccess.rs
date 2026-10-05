@@ -174,5 +174,7 @@ fn adoption_2750_decision_keeps_confined_protection() {
             notice.contains("git -c user.name=… -c user.email=…"),
             !bypass
         );
+        assert_eq!(notice.contains("Any uncommitted changes"), !bypass);
+        assert_eq!(notice.contains("/permissions worktree-lift"), !bypass);
     }
 }

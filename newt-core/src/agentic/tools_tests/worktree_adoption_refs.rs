@@ -311,3 +311,272 @@ async fn adoption_refs_approved_external_destination_is_adopted() {
         );
     }
 }
+
+/// #2753: refusing a compound must teach creation in the worktree, rather than
+/// splitting checkout -b into a mutation of the original checkout first.
+#[tokio::test]
+async fn worktree_notice_compound_refusal_teaches_standalone_b_form() {
+    let _env = crate::process_env::lock();
+    let temp = tempfile::tempdir().unwrap();
+    let session = WorktreeSession::default();
+    let (text, outcome) = run(
+        "git checkout -b step-x && git worktree add task step-x",
+        temp.path(),
+        temp.path(),
+        &Caveats::top(),
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Denied), "{text}");
+    assert!(
+        text.contains("git worktree add -b <new-branch> <path> [<start>]"),
+        "{text}"
+    );
+    assert!(text.contains("standalone"), "{text}");
+    assert!(
+        text.contains("Do not create the branch in the original checkout first"),
+        "{text}"
+    );
+    assert!(session.snapshot().is_none());
+}
+
+/// #2753: ground the recovery notice in Git's actual checked-out-branch error
+/// through the same dispatch that would otherwise adopt a successful worktree.
+#[tokio::test]
+async fn worktree_notice_already_used_branch_gets_recovery_hint() {
+    let _env = crate::process_env::lock();
+    let _engine =
+        crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
+    assert!(crate::confined_exec::kernel_fs_fence_available());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    git(root, root, &["init", "-q", "-b", "original"]);
+    git(
+        root,
+        root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "seed",
+        ],
+    );
+    git(root, root, &["checkout", "-b", "step-x"]);
+    let head = std::fs::read(root.join(".git/HEAD")).unwrap();
+    let session = WorktreeSession::default();
+    let mut caveats = Caveats::top();
+    caveats.net = Scope::none();
+    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    let (text, outcome) = run(
+        "git worktree add task step-x",
+        root,
+        root,
+        &caveats,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Failed), "{text}");
+    assert!(
+        text.contains("is already used by worktree at"),
+        "expected real Git error: {text}"
+    );
+    assert!(
+        text.contains("git switch -"),
+        "missing recovery hint: {text}"
+    );
+    assert!(text.contains("new branch name"), "{text}");
+    assert!(
+        text.contains("git worktree add -b <new-branch> <path> [<start>]"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
+    assert!(session.snapshot().is_none());
+    assert!(!root.join("task").exists());
+
+    let (text, outcome) = run(
+        "git worktree add -b fresh task missing-start",
+        root,
+        root,
+        &caveats,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Failed), "{text}");
+    assert!(
+        !text.contains("git switch -"),
+        "unrelated error must not get recovery advice: {text}"
+    );
+    assert!(session.snapshot().is_none());
+
+    let (text, outcome) = run(
+        "git worktree add -b fresh task HEAD",
+        root,
+        root,
+        &caveats,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
+    assert!(
+        !text.contains("git switch -"),
+        "success must not get recovery advice: {text}"
+    );
+    assert!(
+        text.contains("Any uncommitted changes in the original checkout are now read-only"),
+        "clean original: {text}"
+    );
+    assert!(session.snapshot().is_some());
+    assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
+}
+
+/// #2753 addendum: adopting a throwaway check worktree must disclose the edits
+/// it freezes without launching a status probe.
+#[tokio::test]
+async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
+    let _env = crate::process_env::lock();
+    let _engine =
+        crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
+    assert!(crate::confined_exec::kernel_fs_fence_available());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    git(root, root, &["init", "-q", "-b", "original"]);
+    std::fs::write(root.join("tracked"), "seed").unwrap();
+    git(root, root, &["add", "tracked"]);
+    git(
+        root,
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "seed"],
+    );
+    std::fs::write(root.join("tracked"), "unstaged work").unwrap();
+    std::fs::write(root.join("staged"), "staged work").unwrap();
+    git(root, root, &["add", "staged"]);
+    std::fs::write(root.join("untracked\nfile"), "untracked work").unwrap();
+    let snapshots: Vec<_> = [
+        "tracked",
+        "staged",
+        "untracked\nfile",
+        ".git/index",
+        ".git/HEAD",
+    ]
+    .iter()
+    .map(|p| (root.join(p), std::fs::read(root.join(p)).unwrap()))
+    .collect();
+    let session = WorktreeSession::default();
+    let mut caveats = Caveats::top();
+    caveats.exec = Scope::only(["git".to_owned()]);
+    caveats.net = Scope::none();
+    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    let (text, outcome) = run(
+        "git worktree add --detach .main-check-main HEAD",
+        root,
+        root,
+        &caveats,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
+    assert!(
+        text.contains("Any uncommitted changes in the original checkout are now read-only"),
+        "{text}"
+    );
+    assert!(text.contains("new worktree"), "{text}");
+    assert!(text.contains("/permissions worktree-lift"), "{text}");
+    let policy = session.snapshot().expect("adoption still arms");
+    for (path, contents) in snapshots {
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        assert!(policy.blocked(&path));
+    }
+}
+
+/// #2753: echoed text is not evidence of Git's already-used branch failure.
+#[tokio::test]
+async fn worktree_notice_echo_does_not_forge_git_error() {
+    worktree_notice_unrelated_failure(
+        "echo 'is already used by worktree at'; git worktree add -b fresh task missing-start",
+    )
+    .await;
+}
+
+/// #2753: a quoted invalid start operand is not an already-used branch error.
+#[tokio::test]
+async fn worktree_notice_quoted_operand_does_not_forge_git_error() {
+    worktree_notice_unrelated_failure(
+        "git worktree add -b fresh task 'is already used by worktree at'",
+    )
+    .await;
+}
+
+async fn worktree_notice_unrelated_failure(source: &str) {
+    let _env = crate::process_env::lock();
+    let _engine =
+        crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
+    assert!(crate::confined_exec::kernel_fs_fence_available());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    git(root, root, &["init", "-q", "-b", "original"]);
+    git(
+        root,
+        root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "seed",
+        ],
+    );
+    let session = WorktreeSession::default();
+    let mut caveats = Caveats::top();
+    caveats.net = Scope::none();
+    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    let (text, outcome) = run(source, root, root, &caveats, &session).await;
+    assert_eq!(outcome, Some(ExecOutcome::Failed), "{text}");
+    assert!(
+        !text.contains("Worktree hint:"),
+        "forged failure hint: {text}"
+    );
+    assert!(session.snapshot().is_none());
+}
+
+/// #2753: error-specific advice uses only an exact branch-bound stderr line
+/// for a standalone command, never echoed stdout, operands, or compound output.
+#[test]
+fn worktree_notice_hint_requires_standalone_branch_stderr() {
+    let source = "git worktree add task step-x";
+    let fatal = "fatal: 'step-x' is already used by worktree at '/original'";
+    let failed = |stdout: &str, stderr: &str| serde_json::json!({"exit_code":128,"stdout":stdout,"stderr":stderr});
+    assert!(creation_failure_hint(source, &failed("", fatal)).is_some());
+    for (command, envelope) in [
+        (source, failed(fatal, "fatal: invalid reference: other")),
+        (
+            source,
+            failed(
+                "",
+                "fatal: 'other' is already used by worktree at '/original'",
+            ),
+        ),
+        (
+            source,
+            failed("", &format!("fatal: invalid reference: {fatal}")),
+        ),
+        ("echo fake; git worktree add task step-x", failed("", fatal)),
+        ("git worktree add task step-x 2>&1", failed("", fatal)),
+        (
+            "git worktree add task step-x && echo done",
+            failed("", fatal),
+        ),
+        (source, serde_json::json!({"exit_code":0,"stderr":fatal})),
+        (
+            source,
+            serde_json::json!({"exit_code":128,"stderr":fatal,"denied":true}),
+        ),
+    ] {
+        assert!(
+            creation_failure_hint(command, &envelope).is_none(),
+            "{command}: {envelope}"
+        );
+    }
+}
