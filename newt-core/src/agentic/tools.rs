@@ -1369,26 +1369,9 @@ async fn run_confined_build_lane(
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
     use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
-    // The command is attacker-influenced (repo-configured phase, or a
-    // model-typed argv). `cwd` may be nested, but never an outside root or
-    // symlink escape.
-    let root = match std::path::Path::new(workspace).canonicalize() {
-        Ok(root) => root,
-        Err(error) => {
-            return (
-                format!("error: build workspace: {error}"),
-                crate::ExecOutcome::Unavailable,
-            )
-        }
-    };
-    let cwd = match cwd.canonicalize() {
-        Ok(cwd) if cwd.starts_with(&root) => cwd,
-        _ => {
-            return (
-                "capability denied: build directory must remain inside the workspace".into(),
-                crate::ExecOutcome::Denied,
-            )
-        }
+    let (root, cwd) = match build_shell::build_directory(workspace, cwd, caveats) {
+        Ok(directory) => directory,
+        Err(refusal) => return refusal,
     };
     let request = build_tool_request(&root, &cwd, program, argv, &caveats.net).timeout(wall);
     let build = request.caveats();
@@ -5929,3 +5912,7 @@ mod smart_frame_isolation_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "tools_tests/smart_tool_completion.rs"]
 mod smart_tool_completion_tests;
+
+#[cfg(test)]
+#[path = "tools_tests/sibling_worktree_build.rs"]
+mod sibling_worktree_build_tests;
