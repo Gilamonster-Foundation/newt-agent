@@ -49,6 +49,57 @@ fn catalog_advertises_move() {
     );
 }
 
+/// #2724/#2723: sibling grants select the build root, while missing grants
+/// return the shared actionable refusal before any approval or mutation.
+#[test]
+fn sibling_move_requires_existing_write_authority() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let session = root.join("session");
+    let sibling = root.join("sibling");
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::create_dir_all(sibling.join("src")).unwrap();
+    std::fs::write(
+        sibling.join("Cargo.toml"),
+        "[package]\nname = \"sibling\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let source = sibling.join("src/lib.rs");
+    let child = sibling.join("src/helpers.rs");
+    let before = "fn helper() {}\n";
+    std::fs::write(&source, before).unwrap();
+    let args = serde_json::json!({"path":child, "content":"", "move_from":{"path":source, "items":["helper"]}});
+    let mut caveats = Caveats {
+        fs_read: crate::Scope::only([root.to_string_lossy().into_owned()]),
+        fs_write: crate::Scope::only([session.to_string_lossy().into_owned()]),
+        exec: crate::Scope::none(),
+        net: crate::Scope::none(),
+        ..Caveats::top()
+    };
+    let denied = execute(&args, session.to_str().unwrap(), &caveats, None, &mut None)
+        .err()
+        .unwrap();
+    assert!(
+        denied.contains("grant the worktree with --write <worktree>"),
+        "{denied}"
+    );
+    for writes in [
+        crate::Scope::only([sibling.to_string_lossy().into_owned()]),
+        crate::Scope::All,
+    ] {
+        caveats.fs_write = writes;
+        let admitted = execute(&args, session.to_str().unwrap(), &caveats, None, &mut None)
+            .err()
+            .unwrap();
+        assert!(
+            admitted.contains("explicit confined build authority"),
+            "{admitted}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(source).unwrap(), before);
+    assert!(!child.exists());
+}
+
 /// CI-only real-resource proof grounding the mocked AST/transaction/check seam:
 /// a tiny dependency-free library is checked before/after extraction, then an
 /// actual compiler error restores both files. No kernel skip counts as a pass.
@@ -57,7 +108,13 @@ fn catalog_advertises_move() {
 #[ignore = "CI-only: real confined cargo check; needs installed Rust and kernel build sandbox"]
 fn real_move_from_fixture_compiles_and_failed_check_restores() {
     let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path().canonicalize().unwrap();
+    let base = fixture.path().canonicalize().unwrap();
+    let session = base.join("session");
+    let root = base.join("sibling");
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    // Checking the session instead of the authorized sibling must fail.
+    std::fs::write(session.join("Cargo.toml"), "invalid manifest").unwrap();
     std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"move_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n[lib]\npath = \"lib.rs\"\n").unwrap();
     let source = root.join("lib.rs");
     let child = root.join("helpers.rs");
@@ -81,8 +138,8 @@ fn real_move_from_fixture_compiles_and_failed_check_restores() {
         net: crate::caveats::Scope::none(),
         ..Caveats::top()
     };
-    let args = serde_json::json!({"path":"helpers.rs", "content":"", "move_from":{"path":"lib.rs", "items":["helper"]}});
-    let denied = execute(&args, root.to_str().unwrap(), &caveats, None, &mut None);
+    let args = serde_json::json!({"path":child, "content":"", "move_from":{"path":source, "items":["helper"]}});
+    let denied = execute(&args, session.to_str().unwrap(), &caveats, None, &mut None);
     assert!(denied
         .err()
         .unwrap()
@@ -113,7 +170,7 @@ fn real_move_from_fixture_compiles_and_failed_check_restores() {
     let mut gate = ApproveBuild(0);
     execute(
         &args,
-        root.to_str().unwrap(),
+        session.to_str().unwrap(),
         &caveats,
         None,
         &mut Some(&mut gate),
