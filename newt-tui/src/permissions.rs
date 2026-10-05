@@ -2079,6 +2079,19 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 once_grants.push((req.kind, req.target.clone()));
                 continue;
             }
+            // #2716: one worker invocation can report the same resolved exec
+            // denial many times (e.g. a loop). Reuse this batch's exact-path
+            // approval; nothing survives this call or changes replay policy.
+            if req.tool == "run_command"
+                && req.kind == newt_core::DenialKind::Exec
+                && std::path::Path::new(&req.target).is_absolute()
+                && once_grants
+                    .iter()
+                    .any(|(kind, target)| *kind == req.kind && target == &req.target)
+            {
+                self.record(req, "allow", "once");
+                continue;
+            }
             // Only the eventual operation consumes a request_permissions grant.
             if req.tool != "request_permissions" {
                 if let Some(key) = take_pending_once(&mut self.state.pending_once_grants, req) {
