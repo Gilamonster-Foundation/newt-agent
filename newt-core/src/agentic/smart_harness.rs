@@ -1444,6 +1444,7 @@ mod tests {
             false,
             false,
             false,
+            Default::default(),
         );
         let legacy = tools.clone();
         let smart = advertise(tools, Some(&h));

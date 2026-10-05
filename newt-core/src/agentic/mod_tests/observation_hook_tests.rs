@@ -8,6 +8,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        command_budget: Default::default(),
         overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
@@ -104,7 +105,20 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
 /// than making this regression depend on a frozen catalog size.
 fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
     let tools = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     let mut wire_messages: Vec<serde_json::Value> = messages
             .iter()

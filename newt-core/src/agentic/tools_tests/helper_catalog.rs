@@ -44,7 +44,20 @@ fn use_skill_tool_is_advertised_in_definitions() {
 #[test]
 fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
     let merged = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     let names: Vec<&str> = merged
         .as_array()
@@ -149,7 +162,20 @@ fn builtin_tool_names_are_unique() {
 fn advertised_set_matches_all_tool_names_both_directions() {
     let git = Some(&crate::caveats::Scope::All);
     let all = merged_tool_definitions(
-        &NoMcp, true, true, true, git, true, true, true, true, true, true, true, true,
+        &NoMcp,
+        true,
+        true,
+        true,
+        git,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Default::default(),
     );
     let advertised: std::collections::HashSet<&str> = all
         .as_array()
@@ -205,12 +231,38 @@ fn save_note_advertised_only_with_a_sink() {
     assert!(!names(&base).contains(&"save_note"), "got: {base}");
     // … nor in the merged set without a sink …
     let without = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(!names(&without).contains(&"save_note"));
     // … but a sink advertises it.
     let with = merged_tool_definitions(
-        &NoMcp, true, false, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        true,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(names(&with).contains(&"save_note"), "got: {with}");
 }
@@ -230,16 +282,55 @@ fn recall_advertised_only_with_a_source() {
     let base = tool_definitions();
     assert!(!names(&base).contains(&"recall"), "got: {base}");
     let without = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(!names(&without).contains(&"recall"));
     let with = merged_tool_definitions(
-        &NoMcp, false, true, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        true,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(names(&with).contains(&"recall"), "got: {with}");
     // The two gates are independent: both on advertises both.
     let both = merged_tool_definitions(
-        &NoMcp, true, true, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        true,
+        true,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(names(&both).contains(&"save_note"));
     assert!(names(&both).contains(&"recall"));
@@ -261,17 +352,56 @@ fn memory_fetch_advertised_only_with_a_source() {
     assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
     // Flag off (every existing caller, the inert default) → not advertised.
     let without = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(!names(&without).contains(&"memory_fetch"));
     // Flag on → advertised.
     let with = merged_tool_definitions(
-        &NoMcp, false, false, true, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        true,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
     // Independent of the save_note / recall gates: all three on lists all.
     let all = merged_tool_definitions(
-        &NoMcp, true, true, true, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        true,
+        true,
+        true,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(names(&all).contains(&"save_note"));
     assert!(names(&all).contains(&"recall"));
@@ -291,16 +421,55 @@ fn git_tool_advertised_only_with_the_presence_gate() {
     }
     let git = Some(&crate::caveats::Scope::All);
     let with = merged_tool_definitions(
-        &NoMcp, false, false, false, git, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        git,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(names(&with).contains(&"git"), "with_git advertises git");
     let without = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(!names(&without).contains(&"git"), "no git without the gate");
     // #479: the /team toggle advertises both crew tools, and only then.
     let team = merged_tool_definitions(
-        &NoMcp, false, false, false, None, true, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(
         names(&team).contains(&"crew") && names(&team).contains(&"compose_roster"),
@@ -312,7 +481,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
     );
     // Step 26.4 (#583): the scratchpad state tools, only with the gate on.
     let scratch = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, true, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     for t in ["state_set", "state_get", "state_clear"] {
         assert!(
@@ -327,7 +509,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
     }
     // Step 26.5.5 (#582): the code_search tool, only with its gate on.
     let code = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, true, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     assert!(
         names(&code).contains(&"code_search"),
@@ -340,7 +535,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
     assert!(!is_hallucination("code_search", &serde_json::json!({})));
     // Step 26.6a (#585): the experiential record/recall tools, only with the gate.
     let exp = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, true, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     for t in ["experience_record", "experience_recall"] {
         assert!(names(&exp).contains(&t), "{t} advertised with_experiential");
@@ -353,7 +561,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
     // Step 26.6b (#586) / #715 PR2: the scheduled update_plan + plan_get tools,
     // only with the gate (plan_set/plan_advance collapsed into update_plan).
     let sched = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, true, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     for t in ["update_plan", "plan_get"] {
         assert!(names(&sched).contains(&t), "{t} advertised with_scheduled");
@@ -370,7 +591,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         );
     }
     let plan_control_only = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, true, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        Default::default(),
     );
     assert!(
         !names(&plan_control_only).contains(&"enter_plan_mode"),
@@ -381,7 +615,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         "an inactive control must not advertise an unnecessary exit"
     );
     let active_plan_control = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, true, true,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        true,
+        Default::default(),
     );
     assert!(
         !names(&active_plan_control).contains(&"enter_plan_mode"),
@@ -392,7 +639,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         "an active Plan phase must keep exit available if scheduled planning is toggled off"
     );
     let plan_ready_inactive = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, true, false, true, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        true,
+        false,
+        Default::default(),
     );
     assert!(
         names(&plan_ready_inactive).contains(&"enter_plan_mode"),
@@ -403,7 +663,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         "a frozen multi-round catalog that advertises enter must also advertise same-turn exit"
     );
     let plan_mode = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, true, false, true, true,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        true,
+        true,
+        Default::default(),
     );
     for t in ["enter_plan_mode", "exit_plan_mode"] {
         assert!(
@@ -414,7 +687,20 @@ fn git_tool_advertised_only_with_the_presence_gate() {
     // `/mode auto`: the model-facing selector exists only when the
     // session injects its bounded next-turn control.
     let operating_mode = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, true, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        Default::default(),
     );
     assert!(
         names(&operating_mode).contains(&"select_operating_mode"),

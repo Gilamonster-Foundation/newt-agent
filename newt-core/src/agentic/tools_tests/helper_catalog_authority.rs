@@ -118,7 +118,20 @@ fn exit_plan_mode_result_appends_mandatory_edit_only_when_initiative_requires_it
 fn persona_preferences_rank_the_full_advertised_catalog() {
     let git = Some(&crate::caveats::Scope::All);
     let full = merged_tool_definitions(
-        &NoMcp, true, true, true, git, true, true, true, true, true, true, true, true,
+        &NoMcp,
+        true,
+        true,
+        true,
+        git,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Default::default(),
     );
     let name_set = |v: &serde_json::Value| -> Vec<String> {
         v.as_array()
@@ -268,8 +281,20 @@ fn explicit_plan_filters_catalog_without_treating_response_style_as_authority() 
     // → model dumps or reaches for `wc -l` → empty/denied).
     let research_catalog = filter_tools_for_disposition(
         merged_tool_definitions(
-            &NoMcp, false, false, false, None, false, false, false, false, false, false, false,
+            &NoMcp,
             false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Default::default(),
         ),
         PromptDisposition::Research,
     );

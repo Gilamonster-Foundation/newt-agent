@@ -57,6 +57,7 @@ fn hard_budget_ctx<'a>(
     kind: BackendKind,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        command_budget: Default::default(),
         overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,

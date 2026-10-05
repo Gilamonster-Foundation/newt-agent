@@ -56,6 +56,8 @@ pub use smart_harness::{HarnessLaunch, SmartHarnessConfig};
 pub use summarizer::SummarizerConfig;
 pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
 pub use tools::ToolsConfig;
+mod command_budget;
+pub use command_budget::RunCommandBudget;
 
 mod api_surface;
 mod backend;

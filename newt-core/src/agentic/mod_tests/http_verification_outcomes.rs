@@ -109,6 +109,7 @@ async fn run_script(
     max_tool_rounds: usize,
 ) -> Run {
     run_turn(Turn {
+        command_budget: Default::default(),
         wire,
         smart,
         outcomes,
@@ -126,6 +127,7 @@ async fn run_script(
 /// One scripted turn, for a case that also narrows the session's authority or
 /// pins env the shell reads.
 struct Turn<'a> {
+    command_budget: crate::RunCommandBudget,
     wire: &'a str,
     smart: bool,
     outcomes: bool,
@@ -141,6 +143,7 @@ struct Turn<'a> {
 
 async fn run_turn(turn: Turn<'_>) -> Run {
     let Turn {
+        command_budget,
         wire,
         smart,
         outcomes,
@@ -190,6 +193,7 @@ async fn run_turn(turn: Turn<'_>) -> Run {
     let task = workspace_task.map_or_else(|| instruction(check), |(_, task)| task.to_string());
     let (uri, messages) = (server.uri(), msgs());
     let mut context = ctx(&uri, &messages, &caveats);
+    context.command_budget = command_budget;
     context.workspace = &workspace;
     context.task = &task;
     context.max_tool_rounds = max_tool_rounds;
@@ -271,6 +275,7 @@ async fn workspace_discovery_does_not_make_unrequested_checks_mandatory() {
                     "sh -c 'printf report > ../dashboard.md'"
                 };
                 let run = run_turn(Turn {
+                    command_budget: Default::default(),
                     wire,
                     smart,
                     outcomes,
@@ -512,6 +517,7 @@ async fn cancelling_a_running_check_ends_cancelled_without_a_pass() {
     let run = crate::test_guard::hang_guarded(
         "the interrupted turn",
         run_turn(Turn {
+            command_budget: Default::default(),
             wire: "openai",
             smart: true,
             outcomes: true,
@@ -674,7 +680,7 @@ async fn a_check_created_after_the_first_scan_decides_the_cap_exit() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
-async fn every_verification_case_ends_within_its_allowance() {
+pub(super) async fn every_verification_case_ends_within_its_allowance() {
     use crate::agentic::self_verify::{CheckStatus, VERIFY_REPAIR_ALLOWANCE};
     const ABSENT: &str = "newt-absent-binary-2315-check --verify";
     const SLOW: &str = "sleep 5";
@@ -738,10 +744,7 @@ async fn every_verification_case_ends_within_its_allowance() {
             check: SLOW,
             step: Step::Run(SLOW),
             caveats: Caveats::top(),
-            env: &[
-                ("NEWT_DISABLE_OCAP", "1"),
-                ("NEWT_RUN_COMMAND_TIMEOUT_SECS", "1"),
-            ],
+            env: &[("NEWT_DISABLE_OCAP", "1")],
             reason: "repair_exhausted",
             rounds: 5,
             decisions: EXHAUSTED,
@@ -774,6 +777,11 @@ async fn every_verification_case_ends_within_its_allowance() {
         for (wire, smart) in [("openai", false), ("anthropic", true)] {
             let label = format!("{} on {wire} smart={smart}", case.name);
             let run = run_turn(Turn {
+                command_budget: if case.status == Some(CheckStatus::TimedOut) {
+                    crate::RunCommandBudget::from_configured(Some("1"))
+                } else {
+                    Default::default()
+                },
                 wire,
                 smart,
                 outcomes: true,
@@ -786,6 +794,27 @@ async fn every_verification_case_ends_within_its_allowance() {
                 workspace_task: None,
             })
             .await;
+            for body in &run.bodies {
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+                let tools = body["tools"].as_array().expect("tools");
+                let tool = tools
+                    .iter()
+                    .map(|tool| tool.get("function").unwrap_or(tool))
+                    .find(|tool| tool["name"] == "run_command")
+                    .expect("run_command");
+                let expected = if case.status == Some(CheckStatus::TimedOut) {
+                    1
+                } else {
+                    60
+                };
+                assert!(
+                    tool["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("killed after {expected} seconds")),
+                    "{label}"
+                );
+            }
             assert_eq!(run.reason, case.reason, "{label}");
             // Primary rounds only: a request whose messages equal the previous
             // request's replays that round rather than starting a new one.

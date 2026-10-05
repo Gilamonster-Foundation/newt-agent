@@ -219,7 +219,7 @@ async fn blocked_live_sink_cannot_backpressure_host_pipe_capture() {
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn host_bypass_publishes_output_before_command_completion() {
-    // The host shell reads NEWT_RUN_COMMAND_TIMEOUT_SECS, which a loop test pins.
+    // Other shell fixtures mutate process-wide engine and authority settings.
     let _env = super::disable_ocap_tests::env_lock().await;
     struct ChannelOutput(std::sync::mpsc::Sender<Vec<u8>>);
     impl crate::agentic::LiveToolOutput for ChannelOutput {
@@ -245,7 +245,9 @@ async fn host_bypass_publishes_output_before_command_completion() {
     let sink = std::sync::Arc::new(ChannelOutput(tx));
     let session = LiveOutputSession::start(Some(sink)).unwrap();
     let relay = session.relay();
-    let handle = tokio::spawn(async move { host_shell_output(&command, ".", Some(relay)).await });
+    let handle = tokio::spawn(async move {
+        host_shell_output(&command, ".", Some(relay), Default::default()).await
+    });
 
     let first = tokio::task::spawn_blocking(move || {
         crate::test_guard::recv_guarded(&rx, "the first live host-shell chunk")

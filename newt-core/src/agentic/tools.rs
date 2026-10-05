@@ -1090,6 +1090,7 @@ fn escalation_result(
     first: (String, crate::ExecOutcome),
     escalated: (String, crate::ExecOutcome),
     wall: std::time::Duration,
+    command_budget: crate::RunCommandBudget,
 ) -> (String, crate::ExecOutcome) {
     if matches!(
         escalated.1,
@@ -1105,7 +1106,7 @@ fn escalation_result(
         // alone rather than guess.
         let first_text = first
             .0
-            .strip_suffix(&shell::timed_out_note(wall))
+            .strip_suffix(&shell::timed_out_note(wall, command_budget))
             .unwrap_or(&first.0);
         return (
             format!(
@@ -1147,6 +1148,7 @@ async fn lifecycle_run_with_escalation(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     smart_harness: Option<&super::smart_harness::SmartHarness>,
     presentation: &mut dyn ToolPresentation,
+    command_budget: crate::RunCommandBudget,
 ) -> (String, crate::ExecOutcome) {
     let first = exec_confined_command(
         joined,
@@ -1162,6 +1164,7 @@ async fn lifecycle_run_with_escalation(
         spill_store,
         live_tool_output,
         presentation,
+        command_budget,
     )
     .await;
     // F19: nine `action=run` calls died at the 60s wall before one
@@ -1172,7 +1175,7 @@ async fn lifecycle_run_with_escalation(
     // applied to THIS command — since #2543 a cargo/just phase already ran
     // under the build wall in the run lane, so `escalates` must see which
     // wall killed it, not assume the default.
-    let wall = shell::dispatch_wall(joined);
+    let wall = shell::dispatch_wall(joined, command_budget);
     if !escalates(first.1, wall) {
         return lifecycle_run_result(args, first);
     }
@@ -1204,7 +1207,7 @@ async fn lifecycle_run_with_escalation(
         presentation,
     )
     .await;
-    escalation_result(first, escalated, wall)
+    escalation_result(first, escalated, wall, command_budget)
 }
 
 /// F38: does a lifecycle `run`'s resolved command start with a build tool?
@@ -3595,6 +3598,7 @@ async fn execute_authorized_tool(
 ) -> String {
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
+        command_budget,
         read_history,
         default_command_cwd,
         worktree_session,
@@ -4111,6 +4115,7 @@ async fn execute_authorized_tool(
                             spill_store,
                             live_tool_output.clone(),
                             presentation,
+                            command_budget,
                         )
                         .await,
                     )
@@ -4170,6 +4175,7 @@ async fn execute_authorized_tool(
                     operating_mode_control.is_some(),
                     plan_mode_control.is_some(),
                     plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode),
+                    command_budget,
                 ),
                 persona_tools,
             );
@@ -4425,6 +4431,7 @@ async fn execute_authorized_tool(
                         presentation,
                         commit_broker,
                         args.get("timeout_secs").and_then(serde_json::Value::as_u64),
+                        command_budget,
                     )
                     .await,
                 );
@@ -4523,6 +4530,7 @@ async fn execute_authorized_tool(
                     .map(|guard| guard.clone() as agent_bridle_tool_shell::ExecutionLease),
                 &mut fs_pre_exec_missing,
                 args.get("timeout_secs").and_then(serde_json::Value::as_u64),
+                command_budget,
             )
             .await;
             if let Some(move_info) = &ref_move {
@@ -4769,6 +4777,7 @@ async fn execute_authorized_tool(
                         live_tool_output.clone(),
                         smart_harness,
                         presentation,
+                        command_budget,
                     )
                     .await,
                 ),
@@ -4840,6 +4849,7 @@ async fn execute_authorized_tool(
                         spill_store,
                         live_tool_output.clone(),
                         presentation,
+                        command_budget,
                     )
                     .await,
                 );
