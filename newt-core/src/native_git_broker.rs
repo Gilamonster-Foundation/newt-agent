@@ -3,7 +3,7 @@
 //!
 //! All repository probes use the original invocation's confined executor. The
 //! helper directory is a read-only mechanism resource outside child writes.
-//! Filesystem-All cannot protect it and is explicitly unsupported by this slice.
+//! Ambient sessions attenuate writes for the commit invocation to protect it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,28 @@ pub(crate) struct NativeGitBroker {
 }
 
 impl NativeGitBroker {
+    /// #2720: ambient session authority is not the commit child's write grant.
+    /// Keep helpers and the worker image immutable during the hook handshake.
+    /// Scoped sessions retain their already-bound repository identity; only an
+    /// ambient caller may authorize resolving a repository at dispatch time.
+    pub(crate) fn invocation_caveats(
+        caveats: &crate::Caveats,
+        workspace: &Path,
+    ) -> Result<crate::Caveats, String> {
+        if !matches!(caveats.fs_write, crate::Scope::All) {
+            return Ok(caveats.clone());
+        }
+        let canonical_workspace = workspace
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let write = crate::git_hardening::ambient_gitdir_write_grant(workspace);
+        let mut invocation = caveats.clone();
+        invocation.fs_write = crate::Scope::only(
+            std::iter::once(canonical_workspace.to_string_lossy().into_owned()).chain(write),
+        );
+        Ok(invocation)
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn new(policy: Arc<dyn CommitPolicy>) -> Result<Arc<Self>, String> {
         let executable = std::env::current_exe()
@@ -862,6 +884,28 @@ mod tests {
     use super::forward_original_hook_input;
     use std::io::Read;
     use std::process::{Command, Stdio};
+
+    /// #2720: attenuation is per invocation; it must not mutate the ambient
+    /// session or re-resolve a scoped caller's repository grant.
+    #[test]
+    fn full_access_commit_writes_are_bounded_without_changing_session() {
+        use crate::caveats::permits_path;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let session = crate::Caveats::top();
+        let invocation = super::NativeGitBroker::invocation_caveats(&session, &workspace).unwrap();
+        assert!(matches!(session.fs_write, crate::Scope::All));
+        assert!(permits_path(
+            &invocation.fs_write,
+            workspace.to_str().unwrap()
+        ));
+        assert!(!permits_path(
+            &invocation.fs_write,
+            workspace.parent().unwrap().to_str().unwrap()
+        ));
+        let repeated = super::NativeGitBroker::invocation_caveats(&invocation, &workspace).unwrap();
+        assert_eq!(invocation, repeated);
+    }
 
     #[test]
     fn original_hook_closing_stdin_does_not_refuse_successful_hook() {
