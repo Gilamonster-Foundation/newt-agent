@@ -55,12 +55,13 @@ pub fn tool_definitions() -> serde_json::Value {
                 "name": "write_file",
                 "description": "Create a file, or replace one entirely. To change an \
                                 existing file use edit_file (a large shrink is refused). To \
-                                move existing code, use copy_from — never retype it.",
+                                copy existing code, use copy_from. Extract Rust free functions with move_from: empty content, source path + item names, NEW child .rs path; wires module and checks cargo, restoring files on failure (requires ast). Never retype moved code.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
                         "content": { "type": "string", "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty)" },
+                        "move_from": { "type": "object", "properties": { "path": { "type": "string" }, "items": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true } }, "required": ["path", "items"] },
                         "copy_from": { "type": "object", "description": "Append lines start_line..end_line of another file, copied exactly", "properties": { "path": { "type": "string" }, "start_line": { "type": "integer" }, "end_line": { "type": "integer" } } }
                     },
                     "required": ["path", "content"]
