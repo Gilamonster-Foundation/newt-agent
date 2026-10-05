@@ -274,15 +274,12 @@ mod tests {
     /// #2739: no filesystem mutation without a positive operator decision.
     #[test]
     fn repair_requires_explicit_consent() {
-        let report = ToolTrustReport {
-            lines: vec![],
-            hints: vec![TrustHint {
-                path: "/brew/bin".into(),
-                mode: 0o775,
-                chmod_arg: "g-w",
-            }],
-            ..Default::default()
-        };
+        let mut report = ToolTrustReport::default();
+        report.hints.push(TrustHint {
+            path: "/brew/bin".into(),
+            mode: 0o775,
+            chmod_arg: "g-w",
+        });
         let mut calls = 0;
         report.repair_with(false, |_| {
             calls += 1;
