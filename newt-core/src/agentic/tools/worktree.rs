@@ -4,7 +4,9 @@ use crate::worktree_adoption::{AdoptedWorktree, Creation};
 use crate::Caveats;
 use std::path::{Path, PathBuf};
 
-use super::native_git::{invocation, is_git, literal};
+use super::native_git::{invocation, is_git as resembles_git, literal};
+#[path = "worktree_git.rs"]
+mod git_identity;
 
 /// Match the actual Git subcommand, never words appearing in path operands.
 fn worktree_add_args(words: &[String]) -> Option<&[String]> {
@@ -17,7 +19,7 @@ fn worktree_add_args(words: &[String]) -> Option<&[String]> {
 /// every command independently of cwd/operand resolution and inspect children.
 fn possible_creation(source: &str) -> bool {
     fn words(program: Option<&str>, argv: &[String]) -> bool {
-        program.is_some_and(is_git)
+        program.is_some_and(resembles_git)
             && argv.windows(2).any(|pair| {
                 literal(&pair[0]).as_deref() == Some("worktree")
                     && literal(&pair[1]).as_deref() == Some("add")
@@ -61,7 +63,7 @@ fn creation_admission(
     args: &serde_json::Value,
     workspace: &str,
     caveats: &Caveats,
-) -> Result<Option<Creation>, ()> {
+) -> Result<Option<(Creation, String)>, ()> {
     if name != "run_command"
         || !args
             .get("command")
@@ -73,7 +75,9 @@ fn creation_admission(
     if !creation_batch_is_read_only_after_add(args) {
         return Err(());
     }
-    creation(name, args, workspace, caveats).map(Some).ok_or(())
+    let candidate = creation(name, args, workspace, caveats).ok_or(())?;
+    let source = git_identity::bind(args["command"].as_str().ok_or(())?, caveats)?;
+    Ok(Some((candidate, source)))
 }
 
 fn creation(
@@ -93,7 +97,7 @@ fn creation(
         if command.program.as_deref() == Some("cd") {
             return None;
         }
-        if !is_git(command.program.as_deref()?) {
+        if command.program.as_deref()? != "git" {
             continue;
         }
         let words = command
@@ -180,7 +184,7 @@ fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
         };
         let args: Vec<_> = words.iter().skip(1).map(String::as_str).collect();
         match c.program.as_deref() {
-            Some(program) if is_git(program) => {
+            Some("git") => {
                 if worktree_add_args(&words).is_some() {
                     additions += 1;
                     true
@@ -298,7 +302,7 @@ pub(super) async fn execute(
 ) -> String {
     let session = collab.worktree_session;
     let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);
-    let normalized =
+    let mut normalized =
         shell::command_args_with_default_cwd(name, args, workspace, collab.default_command_cwd)
             .unwrap_or(std::borrow::Cow::Borrowed(args));
     let admission = session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
@@ -312,6 +316,15 @@ pub(super) async fn execute(
             let _ = slot.set(crate::ExecOutcome::Denied);
         }
         return "capability denied: cannot verify this worktree creation and its surrounding commands; run git worktree add as a standalone literal command in the original checkout so it can become read-only before other mutations run".into();
+    };
+    let candidate = candidate.map(|(candidate, source)| {
+        normalized.to_mut()["command"] = source.into();
+        candidate
+    });
+    let args = if candidate.is_some() {
+        normalized.as_ref()
+    } else {
+        args
     };
     let execution = collab.execution;
     let mut collab = collab;
@@ -420,3 +433,7 @@ mod round2_tests;
 #[cfg(test)]
 #[path = "../tools_tests/worktree_adoption_round3.rs"]
 mod round3_tests;
+
+#[cfg(test)]
+#[path = "../tools_tests/worktree_adoption_round5.rs"]
+mod round5_tests;
