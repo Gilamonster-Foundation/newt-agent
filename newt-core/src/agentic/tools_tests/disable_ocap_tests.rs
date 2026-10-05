@@ -637,7 +637,7 @@ async fn no_floor_keeps_disable_ocap_bit_for_bit() {
 #[tokio::test]
 async fn host_shell_127_wording_grounds_the_named_missing_rule() {
     use crate::ExecOutcome;
-    // The host shell reads NEWT_HOST_EXEC_TIMEOUT_SECS, which a loop test pins.
+    // The host shell reads NEWT_RUN_COMMAND_TIMEOUT_SECS, which a loop test pins.
     let _l = env_lock().await;
     let ws = tempfile::TempDir::new().unwrap();
     for (cmd, expected) in [
@@ -647,9 +647,10 @@ async fn host_shell_127_wording_grounds_the_named_missing_rule() {
         ),
         ("exit 127", ExecOutcome::Failed),
     ] {
-        let envelope = super::shell::host_shell_dispatch(cmd, &ws.path().to_string_lossy(), None)
-            .await
-            .expect("host shell runs");
+        let envelope =
+            super::shell::host_shell_dispatch(cmd, &ws.path().to_string_lossy(), None, None)
+                .await
+                .expect("host shell runs");
         assert_eq!(envelope["exit_code"], 127, "{envelope}");
         let (_, class) = super::shell::host_result(&envelope, |_| String::new());
         assert_eq!(class, expected, "{cmd}: {envelope}");
@@ -668,6 +669,7 @@ async fn host_shell_envelope_matches_the_bridle_shape() {
     let envelope = super::shell::host_shell_dispatch(
         "echo out; echo err >&2; exit 3",
         &ws.path().to_string_lossy(),
+        None,
         None,
     )
     .await

@@ -57,6 +57,7 @@ static DEFAULT_SCHEMA: LazyLock<Arc<serde_json::Value>> = LazyLock::new(|| {
 pub struct HostShellTool {
     shell: String,
     max_output: usize,
+    timeout: std::time::Duration,
     sandbox: Arc<SandboxPolicy>,
     /// The tool's input schema — a *property* of this engine instance, not a
     /// hard-coded literal in [`Tool::schema`]. Defaults to the embedded
@@ -88,11 +89,21 @@ impl HostShellTool {
         Self {
             shell: "/bin/sh".to_string(),
             max_output: DEFAULT_MAX_OUTPUT,
+            timeout: std::time::Duration::from_secs(
+                agent_bridle_core::LimitsPolicy::default().default_timeout_secs,
+            ),
             sandbox: Arc::new(SandboxPolicy::default()),
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             execution_lease: None,
         }
+    }
+
+    /// Bound this invocation using the shared process-group supervisor.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Attach a presentation-only observer for bounded stdout/stderr chunks.
@@ -108,7 +119,7 @@ impl HostShellTool {
 
     /// Retain resources until the blocking process owner finishes, including
     /// when its async waiter is dropped. This does not add host-shell
-    /// cancellation or timeout support.
+    /// cancellation support; the configured timeout still governs shutdown.
     #[must_use]
     pub fn with_execution_lease(mut self, lease: crate::ExecutionLease) -> Self {
         self.execution_lease = Some(lease);
@@ -256,6 +267,7 @@ impl Tool for HostShellTool {
         // permitted under exec=All), fail-closes on unenforceable fs, applies the
         // OS jail, and reports the honest kind.
         let mut command = ConfinedCommand::new(&self.shell)
+            .new_process_group()
             .arg("-c")
             .arg(&cmd)
             .sandbox_policy(Arc::clone(&self.sandbox))
@@ -285,6 +297,7 @@ impl Tool for HostShellTool {
             .ok_or_else(|| ToolError::Exec(std::io::Error::other("stderr pipe missing")))?;
         let (output_guard, output) = output_session(self.output_observer.clone(), max_output);
 
+        let timeout = self.timeout;
         let execution_lease = self.execution_lease.clone();
         let captured = tokio::task::spawn_blocking(move || {
             let _execution_lease = execution_lease;
@@ -306,7 +319,10 @@ impl Tool for HostShellTool {
                 )
             });
 
-            let status = child.wait().map_err(ToolError::Exec);
+            let status = crate::supervisor::supervise(std::slice::from_mut(&mut child), timeout);
+            // A shell can exit with background descendants still holding pipes.
+            // Terminate its group before joining the bounded output readers.
+            crate::kill_child_tree(&mut child);
             let stdout = stdout.join().map_err(|_| {
                 ToolError::Exec(std::io::Error::other("stdout reader thread panicked"))
             });
@@ -322,17 +338,26 @@ impl Tool for HostShellTool {
         .await
         .map_err(|e| ToolError::Exec(std::io::Error::other(format!("join: {e}"))))??;
 
-        let (status, stdout, stdout_truncated, stderr, stderr_truncated) = captured;
+        let ((exit_code, timed_out), stdout, stdout_truncated, stderr, stderr_truncated) = captured;
         let stdout = cap_utf8(&stdout, max_output, stdout_truncated);
-        let stderr = cap_utf8(&stderr, max_output, stderr_truncated);
+        let stderr = if timed_out {
+            format!(
+                "command timed out after {}s; process group terminated",
+                timeout.as_secs()
+            )
+        } else {
+            cap_utf8(&stderr, max_output, stderr_truncated)
+        };
         let envelope = ToolEnvelope::new(sandbox_kind)
             .with_disclosure(self.disclosure())
-            .with_exit_code(status.code().unwrap_or(-1))
+            .with_exit_code(exit_code)
             .with_stdout(stdout)
             .with_stderr(stderr)
-            .with_timed_out(false)
+            .with_timed_out(timed_out)
             .into_json();
-        output_guard.finish();
+        if !timed_out {
+            output_guard.finish();
+        }
         Ok(Invocation::Ran(envelope))
     }
 }

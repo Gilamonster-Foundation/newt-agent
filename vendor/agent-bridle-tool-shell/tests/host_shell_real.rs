@@ -449,9 +449,7 @@ fn host_shell_confined_command_admits_net_none_with_named_stdio() {
         .stdout(ConfinedStdio::Piped)
         .stderr(ConfinedStdio::Piped)
         .spawn(&cx)
-        .expect(
-            "net:none with the host-shell's own named stdio shape must now be admitted",
-        );
+        .expect("net:none with the host-shell's own named stdio shape must now be admitted");
 
     let output = child.child.wait_with_output().expect("wait");
     assert!(
@@ -499,4 +497,23 @@ fn host_shell_confined_command_refuses_net_none_with_raw_other_stdio() {
         matches!(res, Err(ToolError::Denied { .. })),
         "the pre-fix raw-Stdio shape must still refuse net:none admission, got {res:?}"
     );
+}
+
+/// newt #2732: grounds the injected-clock supervisor test in the real host
+/// executor. An injected zero budget terminates a non-finishing shell without
+/// sleeping to a wall-clock deadline or asserting elapsed duration.
+#[tokio::test]
+async fn issue_2732_host_shell_zero_budget_returns_timeout() {
+    let tool = HostShellTool::new().with_timeout(Duration::ZERO);
+    let out = tool
+        .invoke(
+            serde_json::json!({"cmd": "while :; do :; done"}),
+            &ctx(Caveats::top()),
+        )
+        .await
+        .expect("timeout envelope");
+    assert_eq!(out["timed_out"], true);
+    assert_eq!(out["exit_code"], 124);
+    assert!(out["stderr"].as_str().unwrap().contains("0s"));
+    assert!(out["stdout"].as_str().unwrap().len() <= OUTPUT_CAP);
 }
