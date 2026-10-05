@@ -2,19 +2,72 @@
 use super::*;
 use crate::agentic::claim_check;
 
-fn words(clause: &str) -> Vec<String> {
+fn tokens(clause: &str) -> Vec<&str> {
     clause
-        .split(|c: char| c.is_whitespace() || "()[]<>`*,;\"".contains(c))
+        .split_inclusive(',')
+        .flat_map(|part| part.split(|c: char| c.is_whitespace() || "()[]<>`*;\"".contains(c)))
+        .map(|word| word.trim_matches(['.', '!', '?', ':']))
         .filter(|word| !word.is_empty())
-        .map(|word| {
-            word.trim_end_matches(['.', '!', '?', ':'])
-                .to_ascii_lowercase()
-        })
         .collect()
 }
 
-fn is_creation_claim(clause: &str) -> bool {
-    let words = words(clause);
+fn reference(token: &str) -> Option<String> {
+    let token = token.trim_end_matches(',');
+    if token.contains("://") && token.contains("/pull/") {
+        return Some(token.to_string());
+    }
+    let number = token.strip_prefix('#').unwrap_or(token);
+    (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit())).then(|| format!("#{number}"))
+}
+
+fn predicate_word(word: &str) -> bool {
+    matches!(
+        word,
+        "is" | "was" | "has" | "been" | "now" | "already" | "successfully"
+    )
+}
+
+/// Keep each PR's number and URL together, splitting explicit reference lists
+/// and stopping before comparison/title prose. The consumed prefix also
+/// identifies an immediately coordinated PR noun.
+fn reference_prefix(tokens: &[&str]) -> (Vec<Vec<String>>, usize) {
+    let mut groups = vec![Vec::new()];
+    let mut consumed = 0;
+    let mut separated = false;
+    while let Some(token) = tokens.get(consumed) {
+        if let Some(reference) = reference(token) {
+            if separated && !groups.last().expect("one group").is_empty() {
+                groups.push(Vec::new());
+            }
+            groups.last_mut().expect("one group").push(reference);
+            separated = token.ends_with(',');
+        } else {
+            let word = token.to_ascii_lowercase();
+            if matches!(word.as_str(), "and" | "&")
+                && tokens
+                    .get(consumed + 1)
+                    .is_some_and(|next| reference(next).is_some())
+            {
+                separated = true;
+            } else if !predicate_word(&word)
+                && !matches!(word.as_str(), "open" | "opened" | "created")
+            {
+                break;
+            }
+        }
+        consumed += 1;
+    }
+    (groups, consumed)
+}
+
+/// Each supported created object gets its own reference group. Merely naming
+/// another PR in comparison prose does not claim that it was created too.
+fn created_references(clause: &str) -> Vec<Vec<String>> {
+    let tokens = tokens(clause);
+    let words: Vec<_> = tokens
+        .iter()
+        .map(|word| word.trim_end_matches(',').to_ascii_lowercase())
+        .collect();
     if words.iter().any(|word| {
         matches!(
             word.as_str(),
@@ -33,13 +86,29 @@ fn is_creation_claim(clause: &str) -> bool {
                 | "earlier"
         ) || word.contains("n't")
     }) {
-        return false;
+        return Vec::new();
     }
-    words.iter().enumerate().any(|(index, word)| {
-        let noun = word == "pr" || (word == "request" && index > 0 && words[index - 1] == "pull");
-        if !noun {
-            return false;
+    let nouns: Vec<_> = words
+        .iter()
+        .enumerate()
+        .filter_map(|(index, word)| {
+            (word == "pr" || (word == "request" && index > 0 && words[index - 1] == "pull"))
+                .then_some(index)
+        })
+        .collect();
+    let noun_start = |index: usize| {
+        if words[index] == "request" {
+            index - 1
+        } else {
+            index
         }
+    };
+    let mut claims = Vec::new();
+    let mut previous: Option<(bool, usize)> = None;
+    for (position, &index) in nouns.iter().enumerate() {
+        let end = nouns
+            .get(position + 1)
+            .map_or(words.len(), |&next| noun_start(next));
         let before = &words[..index];
         let opened_before = before
             .iter()
@@ -52,45 +121,27 @@ fn is_creation_claim(clause: &str) -> bool {
                     )
                 })
             });
-        let after = &words[index + 1..];
+        let after = &words[index + 1..end];
         let opened_after = after.iter().enumerate().any(|(verb, word)| {
             matches!(word.as_str(), "open" | "opened" | "created")
-                && after[..verb].iter().all(|word| {
-                    let number = word.trim_start_matches('#');
-                    matches!(
-                        word.as_str(),
-                        "is" | "was" | "has" | "been" | "now" | "already" | "successfully"
-                    ) || (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
-                        || crate::git_staging::validate_pr_url(word).is_some()
-                })
+                && after[..verb]
+                    .iter()
+                    .all(|word| predicate_word(word) || reference(word).is_some())
         });
-        opened_before || opened_after
-    })
-}
-
-/// Number and URL references are locators; the receipt is the trusted fact.
-fn references(clause: &str) -> Vec<String> {
-    let tokens: Vec<_> = clause
-        .split(|c: char| c.is_whitespace() || "()[]<>`*,;\"".contains(c))
-        .filter(|token| !token.is_empty())
-        .map(|token| token.trim_matches(['.', '!', '?', ':']))
-        .collect();
-    tokens
-        .iter()
-        .enumerate()
-        .filter_map(|(index, token)| {
-            if token.contains("://") && token.contains("/pull/") {
-                return Some((*token).to_string());
-            }
-            let number = token.strip_prefix('#').unwrap_or(token);
-            let previous = index.checked_sub(1).and_then(|i| tokens.get(i))?;
-            (!number.is_empty()
-                && number.chars().all(|c| c.is_ascii_digit())
-                && (previous.eq_ignore_ascii_case("pr")
-                    || previous.eq_ignore_ascii_case("request")))
-            .then(|| format!("#{number}"))
-        })
-        .collect()
+        let coordinated = previous.is_some_and(|(created, end)| {
+            created
+                && words[end..noun_start(index)]
+                    .iter()
+                    .all(|word| matches!(word.as_str(), "and" | "&"))
+        });
+        let created = opened_before || opened_after || coordinated;
+        let (refs, consumed) = reference_prefix(&tokens[index + 1..end]);
+        if created {
+            claims.extend(refs);
+        }
+        previous = Some((created, index + 1 + consumed));
+    }
+    claims
 }
 
 impl VerificationLedger {
@@ -112,15 +163,11 @@ impl VerificationLedger {
                 clause.push_str(token);
                 clause.push(' ');
                 if claim_check::ends_a_clause(token) {
-                    if is_creation_claim(&clause) {
-                        claims.push(references(&clause));
-                    }
+                    claims.extend(created_references(&clause));
                     clause.clear();
                 }
             }
-            if is_creation_claim(&clause) {
-                claims.push(references(&clause));
-            }
+            claims.extend(created_references(&clause));
         }
         if claims.is_empty() {
             return text;
