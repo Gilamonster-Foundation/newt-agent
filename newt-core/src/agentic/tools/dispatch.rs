@@ -29,6 +29,8 @@ use crate::agentic::tools::{execute_tool_inner, shell, tool_presentation};
 /// `Default` is all-`None`: the bare dispatch a test or embedder starts from.
 #[derive(Default)]
 pub(crate) struct ToolCollaborators<'a, 'gate> {
+    /// Turn-local pages observed after successful read authorization.
+    pub(crate) read_history: Option<&'a mut super::ReadHistory>,
     /// Call-local command default supplied by the operator, without granting authority.
     pub(crate) default_command_cwd: Option<&'a std::path::Path>,
     pub(crate) invocation: Option<&'a agentic::smart_harness::ToolInvocation<'a>>,
