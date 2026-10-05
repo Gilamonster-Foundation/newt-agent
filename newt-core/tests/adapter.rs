@@ -158,8 +158,20 @@ mod b0a {
             needle: "self.ask_with_caveats(",
             why: "the ordinary terminal entry must reach the baseline-aware permission path",
         },
+        // #2731: both ordinary and one-fetch approvals share the same
+        // semantic prompt path; pin both forwarding edges independently.
         Link {
             caller: "ask_with_caveats",
+            needle: "self.ask_scoped(",
+            why: "ordinary permissions must reach the shared scoped implementation",
+        },
+        Link {
+            caller: "ask_dependency_fetch",
+            needle: "self.ask_scoped(",
+            why: "operation-only fetch permissions must reach the same implementation",
+        },
+        Link {
+            caller: "ask_scoped",
             needle: "permission_interaction(",
             why: "the terminal answer reader must receive the semantic interaction",
         },
@@ -256,7 +268,7 @@ mod b0a {
         // ...and the surfaces must each name their OWN audience, so a
         // switch that routed both through one hard-coded audience is a
         // failure rather than a pass.
-        for caller in ["ask_with_caveats", "permission_interaction"] {
+        for caller in ["ask_scoped", "permission_interaction"] {
             let terminal = function_body(&lines, caller).expect("terminal path");
             assert!(
                 terminal.contains("Audience::Terminal"),
@@ -307,6 +319,16 @@ mod b0a {
             &[
                 Link {
                     caller: "ask_with_caveats",
+                    needle: "self.ask_scoped(",
+                    why: "the ordinary entry must reach shared authorization",
+                },
+                Link {
+                    caller: "ask_dependency_fetch",
+                    needle: "self.ask_scoped(",
+                    why: "the one-fetch entry must reach shared authorization",
+                },
+                Link {
+                    caller: "ask_scoped",
                     needle: "self.authorize(",
                     why: "the TERMINAL surface must authorize its decoded answer",
                 },
@@ -374,6 +396,12 @@ mod b0a {
             "    self.ask_with_caveats(&self.base.clone(), requests)",
             "}",
             "fn ask_with_caveats(&mut self, baseline: &C, requests: &[R]) -> Decision {",
+            "    self.ask_scoped(baseline, requests, false)",
+            "}",
+            "fn ask_dependency_fetch(&mut self, prepared: &C, request: &R) -> Decision {",
+            "    self.ask_scoped(prepared, std::slice::from_ref(request), true)",
+            "}",
+            "fn ask_scoped(&mut self, baseline: &C, requests: &[R], operation_only: bool) -> Decision {",
             "    let q = Question {",
             "        markdown: format!(\"{} wants\", req.tool),",
             "        actions: vec![],",
@@ -412,8 +440,7 @@ mod b0a {
         assert!(
             missing
                 .iter()
-                .any(|m| m.contains("`fn ask_with_caveats`")
-                    && m.contains("permission_interaction(")),
+                .any(|m| m.contains("`fn ask_scoped`") && m.contains("permission_interaction(")),
             "the guard did not notice that the TERMINAL surface never switched: {missing:#?}"
         );
         assert_eq!(missing.len(), 1, "only the terminal entry is disconnected");
@@ -426,7 +453,7 @@ mod b0a {
         // And the old builder survives in the unswitched function, which
         // the brace-depth body extraction must attribute to the right
         // function rather than to its neighbour.
-        let terminal = function_body(&half_switched, "ask_with_caveats").expect("body");
+        let terminal = function_body(&half_switched, "ask_scoped").expect("body");
         assert!(terminal.contains("Question {"));
         let web = function_body(&half_switched, "await_web_decision").expect("body");
         assert!(
@@ -437,6 +464,8 @@ mod b0a {
 
     /// Seed a broken edge in each named function, including both wrappers
     /// around the shared builder. A matching call elsewhere cannot repair it.
+    /// Regression #2731: disconnecting either approval entry from the extracted
+    /// scoped helper must still fail the guard.
     #[test]
     fn every_definition_link_is_required_in_its_own_function() {
         let lines = production_lines("newt-tui/src/permissions.rs");
