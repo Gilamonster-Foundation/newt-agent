@@ -173,7 +173,9 @@ mod native {
             if skip_without_real_kernel_fence() {
                 return;
             }
-            governed_commit_carries_the_attribution_trailer().await;
+            governed_commit_carries_the_attribution_trailer(false, false).await;
+            governed_commit_carries_the_attribution_trailer(true, false).await;
+            governed_commit_carries_the_attribution_trailer(true, true).await;
             disabling_the_broker_refuses_the_commit_entirely().await;
             super::cancellation::run().await;
             println!("{MARKER}");
@@ -298,10 +300,10 @@ mod native {
     /// (or signature)" as the round-trip proof, and the trailer alone
     /// already proves the policy's `finalize_message` reached the real
     /// commit through the real hook handshake.
-    struct TrailerGitTool;
+    struct TrailerGitTool(bool);
     impl GitTool for TrailerGitTool {
         fn native_commit_policy(&self) -> Option<Arc<dyn CommitPolicy>> {
-            Some(Arc::new(TrailerPolicy))
+            Some(Arc::new(TrailerPolicy(self.0)))
         }
         fn dispatch(
             &self,
@@ -314,7 +316,7 @@ mod native {
         }
     }
 
-    struct TrailerPolicy;
+    struct TrailerPolicy(bool);
     impl CommitPolicy for TrailerPolicy {
         fn finalize_message(&self, message: &str) -> Result<String, String> {
             // #2693: `CommitPolicy::finalize_message`'s doc contract requires
@@ -329,7 +331,7 @@ mod native {
             Ok(format!("{message}\n\n{TRAILER}\n"))
         }
         fn signing_required(&self) -> bool {
-            false
+            self.0
         }
         fn sign_commit(&self, _payload: &[u8]) -> Result<String, String> {
             Err("signing not exercised by this fixture".into())
@@ -375,11 +377,20 @@ mod native {
     /// MUST land on an admitted configuration. Measured red against the
     /// pre-#2693 `ExecOrigin::AgentInfluenced` origin (this assertion fails
     /// with the refusal text quoted); green with `ExecOrigin::BrokerMediated`.
-    async fn governed_commit_carries_the_attribution_trailer() {
+    // #2720: ambient authority must still run the real attribution broker.
+    async fn governed_commit_carries_the_attribution_trailer(
+        full_access: bool,
+        signing_required: bool,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let (main, wt) = init_worktree(root.path());
-        let session = session_caveats(&wt);
-        let git_tool = TrailerGitTool;
+        let session = if full_access {
+            Caveats::top()
+        } else {
+            session_caveats(&wt)
+        };
+        let git_tool = TrailerGitTool(signing_required);
+        let old_tip = real_git_output(&wt, &["rev-parse", "HEAD"]);
 
         let out = newt_core::execute_tool(
             "run_command",
@@ -412,6 +423,20 @@ mod native {
              `ExecOrigin::BrokerMediated`, or a revert to `AgentInfluenced`, in \
              native_git_broker.rs: {out}"
         );
+
+        // #2720: full access must never turn a failed signer into an unsigned commit.
+        if signing_required {
+            assert!(
+                out.contains("signing not exercised by this fixture"),
+                "{out}"
+            );
+            assert_eq!(real_git_output(&wt, &["rev-parse", "HEAD"]), old_tip);
+            assert_eq!(
+                real_git_output(&main, &["rev-parse", "refs/heads/task"]),
+                old_tip
+            );
+            return;
+        }
 
         let message = real_git_output(&main, &["log", "-1", "--format=%B", "refs/heads/task"]);
         assert!(
