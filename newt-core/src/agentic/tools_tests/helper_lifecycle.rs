@@ -695,3 +695,50 @@ fn lifecycle_run_of_non_build_tool_does_not_route() {
     assert!(!lifecycle_run_routes_to_build_lane("black --check ."));
     assert!(!lifecycle_run_routes_to_build_lane("mypy src/"));
 }
+
+/// #2731: a recovery note must reach the terminal override as well as the
+/// model result, even when the build output is trimmed.
+#[test]
+fn cold_cache_recovery_is_visible_to_model_and_operator() {
+    #[derive(Default)]
+    struct Display(String);
+    impl crate::agentic::display::ToolPresentation for Display {
+        fn preview(&mut self, _: &str, _: usize) {}
+        fn document(&mut self, _: &str) {}
+        fn override_result(&mut self, text: String) {
+            self.0 = text;
+        }
+    }
+    for trim in [
+        None,
+        OutputTrim::from_json(Some(&serde_json::json!({"mode":"head","n":1}))),
+    ] {
+        let mut display = Display::default();
+        let out = crate::confined_exec::ConfinedOutput {
+            success: false,
+            code: Some(101),
+            stdout: b"build header\n".to_vec(),
+            stderr: b"error: cache missing\n".to_vec(),
+            timed_out: false,
+            sandbox_kind: agent_bridle::SandboxKind::None,
+        };
+        let note = "note: automatic locked fetch was declined by the operator";
+        let (model, outcome) = render_confined_build_result(
+            Ok(out),
+            Some(note),
+            trim,
+            10,
+            false,
+            false,
+            None,
+            &mut display,
+        );
+        assert_eq!(model.matches(note).count(), 1);
+        assert_eq!(outcome, crate::ExecOutcome::Failed);
+        assert!(
+            display.0.contains(note),
+            "operator missed recovery: {}",
+            display.0
+        );
+    }
+}

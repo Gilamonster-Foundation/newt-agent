@@ -378,6 +378,19 @@ pub trait PermissionGate {
         }
     }
 
+    /// Approve the exact fence of one harness-owned `cargo fetch --locked`.
+    /// Unlike a host grant, this can explicitly authorize unrestricted egress
+    /// on platforms without a host boundary. Never persist/reuse the approval
+    /// or widen the session; enforce delegation and preset ceilings. Legacy
+    /// gates fail closed rather than interpreting a host approval as All.
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &Caveats,
+        _request: &PermissionRequest,
+    ) -> PermissionDecision {
+        PermissionDecision::Deny
+    }
+
     /// #728: ask the human a free-text `question` and return a typed
     /// [`HumanQuestionOutcome`] — the GENERIC ask-the-human primitive behind the
     /// `request_user_input` tool. Distinct from [`PermissionGate::ask`], which

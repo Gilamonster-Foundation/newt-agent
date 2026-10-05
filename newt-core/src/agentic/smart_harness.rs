@@ -214,6 +214,22 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
         self.validate_decision(decision)
     }
 
+    fn ask_dependency_fetch(
+        &mut self,
+        prepared: &crate::caveats::Caveats,
+        request: &super::permissions::PermissionRequest,
+    ) -> super::permissions::PermissionDecision {
+        use super::permissions::PermissionDecision;
+        if matches!(
+            self.validate_decision(PermissionDecision::Allow(prepared.clone())),
+            PermissionDecision::Deny
+        ) {
+            return PermissionDecision::Deny;
+        }
+        let decision = self.inner.ask_dependency_fetch(prepared, request);
+        self.validate_decision(decision)
+    }
+
     fn consume_pending_once(&mut self, kind: super::permissions::DenialKind, target: &str) {
         self.inner.consume_pending_once(kind, target);
     }

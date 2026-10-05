@@ -1143,22 +1143,41 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Practical caveat (now):** when the offline build lane fails because the Cargo cache lacks a crate
   `Cargo.lock` pins, the harness runs `cargo fetch --locked` (`dependency_fetch_request`,
   `newt-core/src/confined_exec.rs`) with the existing operator network grant. An explicit `All` grant
-  remains `All`; otherwise fetch is narrowed to `index.crates.io, static.crates.io` after approval.
-  A fresh approval must remain bounded by the invocation and the requested hosts, even if the session's
-  base authority is broader. The `TrustedInfra` label does not bypass platform admission: current Bridle
-  refuses restricted networking on macOS before spawn. On backends that admit the host list without a
-  kernel destination boundary, the network residual remains open. Its fs fence stays kernel-enforced: reads are the
-  calibrated toolchain set (no `credentials.toml`), writes are the workspace plus `$CARGO_HOME/registry` and
-  cargo's package-cache lock files.
+  remains `All`. On macOS, #2731 asks explicitly for unrestricted egress for this ONE fixed fetch,
+  because Seatbelt cannot enforce the crates.io host list. The prepared fence is checked against frame,
+  delegation and preset ceilings; host/session/durable approvals cannot pre-answer it. The same prepared
+  request (including its environment, argv, working directory and fence) is executed after approval;
+  only its fixed timeout is applied afterward. Only a fresh allow-once authorizes this operation,
+  without changing session or build authority. Gates that do not
+  implement this approval fail closed. Other platforms retain the approved `index.crates.io,
+  static.crates.io` scope. The `TrustedInfra` label never bypasses platform admission.
+  The network residual remains open. Its fs fence stays kernel-enforced: reads are the
+  calibrated toolchain set (no `credentials.toml`), writes are the private input copy and scratch plus
+  `$CARGO_HOME/registry` and cargo's package-cache lock files; the source workspace is not added to the fence.
 - **Residual:** 🟠 ACTIVE while a fetch runs. The child is the operator's `cargo`, its argv is fixed, it compiles
   nothing and runs no build script, and `--locked` binds each download to a lockfile checksum. The repository
-  still steers it through `Cargo.lock` and `.cargo/config`, which is why both are screened below.
-- **Disabled while open:** the fetch without the operator's `net` grant for both crates.io hosts
-  (`fetch_locked_dependencies`, `OCAP-GATE: dependency-fetch-egress`); it fails closed with no operator present.
+  still supplies the manifest and lockfile bytes, but the fetch reads a private copy rather than the
+  live workspace. Operator-owned toolchain and Cargo-home configuration remain trusted inputs.
+- **Disabled while open:** the fetch without the operator's applicable network grant: both crates.io hosts,
+  existing unrestricted authority, or the explicit macOS operation-only egress approval
+  (`fetch_locked_dependencies`, `OCAP-GATE: dependency-fetch-egress`). No operator means no new grant.
 - **Compensating controls:** refused when any `Cargo.lock` package names a source other than crates.io (a git
   or alternate registry could receive a credential or steer the fetch), and when a repository `.cargo/config`
   sits between the build directory and the workspace root (it can replace the crates.io source or name a
-  credential-provider program). A refusal identifies the actual permission or setup failure.
+  credential-provider program). Before approval, descriptor-relative reads copy the workspace into
+  an owner-only temporary directory outside the source workspace. Its outer and copied directories
+  are created with explicit mode 0700 and copied files with mode 0600, atomically at creation rather
+  than by a later chmod; permissive umasks cannot expose them. The complete copy's modes are checked
+  before approval and again before launch; non-owner access or non-regular entries refuse execution.
+  No hardlinks or symlinks to source inputs are carried into the copy. The copied lock/config inputs are screened, and their content IDs
+  are compared with the source before and after approval; a prompt-time lock/config change refuses.
+  Cargo runs against the private copy, so source changes after comparison cannot substitute its inputs.
+  The copy stays alive through execution and is then removed. Git/build artifacts are excluded; copies
+  exceeding 20,000 entries, 128 MiB or 64 directory levels refuse, as do platforms without the required
+  descriptor-relative reads (currently supported on Linux/macOS). Dependencies that require omitted
+  links or files outside the copied workspace fail closed. This protects against writers confined to
+  the source workspace, not a trusted same-user process with authority over the private temporary root.
+  A refusal identifies the actual permission or setup failure.
 - **Closure criterion:** the fetch reaches the network only through a harness egress broker (#1599's mediated
   egress) that admits the crates.io hosts, so the child itself can run under `NetGrant::DenyAll`.
 - **Ratchet guard:** `confined_exec::tests::dependency_fetch_is_online_to_crates_io_only_and_never_writes_credentials`

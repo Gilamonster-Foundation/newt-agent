@@ -4654,3 +4654,102 @@ fn full_access_permission_shortcut_preserves_consent_and_ceilings() {
         assert_eq!(prompts.get(), 1, "{mode}");
     }
 }
+
+fn cold_cache_fetch_request() -> PermissionRequest {
+    PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Net,
+        target: "all destinations for one cargo fetch --locked".into(),
+        reason:
+            "#2731: unrestricted egress only for this fixed cargo fetch --locked; session unchanged"
+                .into(),
+        harness_bound: true,
+    }
+}
+
+/// #2731: the real permission adapter must approve exactly one prepared fetch,
+/// even if an identically named host was granted earlier, without session drift.
+#[test]
+fn cold_cache_fetch_asks_once_per_operation_and_preserves_session() {
+    let base = base_caveats("/ws");
+    let request = cold_cache_fetch_request();
+    let prepared = newt_core::confined_exec::dependency_fetch_request(
+        std::path::Path::new("/ws"),
+        std::path::Path::new("/ws"),
+        &Scope::All,
+    )
+    .caveats()
+    .clone();
+    let mut state = PermissionPromptState::default();
+    state
+        .session_grants
+        .insert((request.kind, request.target.clone()));
+    let before = state.session_grants.clone();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce, PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    for _ in 0..2 {
+        let newt_core::PermissionDecision::Allow(allowed) =
+            gate.ask_dependency_fetch(&prepared, &request)
+        else {
+            panic!("fetch declined")
+        };
+        assert_eq!(allowed, prepared);
+        assert_eq!(gate.base, base);
+    }
+    drop(gate);
+    assert_eq!(prompts.get(), 2);
+    assert_eq!(state.session_grants, before);
+    assert!(state.pending_once_grants.is_empty());
+}
+
+/// #2731: refusal, disabled prompts, and preset/delegation ceilings remain
+/// fail-closed despite the prepared operation asking for All network authority.
+#[test]
+fn cold_cache_fetch_cannot_bypass_denial_or_ceiling() {
+    let base = base_caveats("/ws");
+    let request = cold_cache_fetch_request();
+    let prepared = newt_core::confined_exec::dependency_fetch_request(
+        std::path::Path::new("/ws"),
+        std::path::Path::new("/ws"),
+        &Scope::All,
+    )
+    .caveats()
+    .clone();
+    for mode in ["deny", "disabled", "preset", "delegated"] {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let mut ceiling = prepared.clone();
+        ceiling.net = Scope::only(["index.crates.io".into()]);
+        let delegation = crate::caveat_policy_tests::verified_delegation(ceiling.clone());
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![PromptChoice::Deny],
+            prompts.clone(),
+        );
+        match mode {
+            "disabled" => gate.authorization_prompts_enabled = false,
+            "preset" => gate.preset_clamp = Some(ceiling),
+            "delegated" => gate.delegation = Some(&delegation),
+            _ => {}
+        }
+        assert!(
+            matches!(
+                gate.ask_dependency_fetch(&prepared, &request),
+                newt_core::PermissionDecision::Deny
+            ),
+            "{mode}"
+        );
+        assert_eq!(prompts.get(), usize::from(mode == "deny"), "{mode}");
+        assert_eq!(gate.base, base);
+    }
+}
