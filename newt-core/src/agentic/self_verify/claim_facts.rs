@@ -36,6 +36,11 @@ pub(super) fn command_directory(
     args: &serde_json::Value,
     workspace: &str,
 ) -> Option<PathBuf> {
+    // Never interpret shell quoting/escaping or expansion to recover argv.
+    // Reject it anywhere, including inside otherwise ordinary Cargo arguments.
+    if command.contains(['\'', '"', '\\', '$', '`', '*', '?', '[', ']', '{', '}']) {
+        return None;
+    }
     let segments = split_command(command);
     let ((cargo, separator), leading) = segments.split_last()?;
     if cargo.split_whitespace().next() != Some("cargo") || !separator.is_empty() {
@@ -55,12 +60,14 @@ pub(super) fn command_directory(
         }
         dir = dir.join(path);
     }
-    // Explicit manifests select a different package tree; do not mislabel it
-    // as the cwd. Cargo -C and shell substitutions likewise need richer evidence.
-    if command.contains("--manifest-path")
-        || cargo.split_whitespace().any(|word| word.starts_with("-C"))
-        || command.contains(['$', '`'])
-    {
+    // Only literal tokens remain. Decline options that can redirect Cargo's
+    // package/configuration/output context, in both joined and separated forms.
+    const CONTEXT_OPTIONS: &[&str] = &["--manifest-path", "-C", "--config", "-Z", "--target-dir"];
+    if cargo.split_whitespace().any(|word| {
+        CONTEXT_OPTIONS
+            .iter()
+            .any(|option| word.starts_with(option))
+    }) {
         return None;
     }
     Some(super::super::lexical_normalize(&dir))
@@ -240,6 +247,62 @@ mod tests {
             "{command}: {text}"
         );
         assert!(!text.contains("Passed in"), "{command}: {text}");
+    }
+
+    /// #2718 round 4: shell quote removal must not hide a manifest override.
+    #[tokio::test]
+    async fn round4_quoted_manifest_is_unverified() {
+        assert_unknown_directory("cargo check --manifest''-path=/other/Cargo.toml").await;
+    }
+
+    /// #2718 round 4: quoted Cargo directory options cannot certify launch cwd.
+    #[tokio::test]
+    async fn round4_quoted_directory_option_is_unverified() {
+        assert_unknown_directory("cargo check '-C/other'").await;
+    }
+
+    /// #2718 round 4: every unsupported shell syntax and Cargo context option
+    /// fails closed, including joined and separated option values.
+    #[tokio::test]
+    async fn round4_shell_syntax_and_context_options_are_unverified() {
+        for argument in [
+            "--features 'demo'",
+            "--features \"demo\"",
+            r"--features de\mo",
+            "--features $FEATURE",
+            "--features `echo demo`",
+            "-p cr*",
+            "-p cr?",
+            "-p cr[ab]",
+            "-p {one,two}",
+            "--manifest-path=/other/Cargo.toml",
+            "--manifest-path /other/Cargo.toml",
+            "-C/other",
+            "-C /other",
+            "--config=other.toml",
+            "--config other.toml",
+            "-Zunstable-options",
+            "-Z unstable-options",
+            "--target-dir=/other",
+            "--target-dir /other",
+        ] {
+            assert_unknown_directory(&format!("cargo check {argument}")).await;
+        }
+    }
+
+    /// #2718 round 4: literal ordinary Cargo arguments retain directory evidence.
+    #[tokio::test]
+    async fn round4_plain_package_and_lib_keep_directory() {
+        let mut ledger = VerificationLedger::for_turn("refactor", false);
+        run(
+            &mut ledger,
+            "cd /tree && cargo check -p crate --lib",
+            Passed,
+            "/launch",
+        )
+        .await;
+        let text = ledger.annotate_cargo_claim("Cargo check green".into());
+        assert!(text.contains(&in_dir("Passed", "/tree")), "{text}");
     }
 
     /// #2718 round 3: shell quoting cannot hide cwd changes before Cargo.
