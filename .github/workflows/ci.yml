@@ -205,6 +205,11 @@ jobs:
         # of the inward layer's runtime closure (#1828); enabling it here is
         # what keeps the published JSON Schemas from going stale unnoticed.
         run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
+      - name: ambient worktree dispatch proof (#2750)
+        # HOOK PARITY: CI-only real Git/host-shell proof, named in
+        # .githooks/pre-push. Unix fixture; selected explicitly on Linux.
+        # --exact reaches the ignored dispatch test, including operator preview.
+        run: cargo test -p newt-core --lib agentic::tools::worktree::fullaccess_tests::adoption_2750_full_access_creation_then_task_command -- --ignored --exact
       - name: checked move_from native proof (#2724)
         # HOOK PARITY: CI-only; .githooks/pre-push names this real-Cargo
         # lane in its CI-ONLY list. ast and the network-guard helper are

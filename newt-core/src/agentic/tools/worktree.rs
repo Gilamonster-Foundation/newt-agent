@@ -292,6 +292,25 @@ impl PermissionGate for Guard<'_, '_> {
     }
 }
 
+/// Verified creation can only arm a fence when the executor honors it. The
+/// bypass is frozen launch policy; broad grants alone do not disable adoption.
+fn record_verified_creation(
+    session: &crate::worktree_adoption::WorktreeSession,
+    adopted: AdoptedWorktree,
+    bypass: bool,
+) -> String {
+    if bypass {
+        format!("Task worktree created: {}. Warning: worktree protection is not armed because OCAP is disabled; the original checkout remains writable under existing permissions. Use a confined session for automatic original-checkout protection.", adopted.worktree.display())
+    } else {
+        let notice = format!(
+            "Adopted task worktree: {}. The original checkout and shared config are now read-only for this task. Use git -c user.name=… -c user.email=… for per-command identity.",
+            adopted.worktree.display()
+        );
+        session.adopt(adopted);
+        notice
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     presentation: &mut dyn ToolPresentation,
@@ -306,6 +325,7 @@ pub(super) async fn execute(
     tool_offload: bool,
     disposition: PromptDisposition,
 ) -> String {
+    let bypass = ocap_disabled();
     let session = collab.worktree_session;
     let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);
     let mut normalized =
@@ -328,7 +348,12 @@ pub(super) async fn execute(
         if let Some(slot) = collab.execution {
             let _ = slot.set(crate::ExecOutcome::Denied);
         }
-        return "capability denied: cannot verify this worktree creation and its surrounding commands; run git worktree add as a standalone literal command in the original checkout so it can become read-only before other mutations run".into();
+        let protection = if bypass {
+            "; OCAP is disabled, so automatic worktree protection will not be armed"
+        } else {
+            " so it can become read-only before other mutations run"
+        };
+        return format!("capability denied: cannot verify this worktree creation and its surrounding commands; run git worktree add as a standalone literal command in the original checkout{protection}");
     };
     let candidate = candidate.map(|(candidate, source)| {
         normalized.to_mut()["command"] = source.into();
@@ -385,7 +410,7 @@ pub(super) async fn execute(
         if refuse_git
             || !policy.valid(caveats)
             || refuse
-            || (ocap_disabled() && matches!(name, "run_command" | "lifecycle" | "build_exec"))
+            || (bypass && matches!(name, "run_command" | "lifecycle" | "build_exec"))
         {
             if let Some(invocation) = collab.invocation {
                 invocation.host();
@@ -442,8 +467,13 @@ pub(super) async fn execute(
                 // Reuse the existing bind-once identity cache for later native
                 // Git dispatch; never replace an identity another call pinned.
                 let _ = crate::git_hardening::ambient_gitdir_write_grant(&adopted.worktree);
-                result.push_str(&format!("\nAdopted task worktree: {}. The original checkout and shared config are now read-only for this task. Use git -c user.name=… -c user.email=… for per-command identity.", adopted.worktree.display()));
-                session.adopt(adopted);
+                let notice = record_verified_creation(session, adopted, bypass);
+                if bypass {
+                    // Visible to the operator even when shell output has an
+                    // independently folded/overridden result presentation.
+                    presentation.preview(&notice, 0);
+                }
+                result.push_str(&format!("\n{notice}"));
             }
         }
     }
@@ -479,6 +509,10 @@ mod round5_tests;
 #[cfg(test)]
 #[path = "../tools_tests/worktree_adoption_round6.rs"]
 mod round6_tests;
+
+#[cfg(test)]
+#[path = "../tools_tests/worktree_adoption_fullaccess.rs"]
+mod fullaccess_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tools_tests/worktree_adoption_refs.rs"]

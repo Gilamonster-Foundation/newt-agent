@@ -217,7 +217,9 @@ impl VerificationLedger {
     /// Render observed facts with their exact directory and command scope,
     /// never an unqualified endorsement of the model's tree/package claim.
     pub(crate) fn annotate_cargo_claim(&self, mut text: String) -> String {
-        if !cargo_claim(&text) {
+        // A summarizer may retain the notices while rephrasing the claim.
+        // Recompute and dedupe those too; a marker never supplies evidence.
+        if !cargo_claim(&text) && !text.contains("\n\n⚠ claim check (#2718): ") {
             return text;
         }
         let check = VerifyCheck::new("cargo check", &["cargo check"]).except(CARGO_NON_RUNS);
@@ -275,7 +277,15 @@ impl VerificationLedger {
         if facts.is_empty() {
             facts.push("no cargo check execution was observed this turn".into());
         }
-        text.push_str(&format!("\n\n⚠ claim check (#2718): {}. These are observed check facts, not verification of another tree or a broader check scope.", facts.join("; ")));
+        let annotation = format!("\n\n⚠ claim check (#2718): {}. These are observed check facts, not verification of another tree or a broader check scope.", facts.join("; "));
+        // #2750: cap handoffs and rechecked text can already carry this exact
+        // fact. Recompute from the ledger first: a marker or a different fact
+        // must never suppress the current evidence. Collapse only identical
+        // copies, preserving the rest of the answer byte-for-byte.
+        if let Some((before, after)) = text.split_once(&annotation) {
+            return format!("{before}{annotation}{}", after.replace(&annotation, ""));
+        }
+        text.push_str(&annotation);
         text
     }
 }
@@ -283,6 +293,53 @@ impl VerificationLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2750: a summarizer can also return repeated copies of an earlier notice.
+    #[test]
+    fn adoption_2750_existing_duplicate_claim_warnings_collapse() {
+        let ledger = VerificationLedger::for_turn("refactor", false);
+        let once = ledger.annotate_cargo_claim("Cargo check passed".into());
+        let suffix = once.strip_prefix("Cargo check passed").unwrap();
+        let text = ledger.annotate_cargo_claim(format!("Cargo check passed{}", suffix.repeat(6)));
+        assert_eq!(text, once);
+        let handoff = ledger.annotate_cargo_claim(format!("Status: blocked.{}", suffix.repeat(6)));
+        assert_eq!(handoff, format!("Status: blocked.{suffix}"));
+        let forged = ledger.annotate_cargo_claim(
+            "Cargo check passed\n\n⚠ claim check (#2718): Passed in an invented directory".into(),
+        );
+        assert!(forged.contains("no cargo check execution was observed this turn"));
+    }
+
+    /// #2750: finalization can see an already annotated handoff repeatedly.
+    #[test]
+    fn adoption_2750_claim_warning_is_idempotent() {
+        let ledger = VerificationLedger::for_turn("refactor", false);
+        let mut text = "Cargo check passed".to_string();
+        for _ in 0..6 {
+            text = ledger.annotate_cargo_claim(text);
+        }
+        assert_eq!(text.matches("⚠ claim check (#2718):").count(), 1, "{text}");
+    }
+
+    /// #2750: an old annotation must not suppress facts from a changed ledger.
+    #[tokio::test]
+    async fn adoption_2750_changed_ledger_keeps_fresh_claim_facts() {
+        let mut ledger = VerificationLedger::for_turn("refactor", false);
+        let initial = ledger.annotate_cargo_claim("Cargo check passed".into());
+        run(&mut ledger, "cargo check", Passed, "/task").await;
+        let passed = ledger.annotate_cargo_claim(initial.clone());
+        assert!(passed.starts_with(&initial));
+        assert!(passed.contains(&in_dir("Passed", "/task")), "{passed}");
+        assert_eq!(passed.matches("⚠ claim check (#2718):").count(), 2);
+
+        run(&mut ledger, "cargo check", Failed, "/task").await;
+        let failed = ledger.annotate_cargo_claim(passed.clone());
+        assert!(failed.starts_with(&passed));
+        assert!(failed.contains(&in_dir("Failed", "/task")), "{failed}");
+        assert_eq!(failed.matches("⚠ claim check (#2718):").count(), 3);
+        assert_eq!(ledger.annotate_cargo_claim(failed.clone()), failed);
+    }
+
     use crate::ExecOutcome::{Failed, Passed};
 
     fn in_dir(status: &str, directory: &str) -> String {
