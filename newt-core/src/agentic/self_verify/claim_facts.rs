@@ -36,12 +36,23 @@ pub(super) fn command_directory(
     // The structured cwd field is already a literal path (including Windows
     // separators); only shell cd operands need conservative token handling.
     let mut dir = Path::new(workspace).join(cwd);
+    let mut leading = true;
     for (segment, separator) in split_command(command) {
         let words: Vec<_> = segment.split_whitespace().collect();
         if words.first() != Some(&"cd") {
-            break;
+            leading = false;
+            // Shell builtins hidden behind wrappers and env's chdir options
+            // need execution-layer cwd evidence, not the inferred launch cwd.
+            if words.iter().any(|word| {
+                matches!(*word, "cd" | "pushd" | "popd")
+                    || word.starts_with("--chdir")
+                    || word.starts_with("-C")
+            }) {
+                return None;
+            }
+            continue;
         }
-        if words.len() != 2 || separator != "&&" || !literal_path(words[1]) {
+        if !leading || words.len() != 2 || separator != "&&" || !literal_path(words[1]) {
             return None;
         }
         dir = dir.join(words[1]);
@@ -160,7 +171,7 @@ impl VerificationLedger {
                     *entry = Observed::Write;
                 }
             }
-            let (_, report) = conclude(&Conclusion {
+            let ((_, report), evidence) = conclude_with_evidence(&Conclusion {
                 checks: std::slice::from_ref(&check),
                 requested: &[],
                 ledger: &ledger,
@@ -174,27 +185,12 @@ impl VerificationLedger {
             } else {
                 status
             };
-            // A different/narrower successful invocation cannot discharge an
-            // earlier failure. Name that failed invocation, not the later pass.
-            let failed = matches!(status, CheckStatus::Failed | CheckStatus::TimedOut);
-            let command = ledger
-                .entries
-                .iter()
-                .rev()
-                .find_map(|entry| match entry {
-                    Observed::Exec {
-                        command, outcome, ..
-                    } if check
-                        .invocation(command)
-                        .is_some_and(|i| !failed || i.evidence)
-                        && (!failed
-                            || matches!(outcome, ExecOutcome::Failed | ExecOutcome::TimedOut)) =>
-                    {
-                        Some(command.as_str())
-                    }
-                    _ => None,
-                })
-                .unwrap_or("cargo check");
+            let Some(Observed::Exec {
+                command, directory, ..
+            }) = evidence[0].and_then(|index| ledger.entries.get(index))
+            else {
+                continue;
+            };
             let dir = directory
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -233,6 +229,99 @@ mod tests {
                 "/launch",
             )
             .await;
+    }
+
+    /// #2718 round 2: a denied different scope cannot inherit an earlier pass;
+    /// a real write must still stale the retained evidence.
+    #[tokio::test]
+    async fn round2_status_and_invocation_share_evidence() {
+        let mut ledger = VerificationLedger::for_turn("refactor", false);
+        run(&mut ledger, "cargo check -p core", Passed, "/worktree").await;
+        run(
+            &mut ledger,
+            "cargo check -p other",
+            ExecOutcome::Denied,
+            "/worktree",
+        )
+        .await;
+        let text = ledger.annotate_cargo_claim("Cargo check green".into());
+        assert!(
+            text.contains("observed invocation: `cargo check -p core`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("invocation: `cargo check -p other`"),
+            "{text}"
+        );
+        ledger.record_write();
+        let text = ledger.annotate_cargo_claim("Cargo check green".into());
+        assert!(text.contains("Stale"), "{text}");
+        assert!(text.contains("invocation: `cargo check -p core`"), "{text}");
+    }
+
+    /// #2718 round 2: masked timeout evidence must not rename a retained failure.
+    #[tokio::test]
+    async fn round2_retained_failure_keeps_its_invocation() {
+        let mut ledger = VerificationLedger::for_turn("refactor", false);
+        run(&mut ledger, "cargo check -p core", Failed, "/worktree").await;
+        run(
+            &mut ledger,
+            "cargo check -p other | tail -5",
+            ExecOutcome::TimedOut,
+            "/worktree",
+        )
+        .await;
+        let text = ledger.annotate_cargo_claim("Cargo check green".into());
+        assert!(text.contains(&in_dir("Failed", "/worktree")), "{text}");
+        assert!(text.contains("invocation: `cargo check -p core`"), "{text}");
+        run(
+            &mut ledger,
+            "cargo check -p other",
+            ExecOutcome::TimedOut,
+            "/worktree",
+        )
+        .await;
+        let text = ledger.annotate_cargo_claim("Cargo check green".into());
+        assert!(text.contains(&in_dir("TimedOut", "/worktree")), "{text}");
+        assert!(
+            text.contains("invocation: `cargo check -p other`"),
+            "{text}"
+        );
+    }
+
+    /// #2718 round 2: non-leading cd and cwd-changing env wrappers are ambiguous.
+    #[tokio::test]
+    async fn round2_ambiguous_directories_are_unverified() {
+        for command in [
+            "true && cd /other && cargo check",
+            "cd /first && true && cd /other && cargo check",
+            "env --chdir=/other cargo check",
+        ] {
+            assert_eq!(
+                command_directory(command, &serde_json::json!({}), "/launch"),
+                None,
+                "{command}"
+            );
+            let mut ledger = VerificationLedger::for_turn("refactor", false);
+            run(&mut ledger, command, Passed, "/launch").await;
+            let text = ledger.annotate_cargo_claim("Cargo check green".into());
+            assert!(
+                text.contains("Unverified in `unknown directory`")
+                    || text.contains("no cargo check execution was observed"),
+                "{command}: {text}"
+            );
+            assert!(!text.contains("Passed in"), "{command}: {text}");
+        }
+        let mut ledger = VerificationLedger::for_turn("refactor", false);
+        run(
+            &mut ledger,
+            "cd /first && cd nested && cargo check",
+            Passed,
+            "/launch",
+        )
+        .await;
+        let text = ledger.annotate_cargo_claim("Cargo check green".into());
+        assert!(text.contains(&in_dir("Passed", "/first/nested")), "{text}");
     }
 
     /// #2718: an off-by-default verify gate must not disable final claim facts.

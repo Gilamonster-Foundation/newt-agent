@@ -58,16 +58,23 @@ pub(crate) fn path_claims(text: &str) -> Vec<String> {
 
 /// #2718: proposed files in a remaining-work list are not existence claims.
 fn asserted_path_claims(text: &str) -> Vec<String> {
-    let mut planning = false;
+    let mut planning_level = None;
     let mut claims = Vec::new();
     for line in text.lines() {
-        let lower = line.trim().trim_matches('#').trim().to_ascii_lowercase();
+        let trimmed = line.trim();
+        let heading_level = trimmed.chars().take_while(|c| *c == '#').count();
+        let heading = (1..=6).contains(&heading_level)
+            && trimmed[heading_level..].starts_with(char::is_whitespace);
+        let lower = trimmed.trim_matches('#').trim().to_ascii_lowercase();
         if lower.starts_with("remaining work") || lower.starts_with("next steps") {
-            planning = true;
-        } else if lower.starts_with("current state") || lower.starts_with("completed") {
-            planning = false;
+            planning_level = Some(if heading { heading_level } else { 0 });
+        } else if lower.starts_with("current state")
+            || lower.starts_with("completed")
+            || (heading && planning_level.is_some_and(|level| level == 0 || heading_level <= level))
+        {
+            planning_level = None;
         }
-        if planning
+        if planning_level.is_some()
             || lower.starts_with('>')
             || lower.starts_with("planned:")
             || lower.starts_with("will ")
@@ -1764,6 +1771,16 @@ mod issue_2718_tests {
         let got = annotate_path_claims(text.into(), |_| Some(false));
         let note = got.strip_prefix(text).unwrap();
         assert!(!note.contains("loop_infer"), "{got}");
+        assert!(note.contains("src/missing.rs"), "{got}");
+    }
+
+    /// #2718 round 2: planning ends at the next unrelated section heading.
+    #[test]
+    fn round2_plan_section_does_not_hide_validation_claims() {
+        let text = "## Next steps\nCreate src/future.rs\n## Validation\nUpdated src/missing.rs";
+        let got = annotate_path_claims(text.into(), |_| Some(false));
+        let note = got.strip_prefix(text).unwrap();
+        assert!(!note.contains("src/future.rs"), "{got}");
         assert!(note.contains("src/missing.rs"), "{got}");
     }
 

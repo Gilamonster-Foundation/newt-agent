@@ -1099,6 +1099,14 @@ struct Mutation<'a> {
 
 /// Decide what to do with a concluding answer. Pure.
 pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
+    conclude_with_evidence(c).0
+}
+
+/// #2718: ephemeral ledger positions bind displayed facts to the same entry
+/// that decided each status. These are not persisted identities or trace fields.
+fn conclude_with_evidence(
+    c: &Conclusion<'_>,
+) -> ((Decision, VerificationReport), Vec<Option<usize>>) {
     // The chain head before each entry, then after the last one, rebuilt from
     // the ordered observations with the checks detected NOW. A plain run of a
     // detected check and a read-only command are not mutations; every other
@@ -1141,7 +1149,7 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
         None,
         Pass(usize, &'a Option<ContentId>),
         Unverified(usize),
-        Fail(ExecOutcome, String),
+        Fail(ExecOutcome, String, usize),
         Blocked(ExecOutcome, usize),
     }
     let standing = |check: &VerifyCheck| {
@@ -1162,14 +1170,14 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
             state = match (run.evidence, *outcome, state) {
                 (false, _, kept @ (Standing::Pass(..) | Standing::Fail(..))) => kept,
                 (false, _, _) => Standing::Unverified(i),
-                (true, ExecOutcome::Passed, Standing::Fail(kind, failed))
+                (true, ExecOutcome::Passed, Standing::Fail(kind, failed, i))
                     if failed != run.normalized =>
                 {
-                    Standing::Fail(kind, failed)
+                    Standing::Fail(kind, failed, i)
                 }
                 (true, ExecOutcome::Passed, _) => Standing::Pass(i, tree),
                 (true, kind @ (ExecOutcome::Failed | ExecOutcome::TimedOut), _) => {
-                    Standing::Fail(kind, run.normalized)
+                    Standing::Fail(kind, run.normalized, i)
                 }
                 (true, _, kept @ (Standing::Pass(..) | Standing::Fail(..))) => kept,
                 (true, kind, _) => Standing::Blocked(kind, i),
@@ -1204,7 +1212,7 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
                 }
                 Standing::None => (CheckStatus::NeverRun, None),
                 Standing::Unverified(i) => (CheckStatus::Unverified, chain_at(*i)),
-                Standing::Fail(kind, _) => (
+                Standing::Fail(kind, _, _) => (
                     if *kind == ExecOutcome::TimedOut {
                         CheckStatus::TimedOut
                     } else {
@@ -1247,14 +1255,27 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
         })
         .collect();
 
+    let evidence = standings
+        .iter()
+        .map(|standing| match standing {
+            Standing::None => None,
+            Standing::Pass(i, _)
+            | Standing::Unverified(i)
+            | Standing::Fail(_, _, i)
+            | Standing::Blocked(_, i) => Some(*i),
+        })
+        .collect();
     let decision = decide(c, &reports);
     (
-        decision,
-        VerificationReport {
-            basis,
-            checks: reports,
-            state_now,
-        },
+        (
+            decision,
+            VerificationReport {
+                basis,
+                checks: reports,
+                state_now,
+            },
+        ),
+        evidence,
     )
 }
 
