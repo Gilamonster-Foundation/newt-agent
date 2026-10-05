@@ -1190,8 +1190,17 @@ resolved in a later release:
   entirely — never surfaced to the model, the terminal, or a log — so a
   failed push or PR create degrades to one of a small fixed-form outcome
   category and the operator must re-run by hand to see the real error.
-  Refusal detail is dropped the same way: the model sees
-  `failed(refused_by_harness)`, since a refusal can quote operator config.
+  Refusal detail is dropped the same way, since it can quote operator config.
+  Push refusals add only harness-authored reasons and a standalone retry
+  instruction (#2719); raw diagnostics remain private. The push broker also
+  accepts `HEAD:<current-branch>`, `--dry-run`, and the familiar output suffix
+  `[2>&1] [| head [-N|-n N]] [; echo <literal text or $? >]`. These wrappers
+  format the broker's fixed outcome in-process; no shell or helper runs.
+  Echo reports the broker's success/failure status (0/1), or head's successful
+  pipeline status (0). Dry-run approval explicitly says no publication, the
+  staged Git receives `--dry-run`, and success is `dry_run_checked (no publication)`.
+  Other compositions, file redirection, and dynamic arguments are refused
+  before approval, with a reason and a working standalone command.
 - The trust predicate refuses any group- or other-writable component, so an
   operator whose umask left `~/.newt`, `~/.gitconfig` or `~/.config/gh`
   group-writable must `chmod g-w` them. The operator-accepted 2026-09-30

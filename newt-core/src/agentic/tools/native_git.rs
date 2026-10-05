@@ -2,6 +2,8 @@
 //! Keep the caller's shell source unchanged and preserve the embedded adapter's
 //! destructive-operation confirmations while the command interface migrates.
 
+mod push_command;
+
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::caveats::{Caveats, CaveatsExt};
 use crate::git_caveats::GitCaveats;
@@ -64,9 +66,9 @@ fn is_gh(program: &str) -> bool {
 /// issue-1188: is `source` a `git push` invocation anywhere in it (loose
 /// trigger, same shape as [`needs_commit_broker`])? A `true` here routes the
 /// WHOLE `run_command` call to [`execute_governed_push`] instead of the
-/// confined shell — that function applies the strict standalone/fixed-argv
+/// confined shell — that function applies the source-bound/fixed-argv
 /// check and refuses anything this loose scan admits but the broker cannot
-/// safely execute (composed commands, extra flags, a non-matching branch).
+/// safely execute. Harmless output wrappers are interpreted in-process (#2719).
 pub(super) fn needs_push_broker(source: &str) -> bool {
     fn contains(inspection: &ShellInspection) -> bool {
         inspection.commands.iter().any(|command| {
@@ -101,8 +103,8 @@ pub(super) fn needs_pr_create_broker(source: &str) -> bool {
 }
 
 /// Is `source` a single, literal, standalone command (no compound/redirect/
-/// descendant-exec/dynamic-argv shape)? Shared strictness gate for both
-/// governed brokers below — anything else is refused rather than guessed at,
+/// descendant-exec/dynamic-argv shape)? Strictness gate for the governed
+/// PR-create broker — anything else is refused rather than guessed at,
 /// same posture as `inspect_commands`'s "composed or redirected Git mutation"
 /// refusal.
 fn standalone_literal_argv(source: &str) -> Result<Vec<String>, String> {
@@ -129,8 +131,9 @@ fn standalone_literal_argv(source: &str) -> Result<Vec<String>, String> {
 /// (never trusted from argv), so an explicit branch/refspec operand must
 /// match it exactly or the whole call is refused.
 struct GovernedPush {
+    dry_run: bool,
     remote: String,
-    /// The `<branch>` half of an explicit `<remote> <branch>:<branch>`
+    /// The destination half of `<remote> <branch>:<branch>` or `HEAD:<branch>`
     /// operand, if the model's command supplied one — never used to BUILD
     /// the eventual refspec (that is always the workspace's own resolved
     /// branch, fully qualified), only to verify the model's operand actually
@@ -142,8 +145,9 @@ struct GovernedPush {
 
 fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
     let (verb, args, same_repository) = invocation(argv)?;
-    let args = args.to_vec();
-    if verb != "push" {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let args: Vec<_> = args.iter().filter(|a| *a != "--dry-run").cloned().collect();
+    if !argv.first().is_some_and(|a| is_git(a)) || verb != "push" {
         return Err(unresolved("not a `git push` invocation"));
     }
     if !same_repository {
@@ -153,15 +157,17 @@ fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
     }
     if args.iter().any(|a| a.starts_with('-')) {
         return Err(unresolved(
-            "a governed push accepts no flags (no --force, --all, --mirror, --tags, -u, …)",
+            "a governed push accepts no flags except --dry-run (no --force, --all, --mirror, --tags, -u, …)",
         ));
     }
     match args.len() {
         0 => Ok(GovernedPush {
+            dry_run,
             remote: "origin".to_string(),
             requested_branch: None,
         }),
         1 => Ok(GovernedPush {
+            dry_run,
             remote: args[0].clone(),
             requested_branch: None,
         }),
@@ -169,14 +175,15 @@ fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
             let remote = args[0].clone();
             let refspec = &args[1];
             let (src, dst) = refspec.split_once(':').unwrap_or((refspec, refspec));
-            if src != dst {
+            if src != dst && src != "HEAD" {
                 return Err(unresolved(
                     "a governed push only pushes a branch to its own name",
                 ));
             }
             Ok(GovernedPush {
+                dry_run,
                 remote,
-                requested_branch: Some(src.trim_start_matches("refs/heads/").to_string()),
+                requested_branch: Some(dst.strip_prefix("refs/heads/").unwrap_or(dst).to_string()),
             })
         }
         _ => Err(unresolved("unsupported governed push form")),
@@ -189,11 +196,10 @@ fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
 /// `cwd` is the resolved directory the model's `run_command` targeted (after
 /// any folded leading `cd`).
 ///
-/// F6: the returned text is ALWAYS fixed-form — an [`Unavailable`] notice
-/// (fixed text, no data), or an [`Outcome`]. Every other refusal or error
-/// exit is normalised here to `failed(refused_by_harness)`: its detail can
-/// carry operator config (a helper value, a path) and is dropped with the
-/// raw child output. Operators re-run by hand to debug.
+/// F6: raw child output and refusal details can contain operator config and
+/// are dropped. #2719 adds only harness-authored syntax/permission guidance
+/// to the fixed outcome and interprets validated presentation wrappers in
+/// process. No model-supplied shell is executed by this host-side broker.
 ///
 /// [`Unavailable`]: crate::git_staging::Unavailable
 /// [`Outcome`]: crate::git_staging::Outcome
@@ -204,7 +210,16 @@ pub(super) fn execute_governed_push(
     gate: &mut Option<&mut dyn PermissionGate>,
 ) -> String {
     if let Err(unavailable) = broker_available(caveats) {
-        return unavailable.to_string();
+        return format!("{unavailable}. {}", push_command::RETRY);
+    }
+    let command = match push_command::PushCommand::parse(source) {
+        Ok(command) => command,
+        Err(reason) => return format!("refused: {reason}. {}", push_command::RETRY),
+    };
+    // These parser errors contain only harness-authored text, never config or
+    // child diagnostics. Do not collapse an actionable syntax error into F6.
+    if let Err(reason) = parse_governed_push(&command.argv) {
+        return format!("{reason}. {}", push_command::RETRY);
     }
     // The read roots are bound ONCE, before planning, and the same held
     // handles serve planning reads and the confined copy's admission.
@@ -213,7 +228,16 @@ pub(super) fn execute_governed_push(
         let plan = plan_governed_push(source, cwd, caveats, gate, &held)?;
         run_staged_push(&plan, caveats, &held)
     })();
-    fixed_form_with_notice(result, std::io::stdout())
+    let success = result
+        .as_ref()
+        .is_ok_and(|outcome| !matches!(outcome, crate::git_staging::Outcome::Failed { .. }));
+    let reason = result.as_ref().err().map(|error| error.safe_reason.unwrap_or(
+        "trusted staging checks failed; the operator must check tool/config ownership and repository read authority"));
+    let mut output = fixed_form_with_notice(result, std::io::stdout());
+    if let Some(reason) = reason {
+        output.push_str(&format!(": {reason}. {}", push_command::RETRY));
+    }
+    command.render(output, success)
 }
 
 /// SPEC-FINAL F5/F4 preconditions, checked before any argv or file is read.
@@ -269,8 +293,8 @@ fn plan_governed_push(
     use crate::git_staging as staging;
     staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
 
-    let argv = standalone_literal_argv(source)?;
-    let request = parse_governed_push(&argv)?;
+    let command = push_command::PushCommand::parse(source).map_err(str::to_owned)?;
+    let request = parse_governed_push(&command.argv)?;
 
     // Finding 6 (issue-1188 review #2641): the broker runs outside the
     // confined shell's fence, so it binds itself to the SAME authority a
@@ -279,13 +303,17 @@ fn plan_governed_push(
     // `permits_fs_read` is exact-match and would refuse a subdirectory.
     let cwd_str = cwd.to_string_lossy();
     if !crate::caveats::permits_path(&caveats.fs_read, &cwd_str) {
-        return Err(format!(
+        return Err(staging::Refusal::from(format!(
             "refused: '{cwd_str}' is outside this session's filesystem read authority"
-        )
-        .into());
+        ))
+        .with_reason("worktree read permission is missing; grant read access before retrying"));
     }
     if !caveats.permits_exec("git") {
-        return Err("refused: no exec authority for 'git'".to_string().into());
+        return Err(
+            staging::Refusal::from("refused: no exec authority for 'git'".to_string()).with_reason(
+                "git execution permission is missing; grant git execution before retrying",
+            ),
+        );
     }
 
     // F1/F2: authenticate git/gh/sh/exec-path BEFORE any planning subprocess,
@@ -297,20 +325,20 @@ fn plan_governed_push(
 
     let branch = staging::read_head_branch(&git_dir, held)?;
     if staging::is_default_branch(&common_dir, &branch, held) {
-        return Err(format!(
+        return Err(staging::Refusal::from(format!(
             "refused: cannot push the default branch '{branch}' (open a feature branch instead)"
-        )
-        .into());
+        ))
+        .with_reason("pushing the default branch is prohibited; switch to a feature branch"));
     }
     // Finding 2: an explicit `<remote> <branch>:<branch>` operand must name
     // the SAME branch this broker is about to push.
     if let Some(requested) = &request.requested_branch {
         if requested != &branch {
-            return Err(format!(
+            return Err(staging::Refusal::from(format!(
                 "refused: requested branch '{requested}' does not match the checked-out \
                  branch '{branch}' — a governed push always pushes the workspace's own branch"
-            )
-            .into());
+            ))
+            .with_reason("the destination must match the checked-out branch"));
         }
     }
 
@@ -336,10 +364,23 @@ fn plan_governed_push(
         caveats,
         gate,
         &host,
-        &format!("push commit {oid} as branch '{branch}' to {host} ({url})"),
-    )?;
+        &format!(
+            "{}push commit {oid} as branch '{branch}' to {host} ({url})",
+            if request.dry_run {
+                "dry-run (no publication): "
+            } else {
+                ""
+            }
+        ),
+    )
+    .map_err(|detail| {
+        staging::Refusal::from(detail).with_reason(
+            "destination network permission was not granted; an operator must approve the push",
+        )
+    })?;
 
     Ok(GovernedPushPlan {
+        dry_run: request.dry_run,
         url,
         owner,
         name,
@@ -357,6 +398,7 @@ fn plan_governed_push(
 /// [`execute_governed_push`], which outlives planning and the dial alike.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GovernedPushPlan {
+    dry_run: bool,
     url: String,
     owner: String,
     name: String,
@@ -414,24 +456,27 @@ fn run_staged_push(
 
     // F3: push the APPROVED oid; no ref is resolved after approval.
     let refspec = format!("{}:refs/heads/{}", plan.oid, plan.branch);
+    let mut push_args = vec!["-c", "http.followRedirects=false", "push"];
+    if plan.dry_run {
+        push_args.push("--dry-run");
+    }
+    push_args.extend([plan.url.as_str(), refspec.as_str()]);
     let output = plan
         .tools
-        .git([
-            "-c",
-            "http.followRedirects=false",
-            "push",
-            plan.url.as_str(),
-            refspec.as_str(),
-        ])
+        .git(push_args)
         .current_dir(staging.path())
         .output()
         .map_err(|e| e.to_string())?;
     Ok(if output.status.success() {
-        Outcome::Pushed {
-            oid: plan.oid.clone(),
-            owner: plan.owner.clone(),
-            name: plan.name.clone(),
-            branch: plan.branch.clone(),
+        if plan.dry_run {
+            Outcome::DryRunChecked
+        } else {
+            Outcome::Pushed {
+                oid: plan.oid.clone(),
+                owner: plan.owner.clone(),
+                name: plan.name.clone(),
+                branch: plan.branch.clone(),
+            }
         }
     } else {
         Outcome::Failed {
@@ -2155,6 +2200,44 @@ mod governed_push_tests {
 
     // -- planning refusals (no confined step reached) ----------------------
 
+    /// #2719: a worktree push with familiar output wrappers must reach approval.
+    #[test]
+    fn worktree_push_wrappers_reach_operator_approval() {
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let worktree = repo.path().join("linked");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        for suffix in ["", " 2>&1", " 2>&1 | head -5; echo \"exit=$?\""] {
+            let mut gate = Gate {
+                allow: true,
+                requests: vec![],
+            };
+            let command = format!(
+                "cd {} && git push origin HEAD:linked{suffix}",
+                worktree.display()
+            );
+            let (cwd, source) = super::super::shell::split_leading_cd(&command);
+            let plan = plan_push_test(
+                &source,
+                Path::new(cwd.as_deref().unwrap()),
+                &with_net(Scope::only([])),
+                &mut Some(&mut gate),
+            )
+            .unwrap();
+            assert_eq!(plan.branch, "linked");
+            assert_eq!(gate.requests.len(), 1);
+        }
+    }
+
     #[test]
     fn main_branch_push_is_refused() {
         let _env = BrokerEnv::new();
@@ -2471,6 +2554,65 @@ mod governed_push_tests {
         plan
     }
 
+    /// #2719: approved wrapped pushes use real staging; dry-run never sends
+    /// the receive-pack ref update. The existing loopback endpoint grounds the
+    /// argv/plan tests without publishing to a forge.
+    #[test]
+    fn approved_wrapped_push_and_dry_run_use_governed_staging() {
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let wt = repo.path().join("linked");
+        git(
+            repo.path(),
+            &["worktree", "add", "-b", "linked", wt.to_str().unwrap()],
+        );
+        for dry_run in [true, false] {
+            let flag = if dry_run { "--dry-run " } else { "" };
+            let command =
+                format!("git push {flag}origin HEAD:linked 2>&1 | head -5; echo \"exit=$?\"");
+            let mut gate = Gate {
+                allow: true,
+                requests: vec![],
+            };
+            let caveats = with_net(Scope::only([]));
+            let mut plan = plan_push_test(&command, &wt, &caveats, &mut Some(&mut gate)).unwrap();
+            assert_eq!(gate.requests.len(), 1);
+            assert_eq!(plan.dry_run, dry_run);
+            assert_eq!(gate.requests[0].reason.contains("dry-run"), dry_run);
+            let (port, endpoint) = receive_pack_endpoint(false);
+            // Same bounded transport seam as the existing staging tests:
+            // only the approved plan's URL changes to our loopback endpoint.
+            plan.url = format!("http://127.0.0.1:{port}/o/r.git");
+            let outcome = run_push_test(&plan, &caveats);
+            let seen = stop(port, endpoint);
+            let outcome = outcome.unwrap();
+            assert!(
+                !seen.requests.is_empty(),
+                "the destination must be contacted"
+            );
+            if dry_run {
+                assert_eq!(outcome, crate::git_staging::Outcome::DryRunChecked);
+                assert!(seen.update.is_none(), "{seen:?}");
+                assert!(
+                    !seen.requests.iter().any(|r| r.starts_with("POST ")),
+                    "{seen:?}"
+                );
+            } else {
+                assert!(matches!(
+                    outcome,
+                    crate::git_staging::Outcome::Pushed { .. }
+                ));
+                assert_eq!(
+                    seen.update.as_deref(),
+                    Some(format!("{} {} refs/heads/linked", "0".repeat(40), plan.oid).as_str())
+                );
+            }
+        }
+    }
+
     /// F3 regression + destination proof, traced at the endpoint from the
     /// ACTUAL broker's request: after approval the workspace branch moves,
     /// and the broker still pushes the approved commit, to the approved
@@ -2764,7 +2906,11 @@ mod governed_push_tests {
         env.global(&["credential.helper", &format!("!echo {CANARY}")]);
         let repo = repo_on_feature_branch();
         let result = execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None);
-        assert_eq!(result, "failed(refused_by_harness)");
+        assert!(
+            result.starts_with("failed(refused_by_harness):"),
+            "{result}"
+        );
+        assert!(!result.contains(CANARY));
     }
 
     // -- the real outer dispatch --------------------------------------------
@@ -2772,6 +2918,15 @@ mod governed_push_tests {
     /// Run `command` through the REAL `run_command` dispatch with a
     /// capturing display writer; returns (model result, terminal text).
     fn dispatch_run_command(ws: &Path, command: &str, caveats: &Caveats) -> (String, String) {
+        dispatch_run_command_with_gate(ws, command, caveats, None)
+    }
+
+    fn dispatch_run_command_with_gate(
+        ws: &Path,
+        command: &str,
+        caveats: &Caveats,
+        gate: Option<&mut dyn PermissionGate>,
+    ) -> (String, String) {
         #[derive(Clone, Default)]
         struct Shared(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Shared {
@@ -2803,7 +2958,10 @@ mod governed_push_tests {
                 40,
                 caveats,
                 &mut crate::agentic::NoMcp,
-                super::super::ToolCollaborators::default(),
+                super::super::ToolCollaborators {
+                    permission_gate: gate,
+                    ..Default::default()
+                },
                 false,
                 crate::agentic::PromptDisposition::Act,
                 None,
@@ -2817,6 +2975,74 @@ mod governed_push_tests {
 
     fn refs(repo: &Path) -> String {
         git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// #2719: the actual run_command path folds a worktree cd, intercepts
+    /// wrappers, and reaches the operator. Denial prevents staging/dialing.
+    #[test]
+    fn wrapped_worktree_push_dispatch_reaches_gate_and_honors_denial() {
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let wt = repo.path().join("linked");
+        git(
+            repo.path(),
+            &["worktree", "add", "-b", "linked", wt.to_str().unwrap()],
+        );
+        let before = refs(repo.path());
+        for flag in ["", "--dry-run "] {
+            let mut gate = Gate {
+                allow: false,
+                requests: vec![],
+            };
+            let command = format!(
+                "cd {} && git push {flag}origin HEAD:linked 2>&1 | head -5; echo \"exit=$?\"",
+                wt.display()
+            );
+            let (output, _) = dispatch_run_command_with_gate(
+                repo.path(),
+                &command,
+                &with_net(Scope::only([])),
+                Some(&mut gate),
+            );
+            assert_eq!(gate.requests.len(), 1, "{output}");
+            assert!(
+                output.contains("network permission was not granted"),
+                "{output}"
+            );
+            assert!(output.contains("git push origin"), "{output}");
+            assert_eq!(refs(repo.path()), before);
+        }
+    }
+
+    /// #2719: unsafe forms are refused with a safe explanation and retry.
+    #[test]
+    fn unsafe_push_forms_have_actionable_refusals() {
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        for command in [
+            "git push --force",
+            "git push > marker",
+            "git push; touch marker",
+            "git push origin HEAD:other",
+            "git push origin HEAD:refs/heads/refs/heads/task",
+        ] {
+            let mut gate = Gate {
+                allow: true,
+                requests: vec![],
+            };
+            let output = execute_governed_push(
+                command,
+                repo.path(),
+                &with_net(Scope::only([])),
+                &mut Some(&mut gate),
+            );
+            assert!(gate.requests.is_empty(), "{command}");
+            assert!(output.contains("Retry with run_command"), "{output}");
+            assert!(!repo.path().join("marker").exists());
+        }
     }
 
     /// Regression for #2700 through the real outer dispatch: `Scope::All`
@@ -3077,7 +3303,8 @@ mod governed_push_tests {
         let (model, fd1) = capture_fd(1, || {
             execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None)
         });
-        assert_eq!(model, "failed(refused_by_harness)");
+        assert!(model.starts_with("failed(refused_by_harness):"), "{model}");
+        assert!(!model.contains("sudoers"));
         assert!(
             !fd1.contains("chmod") && !fd1.contains("sudoers"),
             "repository bytes reached the operator sink: {fd1}"
