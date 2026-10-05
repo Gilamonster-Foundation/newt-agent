@@ -78,6 +78,10 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// #2315: where a shell call records its execution class for the loop's
     /// tool-event funnel. `None` when no funnel is listening.
     pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
+    /// #2741: only the governed broker supplies this typed creation outcome.
+    pub(crate) governed_pr: Option<&'a std::sync::OnceLock<crate::git_staging::Outcome>>,
+    /// Actual resolved command cwd; a locator, never new filesystem authority.
+    pub(crate) command_directory: Option<&'a std::sync::OnceLock<std::path::PathBuf>>,
     /// #2551 round 2: the route the `run_command` routing site acted on,
     /// recorded here (never re-derived from a second `classify_call`) so a
     /// caller like
