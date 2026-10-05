@@ -204,8 +204,15 @@ back to 60 seconds, and a zero per-call value uses the configured default.
 On expiry the executor terminates the command group and returns an explicit
 `TimedOut` result naming the applied budget, with bounded partial output.
 Commands that leave the owned process group are outside that group-kill mechanism.
+An escaped descendant holding an output pipe can also delay reader completion
+and return after timeout (agent-bridle#420); Windows cleanup currently covers
+the direct child, without a proven process-tree guarantee.
+SafeSubset stages share one invocation deadline; expiry stops later stages and
+joins the script owner after terminating/reaping active groups.
 
-Mentioning or invoking Cargo inside a shell command does not increase its budget.
-Use `build_exec` or `lifecycle` with `action=build` for long builds and tests;
-those executors retain their own budgets. Permission and confinement checks
+Prepared shell commands containing classified build work (for example,
+`cargo check --workspace && echo checked`) retain the 30-minute build budget.
+Version/help probes do not extend a following search. A positive per-call
+override still narrows a build shell to the requested, capped budget.
+`build_exec` and `lifecycle` with `action=build` retain their own budgets. Permission and confinement checks
 are independent of time-budget selection.

@@ -867,10 +867,13 @@ async fn dispatch_bridled_shell_with_floor(
     // blanket Kernel floor would refuse every exec-restricted command even on
     // Landlock. The correct fix is a PER-AXIS floor at the bridle boundary
     // (fs/net = Kernel, exec = Interceptor-OK); tracked as an ACTIVE deviation.
-    // #2732: authority for a build-bearing shell does not buy a longer clock.
-    // Explicit build_exec/lifecycle executors retain their own build budgets.
+    // #2732: prepared build work retains its build budget; version/help probes
+    // must not lend a following arbitrary command that longer deadline.
     let cmd = args.get("cmd").and_then(serde_json::Value::as_str);
-    let wall = run_command_budget(args.get("timeout_secs").and_then(serde_json::Value::as_u64));
+    let wall = command_wall(
+        cmd.unwrap_or_default(),
+        args.get("timeout_secs").and_then(serde_json::Value::as_u64),
+    );
     // dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the toolchain
     // read roots for a build-tool command are added ONLY to the caveats used
     // for THIS dispatch, never folded back into the session's standing
@@ -1239,7 +1242,7 @@ pub(super) async fn exec_confined_command_with_broker(
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
     let mut dispatch_args = confined_dispatch_args(cmd, cwd);
-    dispatch_args["timeout_secs"] = run_command_budget(timeout_secs).as_secs().into();
+    dispatch_args["timeout_secs"] = serde_json::json!(timeout_secs);
     let result = match dispatch_bridled_shell_with_floor(
         dispatch_args.clone(),
         caveats,
@@ -1615,15 +1618,26 @@ pub(super) fn shell_limits(wall: std::time::Duration) -> agent_bridle::LimitsPol
     }
 }
 
-pub(super) fn dispatch_wall(_cmd: &str) -> std::time::Duration {
-    run_command_budget(None)
+pub(super) fn command_wall(cmd: &str, requested: Option<u64>) -> std::time::Duration {
+    if super::build_shell::has_build_work(cmd) {
+        requested
+            .filter(|secs| *secs > 0)
+            .map(|secs| run_command_budget(Some(secs)))
+            .unwrap_or(LIFECYCLE_BUILD_TIMEOUT)
+    } else {
+        run_command_budget(requested)
+    }
+}
+
+pub(super) fn dispatch_wall(cmd: &str) -> std::time::Duration {
+    command_wall(cmd, None)
 }
 
 /// What the `run_command` description tells the model about its wall, up front.
 /// One owner with [`timed_out_note`], so the two cannot disagree (U6).
 pub(super) fn run_command_limit_sentence() -> String {
     format!(
-        "Each call is killed after {} seconds (wall clock). Override with timeout_secs up to \
+        "Ordinary calls are killed after {} seconds (wall clock); classified builds get 30 minutes. Override with timeout_secs up to \
          {} seconds; the result carries the exit code. For an offline build use \
          `lifecycle` action=build, i.e. call the tool with {LIFECYCLE_BUILD_CALL} (`phase` is \
          never `build`), or narrow the command (one test filter, one crate).",
@@ -1728,10 +1742,11 @@ pub(super) async fn host_shell_dispatch(
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     timeout_secs: Option<u64>,
 ) -> std::io::Result<serde_json::Value> {
-    let wall = run_command_budget(timeout_secs);
-    let run = match timeout_secs {
-        None => host_shell_output(cmd, cwd, live).await?,
-        Some(_) => host_shell_output_with_timeout(cmd, cwd, live, wall).await?,
+    let wall = command_wall(cmd, timeout_secs);
+    let run = if timeout_secs.is_none() && wall != LIFECYCLE_BUILD_TIMEOUT {
+        host_shell_output(cmd, cwd, live).await?
+    } else {
+        host_shell_output_with_timeout(cmd, cwd, live, wall).await?
     };
     Ok(serde_json::json!({
         "exit_code": run.exit_code,

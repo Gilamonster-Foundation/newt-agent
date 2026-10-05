@@ -14,17 +14,31 @@ use std::sync::Arc;
 /// Identify a build tool through Bridle's structural inventory. This selects
 /// an existing capability; it never interprets Cargo flags or rewrites source.
 pub(super) fn build_program(source: &str) -> Option<String> {
-    fn find(inspection: &agent_bridle::ShellInspection) -> Option<String> {
+    find_build_program(source, |program, _| {
+        crate::confined_exec::is_build_tool_exec(program)
+    })
+}
+
+/// Time budgets distinguish actual build work from version/help probes.
+pub(super) fn has_build_work(source: &str) -> bool {
+    find_build_program(source, crate::agentic::routing::is_build_work).is_some()
+}
+
+fn find_build_program(source: &str, predicate: fn(&str, &[String]) -> bool) -> Option<String> {
+    fn find(
+        inspection: &agent_bridle::ShellInspection,
+        predicate: fn(&str, &[String]) -> bool,
+    ) -> Option<String> {
         for command in &inspection.commands {
             if let Some(program) = command
                 .program
                 .as_deref()
-                .filter(|program| crate::confined_exec::is_build_tool_exec(program))
+                .filter(|program| predicate(program, &command.argv))
             {
                 return Some(program.to_owned());
             }
             for child in &command.descendant_execs {
-                if crate::confined_exec::is_build_tool_exec(&child.program) {
+                if predicate(&child.program, &child.argv) {
                     return Some(child.program.clone());
                 }
             }
@@ -33,9 +47,9 @@ pub(super) fn build_program(source: &str) -> Option<String> {
             .constructs
             .iter()
             .filter_map(|construct| construct.inspection.as_ref())
-            .find_map(|nested| find(nested))
+            .find_map(|nested| find(nested, predicate))
     }
-    find(&agent_bridle::inspect_shell(source).ok()?)
+    find(&agent_bridle::inspect_shell(source).ok()?, predicate)
 }
 
 /// #2723: select the build fence from existing filesystem authority, not a
@@ -167,7 +181,7 @@ pub(super) async fn execute(
     };
     let environment: std::collections::BTreeMap<_, _> =
         request.env_grants().iter().cloned().collect();
-    let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment, "timeout_secs": shell::run_command_budget(timeout_secs).as_secs()});
+    let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment, "timeout_secs": timeout_secs});
     // Never retry this source after execution: an earlier pipeline stage may
     // already have had an effect, even if a later command was denied.
     match shell::dispatch_bridled_build_shell(args, build, live_output, scratch, command_broker)

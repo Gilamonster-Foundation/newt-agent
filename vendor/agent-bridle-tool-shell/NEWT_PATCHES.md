@@ -14,7 +14,11 @@ Integration changes:
   A configured deadline terminates/reaps the process group and reports a bounded
   timeout envelope. Deterministic tests inject elapsed time into the shared
   supervisor. Descendants that escape their process group remain outside this
-  mechanism, as with the existing stage/Brush termination helper.
+  mechanism, as with the existing stage/Brush termination helper. Escaped pipe
+  holders can also delay reader joins/return (agent-bridle#420); Windows only
+  has direct-child cleanup. SafeSubset now shares one deadline across the
+  script and all pipeline stages, cancels and joins the owner on outer expiry,
+  and refuses to start later stages after that deadline.
 
 - Project one literal `timeout` wrapper through the existing descendant-command
   inventory, preserving the original shell source and native timeout semantics.

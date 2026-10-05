@@ -157,9 +157,8 @@ fn escalated_after_timeout_labels_the_reroute_and_preserves_the_build_result() {
 /// #2541 round 2 item 3, round 3 item 2: the escalation's decision, isolated
 /// from formatting and table-tested — only a genuine `TimedOut` under the
 /// DEFAULT `run_command` wall justifies spending the build lane's authority
-/// on a second run. #2732 keeps cargo/just shell phases on that ordinary
-/// budget too. A timeout from the explicit build executor has already spent
-/// its longer budget and must not rerun in the same build lane.
+/// on a second run. #2732 preserves the longer budget for classified builds;
+/// those must not rerun after spending that budget.
 #[test]
 fn escalates_only_on_a_default_wall_timeout() {
     let _env = crate::process_env::lock();
@@ -167,8 +166,8 @@ fn escalates_only_on_a_default_wall_timeout() {
     let build_wall = shell::LIFECYCLE_BUILD_TIMEOUT;
     assert_eq!(
         shell::dispatch_wall("cargo test"),
-        default_wall,
-        "#2732: a shell command must keep its ordinary budget"
+        build_wall,
+        "#2732: a classified build retains its build budget"
     );
     assert_ne!(
         default_wall, build_wall,

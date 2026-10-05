@@ -1059,9 +1059,8 @@ fn format_wall(wall: std::time::Duration) -> String {
 }
 
 /// #2541/#2732: only an ordinary command timeout justifies spending the
-/// build lane's authority on a second run. Cargo/just shell phases use the
-/// ordinary budget too; an explicit build executor has already spent its
-/// longer budget and must not repeat it. Other outcomes need no escalation.
+/// build lane's authority on a second run. Classified builds already spent
+/// the longer budget and must not repeat it. Other outcomes need no escalation.
 fn escalates(outcome: crate::ExecOutcome, wall: std::time::Duration) -> bool {
     outcome == crate::ExecOutcome::TimedOut && wall != shell::LIFECYCLE_BUILD_TIMEOUT
 }

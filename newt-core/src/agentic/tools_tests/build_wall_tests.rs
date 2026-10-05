@@ -1,4 +1,4 @@
-//! #2732: ordinary shell commands never inherit the build executor budget.
+//! #2732: builds retain their budget while ordinary commands and probes stay bounded.
 
 use std::time::Duration;
 
@@ -10,22 +10,21 @@ fn default_wall() -> Duration {
     Duration::from_secs(agent_bridle::LimitsPolicy::default().default_timeout_secs)
 }
 
-/// #2732: a compound build-bearing shell keeps the command budget; explicit
-/// build_exec/lifecycle calls own the longer build budget.
+/// #2732: prepared compound builds retain the build executor budget.
 #[test]
-fn a_compound_cargo_command_keeps_the_command_wall() {
+fn a_compound_cargo_command_keeps_the_build_wall() {
     let _env = crate::process_env::lock();
     assert_eq!(
         super::shell::dispatch_wall(r#"cargo test -j 4 -p newt-git; echo "EXIT=$?""#),
-        default_wall()
+        build_wall()
     );
 }
 
 /// `just <recipe>` is the other program in #2533's build-lane table.
 #[test]
-fn a_just_command_keeps_the_command_wall() {
+fn a_just_command_keeps_the_build_wall() {
     let _env = crate::process_env::lock();
-    assert_eq!(super::shell::dispatch_wall("just test"), default_wall());
+    assert_eq!(super::shell::dispatch_wall("just test"), build_wall());
 }
 
 /// An ordinary command is unaffected — the default wall still applies.
@@ -91,22 +90,22 @@ fn the_wall_is_the_default_timeout_not_just_the_ceiling() {
     assert_eq!(ordinary.default_timeout_secs, default_wall().as_secs());
 }
 
-/// A working-directory prefix does not change the ordinary command budget.
+/// A working-directory prefix preserves the classified build budget.
 #[test]
-fn a_cd_prefix_keeps_the_default_wall() {
+fn a_cd_prefix_keeps_the_build_wall() {
     let _env = crate::process_env::lock();
     assert_eq!(
         super::shell::dispatch_wall("cd newt-git && cargo test"),
-        default_wall()
+        build_wall()
     );
 }
 
 #[test]
-fn an_env_prefix_keeps_the_command_wall() {
+fn an_env_prefix_keeps_the_build_wall() {
     let _env = crate::process_env::lock();
     assert_eq!(
         super::shell::dispatch_wall("RUSTC_WRAPPER= cargo test -p newt-git"),
-        default_wall()
+        build_wall()
     );
 }
 
@@ -173,4 +172,53 @@ fn issue_2732_timeout_reports_selected_budget() {
     assert!(text.contains("17s wall"), "{text}");
     assert!(text.contains("killed"), "{text}");
     assert!(!text.contains("17s build-lane"), "{text}");
+}
+
+/// #2732 round 2: a prepared compound build must survive the ordinary deadline.
+#[test]
+fn round2_compound_build_retains_build_budget() {
+    let _env = crate::process_env::lock();
+    let wall = super::shell::dispatch_wall("cargo check --workspace && echo checked");
+    assert_eq!(wall, build_wall());
+    let elapsed = Duration::from_secs(61);
+    assert!(elapsed < wall);
+    assert!(
+        elapsed >= super::shell::dispatch_wall("cargo --version; find / -maxdepth 6 -name camino")
+    );
+}
+
+/// #2732 round 2: probe/help commands stay ordinary, including wrappers and paths.
+#[test]
+fn round2_only_classified_build_work_gets_long_budget() {
+    let _env = crate::process_env::lock();
+    for command in [
+        "cargo --version; find / -maxdepth 6",
+        "cargo check --help; find /",
+        "just --list; find /",
+        "make --version; find /",
+    ] {
+        assert_eq!(
+            super::shell::dispatch_wall(command),
+            default_wall(),
+            "{command}"
+        );
+    }
+    for command in [
+        "cargo +stable check --workspace && echo checked",
+        "cargo --offline --color never check --workspace && echo checked",
+        "just test integration && echo checked",
+        "timeout 100 cargo check --workspace && echo checked",
+        "/usr/bin/cargo check --workspace && echo checked",
+        "make all && echo checked",
+    ] {
+        assert_eq!(
+            super::shell::dispatch_wall(command),
+            build_wall(),
+            "{command}"
+        );
+    }
+    assert_eq!(
+        super::shell::command_wall("cargo check && echo checked", Some(20)),
+        Duration::from_secs(20)
+    );
 }
