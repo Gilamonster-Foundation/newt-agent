@@ -13,7 +13,7 @@ name: CI
 # session / real-PTY integration binaries the hook's nextest filter excludes
 # by name (this file's `test` job is their per-PR run), OCAP
 # register honesty, cross-language conformance, the vendored crossterm
-# regression, and this hook's own regression suites (they gate under CI, not
+# regression, checked move_from native proof, and this hook's own regression suites (they gate under CI, not
 # by running themselves from inside the hook) are CI-ONLY and never run in
 # the hook — the hook's own header comment names each one, plus
 # the separately-triggered newt-web/mesh/formal/behavior-registry workflows,
@@ -205,6 +205,14 @@ jobs:
         # of the inward layer's runtime closure (#1828); enabling it here is
         # what keeps the published JSON Schemas from going stale unnoticed.
         run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
+      - name: checked move_from native proof (#2724)
+        # HOOK PARITY: CI-only; .githooks/pre-push names this real-Cargo
+        # lane in its CI-ONLY list. ast and the network-guard helper are
+        # prerequisites. The exact ignored test fails on unavailable confinement;
+        # no kernel skip or success marker can hide an unexecuted proof.
+        run: |
+          env RUSTC_WRAPPER= CARGO_BUILD_JOBS=4 nice -n 10 ionice -c3 cargo build -p newt-core --features ast --bin newt-net-guard
+          env RUSTC_WRAPPER= CARGO_BUILD_JOBS=4 nice -n 10 ionice -c3 cargo test -p newt-core --features ast --lib agentic::tools::move_from::tests::real_move_from_fixture_compiles_and_failed_check_restores -- --ignored --exact
       - name: vendor crossterm regression gate (newt #2644)
         # The `[patch.crates-io]` vendored crossterm is excluded from the workspace
         # so its unit tests are never reached by `cargo test --workspace`.

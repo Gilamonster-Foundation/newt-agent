@@ -45,6 +45,8 @@ mod dependency_fetch;
 mod dispatch;
 pub(super) mod file_capture;
 mod file_change;
+#[cfg(feature = "ast")]
+mod move_from;
 mod navigation;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
@@ -2843,6 +2845,13 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "write_file" => {
             let path = string("path", "");
             let bytes = args["content"].as_str().unwrap_or("").len();
+            if let Some(source) = args["move_from"]["path"].as_str() {
+                return format!(
+                    "{} (move functions from {})",
+                    file_capture::display_text(&path),
+                    file_capture::display_text(source)
+                );
+            }
             let copy = &args["copy_from"];
             match copy["path"].as_str() {
                 Some(source) => format!(
@@ -4947,6 +4956,28 @@ async fn execute_authorized_tool(
             };
             if path.is_empty() {
                 return "error: write_file needs `path` — nothing was written".to_string();
+            }
+            if args.get("move_from").is_some() {
+                #[cfg(not(feature = "ast"))]
+                return "error: move_from requires a build with the ast feature; nothing changed".into();
+                #[cfg(feature = "ast")]
+                {
+                    let moved = match move_from::execute(args, workspace, caveats, smart_harness, &mut permission_gate) {
+                        Ok(moved) => moved,
+                        Err(error) => return format!("error: move_from: {error}"),
+                    };
+                    let mut artifacts = String::new();
+                    for (label, before, after) in [
+                        (moved.source.as_str(), super::artifact_hooks::ArtifactFileState::from_bytes(moved.before.as_bytes()), moved.parent.as_str()),
+                        (path, super::artifact_hooks::ArtifactFileState::absent(), moved.child.as_str()),
+                    ] {
+                        artifacts.push_str(&record_governed_file_change(artifact_sink, artifact_context, label, "write_file",
+                            Some(before), super::artifact_hooks::ArtifactFileState::from_bytes(after.as_bytes()), color, tool_output_lines));
+                    }
+                    return format!("Moved functions from {} into {}; confined cargo check --lib exited 0. Parent: {} lines; child: {} lines. Displaced entries retained as .newt-move-*.saved beside changed files; inspect before removing.{}",
+                        file_capture::display_text(&moved.source), file_capture::display_text(path),
+                        moved.parent.lines().count(), moved.child.lines().count(), artifacts);
+                }
             }
             // Move code without retyping it: `copy_from` appends an exact line
             // range of another file after `content` (a typed header). The

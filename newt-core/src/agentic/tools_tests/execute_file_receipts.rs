@@ -923,3 +923,35 @@ async fn malformed_mutations_are_refused_before_the_permission_gate() {
         assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {tool} {args}");
     }
 }
+
+/// #2724: grounds the pure extraction validator in the actual write_file
+/// dispatcher: invalid move_from must not fall through to an ordinary write.
+#[tokio::test]
+async fn move_from_rejects_duplicate_items_before_mutation() {
+    let ws = tempfile::tempdir().unwrap();
+    let source = "fn helper() -> u8 { 7 }\n";
+    std::fs::write(ws.path().join("lib.rs"), source).unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname=\"move_fixture\"\nversion=\"0.1.0\"\n[lib]\npath=\"lib.rs\"\n",
+    )
+    .unwrap();
+    let (output, _) = model_and_display(
+        "write_file",
+        serde_json::json!({"path":"child.rs", "content":"", "move_from":{
+            "path":"lib.rs", "items":["helper", "helper"]
+        }}),
+        ws.path(),
+        &Caveats::top(),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(output.starts_with("error:"), "{output}");
+    #[cfg(feature = "ast")]
+    assert!(output.contains("unique, nonempty item names"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("lib.rs")).unwrap(),
+        source
+    );
+    assert!(!ws.path().join("child.rs").exists());
+}
