@@ -36,6 +36,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         task: "do the thing",
         workspace: NO_CHECKS_WORKSPACE,
         default_command_cwd: None,
+        worktree_session: None,
         color: false,
         markdown: false,
         tool_offload: false,
