@@ -29,6 +29,73 @@ fn literal_path(word: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "/._-:".contains(c))
 }
 
+/// A value cannot introduce shell syntax or another Cargo option. Leading
+/// hyphens are declined even though they are allowed inside literal values.
+fn literal_cargo_value(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.,:+-".contains(c))
+}
+
+/// #2718: support only this literal grammar; never infer how Cargo would parse
+/// unknown flags, short-option clusters, global options or trailing arguments.
+fn supported_cargo_arguments(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    if words.next() != Some("cargo") {
+        return false;
+    }
+    let Some(subcommand @ ("check" | "build" | "test" | "clippy")) = words.next() else {
+        return false;
+    };
+    while let Some(word) = words.next() {
+        match word {
+            "--lib"
+            | "--bins"
+            | "--tests"
+            | "--all-targets"
+            | "--workspace"
+            | "--release"
+            | "-q"
+            | "--quiet"
+            | "--offline"
+            | "--locked"
+            | "--frozen"
+            | "--all-features"
+            | "--no-default-features" => {}
+            "-p" | "--package" | "--features" | "--message-format" => {
+                if !words.next().is_some_and(literal_cargo_value) {
+                    return false;
+                }
+            }
+            "--" if subcommand == "clippy" => {
+                let mut has_lint = false;
+                while let Some(flag) = words.next() {
+                    if !matches!(flag, "-D" | "-W" | "-A")
+                        || !words.next().is_some_and(literal_cargo_value)
+                    {
+                        return false;
+                    }
+                    has_lint = true;
+                }
+                return has_lint;
+            }
+            _ => {
+                let Some(("--package" | "--features" | "--message-format", value)) =
+                    word.split_once('=')
+                else {
+                    return false;
+                };
+                if !literal_cargo_value(value) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Attribute only a direct Cargo invocation, optionally preceded by plain
 /// `cd <literal path> &&` segments. All other shell context is unknown.
 pub(super) fn command_directory(
@@ -60,14 +127,7 @@ pub(super) fn command_directory(
         }
         dir = dir.join(path);
     }
-    // Only literal tokens remain. Decline options that can redirect Cargo's
-    // package/configuration/output context, in both joined and separated forms.
-    const CONTEXT_OPTIONS: &[&str] = &["--manifest-path", "-C", "--config", "-Z", "--target-dir"];
-    if cargo.split_whitespace().any(|word| {
-        CONTEXT_OPTIONS
-            .iter()
-            .any(|option| word.starts_with(option))
-    }) {
+    if !supported_cargo_arguments(cargo) {
         return None;
     }
     Some(super::super::lexical_normalize(&dir))
@@ -247,6 +307,93 @@ mod tests {
             "{command}: {text}"
         );
         assert!(!text.contains("Passed in"), "{command}: {text}");
+    }
+
+    /// #2718 round 5: clustered short options must not evade context checks.
+    #[tokio::test]
+    async fn round5_clustered_short_option_is_unverified() {
+        assert_unknown_directory("cargo check -vZbuild-std=core").await;
+    }
+
+    /// #2718 round 5: options outside the supported grammar fail closed.
+    #[tokio::test]
+    async fn round5_unknown_long_option_is_unverified() {
+        assert_unknown_directory("cargo check --future-context=other").await;
+    }
+
+    /// #2718 round 5: exhaust the supported grammar and its value boundaries.
+    #[test]
+    fn round5_argument_grammar_positive_and_negative_controls() {
+        let scope = "--lib --bins --tests --all-targets --workspace --release -q --quiet --offline --locked --frozen --all-features --no-default-features";
+        for verb in ["check", "build", "test", "clippy"] {
+            for args in [
+                scope,
+                "-p crate --package other --features one,two --message-format json",
+                "--package=crate --features=one,two --message-format=json-render-diagnostics",
+                "--package crate_1-2 --features=feat+extra --message-format=a:b.c",
+            ] {
+                let command = format!("cd /tree && cargo {verb} {args}");
+                assert!(
+                    command_directory(&command, &serde_json::json!({}), "/launch").is_some(),
+                    "{command}"
+                );
+            }
+        }
+        for command in [
+            "cargo clippy -- -D warnings",
+            "cargo clippy --lib -- -D warnings -W clippy::all -A dead_code",
+        ] {
+            assert!(
+                command_directory(command, &serde_json::json!({}), "/launch").is_some(),
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo check -vZbuild-std=core",
+            "cargo check --future-context=other",
+            "cargo check -qq",
+            "cargo check -pcrate",
+            "cargo check -p=crate",
+            "cargo check --package",
+            "cargo check --package=",
+            "cargo check --package=one/two",
+            "cargo check --features -vZbuild-std=core",
+            "cargo check --features=-Zunstable-options",
+            "cargo check extra",
+            "cargo check --lib=yes",
+            "cargo check --features=one=two",
+            "cargo check -- -D warnings",
+            "cargo build -- -D warnings",
+            "cargo test -- --ignored",
+            "cargo clippy --",
+            "cargo clippy -- -D",
+            "cargo clippy -- -Dwarnings",
+            "cargo clippy -- -D -W warnings",
+            "cargo clippy -- --cap-lints allow",
+            "cargo clippy -- -D warnings extra",
+            "cargo clean",
+            "cargo +nightly check",
+        ] {
+            assert!(
+                command_directory(command, &serde_json::json!({}), "/launch").is_none(),
+                "{command}"
+            );
+        }
+    }
+
+    /// #2718 round 5: ordinary package and target selection still attributes.
+    #[tokio::test]
+    async fn round5_plain_package_and_lib_keep_directory() {
+        let mut ledger = VerificationLedger::for_turn("refactor", false);
+        run(
+            &mut ledger,
+            "cd /tree && cargo check -p crate --lib",
+            Passed,
+            "/launch",
+        )
+        .await;
+        let text = ledger.annotate_cargo_claim("Cargo check green".into());
+        assert!(text.contains(&in_dir("Passed", "/tree")), "{text}");
     }
 
     /// #2718 round 4: shell quote removal must not hide a manifest override.
