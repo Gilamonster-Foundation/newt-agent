@@ -101,6 +101,15 @@ const SETUP_PACK_COMMAND: &str = "newt setup: standard caveat pack";
 ///   it never execs (GNU/BSD/POSIX).
 /// - `grep` — no flag spawns a process; `--include`/`--exclude` filter paths
 ///   by glob, they don't invoke one (GNU/BSD/POSIX).
+/// - `tr`   — complement/delete/squeeze and GNU/uutils truncation only
+///   transform stdin; BSD/macOS `-u` only disables buffering. No flag spawns
+///   a process (GNU Coreutils manual, Apple BSD tr(1), uutils Windows port).
+/// - `cut`  — byte/character/field selection, delimiters, complement and
+///   NUL records only select input; BSD/macOS `-w` selects whitespace fields.
+///   No flag spawns a process (GNU manual, Apple BSD cut(1), uutils Windows).
+/// - `uniq` — count/repeat/group/skip/case flags only compare adjacent lines;
+///   the optional output operand writes a file, still subject to fs authority.
+///   No flag spawns a process (GNU manual, Apple BSD uniq(1), uutils Windows).
 /// - `wc`   — no flag spawns a process (GNU/BSD/POSIX).
 /// - `ls`   — no flag spawns a process; `--color` only reads env/terminfo
 ///   (GNU/BSD/POSIX).
@@ -111,7 +120,7 @@ const SETUP_PACK_COMMAND: &str = "newt setup: standard caveat pack";
 /// the pack silently never mentioning why they keep prompting: `awk`,
 /// `xargs`, `sh`.
 pub const STANDARD_TEXT_TOOLS: &[&str] = &[
-    "cat", "head", "tail", "grep", "wc", "ls", "awk", "xargs", "sh",
+    "cat", "head", "tail", "grep", "tr", "cut", "uniq", "wc", "ls", "awk", "xargs", "sh",
 ];
 
 /// Names whose exec grant must never enter the candidate pool, no matter what
@@ -306,6 +315,28 @@ mod tests {
     fn standard_pack_never_lists_git_or_gh() {
         assert!(!STANDARD_TEXT_TOOLS.contains(&"git"));
         assert!(!STANDARD_TEXT_TOOLS.contains(&"gh"));
+    }
+
+    /// Regression: ordinary stdin filters were missing from setup proposals,
+    /// so `tr` brace-counting pipelines repeatedly requested exec authority.
+    #[test]
+    fn standard_pack_proposes_tr_cut_and_uniq() {
+        let proposal = propose_standard_pack(
+            STANDARD_TEXT_TOOLS,
+            &[],
+            &HashSet::new(),
+            danger,
+            "2026-10-04",
+        );
+        for tool in ["tr", "cut", "uniq"] {
+            assert!(STANDARD_TEXT_TOOLS.contains(&tool), "pack must list {tool}");
+            assert!(proposal
+                .additions
+                .exec
+                .iter()
+                .any(|entry| entry.target == tool));
+            assert!(!proposal.deferred.iter().any(|entry| entry.target == tool));
+        }
     }
 
     #[test]
