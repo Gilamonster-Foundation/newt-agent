@@ -349,6 +349,31 @@ impl WorkspaceDir {
         .map_err(io::Error::from)
     }
 
+    /// Check that a path still names this held directory (optimistic observation).
+    #[cfg(feature = "ast")]
+    pub(crate) fn still_named_by(&self, path: &Path) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let held = File::from(self.root.try_clone()?).metadata()?;
+        let named = std::fs::metadata(path)?;
+        Ok(held.dev() == named.dev() && held.ino() == named.ino())
+    }
+
+    /// Publish a staged regular file without replacing an existing destination.
+    /// Both parents stay bound to this capability; linkat fails with EEXIST.
+    #[cfg(feature = "ast")]
+    pub(crate) fn link_new(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let (from_dir, from_name) = self.parent_dir_and_name(from)?;
+        let (to_dir, to_name) = self.parent_dir_and_name(to)?;
+        rustix::fs::linkat(
+            &from_dir,
+            Path::new(&from_name),
+            &to_dir,
+            Path::new(&to_name),
+            AtFlags::empty(),
+        )
+        .map_err(io::Error::from)
+    }
+
     /// Open a subdirectory as its own contained [`WorkspaceDir`]. Traversal stays
     /// beneath the original root; the returned handle cannot reach outside it.
     pub fn open_dir(&self, rel: &Path) -> io::Result<Self> {
