@@ -539,6 +539,20 @@ fn strip_read_footer<'a>(
     }
 }
 
+/// The authenticated continuation cursor of a page produced by this process.
+/// Shared with turn-local read history; source lookalikes never advance it.
+pub(crate) fn read_page_continuation(
+    content: &str,
+    path: &str,
+    first_line: usize,
+    char_offset_in: usize,
+) -> Option<(usize, usize)> {
+    strip_read_footer(content, path, first_line, char_offset_in)
+        .1
+        .filter(|footer| footer.trusted)
+        .map(|footer| (footer.next_offset, footer.next_char_offset.unwrap_or(0)))
+}
+
 /// #2638 review round 6: does `content`'s OWN final line look like a
 /// pagination footer for `path`, at `first_line=1`/`char_offset_in=0` (the
 /// whole-file passthrough's fixed coordinates), with a tag that VERIFIES?
