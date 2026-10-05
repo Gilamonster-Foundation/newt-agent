@@ -112,7 +112,7 @@ async fn worktree_adoption_round2_git_clean_preserves_sentinel() {
     assert_eq!(outcome, Some(crate::ExecOutcome::Denied), "{text}");
     assert!(session.snapshot().is_none());
     assert!(!temp.path().join("task").exists());
-    let (text, outcome) = dispatch(serde_json::json!({"command":"git worktree add ../task -b task 2>&1 | tail -5; git branch --show-current"}), &root, &c, &session, None).await;
+    let (text, outcome) = dispatch(serde_json::json!({"command":"git worktree add ../task -b task 2>&1; echo ready; pwd; git branch --show-current"}), &root, &c, &session, None).await;
     assert_eq!(outcome, Some(crate::ExecOutcome::Passed), "{text}");
     assert_eq!(
         session.snapshot().expect(&text).worktree,

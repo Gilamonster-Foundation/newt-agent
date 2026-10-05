@@ -147,6 +147,11 @@ fn creation(
     None
 }
 
+// SafeSubset spawns these names externally; only actual shell builtins qualify.
+fn display_builtin(program: &str, engine: crate::ShellEngine) -> bool {
+    matches!(program, "echo" | "printf" | "pwd") && engine != crate::ShellEngine::SafeSubset
+}
+
 // Adoption is an execution boundary: a compound creation must not write the
 // original checkout later in the SAME shell before the outer guard can run.
 fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
@@ -174,12 +179,7 @@ fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
             return false;
         };
         let args: Vec<_> = words.iter().skip(1).map(String::as_str).collect();
-        match c
-            .program
-            .as_deref()
-            .and_then(|p| Path::new(p).file_name())
-            .and_then(|p| p.to_str())
-        {
+        match c.program.as_deref() {
             Some(program) if is_git(program) => {
                 if worktree_add_args(&words).is_some() {
                     additions += 1;
@@ -194,8 +194,12 @@ fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
                     )
                 }
             }
-            Some("echo" | "printf" | "head" | "tail" | "pwd") => true,
-            _ => false,
+            // Only literal bare builtins have a known implementation here.
+            // Exec authority (even for a basename like tail) does not certify
+            // read-only behavior. External displays run separately, AFTER
+            // adoption; refusing them also closes PATH substitution (#2733).
+            Some(program) => display_builtin(program, shell::shell_engine()),
+            None => false,
         }
     });
     safe && additions == 1

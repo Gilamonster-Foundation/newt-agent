@@ -134,7 +134,7 @@ fn worktree_adoption_round3_exact_creation_and_noncreation_controls() {
     for source in [
         "git worktree add ../task -b task".to_owned(),
         format!("git -C '{}' worktree add ../task -b task", root.display()),
-        "pwd; git worktree add ../task -b task 2>&1 | tail -5; git branch --show-current"
+        "pwd; git worktree add ../task -b task 2>&1; echo ready; pwd; git branch --show-current"
             .to_owned(),
     ] {
         let admission = creation_admission(
@@ -172,5 +172,125 @@ fn worktree_adoption_round3_exact_creation_and_noncreation_controls() {
             .is_ok_and(|candidate| candidate.is_none()),
             "{source}"
         );
+    }
+}
+
+/// #2733 round 4: a display basename does not certify an executable's behavior.
+#[test]
+fn worktree_adoption_round4_display_identity() {
+    for sibling in [
+        "/authorized/bin/tail",
+        "./tail",
+        "/usr/bin/echo hi",
+        "head victim",
+        "tail victim",
+        "unknown-display",
+    ] {
+        assert!(
+            !creation_batch_is_read_only_after_add(&serde_json::json!({
+                "command": format!("git worktree add ../task -b task; {sibling}")
+            })),
+            "accepted {sibling}"
+        );
+    }
+    for sibling in ["echo ready", "pwd", "printf ready"] {
+        assert_eq!(
+            creation_batch_is_read_only_after_add(&serde_json::json!({
+                "command": format!("git worktree add ../task -b task; {sibling}")
+            })),
+            shell_engine() != crate::ShellEngine::SafeSubset,
+            "builtin identity for {sibling}"
+        );
+    }
+}
+
+/// #2733 round 4: ground the display classifier in real dispatch. A native rm
+/// image named tail must not delete the sentinel before the adoption boundary.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires native kernel confinement and git"]
+async fn worktree_adoption_round4_replacement_preserves_sentinel() {
+    assert!(crate::confined_exec::kernel_fs_fence_available());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("main");
+    let bin = temp.path().join("authorized/bin");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy("/bin/rm", bin.join("tail")).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        let out = crate::agentic::tools::tests::git_shell_grant::hermetic_git(&root, temp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    std::fs::write(root.join("victim"), "sentinel").unwrap();
+    let session = WorktreeSession::default();
+    let mut c = Caveats::top();
+    c.net = Scope::none();
+    c.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
+    let (text, outcome) = dispatch(
+        serde_json::json!({"command": format!("git worktree add ../task -b task; '{}' victim", bin.join("tail").display())}),
+        &root, &c, &session, None,
+    ).await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("victim")).ok().as_deref(),
+        Some("sentinel"),
+        "{text}"
+    );
+    assert_eq!(outcome, Some(crate::ExecOutcome::Denied), "{text}");
+    assert!(text.contains("standalone"), "{text}");
+    assert!(!temp.path().join("task").exists());
+    assert!(session.snapshot().is_none());
+    let (text, outcome) = dispatch(
+        serde_json::json!({"command": "pwd; git worktree add ../task -b task; echo ready"}),
+        &root,
+        &c,
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(outcome, Some(crate::ExecOutcome::Passed), "{text}");
+    assert!(session.snapshot().is_some(), "{text}");
+}
+
+/// #2733: safe-subset invokes names as externals, not as shell builtins.
+#[test]
+fn worktree_adoption_round4_builtin_requires_shell_implementation() {
+    for engine in [
+        crate::ShellEngine::Brush,
+        crate::ShellEngine::Host,
+        crate::ShellEngine::SafeSubset,
+    ] {
+        for name in ["echo", "printf", "pwd"] {
+            assert_eq!(
+                display_builtin(name, engine),
+                engine != crate::ShellEngine::SafeSubset
+            );
+        }
+        for name in [
+            "/authorized/bin/tail",
+            "tail",
+            "head",
+            "/bin/echo",
+            "./pwd",
+            "bin/printf",
+        ] {
+            assert!(!display_builtin(name, engine));
+        }
     }
 }
