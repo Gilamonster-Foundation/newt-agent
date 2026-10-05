@@ -32,10 +32,13 @@ Rust name resolution or a semantic equivalence proof.
 
 Both files must be readable and their parent directories writable under the
 session's grants (complete-file staging needs sibling temporary paths). Checks
-run in the owning package inside the current session workspace. The existing
-Build permission gate must approve any additional build authority. Sibling
-worktrees remain subject to the separate containment work in #2723; use a
-session rooted in the intended worktree until that is available.
+run in the owning package, using the same build-root selector as build-bearing
+shell commands (#2723). Absolute source and destination paths can name a sibling
+worktree already authorized by `--write <worktree>`; relative paths still resolve
+against the session workspace. Both files must remain inside the selected build
+root. An unapproved sibling is refused with the grant-or-launch-there retry.
+The existing Build permission gate must approve any additional build authority;
+a write grant alone never authorizes execution.
 
 A confined `cargo check -p <package> --lib` must exit zero before editing and
 again afterward. Default Cargo features/configuration apply; other feature
@@ -63,7 +66,8 @@ fall through to an ordinary write.
 
 The additional CI-only real-resource test grounds those mocks in actual
 bounded file publication and real confined Cargo checks. It compiles a tiny,
-dependency-free library after extraction, then induces a real compiler failure
+dependency-free library in an authorized sibling worktree (with an invalid
+session manifest proving the check runs in the sibling), then induces a real compiler failure
 and verifies byte-for-byte restoration. Run it explicitly on a native host
 with Rust and a working kernel build sandbox:
 
