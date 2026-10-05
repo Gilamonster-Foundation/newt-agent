@@ -270,8 +270,17 @@ fn fixed_form_with_notice(
     result: Result<crate::git_staging::Outcome, crate::git_staging::Refusal>,
     mut notice: impl std::io::Write,
 ) -> String {
-    if let Some(hint) = result.as_ref().err().and_then(|r| r.hint()) {
-        crate::agentic::display::write_harness_notice(&mut notice, &hint.render(), false);
+    if let Err(refusal) = &result {
+        for hint in refusal.hints() {
+            crate::agentic::display::write_harness_notice(&mut notice, &hint.render(), false);
+        }
+        if !refusal.hints().is_empty() {
+            crate::agentic::display::write_harness_notice(
+                &mut notice,
+                "Run `newt doctor` to check all push tool paths.",
+                false,
+            );
+        }
     }
     fixed_form(result)
 }
