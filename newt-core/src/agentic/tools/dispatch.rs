@@ -26,9 +26,10 @@ use crate::agentic::tools::{execute_tool_inner, shell, tool_presentation};
 /// impossible, and a NEW seam is one field plus its construction sites, not a
 /// signature change through six layers.
 ///
-/// `Default` is all-`None`: the bare dispatch a test or embedder starts from.
+/// `Default` uses absent collaborators and the ordinary default command budget.
 #[derive(Default)]
 pub(crate) struct ToolCollaborators<'a, 'gate> {
+    pub(crate) command_budget: crate::RunCommandBudget,
     /// Turn-local pages observed after successful read authorization.
     pub(crate) read_history: Option<&'a mut super::ReadHistory>,
     /// Call-local command default supplied by the operator, without granting authority.

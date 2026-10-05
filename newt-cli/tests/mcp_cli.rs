@@ -446,6 +446,7 @@ mod composed_private_mcp_uat {
 
         let (reply, _, _, hallucinations) = newt_core::chat_complete(
             ChatCtx {
+                command_budget: Default::default(),
                 overflow_retry: Default::default(),
                 run_allowance: None,
                 verify_outcomes: false,

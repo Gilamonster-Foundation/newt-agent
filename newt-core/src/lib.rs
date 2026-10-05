@@ -245,8 +245,8 @@ pub use config::{
     MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure, OpenAiApi,
     PermissionPreset, PickVia, PlanConfig, PlanPruneConfig, ProbeObservation, ProbeWriteback,
     ProbedServing, ProfilePick, ProviderConfig, RequestMode, ResolvedBackend, ResolvedConfig,
-    ScratchConfig, SemanticConfig, Serving, ShellConfig, ShellEngine, SkillsConfig,
-    SummarizerConfig, ThinkingMode, ToolExposureConfig, ToolPermissions, TuiConfig,
+    RunCommandBudget, ScratchConfig, SemanticConfig, Serving, ShellConfig, ShellEngine,
+    SkillsConfig, SummarizerConfig, ThinkingMode, ToolExposureConfig, ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,

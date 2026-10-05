@@ -27,7 +27,20 @@ async fn search(ws: &std::path::Path, caveats: &Caveats, path: Option<&str>) -> 
 #[test]
 fn plan_advertises_registered_navigation_reads_only() {
     let definitions = merged_tool_definitions(
-        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
+        &NoMcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
     );
     let defs = filter_tools_for_disposition(definitions, PromptDisposition::Plan);
     for name in crate::navigator::NAV_TOOL_NAMES {

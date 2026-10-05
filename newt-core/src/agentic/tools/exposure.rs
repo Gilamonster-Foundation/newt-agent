@@ -821,6 +821,7 @@ mod tests {
             true,
             true,
             true,
+            Default::default(),
         );
         let full_tokens = crate::agentic::trim::estimate_value_tokens(&full, est());
         let settings = ExposureSettings {

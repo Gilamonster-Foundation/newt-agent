@@ -15,7 +15,10 @@ fn default_wall() -> Duration {
 fn a_compound_cargo_command_keeps_the_build_wall() {
     let _env = crate::process_env::lock();
     assert_eq!(
-        super::shell::dispatch_wall(r#"cargo test -j 4 -p newt-git; echo "EXIT=$?""#),
+        super::shell::dispatch_wall(
+            r#"cargo test -j 4 -p newt-git; echo "EXIT=$?""#,
+            Default::default(),
+        ),
         build_wall()
     );
 }
@@ -24,21 +27,30 @@ fn a_compound_cargo_command_keeps_the_build_wall() {
 #[test]
 fn a_just_command_keeps_the_build_wall() {
     let _env = crate::process_env::lock();
-    assert_eq!(super::shell::dispatch_wall("just test"), build_wall());
+    assert_eq!(
+        super::shell::dispatch_wall("just test", Default::default(),),
+        build_wall()
+    );
 }
 
 /// An ordinary command is unaffected — the default wall still applies.
 #[test]
 fn a_plain_command_keeps_the_default_wall() {
     let _env = crate::process_env::lock();
-    assert_eq!(super::shell::dispatch_wall("ls -la"), default_wall());
+    assert_eq!(
+        super::shell::dispatch_wall("ls -la", Default::default(),),
+        default_wall()
+    );
 }
 
 /// Mentioning Cargo does not widen an ordinary command budget.
 #[test]
 fn cargo_mentioned_later_does_not_widen_the_wall() {
     let _env = crate::process_env::lock();
-    assert_eq!(super::shell::dispatch_wall("echo cargo"), default_wall());
+    assert_eq!(
+        super::shell::dispatch_wall("echo cargo", Default::default(),),
+        default_wall()
+    );
 }
 
 /// A timed-out result names the wall that actually applied, so a reader can
@@ -65,6 +77,7 @@ fn a_timed_out_build_command_names_the_build_wall_in_its_result() {
                 envelope["stderr"].as_str().unwrap_or_default()
             )
         },
+        Default::default(),
     );
     assert_eq!(class, crate::ExecOutcome::TimedOut);
     assert!(
@@ -95,7 +108,7 @@ fn the_wall_is_the_default_timeout_not_just_the_ceiling() {
 fn a_cd_prefix_keeps_the_build_wall() {
     let _env = crate::process_env::lock();
     assert_eq!(
-        super::shell::dispatch_wall("cd newt-git && cargo test"),
+        super::shell::dispatch_wall("cd newt-git && cargo test", Default::default(),),
         build_wall()
     );
 }
@@ -104,7 +117,7 @@ fn a_cd_prefix_keeps_the_build_wall() {
 fn an_env_prefix_keeps_the_build_wall() {
     let _env = crate::process_env::lock();
     assert_eq!(
-        super::shell::dispatch_wall("RUSTC_WRAPPER= cargo test -p newt-git"),
+        super::shell::dispatch_wall("RUSTC_WRAPPER= cargo test -p newt-git", Default::default(),),
         build_wall()
     );
 }
@@ -114,7 +127,10 @@ fn an_env_prefix_keeps_the_build_wall() {
 fn issue_2732_probe_then_search_keeps_command_budget() {
     let _env = crate::process_env::lock();
     assert_eq!(
-        super::shell::dispatch_wall("cargo --version; find / -maxdepth 6 -name camino"),
+        super::shell::dispatch_wall(
+            "cargo --version; find / -maxdepth 6 -name camino",
+            Default::default(),
+        ),
         default_wall()
     );
 }
@@ -167,6 +183,7 @@ fn issue_2732_timeout_reports_selected_budget() {
         &crate::caveats::Caveats::top(),
         false,
         |_| "partial".into(),
+        Default::default(),
     );
     assert_eq!(outcome, crate::ExecOutcome::TimedOut);
     assert!(text.contains("17s wall"), "{text}");
@@ -178,12 +195,19 @@ fn issue_2732_timeout_reports_selected_budget() {
 #[test]
 fn round2_compound_build_retains_build_budget() {
     let _env = crate::process_env::lock();
-    let wall = super::shell::dispatch_wall("cargo check --workspace && echo checked");
+    let wall = super::shell::dispatch_wall(
+        "cargo check --workspace && echo checked",
+        Default::default(),
+    );
     assert_eq!(wall, build_wall());
     let elapsed = Duration::from_secs(61);
     assert!(elapsed < wall);
     assert!(
-        elapsed >= super::shell::dispatch_wall("cargo --version; find / -maxdepth 6 -name camino")
+        elapsed
+            >= super::shell::dispatch_wall(
+                "cargo --version; find / -maxdepth 6 -name camino",
+                Default::default(),
+            )
     );
 }
 
@@ -198,7 +222,7 @@ fn round2_only_classified_build_work_gets_long_budget() {
         "make --version; find /",
     ] {
         assert_eq!(
-            super::shell::dispatch_wall(command),
+            super::shell::dispatch_wall(command, Default::default(),),
             default_wall(),
             "{command}"
         );
@@ -212,13 +236,67 @@ fn round2_only_classified_build_work_gets_long_budget() {
         "make all && echo checked",
     ] {
         assert_eq!(
-            super::shell::dispatch_wall(command),
+            super::shell::dispatch_wall(command, Default::default(),),
             build_wall(),
             "{command}"
         );
     }
     assert_eq!(
-        super::shell::command_wall("cargo check && echo checked", Some(20)),
+        super::shell::command_wall("cargo check && echo checked", Some(20), Default::default(),),
         Duration::from_secs(20)
     );
+}
+
+/// #2747: catalog, ordinary dispatcher, safe-subset limits, and timeout notes
+/// use the same captured configuration; per-call/build exceptions stay bounded.
+#[test]
+fn command_budget_2747_catalog_and_dispatch_agree() {
+    for value in ["1", "17", "900"] {
+        let budget = crate::RunCommandBudget::from_configured(Some(value));
+        let seconds = budget.seconds(None);
+        let defs = super::catalog::tool_definitions_with_budget(budget);
+        let description = defs[0]["function"]["description"].as_str().unwrap();
+        assert!(description.contains(&format!("killed after {seconds} seconds")));
+        let wall = super::shell::command_wall("echo ready", None, budget);
+        assert_eq!(wall.as_secs(), seconds);
+        assert_eq!(
+            super::shell::shell_limits(wall).default_timeout_secs,
+            seconds
+        );
+        assert!(super::shell::timed_out_note(wall, budget).contains(&format!("{seconds}s wall")));
+        assert_eq!(
+            super::shell::command_wall("echo ready", Some(0), budget),
+            wall
+        );
+        assert_eq!(
+            super::shell::command_wall("echo ready", Some(999), budget).as_secs(),
+            300
+        );
+        assert_eq!(
+            super::shell::command_wall("cargo check", None, budget),
+            build_wall()
+        );
+        assert_eq!(
+            super::shell::command_wall("cargo check", Some(17), budget).as_secs(),
+            17
+        );
+        assert_eq!(
+            super::shell::command_wall("cargo --version", None, budget),
+            wall
+        );
+    }
+}
+
+/// #2747: ground the pure budget selection in a host-dispatch envelope without
+/// measuring elapsed time or changing the process-wide timeout environment.
+#[cfg(unix)]
+#[tokio::test]
+async fn command_budget_2747_host_dispatch_carries_captured_budget() {
+    let budget = crate::RunCommandBudget::from_configured(Some("17"));
+    let envelope = super::shell::host_shell_dispatch("printf ready", ".", None, None, budget)
+        .await
+        .unwrap();
+    assert_eq!(envelope["timeout_secs"], 17);
+    assert_eq!(envelope["exit_code"], 0);
+    assert_eq!(envelope["stdout"], "ready");
 }

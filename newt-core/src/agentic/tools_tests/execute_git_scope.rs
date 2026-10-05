@@ -72,6 +72,7 @@ fn git_catalog_intersects_read_scope_with_prompt_disposition() {
                 false,
                 false,
                 false,
+                Default::default(),
             );
             let defs = filter_tools_for_disposition(defs, disposition);
             let git = defs

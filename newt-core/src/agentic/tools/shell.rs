@@ -822,7 +822,8 @@ pub(super) async fn dispatch_bridled_shell(
     caveats: &crate::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
-    dispatch_bridled_shell_with_floor(args, caveats, sink, None, None, None).await
+    dispatch_bridled_shell_with_floor(args, caveats, sink, None, None, None, Default::default())
+        .await
 }
 
 /// A prepared build keeps the native build executor's strength floor while
@@ -833,6 +834,7 @@ pub(super) async fn dispatch_bridled_build_shell(
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     execution_lease: std::sync::Arc<dyn Send + Sync>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    command_budget: crate::RunCommandBudget,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     dispatch_bridled_shell_with_floor(
         args,
@@ -841,6 +843,7 @@ pub(super) async fn dispatch_bridled_build_shell(
         Some(agent_bridle::AxisEnforcement::Kernel),
         Some(execution_lease),
         command_broker,
+        command_budget,
     )
     .await
 }
@@ -852,6 +855,7 @@ async fn dispatch_bridled_shell_with_floor(
     strength_floor: Option<agent_bridle::AxisEnforcement>,
     execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    command_budget: crate::RunCommandBudget,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     let mut live = LiveOutputSession::start(sink);
     // NOTE (cross-platform review, `unconfined-fallback-on-missing-backend`):
@@ -873,6 +877,7 @@ async fn dispatch_bridled_shell_with_floor(
     let wall = command_wall(
         cmd.unwrap_or_default(),
         args.get("timeout_secs").and_then(serde_json::Value::as_u64),
+        command_budget,
     );
     // dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the toolchain
     // read roots for a build-tool command are added ONLY to the caveats used
@@ -1021,6 +1026,7 @@ pub(super) async fn exec_confined_command(
     spill_store: Option<&dyn SpillStore>,
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
+    command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
     exec_confined_command_with_broker(
         cmd,
@@ -1040,6 +1046,7 @@ pub(super) async fn exec_confined_command(
         None,
         &mut None,
         None,
+        command_budget,
     )
     .await
 }
@@ -1088,6 +1095,7 @@ pub(super) async fn exec_confined_command_with_broker(
     // string does not.
     pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
     timeout_secs: Option<u64>,
+    command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
     // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
     // BEFORE either lane below runs anything — this is the single choke
@@ -1139,6 +1147,7 @@ pub(super) async fn exec_confined_command_with_broker(
             cwd,
             live.as_ref().map(LiveOutputSession::relay),
             timeout_secs,
+            command_budget,
         )
         .await;
         if let Some(live) = live.as_mut() {
@@ -1250,6 +1259,7 @@ pub(super) async fn exec_confined_command_with_broker(
         None,
         execution_lease.clone(),
         command_broker.clone(),
+        command_budget,
     )
     .await
     {
@@ -1388,6 +1398,7 @@ pub(super) async fn exec_confined_command_with_broker(
                                 None,
                                 execution_lease.clone(),
                                 command_broker,
+                                command_budget,
                             )
                             .await
                             {
@@ -1400,8 +1411,12 @@ pub(super) async fn exec_confined_command_with_broker(
                                     );
                                     (denied_run_command_result(&env2, color), ExecOutcome::Denied)
                                 }
-                                Ok(env2) => {
-                                    confined_result(cmd, &env2, &widened, color, |envelope| {
+                                Ok(env2) => confined_result(
+                                    cmd,
+                                    &env2,
+                                    &widened,
+                                    color,
+                                    |envelope| {
                                         shell_envelope_output(
                                             envelope,
                                             tool_output_lines,
@@ -1410,8 +1425,9 @@ pub(super) async fn exec_confined_command_with_broker(
                                             spill_store,
                                             Some(&mut *presentation),
                                         )
-                                    })
-                                }
+                                    },
+                                    command_budget,
+                                ),
                                 Err(e) => dispatch_error_result(e),
                             };
                             return with_denial_context(retried, workspace, cwd, Some(&widened));
@@ -1429,16 +1445,23 @@ pub(super) async fn exec_confined_command_with_broker(
                     *pre_exec_missing = Some(requests);
                 }
             }
-            confined_result(cmd, &envelope, caveats, color, |envelope| {
-                shell_envelope_output(
-                    envelope,
-                    tool_output_lines,
-                    color,
-                    tool_offload,
-                    spill_store,
-                    Some(&mut *presentation),
-                )
-            })
+            confined_result(
+                cmd,
+                &envelope,
+                caveats,
+                color,
+                |envelope| {
+                    shell_envelope_output(
+                        envelope,
+                        tool_output_lines,
+                        color,
+                        tool_offload,
+                        spill_store,
+                        Some(&mut *presentation),
+                    )
+                },
+                command_budget,
+            )
         }
         // An argv-mode leash denial, or an error from inside the tool — surface
         // the reason; the dispatch error Display is safe to show.
@@ -1503,6 +1526,7 @@ pub(super) fn confined_result(
     caveats: &crate::caveats::Caveats,
     color: bool,
     render: impl FnOnce(&serde_json::Value) -> String,
+    command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
     if envelope_denied(envelope) {
         return (
@@ -1557,7 +1581,8 @@ pub(super) fn confined_result(
                 .get("timeout_secs")
                 .and_then(serde_json::Value::as_u64)
                 .map(std::time::Duration::from_secs)
-                .unwrap_or_else(|| dispatch_wall(cmd)),
+                .unwrap_or_else(|| dispatch_wall(cmd, command_budget)),
+            command_budget,
         ));
     }
     (text, outcome)
@@ -1572,40 +1597,11 @@ pub(super) const LIFECYCLE_BUILD_TIMEOUT: std::time::Duration =
 /// of inventing `phase="build"`.
 const LIFECYCLE_BUILD_CALL: &str = r#"{"action":"build","phase":"test"}"#;
 
-/// Operator-configurable ordinary command wall, capped independently of builds.
-fn run_command_wall_secs() -> u64 {
-    command_budget_seconds(
-        std::env::var("NEWT_RUN_COMMAND_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
-        None,
-    )
-}
+pub(super) const RUN_COMMAND_MAX_SECS: u64 = crate::RunCommandBudget::MAX_SECS;
 
-pub(super) const RUN_COMMAND_MAX_SECS: u64 = 300;
-
-/// Pure selection seam: configuration and per-call override can never disable
-/// the deadline or exceed the ordinary command ceiling.
+#[cfg(test)]
 pub(super) fn command_budget_seconds(configured: Option<&str>, requested: Option<u64>) -> u64 {
-    let default = agent_bridle::LimitsPolicy::default().default_timeout_secs;
-    requested
-        .filter(|n| *n > 0)
-        .or_else(|| {
-            configured
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .filter(|n| *n > 0)
-        })
-        .unwrap_or(default)
-        .min(RUN_COMMAND_MAX_SECS)
-}
-
-pub(super) fn run_command_budget(requested: Option<u64>) -> std::time::Duration {
-    std::time::Duration::from_secs(command_budget_seconds(
-        std::env::var("NEWT_RUN_COMMAND_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
-        requested,
-    ))
+    crate::RunCommandBudget::from_configured(configured).seconds(requested)
 }
 
 /// The selected wall must also be the safe-subset engine's default, not only its ceiling.
@@ -1618,30 +1614,37 @@ pub(super) fn shell_limits(wall: std::time::Duration) -> agent_bridle::LimitsPol
     }
 }
 
-pub(super) fn command_wall(cmd: &str, requested: Option<u64>) -> std::time::Duration {
+pub(super) fn command_wall(
+    cmd: &str,
+    requested: Option<u64>,
+    command_budget: crate::RunCommandBudget,
+) -> std::time::Duration {
     if super::build_shell::has_build_work(cmd) {
         requested
             .filter(|secs| *secs > 0)
-            .map(|secs| run_command_budget(Some(secs)))
+            .map(|secs| std::time::Duration::from_secs(command_budget.seconds(Some(secs))))
             .unwrap_or(LIFECYCLE_BUILD_TIMEOUT)
     } else {
-        run_command_budget(requested)
+        std::time::Duration::from_secs(command_budget.seconds(requested))
     }
 }
 
-pub(super) fn dispatch_wall(cmd: &str) -> std::time::Duration {
-    command_wall(cmd, None)
+pub(super) fn dispatch_wall(
+    cmd: &str,
+    command_budget: crate::RunCommandBudget,
+) -> std::time::Duration {
+    command_wall(cmd, None, command_budget)
 }
 
 /// What the `run_command` description tells the model about its wall, up front.
 /// One owner with [`timed_out_note`], so the two cannot disagree (U6).
-pub(super) fn run_command_limit_sentence() -> String {
+pub(super) fn run_command_limit_sentence(command_budget: crate::RunCommandBudget) -> String {
     format!(
         "Ordinary calls are killed after {} seconds (wall clock); classified builds get 30 minutes. Override with timeout_secs up to \
          {} seconds; the result carries the exit code. For an offline build use \
          `lifecycle` action=build, i.e. call the tool with {LIFECYCLE_BUILD_CALL} (`phase` is \
          never `build`), or narrow the command (one test filter, one crate).",
-        run_command_wall_secs(),
+        command_budget.seconds(None),
         RUN_COMMAND_MAX_SECS
     )
 }
@@ -1657,8 +1660,11 @@ pub(super) fn run_command_limit_sentence() -> String {
 /// it recommends was just DECLINED — a result must carry ONE recommendation,
 /// never this note's "use lifecycle action=build" immediately followed by
 /// "build authority was declined".
-pub(super) fn timed_out_note(wall: std::time::Duration) -> String {
-    let default = std::time::Duration::from_secs(run_command_wall_secs());
+pub(super) fn timed_out_note(
+    wall: std::time::Duration,
+    command_budget: crate::RunCommandBudget,
+) -> String {
+    let default = std::time::Duration::from_secs(command_budget.seconds(None));
     let wall_note = if wall == default {
         format!("{}s wall", wall.as_secs())
     } else if wall == LIFECYCLE_BUILD_TIMEOUT {
@@ -1741,10 +1747,11 @@ pub(super) async fn host_shell_dispatch(
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     timeout_secs: Option<u64>,
+    command_budget: crate::RunCommandBudget,
 ) -> std::io::Result<serde_json::Value> {
-    let wall = command_wall(cmd, timeout_secs);
+    let wall = command_wall(cmd, timeout_secs, command_budget);
     let run = if timeout_secs.is_none() && wall != LIFECYCLE_BUILD_TIMEOUT {
-        host_shell_output(cmd, cwd, live).await?
+        host_shell_output(cmd, cwd, live, command_budget).await?
     } else {
         host_shell_output_with_timeout(cmd, cwd, live, wall).await?
     };
@@ -1773,8 +1780,8 @@ pub(super) struct HostShellRun {
 }
 
 /// The unsafe host bypass uses the same configurable, capped command budget.
-fn host_exec_timeout() -> std::time::Duration {
-    run_command_budget(None)
+fn host_exec_timeout(command_budget: crate::RunCommandBudget) -> std::time::Duration {
+    std::time::Duration::from_secs(command_budget.seconds(None))
 }
 
 pub(super) fn decode_shell_stream(bytes: &[u8]) -> String {
@@ -1903,8 +1910,9 @@ pub(super) async fn host_shell_output(
     cmd: &str,
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
+    command_budget: crate::RunCommandBudget,
 ) -> std::io::Result<HostShellRun> {
-    host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout()).await
+    host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout(command_budget)).await
 }
 
 /// newt's control-plane env vars that must NEVER flow into a host-shell child
@@ -2046,8 +2054,9 @@ pub(super) async fn host_shell_output(
     cmd: &str,
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
+    command_budget: crate::RunCommandBudget,
 ) -> std::io::Result<HostShellRun> {
-    host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout()).await
+    host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout(command_budget)).await
 }
 
 #[cfg(windows)]

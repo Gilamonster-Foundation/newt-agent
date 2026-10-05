@@ -52,6 +52,7 @@ async fn build(
             &mut display,
             None,
             None,
+            Default::default(),
         )
         .await
     } else {

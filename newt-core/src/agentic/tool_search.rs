@@ -340,7 +340,20 @@ mod tests {
     fn full_catalog() -> serde_json::Value {
         let git = Some(&crate::caveats::Scope::All);
         merged_tool_definitions(
-            &NoMcp, true, true, true, git, true, true, true, true, true, true, true, true,
+            &NoMcp,
+            true,
+            true,
+            true,
+            git,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            Default::default(),
         )
     }
 

@@ -133,7 +133,7 @@ async fn lifecycle_phase_build_points_at_action_build() {
 /// never silently fall back to the original timeout text.
 #[test]
 fn escalated_after_timeout_labels_the_reroute_and_preserves_the_build_result() {
-    let wall = shell::dispatch_wall("pytest -k slow"); // a non-build-tool program → the default wall
+    let wall = shell::dispatch_wall("pytest -k slow", Default::default()); // a non-build-tool program → the default wall
     for (build_result, outcome) in [
         ("  ✓ build check passed".to_string(), crate::ExecOutcome::Passed),
         (
@@ -162,10 +162,10 @@ fn escalated_after_timeout_labels_the_reroute_and_preserves_the_build_result() {
 #[test]
 fn escalates_only_on_a_default_wall_timeout() {
     let _env = crate::process_env::lock();
-    let default_wall = shell::dispatch_wall("pytest -k slow");
+    let default_wall = shell::dispatch_wall("pytest -k slow", Default::default());
     let build_wall = shell::LIFECYCLE_BUILD_TIMEOUT;
     assert_eq!(
-        shell::dispatch_wall("cargo test"),
+        shell::dispatch_wall("cargo test", Default::default(),),
         build_wall,
         "#2732: a classified build retains its build budget"
     );
@@ -201,7 +201,7 @@ fn escalates_only_on_a_default_wall_timeout() {
 /// escalation by recommending it is wrong (round 3 item 4).
 #[test]
 fn a_refused_escalation_keeps_the_first_runs_evidence() {
-    let wall = shell::dispatch_wall("pytest -k slow");
+    let wall = shell::dispatch_wall("pytest -k slow", Default::default());
     // #2541 follow-up (red first): the confined shell already appends its
     // OWN `shell::timed_out_note(wall)` suffix to a timed-out result — which
     // itself recommends `lifecycle action=build` — before this call ever
@@ -211,7 +211,10 @@ fn a_refused_escalation_keeps_the_first_runs_evidence() {
     // "use action=build" immediately followed by "declined, do not retry
     // it". Use the REAL suffix here so the test can.
     let first = (
-        format!("partial: test_foo hung{}", shell::timed_out_note(wall)),
+        format!(
+            "partial: test_foo hung{}",
+            shell::timed_out_note(wall, Default::default(),)
+        ),
         crate::ExecOutcome::TimedOut,
     );
     for (refusal, outcome) in [
@@ -228,7 +231,7 @@ fn a_refused_escalation_keeps_the_first_runs_evidence() {
             crate::ExecOutcome::Unavailable,
         ),
     ] {
-        let (text, out) = escalation_result(first.clone(), (refusal.clone(), outcome), wall);
+        let (text, out) = escalation_result(first.clone(), (refusal.clone(), outcome), wall, Default::default(),);
         assert_eq!(out, outcome, "the refusal's own class is the final outcome");
         assert!(
             text.contains("partial: test_foo hung"),
@@ -264,7 +267,7 @@ fn a_refused_escalation_keeps_the_first_runs_evidence() {
 /// duplicated, exactly as before this round's fix.
 #[test]
 fn an_executed_escalation_supersedes_the_first_runs_partial_output() {
-    let wall = shell::dispatch_wall("pytest -k slow");
+    let wall = shell::dispatch_wall("pytest -k slow", Default::default());
     let first = (
         "partial: test_foo hung\n(the command hit the 60s wall and was killed...)".to_string(),
         crate::ExecOutcome::TimedOut,
@@ -274,6 +277,7 @@ fn an_executed_escalation_supersedes_the_first_runs_partial_output() {
         first,
         (build_result.clone(), crate::ExecOutcome::Passed),
         wall,
+        Default::default(),
     );
     assert_eq!(out, crate::ExecOutcome::Passed);
     assert!(
@@ -297,7 +301,7 @@ fn the_escalation_names_itself_in_the_permission_prompt() {
         "a direct action=build call names no escalation: {}",
         direct.reason
     );
-    let wall = shell::dispatch_wall("pytest -k slow");
+    let wall = shell::dispatch_wall("pytest -k slow", Default::default());
     let reason = format!(
         "lifecycle action=run hit the confined shell's {}s wall",
         wall.as_secs()
