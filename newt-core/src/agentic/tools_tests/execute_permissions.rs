@@ -137,6 +137,7 @@ fn declined_permissions_report_defaults_without_refreshing_authority() {
         for has_gate in [false, true] {
             let mut gate = NoDiagnosticRefresh;
             let out = execute_request_permissions(
+                &no_fs_caveats(std::path::Path::new("/workspace")),
                 &args,
                 has_gate.then_some(&mut gate as &mut dyn PermissionGate),
                 false,
@@ -607,6 +608,7 @@ fn request_permissions_grant_deny_and_no_gate() {
     // with the parsed axis + target.
     let mut gate = MockGate::new(true, &base);
     let out = execute_request_permissions(
+        &no_fs_caveats(std::path::Path::new("/workspace")),
         &serde_json::json!({"capability": "exec", "target": "mkdir", "reason": "make a dir"}),
         Some(&mut gate),
         false,
@@ -626,6 +628,7 @@ fn request_permissions_grant_deny_and_no_gate() {
     // Mock gate DENIES → "denied" + don't-retry coaching.
     let mut gate = MockGate::new(false, &base);
     let out = execute_request_permissions(
+        &no_fs_caveats(std::path::Path::new("/workspace")),
         &serde_json::json!({"capability": "fs_write", "target": "/tmp/x", "reason": "w"}),
         Some(&mut gate),
         false,
@@ -640,6 +643,7 @@ fn request_permissions_grant_deny_and_no_gate() {
     // NO gate (headless / eval) → "no operator available" — recoverable,
     // never a hang or a config-only dead end.
     let out = execute_request_permissions(
+        &no_fs_caveats(std::path::Path::new("/workspace")),
         &serde_json::json!({"capability": "net", "target": "docs.rs", "reason": "fetch"}),
         None,
         false,
@@ -736,6 +740,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
         let mut allow = MockGate::new(true, &Caveats::top());
         let mut deny = MockGate::new(false, &Caveats::top());
         let granted = execute_request_permissions(
+            &no_fs_caveats(std::path::Path::new("/workspace")),
             &permission,
             Some(&mut allow),
             false,
@@ -749,6 +754,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
                 "request_permissions",
                 permission.clone(),
                 execute_request_permissions(
+                    &no_fs_caveats(std::path::Path::new("/workspace")),
                     &permission,
                     Some(&mut deny),
                     false,
@@ -761,12 +767,22 @@ fn permission_grant_releases_only_cached_authority_failures() {
             (
                 "request_permissions",
                 permission.clone(),
-                execute_request_permissions(&permission, None, false, 20, "/workspace", None).2,
+                execute_request_permissions(
+                    &no_fs_caveats(std::path::Path::new("/workspace")),
+                    &permission,
+                    None,
+                    false,
+                    20,
+                    "/workspace",
+                    None,
+                )
+                .2,
             ),
             (
                 "request_permissions",
                 serde_json::json!({}),
                 execute_request_permissions(
+                    &no_fs_caveats(std::path::Path::new("/workspace")),
                     &serde_json::json!({}),
                     Some(&mut allow),
                     false,
@@ -946,8 +962,16 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                     },
                 );
                 assert!(guard.repeat_steer(name, &command).is_some());
-                let declined =
-                    execute_request_permissions(&permission, None, false, 20, "/workspace", None).2;
+                let declined = execute_request_permissions(
+                    &no_fs_caveats(std::path::Path::new("/workspace")),
+                    &permission,
+                    None,
+                    false,
+                    20,
+                    "/workspace",
+                    None,
+                )
+                .2;
                 guard.record(
                     "request_permissions",
                     &permission,
@@ -963,6 +987,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
 
                 let mut gate = MockGate::new(true, &Caveats::top());
                 let granted = execute_request_permissions(
+                    &no_fs_caveats(std::path::Path::new("/workspace")),
                     &permission,
                     Some(&mut gate),
                     false,
@@ -1047,8 +1072,16 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
 
     let mut gate = MockGate::new(true, &base);
     let permission = serde_json::json!({"capability": "fs_read", "target": file});
-    let granted =
-        execute_request_permissions(&permission, Some(&mut gate), false, 20, "/workspace", None).2;
+    let granted = execute_request_permissions(
+        &no_fs_caveats(std::path::Path::new("/workspace")),
+        &permission,
+        Some(&mut gate),
+        false,
+        20,
+        "/workspace",
+        None,
+    )
+    .2;
     assert!(granted.starts_with("granted:"), "{granted}");
     guard.record(
         "request_permissions",
@@ -1113,7 +1146,7 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
 /// burns tool-call rounds). Would fail on the old dead-end copy.
 #[test]
 fn request_permissions_headless_answer_is_forward_guidance_not_a_dead_end() {
-    let out = execute_request_permissions(
+    let out = execute_request_permissions(&no_fs_caveats(std::path::Path::new("/workspace")),
         &serde_json::json!({"capability": "fs_write", "target": "/app/out", "reason": "write result"}),
         None,
         false,
@@ -1150,6 +1183,7 @@ fn request_permissions_headless_answer_is_forward_guidance_not_a_dead_end() {
 fn request_permissions_coaches_bad_inputs() {
     // Unknown capability → coach listing the valid axes (no gate consulted).
     let out = execute_request_permissions(
+        &no_fs_caveats(std::path::Path::new("/workspace")),
         &serde_json::json!({"capability": "gpu", "target": "x", "reason": "y"}),
         None,
         false,
@@ -1162,6 +1196,7 @@ fn request_permissions_coaches_bad_inputs() {
     assert!(out.contains("fs_read"), "got: {out}");
     // Missing target → coach.
     let out = execute_request_permissions(
+        &no_fs_caveats(std::path::Path::new("/workspace")),
         &serde_json::json!({"capability": "exec", "reason": "y"}),
         None,
         false,
@@ -2699,6 +2734,7 @@ fn native_once_filesystem_schema_and_acknowledgement_explain_the_retry() {
                 let args = serde_json::json!({"capability": capability, "target": target});
                 let mut gate = MockGate::new(true, &Caveats::top());
                 let result = execute_request_permissions(
+                    &no_fs_caveats(std::path::Path::new("/workspace")),
                     &args,
                     Some(&mut gate),
                     false,
@@ -5066,4 +5102,27 @@ async fn queue_owning_gate_proves_exec_once_grant_lifetime_and_danger_controls()
         "control: a refused high-danger request must never reach the queue"
     );
     assert_ne!(execution5.get(), Some(&ExecOutcome::Passed));
+}
+
+/// #2720: headless full-access sessions already hold exec authority; the
+/// redundant request must not tell the model it needs an unavailable operator.
+#[tokio::test]
+async fn full_access_headless_permission_request_reports_existing_authority() {
+    let result = execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({"capability": "exec", "target": "git"}),
+        "/workspace",
+        false,
+        20,
+        &Caveats::top(),
+        &mut NoMcp,
+        ToolCollaborators::default(),
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(result.contains("already granted"), "{result}");
 }
