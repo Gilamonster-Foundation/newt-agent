@@ -273,6 +273,12 @@ fn permission_definition_with_default(
         ),
     };
 
+    let axis = if req.tool == "request_permissions" {
+        "model requested permission"
+    } else {
+        axis
+    };
+
     let blast = match danger.blast_radius(req.kind, &req.target) {
         Some(line) => format!("{line}\n"),
         None => String::new(),
@@ -2021,6 +2027,25 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                         return Deny;
                     }
                 }
+            }
+            // #2720: asking for authority already held is not a denial.
+            // Explicit denies and delegation checks above still win. Only
+            // proactive requests qualify: actual writes and bound replays
+            // retain their independent consent prompts.
+            if req.tool == "request_permissions"
+                && !req.harness_bound
+                && matches!(
+                    req.kind,
+                    newt_core::DenialKind::Exec
+                        | newt_core::DenialKind::Net
+                        | newt_core::DenialKind::FsRead
+                        | newt_core::DenialKind::FsWrite
+                )
+                && self
+                    .policy_with_grants(baseline, &[])
+                    .is_ok_and(|policy| ceiling_permits(&policy, req.kind, &req.target))
+            {
+                continue;
             }
             if session_grant_covers(&self.state.session_grants, req) {
                 // An exact match needs no further widening — it is already
