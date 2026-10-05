@@ -2361,6 +2361,131 @@ fn refresh_caveats_preserves_denials_and_filters_conflicting_cached_grants() {
     assert_eq!(gate.state.decisions.len(), 2);
 }
 
+/// #2716: a loop's repeated resolved exec denials belong to one invocation,
+/// not 150 independent operator approvals. No process or clock is needed: the
+/// worker's terminal denial batch is the production permission-gate boundary.
+#[test]
+fn allow_once_looped_exec_batch_asks_once_per_resolved_path() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce; 150],
+        prompts.clone(),
+    );
+    let path = if cfg!(windows) {
+        "C:/tools/tr.exe"
+    } else {
+        "/usr/bin/tr"
+    };
+    let requests = vec![exec_request(path); 150];
+    let newt_core::PermissionDecision::Allow(allowed) = gate.ask(&requests) else {
+        panic!("one invocation's repeated target should be allowed");
+    };
+    assert!(allowed.permits_exec(path));
+    assert_eq!(
+        prompts.get(),
+        1,
+        "#2716: repeated execs must share one approval"
+    );
+    assert!(gate.state.session_grants.is_empty());
+    assert!(gate.state.pending_once_grants.is_empty());
+}
+
+/// #2716: invocation-local reuse must not approve another program or a
+/// different path with the same basename.
+#[test]
+fn allow_once_exec_batch_keeps_programs_and_paths_distinct() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce; 6],
+        prompts.clone(),
+    );
+    let paths = if cfg!(windows) {
+        ["C:/tools/tr.exe", "C:/tools/cut.exe", "C:/other/tr.exe"]
+    } else {
+        ["/usr/bin/tr", "/usr/bin/cut", "/other/tr"]
+    };
+    let requests: Vec<_> = paths
+        .iter()
+        .cycle()
+        .take(6)
+        .map(|p| exec_request(p))
+        .collect();
+    assert!(matches!(
+        gate.ask(&requests),
+        newt_core::PermissionDecision::Allow(_)
+    ));
+    assert_eq!(prompts.get(), 3, "each exact path needs its own approval");
+}
+
+/// #2716: approval ends with the invocation's batch; the next invocation
+/// of the same resolved path must ask the operator again.
+#[test]
+fn allow_once_exec_batch_expires_before_next_invocation() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce; 4],
+        prompts.clone(),
+    );
+    let path = if cfg!(windows) {
+        "C:/tools/tr.exe"
+    } else {
+        "/usr/bin/tr"
+    };
+    for invocation in 1..=2 {
+        assert!(matches!(
+            gate.ask(&[exec_request(path), exec_request(path)]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(
+            prompts.get(),
+            invocation,
+            "a new invocation needs a new answer"
+        );
+    }
+}
+
+/// #2716: deny-once aborts the batch and creates no reusable approval.
+#[test]
+fn allow_once_exec_batch_deny_still_denies() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::Deny],
+        prompts.clone(),
+    );
+    let path = if cfg!(windows) {
+        "C:/tools/tr.exe"
+    } else {
+        "/usr/bin/tr"
+    };
+    assert!(matches!(
+        gate.ask(&[exec_request(path), exec_request(path)]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert_eq!(prompts.get(), 1);
+    assert!(gate.state.session_grants.is_empty());
+    assert!(gate.state.pending_once_grants.is_empty());
+}
+
 #[test]
 fn allow_once_grants_one_call_and_reprompts_next_time() {
     let mut state = PermissionPromptState::default();
