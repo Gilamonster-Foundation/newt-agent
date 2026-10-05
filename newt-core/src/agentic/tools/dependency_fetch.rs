@@ -611,6 +611,35 @@ checksum = "00"
         assert_eq!(gate.calls, 1);
     }
 
+    /// #2731: Windows has no owner-only pinned-input implementation. Refuse
+    /// before any prompt or execution instead of borrowing macOS egress or
+    /// reverting to the mutable workspace that round 2 deliberately removed.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_fetch_refuses_without_pinned_inputs_before_prompting() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Cargo.lock"), CRATES_IO_LOCK).unwrap();
+        let invocation = crate::confined_exec::build_tool_caveats(workspace.path());
+        let before = invocation.clone();
+        let mut gate = FetchApproval {
+            allow: true,
+            calls: 0,
+        };
+        let result = fetch_locked_dependencies(
+            workspace.path(),
+            workspace.path(),
+            &invocation,
+            &mut Some(&mut gate),
+            |path| std::fs::read_to_string(path).ok(),
+        )
+        .await;
+        assert!(result.is_err_and(
+            |reason| reason.contains("owner-only fetch copies require Unix permissions")
+        ));
+        assert_eq!(gate.calls, 0);
+        assert_eq!(invocation, before);
+    }
+
     fn no_net() -> Caveats {
         crate::confined_exec::build_tool_caveats(Path::new("/ws"))
     }
