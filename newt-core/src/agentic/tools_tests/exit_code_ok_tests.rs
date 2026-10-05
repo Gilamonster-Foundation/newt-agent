@@ -406,11 +406,13 @@ fn a_host_127_the_shell_did_not_attribute_is_failed() {
 /// owner, so they cannot disagree.
 #[test]
 fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
+    let _env = crate::process_env::lock();
     let limit = agent_bridle::LimitsPolicy::default().default_timeout_secs;
-    let (text, class) = confined(
-        "make test",
-        envelope(124, "partial", "command timed out after 60s\n", true),
-    );
+    // #2732: this build was explicitly given the ordinary budget. Actual
+    // dispatch always reports the selected budget in its envelope.
+    let mut timed_out = envelope(124, "partial", "command timed out after 60s\n", true);
+    timed_out["timeout_secs"] = limit.into();
+    let (text, class) = confined("make test", timed_out);
     assert_eq!(class, ExecOutcome::TimedOut);
     for needle in [
         format!("{limit}s"),
@@ -447,8 +449,15 @@ fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
 /// description (one owner for the text).
 #[test]
 fn timeout_coaching_gives_the_literal_lifecycle_call() {
+    let _env = crate::process_env::lock();
     const CALL: &str = r#"{"action":"build","phase":"test"}"#;
-    let (text, _) = confined("make test", envelope(124, "", "", true));
+    // #2732: preserve the explicit short-budget coaching fixture even though
+    // a classified build without an override now keeps its 1800s budget.
+    let mut timed_out = envelope(124, "", "", true);
+    timed_out["timeout_secs"] = agent_bridle::LimitsPolicy::default()
+        .default_timeout_secs
+        .into();
+    let (text, _) = confined("make test", timed_out);
     assert!(
         text.contains(CALL),
         "the result must show the call shape: {text}"

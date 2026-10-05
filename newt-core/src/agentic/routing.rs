@@ -85,6 +85,60 @@ pub(crate) fn is_build_tool_program(program: &str) -> bool {
     program == "cargo" || program == "just"
 }
 
+/// Classify build work from the shell inspector's argv without rewriting it.
+/// Probe/help invocations do not lend unrelated shell stages a build budget.
+pub(crate) fn is_build_work(program: &str, argv: &[String]) -> bool {
+    let name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    let rest = argv.get(1..).unwrap_or_default();
+    if rest
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--version" | "-V" | "--help" | "-h"))
+    {
+        return false;
+    }
+    match name {
+        "cargo" => {
+            let mut words = rest.iter().map(String::as_str);
+            while let Some(word) = words.next() {
+                match word {
+                    word if is_toolchain_selector(word) => {}
+                    "-q" | "--quiet" | "-v" | "-vv" | "--verbose" | "--offline" | "--locked"
+                    | "--frozen" => {}
+                    "--color" | "--config" | "-C" | "-Z" => {
+                        if words.next().is_none() {
+                            return false;
+                        }
+                    }
+                    word if word.starts_with("--color=") || word.starts_with("--config=") => {}
+                    sub => return CARGO_BUILD_SUBCOMMANDS.contains(&sub),
+                }
+            }
+            false
+        }
+        // A recipe can take arguments or run from an explicitly named justfile.
+        // Introspection modes do not execute that recipe.
+        "just" => !rest.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--list"
+                    | "-l"
+                    | "--summary"
+                    | "--show"
+                    | "--dump"
+                    | "--evaluate"
+                    | "--fmt"
+                    | "--completion"
+                    | "--completions"
+            )
+        }),
+        "make" => true,
+        _ => false,
+    }
+}
+
 /// Shell control / redirection / substitution metacharacters. A command
 /// containing any of these is **compound** (`cat f | grep x`, `cat a && cat b`,
 /// `cat $(…)`, a redirect) — its semantics cannot be reproduced by a single

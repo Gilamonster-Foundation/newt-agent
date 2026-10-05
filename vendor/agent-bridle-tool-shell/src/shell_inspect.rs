@@ -1027,7 +1027,7 @@ fn inspect_timeout_descendants(
     let literal = |index: usize| {
         words
             .get(index)
-            .ok_or_else(&invalid)
+            .ok_or_else(invalid)
             .and_then(|word| static_shell_word(word, options).map_err(|_| invalid()))
     };
     let duration = |value: &str| {

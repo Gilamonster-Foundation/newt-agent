@@ -90,12 +90,14 @@ mod output_observer;
 mod parse;
 #[cfg(feature = "shell")]
 mod shell_tool;
+#[cfg(any(feature = "shell", feature = "host-shell"))]
+mod supervisor;
 
 /// Stop the existing stage/worker process group before terminating its members.
 /// Killing a waited-on child first can wake a shell long enough to run its next
 /// command before the group's kill reaches it. Callers retain their wait/reap
 /// handling; this does not reach descendants that leave the process group.
-#[cfg(any(feature = "shell", feature = "brush"))]
+#[cfg(any(feature = "shell", feature = "brush", feature = "host-shell"))]
 fn kill_child_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {

@@ -194,3 +194,25 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:45 EDT | Date: 2026-09-17
+
+## Command time budgets
+
+`run_command` has a 60-second wall-clock budget. Set
+`NEWT_RUN_COMMAND_TIMEOUT_SECS` to change its default, or pass `timeout_secs`
+for one call; both are capped at 300 seconds. Invalid or zero defaults fall
+back to 60 seconds, and a zero per-call value uses the configured default.
+On expiry the executor terminates the command group and returns an explicit
+`TimedOut` result naming the applied budget, with bounded partial output.
+Commands that leave the owned process group are outside that group-kill mechanism.
+An escaped descendant holding an output pipe can also delay reader completion
+and return after timeout (agent-bridle#420); Windows cleanup currently covers
+the direct child, without a proven process-tree guarantee.
+SafeSubset stages share one invocation deadline; expiry stops later stages and
+joins the script owner after terminating/reaping active groups.
+
+Prepared shell commands containing classified build work (for example,
+`cargo check --workspace && echo checked`) retain the 30-minute build budget.
+Version/help probes do not extend a following search. A positive per-call
+override still narrows a build shell to the requested, capped budget.
+`build_exec` and `lifecycle` with `action=build` retain their own budgets. Permission and confinement checks
+are independent of time-budget selection.
