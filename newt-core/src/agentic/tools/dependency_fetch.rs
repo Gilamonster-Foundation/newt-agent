@@ -407,7 +407,20 @@ checksum = "00"
     /// refuse before returning any request that can reach the executor.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn prompt_time_lock_or_config_substitution_refuses_fetch() {
+    fn prompt_time_lock_substitution_refuses_fetch() {
+        assert_prompt_time_substitution_refused(false);
+    }
+
+    /// #2731: adding source replacement config during approval must refuse
+    /// independently of the lockfile substitution regression.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn prompt_time_source_replacement_config_refuses_fetch() {
+        assert_prompt_time_substitution_refused(true);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_prompt_time_substitution_refused(config: bool) {
         struct Substitute<'a>(&'a Path, bool);
         impl PermissionGate for Substitute<'_> {
             fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
@@ -441,7 +454,7 @@ checksum = "00"
                 HumanQuestionOutcome::Unavailable
             }
         }
-        for config in [false, true] {
+        {
             let source = tempfile::tempdir().unwrap();
             let root = source.path().canonicalize().unwrap();
             std::fs::write(root.join("Cargo.lock"), CRATES_IO_LOCK).unwrap();
@@ -460,6 +473,54 @@ checksum = "00"
                 "prompt-time substitution must refuse before launch (config={config})"
             );
         }
+    }
+
+    /// #2731 round 3: a permission change while the gate is pending must
+    /// refuse before an approved request can reach the executor.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn prompt_time_copy_permission_widening_refuses_fetch() {
+        struct WidenCopy;
+        impl PermissionGate for WidenCopy {
+            fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+                unreachable!()
+            }
+            fn ask_dependency_fetch(
+                &mut self,
+                prepared: &Caveats,
+                _: &PermissionRequest,
+            ) -> PermissionDecision {
+                use std::os::unix::fs::PermissionsExt;
+                let crate::Scope::Only(roots) = &prepared.fs_read else {
+                    panic!("bounded read fence")
+                };
+                let copied_lock = roots
+                    .iter()
+                    .map(|root| Path::new(root).join("Cargo.lock"))
+                    .find(|path| path.is_file())
+                    .expect("prepared input copy");
+                std::fs::set_permissions(copied_lock, std::fs::Permissions::from_mode(0o664))
+                    .unwrap();
+                PermissionDecision::Allow(prepared.clone())
+            }
+            fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+                HumanQuestionOutcome::Unavailable
+            }
+        }
+        let source = tempfile::tempdir().unwrap();
+        let root = source.path().canonicalize().unwrap();
+        std::fs::write(root.join("Cargo.lock"), CRATES_IO_LOCK).unwrap();
+        let mut gate = WidenCopy;
+        let mut slot: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let result = prepare_locked_fetch(
+            &root,
+            &root,
+            &no_net(),
+            &mut slot,
+            |p| std::fs::read_to_string(p).ok(),
+            true,
+        );
+        assert!(result.is_err_and(|reason| reason.contains("not owner-only")));
     }
 
     struct Answer(bool, usize);
