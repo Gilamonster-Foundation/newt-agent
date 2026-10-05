@@ -147,6 +147,17 @@ fn keyword_identifier_starts(node: Node<'_>) -> Vec<usize> {
     hits
 }
 
+/// Parse a complete Rust source file for structural edits as well as outlines.
+pub(crate) fn parse_rust(source: &str) -> Result<tree_sitter::Tree, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    parser
+        .parse(source, None)
+        .ok_or_else(|| "Rust parser did not produce a tree".into())
+}
+
 /// The page-cut counterpart of tags-based recovery (#2638 fix item 1): a
 /// definition whose CLOSE never arrives inside this fragment leaves an
 /// unbalanced brace count with no `is_definition` tag of its own. Recovery
@@ -162,11 +173,7 @@ fn trailing_truncated_definition(
     first_line: usize,
     entries: &[OutlineEntry],
 ) -> Option<OutlineEntry> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .expect("tree-sitter-rust's grammar must load");
-    let tree = parser.parse(source, None)?;
+    let tree = parse_rust(source).ok()?;
     let target = final_incomplete_node(tree.root_node())?;
     let line_of = |byte: usize| source[..byte.min(source.len())].matches('\n').count();
     // Recovery boundary: the cut item starts AFTER the last tagged entry
