@@ -1058,18 +1058,10 @@ fn format_wall(wall: std::time::Duration) -> String {
     }
 }
 
-/// F19/#2541 round 2 item 3, round 3 item 2: the ONE decision the escalation
-/// makes, isolated from formatting so it is table-testable on its own — only
-/// a genuine timeout justifies spending the build lane's authority on a
-/// second run, AND only when the wall that killed the first run was the
-/// DEFAULT `run_command` wall. `wall` is `shell::dispatch_wall(joined)` for
-/// the command that just ran: since #2543, a cargo/just phase already gets
-/// the 30-minute build wall in the run lane, so a `TimedOut` there means it
-/// ran the full 30 minutes and died — re-running the identical command for
-/// another 30 minutes in the build lane (whose only difference is the
-/// offline/calibrated fence) adds no new information. Every other outcome
-/// (`Denied`, `Unavailable`, `Failed`, `Passed`) already says everything a
-/// retry could add, regardless of wall.
+/// #2541/#2732: only an ordinary command timeout justifies spending the
+/// build lane's authority on a second run. Cargo/just shell phases use the
+/// ordinary budget too; an explicit build executor has already spent its
+/// longer budget and must not repeat it. Other outcomes need no escalation.
 fn escalates(outcome: crate::ExecOutcome, wall: std::time::Duration) -> bool {
     outcome == crate::ExecOutcome::TimedOut && wall != shell::LIFECYCLE_BUILD_TIMEOUT
 }

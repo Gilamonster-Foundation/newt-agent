@@ -157,18 +157,18 @@ fn escalated_after_timeout_labels_the_reroute_and_preserves_the_build_result() {
 /// #2541 round 2 item 3, round 3 item 2: the escalation's decision, isolated
 /// from formatting and table-tested — only a genuine `TimedOut` under the
 /// DEFAULT `run_command` wall justifies spending the build lane's authority
-/// on a second run. Since #2543, a cargo/just phase already gets the
-/// 30-minute build wall in the RUN lane; a `TimedOut` there means it ran the
-/// full 30 minutes and died, and re-running it in the build lane (whose only
-/// difference is the offline/calibrated fence) adds nothing.
+/// on a second run. #2732 keeps cargo/just shell phases on that ordinary
+/// budget too. A timeout from the explicit build executor has already spent
+/// its longer budget and must not rerun in the same build lane.
 #[test]
 fn escalates_only_on_a_default_wall_timeout() {
+    let _env = crate::process_env::lock();
     let default_wall = shell::dispatch_wall("pytest -k slow");
-    let build_wall = shell::dispatch_wall("cargo test");
+    let build_wall = shell::LIFECYCLE_BUILD_TIMEOUT;
     assert_eq!(
-        build_wall,
-        shell::LIFECYCLE_BUILD_TIMEOUT,
-        "fixture sanity: cargo must dispatch under the build wall"
+        shell::dispatch_wall("cargo test"),
+        default_wall,
+        "#2732: a shell command must keep its ordinary budget"
     );
     assert_ne!(
         default_wall, build_wall,
