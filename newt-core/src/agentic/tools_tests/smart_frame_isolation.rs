@@ -944,8 +944,9 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
     assert!(!denied.contains("outside authority"));
 }
 
-/// #2731: the smart-session adapter must forward operation approval and must
-/// refuse a prepared fetch exposing private frame storage before any prompt.
+/// #2731: forward operation approval only where durable-frame isolation is
+/// supported. Windows must refuse before prompting, even for a narrow fence;
+/// widening the fence must never expose private frame storage on any platform.
 #[test]
 fn cold_cache_fetch_frame_gate_preserves_protection() {
     use crate::agentic::smart_harness::FramePermissionGate;
@@ -986,10 +987,16 @@ fn cold_cache_fetch_frame_gate_preserves_protection() {
             inner: &mut inner,
             refusal: None,
         };
-        assert!(matches!(
-            gate.ask_dependency_fetch(&prepared, &request),
-            PermissionDecision::Allow(_)
-        ));
+        let decision = gate.ask_dependency_fetch(&prepared, &request);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(matches!(decision, PermissionDecision::Allow(_)));
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            assert!(matches!(decision, PermissionDecision::Deny));
+            assert!(gate.refusal.as_deref().is_some_and(|reason| reason.contains(
+                "durable smart harness requires object-bound filesystem tools and a supported kernel sandbox"
+            )));
+        }
         prepared.fs_read = crate::Scope::All;
         assert!(matches!(
             gate.ask_dependency_fetch(&prepared, &request),
@@ -997,5 +1004,8 @@ fn cold_cache_fetch_frame_gate_preserves_protection() {
         ));
         assert!(gate.refusal.is_some());
     }
-    assert_eq!(inner.0, 1);
+    assert_eq!(
+        inner.0,
+        usize::from(cfg!(any(target_os = "linux", target_os = "macos")))
+    );
 }
