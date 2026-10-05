@@ -33,14 +33,23 @@ pub(super) fn execute(
         .ok_or("move_from needs path and items")?;
     let names: Vec<String> = serde_json::from_value(spec["items"].clone())
         .map_err(|_| "move_from items must be an array of function names")?;
-    let root = Path::new(workspace)
+    let launch = Path::new(workspace)
         .canonicalize()
         .map_err(|e| format!("workspace: {e}"))?;
-    let source = local_path(&root, source_label)?;
-    let child = local_path(
-        &root,
-        args["path"].as_str().ok_or("missing destination path")?,
-    )?;
+    let source = launch.join(source_label);
+    let source_parent = source.parent().ok_or("source has no parent")?;
+    // Locate the owning package before selecting its fence: with fs_write=All,
+    // the shared selector deliberately fences just the requested build cwd.
+    // Manifest contents are read only after root admission and fs_read checks.
+    let cwd = source_parent
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file())
+        .unwrap_or(source_parent);
+    let (root, _) = super::build_shell::build_directory(workspace, cwd, caveats)
+        .map_err(|(reason, _)| reason)?;
+    let source = local_path(&root, &source.to_string_lossy())?;
+    let child = launch.join(args["path"].as_str().ok_or("missing destination path")?);
+    let child = local_path(&root, &child.to_string_lossy())?;
     let module = child
         .file_stem()
         .and_then(|s| s.to_str())
@@ -124,9 +133,9 @@ fn local_path(root: &Path, label: &str) -> Result<PathBuf, String> {
     let full = root.join(label);
     let rel = full
         .strip_prefix(root)
-        .map_err(|_| "move_from paths must remain inside the session workspace")?;
+        .map_err(|_| "move_from paths must remain inside the selected build root")?;
     if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
-        return Err("move_from paths must be normalized workspace paths without '..'".into());
+        return Err("move_from paths must be normalized paths without '..'".into());
     }
     // Check every existing ancestor; a not-yet-created module directory is OK.
     for ancestor in full.parent().into_iter().flat_map(Path::ancestors) {
@@ -177,7 +186,7 @@ fn owning_crate(
         let library = local_path(dir, library_path)?;
         return Ok((dir.to_owned(), name.into(), library));
     }
-    Err("no owning Cargo package inside session workspace; nothing changed".into())
+    Err("no owning Cargo package inside selected build root; nothing changed".into())
 }
 
 fn check_request(root: &Path, cwd: &Path, package: &str, caveats: &Caveats) -> ExecRequest {
