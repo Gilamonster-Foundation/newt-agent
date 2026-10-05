@@ -234,6 +234,25 @@ fn plugin_envelope_unavailable_without_operating_key() {
     );
 }
 
+/// A bare TUI config must admit stdin filters without setup or saved grants.
+/// Regression: `tr -cd '{'` prompted repeatedly in the default session.
+#[test]
+fn fresh_default_session_admits_standard_text_filters() {
+    let _env = crate::test_env_guard::env_read_guard();
+    let tui: newt_core::TuiConfig = toml::from_str("").unwrap();
+    assert!(tui.permissions.extra_exec.is_empty());
+    let policy = super::policy_for_launch(
+        Some(tui),
+        "/workspace",
+        newt_core::launch_authority::LaunchAuthority::CONFINED,
+    );
+    assert_ne!(policy.exec, newt_core::Scope::All);
+    for tool in ["tr", "cut", "uniq"] {
+        assert!(policy.permits_exec(tool), "fresh session must admit {tool}");
+    }
+    assert!(!policy.permits_exec("arbitrary-ungranted-program"));
+}
+
 #[serial_test::serial(real_fs)]
 #[test]
 fn establish_configured_is_workspace_dev() {
