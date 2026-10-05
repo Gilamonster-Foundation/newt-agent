@@ -2146,6 +2146,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #2683: HEAD before this turn's own tool calls run, so a "committed"
@@ -4005,6 +4006,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        read_history: Some(&mut read_history),
                         default_command_cwd,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
@@ -7057,6 +7059,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #2683: HEAD before this turn's own tool calls run, so a "committed"
@@ -8916,6 +8919,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        read_history: Some(&mut read_history),
                         default_command_cwd,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
@@ -9827,6 +9831,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #2683: HEAD before this turn's own tool calls run, so a "committed"
@@ -11436,6 +11441,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        read_history: Some(&mut read_history),
                         default_command_cwd,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
@@ -12266,6 +12272,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #2683: HEAD before this turn's own tool calls run, so a "committed"
@@ -13163,6 +13170,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        read_history: Some(&mut read_history),
                         default_command_cwd,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),

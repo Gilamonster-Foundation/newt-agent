@@ -497,18 +497,14 @@ pub(super) fn read_file_page(
     char_offset: Option<usize>,
     tool_offload: bool,
 ) -> String {
-    if tool_offload {
-        paginate_unspillable(path, contents, offset, limit, char_offset)
-    } else {
-        paginate_read_from(
-            path,
-            contents,
-            offset,
-            limit,
-            max_output_tokens(),
-            char_offset,
-        )
-    }
+    paginate_read_from(
+        path,
+        contents,
+        offset,
+        limit,
+        read_page_tokens(tool_offload),
+        char_offset,
+    )
 }
 
 /// [`paginate_read`] held under the model-facing spill cap, for a payload read
@@ -523,15 +519,29 @@ pub(super) fn paginate_unspillable(
     limit: Option<usize>,
     char_offset: Option<usize>,
 ) -> String {
+    paginate_read_from(
+        path,
+        contents,
+        offset,
+        limit,
+        read_page_tokens(true),
+        char_offset,
+    )
+}
+
+/// Shared source/map budget; offloaded reads stay below the spill threshold.
+pub(super) fn read_page_tokens(tool_offload: bool) -> usize {
+    if !tool_offload {
+        return max_output_tokens();
+    }
     // paginate_read's continuation footer rides on top of its char cap.
     const FOOTER_HEADROOM: usize = 512;
     let unspillable = cap_estimator()
         .tokens_for_chars(crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP - FOOTER_HEADROOM);
-    let tokens = match max_output_tokens() {
+    match max_output_tokens() {
         0 => unspillable,
         budget => budget.min(unspillable),
-    };
-    paginate_read_from(path, contents, offset, limit, tokens, char_offset)
+    }
 }
 
 #[cfg(test)]
