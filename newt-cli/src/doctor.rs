@@ -20,6 +20,11 @@ fn security_posture_lines(report: &SecurityReport) -> Vec<String> {
 pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
     println!("newt doctor — checking backends\n");
 
+    println!("Push tool paths:");
+    for line in newt_core::git_staging::tool_diagnostics::diagnose_tool_paths().lines {
+        println!("  {line}");
+    }
+
     // #1951: a resolution failure is exactly what doctor exists to diagnose —
     // `?` here used to end the whole command with that same failure before a
     // single line of diagnosis printed, which is the defect an operator hit

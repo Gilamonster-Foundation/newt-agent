@@ -45,6 +45,22 @@ config root somewhere disposable — never move directories aside:
 NEWT_CONFIG_DIR=$(mktemp -d) newt
 ```
 
+## Push tool permissions
+
+Setup and `newt doctor` check `git`, `gh`, `ssh`, and credential-helper paths
+with the governed-push trust policy. Symlinks are resolved, and all writable
+ancestors are listed together with shell-quoted `chmod` commands. Group write
+uses `chmod g-w`; world write is removed separately when needed.
+
+Setup offers to apply the displayed fixes only after a separate explicit yes.
+A blank answer, unavailable terminal, or the backend setup's `--yes` flag does
+not authorize permission changes. You can decline and run the commands yourself;
+Newt does not elevate privileges. Repairs stay bound to the diagnosed filesystem
+objects while the prompt is open. If an object is replaced or its ownership
+changes, Newt refuses that repair; rerun `newt doctor` to inspect the new state.
+Homebrew operations can restore group write,
+so run `newt doctor` again if a later governed push refuses a tool path.
+
 ## Credentials — encrypted at rest
 
 Prefer an exported environment variable: the wizard records the *reference*

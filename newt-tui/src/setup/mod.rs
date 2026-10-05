@@ -33,6 +33,7 @@
 mod commit;
 pub(crate) mod credentials;
 mod operator;
+mod tool_trust;
 
 use commit::*;
 
@@ -94,6 +95,7 @@ pub(crate) fn run_first_run(_color: bool) -> anyhow::Result<()> {
 }
 
 fn wizard_entry(op: &Operator<'_>, flow: Flow) -> anyhow::Result<()> {
+    tool_trust::check(op)?;
     let config_path =
         Config::user_config_path().unwrap_or_else(|| std::path::PathBuf::from("newt.toml"));
     let client = setup_http_client()?;
@@ -135,6 +137,7 @@ pub async fn run_target(
     };
     let client = setup_http_client()?;
     let op = Operator::terminal();
+    tool_trust::check(&op)?;
     run_target_with(
         &op,
         &client,

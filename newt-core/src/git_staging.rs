@@ -117,7 +117,7 @@ pub struct Refusal {
     detail: String,
     /// Harness-authored explanation; never operator configuration or child output.
     pub(crate) safe_reason: Option<&'static str>,
-    hint: Option<TrustHint>,
+    hints: Vec<TrustHint>,
 }
 
 impl Refusal {
@@ -127,8 +127,13 @@ impl Refusal {
     }
 
     #[must_use]
+    pub fn hints(&self) -> &[TrustHint] {
+        &self.hints
+    }
+
+    #[must_use]
     pub fn hint(&self) -> Option<&TrustHint> {
-        self.hint.as_ref()
+        self.hints.first()
     }
 }
 
@@ -136,7 +141,7 @@ impl From<String> for Refusal {
     fn from(detail: String) -> Self {
         Self {
             detail,
-            hint: None,
+            hints: Vec::new(),
             safe_reason: None,
         }
     }
@@ -257,35 +262,28 @@ fn bind_canonical_paths(scope: &Scope<String>) -> Result<Vec<PathBuf>, Refusal> 
 /// Names the failing component and the reason; a writability refusal also
 /// carries a typed [`TrustHint`].
 pub fn trust_check(path: &Path, ctx: &TrustContext) -> Result<(), Refusal> {
-    if !path.is_absolute() {
-        return Err(format!(
-            "'{}' is not an absolute path; refusing to trust it",
-            path.display()
-        )
-        .into());
+    let hints = tool_path_trust_hints(path, ctx)?;
+    if hints.is_empty() {
+        Ok(())
+    } else {
+        Err(Refusal {
+            detail: format!(
+                "governed push refused: group- or other-writable components: {}; run `newt doctor`",
+                hints
+                    .iter()
+                    .map(|h| h.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            safe_reason: None,
+            hints,
+        })
     }
-    let resolved = std::fs::canonicalize(path).map_err(|e| {
-        format!(
-            "'{}' cannot be resolved ({e}); refusing to trust it",
-            path.display()
-        )
-    })?;
-    // approved_target is `path`: the Xcode.app exemption applies only en
-    // route to a file under Xcode.app, not as a general /Applications pass.
-    check_chain(path, ctx, path)?;
-    if resolved != path {
-        check_chain(&resolved, ctx, path)?;
-    }
-    Ok(())
 }
 
-fn check_chain(path: &Path, ctx: &TrustContext, approved_target: &Path) -> Result<(), Refusal> {
-    let mut below_owner = None;
-    for component in path.ancestors() {
-        below_owner = Some(check_one(component, below_owner, ctx, approved_target)?);
-    }
-    Ok(())
-}
+pub mod tool_diagnostics;
+mod trust_paths;
+pub use trust_paths::tool_path_trust_hints;
 
 /// Returns `true` if any component of `path` is a symlink that is NOT a
 /// known macOS system alias. The ONLY exempt root-owned symlinks are the three
@@ -357,85 +355,6 @@ fn is_secure_sticky(dir_uid: u32, mode: u32, below_owner: Option<u32>, current_u
         && below_owner.is_some_and(|uid| uid == 0 || uid == current_uid)
 }
 
-fn check_one(
-    path: &Path,
-    below_owner: Option<u32>,
-    ctx: &TrustContext,
-    approved_target: &Path,
-) -> Result<u32, Refusal> {
-    let short = shorten_home(path);
-    if ctx.excludes(path) {
-        return Err(format!(
-            "governed push refused: '{short}' is inside a model-writable tree; \
-             the file must live outside the session's writable roots"
-        )
-        .into());
-    }
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("governed push refused: '{short}' cannot be inspected ({e})"))?;
-    if !meta.file_type().is_symlink()
-        && writable_by_others(&meta, below_owner, path, ctx, approved_target)
-    {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = meta.permissions().mode();
-            let chmod_arg = match (mode & 0o020 != 0, mode & 0o002 != 0) {
-                (true, true) => "g-w,o-w",
-                (true, false) => "g-w",
-                _ => "o-w",
-            };
-            return Err(Refusal {
-                safe_reason: None,
-                detail: format!(
-                    "governed push refused: '{short}' is group- or other-writable (mode {mode:04o})"
-                ),
-                hint: Some(TrustHint {
-                    path: path.to_path_buf(),
-                    chmod_arg,
-                    mode,
-                }),
-            });
-        }
-        #[cfg(not(unix))]
-        return Err(format!("governed push refused: '{short}' is group- or other-writable").into());
-    }
-    Ok(owner(&meta))
-}
-
-#[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-fn writable_by_others(
-    meta: &std::fs::Metadata,
-    below_owner: Option<u32>,
-    path: &Path,
-    ctx: &TrustContext,
-    approved_target: &Path,
-) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let mode = meta.permissions().mode();
-    if mode & 0o022 == 0 {
-        return false;
-    }
-    // A2 exemption: root-owned sticky directory whose immediate child is owned
-    // by root or the current user (e.g. /tmp on Linux).
-    if meta.is_dir() && is_secure_sticky(meta.uid(), mode, below_owner, effective_uid()) {
-        return false;
-    }
-    // A5 named widening (operator-accepted 2026-09-30): the root-owned,
-    // admin-group-writable Apple developer directories, bounded by
-    // `is_apple_developer_path` — never a general exemption.
-    #[cfg(target_os = "macos")]
-    if meta.is_dir()
-        && meta.uid() == 0
-        && mode & 0o002 == 0  // NOT other-writable
-        && is_apple_developer_path(path, approved_target, ctx.clt_git)
-    {
-        return false;
-    }
-    true
-}
-
 /// A5: `/Applications` and `/Applications/Xcode.app/…` are exempt ONLY en
 /// route to a file under `/Applications/Xcode.app` (so `/Applications/Other.app`
 /// never gains the exemption). `/Library/Developer/CommandLineTools` is exempt
@@ -448,27 +367,6 @@ fn is_apple_developer_path(path: &Path, approved_target: &Path, clt_git: bool) -
         return approved_target.starts_with("/Applications/Xcode.app");
     }
     path.starts_with(COMMAND_LINE_TOOLS) && clt_git
-}
-
-#[cfg(not(unix))]
-fn writable_by_others(
-    _meta: &std::fs::Metadata,
-    _below_owner: Option<u32>,
-    _path: &Path,
-    _ctx: &TrustContext,
-    _approved_target: &Path,
-) -> bool {
-    false // the broker is refused on Windows before any trust check runs
-}
-
-#[cfg(unix)]
-fn owner(meta: &std::fs::Metadata) -> u32 {
-    std::os::unix::fs::MetadataExt::uid(meta)
-}
-
-#[cfg(not(unix))]
-fn owner(_meta: &std::fs::Metadata) -> u32 {
-    0
 }
 
 #[cfg(unix)]
@@ -1520,7 +1418,7 @@ pub fn validate_helper_value(value: &str, tools: &TrustedTools) -> Result<Helper
     trust_check(&helper, &tools.ctx).map_err(|why| Refusal {
         safe_reason: why.safe_reason,
         detail: format!("refused: credential helper '{value}' — {why}"),
-        hint: why.hint,
+        hints: why.hints,
     })?;
     Ok(HelperForm::BareName(helper))
 }
@@ -1645,7 +1543,7 @@ pub fn import_credentials(
                     "refused: credential configuration at '{}' — {why}",
                     entry.origin.display()
                 ),
-                hint: why.hint,
+                hints: why.hints,
             })?;
         }
         if is_helper_key(&entry.key) {
