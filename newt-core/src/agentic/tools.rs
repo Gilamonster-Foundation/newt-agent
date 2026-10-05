@@ -1411,6 +1411,29 @@ async fn run_confined_build_lane(
             }
         }
     }
+    render_confined_build_result(
+        run,
+        fetch_note.as_deref(),
+        trim,
+        tool_output_lines,
+        color,
+        tool_offload,
+        spill_store,
+        presentation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_confined_build_result(
+    run: Result<crate::confined_exec::ConfinedOutput, crate::confined_exec::ExecRefused>,
+    fetch_note: Option<&str>,
+    trim: Option<OutputTrim>,
+    tool_output_lines: usize,
+    color: bool,
+    tool_offload: bool,
+    spill_store: Option<&dyn super::content_spill::SpillStore>,
+    presentation: &mut dyn ToolPresentation,
+) -> (String, crate::ExecOutcome) {
     let (mut text, outcome) = match run {
         Ok(out) => {
             // The build's own exit code (`out.code`) is untouched by `trim` —
@@ -1420,6 +1443,12 @@ async fn run_confined_build_lane(
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             let view = trim.map(|trim| trim.apply(&stdout, &stderr));
+            // #2731: the terminal override is installed inside the renderer.
+            // Include recovery there, not only in the returned model text.
+            let recovery_view = fetch_note.map(|note| {
+                let selected = view.clone().unwrap_or_else(|| format!("{stdout}{stderr}"));
+                format!("{selected}\n{note}")
+            });
             let envelope = serde_json::json!({
                 "exit_code": out.code,
                 "stdout": stdout,
@@ -1429,7 +1458,7 @@ async fn run_confined_build_lane(
             (
                 shell::shell_envelope_output_with_view(
                     &envelope,
-                    view.as_deref(),
+                    recovery_view.as_deref().or(view.as_deref()),
                     tool_output_lines,
                     color,
                     tool_offload,
@@ -1441,9 +1470,9 @@ async fn run_confined_build_lane(
         }
         Err(error) => (format!("error: {error}"), crate::ExecOutcome::Unavailable),
     };
-    if let Some(note) = fetch_note {
+    if let Some(note) = fetch_note.filter(|note| !text.contains(note)) {
         text.push('\n');
-        text.push_str(&note);
+        text.push_str(note);
     }
     (text, outcome)
 }

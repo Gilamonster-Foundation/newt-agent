@@ -1,21 +1,21 @@
-//! #2719: source-bound output wrappers around a governed push. No shell runs.
+//! #2719: source-bound output wrappers around a governed Git/gh command. No shell runs.
 //! Inspection deliberately flattens topology, so we also consume every byte of
-//! the source, accepting only `push [2>&1] [| head ...] [; echo ...]`.
+//! the source, accepting only `command [2>&1] [| head ...] [; echo ...]`.
 use super::{inspect_shell, literal};
 
 pub(super) const RETRY: &str = "Retry with run_command using the worktree as cwd and command `git push origin` (or `git push --dry-run origin` for a dry run).";
 
-pub(super) struct PushCommand {
+pub(super) struct GovernedCommand {
     pub argv: Vec<String>,
     head: Option<usize>,
     echo: Vec<String>,
 }
 
-impl PushCommand {
+impl GovernedCommand {
     pub fn parse(source: &str) -> Result<Self, &'static str> {
-        let inspection = inspect_shell(source).map_err(|_| "unsupported push shell syntax")?;
+        let inspection = inspect_shell(source).map_err(|_| "unsupported command shell syntax")?;
         if !inspection.constructs.is_empty() {
-            return Err("push wrappers cannot contain substitutions or arithmetic");
+            return Err("command wrappers cannot contain substitutions or arithmetic");
         }
         let mut remaining = source.trim();
         let mut result = Self {
@@ -25,7 +25,7 @@ impl PushCommand {
         };
         for (index, command) in inspection.commands.iter().enumerate() {
             if !command.descendant_execs.is_empty() {
-                return Err("push wrappers cannot execute descendants");
+                return Err("command wrappers cannot execute descendants");
             }
             if index > 0 {
                 let separator = if command.program.as_deref() == Some("head")
@@ -36,17 +36,17 @@ impl PushCommand {
                 } else if command.program.as_deref() == Some("echo") && result.echo.is_empty() {
                     ";"
                 } else {
-                    return Err("only a head pipeline and a trailing echo may wrap a push");
+                    return Err("only a head pipeline and a trailing echo may wrap a command");
                 };
                 remaining = remaining
                     .trim_start()
                     .strip_prefix(separator)
-                    .ok_or("conditional or background push execution is unsupported")?
+                    .ok_or("conditional or background command execution is unsupported")?
                     .trim_start();
             }
             remaining = remaining
                 .strip_prefix(&command.source)
-                .ok_or("push must be a foreground command without shell groups")?;
+                .ok_or("command must be a foreground command without shell groups")?;
             // Reconcile the source with ALL argv words: assignments, prefix
             // redirects and other syntax absent from argv must not be discarded.
             let mut words = command.source.as_str();
@@ -58,13 +58,13 @@ impl PushCommand {
             }
             let redirect = words.trim();
             if !(redirect.is_empty() || index == 0 && redirect == "2>&1") {
-                return Err("push wrappers may only redirect stderr to stdout (2>&1)");
+                return Err("command wrappers may only redirect stderr to stdout (2>&1)");
             }
             if index == 0 {
                 result.argv = command
                     .argv
                     .iter()
-                    .map(|word| literal(word).ok_or("push arguments must be literal"))
+                    .map(|word| literal(word).ok_or("command arguments must be literal"))
                     .collect::<Result<_, _>>()?;
             } else if command.program.as_deref() == Some("head") {
                 let args = command
@@ -102,7 +102,7 @@ impl PushCommand {
             }
         }
         if !remaining.trim().is_empty() || result.argv.is_empty() {
-            return Err("unsupported syntax after the governed push");
+            return Err("unsupported syntax after the governed command");
         }
         Ok(result)
     }
@@ -141,14 +141,15 @@ mod tests {
     /// #2719: accept the witnessed presentation, without executing shell code.
     #[test]
     fn familiar_wrappers_preserve_output_and_status() {
-        let push = PushCommand::parse("git push origin HEAD:task 2>&1 | head -5; echo \"exit=$?\"")
-            .unwrap();
+        let push =
+            GovernedCommand::parse("git push origin HEAD:task 2>&1 | head -5; echo \"exit=$?\"")
+                .unwrap();
         assert_eq!(push.argv, ["git", "push", "origin", "HEAD:task"]);
         assert_eq!(
             push.render("failed(git_error)".into(), false),
             "failed(git_error)\nexit=0"
         );
-        let push = PushCommand::parse("git push; echo \"exit=$?\" '$?'").unwrap();
+        let push = GovernedCommand::parse("git push; echo \"exit=$?\" '$?'").unwrap();
         assert_eq!(
             push.render("failed(git_error)".into(), false),
             "failed(git_error)\nexit=1 $?"
@@ -179,7 +180,7 @@ mod tests {
             "git push; echo ${x:=bad}",
             "git push; echo `id`",
         ] {
-            assert!(PushCommand::parse(source).is_err(), "{source}");
+            assert!(GovernedCommand::parse(source).is_err(), "{source}");
         }
     }
 }

@@ -1907,7 +1907,74 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         baseline: &newt_core::Caveats,
         requests: &[newt_core::PermissionRequest],
     ) -> newt_core::PermissionDecision {
+        self.ask_scoped(baseline, requests, false)
+    }
+
+    fn ask_dependency_fetch(
+        &mut self,
+        prepared: &newt_core::Caveats,
+        request: &newt_core::PermissionRequest,
+    ) -> newt_core::PermissionDecision {
+        self.ask_scoped(prepared, std::slice::from_ref(request), true)
+    }
+
+    fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
+        // C1 (#1862): the SESSION builds the semantic form; whichever surface
+        // owns the terminal renders and reads it. Previously this thread called
+        // `Terminal::suspend_for_prompt` itself — taking stdin and writing
+        // prompt bytes from the session thread, which is what
+        // `session_worker`'s law 1 ("a worker never writes terminal bytes")
+        // forbids and what the cockpit made observable.
+        //
+        // Blocking on the operator still surfaces to the cockpit through the
+        // tty arbiter's Blocked/Unblocked, because `suspend_for_prompt` still
+        // happens — just on the other side of the seam.
+        let interaction = SurfaceInteraction::blocking(free_text_form(question));
+        let outcome = match self.ask_surface {
+            Some(ask) => ask(&interaction),
+            None => {
+                let w =
+                    Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionQuestion);
+                present_on_terminal(&w, &interaction)
+            }
+        };
+        // The CONTROL side effects are the session's, not the terminal's: only
+        // this side owns the turn's cancel/exit flags. `present_on_terminal`
+        // reports what happened and applies nothing.
+        match outcome {
+            // Esc / slash-command back-out: cancel the turn, report Cancelled
+            // (never "headless"). The adapter rewrites a typed `/cmd` into a
+            // back-out, so that lands here too.
+            HumanQuestionOutcome::Cancelled => {
+                self.apply_control(PromptChoice::Back);
+                HumanQuestionOutcome::Cancelled
+            }
+            // Ctrl-C / Ctrl-D: cancel the turn AND request exit.
+            HumanQuestionOutcome::ExitRequested => {
+                self.apply_control(PromptChoice::Exit);
+                HumanQuestionOutcome::ExitRequested
+            }
+            other => other,
+        }
+    }
+}
+
+impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermissionGate<'_, F> {
+    fn ask_scoped(
+        &mut self,
+        baseline: &newt_core::Caveats,
+        requests: &[newt_core::PermissionRequest],
+        operation_only: bool,
+    ) -> newt_core::PermissionDecision {
         use newt_core::PermissionDecision::{Allow, Deny};
+        if operation_only
+            && (requests.len() != 1
+                || requests[0].tool != "lifecycle"
+                || requests[0].kind != newt_core::DenialKind::Net
+                || baseline.net != newt_core::Scope::All)
+        {
+            return Deny;
+        }
         if requests.is_empty() {
             return Deny;
         }
@@ -1933,9 +2000,10 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         // A prepared build request carries its exact projected fence. Check
         // that fence before prompting as well as the named Build capability;
         // returned authority is clamped again by mint().
-        if requests
-            .iter()
-            .any(|request| request.kind == newt_core::DenialKind::Build)
+        if (operation_only
+            || requests
+                .iter()
+                .any(|request| request.kind == newt_core::DenialKind::Build))
             && (self
                 .preset_clamp
                 .as_ref()
@@ -2047,7 +2115,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             {
                 continue;
             }
-            if session_grant_covers(&self.state.session_grants, req) {
+            if !operation_only && session_grant_covers(&self.state.session_grants, req) {
                 // An exact match needs no further widening — it is already
                 // reachable through `recalled_grants` in `mint`. The
                 // build-tool fallback in `session_grant_covers` is NOT itself
@@ -2083,21 +2151,23 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
                 continue;
             }
-            if self
-                .state
-                .durable_grants
-                .contains(&(req.kind, req.target.clone()))
+            if !operation_only
+                && self
+                    .state
+                    .durable_grants
+                    .contains(&(req.kind, req.target.clone()))
                 && self.danger.classify(req.kind, &req.target) != danger::DangerTier::High
             {
                 self.record(req, "allow", "encrypted-permanent");
                 continue;
             }
             // Durable approval pre-answers only a low-danger request.
-            if newt_core::ocap_store::evaluate_request(
-                &self.state.ocap_policy,
-                req.kind,
-                &req.target,
-            ) == Some(newt_core::ocap_store::Verdict::Approve)
+            if !operation_only
+                && newt_core::ocap_store::evaluate_request(
+                    &self.state.ocap_policy,
+                    req.kind,
+                    &req.target,
+                ) == Some(newt_core::ocap_store::Verdict::Approve)
                 && self.danger.classify(req.kind, &req.target) != danger::DangerTier::High
             {
                 self.record(req, "allow", "ocap-approve");
@@ -2118,7 +2188,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 continue;
             }
             // Only the eventual operation consumes a request_permissions grant.
-            if req.tool != "request_permissions" {
+            if !operation_only && req.tool != "request_permissions" {
                 if let Some(key) = take_pending_once(&mut self.state.pending_once_grants, req) {
                     self.record(req, "allow", "once");
                     once_grants.push(key);
@@ -2417,46 +2487,15 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         if self.state.validate_caveats(&allowed).is_err() {
             return Deny;
         }
-        Allow(allowed)
-    }
-
-    fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
-        // C1 (#1862): the SESSION builds the semantic form; whichever surface
-        // owns the terminal renders and reads it. Previously this thread called
-        // `Terminal::suspend_for_prompt` itself — taking stdin and writing
-        // prompt bytes from the session thread, which is what
-        // `session_worker`'s law 1 ("a worker never writes terminal bytes")
-        // forbids and what the cockpit made observable.
-        //
-        // Blocking on the operator still surfaces to the cockpit through the
-        // tty arbiter's Blocked/Unblocked, because `suspend_for_prompt` still
-        // happens — just on the other side of the seam.
-        let interaction = SurfaceInteraction::blocking(free_text_form(question));
-        let outcome = match self.ask_surface {
-            Some(ask) => ask(&interaction),
-            None => {
-                let w =
-                    Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionQuestion);
-                present_on_terminal(&w, &interaction)
+        if operation_only {
+            // Recalled grants cannot add unrelated authority to the prepared
+            // operation, and a clamp may not silently remove its needed fence.
+            if !baseline.leq(&allowed) {
+                return Deny;
             }
-        };
-        // The CONTROL side effects are the session's, not the terminal's: only
-        // this side owns the turn's cancel/exit flags. `present_on_terminal`
-        // reports what happened and applies nothing.
-        match outcome {
-            // Esc / slash-command back-out: cancel the turn, report Cancelled
-            // (never "headless"). The adapter rewrites a typed `/cmd` into a
-            // back-out, so that lands here too.
-            HumanQuestionOutcome::Cancelled => {
-                self.apply_control(PromptChoice::Back);
-                HumanQuestionOutcome::Cancelled
-            }
-            // Ctrl-C / Ctrl-D: cancel the turn AND request exit.
-            HumanQuestionOutcome::ExitRequested => {
-                self.apply_control(PromptChoice::Exit);
-                HumanQuestionOutcome::ExitRequested
-            }
-            other => other,
+            Allow(allowed.meet(baseline))
+        } else {
+            Allow(allowed)
         }
     }
 }
