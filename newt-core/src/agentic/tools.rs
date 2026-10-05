@@ -4372,6 +4372,7 @@ async fn execute_authorized_tool(
                         live_tool_output.clone(),
                         presentation,
                         commit_broker,
+                        args.get("timeout_secs").and_then(serde_json::Value::as_u64),
                     )
                     .await,
                 );
@@ -4459,6 +4460,7 @@ async fn execute_authorized_tool(
                     .as_ref()
                     .map(|guard| guard.clone() as agent_bridle_tool_shell::ExecutionLease),
                 &mut fs_pre_exec_missing,
+                args.get("timeout_secs").and_then(serde_json::Value::as_u64),
             )
             .await;
             if let Some(move_info) = &ref_move {

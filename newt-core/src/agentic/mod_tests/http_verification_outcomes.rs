@@ -740,7 +740,7 @@ async fn every_verification_case_ends_within_its_allowance() {
             caveats: Caveats::top(),
             env: &[
                 ("NEWT_DISABLE_OCAP", "1"),
-                ("NEWT_HOST_EXEC_TIMEOUT_SECS", "1"),
+                ("NEWT_RUN_COMMAND_TIMEOUT_SECS", "1"),
             ],
             reason: "repair_exhausted",
             rounds: 5,

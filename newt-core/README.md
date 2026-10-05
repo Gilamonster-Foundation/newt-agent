@@ -194,3 +194,18 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:45 EDT | Date: 2026-09-17
+
+## Command time budgets
+
+`run_command` has a 60-second wall-clock budget. Set
+`NEWT_RUN_COMMAND_TIMEOUT_SECS` to change its default, or pass `timeout_secs`
+for one call; both are capped at 300 seconds. Invalid or zero defaults fall
+back to 60 seconds, and a zero per-call value uses the configured default.
+On expiry the executor terminates the command group and returns an explicit
+`TimedOut` result naming the applied budget, with bounded partial output.
+Commands that leave the owned process group are outside that group-kill mechanism.
+
+Mentioning or invoking Cargo inside a shell command does not increase its budget.
+Use `build_exec` or `lifecycle` with `action=build` for long builds and tests;
+those executors retain their own budgets. Permission and confinement checks
+are independent of time-budget selection.

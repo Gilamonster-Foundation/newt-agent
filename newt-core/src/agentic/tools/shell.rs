@@ -684,6 +684,7 @@ fn bridle_registry(
         }
         crate::ShellEngine::Host => {
             let mut tool = agent_bridle::HostShellTool::new()
+                .with_timeout(wall)
                 .sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
             if let Some(lease) = execution_lease {
                 tool = tool.with_execution_lease(lease);
@@ -845,7 +846,7 @@ pub(super) async fn dispatch_bridled_build_shell(
 }
 
 async fn dispatch_bridled_shell_with_floor(
-    args: serde_json::Value,
+    mut args: serde_json::Value,
     caveats: &crate::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     strength_floor: Option<agent_bridle::AxisEnforcement>,
@@ -866,21 +867,10 @@ async fn dispatch_bridled_shell_with_floor(
     // blanket Kernel floor would refuse every exec-restricted command even on
     // Landlock. The correct fix is a PER-AXIS floor at the bridle boundary
     // (fs/net = Kernel, exec = Interceptor-OK); tracked as an ACTIVE deviation.
-    // F20: a command whose leading program is a recognised build tool gets the
-    // build lane's wall here too — this IS the lane a compound build command
-    // (`cargo test …; echo …`) runs in, because #2533's routing refuses to
-    // route anything compound. `dispatch_wall` reads only `args["cmd"]`, so
-    // this changes nothing but the wall clock: `caveats` (fs/net/exec
-    // authority) passed to `.dispatch()` below is untouched.
+    // #2732: authority for a build-bearing shell does not buy a longer clock.
+    // Explicit build_exec/lifecycle executors retain their own build budgets.
     let cmd = args.get("cmd").and_then(serde_json::Value::as_str);
-    let wall = if strength_floor.is_some() {
-        LIFECYCLE_BUILD_TIMEOUT
-    } else {
-        cmd.map_or_else(
-            || std::time::Duration::from_secs(run_command_wall_secs()),
-            dispatch_wall,
-        )
-    };
+    let wall = run_command_budget(args.get("timeout_secs").and_then(serde_json::Value::as_u64));
     // dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the toolchain
     // read roots for a build-tool command are added ONLY to the caveats used
     // for THIS dispatch, never folded back into the session's standing
@@ -906,6 +896,11 @@ async fn dispatch_bridled_shell_with_floor(
         command_broker,
     );
     let grant = registry.mint_grant(dispatch_caveats);
+    // The selected budget is engine configuration, not an extra model field in
+    // Brush/Host's private shell schema. SafeSubset uses the same configured default.
+    if let Some(args) = args.as_object_mut() {
+        args.remove("timeout_secs");
+    }
     let result = match strength_floor {
         Some(floor) => {
             registry
@@ -927,7 +922,10 @@ async fn dispatch_bridled_shell_with_floor(
             live.finish();
         }
     }
-    result
+    result.map(|mut envelope| {
+        envelope["timeout_secs"] = wall.as_secs().into();
+        envelope
+    })
 }
 
 /// #2636: the EXACT message emitted only when `run_command` is refused
@@ -1038,6 +1036,7 @@ pub(super) async fn exec_confined_command(
         None,
         None,
         &mut None,
+        None,
     )
     .await
 }
@@ -1085,6 +1084,7 @@ pub(super) async fn exec_confined_command_with_broker(
     // rerun-eligible slot; child stdout that happens to contain the denial
     // string does not.
     pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
+    timeout_secs: Option<u64>,
 ) -> (String, ExecOutcome) {
     // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
     // BEFORE either lane below runs anything — this is the single choke
@@ -1135,6 +1135,7 @@ pub(super) async fn exec_confined_command_with_broker(
             &cmd_with_venv,
             cwd,
             live.as_ref().map(LiveOutputSession::relay),
+            timeout_secs,
         )
         .await;
         if let Some(live) = live.as_mut() {
@@ -1237,7 +1238,8 @@ pub(super) async fn exec_confined_command_with_broker(
 
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
-    let dispatch_args = confined_dispatch_args(cmd, cwd);
+    let mut dispatch_args = confined_dispatch_args(cmd, cwd);
+    dispatch_args["timeout_secs"] = run_command_budget(timeout_secs).as_secs().into();
     let result = match dispatch_bridled_shell_with_floor(
         dispatch_args.clone(),
         caveats,
@@ -1395,17 +1397,18 @@ pub(super) async fn exec_confined_command_with_broker(
                                     );
                                     (denied_run_command_result(&env2, color), ExecOutcome::Denied)
                                 }
-                                Ok(env2) => (
-                                    shell_envelope_output(
-                                        &env2,
-                                        tool_output_lines,
-                                        color,
-                                        tool_offload,
-                                        spill_store,
-                                        Some(&mut *presentation),
-                                    ),
-                                    envelope_outcome(&env2),
-                                ),
+                                Ok(env2) => {
+                                    confined_result(cmd, &env2, &widened, color, |envelope| {
+                                        shell_envelope_output(
+                                            envelope,
+                                            tool_output_lines,
+                                            color,
+                                            tool_offload,
+                                            spill_store,
+                                            Some(&mut *presentation),
+                                        )
+                                    })
+                                }
                                 Err(e) => dispatch_error_result(e),
                             };
                             return with_denial_context(retried, workspace, cwd, Some(&widened));
@@ -1546,7 +1549,13 @@ pub(super) fn confined_result(
         text.push_str(note);
     }
     if outcome == ExecOutcome::TimedOut {
-        text.push_str(&timed_out_note(dispatch_wall(cmd)));
+        text.push_str(&timed_out_note(
+            envelope
+                .get("timeout_secs")
+                .and_then(serde_json::Value::as_u64)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or_else(|| dispatch_wall(cmd)),
+        ));
     }
     (text, outcome)
 }
@@ -1560,25 +1569,43 @@ pub(super) const LIFECYCLE_BUILD_TIMEOUT: std::time::Duration =
 /// of inventing `phase="build"`.
 const LIFECYCLE_BUILD_CALL: &str = r#"{"action":"build","phase":"test"}"#;
 
-/// The confined shell's per-call wall clock (agent-bridle's default; newt never
-/// overrides it, and the model has no argument to raise it).
+/// Operator-configurable ordinary command wall, capped independently of builds.
 fn run_command_wall_secs() -> u64 {
-    agent_bridle::LimitsPolicy::default().default_timeout_secs
+    command_budget_seconds(
+        std::env::var("NEWT_RUN_COMMAND_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+        None,
+    )
 }
 
-/// F20: the wall clock for THIS `cmd` — [`LIFECYCLE_BUILD_TIMEOUT`] when its
-/// leading program is a recognised build tool (reusing routing's
-/// `is_build_tool_program` table, not a second list), else the ordinary
-/// [`run_command_wall_secs`]. This is the same 60s-vs-30min split
-/// `lifecycle action=build` already gets — just applied to the shell lane a
-/// COMPOUND build command (`cargo test …; echo …`) actually runs in, since
-/// #2533's routing refuses to route anything compound. Only the wall clock
-/// changes: fs/net/exec authority is unaffected (`dispatch_bridled_shell`
-/// passes `caveats` through unchanged).
-/// `ShellTool` limits for a call whose wall is `wall`. The model's args carry
-/// no `timeout_secs`, so `ShellTool` falls back to `default_timeout_secs`:
-/// that field IS the wall. `max_timeout_secs` is raised with it or the clamp
-/// would cut a build wall back to 300s.
+pub(super) const RUN_COMMAND_MAX_SECS: u64 = 300;
+
+/// Pure selection seam: configuration and per-call override can never disable
+/// the deadline or exceed the ordinary command ceiling.
+pub(super) fn command_budget_seconds(configured: Option<&str>, requested: Option<u64>) -> u64 {
+    let default = agent_bridle::LimitsPolicy::default().default_timeout_secs;
+    requested
+        .filter(|n| *n > 0)
+        .or_else(|| {
+            configured
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+        })
+        .unwrap_or(default)
+        .min(RUN_COMMAND_MAX_SECS)
+}
+
+pub(super) fn run_command_budget(requested: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_secs(command_budget_seconds(
+        std::env::var("NEWT_RUN_COMMAND_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+        requested,
+    ))
+}
+
+/// The selected wall must also be the safe-subset engine's default, not only its ceiling.
 pub(super) fn shell_limits(wall: std::time::Duration) -> agent_bridle::LimitsPolicy {
     let default = agent_bridle::LimitsPolicy::default();
     agent_bridle::LimitsPolicy {
@@ -1588,25 +1615,20 @@ pub(super) fn shell_limits(wall: std::time::Duration) -> agent_bridle::LimitsPol
     }
 }
 
-pub(super) fn dispatch_wall(cmd: &str) -> std::time::Duration {
-    match leading_program(cmd) {
-        Some(program) if crate::agentic::routing::is_build_tool_program(program) => {
-            LIFECYCLE_BUILD_TIMEOUT
-        }
-        _ => std::time::Duration::from_secs(run_command_wall_secs()),
-    }
+pub(super) fn dispatch_wall(_cmd: &str) -> std::time::Duration {
+    run_command_budget(None)
 }
 
 /// What the `run_command` description tells the model about its wall, up front.
 /// One owner with [`timed_out_note`], so the two cannot disagree (U6).
 pub(super) fn run_command_limit_sentence() -> String {
     format!(
-        "Each call is killed after {} seconds (wall clock), {} minutes when it starts with \
-         `cargo` or `just`; the result carries the exit code. For an offline build use \
+        "Each call is killed after {} seconds (wall clock). Override with timeout_secs up to \
+         {} seconds; the result carries the exit code. For an offline build use \
          `lifecycle` action=build, i.e. call the tool with {LIFECYCLE_BUILD_CALL} (`phase` is \
          never `build`), or narrow the command (one test filter, one crate).",
         run_command_wall_secs(),
-        LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
+        RUN_COMMAND_MAX_SECS
     )
 }
 
@@ -1625,9 +1647,15 @@ pub(super) fn timed_out_note(wall: std::time::Duration) -> String {
     let default = std::time::Duration::from_secs(run_command_wall_secs());
     let wall_note = if wall == default {
         format!("{}s wall", wall.as_secs())
-    } else {
+    } else if wall == LIFECYCLE_BUILD_TIMEOUT {
         format!(
             "{}s build-lane wall (not the default {}s)",
+            wall.as_secs(),
+            default.as_secs()
+        )
+    } else {
+        format!(
+            "{}s wall (per-call budget; default {}s)",
             wall.as_secs(),
             default.as_secs()
         )
@@ -1698,10 +1726,16 @@ pub(super) async fn host_shell_dispatch(
     cmd: &str,
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout_secs: Option<u64>,
 ) -> std::io::Result<serde_json::Value> {
-    let run = host_shell_output(cmd, cwd, live).await?;
+    let wall = run_command_budget(timeout_secs);
+    let run = match timeout_secs {
+        None => host_shell_output(cmd, cwd, live).await?,
+        Some(_) => host_shell_output_with_timeout(cmd, cwd, live, wall).await?,
+    };
     Ok(serde_json::json!({
         "exit_code": run.exit_code,
+        "timeout_secs": wall.as_secs(),
         "stdout": decode_shell_stream(&run.stdout),
         "stderr": decode_shell_stream(&run.stderr),
         // Same `timed_out` flag the confined bridle envelope carries, so the
@@ -1723,22 +1757,9 @@ pub(super) struct HostShellRun {
     pub(super) timed_out: bool,
 }
 
-/// Wall-clock ceiling for a single host-bypass shell command. A child that
-/// blocks past this (a REPL awaiting input, an accidental `cat` with no args,
-/// an interactive prompt) is killed rather than wedging the whole turn — the
-/// interrupt keyboard-watcher cannot help once a foreground child owns the tty.
-///
-/// Convention-driven: override with `NEWT_HOST_EXEC_TIMEOUT_SECS` (a positive
-/// integer number of seconds). Absent/blank/invalid/zero falls back to the
-/// 120s default, mirroring the confined shell's bound.
+/// The unsafe host bypass uses the same configurable, capped command budget.
 fn host_exec_timeout() -> std::time::Duration {
-    const DEFAULT_SECS: u64 = 120;
-    let secs = std::env::var("NEWT_HOST_EXEC_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_SECS);
-    std::time::Duration::from_secs(secs)
+    run_command_budget(None)
 }
 
 pub(super) fn decode_shell_stream(bytes: &[u8]) -> String {

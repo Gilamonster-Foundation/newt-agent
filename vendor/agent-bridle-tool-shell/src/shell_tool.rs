@@ -1849,42 +1849,7 @@ fn run_pipeline(
     // buffer); on the deadline, SIGKILL each stage's process group and reap, so
     // nothing — child or descendant — outlives the timeout. The pipeline's exit
     // code is the last stage's.
-    let deadline = std::time::Instant::now() + timeout;
-    let mut exit_code = -1;
-    let mut timed_out = false;
-    let mut done = vec![false; children.len()];
-    loop {
-        let mut all_done = true;
-        for (i, child) in children.iter_mut().enumerate() {
-            if done[i] {
-                continue;
-            }
-            match child.try_wait().map_err(ToolError::Exec)? {
-                Some(status) => {
-                    done[i] = true;
-                    if i == last {
-                        exit_code = status.code().unwrap_or(-1);
-                    }
-                }
-                None => all_done = false,
-            }
-        }
-        if all_done {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            timed_out = true;
-            for child in children.iter_mut() {
-                crate::kill_child_tree(child);
-            }
-            // Reap every stage so no zombie/child survives the call.
-            for child in children.iter_mut() {
-                let _ = child.wait();
-            }
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    let (exit_code, timed_out) = crate::supervisor::supervise(&mut children, timeout)?;
 
     let (stdout, stdout_truncated) =
         stdout_thread.map_or((Vec::new(), false), |h| h.join().unwrap_or_default());

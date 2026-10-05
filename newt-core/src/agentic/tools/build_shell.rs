@@ -102,6 +102,7 @@ pub(super) async fn execute(
     live_output: Option<Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
     command_broker: Option<Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    timeout_secs: Option<u64>,
 ) -> (String, ExecOutcome) {
     if let Some(refusal) = shell::same_file_redirect_refusal(source, cwd) {
         return (refusal, ExecOutcome::Denied);
@@ -166,7 +167,7 @@ pub(super) async fn execute(
     };
     let environment: std::collections::BTreeMap<_, _> =
         request.env_grants().iter().cloned().collect();
-    let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment});
+    let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment, "timeout_secs": shell::run_command_budget(timeout_secs).as_secs()});
     // Never retry this source after execution: an earlier pipeline stage may
     // already have had an effect, even if a later command was denied.
     match shell::dispatch_bridled_build_shell(args, build, live_output, scratch, command_broker)
