@@ -8,7 +8,7 @@ use super::{shell, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::caveats::Caveats;
 use crate::confined_exec::build_tool_request;
 use crate::ExecOutcome;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Identify a build tool through Bridle's structural inventory. This selects
@@ -38,6 +38,53 @@ pub(super) fn build_program(source: &str) -> Option<String> {
     find(&agent_bridle::inspect_shell(source).ok()?)
 }
 
+/// #2723: select the build fence from existing filesystem authority, not a
+/// second workspace allowlist. Canonical containment keeps a symlink inside a
+/// granted directory from authorizing an ungranted target. Build/frame approval
+/// still happens below, using this same root for every part of the request.
+pub(super) fn build_directory(
+    workspace: &str,
+    cwd: &Path,
+    caveats: &Caveats,
+) -> Result<(PathBuf, PathBuf), (String, ExecOutcome)> {
+    let launch = Path::new(workspace).canonicalize().map_err(|error| {
+        (
+            format!("error: build workspace: {error}"),
+            ExecOutcome::Unavailable,
+        )
+    })?;
+    let refusal = || {
+        (
+            concat!(
+                "capability denied: build directory must remain inside the workspace ",
+                "or an authorized write root; grant the worktree with --write <worktree> ",
+                "or launch there; no command ran"
+            )
+            .into(),
+            ExecOutcome::Denied,
+        )
+    };
+    let cwd = cwd.canonicalize().map_err(|_| refusal())?;
+    if !cwd.is_dir() {
+        return Err(refusal());
+    }
+    if cwd.starts_with(&launch) {
+        return Ok((launch, cwd));
+    }
+    let root = match &caveats.fs_write {
+        // The operator explicitly authorized all paths; keep this build's
+        // calibrated fence narrow rather than granting the filesystem root.
+        crate::Scope::All => Some(cwd.clone()),
+        crate::Scope::Only(roots) => roots
+            .iter()
+            .filter(|root| Path::new(root).is_absolute())
+            .filter_map(|root| Path::new(root).canonicalize().ok())
+            .filter(|root| root.is_dir() && cwd.starts_with(root))
+            .max_by_key(|root| root.components().count()),
+    };
+    root.map(|root| (root, cwd)).ok_or_else(refusal)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     source: &str,
@@ -59,23 +106,9 @@ pub(super) async fn execute(
     if let Some(refusal) = shell::same_file_redirect_refusal(source, cwd) {
         return (refusal, ExecOutcome::Denied);
     }
-    let root = match Path::new(workspace).canonicalize() {
-        Ok(root) => root,
-        Err(error) => {
-            return (
-                format!("error: build workspace: {error}"),
-                ExecOutcome::Unavailable,
-            );
-        }
-    };
-    let cwd = match Path::new(cwd).canonicalize() {
-        Ok(cwd) if cwd.starts_with(&root) => cwd,
-        _ => {
-            return (
-                "capability denied: build directory must remain inside the workspace".into(),
-                ExecOutcome::Denied,
-            );
-        }
+    let (root, cwd) = match build_directory(workspace, Path::new(cwd), caveats) {
+        Ok(directory) => directory,
+        Err(refusal) => return refusal,
     };
 
     // The existing argv request supplies the authority, environment, and

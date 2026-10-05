@@ -110,15 +110,22 @@ impl TrustHint {
 }
 
 /// Why the broker refused. `detail` may quote operator config or repository
-/// bytes and is normalised away at the F6 boundary; `hint` is the only part
-/// that reaches the operator, and only the harness can construct one.
+/// bytes and is normalised away at the F6 boundary. Only a typed trust `hint`
+/// and a static harness-authored `safe_reason` may cross that boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     detail: String,
+    /// Harness-authored explanation; never operator configuration or child output.
+    pub(crate) safe_reason: Option<&'static str>,
     hint: Option<TrustHint>,
 }
 
 impl Refusal {
+    pub(crate) fn with_reason(mut self, reason: &'static str) -> Self {
+        self.safe_reason = Some(reason);
+        self
+    }
+
     #[must_use]
     pub fn hint(&self) -> Option<&TrustHint> {
         self.hint.as_ref()
@@ -127,7 +134,11 @@ impl Refusal {
 
 impl From<String> for Refusal {
     fn from(detail: String) -> Self {
-        Self { detail, hint: None }
+        Self {
+            detail,
+            hint: None,
+            safe_reason: None,
+        }
     }
 }
 
@@ -166,9 +177,16 @@ impl TrustContext {
     /// # Errors
     /// When a root exists but cannot be resolved ([`bind_canonical_paths`]).
     pub fn bind(fs_write: &Scope<String>) -> Result<Self, Refusal> {
+        // #2720: ambient authority explicitly trusts the host environment.
+        // There is no outside-of-model-write tree in this mode; ownership,
+        // mode, symlink, helper, and destination validation still apply.
+        let write_scope = match fs_write {
+            Scope::All => Scope::none(),
+            scoped => scoped.clone(),
+        };
         Ok(Self {
-            write_scope: fs_write.clone(),
-            write_roots: bind_canonical_paths(fs_write)?,
+            write_roots: bind_canonical_paths(&write_scope)?,
+            write_scope,
             clt_git: false,
         })
     }
@@ -368,6 +386,7 @@ fn check_one(
                 _ => "o-w",
             };
             return Err(Refusal {
+                safe_reason: None,
                 detail: format!(
                     "governed push refused: '{short}' is group- or other-writable (mode {mode:04o})"
                 ),
@@ -1499,6 +1518,7 @@ pub fn validate_helper_value(value: &str, tools: &TrustedTools) -> Result<Helper
         .into());
     }
     trust_check(&helper, &tools.ctx).map_err(|why| Refusal {
+        safe_reason: why.safe_reason,
         detail: format!("refused: credential helper '{value}' — {why}"),
         hint: why.hint,
     })?;
@@ -1620,6 +1640,7 @@ pub fn import_credentials(
     for entry in &entries {
         if seen_origins.insert(entry.origin.clone()) {
             trust_check(&entry.origin, &tools.ctx).map_err(|why| Refusal {
+                safe_reason: why.safe_reason,
                 detail: format!(
                     "refused: credential configuration at '{}' — {why}",
                     entry.origin.display()
@@ -1722,6 +1743,8 @@ pub fn resolve_alternates_chain(
 /// `Display` consumers below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
+    /// The destination accepted a dry-run check; no ref was published.
+    DryRunChecked,
     Pushed {
         oid: String,
         owner: String,
@@ -1763,6 +1786,7 @@ impl std::fmt::Display for FailureCategory {
 impl std::fmt::Display for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DryRunChecked => f.write_str("dry_run_checked (no publication)"),
             Self::Pushed {
                 oid,
                 owner,
@@ -1852,6 +1876,17 @@ mod tests {
             env: Vec::new(),
             ctx: ctx(write_roots),
         }
+    }
+
+    /// #2720: ambient authority trusts the host, but never loose file modes.
+    #[test]
+    fn full_access_trust_retains_mode_checks() {
+        let dir = tempdir();
+        let file = owned_file(dir.path(), "credential", 0o600);
+        let ambient = ctx_from(&Scope::All);
+        assert!(trust_check(&file, &ambient).is_ok());
+        chmod(&file, 0o666);
+        assert!(trust_check(&file, &ambient).is_err());
     }
 
     #[test]

@@ -234,6 +234,8 @@ impl ToolPermissions {
         "head",
         "tail",
         "wc",
+        // Audited non-spawning filter; see caveat_pack::STANDARD_TEXT_TOOLS.
+        "tr",
         "sort",
         "uniq",
         "diff",
