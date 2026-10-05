@@ -70,6 +70,7 @@ fn hard_budget_ctx<'a>(
         task,
         workspace: ".",
         default_command_cwd: None,
+        worktree_session: None,
         color: false,
         markdown: false,
         tool_offload: false,
