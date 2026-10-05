@@ -61,9 +61,12 @@ pub(super) async fn dispatch(
 /// #2733 P1: path operands cannot masquerade as the Git creation verb.
 #[test]
 fn worktree_adoption_round2_git_clean_operands_are_not_creation() {
-    assert!(!creation_batch_is_read_only_after_add(&serde_json::json!({
-        "command":"git worktree add ../task -b task; git clean -fd -- victim worktree add"
-    })));
+    assert!(!creation_batch_is_read_only_after_add(
+        &serde_json::json!({
+            "command":"git worktree add ../task -b task; git clean -fd -- victim worktree add"
+        }),
+        crate::ShellEngine::Brush
+    ));
 }
 
 /// #2733 P1: ground the literal classifier in real Git dispatch. The exact
@@ -284,6 +287,9 @@ fn worktree_adoption_round2_siblings_cannot_hide_creation() {
             "{suffix}: {:?}",
             agent_bridle::inspect_shell(args["command"].as_str().unwrap())
         );
-        assert!(!creation_batch_is_read_only_after_add(&args), "{suffix}");
+        assert!(
+            !creation_batch_is_read_only_after_add(&args, crate::ShellEngine::Brush),
+            "{suffix}"
+        );
     }
 }

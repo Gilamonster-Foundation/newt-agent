@@ -63,6 +63,8 @@ fn creation_admission(
     args: &serde_json::Value,
     workspace: &str,
     caveats: &Caveats,
+    engine: crate::ShellEngine,
+    trusted_git: impl FnOnce(&Caveats) -> Result<PathBuf, ()>,
 ) -> Result<Option<(Creation, String)>, ()> {
     if name != "run_command"
         || !args
@@ -72,11 +74,11 @@ fn creation_admission(
     {
         return Ok(None);
     }
-    if !creation_batch_is_read_only_after_add(args) {
+    if !creation_batch_is_read_only_after_add(args, engine) {
         return Err(());
     }
     let candidate = creation(name, args, workspace, caveats).ok_or(())?;
-    let source = git_identity::bind(args["command"].as_str().ok_or(())?, caveats)?;
+    let source = git_identity::pin(args["command"].as_str().ok_or(())?, &trusted_git(caveats)?)?;
     Ok(Some((candidate, source)))
 }
 
@@ -158,7 +160,10 @@ fn display_builtin(program: &str, engine: crate::ShellEngine) -> bool {
 
 // Adoption is an execution boundary: a compound creation must not write the
 // original checkout later in the SAME shell before the outer guard can run.
-fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
+fn creation_batch_is_read_only_after_add(
+    args: &serde_json::Value,
+    engine: crate::ShellEngine,
+) -> bool {
     let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
@@ -202,7 +207,7 @@ fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
             // Exec authority (even for a basename like tail) does not certify
             // read-only behavior. External displays run separately, AFTER
             // adoption; refusing them also closes PATH substitution (#2733).
-            Some(program) => display_builtin(program, shell::shell_engine()),
+            Some(program) => display_builtin(program, engine),
             None => false,
         }
     });
@@ -306,7 +311,14 @@ pub(super) async fn execute(
         shell::command_args_with_default_cwd(name, args, workspace, collab.default_command_cwd)
             .unwrap_or(std::borrow::Cow::Borrowed(args));
     let admission = session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
-        creation_admission(name, &normalized, workspace, caveats)
+        creation_admission(
+            name,
+            &normalized,
+            workspace,
+            caveats,
+            shell::shell_engine(),
+            git_identity::resolve,
+        )
     });
     let Ok(candidate) = admission else {
         if let Some(invocation) = collab.invocation {
@@ -437,3 +449,7 @@ mod round3_tests;
 #[cfg(test)]
 #[path = "../tools_tests/worktree_adoption_round5.rs"]
 mod round5_tests;
+
+#[cfg(test)]
+#[path = "../tools_tests/worktree_adoption_round6.rs"]
+mod round6_tests;

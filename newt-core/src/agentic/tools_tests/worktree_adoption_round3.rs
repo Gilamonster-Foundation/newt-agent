@@ -117,7 +117,9 @@ fn worktree_adoption_round3_ambiguous_attempts_fail_closed() {
                 "run_command",
                 &serde_json::json!({"command":source}),
                 root.to_str().unwrap(),
-                &Caveats::top()
+                &Caveats::top(),
+                crate::ShellEngine::Brush,
+                |_| Ok(PathBuf::from("/fixture/git"))
             )
             .is_err(),
             "fell open: {source}"
@@ -142,6 +144,8 @@ fn worktree_adoption_round3_exact_creation_and_noncreation_controls() {
             &serde_json::json!({"command":source}),
             root.to_str().unwrap(),
             &Caveats::top(),
+            crate::ShellEngine::Brush,
+            |_| Ok(PathBuf::from("/fixture/git")),
         );
         if cfg!(unix) {
             assert!(
@@ -167,7 +171,9 @@ fn worktree_adoption_round3_exact_creation_and_noncreation_controls() {
                 "run_command",
                 &serde_json::json!({"command":source}),
                 root.to_str().unwrap(),
-                &Caveats::top()
+                &Caveats::top(),
+                crate::ShellEngine::Brush,
+                |_| Ok(PathBuf::from("/fixture/git"))
             )
             .is_ok_and(|candidate| candidate.is_none()),
             "{source}"
@@ -187,18 +193,23 @@ fn worktree_adoption_round4_display_identity() {
         "unknown-display",
     ] {
         assert!(
-            !creation_batch_is_read_only_after_add(&serde_json::json!({
-                "command": format!("git worktree add ../task -b task; {sibling}")
-            })),
+            !creation_batch_is_read_only_after_add(
+                &serde_json::json!({
+                    "command": format!("git worktree add ../task -b task; {sibling}")
+                }),
+                crate::ShellEngine::Brush
+            ),
             "accepted {sibling}"
         );
     }
     for sibling in ["echo ready", "pwd", "printf ready"] {
-        assert_eq!(
-            creation_batch_is_read_only_after_add(&serde_json::json!({
-                "command": format!("git worktree add ../task -b task; {sibling}")
-            })),
-            shell_engine() != crate::ShellEngine::SafeSubset,
+        assert!(
+            creation_batch_is_read_only_after_add(
+                &serde_json::json!({
+                    "command": format!("git worktree add ../task -b task; {sibling}")
+                }),
+                crate::ShellEngine::Brush
+            ),
             "builtin identity for {sibling}"
         );
     }

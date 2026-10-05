@@ -19,7 +19,7 @@ pub(super) fn authenticate(path: &OsStr, caveats: &Caveats) -> Result<PathBuf, (
     Ok(resolved)
 }
 
-pub(super) fn bind(source: &str, caveats: &Caveats) -> Result<String, ()> {
+pub(super) fn resolve(caveats: &Caveats) -> Result<PathBuf, ()> {
     // Use the same venv/exec-path/developer-tool selection as shell dispatch.
     // In particular macOS may select the real tool instead of /usr/bin's shim.
     let env = super::shell::venv_env_map();
@@ -28,8 +28,7 @@ pub(super) fn bind(source: &str, caveats: &Caveats) -> Result<String, ()> {
         .map(std::ffi::OsString::from)
         .or_else(|| std::env::var_os("PATH"))
         .ok_or(())?;
-    let trusted = authenticate(&path, caveats)?;
-    pin(source, &trusted)
+    authenticate(&path, caveats)
 }
 
 /// For an already-admitted batch, replace only inspected executable words.

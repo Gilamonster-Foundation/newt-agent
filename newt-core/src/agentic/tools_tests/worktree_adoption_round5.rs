@@ -24,7 +24,10 @@ fn worktree_adoption_round5_git_identity_sweep() {
         ] {
             let source = format!("git worktree add ../task -b task; {program} {suffix}");
             assert!(
-                !creation_batch_is_read_only_after_add(&serde_json::json!({"command": source})),
+                !creation_batch_is_read_only_after_add(
+                    &serde_json::json!({"command": source}),
+                    crate::ShellEngine::Brush
+                ),
                 "{source}"
             );
         }
@@ -34,12 +37,16 @@ fn worktree_adoption_round5_git_identity_sweep() {
             "recognition must fail closed: {source}"
         );
         assert!(
-            !creation_batch_is_read_only_after_add(&serde_json::json!({"command": source})),
+            !creation_batch_is_read_only_after_add(
+                &serde_json::json!({"command": source}),
+                crate::ShellEngine::Brush
+            ),
             "{source}"
         );
     }
     assert!(creation_batch_is_read_only_after_add(
-        &serde_json::json!({"command": "git worktree add ../task -b task; git status"})
+        &serde_json::json!({"command": "git worktree add ../task -b task; git status"}),
+        crate::ShellEngine::Brush
     ));
 }
 
@@ -147,11 +154,10 @@ fn worktree_adoption_round5_lookup_rejects_untrusted_and_relative_paths() {
             "{path}"
         );
     }
-    // Native system Git grounds the same lookup and trust predicate used by
-    // the broker; this performs metadata reads only, never executes the tool.
-    let git = git_identity::authenticate(std::ffi::OsStr::new("/usr/bin:/bin"), &c).unwrap();
-    assert!(git.is_absolute());
-    assert_eq!(git, Path::new("/usr/bin/git").canonicalize().unwrap());
+    // Without the write-root exclusion, unsafe fixture permissions still deny.
+    c.fs_write = Scope::none();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(git_identity::authenticate(temp.path().as_os_str(), &c).is_err());
 }
 
 /// #2733: direct candidate extraction cannot independently admit an impostor.

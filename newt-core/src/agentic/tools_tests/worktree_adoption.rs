@@ -322,15 +322,14 @@ fn worktree_adoption_creation_is_an_execution_boundary() {
         "git worktree add ../task; echo stray > source.rs",
     ] {
         assert!(!creation_batch_is_read_only_after_add(
-            &serde_json::json!({"command":cmd})
+            &serde_json::json!({"command":cmd}),
+            crate::ShellEngine::Brush
         ));
     }
-    assert_eq!(
-        creation_batch_is_read_only_after_add(
-            &serde_json::json!({"command":"git worktree add -b task ../task 2>&1; echo ready; pwd; git branch --show-current"})
-        ),
-        shell_engine() != crate::ShellEngine::SafeSubset
-    );
+    assert!(creation_batch_is_read_only_after_add(
+        &serde_json::json!({"command":"git worktree add -b task ../task 2>&1; echo ready; pwd; git branch --show-current"}),
+        crate::ShellEngine::Brush
+    ));
 }
 
 /// #2733: an injected policy cannot authorize dispatch where its Git metadata
