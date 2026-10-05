@@ -51,10 +51,9 @@ mod tests {
             mode: 0o775,
             chmod_arg: "g-w",
         };
-        let report = ToolTrustReport {
-            lines: vec![hint.render()],
-            hints: vec![hint],
-        };
+        let mut report = ToolTrustReport::default();
+        report.lines.push(hint.render());
+        report.hints.push(hint);
         for (answers, expected) in [
             (&["yes"][..], true),
             (&["no"][..], false),
