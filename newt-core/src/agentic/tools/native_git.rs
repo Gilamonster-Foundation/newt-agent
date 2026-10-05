@@ -2,7 +2,7 @@
 //! Keep the caller's shell source unchanged and preserve the embedded adapter's
 //! destructive-operation confirmations while the command interface migrates.
 
-mod push_command;
+pub(super) mod push_command;
 
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::caveats::{Caveats, CaveatsExt};

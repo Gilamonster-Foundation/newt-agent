@@ -4391,6 +4391,12 @@ async fn execute_authorized_tool(
                 Ok(requests) => requests,
                 Err(error) => return host_return(error),
             };
+            if let Some(policy) = &adopted {
+                if let Some(result) = worktree::branch::execute(policy, cmd, std::path::Path::new(&run_cwd), caveats, &filesystem_requests) {
+                    if let Some(invocation) = invocation { invocation.host(); }
+                    return executed(result);
+                }
+            }
             if let Some(program) = build_shell::build_program(cmd) {
                 // #2636 (round1 finding 3): a build denial is NEVER eligible
                 // for #2628 replay. `build_shell::execute` enforces the
@@ -4476,6 +4482,10 @@ async fn execute_authorized_tool(
             // never publishes; escaped descendants remain a documented residual.
             let mut detach_guard = None;
             if let Some(move_info) = &ref_move {
+                if adopted.as_ref().is_some_and(|policy| policy.protects_branch(&move_info.branch)) {
+                    if let Some(invocation) = invocation { invocation.host(); }
+                    return executed(("capability denied: the original checkout's branch remains read-only".into(), crate::ExecOutcome::Denied));
+                }
                 if let Err(error) =
                     crate::git_hardening::detach_own_head(&move_info.identity, &move_info.old_tip)
                 {
