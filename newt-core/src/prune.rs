@@ -1813,34 +1813,42 @@ fn third(z: u32) -> u32 {
         );
     }
 
-    /// #2638 coverage fix, measured red before items 1/2: an `offset=6000`
-    /// page of the real file lands mid-body of `cap_exit_progress_handoff`
-    /// AND cuts `openai_chat_complete_with_prompt_and_artifacts` (2,300
-    /// lines) partway through — the two cases the fix items target. The
-    /// listed `fn` count must be at least the page's real `fn` count, grep
-    /// method: `^\s*(pub(\(crate\))? )?(async )?fn [A-Za-z_]` over the
-    /// page's own line range (matches the measurement in
-    /// `../pr-2638-r7/measure-2638`).
+    /// #2735: anchor the real page to the same unmatched-delimiter boundary,
+    /// not a line number that changes after unrelated edits. Keep the original
+    /// all-function count contract and check each header's absolute coordinate.
     #[cfg(feature = "ast")]
     #[test]
-    fn an_offset_6000_page_of_the_real_file_lists_at_least_every_real_fn() {
+    fn a_mid_block_page_of_the_real_file_lists_every_real_fn() {
         const MOD_RS: &str = include_str!("agentic/mod.rs");
         let path = "newt-core/src/agentic/mod.rs";
+        let anchor = MOD_RS
+            .find("\nfn strip_trailing_nudge_exchange(")
+            .expect("fixture function");
+        let start = MOD_RS[..anchor]
+            .rfind("\n    ))\n}\n")
+            .expect("preceding unmatched-delimiter tail")
+            + 1;
+        let offset = MOD_RS[..start].bytes().filter(|&b| b == b'\n').count() + 1;
         let page = crate::agentic::tools::output_budget::paginate_read_from(
             path,
             MOD_RS,
-            Some(6000),
+            Some(offset),
             None,
             0,
             None,
         );
+        assert!(
+            page.starts_with("    ))\n}\n"),
+            "fixture must start mid-block"
+        );
         let (next_offset, _) = parse_offset_and_char_offset(&page);
         let last_line = next_offset.map_or(MOD_RS.lines().count(), |n| n - 1);
-        let real_fn_count = MOD_RS
+        let real_fns: Vec<_> = MOD_RS
             .lines()
-            .skip(5999)
-            .take(last_line - 5999)
-            .filter(|l| {
+            .enumerate()
+            .skip(offset - 1)
+            .take(last_line - offset + 1)
+            .filter(|(_, l)| {
                 let t = l.trim_start();
                 let indent = l.len() - t.len();
                 indent <= 8
@@ -1854,16 +1862,17 @@ fn third(z: u32) -> u32 {
                     .iter()
                     .any(|kw| t.starts_with(kw))
             })
-            .count();
+            .collect();
+        let real_fn_count = real_fns.len();
         assert!(
             real_fn_count > 0,
             "fixture page must contain real fns to compare against"
         );
 
-        let line = summarize_one("read_file", json!({"path": path, "offset": 6000}), &page);
+        let line = summarize_one("read_file", json!({"path": path, "offset": offset}), &page);
         assert!(
             line.contains("— outline"),
-            "an offset=6000 page of the real file must get an outline: {line}"
+            "a mid-block page of the real file must get an outline: {line}"
         );
         let listed_fn_count = line
             .lines()
@@ -1873,6 +1882,27 @@ fn third(z: u32) -> u32 {
             listed_fn_count >= real_fn_count,
             "the outline must list at least every real fn on the page — got {listed_fn_count}, \
              real count {real_fn_count} (last_line={last_line}): {line}"
+        );
+        for (index, header) in real_fns {
+            let header = header.trim_end_matches(['{', ';']).trim();
+            assert!(
+                line.lines().any(|entry| {
+                    entry.split_once('\t').is_some_and(|(span, text)| {
+                        span.trim()
+                            .split('-')
+                            .next()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            == Some(index + 1)
+                            && text == header
+                    })
+                }),
+                "missing function at {}: {header}\n{line}",
+                index + 1
+            );
+        }
+        assert!(
+            line.contains("-…\tasync fn openai_chat_complete_with_prompt_and_artifacts("),
+            "the trailing cut definition must remain open-ended: {line}"
         );
     }
 
