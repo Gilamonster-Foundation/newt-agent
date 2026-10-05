@@ -1,5 +1,7 @@
 //! #2718: final-answer facts from the existing verification ledger. Directory
 //! paths are locators only; freshness uses conclude's content-addressed chain.
+mod pull_requests;
+
 use super::*;
 use std::path::{Path, PathBuf};
 
@@ -160,6 +162,13 @@ fn cargo_claim(text: &str) -> bool {
 }
 
 impl VerificationLedger {
+    pub(crate) fn record_command_directory(&mut self, directory: &Path) {
+        let directory = crate::agentic::lexical_normalize(directory);
+        if self.claim_directories.len() < 40 && !self.claim_directories.contains(&directory) {
+            self.claim_directories.push(directory);
+        }
+    }
+
     pub(crate) async fn observe_routed(
         &mut self,
         name: &str,
@@ -197,10 +206,7 @@ impl VerificationLedger {
             None
         };
         if let Some(dir) = directory {
-            let dir = super::super::lexical_normalize(&dir);
-            if self.claim_directories.len() < 40 && !self.claim_directories.contains(&dir) {
-                self.claim_directories.push(dir);
-            }
+            self.record_command_directory(&dir);
         }
     }
 
