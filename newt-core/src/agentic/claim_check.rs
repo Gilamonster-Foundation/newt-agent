@@ -57,7 +57,7 @@ pub(crate) fn path_claims(text: &str) -> Vec<String> {
 }
 
 /// #2718: proposed files in a remaining-work list are not existence claims.
-fn asserted_path_claims(text: &str) -> Vec<String> {
+pub(super) fn asserted_claim_lines(text: &str) -> Vec<&str> {
     let mut planning_level = None;
     let mut claims = Vec::new();
     for line in text.lines() {
@@ -82,6 +82,14 @@ fn asserted_path_claims(text: &str) -> Vec<String> {
         {
             continue;
         }
+        claims.push(line);
+    }
+    claims
+}
+
+fn asserted_path_claims(text: &str) -> Vec<String> {
+    let mut claims = Vec::new();
+    for line in asserted_claim_lines(text) {
         for claim in path_claims(line) {
             if !claims.contains(&claim) {
                 claims.push(claim);
@@ -172,7 +180,13 @@ fn workspace_claim_resolver(
             return norm.starts_with(&root).then(|| exists(&norm));
         }
         let mut in_workspace = false;
-        for base in std::iter::once(&root).chain(extra_bases.iter()) {
+        // An observed file parent can be deeper than the citation's base.
+        // Try ancestor bases only when the resolved candidate stays inside
+        // the already observed/read-authorized root.
+        for base in root
+            .ancestors()
+            .chain(extra_bases.iter().map(|p| p.as_path()))
+        {
             let norm = super::lexical_normalize(&base.join(p));
             if !norm.starts_with(&root) {
                 continue;
@@ -705,7 +719,7 @@ const CLAUSE_ABBREVIATIONS: [&str; 6] = ["e.g.", "i.e.", "etc.", "vs.", "mr.", "
 /// a known abbreviation? Checking the token's END (not merely whether it
 /// CONTAINS a boundary char anywhere) already excludes a path's embedded
 /// extension dot, since that dot is not the token's last character.
-fn ends_a_clause(tok: &str) -> bool {
+pub(super) fn ends_a_clause(tok: &str) -> bool {
     tok.ends_with(CLAUSE_BOUNDARY)
         && !CLAUSE_ABBREVIATIONS.contains(&tok.to_ascii_lowercase().as_str())
 }
@@ -1812,5 +1826,22 @@ mod issue_2718_tests {
         );
         assert!(denied.contains("unverified"));
         assert!(!denied.contains("not found"));
+    }
+}
+
+#[cfg(test)]
+mod issue_2741_tests {
+    use super::*;
+
+    /// #2741: observing an absolute file path supplies its containing directory,
+    /// so a later repository-relative citation must not double that prefix.
+    #[test]
+    fn issue_2741_repository_relative_citation_from_observed_file_parent() {
+        let mut resolve = workspace_claim_resolver("/task/newt-core/src", |p| {
+            p == std::path::Path::new("/task/newt-core/src/loop.rs")
+        });
+        assert_eq!(resolve("newt-core/src/loop.rs"), Some(true));
+        assert_eq!(resolve("src/loop.rs"), Some(true));
+        assert_ne!(resolve("newt-tui/src/loop.rs"), Some(true));
     }
 }
