@@ -4,7 +4,14 @@ use crate::worktree_adoption::{AdoptedWorktree, Creation};
 use crate::Caveats;
 use std::path::{Path, PathBuf};
 
-use super::native_git::{is_git, literal};
+use super::native_git::{invocation, is_git, literal};
+
+/// Match the actual Git subcommand, never words appearing in path operands.
+fn worktree_add_args(words: &[String]) -> Option<&[String]> {
+    let (verb, args, _) = invocation(words).ok()?;
+    let (action, args) = args.split_first()?;
+    (verb == "worktree" && action == "add").then_some(args)
+}
 
 fn creation(
     name: &str,
@@ -19,7 +26,6 @@ fn creation(
     let cwd = resolve_exec_cwd(workspace, args.get("cwd").and_then(|v| v.as_str()));
     let cwd = resolve_exec_cwd(&cwd, cd.as_deref());
     let inspection = agent_bridle::inspect_shell(&cmd).ok()?;
-    let mut target = None;
     for command in inspection.commands {
         if command.program.as_deref() == Some("cd") {
             return None;
@@ -32,6 +38,9 @@ fn creation(
             .iter()
             .map(|s| literal(s))
             .collect::<Option<Vec<_>>>()?;
+        let Some(add_args) = worktree_add_args(&words) else {
+            continue;
+        };
         let mut args = words.iter().skip(1);
         let mut git_cwd = PathBuf::from(&cwd);
         let mut word = args.next()?;
@@ -39,9 +48,10 @@ fn creation(
             git_cwd = git_cwd.join(args.next()?);
             word = args.next()?;
         }
-        if word != "worktree" || args.next()?.as_str() != "add" {
-            continue;
+        if word != "worktree" {
+            return None; // Only the supported -C selector may change Git's cwd.
         }
+        let mut args = add_args.iter();
         let mut destination = None;
         while let Some(word) = args.next() {
             match word.as_str() {
@@ -61,18 +71,17 @@ fn creation(
                 }
             }
         }
-        if target.is_some() {
-            return None;
-        }
         // The actual creation repository must also be this session's original.
         let candidate =
             Creation::before(Path::new(workspace), &git_cwd.join(destination?), caveats)?;
         if !candidate.matches_source(&git_cwd) {
             return None;
         }
-        target = Some(candidate);
+        // Once found, the whole batch must pass the mutation check below.
+        // A later cd/dynamic command must not erase this execution boundary.
+        return Some(candidate);
     }
-    target
+    None
 }
 
 // Adoption is an execution boundary: a compound creation must not write the
@@ -85,7 +94,8 @@ fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
     let Ok(inspection) = agent_bridle::inspect_shell(&command) else {
         return false;
     };
-    inspection.commands.iter().all(|c| {
+    let mut additions = 0;
+    let safe = inspection.commands.iter().all(|c| {
         if c.redirects.iter().any(redirect_has_effect) {
             return false;
         }
@@ -105,19 +115,24 @@ fn creation_batch_is_read_only_after_add(args: &serde_json::Value) -> bool {
             .and_then(|p| p.to_str())
         {
             Some(program) if is_git(program) => {
-                args.windows(2).any(|pair| pair == ["worktree", "add"])
-                    || matches!(
+                if worktree_add_args(&words).is_some() {
+                    additions += 1;
+                    true
+                } else {
+                    matches!(
                         args.as_slice(),
                         ["branch", "--show-current"]
                             | ["worktree", "list"]
                             | ["status"]
                             | ["status", "--short"]
                     )
+                }
             }
             Some("echo" | "printf" | "head" | "tail" | "pwd") => true,
             _ => false,
         }
-    })
+    });
+    safe && additions == 1
 }
 
 struct Guard<'p, 'g> {
@@ -327,3 +342,7 @@ pub(super) async fn execute(
 #[cfg(test)]
 #[path = "../tools_tests/worktree_adoption.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tools_tests/worktree_adoption_round2.rs"]
+mod round2_tests;

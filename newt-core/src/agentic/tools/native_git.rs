@@ -866,7 +866,7 @@ pub(super) fn literal(word: &str) -> Option<String> {
 
 /// Find the native verb without translating argv. Repository/config selectors
 /// remain usable for reads, but mutation cannot rely on the caller's cwd then.
-fn invocation(argv: &[String]) -> Result<(&str, &[String], bool), String> {
+pub(super) fn invocation(argv: &[String]) -> Result<(&str, &[String], bool), String> {
     let mut index = 1;
     let mut same_repository = true;
     while let Some(word) = argv.get(index) {

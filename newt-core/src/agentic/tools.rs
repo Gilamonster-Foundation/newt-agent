@@ -4368,7 +4368,7 @@ async fn execute_authorized_tool(
                         cmd,
                         &program,
                         &run_cwd,
-                        workspace,
+                        build_workspace,
                         caveats,
                         &filesystem_requests,
                         &mut permission_gate,
@@ -4684,7 +4684,7 @@ async fn execute_authorized_tool(
                     let (program, argv) = build_check_argv(&joined);
                     executed(
                         run_confined_build_lane(
-                            workspace,
+                            build_workspace,
                             effective_path,
                             program,
                             argv,
@@ -4815,7 +4815,7 @@ async fn execute_authorized_tool(
                 ),
             };
             let (text, outcome) = run_confined_build_lane(
-                workspace,
+                build_workspace,
                 &effective_dir,
                 program,
                 rest.to_vec(),
