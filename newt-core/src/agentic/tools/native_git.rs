@@ -756,7 +756,7 @@ fn ensure_net_granted(
     }
 }
 
-fn is_git(program: &str) -> bool {
+pub(super) fn is_git(program: &str) -> bool {
     let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
     name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
 }
@@ -852,7 +852,7 @@ pub(super) fn windows_appcontainer_native_git_refusal(
 
 /// Reuse Bridle's static executable-word resolution for a single literal
 /// argument. No shell is run; expansions, multiple words, and redirects fail.
-fn literal(word: &str) -> Option<String> {
+pub(super) fn literal(word: &str) -> Option<String> {
     let parsed = inspect_shell(word).ok()?;
     let command = parsed.commands.first()?;
     (parsed.commands.len() == 1
