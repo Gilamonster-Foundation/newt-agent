@@ -42,7 +42,13 @@ pub fn maybe_run(color: bool) -> anyhow::Result<()> {
     }
     if first_run_mode() == FirstRun::Defaults {
         // CI / piped / no terminal: the original silent probe path,
-        // immediately.
+        // immediately. Diagnose permissions without asking or changing them.
+        let report = newt_core::git_staging::tool_diagnostics::diagnose_tool_paths();
+        if !report.hints.is_empty() {
+            for line in report.lines {
+                println!("{line}");
+            }
+        }
         return run_setup(color, &config_path);
     }
     print_first_run_banner(color);
