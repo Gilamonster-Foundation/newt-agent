@@ -3948,6 +3948,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
+            let governed_pr = std::sync::OnceLock::new();
+            let command_directory = std::sync::OnceLock::new();
             let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
             // #727: intercept the read-only budget self-read here. Its answer is
             // dynamic per-turn loop state — the num_ctx input ceiling and the
@@ -4041,6 +4043,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        governed_pr: Some(&governed_pr),
+                        command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
                     },
@@ -4108,6 +4112,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            if let Some(outcome) = governed_pr.get() {
+                verification.record_pr_outcome(outcome);
+            }
+            if ok {
+                if let Some(directory) = command_directory.get() {
+                    verification.record_command_directory(directory);
+                }
+            }
             verification
                 .observe_routed(
                     name,
@@ -6303,6 +6315,7 @@ fn finalize_final_text(
         claim_check::collect_git_evidence(workspace, read_scope, head_before).as_ref(),
     );
     let text = verification.annotate_cargo_claim(text);
+    let text = verification.annotate_pr_claim(text);
     redact_model_facing(disclosure, text)
 }
 
@@ -8858,6 +8871,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
+            let governed_pr = std::sync::OnceLock::new();
+            let command_directory = std::sync::OnceLock::new();
             let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // OpenAI-compatible endpoints do not receive `num_ctx`, but a local
@@ -8939,6 +8954,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        governed_pr: Some(&governed_pr),
+                        command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
                     },
@@ -9014,6 +9031,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            if let Some(outcome) = governed_pr.get() {
+                verification.record_pr_outcome(outcome);
+            }
+            if ok {
+                if let Some(directory) = command_directory.get() {
+                    verification.record_command_directory(directory);
+                }
+            }
             verification
                 .observe_routed(
                     name,
@@ -11368,6 +11393,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
+            let governed_pr = std::sync::OnceLock::new();
+            let command_directory = std::sync::OnceLock::new();
             let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
             // #727: intercept the read-only budget self-read (mirrors the
             // OpenAI path — `num_ctx` never rides this wire either).
@@ -11443,6 +11470,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        governed_pr: Some(&governed_pr),
+                        command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
                     },
@@ -11515,6 +11544,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            if let Some(outcome) = governed_pr.get() {
+                verification.record_pr_outcome(outcome);
+            }
+            if ok {
+                if let Some(directory) = command_directory.get() {
+                    verification.record_command_directory(directory);
+                }
+            }
             verification
                 .observe_routed(
                     name,
@@ -13067,6 +13104,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
+            let governed_pr = std::sync::OnceLock::new();
+            let command_directory = std::sync::OnceLock::new();
             let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // The Responses loop has no PromptTracker, so `used` is the chars/4
@@ -13162,6 +13201,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        governed_pr: Some(&governed_pr),
+                        command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
                     },
@@ -13235,6 +13276,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            if let Some(outcome) = governed_pr.get() {
+                verification.record_pr_outcome(outcome);
+            }
+            if ok {
+                if let Some(directory) = command_directory.get() {
+                    verification.record_command_directory(directory);
+                }
+            }
             verification
                 .observe_routed(
                     name,

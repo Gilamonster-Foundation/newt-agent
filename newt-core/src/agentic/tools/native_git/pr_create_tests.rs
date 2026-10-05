@@ -89,6 +89,7 @@ fn issue_2740_pr_create_refusals_are_actionable_and_safe() {
             repo.path(),
             &with_net(Scope::only([])),
             &mut Some(&mut gate),
+            None,
         );
         assert!(out.contains(reason), "{source}: {out}");
         assert!(out.contains("gh pr create --base <default-branch> --head <current-branch> --title '<title>' --body '<body>'"), "{out}");
@@ -208,6 +209,7 @@ fn issue_2740_unknown_default_and_denied_approval_explain_refusal() {
         repo.path(),
         &with_net(Scope::only([])),
         &mut Some(&mut gate),
+        None,
     );
     assert!(
         out.contains("an operator must approve PR creation"),
@@ -225,6 +227,7 @@ fn issue_2740_unknown_default_and_denied_approval_explain_refusal() {
         repo.path(),
         &with_net(Scope::only([])),
         &mut Some(&mut gate),
+        None,
     );
     assert!(
         out.contains("repository default branch is unknown"),
@@ -264,6 +267,7 @@ fn issue_2740_ambiguous_or_dynamic_commands_are_refused() {
             repo.path(),
             &with_net(Scope::only([])),
             &mut Some(&mut gate),
+            None,
         );
         assert!(out.contains("refused:"), "{source}: {out}");
         assert!(out.contains(PR_CREATE_RETRY), "{source}: {out}");

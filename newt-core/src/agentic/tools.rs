@@ -3619,6 +3619,8 @@ async fn execute_authorized_tool(
         live_tool_output,
         completed_spill_renderer: _,
         execution,
+        governed_pr,
+        command_directory,
         routed_to: routed_to_slot,
         pending_rerun,
     } = collab;
@@ -4335,6 +4337,9 @@ async fn execute_authorized_tool(
             // `cwd` arg — it's the more specific, in-command intent).
             let command_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
             let run_cwd = resolve_exec_cwd(&command_cwd, cd_path.as_deref());
+            if let Some(slot) = command_directory {
+                let _ = slot.set(std::path::PathBuf::from(&run_cwd));
+            }
             // issue-1188: `git push` / `gh pr create` cannot reach the forge
             // from the confined child at all (#2619 narrows any host-scoped
             // net grant to `net: none` for spawned children on Linux — the
@@ -4359,6 +4364,7 @@ async fn execute_authorized_tool(
                     std::path::Path::new(&run_cwd),
                     caveats,
                     &mut permission_gate,
+                    governed_pr,
                 ));
             }
             if let Err(reason) = native_git::preflight(

@@ -736,6 +736,8 @@ pub struct VerificationLedger {
     entries: Vec<Observed>,
     /// #2718: observed directory locators, not identities or additional grants.
     claim_directories: Vec<std::path::PathBuf>,
+    /// #2741: governed creation URL locators, retained only for this turn.
+    created_prs: Vec<String>,
     /// The instruction checks are detected against, so only a check's own pass
     /// pays for a tree hash.
     task: String,
@@ -759,6 +761,7 @@ impl VerificationLedger {
             result_aware,
             checks: None,
             claim_directories: Vec::new(),
+            created_prs: Vec::new(),
         }
     }
 
