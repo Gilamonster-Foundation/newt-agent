@@ -2053,6 +2053,17 @@ fn execute_request_permissions(
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
     let reason = args["reason"].as_str().unwrap_or("").trim();
+    // #2750: an exec grant cannot clear the session's worktree guard. Keep
+    // this operator command out of the capability prompt rather than issuing
+    // a misleading "granted" receipt for an action that was never performed.
+    if target == "worktree-lift" || target == "/permissions worktree-lift" {
+        return (
+            None,
+            None,
+            "request_permissions: worktree-lift is an operator command, not a capability target. The operator must use /permissions worktree-lift; no permission was granted and no worktree protection was lifted.".into(),
+        );
+    }
+
     let Some(kind) = parse_capability(capability) else {
         return (
             None,

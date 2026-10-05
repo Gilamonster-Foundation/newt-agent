@@ -216,3 +216,15 @@ Version/help probes do not extend a following search. A positive per-call
 override still narrows a build shell to the requested, capped budget.
 `build_exec` and `lifecycle` with `action=build` retain their own budgets. Permission and confinement checks
 are independent of time-budget selection.
+
+## Worktree adoption with ambient execution
+
+Verified task-worktree creation protects the original checkout in confined
+sessions. With OCAP explicitly disabled (`--yolo`, including
+`--full-access --yolo`), adoption does not arm that protection: the operator
+receives a notice and existing permissions still apply. Full filesystem grants
+alone do not disable protection when execution remains confined.
+
+To lift an armed guard, the operator uses `/permissions worktree-lift`.
+`request_permissions` rejects that reserved target; an executable grant cannot
+perform the operator command.
