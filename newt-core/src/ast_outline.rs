@@ -5,6 +5,9 @@
 //! [`outline_rust`] instead of the plain one-liner when it can, and falls
 //! back to the one-liner otherwise — never to a regex approximation.
 
+mod whole_file;
+pub(crate) use whole_file::whole_file_outline;
+
 use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
