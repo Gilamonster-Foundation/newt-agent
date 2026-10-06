@@ -1,5 +1,6 @@
-//! Session-only worktree write attenuation (#2733). Paths are runtime locators,
-//! never persisted identities or additional authority.
+//! Session worktree adoption and original-checkout protection (#2733, #2757).
+//! Explicit destination approval can relocate workspace access for the task;
+//! paths remain runtime locators, never persisted identities.
 use crate::{Caveats, Scope};
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,7 @@ pub(crate) struct AdoptedWorktree {
     common: PathBuf,
     admin: PathBuf,
     protected_branch: Option<String>,
+    relocate_workspace_access: bool,
 }
 
 fn resolved(path: &Path) -> Option<PathBuf> {
@@ -39,6 +41,24 @@ fn overlap(a: &Path, b: &Path) -> bool {
 }
 
 impl AdoptedWorktree {
+    /// A verified, approved workspace switch carries the original workspace's
+    /// access to this task only. Do not replay the one-shot grant or restore an
+    /// axis removed by a read-only/deny-all caller. Normal gate ceilings still
+    /// apply after this projection; attenuation itself remains narrowing-only.
+    pub(crate) fn task_authority(&self, base: &Caveats) -> Caveats {
+        let mut out = base.clone();
+        if self.relocate_workspace_access {
+            for scope in [&mut out.fs_read, &mut out.fs_write] {
+                if crate::caveats::permits_path(scope, &self.original.to_string_lossy()) {
+                    if let Scope::Only(roots) = scope {
+                        roots.insert(self.worktree.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) fn valid(&self, caveats: &Caveats) -> bool {
         self.worktree.canonicalize().ok().as_ref() == Some(&self.worktree)
             && crate::git_staging::HeldRoots::bind(&caveats.fs_read)
@@ -121,16 +141,65 @@ pub(crate) struct Creation {
     common: PathBuf,
     read: Scope<String>,
     protected_branch: Option<String>,
+    relocate_workspace_access: bool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    parent: agent_bridle_fdguard::GrantedRoot,
 }
 impl Creation {
-    /// Creating an absent directory needs write authority on its existing
-    /// parent. A kernel grant naming the absent child alone cannot create it.
-    pub(crate) fn creation_write_root(&self) -> &Path {
-        self.destination
-            .ancestors()
-            .find(|path| path.is_dir())
-            .unwrap_or(&self.destination)
+    pub(crate) fn destination(&self) -> &Path {
+        &self.destination
     }
+
+    /// Only after approval: create the destination through its held parent so
+    /// the child fence can bind the destination itself, never its whole parent.
+    pub(crate) fn prepare(&mut self, authority: &Caveats) -> Result<(), String> {
+        if ![&authority.fs_read, &authority.fs_write]
+            .iter()
+            .all(|scope| crate::caveats::permits_path(scope, &self.destination.to_string_lossy()))
+        {
+            return Err("worktree destination needs read and write approval".into());
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let current = agent_bridle_fdguard::GrantedRoot::acquire(self.parent.provenance())
+                .map_err(|e| e.to_string())?;
+            if current.identity() != self.parent.identity() {
+                return Err("worktree destination parent changed during approval".into());
+            }
+            if resolved(&self.destination).as_ref() != Some(&self.destination) {
+                return Err("worktree destination changed during approval".into());
+            }
+            // If the existing parent is already readable/writable, Git can
+            // create the directory itself, preserving its failure cleanup.
+            // Otherwise materialize only the approved path so the child needs
+            // no parent grant, including when several components are missing.
+            let parent_authorized = [&authority.fs_read, &authority.fs_write]
+                .iter()
+                .all(|scope| {
+                    crate::caveats::permits_path(scope, &self.parent.provenance().to_string_lossy())
+                });
+            if !parent_authorized {
+                let directory = crate::fs_cap::WorkspaceDir::from_granted_root(&self.parent)
+                    .map_err(|e| e.to_string())?;
+                let relative = self
+                    .destination
+                    .strip_prefix(self.parent.provenance())
+                    .map_err(|e| e.to_string())?;
+                directory
+                    .create_dir_all_nofollow(relative)
+                    .map_err(|e| e.to_string())?;
+                if self.destination.canonicalize().ok().as_ref() != Some(&self.destination) {
+                    return Err("worktree destination changed during preparation".into());
+                }
+            }
+            self.read = authority.fs_read.clone();
+            self.relocate_workspace_access = true;
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        Err("safe worktree destination preparation is unavailable on this platform".into())
+    }
+
     pub(crate) fn before(original: &Path, destination: &Path, caveats: &Caveats) -> Option<Self> {
         let original = original.canonicalize().ok()?;
         let original = original
@@ -154,12 +223,23 @@ impl Creation {
         } else {
             return None;
         };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let parent = agent_bridle_fdguard::GrantedRoot::acquire(
+            destination
+                .parent()?
+                .ancestors()
+                .find(|path| path.is_dir())?,
+        )
+        .ok()?;
         Some(Self {
             original,
             destination,
             common,
             read: caveats.fs_read.clone(),
             protected_branch,
+            relocate_workspace_access: false,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            parent,
         })
     }
     pub(crate) fn matches_source(&self, cwd: &Path) -> bool {
@@ -192,6 +272,7 @@ impl Creation {
             common,
             admin,
             protected_branch: self.protected_branch,
+            relocate_workspace_access: self.relocate_workspace_access,
         })
     }
 }

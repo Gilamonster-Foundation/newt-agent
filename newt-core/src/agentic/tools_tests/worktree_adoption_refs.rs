@@ -232,7 +232,7 @@ async fn adoption_refs_external_destination_prompts_before_execution() {
     assert!(
         gate.0
             .iter()
-            .any(|r| r.kind == DenialKind::FsWrite && Path::new(&r.target) == temp.path()),
+            .any(|r| r.kind == DenialKind::FsWrite && Path::new(&r.target) == target),
         "missing destination prompt: {text}"
     );
     assert_eq!(outcome, Some(ExecOutcome::Denied), "{text}");
@@ -240,7 +240,7 @@ async fn adoption_refs_external_destination_prompts_before_execution() {
     assert!(session.snapshot().is_none());
 }
 
-/// #2748: permission approval adds only the destination's existing parent and lets
+/// #2757: permission approval adds only the exact prepared destination and lets
 /// the same preflighted creation complete for sibling and separate temp roots.
 #[tokio::test]
 async fn adoption_refs_approved_external_destination_is_adopted() {
@@ -304,7 +304,7 @@ async fn adoption_refs_approved_external_destination_is_adopted() {
         .await;
         assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
         assert_eq!(gate.0.len(), 1, "{text}");
-        assert_eq!(Path::new(&gate.0[0].target), target.parent().unwrap());
+        assert_eq!(Path::new(&gate.0[0].target), target);
         assert_eq!(
             session.snapshot().unwrap().worktree,
             target.canonicalize().unwrap()

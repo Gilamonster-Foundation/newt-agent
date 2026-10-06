@@ -8,6 +8,7 @@ use super::native_git::{invocation, is_git as resembles_git, literal};
 pub(super) mod branch;
 #[path = "worktree_git.rs"]
 mod git_identity;
+mod prepare;
 
 /// Match the actual Git subcommand, never words appearing in path operands.
 fn worktree_add_args(words: &[String]) -> Option<&[String]> {
@@ -391,6 +392,33 @@ pub(super) async fn execute(
     let bypass = ocap_disabled();
     let session = collab.worktree_session;
     let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);
+    let mut collab = collab;
+    // Project the approved workspace switch before refreshing current ceilings.
+    // Native file tools must see the same limits as the shell; never re-project
+    // after a gate has removed an axis or refused the current policy.
+    let task_authority = if let Some(policy) = &policy {
+        let projected = policy.attenuate(&policy.task_authority(caveats));
+        let current = match collab.permission_gate.as_deref_mut() {
+            Some(gate) => match gate.refresh_caveats(&projected) {
+                PermissionDecision::Allow(current) => current,
+                PermissionDecision::Deny => {
+                    if let Some(invocation) = collab.invocation {
+                        invocation.host();
+                    }
+                    if let Some(slot) = collab.execution {
+                        let _ = slot.set(crate::ExecOutcome::Denied);
+                    }
+                    return "capability denied: current permissions refuse task worktree access"
+                        .into();
+                }
+            },
+            None => projected,
+        };
+        Some(policy.attenuate(&current))
+    } else {
+        None
+    };
+    let caveats = task_authority.as_ref().unwrap_or(caveats);
     let mut normalized =
         shell::command_args_with_default_cwd(name, args, workspace, collab.default_command_cwd)
             .unwrap_or(std::borrow::Cow::Borrowed(args));
@@ -418,42 +446,39 @@ pub(super) async fn execute(
         };
         return format!("capability denied: cannot verify this worktree creation and its surrounding commands; run `git worktree add -b <new-branch> <path> [<start>]` as a standalone literal command in the original checkout{protection}. Do not create the branch in the original checkout first; -b creates it for the new worktree");
     };
-    let candidate = candidate.map(|(candidate, source)| {
+    let mut candidate = candidate.map(|(candidate, source)| {
         normalized.to_mut()["command"] = source.into();
-        // #2748: Git's destination is known before execution. Feed it through
-        // the existing manifest preflight instead of waiting for kernel EACCES.
-        // An absent destination requires its existing parent, not a grant on
-        // the nonexistent child. The prompt names that real scope explicitly.
-        let destination = candidate
-            .creation_write_root()
-            .to_string_lossy()
-            .into_owned();
-        if !crate::caveats::permits_path(&caveats.fs_write, &destination) {
-            let manifest = normalized
-                .to_mut()
-                .as_object_mut()
-                .expect("command arguments");
-            let writes = manifest
-                .entry("fs_write")
-                .or_insert_with(|| serde_json::json!([]));
-            if let Some(writes) = writes.as_array_mut() {
-                if !writes
-                    .iter()
-                    .any(|value| value.as_str() == Some(&destination))
-                {
-                    writes.push(destination.into());
-                }
-            }
-        }
         candidate
     });
+    let creation_authority = if let Some(candidate) = candidate.as_mut() {
+        match prepare::creation(
+            candidate,
+            &normalized,
+            workspace,
+            caveats,
+            &mut collab.permission_gate,
+        ) {
+            Ok(authority) => Some(authority),
+            Err(reason) => {
+                if let Some(invocation) = collab.invocation {
+                    invocation.host();
+                }
+                if let Some(slot) = collab.execution {
+                    let _ = slot.set(crate::ExecOutcome::Denied);
+                }
+                return format!("capability denied: {reason}");
+            }
+        }
+    } else {
+        None
+    };
+    let caveats = creation_authority.as_ref().unwrap_or(caveats);
     let args = if candidate.is_some() {
         normalized.as_ref()
     } else {
         args
     };
     let execution = collab.execution;
-    let mut collab = collab;
     let mut result = if let Some(policy) = &policy {
         let refuse_git = name == "git"
             && !matches!(
@@ -580,3 +605,7 @@ mod fullaccess_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tools_tests/worktree_adoption_refs.rs"]
 mod refs_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tools_tests/worktree_adoption_sibling.rs"]
+mod sibling_tests;
