@@ -226,6 +226,7 @@ fn request_user_input_is_a_real_tool_not_a_phantom() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     let names: Vec<&str> = defs
         .as_array()

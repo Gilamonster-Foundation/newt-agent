@@ -58,6 +58,7 @@ fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     let names: Vec<&str> = merged
         .as_array()
@@ -176,6 +177,7 @@ fn advertised_set_matches_all_tool_names_both_directions() {
         true,
         true,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     let advertised: std::collections::HashSet<&str> = all
         .as_array()
@@ -245,6 +247,7 @@ fn save_note_advertised_only_with_a_sink() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(!names(&without).contains(&"save_note"));
     // … but a sink advertises it.
@@ -263,6 +266,7 @@ fn save_note_advertised_only_with_a_sink() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(names(&with).contains(&"save_note"), "got: {with}");
 }
@@ -296,6 +300,7 @@ fn recall_advertised_only_with_a_source() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(!names(&without).contains(&"recall"));
     let with = merged_tool_definitions(
@@ -313,6 +318,7 @@ fn recall_advertised_only_with_a_source() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(names(&with).contains(&"recall"), "got: {with}");
     // The two gates are independent: both on advertises both.
@@ -331,6 +337,7 @@ fn recall_advertised_only_with_a_source() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(names(&both).contains(&"save_note"));
     assert!(names(&both).contains(&"recall"));
@@ -366,6 +373,7 @@ fn memory_fetch_advertised_only_with_a_source() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(!names(&without).contains(&"memory_fetch"));
     // Flag on → advertised.
@@ -384,6 +392,7 @@ fn memory_fetch_advertised_only_with_a_source() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
     // Independent of the save_note / recall gates: all three on lists all.
@@ -402,6 +411,7 @@ fn memory_fetch_advertised_only_with_a_source() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(names(&all).contains(&"save_note"));
     assert!(names(&all).contains(&"recall"));
@@ -435,6 +445,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(names(&with).contains(&"git"), "with_git advertises git");
     let without = merged_tool_definitions(
@@ -452,6 +463,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(!names(&without).contains(&"git"), "no git without the gate");
     // #479: the /team toggle advertises both crew tools, and only then.
@@ -470,6 +482,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(
         names(&team).contains(&"crew") && names(&team).contains(&"compose_roster"),
@@ -495,6 +508,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     for t in ["state_set", "state_get", "state_clear"] {
         assert!(
@@ -523,6 +537,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(
         names(&code).contains(&"code_search"),
@@ -549,6 +564,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     for t in ["experience_record", "experience_recall"] {
         assert!(names(&exp).contains(&t), "{t} advertised with_experiential");
@@ -575,6 +591,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     for t in ["update_plan", "plan_get"] {
         assert!(names(&sched).contains(&t), "{t} advertised with_scheduled");
@@ -605,6 +622,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         true,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(
         !names(&plan_control_only).contains(&"enter_plan_mode"),
@@ -629,6 +647,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         true,
         true,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(
         !names(&active_plan_control).contains(&"enter_plan_mode"),
@@ -653,6 +672,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         true,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(
         names(&plan_ready_inactive).contains(&"enter_plan_mode"),
@@ -677,6 +697,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         true,
         true,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     for t in ["enter_plan_mode", "exit_plan_mode"] {
         assert!(
@@ -701,6 +722,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(
         names(&operating_mode).contains(&"select_operating_mode"),
@@ -714,4 +736,30 @@ fn git_tool_advertised_only_with_the_presence_gate() {
         "select_operating_mode",
         &serde_json::json!({})
     ));
+}
+
+/// #2775: the catalog must name the selected dialect on every platform, using
+/// injected routing rather than the machine running the test.
+#[test]
+fn shell_dialect_2775_catalog_matches_injected_route() {
+    for (host_bypass, windows) in [(true, true), (true, false), (false, true), (false, false)] {
+        let sentence = super::shell::shell_dialect_sentence(host_bypass, windows);
+        let defs = crate::agentic::tools::catalog::tool_definitions_with_dialect(
+            Default::default(),
+            sentence,
+        );
+        let description = defs[0]["function"]["description"].as_str().unwrap();
+        assert!(
+            description.contains(sentence),
+            "{host_bypass}/{windows}: {description}"
+        );
+        if host_bypass && windows {
+            assert!(description.contains("cmd.exe /C"));
+            assert!(description.contains("%ERRORLEVEL%"));
+            assert!(description.contains("`;` and `$?` are not supported"));
+        } else {
+            assert!(description.contains("POSIX"));
+            assert!(!description.contains("cmd.exe"));
+        }
+    }
 }

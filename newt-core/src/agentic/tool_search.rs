@@ -354,6 +354,7 @@ mod tests {
             true,
             true,
             Default::default(),
+            crate::agentic::shell_dialect_sentence(false, false),
         )
     }
 

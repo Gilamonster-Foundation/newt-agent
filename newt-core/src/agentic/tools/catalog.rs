@@ -12,17 +12,32 @@ pub fn tool_definitions() -> serde_json::Value {
 pub(crate) fn tool_definitions_with_budget(
     command_budget: crate::RunCommandBudget,
 ) -> serde_json::Value {
+    tool_definitions_with_dialect(
+        command_budget,
+        super::shell::shell_dialect_sentence(false, false),
+    )
+}
+
+pub(crate) fn tool_definitions_with_dialect(
+    command_budget: crate::RunCommandBudget,
+    shell_dialect: &str,
+) -> serde_json::Value {
+    let shell_dialect = if shell_dialect.is_empty() {
+        super::shell::shell_dialect_sentence(false, false)
+    } else {
+        shell_dialect
+    };
     serde_json::json!([
         {
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": format!("{} {}", "Run a command in the workspace shell and return its output and exit status. \
+                "description": format!("{} {} {}", "Run a command in the workspace shell and return its output and exit status. \
                                 Use ordinary commands, including git, with their normal arguments. \
                                 File access, execution, and networking are governed by the session's \
                                 OCAP grants. Needed authority is approved before execution. \
                                 Optional fs_read/fs_write arrays declare additional absolute paths \
-                                needed by this invocation.", super::shell::run_command_limit_sentence(command_budget)),
+                                needed by this invocation.", super::shell::run_command_limit_sentence(command_budget), shell_dialect),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -365,8 +380,9 @@ pub(crate) fn merged_tool_definitions(
     with_plan_mode_control: bool,
     with_plan_mode_active: bool,
     command_budget: crate::RunCommandBudget,
+    shell_dialect: &str,
 ) -> serde_json::Value {
-    let mut defs = match tool_definitions_with_budget(command_budget) {
+    let mut defs = match tool_definitions_with_dialect(command_budget, shell_dialect) {
         serde_json::Value::Array(a) => a,
         other => vec![other],
     };

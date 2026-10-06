@@ -30,6 +30,8 @@ use crate::agentic::tools::{execute_tool_inner, shell, tool_presentation};
 #[derive(Default)]
 pub(crate) struct ToolCollaborators<'a, 'gate> {
     pub(crate) command_budget: crate::RunCommandBudget,
+    /// Empty in legacy fixtures: use the default POSIX guidance.
+    pub(crate) shell_dialect: &'static str,
     /// Turn-local pages observed after successful read authorization.
     pub(crate) read_history: Option<&'a mut super::ReadHistory>,
     /// Call-local command default supplied by the operator, without granting authority.

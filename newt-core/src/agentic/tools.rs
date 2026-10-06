@@ -67,6 +67,7 @@ pub(crate) mod output_budget;
 mod read_history;
 pub(crate) use read_history::ReadHistory;
 mod shell;
+pub use shell::{run_command_dialect_sentence, shell_dialect_sentence};
 /// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
 /// silent tool is never a blank row, and the first live byte takes the row
 /// for good. Unix-only — it needs a real pty pair.
@@ -3631,6 +3632,7 @@ async fn execute_authorized_tool(
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
         command_budget,
+        shell_dialect,
         read_history,
         default_command_cwd,
         worktree_session,
@@ -4208,6 +4210,7 @@ async fn execute_authorized_tool(
                     plan_mode_control.is_some(),
                     plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode),
                     command_budget,
+                    shell_dialect,
                 ),
                 persona_tools,
             );

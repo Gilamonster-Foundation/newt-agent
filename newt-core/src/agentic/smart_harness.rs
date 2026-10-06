@@ -1445,6 +1445,7 @@ mod tests {
             false,
             false,
             Default::default(),
+            crate::agentic::shell_dialect_sentence(false, false),
         );
         let legacy = tools.clone();
         let smart = advertise(tools, Some(&h));

@@ -8,6 +8,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        shell_dialect: crate::agentic::shell_dialect_sentence(false, false),
         command_budget: Default::default(),
         overflow_retry: Default::default(),
         run_allowance: None,
@@ -119,6 +120,7 @@ fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     let mut wire_messages: Vec<serde_json::Value> = messages
             .iter()

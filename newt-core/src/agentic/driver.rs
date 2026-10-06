@@ -98,6 +98,8 @@ impl std::fmt::Debug for HeadlessCodeSearch {
 /// separately by the driver and shared across its submitted turns.
 #[derive(Debug, Clone)]
 pub struct TurnDriverConfig {
+    /// Shell guidance captured once at session construction.
+    pub shell_dialect: &'static str,
     /// Resolved once; callers may supply a deterministic budget.
     pub command_budget: crate::RunCommandBudget,
     /// Shared accounted session and independent narration adjudicator.
@@ -203,6 +205,7 @@ impl TurnDriverConfig {
     ) -> Self {
         Self {
             command_budget: crate::RunCommandBudget::from_env(),
+            shell_dialect: super::run_command_dialect_sentence(),
             smart_harness: None,
             url: url.into(),
             model: model.into(),
@@ -705,6 +708,7 @@ async fn run_one_turn(
         .run_allowance
         .map(super::run_allowance::RunAllowance::new);
     let ctx = ChatCtx {
+        shell_dialect: config.shell_dialect,
         command_budget: config.command_budget,
         run_allowance: run_allowance.as_ref(),
         verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),

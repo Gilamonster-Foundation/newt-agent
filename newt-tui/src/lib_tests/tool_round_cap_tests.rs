@@ -124,6 +124,7 @@ fn openai_loop_recovers_from_context_window_400() {
             };
             openai_chat_complete(
                 ChatCtx {
+                    shell_dialect: newt_core::agentic::shell_dialect_sentence(false, false),
                     command_budget: Default::default(),
                     overflow_retry: Default::default(),
                     run_allowance: None,

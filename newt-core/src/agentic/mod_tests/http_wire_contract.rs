@@ -569,3 +569,41 @@ fn command_budget_2747_concurrent_wire_contract() {
         }
     });
 }
+
+/// #2775: independent captured session dialects reach the actual provider wire;
+/// catalog construction must not replace them with this host's environment.
+#[tokio::test]
+async fn shell_dialect_2775_captured_session_reaches_wire() {
+    for windows_host in [true, false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ready"}}],
+            })))
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.shell_dialect = shell_dialect_sentence(true, windows_host);
+        let expected = c.shell_dialect;
+        chat_complete(c, &mut NoMcp).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        for request in requests {
+            let body = body_json(&request);
+            let tools = body["tools"].as_array().unwrap();
+            let shell = tools
+                .iter()
+                .find(|t| t["function"]["name"] == "run_command")
+                .unwrap();
+            assert!(shell["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains(expected));
+        }
+    }
+}

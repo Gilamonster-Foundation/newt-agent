@@ -315,9 +315,9 @@ pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
     exit_plan_mode_result, filter_advertised_tools, filter_tools_for_disposition,
     full_access_requested, ocap_disabled, persona_tool_allowed, plan_phase_clamp,
-    preserve_mcp_resource_url_affinity, set_max_output_tokens, set_output_cap_chars_per_token,
-    set_output_head_tokens, tool_allowed, tool_definitions, venv_cmd_prefix, ExposureSettings,
-    MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    preserve_mcp_resource_url_affinity, run_command_dialect_sentence, set_max_output_tokens,
+    set_output_cap_chars_per_token, set_output_head_tokens, shell_dialect_sentence, tool_allowed,
+    tool_definitions, venv_cmd_prefix, ExposureSettings, MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -947,6 +947,8 @@ impl Drop for CompletedSpillDismissGuard<'_> {
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
 pub struct ChatCtx<'a> {
+    /// Captured shell syntax guidance shared by initial and deferred catalogs.
+    pub shell_dialect: &'static str,
     /// Captured session budget shared by tool schemas and execution.
     pub command_budget: crate::RunCommandBudget,
     /// Optional accounted projection and auxiliary completion adjudication.
@@ -1963,6 +1965,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .await;
     }
     let ChatCtx {
+        shell_dialect,
         command_budget,
         verify_outcomes,
         smart_harness,
@@ -2231,6 +2234,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         advertise_plan_mode,
         advertise_plan_mode_active,
         command_budget,
+        shell_dialect,
     );
     // Put the persona's preferred tools first without removing other tools.
     // Dispatch separately checks explicit permissions and delegation authority.
@@ -4032,6 +4036,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     mcp,
                     tools::ToolCollaborators {
                         command_budget,
+                        shell_dialect,
                         read_history: Some(&mut read_history),
                         default_command_cwd,
                         worktree_session,
@@ -6862,6 +6867,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        shell_dialect,
         command_budget,
         verify_outcomes,
         smart_harness,
@@ -7149,6 +7155,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         advertise_plan_mode,
         advertise_plan_mode_active,
         command_budget,
+        shell_dialect,
     );
     // Put the persona's preferred tools first without removing other tools.
     // Dispatch separately checks explicit permissions and delegation authority.
@@ -8962,6 +8969,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     mcp,
                     tools::ToolCollaborators {
                         command_budget,
+                        shell_dialect,
                         read_history: Some(&mut read_history),
                         default_command_cwd,
                         worktree_session,
@@ -9618,6 +9626,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        shell_dialect,
         command_budget,
         verify_outcomes,
         smart_harness,
@@ -9924,6 +9933,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         advertise_plan_mode,
         advertise_plan_mode_active,
         command_budget,
+        shell_dialect,
     );
     let tools = filter_advertised_tools(tools, persona_tools);
     let tools = filter_tools_for_disposition(
@@ -11491,6 +11501,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     mcp,
                     tools::ToolCollaborators {
                         command_budget,
+                        shell_dialect,
                         read_history: Some(&mut read_history),
                         default_command_cwd,
                         worktree_session,
@@ -12033,6 +12044,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        shell_dialect,
         command_budget,
         verify_outcomes,
         smart_harness,
@@ -12237,6 +12249,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         advertise_plan_mode,
         advertise_plan_mode_active,
         command_budget,
+        shell_dialect,
     );
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona
     // (Responses wire). No-op when `persona_tools` is `None`.
@@ -13227,6 +13240,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     mcp,
                     tools::ToolCollaborators {
                         command_budget,
+                        shell_dialect,
                         read_history: Some(&mut read_history),
                         default_command_cwd,
                         worktree_session,
@@ -13944,6 +13958,7 @@ pub(crate) fn builtin_catalog_tokens(disposition: PromptDisposition) -> usize {
             false,
             false,
             Default::default(),
+            crate::agentic::shell_dialect_sentence(false, false),
         ),
         disposition,
     );

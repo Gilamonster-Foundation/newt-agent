@@ -1689,6 +1689,7 @@ fn session_body(
     to_ui: std::sync::mpsc::SyncSender<crate::session_worker::SurfaceRequest>,
 ) -> anyhow::Result<()> {
     let command_budget = newt_core::RunCommandBudget::from_env();
+    let shell_dialect = newt_core::agentic::run_command_dialect_sentence();
     // ENTER the runtime on this thread before anything else runs.
     //
     // The body relied on `Handle::current()` being ambient — it ran ON a
@@ -8614,6 +8615,7 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
+                                        shell_dialect,
                                         command_budget,
                                         // #2313 b3: the session-scoped allowance
                                         // constructed above, shared with the

@@ -607,6 +607,21 @@ pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value 
     })
 }
 
+/// Capture the ambient/bridled routing choice once for session catalogs.
+pub fn run_command_dialect_sentence() -> &'static str {
+    shell_dialect_sentence(ocap_disabled(), cfg!(windows))
+}
+
+/// The ambient bypass uses cmd /C on Windows; confined engines use POSIX
+/// grammar. Inject the route and platform so the catalog contract is portable.
+pub fn shell_dialect_sentence(host_bypass: bool, windows: bool) -> &'static str {
+    if host_bypass && windows {
+        "Host commands run under cmd.exe /C: chain with && and read status with %ERRORLEVEL%; `;` and `$?` are not supported (confined routes use POSIX syntax)."
+    } else {
+        "Commands use POSIX shell syntax; the selected engine may restrict shell constructs."
+    }
+}
+
 /// The shell engine selected for this dispatch (ADR 0005 D2 seam). An explicit
 /// `[shell] engine` / `--shell-engine` choice is published by the CLI through
 /// `NEWT_SHELL_ENGINE`, so deep `run_command` dispatch reads it without threading

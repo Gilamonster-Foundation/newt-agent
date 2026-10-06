@@ -16,6 +16,7 @@ fn msgs() -> Vec<MemMessage> {
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        shell_dialect: crate::agentic::shell_dialect_sentence(false, false),
         command_budget: Default::default(),
         overflow_retry: Default::default(),
         run_allowance: None,
