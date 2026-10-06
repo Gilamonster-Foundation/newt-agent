@@ -28,6 +28,34 @@ pub(super) fn creation_failure_hint(
     if shell::envelope_outcome(envelope) != crate::ExecOutcome::Failed {
         return None;
     }
+    let words = standalone_git_words(source)?;
+    // Admission allows only -C before the subcommand, not config overrides.
+    let mut global = words.iter().skip(1);
+    let mut word = global.next()?;
+    while word == "-C" {
+        global.next()?;
+        word = global.next()?;
+    }
+    if word != "worktree" {
+        return None;
+    }
+    // Reuse the admission parser's Git/subcommand interpretation. Limit the
+    // hint to explicit branch operands, avoiding guesses about HEAD or -d.
+    let args = worktree_add_args(&words)?;
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let branch = match args.as_slice() {
+        [path, branch] if !path.starts_with('-') => *branch,
+        ["-b" | "-B", branch, _] | ["-b" | "-B", branch, _, _] => *branch,
+        _ => return None,
+    };
+    let prefix = format!("fatal: '{branch}' is already used by worktree at ");
+    envelope.get("stderr")?.as_str()?.lines().any(|line| line.starts_with(&prefix)).then_some(
+        "\nWorktree hint: if you switched the original to that branch, switch it back with `git switch -`. To create a new task branch, pick a new branch name and run `git worktree add -b <new-branch> <path> [<start>]` as a standalone command."
+    )
+}
+
+/// Literal standalone Git argv, shared by advisory notices and task recording.
+fn standalone_git_words(source: &str) -> Option<Vec<String>> {
     let inspection = agent_bridle::inspect_shell(source).ok()?;
     let [command] = inspection.commands.as_slice() else {
         return None;
@@ -56,29 +84,7 @@ pub(super) fn creation_failure_hint(
     if words.iter().any(|word| word.contains(['\n', '\r'])) {
         return None;
     }
-    // Admission allows only -C before the subcommand, not config overrides.
-    let mut global = words.iter().skip(1);
-    let mut word = global.next()?;
-    while word == "-C" {
-        global.next()?;
-        word = global.next()?;
-    }
-    if word != "worktree" {
-        return None;
-    }
-    // Reuse the admission parser's Git/subcommand interpretation. Limit the
-    // hint to explicit branch operands, avoiding guesses about HEAD or -d.
-    let args = worktree_add_args(&words)?;
-    let args: Vec<_> = args.iter().map(String::as_str).collect();
-    let branch = match args.as_slice() {
-        [path, branch] if !path.starts_with('-') => *branch,
-        ["-b" | "-B", branch, _] | ["-b" | "-B", branch, _, _] => *branch,
-        _ => return None,
-    };
-    let prefix = format!("fatal: '{branch}' is already used by worktree at ");
-    envelope.get("stderr")?.as_str()?.lines().any(|line| line.starts_with(&prefix)).then_some(
-        "\nWorktree hint: if you switched the original to that branch, switch it back with `git switch -`. To create a new task branch, pick a new branch name and run `git worktree add -b <new-branch> <path> [<start>]` as a standalone command."
-    )
+    Some(words)
 }
 
 /// A conservative refusal trigger, NEVER evidence authorizing adoption. Scan
@@ -370,6 +376,9 @@ fn record_verified_creation(
     adopted: AdoptedWorktree,
     bypass: bool,
 ) -> String {
+    if let Some(branch) = &adopted.task_branch {
+        session.record_task_worktree(&adopted.worktree, branch);
+    }
     if bypass {
         format!(
             "Task worktree created: {}. {UNARMED_NOTICE}",
@@ -658,6 +667,14 @@ pub(super) async fn execute(
             .and_then(|value| value.as_str())
             .is_some_and(possible_creation)
     {
+        if let Some(session) = session {
+            nudge::record_unarmed_creation(
+                session,
+                &normalized,
+                workspace,
+                execution.and_then(|slot| slot.get()),
+            );
+        }
         presentation.preview(UNARMED_NOTICE, 0);
         result.push_str(&format!("\n{UNARMED_NOTICE}"));
     }

@@ -29,6 +29,7 @@ async fn compact_responses_input_post_fence_overflow_is_transactional() {
     let mut state = CompressState::new();
 
     let outcome = compact_responses_input(
+        None,
         &mut input,
         Some("you are newt"),
         None,
@@ -83,6 +84,7 @@ async fn compact_responses_input_bridge_error_is_transactional() {
     let original = input.clone();
     let mut state = CompressState::new();
     let outcome = compact_responses_input(
+        None,
         &mut input,
         Some("you are newt"),
         None,
@@ -122,6 +124,7 @@ async fn compact_responses_input_refusal_is_transactional() {
     let mut state = CompressState::new();
     // compaction_budget = 1 → the protected head alone exceeds it → refuse.
     let outcome = compact_responses_input(
+        None,
         &mut input,
         Some("you are newt with a large protected head that cannot shrink"),
         None,
@@ -171,6 +174,7 @@ async fn compact_responses_input_commits_only_on_success() {
     let before_len = input.len();
     let mut state = CompressState::new();
     let outcome = compact_responses_input(
+        None,
         &mut input,
         Some("you are newt"),
         None,
@@ -241,6 +245,7 @@ async fn compact_responses_input_spill_store_is_transactional() {
         let mut input = make_input();
         let mut state = CompressState::new();
         let outcome = compact_responses_input(
+            None,
             &mut input,
             Some("you are newt"),
             None,
@@ -288,6 +293,7 @@ async fn compact_responses_input_spill_store_is_transactional() {
         let mut input = make_input();
         let mut state = CompressState::new();
         let outcome = compact_responses_input(
+            None,
             &mut input,
             Some("you are newt"),
             None,
@@ -343,6 +349,7 @@ async fn compact_responses_input_no_store_emits_no_retrieval_handle() {
     let mut input = spill_middle_input();
     let mut state = crate::agentic::compress::CompressState::new();
     let outcome = compact_responses_input(
+        None,
         &mut input,
         Some("you are newt"),
         None,
@@ -388,6 +395,7 @@ async fn compact_responses_input_names_a_resolvable_content_handle() {
     let mut input = spill_middle_input();
     let mut state = crate::agentic::compress::CompressState::new();
     let outcome = compact_responses_input(
+        None,
         &mut input,
         Some("you are newt"),
         None,
@@ -426,4 +434,55 @@ async fn compact_responses_input_names_a_resolvable_content_handle() {
         "the emitted handle resolves to the committed verbatim span"
     );
     assert_eq!(store.unique_objects(), 1);
+}
+
+/// #2766: Responses uses a separate transactional compaction seam. Carry the
+/// recorded task location through it, including its post-bridge budget check.
+#[tokio::test]
+async fn compaction_task_worktree_responses() {
+    let session = crate::worktree_adoption::WorktreeSession::default();
+    session.record_task_worktree(std::path::Path::new("task-checkout"), "task-branch");
+    let expected = session.task_hint().unwrap();
+    let summ: crate::agentic::compress::Summarizer =
+        Box::new(|_| Box::pin(async { Ok(("brief".into(), None)) }));
+    for budget in [10, 100_000] {
+        let mut input = spill_middle_input();
+        let original = input.clone();
+        let mut state = CompressState::new();
+        let result = compact_responses_input(
+            Some(&session),
+            &mut input,
+            Some("you are newt"),
+            None,
+            Some(budget),
+            400,
+            1.0,
+            crate::tokens::TokenEstimation::default(),
+            "task",
+            8192,
+            true,
+            None,
+            Some(&*summ),
+            &mut state,
+            false,
+            None,
+            false,
+        )
+        .await;
+        if budget == 10 {
+            assert!(matches!(
+                result,
+                ResponsesCompaction::OverBudgetAfterFence(_)
+            ));
+            assert_eq!(input, original);
+        } else {
+            assert!(matches!(result, ResponsesCompaction::Compacted));
+            assert!(
+                input.iter().any(|item| item["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&expected))),
+                "{input:?}"
+            );
+        }
+    }
 }

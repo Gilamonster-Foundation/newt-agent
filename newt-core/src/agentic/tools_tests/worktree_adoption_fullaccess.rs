@@ -57,7 +57,8 @@ impl ToolPresentation for Notices {
 /// host-shell execution in the task worktree. No kernel fence is available in
 /// this explicit bypass mode; arming one must not strand the session.
 /// #2763 also grounds bypass admission for standalone and compound creations,
-/// including destinations the confined verifier rejects.
+/// including destinations the confined verifier rejects. #2766 checks that the
+/// actual dispatch records task location for post-compaction/captured state.
 /// Selected explicitly by ci.yml's Linux `test` job (ambient worktree proof).
 #[cfg(unix)]
 #[tokio::test]
@@ -136,6 +137,9 @@ async fn adoption_2750_full_access_creation_then_task_command() {
             "call {index}: {text}"
         );
         if index == 0 {
+            // #2766: this scheduled real-dispatch proof must exercise recording,
+            // not merely seed session state before testing compaction.
+            assert_task_handoff(&session, &task, "task");
             creation_text = text;
         } else if index == 1 {
             assert!(text.contains("adoption_2750_ready"), "{text}");
@@ -218,4 +222,86 @@ fn adoption_2763_bypass_skips_creation_verification() {
         |_| panic!("confined compound must fail before Git resolution"),
     )
     .is_err());
+}
+
+/// #2766: verified confined creation survives both summary and static-fallback
+/// compaction, and appears in the captured working state without a scratchpad.
+#[test]
+fn compaction_task_worktree_confined() {
+    compaction_task_worktree_after_creation(false);
+}
+
+/// #2766: recording the task location must not depend on arming adoption.
+#[test]
+fn compaction_task_worktree_unarmed() {
+    compaction_task_worktree_after_creation(true);
+}
+
+fn compaction_task_worktree_after_creation(bypass: bool) {
+    let (_temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
+    let worktree = policy.worktree.clone();
+    let session = crate::worktree_adoption::WorktreeSession::default();
+    record_verified_creation(&session, policy, bypass);
+    assert_eq!(session.snapshot().is_none(), bypass);
+    assert_task_handoff(&session, &worktree, "task");
+}
+
+fn assert_task_handoff(
+    session: &crate::worktree_adoption::WorktreeSession,
+    path: &Path,
+    branch: &str,
+) {
+    use crate::agentic::{
+        apply_post_compaction_continuation, cap_exit_progress, compress::CompressAction,
+        prompt_read::PromptReadContext,
+    };
+    let expected = format!(
+        "Task worktree: {} (branch {branch}) — run commands there, not in the original checkout.",
+        path.display()
+    );
+    for action in [CompressAction::Summarized, CompressAction::StaticFallback] {
+        let mut messages =
+            vec![serde_json::json!({"role":"system", "content":"compacted history"})];
+        apply_post_compaction_continuation(
+            Some(session),
+            &mut messages,
+            &mut 1,
+            action,
+            None,
+            PromptReadContext::new(None, "Refactor in a new worktree", None),
+            true,
+            |_| true,
+        );
+        assert!(
+            messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains(&expected),
+            "{messages:?}"
+        );
+    }
+    let mut rejected = vec![serde_json::json!({"role":"system", "content":"compacted history"})];
+    let before = rejected.clone();
+    apply_post_compaction_continuation(
+        Some(session),
+        &mut rejected,
+        &mut 1,
+        CompressAction::Summarized,
+        None,
+        PromptReadContext::new(None, "Refactor in a new worktree", None),
+        true,
+        |candidate| {
+            assert!(candidate.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains(&expected));
+            false
+        },
+    );
+    assert_eq!(
+        rejected, before,
+        "the hint must obey the existing budget gate"
+    );
+    let captured = cap_exit_progress(Some(session), None, None).unwrap_or_default();
+    assert!(captured.contains(&expected), "{captured}");
 }

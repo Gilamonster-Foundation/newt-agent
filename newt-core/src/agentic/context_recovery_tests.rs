@@ -211,6 +211,7 @@ async fn overflow_smart_responses_projection_cannot_skip_elision_due_to_rounding
     )
     .unwrap();
     let outcome = super::super::compact_responses_input(
+        None,
         &mut input,
         Some("policy"),
         None,

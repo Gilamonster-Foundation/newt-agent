@@ -23,6 +23,7 @@ pub(crate) fn fixture(nested: bool) -> (tempfile::TempDir, AdoptedWorktree, Path
     let policy = AdoptedWorktree {
         original: original.canonicalize().unwrap(),
         worktree: worktree.canonicalize().unwrap(),
+        task_branch: Some("task".into()),
         common: common.canonicalize().unwrap(),
         admin: admin.canonicalize().unwrap(),
         protected_branch: Some("main".into()),
@@ -113,7 +114,10 @@ fn verified_creation_requires_new_matching_git_metadata() {
     assert!(candidate.verify().is_none());
     let candidate = Creation::before(&policy.original, &policy.worktree, &Caveats::top()).unwrap();
     link(&policy);
+    // #2766: use the linked checkout's branch, never the protected source branch.
+    std::fs::write(policy.admin.join("HEAD"), "ref: refs/heads/task\n").unwrap();
     let verified = candidate.verify().unwrap();
+    assert_eq!(verified.task_branch.as_deref(), Some("task"));
     assert_eq!(verified.worktree, policy.worktree);
     assert!(Creation::before(&policy.original, &policy.worktree, &Caveats::top()).is_none());
     assert!(verified.valid(&Caveats::top()));

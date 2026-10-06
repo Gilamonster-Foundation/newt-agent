@@ -572,6 +572,7 @@ pub(crate) type CompactionStageBuffer =
 /// [`CompactionRejection`]).
 #[allow(clippy::too_many_arguments)]
 async fn compact_responses_input(
+    worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
     input: &mut Vec<serde_json::Value>,
     instructions: Option<&str>,
     tools: Option<&[serde_json::Value]>,
@@ -589,6 +590,20 @@ async fn compact_responses_input(
     smart_harness: Option<&smart_harness::SmartHarness>,
     overflow_recovery: bool,
 ) -> ResponsesCompaction {
+    // #2766: the task location outlives lossy history. Reuse the continuation
+    // marker so repeated compactions replace the old hint; include its bytes
+    // before the existing transactional request-budget checks in either path.
+    let with_task = |mut candidate: Vec<serde_json::Value>| {
+        if let Some(hint) =
+            worktree_session.and_then(crate::worktree_adoption::WorktreeSession::task_hint)
+        {
+            candidate.retain(|item| !compress::is_continuation_message(item));
+            candidate.push(serde_json::json!({"role":"user", "content":
+                format!("{} {}", compress::CONTINUATION_PREFIX, workflow_guidance(hint))}));
+        }
+        candidate
+    };
+
     if let Some(harness) = smart_harness {
         // Preserve native call IDs and reasoning items through host selection.
         // The legacy summarizer bridge intentionally flattens them to prose.
@@ -598,7 +613,7 @@ async fn compact_responses_input(
                 Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
             };
         let projected = match harness.project(input, max_bytes).await {
-            Ok(messages) => messages,
+            Ok(messages) => with_task(messages),
             Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
         };
         let required = estimate_responses_request_real_tokens(
@@ -698,7 +713,7 @@ async fn compact_responses_input(
     // Reclassify to typed provenance, then rebuild exhaustively (untrusted-derived
     // → fenced `user`).
     let rebuilt_msgs = responses_compaction::chat_to_compaction(rebuilt_chat);
-    let rebuilt_input = responses_compaction::compaction_to_responses(&rebuilt_msgs);
+    let rebuilt_input = with_task(responses_compaction::compaction_to_responses(&rebuilt_msgs));
     // #1528 B2 (BHV-BUDGET-004): the provenance fences are added AFTER the
     // compressor fit its budget, so validate the REBUILT request against the
     // authoritative budget (the SHARED B1 estimator, same real-token currency
@@ -2597,6 +2612,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
                     apply_post_compaction_continuation(
+                        worktree_session,
                         &mut messages,
                         &mut narration_nudges,
                         outcome.action,
@@ -2947,6 +2963,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 messages = outcome.messages;
                                 prompt_tracker.invalidate();
                                 apply_post_compaction_continuation(
+                                    worktree_session,
                                     &mut messages,
                                     &mut narration_nudges,
                                     outcome.action,
@@ -3638,6 +3655,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         messages = outcome.messages;
                         prompt_tracker.invalidate();
                         apply_post_compaction_continuation(
+                            worktree_session,
                             &mut messages,
                             &mut narration_nudges,
                             outcome.action,
@@ -4204,7 +4222,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let trimmed = trim_for_summary(&messages, protected_head, 6);
     // Step 27.5: salvage the plan/state ledger + the failed-call count so the
     // summary reflects progress and the fallback advice is honest.
-    let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    let progress = cap_exit_progress(worktree_session, step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
     let cap_reason = verification
         .cap_exit_reason(
@@ -5084,16 +5102,18 @@ const PERMISSION_RECOVERY_GUIDANCE: &str =
      an available operator, call request_permissions once. Never re-ask for or retry a permission \
      the operator declined, or ask again with no operator available. Do not bypass a refusal.";
 
-/// Render the agent's working-memory progress (`<plan>` checklist + `<state>`)
-/// at a cap exit, so partial work is salvaged into the final summary / fallback
-/// instead of being lost (Step 27.5). `None` when both are empty.
+/// Render saved plan, scratchpad and task worktree at a cap exit, so partial
+/// work is salvaged into the final summary / fallback instead of being lost
+/// (Step 27.5, #2766). `None` when all are empty.
 fn cap_exit_progress(
+    worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     scratchpad_store: Option<&dyn scratchpad::ScratchpadStore>,
 ) -> Option<String> {
     let plan = step_ledger.and_then(scheduled::plan_block);
     let state = scratchpad_store.and_then(scratchpad::scratchpad_state_block);
-    let parts: Vec<String> = [plan, state].into_iter().flatten().collect();
+    let task = worktree_session.and_then(crate::worktree_adoption::WorktreeSession::task_hint);
+    let parts: Vec<String> = [plan, state, task].into_iter().flatten().collect();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
@@ -5754,6 +5774,7 @@ fn narration_action_nudge() -> String {
 /// the current one with a lossy summary, so role-scanning cannot identify the
 /// active task reliably (#1163, 2026-07-16 multi-turn repro).
 fn post_compaction_continuation(
+    worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     prompt_context: prompt_read::PromptReadContext<'_>,
 ) -> String {
@@ -5787,9 +5808,13 @@ fn post_compaction_continuation(
             )
         },
     );
+    let task_clause = worktree_session
+        .and_then(crate::worktree_adoption::WorktreeSession::task_hint)
+        .map(|hint| format!("\n{hint}\n"))
+        .unwrap_or_default();
     workflow_guidance(format!(
         "{} You are mid-task: the context above was just compacted, not \
-         completed.{instruction_clause}{plan_clause} For prompt-rooted work, \
+         completed.{instruction_clause}{plan_clause}{task_clause} For prompt-rooted work, \
          use artifact_read {{\"address\":\"root\"}} before deciding what remains. \
          When continuing, your next output should be the next concrete tool call; re-read \
          files before editing. To re-anchor on ground truth, check the current git branch and the last few \
@@ -5819,7 +5844,9 @@ fn post_compaction_continuation(
 /// candidate under the provider's existing request-budget contract. A rejected
 /// hint leaves the compacted transcript intact; final dispatch preflight still
 /// checks that transcript and refuses an irreducible oversized request.
+#[allow(clippy::too_many_arguments)]
 fn apply_post_compaction_continuation(
+    worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
     messages: &mut Vec<serde_json::Value>,
     narration_nudges: &mut usize,
     action: CompressAction,
@@ -5843,7 +5870,7 @@ fn apply_post_compaction_continuation(
     candidate.retain(|m| !compress::is_continuation_message(m));
     candidate.push(serde_json::json!({
         "role": "user",
-        "content": post_compaction_continuation(step_ledger, prompt_context),
+        "content": post_compaction_continuation(worktree_session, step_ledger, prompt_context),
     }));
     if admit(&candidate) {
         *messages = candidate;
@@ -7443,6 +7470,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
                     apply_post_compaction_continuation(
+                        worktree_session,
                         &mut messages,
                         &mut narration_nudges,
                         outcome.action,
@@ -7849,6 +7877,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 messages = outcome.messages;
                                 prompt_tracker.invalidate();
                                 apply_post_compaction_continuation(
+                                    worktree_session,
                                     &mut messages,
                                     &mut narration_nudges,
                                     outcome.action,
@@ -9125,7 +9154,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
-    let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    let progress = cap_exit_progress(worktree_session, step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
     let cap_reason = verification
         .cap_exit_reason(
@@ -10176,6 +10205,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
                     apply_post_compaction_continuation(
+                        worktree_session,
                         &mut messages,
                         &mut narration_nudges,
                         outcome.action,
@@ -10462,6 +10492,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 messages = outcome.messages;
                                 prompt_tracker.invalidate();
                                 apply_post_compaction_continuation(
+                                    worktree_session,
                                     &mut messages,
                                     &mut narration_nudges,
                                     outcome.action,
@@ -11645,7 +11676,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         compress::protected_reasoning_tail_len(&messages, reasoning_replay_scope);
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (mirrors the OpenAI path).
-    let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    let progress = cap_exit_progress(worktree_session, step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
     let cap_reason = verification
         .cap_exit_reason(
@@ -12457,6 +12488,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 );
                 if before > budget {
                     let compression = compact_responses_input(
+                        worktree_session,
                         &mut input,
                         instructions.as_deref(),
                         tools_supported.then_some(tools.as_slice()),
@@ -12619,6 +12651,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 estimation,
                             );
                             let compression = compact_responses_input(
+                                worktree_session,
                                 &mut input,
                                 instructions.as_deref(),
                                 tools_supported.then_some(tools.as_slice()),
@@ -13375,7 +13408,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // Keep the pre-summary usage separate so the footer's "across N rounds"
     // count does not include this extra tools-disabled completion.
     let cap_accumulated = accumulated_usage;
-    let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    let progress = cap_exit_progress(worktree_session, step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
     let cap_reason = verification
         .cap_exit_reason(
@@ -13436,6 +13469,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         );
         if before > budget {
             let compression = compact_responses_input(
+                worktree_session,
                 &mut input,
                 instructions.as_deref(),
                 None,
