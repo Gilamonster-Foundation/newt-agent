@@ -402,7 +402,7 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
     );
     assert!(
         text.contains(&format!(
-            "left empty directory {}; remove it if unwanted",
+            "left empty directory `{}`; remove it if unwanted",
             temp.path().join("task").display()
         )),
         "{text}"
