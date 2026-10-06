@@ -165,6 +165,28 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         .iter()
         .any(|line| line.contains("original checkout remains writable")));
 
+    // #2771: genuine creation enables relative file routing.
+    std::fs::write(root.join("routing_probe"), "original routing marker").unwrap();
+    std::fs::write(task.join("routing_probe"), "task routing marker").unwrap();
+    let out = execute(
+        &mut presentation,
+        "read_file",
+        &serde_json::json!({"path":"routing_probe"}),
+        root.to_str().unwrap(),
+        false,
+        20,
+        &Caveats::top(),
+        &mut crate::agentic::NoMcp,
+        ToolCollaborators {
+            worktree_session: Some(&session),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+    )
+    .await;
+    assert!(out.contains("task routing marker"), "{out}");
+
     // #2766 round 2: Git resolves parent traversal after following the cwd
     // symlink. The lexical sibling under `main` is a different tree.
     let elsewhere = temp.path().join("elsewhere");
@@ -233,6 +255,43 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         assert_task_handoff(&session, &actual, branch);
         assert!(session.snapshot().is_none());
     }
+    // #2771: a successful executable named git cannot select a foreign checkout.
+    use std::os::unix::fs::PermissionsExt;
+    let fake_dir = temp.path().join("fakebin");
+    std::fs::create_dir(&fake_dir).unwrap();
+    let fake = fake_dir.join("git");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let foreign = elsewhere.join("via-c");
+    std::fs::write(foreign.join("routing_probe"), "foreign routing marker").unwrap();
+    let outcome = std::sync::OnceLock::new();
+    let out = execute(&mut presentation, "run_command",
+        &serde_json::json!({"command":format!("'{}' worktree add -b forged '{}'", fake.display(), foreign.display())}),
+        root.to_str().unwrap(), false, 20, &Caveats::top(), &mut crate::agentic::NoMcp,
+        ToolCollaborators { worktree_session: Some(&session), execution: Some(&outcome), ..Default::default() }, false, PromptDisposition::Act).await;
+    assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Passed), "{out}");
+    assert!(session
+        .task_hint()
+        .unwrap()
+        .contains(foreign.to_string_lossy().as_ref()));
+    let out = execute(
+        &mut presentation,
+        "read_file",
+        &serde_json::json!({"path":"routing_probe"}),
+        root.to_str().unwrap(),
+        false,
+        20,
+        &Caveats::top(),
+        &mut crate::agentic::NoMcp,
+        ToolCollaborators {
+            worktree_session: Some(&session),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+    )
+    .await;
+    assert!(out.contains("original routing marker"), "{out}");
 }
 
 /// #2750: ambient bypass stays unarmed; full authority with confinement still
@@ -399,6 +458,7 @@ async fn relative_task_root(bypass: bool) {
     let admin = original.join(".git/worktrees/task");
     std::fs::write(task.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
     std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::write(admin.join("gitdir"), task.join(".git").to_str().unwrap()).unwrap();
     std::fs::write(admin.join("HEAD"), "ref: refs/heads/task\n").unwrap();
     std::fs::write(original.join("probe.txt"), "original marker\n").unwrap();
     std::fs::write(task.join("probe.txt"), "task marker\n").unwrap();
@@ -487,6 +547,30 @@ async fn relative_task_root(bypass: bool) {
     )
     .await;
     assert!(out.contains("edited task"), "{out}");
+    for (tool, args, expected) in [
+        (
+            "find",
+            serde_json::json!({"path":original, "name":"before.txt"}),
+            "before.txt",
+        ),
+        (
+            "grep",
+            serde_json::json!({"path":original, "pattern":"original marker"}),
+            "original marker",
+        ),
+    ] {
+        let out = call(tool, args).await;
+        assert!(out.contains(expected), "absolute {tool}: {out}");
+    }
+    // The absolute search boundary has not expanded to the sibling task.
+    for tool in ["find", "grep"] {
+        let out = call(
+            tool,
+            serde_json::json!({"path":task, "pattern":"edited task"}),
+        )
+        .await;
+        assert!(out.contains("workspace-only"), "absolute {tool}: {out}");
+    }
     let out = call("write_file", serde_json::json!({"path":"copied.txt", "content":"", "copy_from":{"path":"probe.txt", "start_line":1, "end_line":1}})).await;
     assert_eq!(
         std::fs::read_to_string(task.join("copied.txt")).unwrap(),
@@ -534,4 +618,47 @@ fn relative_task_root_missing_error_names_base() {
     )
     .render(root, &crate::Scope::All);
     assert!(out.contains(&format!("resolved against {root}")), "{out}");
+}
+
+/// #2771 round 2: unlinked advisory roots must not redirect native file tools,
+/// even when ambient file authority permits both destinations.
+#[tokio::test]
+async fn relative_task_root_unlinked_is_advisory_only() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    for bypass in ["0", "1"] {
+        let _bypass = EnvVar::set("NEWT_DISABLE_OCAP", bypass);
+        let (temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
+        let root = temp.path().join("main");
+        let task = policy.worktree;
+        std::fs::write(root.join("probe"), "original").unwrap();
+        std::fs::write(task.join("probe"), "forged").unwrap();
+        let session = crate::worktree_adoption::WorktreeSession::default();
+        session.record_task_worktree(&task, "task");
+        struct Quiet;
+        impl ToolPresentation for Quiet {
+            fn preview(&mut self, _: &str, _: usize) {}
+            fn document(&mut self, _: &str) {}
+            fn override_result(&mut self, _: String) {}
+        }
+        let out = execute(
+            &mut Quiet,
+            "read_file",
+            &serde_json::json!({"path":"probe"}),
+            root.to_str().unwrap(),
+            false,
+            20,
+            &Caveats::top(),
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                worktree_session: Some(&session),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+        )
+        .await;
+        assert_eq!(out.trim(), "original", "{bypass}: {out}");
+        assert!(session.task_hint().is_some());
+    }
 }

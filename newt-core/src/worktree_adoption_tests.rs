@@ -313,3 +313,52 @@ fn sibling_task_handoff_preserves_caller_bounds() {
         assert_eq!(policy.task_authority(&base), base);
     }
 }
+
+/// #2771 round 2: routing needs a reciprocal same-repository link, including
+/// when the session itself starts in a linked checkout. Advisory text survives
+/// malformed, removed, and foreign metadata. Portable: no Git or held-root API.
+#[test]
+fn relative_task_root_requires_reciprocal_repository_binding() {
+    let (_temp, policy, other) = fixture(false);
+    let session = WorktreeSession::default();
+    session.record_task_worktree(&policy.worktree, "task");
+    assert!(session.task_root(&policy.original).is_none());
+    std::fs::create_dir(policy.worktree.join(".git")).unwrap();
+    assert!(session.task_root(&policy.original).is_none());
+    std::fs::remove_dir(policy.worktree.join(".git")).unwrap();
+    link(&policy);
+    assert_eq!(
+        session.task_root(&policy.original),
+        Some(policy.worktree.clone())
+    );
+    for backlink in ["", "missing", policy.common.to_str().unwrap()] {
+        std::fs::write(policy.admin.join("gitdir"), backlink).unwrap();
+        assert!(session.task_root(&policy.original).is_none(), "{backlink}");
+        assert!(session.task_hint().is_some());
+    }
+    link(&policy);
+    let other_admin = policy.common.join("worktrees/other");
+    std::fs::create_dir(&other_admin).unwrap();
+    std::fs::write(
+        other.join(".git"),
+        format!("gitdir: {}", other_admin.display()),
+    )
+    .unwrap();
+    std::fs::write(other_admin.join("commondir"), "../..").unwrap();
+    assert_eq!(session.task_root(&other), Some(policy.worktree.clone()));
+    // A self-consistent foreign admin cannot bind to the session repository.
+    let foreign = other.join("foreign");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::write(
+        foreign.join("gitdir"),
+        policy.worktree.join(".git").to_str().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        policy.worktree.join(".git"),
+        format!("gitdir: {}", foreign.display()),
+    )
+    .unwrap();
+    assert!(session.task_root(&policy.original).is_none());
+    assert!(session.task_hint().is_some());
+}

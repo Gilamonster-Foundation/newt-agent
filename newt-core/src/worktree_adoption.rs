@@ -32,12 +32,45 @@ impl WorktreeSession {
             path.display()
         ))
     }
-    pub(crate) fn task_root(&self) -> Option<PathBuf> {
-        self.task_worktree
+    /// Routing needs a reciprocal link to THIS repository, not just advisory
+    /// command success. This portable metadata check grants no file authority.
+    pub(crate) fn task_root(&self, workspace: &Path) -> Option<PathBuf> {
+        let root = self
+            .task_worktree
             .lock()
             .expect("worktree hint lock")
-            .as_ref()
-            .map(|(path, _)| path.clone())
+            .as_ref()?
+            .0
+            .clone()
+            .canonicalize()
+            .ok()?;
+        let gitfile = root.join(".git");
+        if !std::fs::symlink_metadata(&gitfile).ok()?.is_file() {
+            return None;
+        }
+        let original_admin = crate::workspace_key::discover_git_dir(workspace)?
+            .canonicalize()
+            .ok()?;
+        let common = match std::fs::read_to_string(original_admin.join("commondir")) {
+            Ok(text) if !text.trim().is_empty() => {
+                original_admin.join(text.trim()).canonicalize().ok()?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => original_admin,
+            _ => return None,
+        };
+        let admin = crate::workspace_key::resolve_gitdir_file(&gitfile, &root)?
+            .canonicalize()
+            .ok()?;
+        if !admin.is_dir() || admin.parent()? != common.join("worktrees") {
+            return None;
+        }
+        let backlink = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+        if backlink.trim().is_empty()
+            || admin.join(backlink.trim()).canonicalize().ok()? != gitfile.canonicalize().ok()?
+        {
+            return None;
+        }
+        Some(root)
     }
     pub(crate) fn snapshot(&self) -> Option<AdoptedWorktree> {
         self.adopted.lock().expect("worktree session lock").clone()

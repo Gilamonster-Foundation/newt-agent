@@ -430,11 +430,19 @@ pub(super) async fn execute(
             name,
             "read_file" | "write_file" | "edit_file" | "delete_file" | "list_dir" | "find" | "grep"
         )
-        .then(|| session.task_root())
+        .then(|| session.task_root(Path::new(workspace)))
         .flatten()
     });
+    // Absolute searches retain the original workspace-only boundary. Only
+    // relative operands select the task's search root; no fence is widened.
+    let absolute_search = matches!(name, "find" | "grep")
+        && args
+            .get("path")
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| Path::new(p).is_absolute());
     let workspace = task_root
         .as_deref()
+        .filter(|_| !absolute_search)
         .and_then(Path::to_str)
         .unwrap_or(workspace);
     let objective = collab.prompt_context.map(|context| context.active_text());
