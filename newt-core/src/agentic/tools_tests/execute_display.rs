@@ -147,8 +147,8 @@ async fn find_error_uses_the_same_spill_boundary() {
     assert_eq!(
         out,
         format!(
-            "error: no such path 'missing'\nresolved against {}",
-            ws.path().display()
+            "error: no such path 'missing'\nresolved against `{}`",
+            dunce::simplified(ws.path()).display()
         )
     );
     assert!(

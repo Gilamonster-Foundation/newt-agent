@@ -25,7 +25,11 @@ impl FileIoError {
         if self.kind != Some(std::io::ErrorKind::NotFound) {
             return self.text;
         }
-        let text = format!("{}\nresolved against {workspace}", self.text);
+        let text = format!(
+            "{}\nresolved against {}",
+            self.text,
+            crate::worktree_adoption::task_path_literal(Path::new(workspace))
+        );
         let Some(path) = self.operand.to_str() else {
             return text;
         };

@@ -583,7 +583,10 @@ async fn relative_task_root(bypass: bool) {
     assert!(!task.join("created.txt").exists(), "{out}");
     let out = call("read_file", serde_json::json!({"path":"missing.txt"})).await;
     assert!(
-        out.contains(&format!("resolved against {}", task.display())),
+        out.contains(&format!(
+            "resolved against `{}`",
+            dunce::simplified(&task).display()
+        )),
         "{out}"
     );
     let out = call(
@@ -619,7 +622,11 @@ fn relative_task_root_missing_error_names_base() {
         "error: missing file".into(),
     )
     .render(root, &crate::Scope::All);
-    assert!(out.contains(&format!("resolved against {root}")), "{out}");
+    let display_root = dunce::simplified(temp.path()).display();
+    assert!(
+        out.contains(&format!("resolved against `{display_root}`")),
+        "{out}"
+    );
 }
 
 /// #2771 round 2: unlinked advisory roots must not redirect native file tools,

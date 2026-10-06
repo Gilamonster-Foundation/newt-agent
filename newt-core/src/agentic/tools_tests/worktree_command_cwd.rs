@@ -133,8 +133,8 @@ async fn shell_task_cwd_2780_actual_git_and_lift() {
         serde_json::json!({"command":"git branch --show-current", "cwd":policy.worktree.join("missing")}), &Caveats::top()).await;
     assert!(
         out.contains(&format!(
-            "default working directory remains {}",
-            policy.worktree.display()
+            "default working directory remains `{}`",
+            dunce::simplified(&policy.worktree).display()
         )),
         "{out}"
     );
@@ -330,4 +330,70 @@ fn shell_task_cwd_2780_projected_paths_are_child_compatible() {
         assert!(!cwd.starts_with(r"\\?\"), "{name}: {cwd}");
         assert_eq!(Path::new(cwd).canonicalize().unwrap(), policy.worktree);
     }
+}
+
+/// #2783: bound-task error paths survive the production Markdown renderer.
+#[cfg(feature = "markdown")]
+async fn bound_task_error_rendering(tool: &str) {
+    use crate::agentic::markdown::{render_markdown, RenderOpts};
+    let _lock = env_lock().await;
+    let _bypass = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let (temp, mut policy) = fixture();
+    let task = temp.path().join(r"task\.worktrees\[bound]");
+    std::fs::create_dir_all(&task).unwrap();
+    policy.worktree = task.canonicalize().unwrap();
+    crate::worktree_adoption::tests::link(&policy);
+    let original = temp.path().join("main").canonicalize().unwrap();
+    let session = WorktreeSession::default();
+    session.record_task_worktree(&policy.worktree, "task");
+    assert_eq!(session.task_root(&original), Some(policy.worktree.clone()));
+    let missing = policy.worktree.join("missing");
+    let task_text = dunce::simplified(&policy.worktree).display().to_string();
+    let missing_text = dunce::simplified(&missing).display().to_string();
+    for (name, args, phrases) in [
+        (
+            "run_command",
+            serde_json::json!({"command":"echo should-not-run", "cwd":missing}),
+            vec![
+                ("working directory", missing_text),
+                ("default working directory remains", task_text.clone()),
+            ],
+        ),
+        (
+            "read_file",
+            serde_json::json!({"path":"missing.txt"}),
+            vec![("resolved against", task_text)],
+        ),
+    ] {
+        if name != tool {
+            continue;
+        }
+        let (out, cwd, _) = call(&session, &original, name, args, &Caveats::top()).await;
+        assert!(cwd.is_none());
+        let rendered = crate::tty::width::strip_ansi(&render_markdown(
+            &out,
+            RenderOpts {
+                color: true,
+                cols: 4096,
+            },
+        ));
+        for (prefix, path) in phrases {
+            assert!(rendered.contains(&format!("{prefix} {path}")), "{rendered}");
+            assert!(out.contains(&format!("{prefix} `{path}`")), "{out}");
+        }
+    }
+}
+
+/// #2783: the missing cwd and retained task cwd must remain literal paths.
+#[cfg(feature = "markdown")]
+#[tokio::test]
+async fn handoff_2783_bound_task_cwd_error_rendering() {
+    bound_task_error_rendering("run_command").await;
+}
+
+/// #2783: a relative-file failure names the bound task root literally.
+#[cfg(feature = "markdown")]
+#[tokio::test]
+async fn handoff_2783_bound_task_file_error_rendering() {
+    bound_task_error_rendering("read_file").await;
 }
