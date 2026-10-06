@@ -210,6 +210,11 @@ jobs:
         # .githooks/pre-push. Unix fixture; selected explicitly on Linux.
         # --exact reaches the ignored dispatch test, including operator preview.
         run: cargo test -p newt-core --lib agentic::tools::worktree::fullaccess_tests::adoption_2750_full_access_creation_then_task_command -- --ignored --exact
+      - name: worktree nudge dispatch proof (#2761)
+        # HOOK PARITY: CI-only real Git/host-shell proof, named in
+        # .githooks/pre-push. Select the ignored production-annotation test
+        # exactly so removing the result wiring cannot leave CI green.
+        run: env RUSTC_WRAPPER= CARGO_BUILD_JOBS=4 nice -n 10 ionice -c3 cargo test -p newt-core --lib agentic::tools::worktree::nudge::tests::worktree_nudge_dispatch_result -- --ignored --exact
       - name: checked move_from native proof (#2724)
         # HOOK PARITY: CI-only; .githooks/pre-push names this real-Cargo
         # lane in its CI-ONLY list. ast and the network-guard helper are
