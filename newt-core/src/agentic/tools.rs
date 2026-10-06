@@ -4408,6 +4408,7 @@ async fn execute_authorized_tool(
                     std::path::Path::new(&run_cwd),
                     caveats,
                     &mut permission_gate,
+                    governed_pr,
                 ));
             }
             if governed_git && native_git::needs_pr_create_broker(cmd) {

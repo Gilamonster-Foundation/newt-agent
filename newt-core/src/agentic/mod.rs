@@ -4142,7 +4142,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 tool_t0,
             );
             if let Some(outcome) = governed_pr.get() {
-                verification.record_pr_outcome(outcome);
+                verification.record_publication_outcome(outcome);
             }
             if ok {
                 if let Some(directory) = command_directory.get() {
@@ -6354,6 +6354,7 @@ fn finalize_final_text(
     );
     let text = verification.annotate_cargo_claim(text);
     let text = verification.annotate_pr_claim(text);
+    let text = verification.annotate_push_claim(text);
     redact_model_facing(disclosure, text)
 }
 
@@ -9079,7 +9080,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 tool_t0,
             );
             if let Some(outcome) = governed_pr.get() {
-                verification.record_pr_outcome(outcome);
+                verification.record_publication_outcome(outcome);
             }
             if ok {
                 if let Some(directory) = command_directory.get() {
@@ -11601,7 +11602,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 tool_t0,
             );
             if let Some(outcome) = governed_pr.get() {
-                verification.record_pr_outcome(outcome);
+                verification.record_publication_outcome(outcome);
             }
             if ok {
                 if let Some(directory) = command_directory.get() {
@@ -13342,7 +13343,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 tool_t0,
             );
             if let Some(outcome) = governed_pr.get() {
-                verification.record_pr_outcome(outcome);
+                verification.record_publication_outcome(outcome);
             }
             if ok {
                 if let Some(directory) = command_directory.get() {

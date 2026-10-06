@@ -145,7 +145,8 @@ fn created_references(clause: &str) -> Vec<Vec<String>> {
 }
 
 impl VerificationLedger {
-    pub(crate) fn record_pr_outcome(&mut self, outcome: &crate::git_staging::Outcome) {
+    pub(crate) fn record_publication_outcome(&mut self, outcome: &crate::git_staging::Outcome) {
+        self.record_push_outcome(outcome);
         if let crate::git_staging::Outcome::PrCreated { url } = outcome {
             if let Some(url) = crate::git_staging::validate_pr_url(url) {
                 if !self.created_prs.contains(&url) {
