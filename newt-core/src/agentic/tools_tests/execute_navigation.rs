@@ -41,6 +41,7 @@ fn plan_advertises_registered_navigation_reads_only() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     let defs = filter_tools_for_disposition(definitions, PromptDisposition::Plan);
     for name in crate::navigator::NAV_TOOL_NAMES {

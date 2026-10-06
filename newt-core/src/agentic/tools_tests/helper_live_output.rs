@@ -124,6 +124,7 @@ async fn blocked_live_sink_cannot_delay_host_timeout() {
     let relay = session.relay();
     let run = tokio::spawn(async move {
         host_shell_output_with_timeout(
+            super::shell::ShellRoute::BashSh,
             "printf ready; sleep 5",
             ".",
             Some(relay),
@@ -191,6 +192,7 @@ async fn blocked_live_sink_cannot_backpressure_host_pipe_capture() {
     // it. A 5 s ceiling plus a 2 s outer budget read a loaded box as the bug.
     let run = tokio::spawn(async move {
         host_shell_output_with_timeout(
+            super::shell::ShellRoute::BashSh,
             "head -c 262144 /dev/zero",
             ".",
             Some(relay),
@@ -246,7 +248,14 @@ async fn host_bypass_publishes_output_before_command_completion() {
     let session = LiveOutputSession::start(Some(sink)).unwrap();
     let relay = session.relay();
     let handle = tokio::spawn(async move {
-        host_shell_output(&command, ".", Some(relay), Default::default()).await
+        host_shell_output(
+            super::shell::ShellRoute::BashSh,
+            &command,
+            ".",
+            Some(relay),
+            Default::default(),
+        )
+        .await
     });
 
     let first = tokio::task::spawn_blocking(move || {

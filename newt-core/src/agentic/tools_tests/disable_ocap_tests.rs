@@ -648,6 +648,7 @@ async fn host_shell_127_wording_grounds_the_named_missing_rule() {
         ("exit 127", ExecOutcome::Failed),
     ] {
         let envelope = super::shell::host_shell_dispatch(
+            super::shell::ShellRoute::BashSh,
             cmd,
             &ws.path().to_string_lossy(),
             None,
@@ -672,6 +673,7 @@ async fn host_shell_envelope_matches_the_bridle_shape() {
     let _l = env_lock().await;
     let ws = tempfile::TempDir::new().unwrap();
     let envelope = super::shell::host_shell_dispatch(
+        super::shell::ShellRoute::BashSh,
         "echo out; echo err >&2; exit 3",
         &ws.path().to_string_lossy(),
         None,

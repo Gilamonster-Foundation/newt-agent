@@ -40,6 +40,7 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
     let mut reaches = Vec::new();
     chat_complete(
         ChatCtx {
+            shell_dialect: crate::agentic::shell_dialect_sentence(false, false),
             command_budget: Default::default(),
             overflow_retry: Default::default(),
             run_allowance: None,
@@ -202,6 +203,7 @@ async fn openai_loop_records_tool_events_with_digested_args() {
     let mut events: Vec<crate::ToolEvent> = Vec::new();
     openai_chat_complete(
         ChatCtx {
+            shell_dialect: crate::agentic::shell_dialect_sentence(false, false),
             command_budget: Default::default(),
             overflow_retry: Default::default(),
             run_allowance: None,
@@ -330,6 +332,7 @@ fn outcome_ctx<'a>(
     events: &'a mut Vec<crate::ToolEvent>,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        shell_dialect: crate::agentic::shell_dialect_sentence(false, false),
         command_budget: Default::default(),
         verify_outcomes: false,
         round_cap_hit: None,

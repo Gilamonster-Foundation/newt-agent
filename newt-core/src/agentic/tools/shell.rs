@@ -634,6 +634,75 @@ pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value 
     })
 }
 
+/// Execution route shared by admission, child construction and catalog guidance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ShellRoute {
+    Cmd,
+    BashSh,
+    Bridled(crate::ShellEngine),
+}
+
+/// Keep command-specific clamps in this decision, rather than inferring the
+/// shell from the session's OCAP switch alone. A broker always needs Brush.
+pub(super) fn select_shell_route(
+    bypass_enabled: bool,
+    has_broker: bool,
+    has_lease: bool,
+    floor_permits: bool,
+    windows: bool,
+    engine: crate::ShellEngine,
+) -> ShellRoute {
+    if bypass_enabled && !has_broker && !has_lease && floor_permits {
+        if windows {
+            ShellRoute::Cmd
+        } else {
+            ShellRoute::BashSh
+        }
+    } else {
+        ShellRoute::Bridled(if has_broker {
+            crate::ShellEngine::Brush
+        } else {
+            engine
+        })
+    }
+}
+
+impl ShellRoute {
+    pub(super) fn sentence(self) -> &'static str {
+        match self {
+            Self::Cmd => "Commands run under cmd.exe /C: chain with &&; POSIX ; and $? are not supported. run_command already returns the exit status — do not echo it.",
+            Self::BashSh | Self::Bridled(_) => "Commands use POSIX shell syntax; the selected engine may restrict shell constructs.",
+        }
+    }
+}
+
+/// Capture the session-default route. Brokers, leases and exec floors are
+/// command-specific: execution re-evaluates them before dispatch.
+pub fn run_command_dialect_sentence() -> &'static str {
+    select_shell_route(
+        ocap_disabled(),
+        false,
+        false,
+        true,
+        cfg!(windows),
+        shell_engine(),
+    )
+    .sentence()
+}
+
+/// Pure session-default guidance for callers with injected platform/authority.
+pub fn shell_dialect_sentence(host_bypass: bool, windows: bool) -> &'static str {
+    select_shell_route(
+        host_bypass,
+        false,
+        false,
+        true,
+        windows,
+        crate::ShellEngine::SafeSubset,
+    )
+    .sentence()
+}
+
 /// The shell engine selected for this dispatch (ADR 0005 D2 seam). An explicit
 /// `[shell] engine` / `--shell-engine` choice is published by the CLI through
 /// `NEWT_SHELL_ENGINE`, so deep `run_command` dispatch reads it without threading
@@ -919,12 +988,18 @@ async fn dispatch_bridled_shell_with_floor(
     } else {
         dispatch_caveats_for_command(cmd.unwrap_or(""), caveats)
     };
+    let ShellRoute::Bridled(engine) = select_shell_route(
+        false,
+        command_broker.is_some(),
+        execution_lease.is_some(),
+        true,
+        cfg!(windows),
+        shell_engine(),
+    ) else {
+        unreachable!("bridled dispatch cannot bypass confinement")
+    };
     let registry = bridle_registry(
-        if command_broker.is_some() {
-            crate::ShellEngine::Brush
-        } else {
-            shell_engine()
-        },
+        engine,
         live.as_ref().map(LiveOutputSession::relay),
         wall,
         execution_lease.clone(),
@@ -1163,10 +1238,15 @@ pub(super) async fn exec_confined_command_with_broker(
     // command's leading token; else it falls through to the confined shell,
     // which enforces the already-clamped `caveats`. `None` keeps the bypass
     // bit-for-bit.
-    let host_bypass = command_broker.is_none()
-        && execution_lease.is_none()
-        && ocap_disabled()
-        && exec_floor_permits(exec_floor, cmd);
+    let route = select_shell_route(
+        ocap_disabled(),
+        command_broker.is_some(),
+        execution_lease.is_some(),
+        exec_floor_permits(exec_floor, cmd),
+        cfg!(windows),
+        shell_engine(),
+    );
+    let host_bypass = !matches!(route, ShellRoute::Bridled(_));
 
     // #1176: shadow-OCAP — record the authority a leash WOULD have gated on
     // whenever this command runs UNCONFINED: the yolo/disable-ocap host bypass
@@ -1182,6 +1262,7 @@ pub(super) async fn exec_confined_command_with_broker(
     if host_bypass {
         let mut live = LiveOutputSession::start(live_tool_output);
         let run = host_shell_dispatch(
+            route,
             &cmd_with_venv,
             cwd,
             live.as_ref().map(LiveOutputSession::relay),
@@ -1797,6 +1878,7 @@ fn host_named_missing(envelope: &serde_json::Value) -> Option<&str> {
 }
 
 pub(super) async fn host_shell_dispatch(
+    route: ShellRoute,
     cmd: &str,
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
@@ -1805,9 +1887,9 @@ pub(super) async fn host_shell_dispatch(
 ) -> std::io::Result<serde_json::Value> {
     let wall = command_wall(cmd, timeout_secs, command_budget);
     let run = if timeout_secs.is_none() && wall != LIFECYCLE_BUILD_TIMEOUT {
-        host_shell_output(cmd, cwd, live, command_budget).await?
+        host_shell_output(route, cmd, cwd, live, command_budget).await?
     } else {
-        host_shell_output_with_timeout(cmd, cwd, live, wall).await?
+        host_shell_output_with_timeout(route, cmd, cwd, live, wall).await?
     };
     Ok(serde_json::json!({
         "exit_code": run.exit_code,
@@ -1961,12 +2043,13 @@ async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
 ///   path's envelope shape.
 #[cfg(not(windows))]
 pub(super) async fn host_shell_output(
+    route: ShellRoute,
     cmd: &str,
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     command_budget: crate::RunCommandBudget,
 ) -> std::io::Result<HostShellRun> {
-    host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout(command_budget)).await
+    host_shell_output_with_timeout(route, cmd, cwd, live, host_exec_timeout(command_budget)).await
 }
 
 /// newt's control-plane env vars that must NEVER flow into a host-shell child
@@ -2020,26 +2103,38 @@ fn strip_child_authority_env(c: &mut tokio::process::Command) {
 /// inherits the rest of the environment (the Yolo lane's explicit ambient-
 /// authority grant). Own process group (setsid-equivalent) + `kill_on_drop` so a
 /// hung or tty-stealing child is reaped as a whole tree.
-#[cfg(not(windows))]
-pub(super) fn host_shell_command(program: &str, cmd: &str, cwd: &str) -> tokio::process::Command {
+pub(super) fn host_shell_command(
+    route: ShellRoute,
+    fallback: bool,
+    cmd: &str,
+    cwd: &str,
+) -> std::io::Result<tokio::process::Command> {
     use std::process::Stdio;
+    let (program, flag) = match route {
+        ShellRoute::Cmd => ("cmd", "/C"),
+        ShellRoute::BashSh => (if fallback { "sh" } else { "bash" }, "-c"),
+        ShellRoute::Bridled(_) => {
+            return Err(std::io::Error::other(
+                "bridled route cannot construct an ambient child",
+            ))
+        }
+    };
     let mut c = tokio::process::Command::new(program);
-    c.arg("-c")
-        .arg(cmd)
+    c.args([flag, cmd])
         .current_dir(cwd)
-        // A child that reads stdin gets EOF, never a blocking wait on a tty
-        // the agent cannot drive.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true);
+    #[cfg(not(windows))]
+    c.process_group(0);
     strip_child_authority_env(&mut c);
-    c
+    Ok(c)
 }
 
 #[cfg(not(windows))]
 pub(super) async fn host_shell_output_with_timeout(
+    route: ShellRoute,
     cmd: &str,
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
@@ -2091,10 +2186,15 @@ pub(super) async fn host_shell_output_with_timeout(
         }
     }
 
-    match host_shell_command("bash", cmd, cwd).spawn() {
+    match host_shell_command(route, false, cmd, cwd)?.spawn() {
         Ok(child) => run_one(child, live, timeout).await,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            run_one(host_shell_command("sh", cmd, cwd).spawn()?, live, timeout).await
+        Err(e) if route == ShellRoute::BashSh && e.kind() == std::io::ErrorKind::NotFound => {
+            run_one(
+                host_shell_command(route, true, cmd, cwd)?.spawn()?,
+                live,
+                timeout,
+            )
+            .await
         }
         Err(e) => Err(e),
     }
@@ -2105,34 +2205,24 @@ pub(super) async fn host_shell_output_with_timeout(
 /// `kill_on_drop` so a hung child cannot wedge the turn.
 #[cfg(windows)]
 pub(super) async fn host_shell_output(
+    route: ShellRoute,
     cmd: &str,
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     command_budget: crate::RunCommandBudget,
 ) -> std::io::Result<HostShellRun> {
-    host_shell_output_with_timeout(cmd, cwd, live, host_exec_timeout(command_budget)).await
+    host_shell_output_with_timeout(route, cmd, cwd, live, host_exec_timeout(command_budget)).await
 }
 
 #[cfg(windows)]
 pub(super) async fn host_shell_output_with_timeout(
+    route: ShellRoute,
     cmd: &str,
     cwd: &str,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     timeout: std::time::Duration,
 ) -> std::io::Result<HostShellRun> {
-    use std::process::Stdio;
-
-    // step-7.1a / #8 / invariant 9: newt's whole control plane (authority
-    // switches + newt's own secrets) must not flow into the host-shell child.
-    let mut cmd_builder = tokio::process::Command::new("cmd");
-    cmd_builder
-        .args(["/C", cmd])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    strip_child_authority_env(&mut cmd_builder);
+    let mut cmd_builder = host_shell_command(route, false, cmd, cwd)?;
     let mut child = cmd_builder.spawn()?;
 
     let stdout = child

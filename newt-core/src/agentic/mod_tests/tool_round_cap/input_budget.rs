@@ -62,6 +62,7 @@ fn mid_sized_pair_budget(task: &str, responses_wire: bool) -> usize {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     let tools = if responses_wire {
         serde_json::Value::Array(tools_to_responses(&chat_tools))

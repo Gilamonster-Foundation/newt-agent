@@ -177,6 +177,7 @@ pub(super) async fn run_scenario_for(
     };
     let mut end_reason: Option<crate::TurnEndReason> = None;
     let mut c = ChatCtx {
+        shell_dialect: crate::agentic::shell_dialect_sentence(false, false),
         command_budget: Default::default(),
         overflow_retry: Default::default(),
         run_allowance: None,

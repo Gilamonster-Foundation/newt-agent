@@ -378,6 +378,7 @@ fn get_context_remaining_is_a_real_tool_not_a_phantom() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     assert!(defs
         .as_array()

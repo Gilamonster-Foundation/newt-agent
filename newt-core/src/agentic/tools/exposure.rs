@@ -822,6 +822,7 @@ mod tests {
             true,
             true,
             Default::default(),
+            crate::agentic::shell_dialect_sentence(false, false),
         );
         let full_tokens = crate::agentic::trim::estimate_value_tokens(&full, est());
         let settings = ExposureSettings {

@@ -187,6 +187,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
 
     let (reply, _, _, hallucinations) = chat_complete(
         ChatCtx {
+            shell_dialect: crate::agentic::shell_dialect_sentence(false, false),
             command_budget: Default::default(),
             overflow_retry: Default::default(),
             run_allowance: None,

@@ -132,6 +132,7 @@ fn persona_preferences_rank_the_full_advertised_catalog() {
         true,
         true,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     let name_set = |v: &serde_json::Value| -> Vec<String> {
         v.as_array()
@@ -295,6 +296,7 @@ fn explicit_plan_filters_catalog_without_treating_response_style_as_authority() 
             false,
             false,
             Default::default(),
+            crate::agentic::shell_dialect_sentence(false, false),
         ),
         PromptDisposition::Research,
     );

@@ -443,6 +443,7 @@ fn merged_model_catalog_scrubs_affinity_but_recovery_catalog_retains_it() {
         false,
         false,
         Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
     );
     let remote = model_catalog
         .as_array()

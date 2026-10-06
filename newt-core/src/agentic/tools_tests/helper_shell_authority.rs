@@ -169,7 +169,7 @@ async fn run_command_route_fd_hygiene_is_cloexec_based_via_fdguard() {
 #[cfg(not(windows))]
 #[test]
 fn host_shell_command_strips_authority_env() {
-    let c = host_shell_command("bash", "true", "/tmp");
+    let c = host_shell_command(super::shell::ShellRoute::BashSh, false, "true", "/tmp").unwrap();
     let removed: Vec<String> = c
         .as_std()
         .get_envs()

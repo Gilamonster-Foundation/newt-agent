@@ -384,6 +384,7 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
     let uri = server.uri();
     let (reply, streamed, usage, _hallu) = openai_responses_complete_with_prompt(
         ChatCtx {
+            shell_dialect: crate::agentic::shell_dialect_sentence(false, false),
             command_budget: Default::default(),
             overflow_retry: Default::default(),
             run_allowance: None,
