@@ -150,6 +150,11 @@ pub(crate) struct Creation {
     path_guard: destination::Destination,
 }
 impl Creation {
+    /// Canonical paths also catch destinations reached through a symlink or -C.
+    pub(crate) fn nested_in_original(&self) -> bool {
+        self.destination.starts_with(&self.original)
+    }
+
     pub(crate) fn destination(&self) -> &Path {
         &self.destination
     }

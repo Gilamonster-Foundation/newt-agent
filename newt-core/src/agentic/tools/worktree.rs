@@ -458,6 +458,18 @@ pub(super) async fn execute(
         };
         return format!("capability denied: cannot verify this worktree creation and its surrounding commands; run `git worktree add -b <new-branch> <path> [<start>]` as a standalone literal command in the original checkout{protection}. Do not create the branch in the original checkout first; -b creates it for the new worktree");
     };
+    if candidate
+        .as_ref()
+        .is_some_and(|(candidate, _)| candidate.nested_in_original())
+    {
+        if let Some(invocation) = collab.invocation {
+            invocation.host();
+        }
+        if let Some(slot) = collab.execution {
+            let _ = slot.set(crate::ExecOutcome::Denied);
+        }
+        return "capability denied: the task worktree must be outside the original checkout; choose a sibling destination, for example `git worktree add -b <new-branch> ../<name> [<start>]`".into();
+    }
     let mut candidate = candidate.map(|(candidate, source)| {
         normalized.to_mut()["command"] = source.into();
         candidate
@@ -622,7 +634,11 @@ pub(super) async fn execute(
         }
     }
     if let Some(policy) = &policy {
-        if execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Denied) {
+        // Shell denials are classified from their structured filesystem evidence
+        // at dispatch. An exec miss or pending grant is not an adoption fence.
+        if name != "run_command"
+            && execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Denied)
+        {
             result.push_str(&format!("\n{}", policy.notice()));
         } else if execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Failed) {
             result.push_str(&format!(
@@ -661,6 +677,10 @@ mod fullaccess_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tools_tests/worktree_adoption_refs.rs"]
 mod refs_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tools_tests/worktree_adoption_nested.rs"]
+mod nested_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tools_tests/worktree_adoption_sibling.rs"]

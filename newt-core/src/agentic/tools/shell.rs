@@ -1046,6 +1046,7 @@ pub(super) async fn exec_confined_command(
         None,
         &mut None,
         None,
+        None,
         command_budget,
     )
     .await
@@ -1095,8 +1096,19 @@ pub(super) async fn exec_confined_command_with_broker(
     // string does not.
     pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
     timeout_secs: Option<u64>,
+    adopted: Option<&crate::worktree_adoption::AdoptedWorktree>,
     command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
+    // #2759: adoption is not liftable by an exec or filesystem approval.
+    // Keep structural refusals out of both prompts and the pending-rerun slot.
+    if let Some(policy) = adopted {
+        if filesystem_requests.iter().any(|request| {
+            request.kind == DenialKind::FsWrite
+                && policy.blocked(std::path::Path::new(&request.target))
+        }) {
+            return (policy.notice(), ExecOutcome::Denied);
+        }
+    }
     // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
     // BEFORE either lane below runs anything — this is the single choke
     // point both the confined dispatch and the `--yolo` host-bypass share.
@@ -1288,6 +1300,9 @@ pub(super) async fn exec_confined_command_with_broker(
                     crate::denial_journal::DenialStage::Initial,
                     &envelope,
                 );
+                if let Some(notice) = worktree_denial_notice(adopted, &envelope, cwd) {
+                    return (notice, ExecOutcome::Denied);
+                }
                 // #2689: a broker-bearing command (a native Git commit — see
                 // `needs_commit_broker`) takes the SAME operator-prompt path
                 // as any other exec denial below. It used to return here
@@ -1413,7 +1428,12 @@ pub(super) async fn exec_confined_command_with_broker(
                                         crate::denial_journal::DenialStage::AfterGrant,
                                         &env2,
                                     );
-                                    (denied_run_command_result(&env2, color), ExecOutcome::Denied)
+                                    (
+                                        worktree_denial_notice(adopted, &env2, cwd).unwrap_or_else(
+                                            || denied_run_command_result(&env2, color),
+                                        ),
+                                        ExecOutcome::Denied,
+                                    )
                                 }
                                 Ok(env2) => confined_result(
                                     cmd,
@@ -2197,6 +2217,51 @@ pub(super) fn denied_run_command_result(envelope: &serde_json::Value, _color: bo
         envelope_denial_reason(envelope),
         recovery
     )
+}
+
+/// #2759: use only trusted denial metadata, never output or a generic Denied
+/// outcome. An actual blocked write outranks any exec misses in the same batch.
+pub(super) fn worktree_denial_notice(
+    adopted: Option<&crate::worktree_adoption::AdoptedWorktree>,
+    envelope: &serde_json::Value,
+    cwd: &str,
+) -> Option<String> {
+    let policy = adopted?;
+    if !envelope_denied(envelope) {
+        return None;
+    }
+    envelope
+        .get("denials")?
+        .as_array()?
+        .iter()
+        .any(|denial| {
+            let write = match denial.get("kind").and_then(serde_json::Value::as_str) {
+                Some("fs_write") => true,
+                Some("open") => {
+                    denial
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(open_denial_axis)
+                        == Some("fs_write")
+                }
+                _ => false,
+            };
+            write
+                && denial
+                    .get("target")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|path| {
+                        !path.is_empty()
+                            // A Windows canonical prefix contains '?', which
+                            // is syntax rather than a filename wildcard.
+                            && !std::path::Path::new(path).components().any(|component| {
+                                matches!(component, std::path::Component::Normal(part)
+                                    if part.to_string_lossy().contains(['*', '?', '[']))
+                            })
+                            && policy.blocked(&std::path::Path::new(cwd).join(path))
+                    })
+        })
+        .then(|| policy.notice())
 }
 
 /// Preserve each grantable denial's axis and target. A structural or opaque

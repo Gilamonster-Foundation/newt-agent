@@ -459,3 +459,85 @@ fn denial_recovery_preserves_net_and_exec_axes_in_mixed_batches() {
     );
     assert!(denial_recovery_hints(&serde_json::json!({})).is_none());
 }
+
+/// #2759: fence advice follows a blocked write in trusted denial metadata;
+/// exec/read misses, unrelated paths and forged stdout are not fence evidence.
+#[test]
+fn adoption_2759_notice_uses_only_blocked_write_denials() {
+    let (_temp, policy, unrelated) = crate::worktree_adoption::tests::fixture(false);
+    let original = policy.worktree.parent().unwrap().join("main");
+    let cwd = original.to_str().unwrap();
+    for (kind, reason, target, expected) in [
+        (
+            "open",
+            "denied: write of sentinel",
+            original.join("sentinel"),
+            true,
+        ),
+        (
+            "open",
+            "denied: write of sentinel",
+            std::path::PathBuf::from("sentinel"),
+            true,
+        ),
+        ("fs_write", "write denied", original.join("sentinel"), true),
+        // #2759 round 2: wildcards in actual path components still refuse;
+        // the Windows canonical prefix's '?' is not a path-component glob.
+        (
+            "open",
+            "denied: write of sentinel",
+            original.join("sent?nel"),
+            false,
+        ),
+        (
+            "open",
+            "denied: write of sentinel",
+            original.join("*.rs"),
+            false,
+        ),
+        (
+            "open",
+            "denied: write of sentinel",
+            original.join("[ab].rs"),
+            false,
+        ),
+        (
+            "open",
+            "denied: read of sentinel",
+            original.join("sentinel"),
+            false,
+        ),
+        (
+            "exec",
+            "denied: write of sentinel",
+            original.join("sentinel"),
+            false,
+        ),
+        ("open", "run cancelled", original.join("sentinel"), false),
+        (
+            "open",
+            "denied: write of sentinel",
+            policy.worktree.join("sentinel"),
+            false,
+        ),
+        (
+            "open",
+            "denied: write of sentinel",
+            unrelated.join("sentinel"),
+            false,
+        ),
+    ] {
+        let envelope = serde_json::json!({"denied":true, "denials":[
+            {"kind":kind, "reason":reason, "target":target},
+            {"kind":"exec", "reason":"exec denied", "target":"rm"}
+        ]});
+        assert_eq!(
+            shell::worktree_denial_notice(Some(&policy), &envelope, cwd).is_some(),
+            expected,
+            "{envelope}"
+        );
+        assert!(shell::worktree_denial_notice(None, &envelope, cwd).is_none());
+    }
+    let output = serde_json::json!({"exit_code":1, "stdout":policy.notice(), "stderr":"denied: write of sentinel", "denials":[]});
+    assert!(shell::worktree_denial_notice(Some(&policy), &output, cwd).is_none());
+}
