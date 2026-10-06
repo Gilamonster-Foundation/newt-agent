@@ -101,12 +101,13 @@ fn cap_exit_progress_renders_plan_and_state_or_none() {
     let ledger = SessionStepLedger::default();
     let pad = SessionScratchpadStore::default();
     // Both empty → nothing to salvage.
-    assert!(cap_exit_progress(Some(&ledger), Some(&pad)).is_none());
-    assert!(cap_exit_progress(None, None).is_none());
+    assert!(cap_exit_progress(None, Some(&ledger), Some(&pad)).is_none());
+    assert!(cap_exit_progress(None, None, None).is_none());
     // Populated → a combined block naming both.
     ledger.set_plan(&["build it".to_string(), "test it".to_string()]);
     pad.set("cwd", "/work".to_string());
     let p = cap_exit_progress(
+        None,
         Some(&ledger as &dyn StepLedger),
         Some(&pad as &dyn ScratchpadStore),
     )

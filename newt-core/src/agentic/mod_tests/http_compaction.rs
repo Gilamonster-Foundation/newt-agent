@@ -301,7 +301,11 @@ fn post_compaction_continuation_reanchors_on_ground_truth() {
     // worktree is clean, start fresh", DISOWNED its own branch+commit and
     // repeated finished work. The continuation directive must order a
     // ground-truth re-anchor and state the clean-tree≠no-work rule.
-    let d = post_compaction_continuation(None, prompt_read::PromptReadContext::new(None, "", None));
+    let d = post_compaction_continuation(
+        None,
+        None,
+        prompt_read::PromptReadContext::new(None, "", None),
+    );
     assert!(d.contains("re-anchor on ground truth"), "{d}");
     assert!(d.contains("git branch"), "{d}");
     assert!(
@@ -325,6 +329,7 @@ fn post_compaction_continuation_preserves_work_but_defers_to_operator_correction
     ]);
     ledger.advance(); // step 1 done, step 2 active
     let d = post_compaction_continuation(
+        None,
         Some(&ledger),
         prompt_read::PromptReadContext::new(None, "", None),
     );
@@ -343,8 +348,11 @@ fn post_compaction_continuation_preserves_work_but_defers_to_operator_correction
     assert!(!d.contains("NEVER to replace"), "{d}");
     assert!(!d.contains("do not re-plan"), "{d}");
     // No plan → no plan clause (and no panic).
-    let empty =
-        post_compaction_continuation(None, prompt_read::PromptReadContext::new(None, "", None));
+    let empty = post_compaction_continuation(
+        None,
+        None,
+        prompt_read::PromptReadContext::new(None, "", None),
+    );
     assert!(!empty.contains("saved plan is below"), "{empty}");
 }
 
@@ -359,6 +367,7 @@ fn post_compaction_continuation_points_to_the_immutable_prompt_without_quoting_i
     let task = "make a plan, make a branch, write me a commit for each suggestion";
     let turn = crate::TurnPromptContext::ephemeral_operator("conv", task, task);
     let d = post_compaction_continuation(
+        None,
         None,
         prompt_read::PromptReadContext::new(Some(&turn), task, None),
     );
@@ -390,6 +399,7 @@ fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt(
     let mut nudges = 1usize;
 
     apply_post_compaction_continuation(
+        None,
         &mut messages,
         &mut nudges,
         CompressAction::Summarized,
@@ -443,6 +453,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
 
     // Prune-only passes keep the corrective text: no refund, no anchor.
     apply_post_compaction_continuation(
+        None,
         &mut messages,
         &mut nudges,
         CompressAction::Pruned,
@@ -458,6 +469,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
     // compaction): no directive — "You are mid-task … do not summarize"
     // would countermand the operator's brand-new ask sitting above it.
     apply_post_compaction_continuation(
+        None,
         &mut messages,
         &mut nudges,
         CompressAction::Summarized,
@@ -473,6 +485,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
     // directive, and appends exactly one fresh act-now anchor as the last
     // user message.
     apply_post_compaction_continuation(
+        None,
         &mut messages,
         &mut nudges,
         CompressAction::Summarized,
@@ -529,6 +542,7 @@ fn post_compaction_optional_hint_obeys_each_provider_budget() {
         let mut with_hint = original.clone();
         let mut nudges = 1;
         apply_post_compaction_continuation(
+            None,
             &mut with_hint,
             &mut nudges,
             CompressAction::StaticFallback,
@@ -560,6 +574,7 @@ fn post_compaction_optional_hint_obeys_each_provider_budget() {
             let mut messages = original.clone();
             let mut nudges = 1;
             apply_post_compaction_continuation(
+                None,
                 &mut messages,
                 &mut nudges,
                 CompressAction::StaticFallback,

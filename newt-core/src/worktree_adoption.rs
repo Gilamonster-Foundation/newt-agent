@@ -12,12 +12,24 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default)]
 pub struct WorktreeSession {
     adopted: std::sync::Mutex<Option<AdoptedWorktree>>,
+    // Advisory working state, independent of whether confinement is armed.
+    task_hint: std::sync::Mutex<Option<String>>,
     pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
 }
 impl WorktreeSession {
     /// Explicit operator lift, also used at the existing new-task boundary.
     pub fn lift(&self) {
         *self.adopted.lock().expect("worktree session lock") = None;
+        *self.task_hint.lock().expect("worktree hint lock") = None;
+    }
+    pub(crate) fn record_task_worktree(&self, path: &Path, branch: &str) {
+        *self.task_hint.lock().expect("worktree hint lock") = Some(format!(
+            "Task worktree: {} (branch {branch}) — run commands there, not in the original checkout.",
+            path.display()
+        ));
+    }
+    pub(crate) fn task_hint(&self) -> Option<String> {
+        self.task_hint.lock().expect("worktree hint lock").clone()
     }
     pub(crate) fn snapshot(&self) -> Option<AdoptedWorktree> {
         self.adopted.lock().expect("worktree session lock").clone()
@@ -34,6 +46,7 @@ impl WorktreeSession {
 pub(crate) struct AdoptedWorktree {
     original: PathBuf,
     pub(crate) worktree: PathBuf,
+    pub(crate) task_branch: Option<String>,
     common: PathBuf,
     admin: PathBuf,
     protected_branch: Option<String>,
@@ -264,6 +277,7 @@ impl Creation {
         Some(AdoptedWorktree {
             original: self.original,
             worktree: self.destination,
+            task_branch: crate::git_staging::read_head_branch(&admin, &held).ok(),
             common,
             admin,
             protected_branch: self.protected_branch,
