@@ -334,7 +334,7 @@ pub(super) fn read_for_edit(
     scope: &Scope<String>,
     path: &Path,
     label: &str,
-) -> Result<String, String> {
+) -> Result<String, super::FileIoError> {
     let read = (|| {
         let mut file = open_for_scope(scope, path, false)?;
         let mut text = String::new();
@@ -348,13 +348,17 @@ pub(super) fn read_for_edit(
             // would be asked for; `label` (the model's spelling) is kept for
             // the ordinary read error only.
             if error.kind() == io::ErrorKind::PermissionDenied {
-                return Err(super::denied_fs_result("fs_write", &path.to_string_lossy()));
+                return Err(super::denied_fs_result("fs_write", &path.to_string_lossy()).into());
             }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if super::is_fs_containment_denied(&error) {
-                return Err(super::denied_fs_result("fs_write", &path.to_string_lossy()));
+                return Err(super::denied_fs_result("fs_write", &path.to_string_lossy()).into());
             }
-            Err(format!("error: reading {label}: {error}"))
+            Err(super::FileIoError::io(
+                &error,
+                path,
+                format!("error: reading {label}: {error}"),
+            ))
         }
     }
 }

@@ -51,12 +51,14 @@ mod file_change;
 #[cfg(feature = "ast")]
 mod move_from;
 mod navigation;
+mod path_suggest;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
 pub use dispatch::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
+use path_suggest::FileIoError;
 pub(crate) mod exposure;
 mod grep_tool;
 mod live_output;
@@ -574,13 +576,13 @@ fn object_bound_target<'a>(
 
 /// Unconfined directory listing via `std::fs` — the `Scope::All` / non-Linux /
 /// #263-gate-approved path. One owner so the three call sites don't drift.
-fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, String> {
+fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, FileIoError> {
     match std::fs::read_dir(full) {
         Ok(entries) => Ok(entries
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect()),
-        Err(e) => Err(format!("error: {e}")),
+        Err(e) => Err(FileIoError::io(&e, full, format!("error: {e}"))),
     }
 }
 
@@ -601,15 +603,14 @@ fn object_bound_read(
     path: &str,
     full: &std::path::Path,
     full_str: &str,
-) -> Result<String, String> {
+) -> Result<String, FileIoError> {
     use std::io::Read;
     match object_bound_target(scope, full_str) {
         // The gate already permitted this read, so `None` here would be a logic
         // error (the two matchers disagreeing); fail closed rather than read.
-        None => Err(denied_fs_result(axis, full_str)),
-        Some(None) => {
-            std::fs::read_to_string(full).map_err(|e| format!("error: reading {path}: {e}"))
-        }
+        None => Err(denied_fs_result(axis, full_str).into()),
+        Some(None) => std::fs::read_to_string(full)
+            .map_err(|e| FileIoError::io(&e, full, format!("error: reading {path}: {e}"))),
         Some(Some((root, rel))) => {
             let read = crate::fs_cap::WorkspaceDir::open_granted_file(
                 std::path::Path::new(root),
@@ -623,8 +624,14 @@ fn object_bound_read(
             });
             match read {
                 Ok(s) => Ok(s),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, full_str)),
-                Err(e) => Err(format!("error: reading {path}: {e}")),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(denied_fs_result(axis, full_str).into())
+                }
+                Err(e) => Err(FileIoError::io(
+                    &e,
+                    full,
+                    format!("error: reading {path}: {e}"),
+                )),
             }
         }
     }
@@ -639,9 +646,9 @@ fn object_bound_list(
     scope: &crate::caveats::Scope<String>,
     full: &std::path::Path,
     full_str: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, FileIoError> {
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_read", full_str)),
+        None => Err(denied_fs_result("fs_read", full_str).into()),
         Some(None) => std_list_dir(full),
         Some(Some((root, rel))) => {
             match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
@@ -652,9 +659,9 @@ fn object_bound_list(
                     .map(|n| n.to_string_lossy().into_owned())
                     .collect()),
                 Err(e) if is_fs_containment_denied(&e) => {
-                    Err(denied_fs_result("fs_read", full_str))
+                    Err(denied_fs_result("fs_read", full_str).into())
                 }
-                Err(e) => Err(format!("error: {e}")),
+                Err(e) => Err(FileIoError::io(&e, full, format!("error: {e}"))),
             }
         }
     }
@@ -670,8 +677,9 @@ fn object_bound_read(
     path: &str,
     full: &std::path::Path,
     _full_str: &str,
-) -> Result<String, String> {
-    std::fs::read_to_string(full).map_err(|e| format!("error: reading {path}: {e}"))
+) -> Result<String, FileIoError> {
+    std::fs::read_to_string(full)
+        .map_err(|e| FileIoError::io(&e, full, format!("error: reading {path}: {e}")))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -679,17 +687,18 @@ fn object_bound_list(
     _scope: &crate::caveats::Scope<String>,
     full: &std::path::Path,
     _full_str: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, FileIoError> {
     std_list_dir(full)
 }
 
 /// Unconfined write via `std::fs` (creating parents) — the `Scope::All` /
 /// non-Linux / #263-gate-approved path. One owner so the call sites don't drift.
-fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), String> {
+fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), FileIoError> {
     if let Some(parent) = full.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(full, content).map_err(|e| format!("error: writing {path}: {e}"))
+    std::fs::write(full, content)
+        .map_err(|e| FileIoError::io(&e, full, format!("error: writing {path}: {e}")))
 }
 
 /// Object-bound write of `content` to `full` (the workspace-joined model path)
@@ -708,10 +717,10 @@ fn object_bound_write(
     full: &std::path::Path,
     full_str: &str,
     content: &str,
-) -> Result<(), String> {
+) -> Result<(), FileIoError> {
     use std::io::Write;
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result(axis, full_str)),
+        None => Err(denied_fs_result(axis, full_str).into()),
         Some(None) => std_write(full, path, content),
         Some(Some((root, rel))) => {
             let write =
@@ -722,8 +731,14 @@ fn object_bound_write(
                     });
             match write {
                 Ok(()) => Ok(()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, full_str)),
-                Err(e) => Err(format!("error: writing {path}: {e}")),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(denied_fs_result(axis, full_str).into())
+                }
+                Err(e) => Err(FileIoError::io(
+                    &e,
+                    full,
+                    format!("error: writing {path}: {e}"),
+                )),
             }
         }
     }
@@ -737,7 +752,7 @@ fn object_bound_write(
     full: &std::path::Path,
     _full_str: &str,
     content: &str,
-) -> Result<(), String> {
+) -> Result<(), FileIoError> {
     std_write(full, path, content)
 }
 
@@ -752,21 +767,24 @@ fn object_bound_delete(
     path: &str,
     full: &std::path::Path,
     full_str: &str,
-) -> Result<(), String> {
+) -> Result<(), FileIoError> {
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_write", full_str)),
-        Some(None) => {
-            std::fs::remove_file(full).map_err(|e| format!("error: deleting {path}: {e}"))
-        }
+        None => Err(denied_fs_result("fs_write", full_str).into()),
+        Some(None) => std::fs::remove_file(full)
+            .map_err(|e| FileIoError::io(&e, full, format!("error: deleting {path}: {e}"))),
         Some(Some((root, rel))) => {
             match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
                 .and_then(|dir| dir.unlink(&rel))
             {
                 Ok(()) => Ok(()),
                 Err(e) if is_fs_containment_denied(&e) => {
-                    Err(denied_fs_result("fs_write", full_str))
+                    Err(denied_fs_result("fs_write", full_str).into())
                 }
-                Err(e) => Err(format!("error: deleting {path}: {e}")),
+                Err(e) => Err(FileIoError::io(
+                    &e,
+                    full,
+                    format!("error: deleting {path}: {e}"),
+                )),
             }
         }
     }
@@ -778,8 +796,9 @@ fn object_bound_delete(
     path: &str,
     full: &std::path::Path,
     _full_str: &str,
-) -> Result<(), String> {
-    std::fs::remove_file(full).map_err(|e| format!("error: deleting {path}: {e}"))
+) -> Result<(), FileIoError> {
+    std::fs::remove_file(full)
+        .map_err(|e| FileIoError::io(&e, full, format!("error: deleting {path}: {e}")))
 }
 
 /// Whether `find`'s recursive-read root is contained to the WORKSPACE. Unlike
@@ -1676,8 +1695,10 @@ pub(super) fn authorized_read(
     if scope_permits {
         object_bound_read(&caveats.fs_read, "fs_read", path, &full, &full_str)
     } else {
-        std::fs::read_to_string(&full).map_err(|e| format!("error: reading {path}: {e}"))
+        std::fs::read_to_string(&full)
+            .map_err(|e| FileIoError::io(&e, &full, format!("error: reading {path}: {e}")))
     }
+    .map_err(|error| error.render(workspace, &caveats.fs_read))
 }
 
 fn fs_gate_allows(
@@ -5264,7 +5285,7 @@ async fn execute_authorized_tool(
                             .unwrap_or_default();
                         receipt.present_success(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
-                    Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                    Err(tool_output) => receipt.present(file_capture::failure(tool_output.render(workspace, &caveats.fs_read), ""), "", presentation),
                 }
             } else {
                 format!("user declined to write {path}")
@@ -5299,7 +5320,7 @@ async fn execute_authorized_tool(
             let meta = match std::fs::symlink_metadata(&full) {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return format!("error: deleting {path}: file does not exist");
+                    return FileIoError::io(&e, &full, format!("error: deleting {path}: file does not exist")).render(workspace, &caveats.fs_read);
                 }
                 Err(e) => return format!("error: deleting {path}: {e}"),
             };
@@ -5335,7 +5356,7 @@ async fn execute_authorized_tool(
             let delete_result = if scope_permits {
                 object_bound_delete(&caveats.fs_write, path, &full, &full_str)
             } else {
-                std::fs::remove_file(&full).map_err(|e| format!("error: deleting {path}: {e}"))
+                std::fs::remove_file(&full).map_err(|e| FileIoError::io(&e, &full, format!("error: deleting {path}: {e}")))
             };
             let receipt_after = file_capture::capture(&caveats.fs_read, &full);
             let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
@@ -5389,7 +5410,7 @@ async fn execute_authorized_tool(
                         .unwrap_or_default();
                     receipt.present_success(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                Err(tool_output) => receipt.present(file_capture::failure(tool_output.render(workspace, &caveats.fs_read), ""), "", presentation),
             }
         }
 
@@ -5461,7 +5482,7 @@ async fn execute_authorized_tool(
             let read = file_capture::read_for_edit(mutation_scope, &full, path);
             let existing = match read {
                 Ok(s) => s,
-                Err(tool_output) => return tool_output,
+                Err(tool_output) => return tool_output.render(workspace, &caveats.fs_read),
             };
             let count = existing.matches(old_string).count();
             if count == 0 {
@@ -5602,7 +5623,7 @@ async fn execute_authorized_tool(
                         .unwrap_or_default();
                     receipt.present_success(format!("edited {path} ({delta_str} lines, now {new_lines} total){escape_warning}"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                Err(tool_output) => receipt.present(file_capture::failure(tool_output.render(workspace, &caveats.fs_read), ""), "", presentation),
             }
         }
 
@@ -5644,7 +5665,7 @@ async fn execute_authorized_tool(
                     names.sort();
                     names.join("\n")
                 }
-                Err(tool_output) => tool_output,
+                Err(tool_output) => tool_output.render(workspace, &caveats.fs_read),
             }
         }
 
@@ -5691,8 +5712,8 @@ async fn execute_authorized_tool(
                     Ok(extensions) => extensions,
                     Err(error) => return format!("error: {error}"),
                 };
-            if !full.exists() {
-                return format!("error: no such path '{path}'");
+            if let Err(error) = std::fs::metadata(&full) {
+                return FileIoError::io(&error, &full, format!("error: no such path '{path}'")).render(workspace, &caveats.fs_read);
             }
             // Recheck workspace containment after any human prompt. The legacy
             // walk still reopens this path; smart sessions refuse this adapter.
@@ -5782,8 +5803,8 @@ async fn execute_authorized_tool(
                 Ok(v) => v.unwrap_or(grep_tool::DEFAULT_MAX_RESULTS),
                 Err(e) => return format!("error: grep: {e}"),
             };
-            if !full.exists() {
-                return format!("error: no such path '{path}'");
+            if let Err(error) = std::fs::metadata(&full) {
+                return FileIoError::io(&error, &full, format!("error: no such path '{path}'")).render(workspace, &caveats.fs_read);
             }
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
                 return WORKSPACE_ONLY.to_string();
