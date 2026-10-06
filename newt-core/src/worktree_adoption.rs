@@ -123,6 +123,11 @@ pub(crate) struct Creation {
     protected_branch: Option<String>,
 }
 impl Creation {
+    /// Canonical paths also catch destinations reached through a symlink or -C.
+    pub(crate) fn nested_in_original(&self) -> bool {
+        self.destination.starts_with(&self.original)
+    }
+
     /// Creating an absent directory needs write authority on its existing
     /// parent. A kernel grant naming the absent child alone cannot create it.
     pub(crate) fn creation_write_root(&self) -> &Path {

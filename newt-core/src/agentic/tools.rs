@@ -4562,6 +4562,7 @@ async fn execute_authorized_tool(
                     .map(|guard| guard.clone() as agent_bridle_tool_shell::ExecutionLease),
                 &mut fs_pre_exec_missing,
                 args.get("timeout_secs").and_then(serde_json::Value::as_u64),
+                adopted.as_ref(),
                 command_budget,
             )
             .await;

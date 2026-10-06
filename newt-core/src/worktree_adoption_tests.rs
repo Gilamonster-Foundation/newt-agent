@@ -248,3 +248,20 @@ fn adoption_fences_common_metadata_outside_the_original_checkout() {
         ));
     }
 }
+
+/// #2759: nested creation is distinguished from supported sibling creation on
+/// every platform; dispatch rejects it before running Git.
+#[test]
+fn adoption_2759_canonical_nested_destination() {
+    let (_temp, policy, _) = fixture(false);
+    std::fs::create_dir(policy.original.join("sub")).unwrap();
+    for (destination, expected) in [
+        (policy.original.join(".worktrees/task"), true),
+        (policy.original.join("sub/../task"), true),
+        (policy.worktree.clone(), false),
+    ] {
+        let candidate =
+            Creation::before(&policy.original.join("sub"), &destination, &Caveats::top()).unwrap();
+        assert_eq!(candidate.nested_in_original(), expected, "{destination:?}");
+    }
+}

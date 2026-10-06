@@ -92,9 +92,9 @@ async fn adoption_refs_real_checkout_and_commit_preserve_original() {
     c.net = Scope::none();
     c.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     let session = WorktreeSession::default();
-    let target = original.join("task");
+    let target = temp.path().join("task");
     let (text, outcome) = run(
-        "git worktree add --detach task HEAD",
+        "git worktree add --detach ../task HEAD",
         &original,
         &original,
         &c,
@@ -349,7 +349,9 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
         crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
     assert!(crate::confined_exec::kernel_fs_fence_available());
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
+    let original = temp.path().join("original");
+    std::fs::create_dir(&original).unwrap();
+    let root = original.as_path();
     git(root, root, &["init", "-q", "-b", "original"]);
     git(
         root,
@@ -368,9 +370,9 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
     let session = WorktreeSession::default();
     let mut caveats = Caveats::top();
     caveats.net = Scope::none();
-    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    caveats.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     let (text, outcome) = run(
-        "git worktree add task step-x",
+        "git worktree add ../task step-x",
         root,
         root,
         &caveats,
@@ -393,10 +395,10 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
     );
     assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
     assert!(session.snapshot().is_none());
-    assert!(!root.join("task").exists());
+    assert!(!temp.path().join("task").exists());
 
     let (text, outcome) = run(
-        "git worktree add -b fresh task missing-start",
+        "git worktree add -b fresh ../task missing-start",
         root,
         root,
         &caveats,
@@ -411,7 +413,7 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
     assert!(session.snapshot().is_none());
 
     let (text, outcome) = run(
-        "git worktree add -b fresh task HEAD",
+        "git worktree add -b fresh ../task HEAD",
         root,
         root,
         &caveats,
@@ -440,7 +442,9 @@ async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
         crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
     assert!(crate::confined_exec::kernel_fs_fence_available());
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
+    let original = temp.path().join("original");
+    std::fs::create_dir(&original).unwrap();
+    let root = original.as_path();
     git(root, root, &["init", "-q", "-b", "original"]);
     std::fs::write(root.join("tracked"), "seed").unwrap();
     git(root, root, &["add", "tracked"]);
@@ -467,9 +471,9 @@ async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
     let mut caveats = Caveats::top();
     caveats.exec = Scope::only(["git".to_owned()]);
     caveats.net = Scope::none();
-    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    caveats.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     let (text, outcome) = run(
-        "git worktree add --detach .main-check-main HEAD",
+        "git worktree add --detach ../main-check HEAD",
         root,
         root,
         &caveats,
@@ -494,7 +498,7 @@ async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
 #[tokio::test]
 async fn worktree_notice_echo_does_not_forge_git_error() {
     worktree_notice_unrelated_failure(
-        "echo 'is already used by worktree at'; git worktree add -b fresh task missing-start",
+        "echo 'is already used by worktree at'; git worktree add -b fresh ../task missing-start",
     )
     .await;
 }
@@ -503,7 +507,7 @@ async fn worktree_notice_echo_does_not_forge_git_error() {
 #[tokio::test]
 async fn worktree_notice_quoted_operand_does_not_forge_git_error() {
     worktree_notice_unrelated_failure(
-        "git worktree add -b fresh task 'is already used by worktree at'",
+        "git worktree add -b fresh ../task 'is already used by worktree at'",
     )
     .await;
 }
@@ -514,7 +518,9 @@ async fn worktree_notice_unrelated_failure(source: &str) {
         crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
     assert!(crate::confined_exec::kernel_fs_fence_available());
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
+    let original = temp.path().join("original");
+    std::fs::create_dir(&original).unwrap();
+    let root = original.as_path();
     git(root, root, &["init", "-q", "-b", "original"]);
     git(
         root,
@@ -531,7 +537,7 @@ async fn worktree_notice_unrelated_failure(source: &str) {
     let session = WorktreeSession::default();
     let mut caveats = Caveats::top();
     caveats.net = Scope::none();
-    caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
+    caveats.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     let (text, outcome) = run(source, root, root, &caveats, &session).await;
     assert_eq!(outcome, Some(ExecOutcome::Failed), "{text}");
     assert!(
