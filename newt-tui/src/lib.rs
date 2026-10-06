@@ -1350,6 +1350,10 @@ struct PlanModeState {
     /// taking it. Separate from `active` so the clamp itself is untouched
     /// until approval — the whole point of the request/approve split.
     exit_requested: std::sync::atomic::AtomicBool,
+    /// Plan-before-act: the current turn is the implementing turn an
+    /// approval seeded, so the executor must not ask about that plan again.
+    /// Set at prompt comprehension from the input's origin, every turn.
+    implementing_approved: std::sync::atomic::AtomicBool,
 }
 
 impl PlanModeState {
@@ -1357,10 +1361,17 @@ impl PlanModeState {
         self.active.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    fn set_implementing_approved(&self, seeded_by_approval: bool) {
+        self.implementing_approved
+            .store(seeded_by_approval, std::sync::atomic::Ordering::Release);
+    }
+
     fn clear(&self) {
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
         self.exit_requested
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.implementing_approved
             .store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -1389,6 +1400,11 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
 
     fn exit_requested(&self) -> bool {
         self.exit_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn implementing_approved_plan(&self) -> bool {
+        self.implementing_approved
             .load(std::sync::atomic::Ordering::Acquire)
     }
 }

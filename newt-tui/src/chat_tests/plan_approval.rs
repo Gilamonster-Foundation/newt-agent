@@ -92,6 +92,7 @@ fn a_plan_turn_that_presented_a_draft_is_asked_even_without_the_model_flag() {
         /* model_entered_plan */ false,
         /* exit_requested */ false,
         /* presented_draft */ true,
+        false
     ));
 }
 
@@ -104,6 +105,7 @@ fn a_plan_turn_with_no_draft_is_not_asked() {
         false,
         false,
         /* presented_draft */ false,
+        false
     ));
 }
 
@@ -117,9 +119,11 @@ fn model_entered_plan_with_a_draft_is_asked_and_a_plain_act_turn_is_not() {
         /* model_entered_plan */ true,
         false,
         /* presented_draft */ true,
+        false
     ));
     assert!(!plan_approval_due(
         PromptDisposition::Act,
+        false,
         false,
         false,
         false
@@ -135,11 +139,13 @@ fn an_exit_request_is_always_asked() {
         false,
         /* exit_requested */ true,
         /* presented_draft */ false,
+        false
     ));
     assert!(plan_approval_due(
         PromptDisposition::Plan,
         false,
         true,
+        false,
         false
     ));
 }
@@ -155,10 +161,92 @@ fn a_non_plan_disposition_is_not_asked_without_an_exit_request() {
         PromptDisposition::Research,
     ] {
         assert!(
-            !plan_approval_due(disposition, false, false, true),
+            !plan_approval_due(disposition, false, false, true, false),
             "{disposition:?} is not a plan turn"
         );
     }
+}
+
+/// A Plan turn that set a multi-step plan in the harness ledger drafted a
+/// plan the operator can read, so it is asked even with no `render_report`
+/// draft; an Act turn's first plan reaches the hook as an exit request
+/// instead, never through this flag alone.
+#[test]
+fn a_plan_turn_that_set_a_ledger_plan_is_asked_without_a_draft() {
+    assert!(plan_approval_due(
+        PromptDisposition::Plan,
+        false,
+        false,
+        /* presented_draft */ false,
+        /* set_plan_this_turn */ true,
+    ));
+    assert!(!plan_approval_due(
+        PromptDisposition::Act,
+        false,
+        false,
+        false,
+        /* set_plan_this_turn */ true,
+    ));
+}
+
+/// With no presented draft, approval seeds implementation from the ledger's
+/// own `<plan>` block — the plan the operator just read.
+#[test]
+fn approval_seeds_the_ledger_plan_when_no_draft_was_presented() {
+    let states = ConversationModeStates::default();
+    let a = objective("refactor the parser");
+    states.plan.set_plan_mode(true).unwrap();
+    let mut gate = ScriptedGate::new([answer("y")]);
+    let block = "<plan>\n✓ 1. inspect\n→ 2. repair\n</plan>";
+    let effects = run_plan_approval(
+        Some(&mut gate),
+        PlanEntry::ModelDuringAct,
+        &states.plan,
+        &states.plan_draft,
+        Some(&a),
+        PlanApprovalSeed {
+            exit_guidance: "GUIDANCE",
+            ledger_plan: Some(block),
+        },
+        false,
+    );
+    assert!(!states.plan.is_plan_mode(), "clamp lifted");
+    let (input, _) = effects.queued.expect("one continuation").into_input();
+    let ReadOutcome::Line(text) = input else {
+        panic!("a line of input")
+    };
+    assert!(text.contains("approved the plan below"), "{text}");
+    assert!(text.contains(block), "{text}");
+}
+
+/// `/mode full-auto` answers the question for the operator: nothing is
+/// asked, the clamp lifts, the seed runs, and the notice says why.
+#[test]
+fn full_auto_approves_without_asking() {
+    let states = ConversationModeStates::default();
+    let a = objective("A");
+    presented_plan(&states, &a, "# plan A");
+    let mut gate = ScriptedGate::new([]);
+    let effects = run_plan_approval(
+        Some(&mut gate),
+        PlanEntry::ModelDuringAct,
+        &states.plan,
+        &states.plan_draft,
+        Some(&a),
+        PlanApprovalSeed {
+            exit_guidance: "GUIDANCE",
+            ledger_plan: None,
+        },
+        true,
+    );
+    assert!(gate.asked.is_empty(), "no question under full-auto");
+    assert!(!states.plan.is_plan_mode(), "clamp lifted");
+    assert!(effects.queued.is_some());
+    assert!(
+        effects.notice.contains("auto-approved"),
+        "{}",
+        effects.notice
+    );
 }
 
 /// #2424: the seeded implementation turn carries the approved draft when
@@ -196,6 +284,25 @@ fn approval_intake_resumes_as_act_even_when_the_text_quotes_a_plan() {
     );
     assert_eq!(
         plan_approval_intake(&text, &lexicon).disposition(),
+        PromptDisposition::Act
+    );
+}
+
+/// The same decision holds when the seeded text itself opens collaboratively
+/// (the one wording intake reads as Plan on its own): approval is the
+/// operator's decision, so `resume_with` keeps Act rather than re-clamping
+/// the turn.
+#[test]
+fn approval_intake_resumes_as_act_even_when_the_text_opens_collaboratively() {
+    let lexicon = newt_core::agentic::DispositionLexicon::default();
+    let text = "let's refactor the parser";
+    assert_eq!(
+        newt_core::agentic::PromptIntake::analyze_with(text, &lexicon).disposition(),
+        PromptDisposition::Plan,
+        "control: on its own this wording reads as Plan"
+    );
+    assert_eq!(
+        plan_approval_intake(text, &lexicon).disposition(),
         PromptDisposition::Act
     );
 }
@@ -288,7 +395,11 @@ fn approve(
         &states.plan,
         &states.plan_draft,
         parent,
-        "GUIDANCE",
+        PlanApprovalSeed {
+            exit_guidance: "GUIDANCE",
+            ledger_plan: None,
+        },
+        false,
     )
 }
 
@@ -371,7 +482,11 @@ fn every_non_approval_outcome_queues_nothing_and_keeps_the_clamp() {
         &states.plan,
         &states.plan_draft,
         Some(&a),
-        "GUIDANCE",
+        PlanApprovalSeed {
+            exit_guidance: "GUIDANCE",
+            ledger_plan: None,
+        },
+        false,
     );
     assert!(effects.queued.is_none());
     assert!(states.plan.is_plan_mode());

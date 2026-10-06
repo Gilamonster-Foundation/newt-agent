@@ -251,7 +251,8 @@ pub use prompt_read::{
     SessionPromptStore, StorePromptSource,
 };
 pub use scheduled::{
-    plan_block, plan_reseat_pointer, PlanSnapshot, SessionStepLedger, Step, StepLedger, StepStatus,
+    fresh_multi_step_plan, plan_block, plan_reseat_pointer, step_change_line, PlanSnapshot,
+    SessionStepLedger, Step, StepLedger, StepStatus,
 };
 pub use scratchpad::{
     scratchpad_state_block, working_memory_head, ScratchpadStore, SessionScratchpadStore,

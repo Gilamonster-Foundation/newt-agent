@@ -387,6 +387,16 @@ fn plan_objective(context: Option<&newt_core::TurnPromptContext>) -> Option<newt
     context.map(|c| c.active().root_prompt_id())
 }
 
+/// What the approved implementing turn is seeded with: the initiative exit
+/// guidance always, and the harness ledger's `<plan>` block when no
+/// `render_report` draft was presented — a plan set with `update_plan` is the
+/// plan the operator just read and approved.
+#[derive(Debug, Clone, Copy)]
+struct PlanApprovalSeed<'a> {
+    exit_guidance: &'a str,
+    ledger_plan: Option<&'a str>,
+}
+
 /// #2424: what the turn-end approval hook decided, as data. The loop applies
 /// the side effects this crate cannot test in isolation (the process-global
 /// session mode, printing); everything that decides WHETHER work proceeds
@@ -414,8 +424,15 @@ fn run_plan_approval(
     plan_state: &PlanModeState,
     plan_draft: &PlanDraftState,
     parent: Option<&newt_core::TurnPromptContext>,
-    exit_guidance: &str,
+    seed: PlanApprovalSeed<'_>,
+    // `/mode full-auto` is the operator's standing "do not ask": the plan is
+    // still shown, the question is answered for them, and the seed runs.
+    auto_approve: bool,
 ) -> PlanApprovalEffects {
+    let PlanApprovalSeed {
+        exit_guidance,
+        ledger_plan,
+    } = seed;
     use newt_core::agentic::{
         plan_verdict, HumanQuestionOutcome, PlanEntry, PlanModeControl as _, PlanVerdict,
     };
@@ -428,9 +445,13 @@ fn run_plan_approval(
             "Approve this plan? [y/N/discuss] "
         }
     };
-    let outcome = match gate {
-        Some(gate) => gate.ask_question(question),
-        None => HumanQuestionOutcome::Unavailable,
+    let outcome = if auto_approve {
+        HumanQuestionOutcome::Answer("y".to_string())
+    } else {
+        match gate {
+            Some(gate) => gate.ask_question(question),
+            None => HumanQuestionOutcome::Unavailable,
+        }
     };
     let mut effects = PlanApprovalEffects::default();
     match plan_verdict(entry, outcome) {
@@ -449,7 +470,9 @@ fn run_plan_approval(
                     let plan = plan_draft.take_approved(parent.active().root_prompt_id());
                     effects.queued = Some(PendingPlanTurn {
                         text: plan_approval_seed_text(
-                            plan.as_ref().map(|p| p.draft.markdown.as_str()),
+                            plan.as_ref()
+                                .map(|p| p.draft.markdown.as_str())
+                                .or(ledger_plan),
                             exit_guidance,
                         ),
                         parent: Box::new(parent.clone()),
@@ -463,6 +486,9 @@ fn run_plan_approval(
                 None => false,
             };
             effects.notice = match (entry, seeded) {
+                (_, true) if auto_approve => {
+                    "▸  plan auto-approved under /mode full-auto — implementing."
+                }
                 (PlanEntry::OperatorSelected, true) => {
                     "▸  plan approved — switched to /mode dev; implementing."
                 }
@@ -549,15 +575,20 @@ fn plan_entry_for_turn(
 /// half. And a Plan turn that drafted nothing (it answered a question, say)
 /// has no plan to approve, so it is not asked — unless the model explicitly
 /// requested exit, in which case the clamp lift itself is what needs a human.
+/// A Plan turn that set a multi-step plan in the harness ledger this turn
+/// (`update_plan`, no `render_report`) drafted a plan the operator can read
+/// just as well, so it is asked too; an Act turn's own first plan arrives
+/// here as an exit request the executor raised on the model's behalf.
 fn plan_approval_due(
     turn_disposition: newt_core::agentic::PromptDisposition,
     model_entered_plan: bool,
     exit_requested: bool,
     presented_draft: bool,
+    set_plan_this_turn: bool,
 ) -> bool {
     let plan_turn =
         turn_disposition == newt_core::agentic::PromptDisposition::Plan || model_entered_plan;
-    exit_requested || (plan_turn && presented_draft)
+    exit_requested || (plan_turn && (presented_draft || set_plan_this_turn))
 }
 
 /// A harness-owned clarification handoff. The live copy avoids repeated store
@@ -7487,6 +7518,17 @@ fn session_body(
                             (style, authority_mode)
                         },
                     );
+                    // Plan-before-act: the implementing turn an approval
+                    // seeded carries the operator's decision, so the
+                    // executor must not ask about the same plan again when
+                    // the model records it in the ledger. Any other origin
+                    // clears the flag.
+                    conversation_mode_states
+                        .plan
+                        .set_implementing_approved(matches!(
+                            model_input_origin,
+                            ModelInputOrigin::HarnessPlanApproval { .. }
+                        ));
 
                     // #1749: the deterministic detector says a decision MIGHT
                     // exist; one bounded, tool-less side call says whether the
@@ -7941,6 +7983,10 @@ fn session_body(
                     // Step 26.3/26.4: resolve the per-turn feature set once (used
                     // for the <state> injection here and the ChatCtx fields below).
                     let turn_disposition = prompt_intake.disposition();
+                    // Plan-before-act: what the ledger held before this turn,
+                    // so the turn-end hook can tell a plan set now from one
+                    // carried over.
+                    let plan_before = newt_core::StepLedger::snapshot(&step_ledger);
                     let turn_manager = context_manager(&cfg, context_manager_override);
                     let turn_features =
                         context_features(&cfg, turn_manager, &context_features_override, inf_kind);
@@ -9092,12 +9138,29 @@ fn session_body(
                                     use newt_core::agentic::PlanModeControl as _;
                                     let plan_state = &conversation_mode_states.plan;
                                     let exit_requested = plan_state.take_exit_requested();
-                                    if plan_approval_due(
+                                    let set_plan_this_turn = newt_core::fresh_multi_step_plan(
+                                        &plan_before,
+                                        &newt_core::StepLedger::snapshot(&step_ledger),
+                                    );
+                                    let ledger_plan = newt_core::plan_block(&step_ledger);
+                                    let approval_due = plan_approval_due(
                                         turn_disposition,
                                         plan_state.is_plan_mode(),
                                         exit_requested,
                                         presented_draft,
-                                    ) {
+                                        set_plan_this_turn,
+                                    );
+                                    // The operator answers about a plan they can
+                                    // see: when a question follows and no draft
+                                    // was presented, the ledger's own block is
+                                    // shown once here.
+                                    if approval_due && !presented_draft {
+                                        if let Some(block) = ledger_plan.as_deref() {
+                                            print!("{}", newt_core::agentic::REPLY_MARKER);
+                                            println!("{block}");
+                                        }
+                                    }
+                                    if approval_due {
                                         let entry = plan_entry_for_turn(
                                             turn_disposition,
                                             active_operating_mode,
@@ -9113,9 +9176,15 @@ fn session_body(
                                             // `_turn_binding` is still held here, so
                                             // this reads the initiative the turn
                                             // captured, not a dial moved since.
-                                            &newt_core::agentic::exit_plan_mode_result(
-                                                newt_core::initiative::effective_initiative(),
-                                            ),
+                                            PlanApprovalSeed {
+                                                exit_guidance:
+                                                    &newt_core::agentic::exit_plan_mode_result(
+                                                        newt_core::initiative::effective_initiative(
+                                                        ),
+                                                    ),
+                                                ledger_plan: ledger_plan.as_deref(),
+                                            },
+                                            active_operating_mode == OperatingMode::FullAuto,
                                         );
                                         if effects.switch_to_dev {
                                             // Same two writes `/mode dev` performs: the process-global

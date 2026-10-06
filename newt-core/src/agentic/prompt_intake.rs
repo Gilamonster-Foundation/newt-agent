@@ -1373,6 +1373,17 @@ pub struct DispositionLexicon {
     /// a clause opening this way skips the `?` fallback and routes like its
     /// imperative form. The needle lists still decide first.
     pub request_openers: Vec<String>,
+    /// Clause openings that propose work rather than order it ("let's ",
+    /// "we should ", "shall we "): a prompt whose EVERY ask opens with one
+    /// reads as **Plan**, checked before the action needles. Matched at the
+    /// START of each extracted ask, never anywhere in the prompt — "fix the
+    /// bug we should have caught" is an order. A bare nudge behind the opener
+    /// ("let's go", "let's continue") proposes nothing and falls through.
+    pub collaborative: Vec<String>,
+    /// Verbs that keep a collaborative opener an order: "let's commit this",
+    /// "let's run the tests", "lets push" ask for one bounded act, not a
+    /// plan. Matched against the first word after the opener.
+    pub direct_verbs: Vec<String>,
     /// Clause openings that announce a stated fact outright (#1971). Matched at
     /// the START of a clause; no further evidence is required.
     pub informational_markers: Vec<String>,
@@ -1545,6 +1556,29 @@ impl Default for DispositionLexicon {
             ]
             .map(str::to_string)
             .to_vec(),
+            // Both apostrophes are data: `to_ascii_lowercase` leaves U+2019
+            // (the smart quote macOS types) alone, so "Let’s" needs its own
+            // entry or it silently stays on the ordinary ladder.
+            collaborative: [
+                "let's ",
+                "lets ",
+                "let’s ",
+                "we should ",
+                "how about we ",
+                "i'm thinking ",
+                "i’m thinking ",
+                "i am thinking ",
+                "shall we ",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            direct_verbs: [
+                "commit", "push", "pull", "merge", "rebase", "run", "rerun", "test", "build",
+                "deploy", "release", "tag", "install", "lint", "format", "check", "land", "ship",
+                "publish", "bump", "revert", "retry", "start", "stop", "restart", "open", "close",
+            ]
+            .map(str::to_string)
+            .to_vec(),
             // Self-announcing statements. `i'll want` / `i'm going to` are the
             // future-tense forms only: bare `i want` is routinely an
             // instruction ("I want you to fix the parser") and is deliberately
@@ -1642,7 +1676,16 @@ fn infer_disposition(prompt: &str, asks: &[AtomicAsk]) -> PromptDisposition {
 }
 
 /// Classify a prompt's disposition against `lexicon` (#1260) — pure, no I/O.
-/// Precedence is unchanged from the historical logic: an action needle wins
+/// Precedence: a collaborative opener on EVERY ask reads as `Plan` first.
+/// "let's refactor the largest file" proposes the refactor rather than
+/// ordering it, so the opener must be read before the `refactor` action
+/// needle (added for "refactor the largest file") can claim the prompt. The
+/// opener is matched at the start of each ask, never mid-clause ("fix the bug
+/// we should have caught" keeps `Act`), and a bare nudge behind it ("let's
+/// go", "let's continue") is handed back to the ordinary ladder through
+/// [`crate::classifiers::is_bare_continuation`] on the remainder. Like the
+/// statement arm below, this narrows on positive evidence, never on silence.
+/// After it, unchanged from the historical logic: an action needle wins
 /// outright; else research; else explain; else the `?` fallback; else the
 /// terminal fallback.
 ///
@@ -1676,6 +1719,26 @@ fn infer_disposition_with(
     asks: &[AtomicAsk],
     lexicon: &DispositionLexicon,
 ) -> PromptDisposition {
+    let proposes = |ask: &AtomicAsk| {
+        let text = ask.text.trim_start().to_ascii_lowercase();
+        lexicon
+            .collaborative
+            .iter()
+            .filter(|n| !n.is_empty())
+            .find_map(|n| text.strip_prefix(n.as_str()))
+            .is_some_and(|rest| {
+                let verb = rest
+                    .split_whitespace()
+                    .next()
+                    .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+                    .unwrap_or("");
+                !crate::classifiers::is_bare_continuation(rest)
+                    && !lexicon.direct_verbs.iter().any(|v| v == verb)
+            })
+    };
+    if !asks.is_empty() && asks.iter().all(proposes) {
+        return PromptDisposition::Plan;
+    }
     let lower = prompt.to_ascii_lowercase();
     // Padding makes a lexicon entry with a leading-space word boundary match at
     // the beginning of a prompt without losing that boundary inside prose.

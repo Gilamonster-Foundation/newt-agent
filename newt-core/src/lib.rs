@@ -200,7 +200,7 @@ pub use agentic::{
     append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
     compress_user_initiated_for_task, execute_tool, experience_block, format_index_status,
     format_search_hits, format_search_model, format_search_preview, format_search_rejects,
-    gather_code_files, gather_with_manifest, index_files, load_denials,
+    fresh_multi_step_plan, gather_code_files, gather_with_manifest, index_files, load_denials,
     memory_fetch_tool_definition, openai_chat_complete, openai_chat_complete_with_prompt,
     openai_responses_complete, openai_responses_complete_with_prompt, parse_context_window_error,
     plan_block, plan_verdict, recover_context_window_400, render_code_evidence, retrieve_evidence,
