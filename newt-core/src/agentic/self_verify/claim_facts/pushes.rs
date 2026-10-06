@@ -7,7 +7,6 @@ use crate::agentic::claim_check;
 pub(in crate::agentic::self_verify) struct PushObservation {
     remote: Option<String>,
     branch: Option<String>,
-    directory: Option<PathBuf>,
 }
 
 impl VerificationLedger {
@@ -22,7 +21,6 @@ impl VerificationLedger {
             self.pushed_branches.push(PushObservation {
                 remote: Some(format!("{owner}/{name}")),
                 branch: Some(branch.clone()),
-                directory: None,
             });
         }
     }
@@ -33,21 +31,18 @@ impl VerificationLedger {
         args: &serde_json::Value,
         execution: Option<ExecOutcome>,
         bypass: bool,
-        workspace: &str,
     ) {
         if bypass
             && execution == Some(ExecOutcome::Passed)
             && super::super::super::dispatched_tool_name(name) == Some("run_command")
         {
-            if let Some(branch) =
-                plain_push_branch(args["command"].as_str().unwrap_or(""), args, workspace)
-            {
+            if let Some(branch) = plain_push_branch(args["command"].as_str().unwrap_or("")) {
                 self.pushed_branches.push(branch);
             }
         }
     }
 
-    pub(crate) fn annotate_push_claim(&self, mut text: String, workspace: &str) -> String {
+    pub(crate) fn annotate_push_claim(&self, mut text: String) -> String {
         const MARKER: &str = "⚠ claim check (#2769): ";
         if text.contains(MARKER) {
             text = text
@@ -92,13 +87,7 @@ impl VerificationLedger {
                         .remote
                         .as_ref()
                         .zip(observed.branch.as_ref())
-                        .is_some_and(|(remote, branch)| {
-                            claim == &format!("{remote}/{branch}")
-                                && observed.directory.as_ref().is_none_or(|directory| {
-                                    directory
-                                        == &crate::agentic::lexical_normalize(Path::new(workspace))
-                                })
-                        })
+                        .is_some_and(|(remote, branch)| claim == &format!("{remote}/{branch}"))
                 }
             })
         });
@@ -158,51 +147,45 @@ fn push_claims(tokens: &[&str]) -> Vec<Option<String>> {
         crate::git_staging::validate_branch_name(word).ok()?;
         Some(word.into())
     };
-    let mut branches: Vec<_> = words
-        .iter()
-        .filter(|w| w.contains('/'))
-        .filter_map(|w| branch(w))
-        .map(Some)
-        .collect();
-    if branches.is_empty() {
-        let named = lower
-            .iter()
-            .position(|w| w == "branch")
-            .and_then(|i| words.get(i + 1))
-            .and_then(|w| branch(w))
-            .or_else(|| {
-                pushed
-                    .and_then(|i| words.get(i + 1))
+    // Only the branch attached to the push/branch phrase is asserted. Later
+    // slash tokens may be negated branches or unrelated paths (#2769 round 3).
+    let named = pushed
+        .and_then(|i| {
+            let next = if lower.get(i + 1).is_some_and(|w| w == "branch") {
+                i + 2
+            } else {
+                i + 1
+            };
+            words.get(next).and_then(|w| branch(w)).or_else(|| {
+                lower[..i]
+                    .iter()
+                    .position(|w| w == "branch")
+                    .and_then(|j| words.get(j + 1))
                     .and_then(|w| branch(w))
             })
-            .or_else(|| {
-                if live {
-                    lower
-                        .iter()
-                        .position(|w| w == "is")
-                        .and_then(|i| i.checked_sub(1))
-                        .and_then(|i| branch(words[i]))
-                } else {
-                    None
-                }
-            });
-        let named = if live && lower.windows(2).any(|w| w == ["on", "origin"]) {
-            named.map(|branch| format!("origin/{branch}"))
-        } else {
-            named
-        };
-        branches.push(named);
-    }
-    branches
+        })
+        .or_else(|| {
+            if live {
+                lower
+                    .iter()
+                    .position(|w| w == "is")
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| branch(words[i]))
+            } else {
+                None
+            }
+        });
+    let named = if live && lower.windows(2).any(|w| w == ["on", "origin"]) {
+        named.map(|branch| format!("origin/{branch}"))
+    } else {
+        named
+    };
+    vec![named]
 }
 
 /// Only a literal push, optionally after leading cd &&, can borrow the shell's exit status. Unknown
 /// default refspecs prove a push happened, but cannot certify a named branch.
-fn plain_push_branch(
-    command: &str,
-    args: &serde_json::Value,
-    workspace: &str,
-) -> Option<PushObservation> {
+fn plain_push_branch(command: &str) -> Option<PushObservation> {
     let segments = split_command(command);
     let ((command, separator), leading) = segments.split_last()?;
     if !separator.is_empty()
@@ -214,19 +197,9 @@ fn plain_push_branch(
     {
         return None;
     }
-    let mut directory = Path::new(workspace).join(args["cwd"].as_str().unwrap_or("."));
-    for (prefix, _) in leading {
-        let path = prefix.trim().strip_prefix("cd")?.trim();
-        let path = path.strip_prefix("/d ").unwrap_or(path).trim();
-        if path.is_empty() || path.starts_with('-') {
-            return None;
-        }
-        directory = directory.join(path.trim_matches(['\"', '\'']));
-    }
     let mut observation = PushObservation {
         remote: None,
         branch: None,
-        directory: Some(crate::agentic::lexical_normalize(&directory)),
     };
     if command.contains([';', '|', '&', '$', '`', '\n', '>', '<', '\'', '"']) {
         return None;

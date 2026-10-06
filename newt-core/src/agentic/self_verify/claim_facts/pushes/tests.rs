@@ -1,6 +1,6 @@
 use super::*;
 fn claim(ledger: &VerificationLedger) -> String {
-    ledger.annotate_push_claim("Pushed: origin/topic is live.".into(), ".")
+    ledger.annotate_push_claim("Pushed: origin/topic is live.".into())
 }
 /// #2769: missing and failed pushes cannot support the closing summary.
 #[test]
@@ -12,7 +12,6 @@ fn push_2769_missing_failed_and_wrong_branch_warn() {
         &serde_json::json!({"command":"git push origin topic"}),
         Some(ExecOutcome::Failed),
         true,
-        ".",
     );
     assert!(claim(&ledger).contains("#2769"));
     ledger.record_push_outcome(&crate::git_staging::Outcome::Pushed {
@@ -42,12 +41,11 @@ fn push_2769_successful_observation_covers_claim() {
                 &serde_json::json!({"command":"git.exe push -u origin HEAD:refs/heads/topic"}),
                 Some(ExecOutcome::Passed),
                 true,
-                ".",
             );
         }
         if governed {
             assert_eq!(
-                ledger.annotate_push_claim("Pushed topic".into(), "."),
+                ledger.annotate_push_claim("Pushed topic".into()),
                 "Pushed topic"
             );
             assert!(
@@ -77,7 +75,6 @@ fn push_2769_non_evidence_and_nonclaims() {
             &serde_json::json!({"command":command}),
             Some(ExecOutcome::Passed),
             true,
-            ".",
         );
         assert!(claim(&ledger).contains("#2769"), "{command}");
     }
@@ -88,7 +85,7 @@ fn push_2769_non_evidence_and_nonclaims() {
         "> Pushed topic.",
         "```\nPushed topic.\n```",
     ] {
-        assert_eq!(ledger.annotate_push_claim(text.into(), "."), text);
+        assert_eq!(ledger.annotate_push_claim(text.into()), text);
     }
 }
 
@@ -108,7 +105,7 @@ fn push_2769_finalizer_and_updated_facts() {
         &ledger,
     );
     assert!(text.contains("#2769"), "{text}");
-    assert_eq!(ledger.annotate_push_claim(text.clone(), "."), text);
+    assert_eq!(ledger.annotate_push_claim(text.clone()), text);
     ledger.record_publication_outcome(&crate::git_staging::Outcome::Pushed {
         oid: "abc".into(),
         owner: "org".into(),
@@ -116,7 +113,7 @@ fn push_2769_finalizer_and_updated_facts() {
         branch: "topic".into(),
     });
     assert!(!ledger
-        .annotate_push_claim(text.replace("origin/topic", "org/repo/topic"), ".")
+        .annotate_push_claim(text.replace("origin/topic", "org/repo/topic"))
         .contains("#2769"));
 }
 
@@ -165,9 +162,7 @@ fn push_2769_claim_spellings_and_default_refspecs() {
         "The branch is pushed",
     ] {
         assert!(
-            ledger
-                .annotate_push_claim(text.into(), ".")
-                .contains("#2769"),
+            ledger.annotate_push_claim(text.into()).contains("#2769"),
             "{text}"
         );
     }
@@ -178,10 +173,9 @@ fn push_2769_claim_spellings_and_default_refspecs() {
         &serde_json::json!({"command":"git push"}),
         Some(ExecOutcome::Passed),
         true,
-        ".",
     );
     assert_eq!(
-        ledger.annotate_push_claim("The branch is pushed".into(), "."),
+        ledger.annotate_push_claim("The branch is pushed".into()),
         "The branch is pushed"
     );
     assert!(claim(&ledger).contains("#2769"));
@@ -201,16 +195,12 @@ fn push_2769_leading_cd_preserves_evidence() {
             &serde_json::json!({"command":command}),
             Some(ExecOutcome::Passed),
             true,
-            ".",
         );
         assert_eq!(
-            ledger.annotate_push_claim("Pushed topic".into(), "."),
+            ledger.annotate_push_claim("Pushed topic".into()),
             "Pushed topic"
         );
-        assert!(
-            claim(&ledger).contains("#2769"),
-            "origin in a different directory is not launch origin: {command}"
-        );
+        assert!(!claim(&ledger).contains("#2769"), "{command}");
     }
     for command in [
         "false || git push origin topic",
@@ -223,23 +213,25 @@ fn push_2769_leading_cd_preserves_evidence() {
             &serde_json::json!({"command":command}),
             Some(ExecOutcome::Passed),
             true,
-            ".",
         );
         assert!(claim(&ledger).contains("#2769"), "{command}");
     }
 }
 
-/// #2769 review: origin cannot borrow a backup push or another repository's
-/// same-named origin branch. Destination aliases are local to a repository.
+/// #2769: origin cannot borrow a backup push. Round 3 deliberately allows
+/// the same remote+branch observation from any cwd in the turn.
 #[test]
 fn push_2769_round2_destination_binding() {
-    for args in [
-        serde_json::json!({"command":"git push backup topic"}),
-        serde_json::json!({"command":"git push origin topic", "cwd":"other-repository"}),
+    for (args, warns) in [
+        (serde_json::json!({"command":"git push backup topic"}), true),
+        (
+            serde_json::json!({"command":"git push origin topic", "cwd":"other-repository"}),
+            false,
+        ),
     ] {
         let mut ledger = VerificationLedger::default();
-        ledger.observe_plain_push("run_command", &args, Some(ExecOutcome::Passed), true, ".");
-        assert!(claim(&ledger).contains("#2769"), "{args}");
+        ledger.observe_plain_push("run_command", &args, Some(ExecOutcome::Passed), true);
+        assert_eq!(claim(&ledger).contains("#2769"), warns, "{args}");
     }
 }
 
@@ -255,23 +247,21 @@ fn push_2769_round2_incomplete_and_unrelated_negation() {
         "No branch has been pushed",
         "Branch topic would be pushed",
     ] {
-        assert_eq!(ledger.annotate_push_claim(text.into(), "."), text);
+        assert_eq!(ledger.annotate_push_claim(text.into()), text);
     }
     for text in [
         "Not committed; pushed origin/topic.",
         "Pushed origin/topic, but not opened a PR.",
     ] {
         assert!(
-            ledger
-                .annotate_push_claim(text.into(), ".")
-                .contains("#2769"),
+            ledger.annotate_push_claim(text.into()).contains("#2769"),
             "{text}"
         );
     }
 }
 
 /// #2769 round 2: preserve known aliases and governed owner/repo destinations;
-/// only unqualified claims may match another destination or repository.
+/// remote-qualified claims match the same destination anywhere in the turn.
 #[test]
 fn push_2769_round2_matching_destinations() {
     let mut ledger = VerificationLedger::default();
@@ -280,20 +270,16 @@ fn push_2769_round2_matching_destinations() {
         &serde_json::json!({"command":"git push backup topic", "cwd":"task"}),
         Some(ExecOutcome::Passed),
         true,
-        ".",
     );
-    for (text, cwd, warns) in [
-        ("Pushed backup/topic", "task", false),
-        ("Pushed backup/topic", "another-task", true),
-        ("Pushed origin/topic", "task", true),
-        ("Pushed topic", "another-task", false),
+    for (text, warns) in [
+        ("Pushed backup/topic", false),
+        ("Pushed origin/topic", true),
+        ("Pushed topic", false),
     ] {
         assert_eq!(
-            ledger
-                .annotate_push_claim(text.into(), cwd)
-                .contains("#2769"),
+            ledger.annotate_push_claim(text.into()).contains("#2769"),
             warns,
-            "{text} in {cwd}"
+            "{text}"
         );
     }
     ledger.record_push_outcome(&crate::git_staging::Outcome::Pushed {
@@ -303,12 +289,66 @@ fn push_2769_round2_matching_destinations() {
         branch: "topic".into(),
     });
     assert_eq!(
-        ledger.annotate_push_claim("Pushed owner/repo/topic".into(), "."),
+        ledger.annotate_push_claim("Pushed owner/repo/topic".into()),
         "Pushed owner/repo/topic"
     );
     assert!(ledger
-        .annotate_push_claim("Pushed other/repo/topic".into(), ".")
+        .annotate_push_claim("Pushed other/repo/topic".into())
         .contains("#2769"));
     assert!(!claim_check::claims_committed("Ready to be committed"));
     assert!(claim_check::claims_committed("Committed, but not pushed"));
+}
+
+/// #2769 round 3: only the object attached to the completed push is a claim;
+/// a negated or incidental slash-bearing token is not another pushed branch.
+#[test]
+fn push_2769_round3_mixed_objects() {
+    let text = "Pushed origin/topic, not origin/other.";
+    let mut ledger = VerificationLedger::default();
+    let missing = ledger.annotate_push_claim(text.into());
+    let warning = missing.strip_prefix(text).unwrap();
+    assert!(warning.contains("origin/topic"), "{missing}");
+    assert!(!warning.contains("origin/other"), "{missing}");
+    ledger.observe_plain_push(
+        "run_command",
+        &serde_json::json!({"command":"git push origin topic"}),
+        Some(ExecOutcome::Passed),
+        true,
+    );
+    assert_eq!(ledger.annotate_push_claim(text.into()), text);
+    let incidental = "Pushed origin/topic, see docs/guide.md.";
+    assert_eq!(ledger.annotate_push_claim(incidental.into()), incidental);
+}
+
+/// #2769 round 3: ground the symlink/parent counterexample in a real filesystem.
+/// The conductor's turn-wide remote+branch rule deliberately needs no cwd identity.
+#[cfg(unix)]
+#[tokio::test]
+async fn push_2769_round3_symlink_parent_observation() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let _bypass = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let other = temp.path().join("other");
+    std::fs::create_dir(&main).unwrap();
+    std::fs::create_dir_all(other.join("sub")).unwrap();
+    std::os::unix::fs::symlink(other.join("sub"), main.join("link")).unwrap();
+    assert_eq!(
+        main.join("link/..").canonicalize().unwrap(),
+        other.canonicalize().unwrap()
+    );
+    let mut ledger = VerificationLedger::default();
+    ledger
+        .observe_routed(
+            "run_command",
+            &serde_json::json!({"command":"git push origin topic", "cwd":"link/.."}),
+            true,
+            Some(ExecOutcome::Passed),
+            main.to_str().unwrap(),
+            None,
+        )
+        .await;
+    let text = "Pushed origin/topic";
+    assert_eq!(ledger.annotate_push_claim(text.into()), text);
 }

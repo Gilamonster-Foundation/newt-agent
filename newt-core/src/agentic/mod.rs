@@ -6354,7 +6354,7 @@ fn finalize_final_text(
     );
     let text = verification.annotate_cargo_claim(text);
     let text = verification.annotate_pr_claim(text);
-    let text = verification.annotate_push_claim(text, workspace);
+    let text = verification.annotate_push_claim(text);
     redact_model_facing(disclosure, text)
 }
 
