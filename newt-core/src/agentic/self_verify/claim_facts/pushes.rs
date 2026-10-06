@@ -2,10 +2,28 @@
 use super::*;
 use crate::agentic::claim_check;
 
+/// Ephemeral locators from the same observation, not persisted identities.
+#[derive(Debug, Clone)]
+pub(in crate::agentic::self_verify) struct PushObservation {
+    remote: Option<String>,
+    branch: Option<String>,
+    directory: Option<PathBuf>,
+}
+
 impl VerificationLedger {
     pub(crate) fn record_push_outcome(&mut self, outcome: &crate::git_staging::Outcome) {
-        if let crate::git_staging::Outcome::Pushed { branch, .. } = outcome {
-            self.pushed_branches.push(Some(branch.clone()));
+        if let crate::git_staging::Outcome::Pushed {
+            owner,
+            name,
+            branch,
+            ..
+        } = outcome
+        {
+            self.pushed_branches.push(PushObservation {
+                remote: Some(format!("{owner}/{name}")),
+                branch: Some(branch.clone()),
+                directory: None,
+            });
         }
     }
 
@@ -15,18 +33,21 @@ impl VerificationLedger {
         args: &serde_json::Value,
         execution: Option<ExecOutcome>,
         bypass: bool,
+        workspace: &str,
     ) {
         if bypass
             && execution == Some(ExecOutcome::Passed)
             && super::super::super::dispatched_tool_name(name) == Some("run_command")
         {
-            if let Some(branch) = plain_push_branch(args["command"].as_str().unwrap_or("")) {
+            if let Some(branch) =
+                plain_push_branch(args["command"].as_str().unwrap_or(""), args, workspace)
+            {
                 self.pushed_branches.push(branch);
             }
         }
     }
 
-    pub(crate) fn annotate_push_claim(&self, mut text: String) -> String {
+    pub(crate) fn annotate_push_claim(&self, mut text: String, workspace: &str) -> String {
         const MARKER: &str = "⚠ claim check (#2769): ";
         if text.contains(MARKER) {
             text = text
@@ -58,10 +79,28 @@ impl VerificationLedger {
             missing.extend(push_claims(&clause));
         }
         missing.retain(|branch| {
-            !self
-                .pushed_branches
-                .iter()
-                .any(|observed| branch.is_none() || branch == observed)
+            !self.pushed_branches.iter().any(|observed| match branch {
+                None => true,
+                Some(claim) => {
+                    // A slash-bearing claim is destination-qualified unless
+                    // explicitly written as refs/heads/<branch>.
+                    let local = claim.strip_prefix("refs/heads/");
+                    if local.is_some() || !claim.contains('/') {
+                        return observed.branch.as_deref() == Some(local.unwrap_or(claim));
+                    }
+                    observed
+                        .remote
+                        .as_ref()
+                        .zip(observed.branch.as_ref())
+                        .is_some_and(|(remote, branch)| {
+                            claim == &format!("{remote}/{branch}")
+                                && observed.directory.as_ref().is_none_or(|directory| {
+                                    directory
+                                        == &crate::agentic::lexical_normalize(Path::new(workspace))
+                                })
+                        })
+                }
+            })
         });
         missing.sort();
         missing.dedup();
@@ -81,33 +120,16 @@ fn push_claims(tokens: &[&str]) -> Vec<Option<String>> {
         .map(|w| w.trim_matches(|c: char| "`*\"'[](),:;.!?".contains(c)))
         .collect();
     let lower: Vec<_> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
-    if lower.iter().any(|w| {
-        matches!(
-            w.as_str(),
-            "not"
-                | "no"
-                | "never"
-                | "will"
-                | "would"
-                | "should"
-                | "could"
-                | "must"
-                | "pending"
-                | "if"
-                | "until"
-                | "previously"
-                | "earlier"
-        ) || w.contains("n't")
-    }) {
-        return Vec::new();
-    }
     let pushed = lower.iter().position(|w| w == "pushed");
     let live = lower
         .windows(4)
         .any(|w| w == ["is", "live", "on", "origin"])
         || (lower.iter().any(|w| w.starts_with("origin/"))
             && lower.windows(2).any(|w| w == ["is", "live"]));
-    if pushed.is_none() && !live {
+    let clause = tokens.join(" ");
+    if !claim_check::claims_completed_action(&clause, "pushed")
+        && !(live && claim_check::claims_completed_action(&clause, "live"))
+    {
         return Vec::new();
     }
     let branch = |word: &str| -> Option<String> {
@@ -132,16 +154,13 @@ fn push_claims(tokens: &[&str]) -> Vec<Option<String>> {
         ) {
             return None;
         }
-        let word = word
-            .strip_prefix("origin/")
-            .or_else(|| word.strip_prefix("refs/heads/"))
-            .unwrap_or(word);
+
         crate::git_staging::validate_branch_name(word).ok()?;
         Some(word.into())
     };
     let mut branches: Vec<_> = words
         .iter()
-        .filter(|w| w.starts_with("origin/") || w.starts_with("refs/heads/"))
+        .filter(|w| w.contains('/'))
         .filter_map(|w| branch(w))
         .map(Some)
         .collect();
@@ -167,6 +186,11 @@ fn push_claims(tokens: &[&str]) -> Vec<Option<String>> {
                     None
                 }
             });
+        let named = if live && lower.windows(2).any(|w| w == ["on", "origin"]) {
+            named.map(|branch| format!("origin/{branch}"))
+        } else {
+            named
+        };
         branches.push(named);
     }
     branches
@@ -174,7 +198,11 @@ fn push_claims(tokens: &[&str]) -> Vec<Option<String>> {
 
 /// Only a literal push, optionally after leading cd &&, can borrow the shell's exit status. Unknown
 /// default refspecs prove a push happened, but cannot certify a named branch.
-fn plain_push_branch(command: &str) -> Option<Option<String>> {
+fn plain_push_branch(
+    command: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+) -> Option<PushObservation> {
     let segments = split_command(command);
     let ((command, separator), leading) = segments.split_last()?;
     if !separator.is_empty()
@@ -186,6 +214,20 @@ fn plain_push_branch(command: &str) -> Option<Option<String>> {
     {
         return None;
     }
+    let mut directory = Path::new(workspace).join(args["cwd"].as_str().unwrap_or("."));
+    for (prefix, _) in leading {
+        let path = prefix.trim().strip_prefix("cd")?.trim();
+        let path = path.strip_prefix("/d ").unwrap_or(path).trim();
+        if path.is_empty() || path.starts_with('-') {
+            return None;
+        }
+        directory = directory.join(path.trim_matches(['\"', '\'']));
+    }
+    let mut observation = PushObservation {
+        remote: None,
+        branch: None,
+        directory: Some(crate::agentic::lexical_normalize(&directory)),
+    };
     if command.contains([';', '|', '&', '$', '`', '\n', '>', '<', '\'', '"']) {
         return None;
     }
@@ -211,8 +253,13 @@ fn plain_push_branch(command: &str) -> Option<Option<String>> {
         operands.push(word);
     }
     match operands.as_slice() {
-        [] | [_] => Some(None),
-        [_, spec] => {
+        [] => Some(observation),
+        [remote] => {
+            observation.remote = Some((*remote).into());
+            Some(observation)
+        }
+        [remote, spec] => {
+            observation.remote = Some((*remote).into());
             let branch = if let Some((source, dest)) = spec.split_once(':') {
                 if source.is_empty() || dest.is_empty() {
                     return None;
@@ -222,13 +269,14 @@ fn plain_push_branch(command: &str) -> Option<Option<String>> {
                 spec.strip_prefix("refs/heads/").unwrap_or(spec)
             };
             if branch == "HEAD" {
-                return Some(None);
+                return Some(observation);
             }
             if branch.starts_with("refs/") || branch.contains(['*', '?', '[', ']', ':', '+']) {
                 return None;
             }
             crate::git_staging::validate_branch_name(branch).ok()?;
-            Some(Some(branch.into()))
+            observation.branch = Some(branch.into());
+            Some(observation)
         }
         _ => None,
     }

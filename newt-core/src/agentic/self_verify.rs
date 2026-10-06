@@ -738,8 +738,8 @@ pub struct VerificationLedger {
     claim_directories: Vec<std::path::PathBuf>,
     /// #2741: governed creation URL locators, retained only for this turn.
     created_prs: Vec<String>,
-    /// Observed destination branches; None means a default refspec was not resolved.
-    pushed_branches: Vec<Option<String>>,
+    /// Observed push destinations and their local repository context.
+    pushed_branches: Vec<claim_facts::pushes::PushObservation>,
     /// The instruction checks are detected against, so only a check's own pass
     /// pays for a tree hash.
     task: String,
@@ -835,7 +835,13 @@ impl VerificationLedger {
         workspace: &str,
     ) {
         self.observe_directory(name, args, ok, workspace);
-        self.observe_plain_push(name, args, execution, super::tools::ocap_disabled());
+        self.observe_plain_push(
+            name,
+            args,
+            execution,
+            super::tools::ocap_disabled(),
+            workspace,
+        );
         match execution {
             Some(outcome) => {
                 let command = claim_facts::observed_command(name, args);
