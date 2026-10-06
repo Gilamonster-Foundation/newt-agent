@@ -9,6 +9,29 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Added — the operator sees what the model is doing, and approves its first plan
+
+- The prose a model sends together with a tool call is now shown as one dim
+  `·` row above that batch's `⚙` headers, on every wire and on the piped
+  path; it used to be replayed into history and shown to nobody. A tick of an
+  existing plan shows as `step 3 of 7: …` instead of the whole `<plan>` block.
+- Plan-before-act: under initiative `patient` or `measured` (the default),
+  the first multi-step `update_plan` of an acting turn enters the Plan phase
+  on the model's behalf and ends the turn at `Approve this plan? [y/N/discuss]`;
+  later calls in that batch are clamped. `decisive` and `eager` set the plan
+  silently; `/mode full-auto` approves without asking. Approval seeds the
+  implementing turn with the ledger plan when no draft was presented, and a
+  bare continuation typed at the question (`go`, `do it`, `proceed`) is a
+  yes. Each plan asks once; the next task's plan asks again.
+- A prompt whose asks open collaboratively ("let's …", "we should …") is
+  classified Plan before the action needles; bare continuations ("let's go")
+  and direct verbs ("let's commit this", "let's run the tests") still act.
+  Both lists live in `DispositionLexicon` and the `[intake]` table.
+- `[tui] narration_intent_line` (default false) appends one sentence asking
+  the model to state its intent before each tool call, in the same reply as
+  the call.
+- Design: `docs/design/narration-and-plan-before-act.md`.
+
 ### Fixed — a governed commit is no longer refused in a default-permission Linux session (#2693)
 
 - The native commit broker's own `git` re-dispatch (`NativeGitBroker`) minted
