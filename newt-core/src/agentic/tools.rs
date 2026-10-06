@@ -4389,6 +4389,13 @@ async fn execute_authorized_tool(
             // `cwd` arg — it's the more specific, in-command intent).
             let command_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
             let run_cwd = resolve_exec_cwd(&command_cwd, cd_path.as_deref());
+            if let Err((error, outcome)) = shell::existing_exec_cwd(std::path::Path::new(&run_cwd)) {
+                let previous = default_command_cwd.unwrap_or_else(|| std::path::Path::new(workspace));
+                return host_return(executed((
+                    format!("{error}; default working directory remains {}", previous.display()),
+                    outcome,
+                )));
+            }
             if let Some(slot) = command_directory {
                 let _ = slot.set(std::path::PathBuf::from(&run_cwd));
             }

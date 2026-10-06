@@ -231,6 +231,33 @@ pub(super) fn resolve_exec_cwd(workspace: &str, cwd: Option<&str>) -> String {
     }
 }
 
+/// #2773: cwd availability is an execution precondition, not filesystem
+/// authority. Callers still enforce their existing containment policy.
+pub(super) fn existing_exec_cwd(
+    cwd: &std::path::Path,
+) -> Result<std::path::PathBuf, (String, ExecOutcome)> {
+    let unavailable = |reason: String| {
+        (
+            format!(
+                "error: working directory {} {reason}; no command ran",
+                cwd.display()
+            ),
+            ExecOutcome::Unavailable,
+        )
+    };
+    let resolved = cwd.canonicalize().map_err(|error| {
+        unavailable(if error.kind() == std::io::ErrorKind::NotFound {
+            "does not exist".into()
+        } else {
+            format!("cannot be resolved: {error}")
+        })
+    })?;
+    if !resolved.is_dir() {
+        return Err(unavailable("is not a directory".into()));
+    }
+    Ok(resolved)
+}
+
 /// Split a leading `cd <path> &&` (or `cd <path> ;`) off a `run_command`
 /// string so the `cd` — a shell **builtin**, not an executable — never reaches
 /// the confined exec layer, which would try to `execvp("cd")` and fail (on
