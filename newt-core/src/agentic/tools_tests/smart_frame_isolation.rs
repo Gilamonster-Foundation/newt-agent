@@ -949,6 +949,11 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
 /// widening the fence must never expose private frame storage on any platform.
 #[test]
 fn cold_cache_fetch_frame_gate_preserves_protection() {
+    // #2773: ambient dispatch fixtures mutate these process-wide switches.
+    // Own the shared lock and establish the confined launch this test proves.
+    let _env = crate::process_env::lock();
+    let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
     use crate::agentic::smart_harness::FramePermissionGate;
     struct FetchGate(usize);
     impl PermissionGate for FetchGate {
@@ -989,7 +994,11 @@ fn cold_cache_fetch_frame_gate_preserves_protection() {
         };
         let decision = gate.ask_dependency_fetch(&prepared, &request);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        assert!(matches!(decision, PermissionDecision::Allow(_)));
+        assert!(
+            matches!(decision, PermissionDecision::Allow(_)),
+            "unexpected frame refusal: {:?}",
+            gate.refusal
+        );
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             assert!(matches!(decision, PermissionDecision::Deny));

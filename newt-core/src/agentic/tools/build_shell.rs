@@ -78,10 +78,7 @@ pub(super) fn build_directory(
             ExecOutcome::Denied,
         )
     };
-    let cwd = cwd.canonicalize().map_err(|_| refusal())?;
-    if !cwd.is_dir() {
-        return Err(refusal());
-    }
+    let cwd = shell::existing_exec_cwd(cwd)?;
     if cwd.starts_with(&launch) {
         return Ok((launch, cwd));
     }

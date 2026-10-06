@@ -238,3 +238,96 @@ async fn host_scoped_build_children_narrow_network_argv() {
 async fn host_scoped_build_children_narrow_network_shell() {
     host_scoped_build_child_narrows_network(true).await;
 }
+
+/// #2773: a missing cwd is an execution precondition failure, not missing
+/// authority. Real directories ground both build routes without spawning Cargo.
+#[tokio::test]
+async fn missing_cwd_2773_build_routes() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    for shell_route in [false, true] {
+        let mut gate = BuildGate::default();
+        let (text, outcome) = build(
+            shell_route,
+            root.path(),
+            &missing,
+            &grants(root.path()),
+            &mut gate,
+        )
+        .await;
+        assert_eq!(outcome, crate::ExecOutcome::Unavailable, "{text}");
+        assert!(text.contains("does not exist; no command ran"), "{text}");
+        assert!(text.contains(&missing.display().to_string()), "{text}");
+        assert!(!text.contains("capability denied"), "{text}");
+        assert!(gate.0.is_empty());
+    }
+}
+
+/// #2773: a failed cd must never become an observed command directory or
+/// change the next call's default. Real host effects ground the dispatch seam
+/// on Linux, macOS and Windows; no external executable beyond the host shell.
+#[tokio::test]
+async fn missing_cwd_2773_dispatch_keeps_previous_directory() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _ocap = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let previous = root.join("previous");
+    std::fs::create_dir(&previous).unwrap();
+    for args in [
+        serde_json::json!({"command":"cd missing && cargo --version"}),
+        serde_json::json!({"command":"echo should-not-run > marker", "cwd":previous.join("missing")}),
+        serde_json::json!({"command":"echo recovered > marker"}),
+    ] {
+        let directory = std::sync::OnceLock::new();
+        let execution = std::sync::OnceLock::new();
+        let result = execute_tool_with_collaborators(
+            "run_command",
+            &args,
+            root.to_str().unwrap(),
+            false,
+            100,
+            &Caveats::top(),
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                default_command_cwd: Some(&previous),
+                command_directory: Some(&directory),
+                execution: Some(&execution),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if args["command"] == "echo recovered > marker" {
+            assert_eq!(
+                execution.get(),
+                Some(&crate::ExecOutcome::Passed),
+                "{result}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(previous.join("marker"))
+                    .unwrap()
+                    .trim(),
+                "recovered"
+            );
+            assert!(!root.join("marker").exists());
+        } else {
+            assert!(
+                result.contains("does not exist; no command ran"),
+                "{result}"
+            );
+            assert!(result.contains("working directory remains"), "{result}");
+            assert!(result.contains(&previous.display().to_string()), "{result}");
+            assert_eq!(execution.get(), Some(&crate::ExecOutcome::Unavailable));
+            assert!(
+                directory.get().is_none(),
+                "a nonexistent cwd is not an observation"
+            );
+            assert!(!previous.join("marker").exists());
+        }
+    }
+}

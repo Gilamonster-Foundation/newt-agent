@@ -330,9 +330,9 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
         let task = "Inspect the workspace and report the findings.";
         let messages = vec![MemMessage::user(task)];
         // Windows: this is a recovery-transcript fixture, not an AppContainer
-        // proof. Unrestricted axes let the invalid cwd reach the operating
-        // system; AppContainer evidence lives in the dedicated Windows
-        // evidence lane.
+        // proof. Unrestricted axes model the ambient session; the missing
+        // cwd is rejected before spawn. AppContainer evidence lives in the
+        // dedicated Windows evidence lane.
         #[cfg(windows)]
         let caveats = crate::caveats::Caveats::top();
         // Everywhere else: exercise the invalid cwd under the same confined
@@ -377,21 +377,13 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body))
             .collect();
+        // #2773: dispatch reports a portable cwd precondition error before
+        // attempting the command, rather than leaking OS-specific spawn text.
         assert!(
             request_text
                 .last()
                 .unwrap()
-                .contains("No such file or directory")
-                || request_text
-                    .last()
-                    .unwrap()
-                    .contains("cannot find the path")
-                // Windows reports an absent process working directory as
-                // ERROR_DIRECTORY (267), whose system message is this text.
-                || request_text
-                    .last()
-                    .unwrap()
-                    .contains("directory name is invalid"),
+                .contains("does not exist; no command ran"),
             "{wire}: failure must come from the absent cwd: {}",
             request_text.last().unwrap()
         );
