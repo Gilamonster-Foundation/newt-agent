@@ -482,9 +482,30 @@ pub(super) async fn execute(
         None
     };
     let caveats = task_authority.as_ref().unwrap_or(caveats);
-    let mut normalized =
-        shell::command_args_with_default_cwd(name, args, workspace, collab.default_command_cwd)
-            .unwrap_or(std::borrow::Cow::Borrowed(args));
+    let mut normalized = shell::command_args_with_default_cwd(
+        name,
+        args,
+        workspace,
+        collab.default_command_cwd,
+        collab.worktree_session,
+    )
+    .unwrap_or(std::borrow::Cow::Borrowed(args));
+    // Announce only an implicit task default, never an explicit cwd/dir/cd.
+    // Keep the path chosen for this call; the inner dispatcher receives the
+    // same projected args, rather than independently choosing another root.
+    let command_default_notice = shell::command_cwd_key(name).and_then(|key| {
+        if args.get(key).is_some()
+            || args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(|cmd| shell::split_leading_cd(cmd).0.is_some())
+        {
+            return None;
+        }
+        let task = session?.task_root(Path::new(workspace))?;
+        (normalized.get(key)?.as_str()? == task.to_str()?)
+            .then(|| format!("Commands now run in the task worktree {}", task.display()))
+    });
     let admission = session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
         creation_admission(
             bypass,
@@ -553,11 +574,7 @@ pub(super) async fn execute(
         None
     };
     let caveats = creation_authority.as_ref().unwrap_or(caveats);
-    let args = if candidate.is_some() {
-        normalized.as_ref()
-    } else {
-        args
-    };
+    let args = normalized.as_ref();
     let execution = collab.execution;
     if let Some(candidate) = &candidate {
         if let Err(reason) = candidate.ready() {
@@ -663,6 +680,15 @@ pub(super) async fn execute(
         )
         .await
     };
+    if let (Some(session), Some(notice)) = (session, command_default_notice) {
+        if !session
+            .command_cwd_notice_shown
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            presentation.preview(&notice, 0);
+            result.push_str(&format!("\n{notice}"));
+        }
+    }
     if name == "run_command"
         && execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Passed)
     {
@@ -850,3 +876,7 @@ mod invalid_reference_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tools_tests/worktree_command_cwd.rs"]
+mod command_cwd_tests;
