@@ -20,6 +20,7 @@ fn worktree_adoption_round6_injected_trust_and_engine_matrix() {
                     "git worktree add ../task -b task; git branch --show-current"
                 };
                 let admission = creation_admission(
+                    false,
                     "run_command",
                     &serde_json::json!({"command":source}),
                     root.to_str().unwrap(),
@@ -45,6 +46,7 @@ fn worktree_adoption_round6_injected_trust_and_engine_matrix() {
             }
         }
         let no_creation = creation_admission(
+            false,
             "run_command",
             &serde_json::json!({"command":"git branch --show-current"}),
             root.to_str().unwrap(),
