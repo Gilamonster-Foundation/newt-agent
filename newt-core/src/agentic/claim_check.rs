@@ -706,7 +706,21 @@ pub(crate) fn claimed_branches(text: &str) -> Vec<String> {
 /// honest non-claim into a false positive. [`CLAUSE_ABBREVIATIONS`] closes
 /// the matching gap at the OTHER end of a token: "e.g."/"etc." genuinely end
 /// with a period without ending the sentence.
-const COMMIT_VOID_WORDS: [&str; 5] = ["not", "never", "will", "previously", "earlier"];
+const ACTION_VOID_WORDS: [&str; 13] = [
+    "not",
+    "no",
+    "never",
+    "will",
+    "would",
+    "should",
+    "could",
+    "must",
+    "pending",
+    "if",
+    "until",
+    "previously",
+    "earlier",
+];
 const CLAUSE_BOUNDARY: [char; 4] = ['.', '!', '?', ';'];
 
 /// Trailing-period abbreviations common enough in operator prose that a
@@ -725,6 +739,11 @@ pub(super) fn ends_a_clause(tok: &str) -> bool {
 }
 
 pub(crate) fn claims_committed(text: &str) -> bool {
+    claims_completed_action(text, "committed")
+}
+
+/// Shared completed-action classifier for commit and push claim checks.
+pub(crate) fn claims_completed_action(text: &str, action: &str) -> bool {
     let normalize = |t: &str| {
         t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
             .to_ascii_lowercase()
@@ -735,7 +754,7 @@ pub(crate) fn claims_committed(text: &str) -> bool {
         }
         let toks: Vec<&str> = line.split_whitespace().collect();
         toks.iter().enumerate().any(|(i, tok)| {
-            if normalize(tok) != "committed" {
+            if normalize(tok) != action {
                 return false;
             }
             let clause_start = toks[..i]
@@ -745,8 +764,10 @@ pub(crate) fn claims_committed(text: &str) -> bool {
             let clause: Vec<String> = toks[clause_start..i].iter().map(|t| normalize(t)).collect();
             let voided = clause
                 .iter()
-                .any(|k| COMMIT_VOID_WORDS.contains(&k.as_str()) || k.contains("n't"))
-                || clause.windows(2).any(|w| w[0] == "yet" && w[1] == "to");
+                .any(|k| ACTION_VOID_WORDS.contains(&k.as_str()) || k.contains("n't"))
+                || clause
+                    .windows(2)
+                    .any(|w| matches!(w[0].as_str(), "yet" | "ready") && w[1] == "to");
             !voided
         })
     })

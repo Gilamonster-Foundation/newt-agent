@@ -5,7 +5,7 @@ const URL: &str = "https://github.com/o/r/pull/7";
 
 fn created() -> VerificationLedger {
     let mut ledger = VerificationLedger::for_turn("refactor", false);
-    ledger.record_pr_outcome(&Outcome::PrCreated { url: URL.into() });
+    ledger.record_publication_outcome(&Outcome::PrCreated { url: URL.into() });
     ledger
 }
 
@@ -80,10 +80,10 @@ fn issue_2741_observed_create_and_non_claims_pass() {
 #[test]
 fn issue_2741_failed_creation_and_turn_isolation() {
     let mut ledger = VerificationLedger::default();
-    ledger.record_pr_outcome(&Outcome::Failed {
+    ledger.record_publication_outcome(&Outcome::Failed {
         category: crate::git_staging::FailureCategory::Parse,
     });
-    ledger.record_pr_outcome(&Outcome::PrCreated {
+    ledger.record_publication_outcome(&Outcome::PrCreated {
         url: "not a URL".into(),
     });
     let text = "Opened PR #7.";
@@ -180,7 +180,7 @@ fn final_claim(ledger: &VerificationLedger, text: &str) -> String {
 #[test]
 fn issue_2741_round2_multiple_created_prs_pass_finalizer() {
     let mut ledger = created();
-    ledger.record_pr_outcome(&Outcome::PrCreated {
+    ledger.record_publication_outcome(&Outcome::PrCreated {
         url: "https://github.com/o/r/pull/8".into(),
     });
     for text in [
@@ -211,7 +211,7 @@ fn issue_2741_round2_comparison_reference_is_not_a_creation() {
 #[test]
 fn issue_2741_round2_false_creation_among_true_ones_is_refuted() {
     let mut ledger = created();
-    ledger.record_pr_outcome(&Outcome::PrCreated {
+    ledger.record_publication_outcome(&Outcome::PrCreated {
         url: "https://github.com/o/r/pull/8".into(),
     });
     for text in [
@@ -231,7 +231,7 @@ fn issue_2741_round2_false_creation_among_true_ones_is_refuted() {
 #[test]
 fn issue_2741_round2_coordinated_bare_references() {
     let mut ledger = created();
-    ledger.record_pr_outcome(&Outcome::PrCreated {
+    ledger.record_publication_outcome(&Outcome::PrCreated {
         url: "https://github.com/o/r/pull/8".into(),
     });
     for text in [

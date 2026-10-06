@@ -187,6 +187,7 @@ pub(super) fn execute_governed_push(
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
+    observed: Option<&std::sync::OnceLock<crate::git_staging::Outcome>>,
 ) -> String {
     if let Err(unavailable) = broker_available(caveats) {
         return format!("{unavailable}. {}", push_command::RETRY);
@@ -207,6 +208,9 @@ pub(super) fn execute_governed_push(
         let plan = plan_governed_push(source, cwd, caveats, gate, &held)?;
         run_staged_push(&plan, caveats, &held)
     })();
+    if let (Some(slot), Ok(outcome)) = (observed, &result) {
+        let _ = slot.set(outcome.clone());
+    }
     render_governed_result(&command, result, push_command::RETRY)
 }
 
@@ -2968,7 +2972,8 @@ mod governed_push_tests {
         let env = BrokerEnv::new();
         env.global(&["credential.helper", &format!("!echo {CANARY}")]);
         let repo = repo_on_feature_branch();
-        let result = execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None);
+        let result =
+            execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None, None);
         assert!(
             result.starts_with("failed(refused_by_harness):"),
             "{result}"
@@ -3043,7 +3048,12 @@ mod governed_push_tests {
                 if result == format!("pr_created {url}"))
             );
             assert_eq!(command_directory.get().map(|p| p.as_path()), Some(ws));
-        } else if !needs_pr_create_broker(command) {
+        } else if needs_push_broker(command) && result.starts_with("pushed ") {
+            assert!(matches!(
+                governed_pr.get(),
+                Some(crate::git_staging::Outcome::Pushed { .. })
+            ));
+        } else if !needs_pr_create_broker(command) && !needs_push_broker(command) {
             assert!(governed_pr.get().is_none());
         }
         drop(display);
@@ -3116,6 +3126,7 @@ mod governed_push_tests {
                 repo.path(),
                 &with_net(Scope::only([])),
                 &mut Some(&mut gate),
+                None,
             );
             assert!(gate.requests.is_empty(), "{command}");
             assert!(output.contains("Retry with run_command"), "{output}");
@@ -3395,7 +3406,7 @@ mod governed_push_tests {
         )
         .unwrap();
         let (model, fd1) = capture_fd(1, || {
-            execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None)
+            execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None, None)
         });
         assert!(model.starts_with("failed(refused_by_harness):"), "{model}");
         assert!(!model.contains("sudoers"));
