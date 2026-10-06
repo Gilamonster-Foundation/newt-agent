@@ -8,6 +8,7 @@ use super::native_git::{invocation, is_git as resembles_git, literal};
 pub(super) mod branch;
 #[path = "worktree_git.rs"]
 mod git_identity;
+mod nudge;
 mod prepare;
 
 /// Match the actual Git subcommand, never words appearing in path operands.
@@ -403,6 +404,8 @@ pub(super) async fn execute(
 ) -> String {
     let bypass = ocap_disabled();
     let session = collab.worktree_session;
+    let objective = collab.prompt_context.map(|context| context.active_text());
+    let command_directory = collab.command_directory;
     let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);
     let mut collab = collab;
     // Project the approved workspace switch before refreshing current ceilings.
@@ -611,6 +614,30 @@ pub(super) async fn execute(
         )
         .await
     };
+    if name == "run_command"
+        && execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Passed)
+    {
+        if let (Some(session), Some(objective), Some(raw)) = (
+            session,
+            objective,
+            normalized.get("command").and_then(|value| value.as_str()),
+        ) {
+            let (cd, command) = shell::split_leading_cd(raw);
+            let base = shell::resolve_exec_cwd(
+                workspace,
+                normalized.get("cwd").and_then(|value| value.as_str()),
+            );
+            let fallback = PathBuf::from(shell::resolve_exec_cwd(&base, cd.as_deref()));
+            let cwd = command_directory
+                .and_then(|slot| slot.get())
+                .unwrap_or(&fallback);
+            if let Some(hint) =
+                nudge::branch_in_place(session, objective, &command, cwd, &caveats.fs_read)
+            {
+                result.push_str(&format!("\n{hint}"));
+            }
+        }
+    }
     if let Some(candidate) = &candidate {
         result = report_leftover(presentation, candidate, result);
     }

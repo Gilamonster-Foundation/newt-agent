@@ -36,6 +36,10 @@
 #   - ambient worktree dispatch proof (#2750), .github/workflows/ci.yml test job:
 #     explicitly runs the exact ignored fullaccess_tests::adoption_2750_full_access_creation_then_task_command
 #     in newt-core's worktree module. Real Git/host shell, Linux CI only.
+#   - worktree nudge dispatch proof (#2761), .github/workflows/ci.yml test job:
+#     explicitly runs the exact ignored nudge::tests::worktree_nudge_dispatch_result
+#     test in newt-core's worktree module. Real Git/host shell, Linux CI only;
+#     exercises the production annotation seam as well as the hint helper.
 #   - checked move_from native proof (#2724), .github/workflows/ci.yml test job:
 #     builds newt-net-guard with ast, then explicitly runs the exact ignored
 #     newt-core::agentic::tools::move_from::tests::real_move_from_fixture_compiles_and_failed_check_restores
