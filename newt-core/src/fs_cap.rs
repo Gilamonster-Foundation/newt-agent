@@ -271,18 +271,9 @@ impl WorkspaceDir {
     /// is refused by the kernel — there is no `mkdir -p` over an un-resolved path.
     /// An existing directory is fine; a non-directory in the path errors.
     pub fn create_dir_all(&self, rel: &Path) -> io::Result<()> {
-        self.create_directories(rel, OFlags::empty())
-    }
-
-    /// Materialize an approved destination without following even in-root links.
-    pub(crate) fn create_dir_all_nofollow(&self, rel: &Path) -> io::Result<()> {
-        self.create_directories(rel, OFlags::NOFOLLOW)
-    }
-
-    fn create_directories(&self, rel: &Path, extra_flags: OFlags) -> io::Result<()> {
         // `try_clone` so the walk owns its cursor without consuming `self.root`.
         let mut cur: OwnedFd = self.root.try_clone()?;
-        let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | extra_flags;
+        let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
         for comp in rel.components() {
             let name = match comp {
                 Component::Normal(n) => n,

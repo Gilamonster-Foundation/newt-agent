@@ -13,7 +13,7 @@ fn git(root: &Path, home: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-async fn run(
+pub(super) async fn run(
     source: &str,
     cwd: &Path,
     original: &Path,

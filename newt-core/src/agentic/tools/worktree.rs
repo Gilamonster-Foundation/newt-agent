@@ -479,6 +479,17 @@ pub(super) async fn execute(
         args
     };
     let execution = collab.execution;
+    if let Some(candidate) = &candidate {
+        if let Err(reason) = candidate.ready() {
+            if let Some(invocation) = collab.invocation {
+                invocation.host();
+            }
+            if let Some(slot) = execution {
+                let _ = slot.set(crate::ExecOutcome::Denied);
+            }
+            return format!("capability denied: {reason}");
+        }
+    }
     let mut result = if let Some(policy) = &policy {
         let refuse_git = name == "git"
             && !matches!(
@@ -524,6 +535,28 @@ pub(super) async fn execute(
             mcp,
             ToolCollaborators {
                 permission_gate: Some(&mut gate),
+                ..collab
+            },
+            tool_offload,
+            disposition,
+        )
+        .await
+    } else if let Some(candidate) = &candidate {
+        let mut guard = prepare::Guard {
+            candidate,
+            inner: collab.permission_gate.take(),
+        };
+        execute_tool_unadopted(
+            presentation,
+            name,
+            args,
+            workspace,
+            color,
+            tool_output_lines,
+            caveats,
+            mcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut guard),
                 ..collab
             },
             tool_offload,

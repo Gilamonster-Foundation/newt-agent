@@ -1,5 +1,6 @@
 //! #2757: approve creating and adopting the exact destination before host mkdir.
 use super::*;
+use crate::Scope;
 
 pub(super) fn creation(
     candidate: &mut Creation,
@@ -60,4 +61,81 @@ pub(super) fn creation(
     }
     candidate.prepare(&authority)?;
     Ok(authority)
+}
+
+/// Recheck after late permission callbacks as well as at the dispatch entry.
+/// A prompt/refresh may yield control after the directory was prepared.
+pub(super) struct Guard<'c, 'g> {
+    pub(super) candidate: &'c Creation,
+    pub(super) inner: Option<&'g mut dyn PermissionGate>,
+}
+impl Guard<'_, '_> {
+    fn checked(&self, decision: PermissionDecision) -> PermissionDecision {
+        if self.candidate.ready().is_err() {
+            PermissionDecision::Deny
+        } else {
+            decision
+        }
+    }
+}
+impl PermissionGate for Guard<'_, '_> {
+    fn refresh_caveats(&mut self, base: &Caveats) -> PermissionDecision {
+        let decision = self.inner.as_deref_mut().map_or_else(
+            || PermissionDecision::Allow(base.clone()),
+            |g| g.refresh_caveats(base),
+        );
+        self.checked(decision)
+    }
+    fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+        let decision = self
+            .inner
+            .as_deref_mut()
+            .map_or(PermissionDecision::Deny, |g| g.ask(requests));
+        self.checked(decision)
+    }
+    fn ask_with_caveats(
+        &mut self,
+        base: &Caveats,
+        requests: &[PermissionRequest],
+    ) -> PermissionDecision {
+        let decision = self
+            .inner
+            .as_deref_mut()
+            .map_or(PermissionDecision::Deny, |g| {
+                g.ask_with_caveats(base, requests)
+            });
+        self.checked(decision)
+    }
+    fn ask_question(&mut self, q: &str) -> HumanQuestionOutcome {
+        self.inner
+            .as_deref_mut()
+            .map_or(HumanQuestionOutcome::Unavailable, |g| g.ask_question(q))
+    }
+    fn consume_pending_once(&mut self, kind: DenialKind, target: &str) {
+        if let Some(g) = self.inner.as_deref_mut() {
+            g.consume_pending_once(kind, target);
+        }
+    }
+    fn queue_pending_once(&mut self, kind: DenialKind, target: &str) {
+        if let Some(g) = self.inner.as_deref_mut() {
+            g.queue_pending_once(kind, target);
+        }
+    }
+    fn apply_pending_once(&mut self, kind: DenialKind, target: &str, base: &Caveats) -> Caveats {
+        let current = self.inner.as_deref_mut().map_or_else(
+            || base.clone(),
+            |g| g.apply_pending_once(kind, target, base),
+        );
+        if self.candidate.ready().is_ok() {
+            current
+        } else {
+            Caveats {
+                exec: Scope::none(),
+                fs_read: Scope::none(),
+                fs_write: Scope::none(),
+                net: Scope::none(),
+                ..current
+            }
+        }
+    }
 }

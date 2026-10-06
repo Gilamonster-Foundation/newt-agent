@@ -1,6 +1,10 @@
 //! Session worktree adoption and original-checkout protection (#2733, #2757).
 //! Explicit destination approval can relocate workspace access for the task;
 //! paths remain runtime locators, never persisted identities.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "worktree_destination.rs"]
+mod destination;
+
 use crate::{Caveats, Scope};
 use std::path::{Path, PathBuf};
 
@@ -143,7 +147,7 @@ pub(crate) struct Creation {
     protected_branch: Option<String>,
     relocate_workspace_access: bool,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    parent: agent_bridle_fdguard::GrantedRoot,
+    path_guard: destination::Destination,
 }
 impl Creation {
     pub(crate) fn destination(&self) -> &Path {
@@ -161,37 +165,7 @@ impl Creation {
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let current = agent_bridle_fdguard::GrantedRoot::acquire(self.parent.provenance())
-                .map_err(|e| e.to_string())?;
-            if current.identity() != self.parent.identity() {
-                return Err("worktree destination parent changed during approval".into());
-            }
-            if resolved(&self.destination).as_ref() != Some(&self.destination) {
-                return Err("worktree destination changed during approval".into());
-            }
-            // If the existing parent is already readable/writable, Git can
-            // create the directory itself, preserving its failure cleanup.
-            // Otherwise materialize only the approved path so the child needs
-            // no parent grant, including when several components are missing.
-            let parent_authorized = [&authority.fs_read, &authority.fs_write]
-                .iter()
-                .all(|scope| {
-                    crate::caveats::permits_path(scope, &self.parent.provenance().to_string_lossy())
-                });
-            if !parent_authorized {
-                let directory = crate::fs_cap::WorkspaceDir::from_granted_root(&self.parent)
-                    .map_err(|e| e.to_string())?;
-                let relative = self
-                    .destination
-                    .strip_prefix(self.parent.provenance())
-                    .map_err(|e| e.to_string())?;
-                directory
-                    .create_dir_all_nofollow(relative)
-                    .map_err(|e| e.to_string())?;
-                if self.destination.canonicalize().ok().as_ref() != Some(&self.destination) {
-                    return Err("worktree destination changed during preparation".into());
-                }
-            }
+            self.path_guard.prepare()?;
             self.read = authority.fs_read.clone();
             self.relocate_workspace_access = true;
             Ok(())
@@ -224,13 +198,7 @@ impl Creation {
             return None;
         };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let parent = agent_bridle_fdguard::GrantedRoot::acquire(
-            destination
-                .parent()?
-                .ancestors()
-                .find(|path| path.is_dir())?,
-        )
-        .ok()?;
+        let path_guard = destination::Destination::capture(&destination).ok()?;
         Some(Self {
             original,
             destination,
@@ -239,7 +207,7 @@ impl Creation {
             protected_branch,
             relocate_workspace_access: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            parent,
+            path_guard,
         })
     }
     pub(crate) fn matches_source(&self, cwd: &Path) -> bool {
@@ -248,7 +216,15 @@ impl Creation {
             .and_then(|held| crate::git_staging::discover_git_dirs(cwd, &held).ok())
             .is_some_and(|(common, _)| common == self.common)
     }
-    pub(crate) fn verify(self) -> Option<AdoptedWorktree> {
+    pub(crate) fn ready(&self) -> Result<(), String> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.path_guard.check()?;
+        Ok(())
+    }
+
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+    pub(crate) fn verify(mut self) -> Option<AdoptedWorktree> {
+        self.ready().ok()?;
         let held = crate::git_staging::HeldRoots::bind(&self.read).ok()?;
         let (common, admin) =
             crate::git_staging::discover_git_dirs(&self.destination, &held).ok()?;
@@ -266,9 +242,12 @@ impl Creation {
         if resolved(Path::new(back.trim()))? != gitlink.canonicalize().ok()? {
             return None;
         }
+        self.ready().ok()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.path_guard.keep();
         Some(AdoptedWorktree {
             original: self.original,
-            worktree: self.destination.canonicalize().ok()?,
+            worktree: self.destination,
             common,
             admin,
             protected_branch: self.protected_branch,
