@@ -4352,7 +4352,10 @@ async fn execute_authorized_tool(
             // expanded command bound to host-held attribution/signing policy.
             // Other commit-producing verbs still need multi-commit lifecycle
             // support; they keep the explicit guard below.
-            let commit_requested = native_git::needs_commit_broker(cmd);
+            // Match the ordinary host route: an explicit preset floor still wins.
+            let publication_bypass = ocap_disabled() && shell::exec_floor_permits(exec_floor, cmd);
+            let governed_git = native_git::publication::governed(cmd, publication_bypass, presentation);
+            let commit_requested = governed_git && native_git::needs_commit_broker(cmd);
             let commit_broker = if commit_requested {
                 match git_tool.and_then(|tool| tool.native_commit_policy()) {
                     Some(policy) => match crate::native_git_broker::NativeGitBroker::new(policy) {
@@ -4364,7 +4367,7 @@ async fn execute_authorized_tool(
             } else {
                 None
             };
-            if run_command_creates_shell_git_commit(cmd) && commit_broker.is_none() {
+            if governed_git && run_command_creates_shell_git_commit(cmd) && commit_broker.is_none() {
                 let reason = match agent_bridle::inspect_shell(cmd) {
                     Err(error) => format!("shell inspection failed: {error}"),
                     Ok(_) if commit_requested => "native commit attribution/signing policy is unavailable in this session".to_owned(),
@@ -4399,7 +4402,7 @@ async fn execute_authorized_tool(
             // where it would either hang against `net: none` or (if that
             // narrowing ever regressed) inherit the session's full net scope
             // inside a hostile-repo-influenced child.
-            if native_git::needs_push_broker(cmd) {
+            if governed_git && native_git::needs_push_broker(cmd) {
                 return host_return(native_git::execute_governed_push(
                     cmd,
                     std::path::Path::new(&run_cwd),
@@ -4407,7 +4410,7 @@ async fn execute_authorized_tool(
                     &mut permission_gate,
                 ));
             }
-            if native_git::needs_pr_create_broker(cmd) {
+            if governed_git && native_git::needs_pr_create_broker(cmd) {
                 return host_return(native_git::execute_governed_pr_create(
                     cmd,
                     std::path::Path::new(&run_cwd),
@@ -4416,14 +4419,16 @@ async fn execute_authorized_tool(
                     governed_pr,
                 ));
             }
-            if let Err(reason) = native_git::preflight(
-                cmd,
-                std::path::Path::new(&run_cwd),
-                caveats,
-                &mut permission_gate,
-                commit_broker.is_some(),
-            ) {
-                return host_return(reason);
+            if governed_git {
+                if let Err(reason) = native_git::preflight(
+                    cmd,
+                    std::path::Path::new(&run_cwd),
+                    caveats,
+                    &mut permission_gate,
+                    commit_broker.is_some(),
+                ) {
+                    return host_return(reason);
+                }
             }
             let filesystem_requests = match declared_filesystem_requests(args, cmd, &run_cwd) {
                 Ok(requests) => requests,
