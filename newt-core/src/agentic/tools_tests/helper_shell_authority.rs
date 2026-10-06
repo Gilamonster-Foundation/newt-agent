@@ -481,6 +481,26 @@ fn adoption_2759_notice_uses_only_blocked_write_denials() {
             true,
         ),
         ("fs_write", "write denied", original.join("sentinel"), true),
+        // #2759 round 2: wildcards in actual path components still refuse;
+        // the Windows canonical prefix's '?' is not a path-component glob.
+        (
+            "open",
+            "denied: write of sentinel",
+            original.join("sent?nel"),
+            false,
+        ),
+        (
+            "open",
+            "denied: write of sentinel",
+            original.join("*.rs"),
+            false,
+        ),
+        (
+            "open",
+            "denied: write of sentinel",
+            original.join("[ab].rs"),
+            false,
+        ),
         (
             "open",
             "denied: read of sentinel",

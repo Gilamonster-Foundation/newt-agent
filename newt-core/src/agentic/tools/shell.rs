@@ -2252,7 +2252,12 @@ pub(super) fn worktree_denial_notice(
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|path| {
                         !path.is_empty()
-                            && !path.contains(['*', '?', '['])
+                            // A Windows canonical prefix contains '?', which
+                            // is syntax rather than a filename wildcard.
+                            && !std::path::Path::new(path).components().any(|component| {
+                                matches!(component, std::path::Component::Normal(part)
+                                    if part.to_string_lossy().contains(['*', '?', '[']))
+                            })
                             && policy.blocked(&std::path::Path::new(cwd).join(path))
                     })
         })

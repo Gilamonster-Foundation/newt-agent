@@ -255,8 +255,10 @@ fn adoption_fences_common_metadata_outside_the_original_checkout() {
     }
 }
 
-/// #2759: nested creation is distinguished from supported sibling creation on
-/// every platform; dispatch rejects it before running Git.
+/// #2759: nested creation is distinguished from supported sibling creation
+/// where held metadata reads can admit a candidate. Non-Unix refusal is covered
+/// by unsupported_metadata_reads_refuse_adoption above.
+#[cfg(unix)]
 #[test]
 fn adoption_2759_canonical_nested_destination() {
     let (_temp, policy, _) = fixture(false);
