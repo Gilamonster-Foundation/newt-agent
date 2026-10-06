@@ -51,7 +51,8 @@ pub(super) fn branch_in_place(
     Some(HINT)
 }
 
-/// #2766: successful standalone argv is advisory evidence in ambient mode.
+/// #2766: record the existing destination and observed branch after a successful
+/// standalone creation in ambient mode. This is advisory evidence only.
 /// Never enter confinement verification here (#2763), or infer success from
 /// an aggregate pipeline/compound result. Unknown commands retain prior state.
 pub(super) fn record_unarmed_creation(
@@ -94,8 +95,18 @@ fn unarmed_task_location(args: &serde_json::Value, workspace: &str) -> Option<(P
     if path.starts_with('-') || path.is_empty() {
         return None;
     }
-    let path = crate::caveats::lexically_normalize(&cwd.join(path).to_string_lossy());
-    Some((path, branch.clone()))
+    // Resolve through the filesystem: lexical `..` removal changes the meaning
+    // when cwd or -C passes through a symlink.
+    let path = cwd.join(path).canonicalize().ok()?;
+    let gitlink = std::fs::read_to_string(path.join(".git")).ok()?;
+    let admin = gitlink.strip_prefix("gitdir:")?.trim();
+    if admin.is_empty() {
+        return None;
+    }
+    let head = std::fs::read_to_string(path.join(admin).join("HEAD")).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    crate::git_staging::validate_branch_name(branch).ok()?;
+    Some((path, branch.to_owned()))
 }
 
 #[cfg(all(test, unix))]
@@ -312,6 +323,22 @@ mod handoff_tests {
             record_unarmed_creation(&session, &args, workspace, outcome);
             assert!(session.task_hint().is_none());
         }
+        // A Passed outcome without an existing linked checkout is insufficient.
+        record_unarmed_creation(
+            &session,
+            &args,
+            workspace,
+            Some(&crate::ExecOutcome::Passed),
+        );
+        assert!(session.task_hint().is_none());
+        std::fs::create_dir(temp.path().join("repo")).unwrap();
+        let task = temp.path().join("task");
+        let admin = temp.path().join("admin");
+        std::fs::create_dir(&task).unwrap();
+        std::fs::create_dir(&admin).unwrap();
+        std::fs::write(task.join(".git"), "gitdir: ../admin\n").unwrap();
+        // Use observed HEAD, not the requested branch operand.
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/observed-task\n").unwrap();
         for args in [
             args,
             serde_json::json!({"command":"cd repo && git worktree add -b task ../task"}),
@@ -323,11 +350,26 @@ mod handoff_tests {
                 workspace,
                 Some(&crate::ExecOutcome::Passed),
             );
-            let expected = format!("Task worktree: {} (branch task) — run commands there, not in the original checkout.", temp.path().join("task").display());
+            let expected = format!("Task worktree: {} (branch observed-task) — run commands there, not in the original checkout.", task.canonicalize().unwrap().display());
             assert_eq!(session.task_hint().as_deref(), Some(expected.as_str()));
             assert!(session.snapshot().is_none());
             session.lift();
             assert!(session.task_hint().is_none());
+        }
+        for head in [
+            "",
+            "not a HEAD",
+            "ref: refs/heads/bad..branch\n",
+            "0123456789012345678901234567890123456789\n",
+        ] {
+            std::fs::write(admin.join("HEAD"), head).unwrap();
+            record_unarmed_creation(
+                &session,
+                &serde_json::json!({"command":"git worktree add -b task task"}),
+                workspace,
+                Some(&crate::ExecOutcome::Passed),
+            );
+            assert!(session.task_hint().is_none(), "{head}");
         }
         for command in [
             "echo 'git worktree add -b fake ../fake'",
