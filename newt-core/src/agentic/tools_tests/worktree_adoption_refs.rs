@@ -13,7 +13,7 @@ fn git(root: &Path, home: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-async fn run(
+pub(super) async fn run(
     source: &str,
     cwd: &Path,
     original: &Path,
@@ -232,7 +232,7 @@ async fn adoption_refs_external_destination_prompts_before_execution() {
     assert!(
         gate.0
             .iter()
-            .any(|r| r.kind == DenialKind::FsWrite && Path::new(&r.target) == temp.path()),
+            .any(|r| r.kind == DenialKind::FsWrite && Path::new(&r.target) == target),
         "missing destination prompt: {text}"
     );
     assert_eq!(outcome, Some(ExecOutcome::Denied), "{text}");
@@ -240,7 +240,7 @@ async fn adoption_refs_external_destination_prompts_before_execution() {
     assert!(session.snapshot().is_none());
 }
 
-/// #2748: permission approval adds only the destination's existing parent and lets
+/// #2757: permission approval adds only the exact prepared destination and lets
 /// the same preflighted creation complete for sibling and separate temp roots.
 #[tokio::test]
 async fn adoption_refs_approved_external_destination_is_adopted() {
@@ -304,7 +304,7 @@ async fn adoption_refs_approved_external_destination_is_adopted() {
         .await;
         assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
         assert_eq!(gate.0.len(), 1, "{text}");
-        assert_eq!(Path::new(&gate.0[0].target), target.parent().unwrap());
+        assert_eq!(Path::new(&gate.0[0].target), target);
         assert_eq!(
             session.snapshot().unwrap().worktree,
             target.canonicalize().unwrap()
@@ -393,7 +393,15 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
     );
     assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
     assert!(session.snapshot().is_none());
-    assert!(!root.join("task").exists());
+    assert!(root.join("task").is_dir());
+    assert_eq!(std::fs::read_dir(root.join("task")).unwrap().count(), 0);
+    assert!(
+        text.contains(&format!(
+            "left empty directory {}; remove it if unwanted",
+            root.join("task").display()
+        )),
+        "{text}"
+    );
 
     let (text, outcome) = run(
         "git worktree add -b fresh task missing-start",

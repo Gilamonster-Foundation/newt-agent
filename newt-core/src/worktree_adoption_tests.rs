@@ -14,6 +14,11 @@ pub(crate) fn fixture(nested: bool) -> (tempfile::TempDir, AdoptedWorktree, Path
     for dir in [&worktree, &admin, &unrelated, &common.join("objects")] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     let policy = AdoptedWorktree {
         original: original.canonicalize().unwrap(),
@@ -21,6 +26,7 @@ pub(crate) fn fixture(nested: bool) -> (tempfile::TempDir, AdoptedWorktree, Path
         common: common.canonicalize().unwrap(),
         admin: admin.canonicalize().unwrap(),
         protected_branch: Some("main".into()),
+        relocate_workspace_access: false,
     };
     (temp, policy, unrelated.canonicalize().unwrap())
 }
@@ -246,5 +252,41 @@ fn adoption_fences_common_metadata_outside_the_original_checkout() {
             &narrowed.fs_write,
             &path.to_string_lossy()
         ));
+    }
+}
+
+/// #2757: an approved task handoff projects only existing workspace axes,
+/// never exec/net authority, deny-all, or an unrelated caller's permissions.
+#[test]
+fn sibling_task_handoff_preserves_caller_bounds() {
+    let (_temp, mut policy, unrelated) = fixture(false);
+    policy.relocate_workspace_access = true;
+    let mut base = Caveats::top();
+    base.exec = Scope::only(["git".into()]);
+    base.net = Scope::none();
+    base.fs_read = Scope::only([policy.original.to_string_lossy().into_owned()]);
+    base.fs_write = base.fs_read.clone();
+    let task = policy.task_authority(&base);
+    assert!(crate::caveats::permits_path(
+        &task.fs_read,
+        &policy.worktree.to_string_lossy()
+    ));
+    assert!(crate::caveats::permits_path(
+        &task.fs_write,
+        &policy.worktree.to_string_lossy()
+    ));
+    assert_eq!(task.exec, base.exec);
+    assert_eq!(task.net, base.net);
+    assert!(!crate::caveats::permits_path(
+        &policy.attenuate(&task).fs_write,
+        &policy.original.to_string_lossy()
+    ));
+    for scope in [
+        Scope::none(),
+        Scope::only([unrelated.to_string_lossy().into_owned()]),
+    ] {
+        base.fs_read = scope.clone();
+        base.fs_write = scope;
+        assert_eq!(policy.task_authority(&base), base);
     }
 }
