@@ -222,8 +222,18 @@ impl Creation {
         Ok(())
     }
 
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
-    pub(crate) fn verify(mut self) -> Option<AdoptedWorktree> {
+    pub(crate) fn leftover_notice(&self) -> Option<String> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.path_guard.left_empty() {
+            return Some(format!(
+                "left empty directory {}; remove it if unwanted",
+                self.destination.display()
+            ));
+        }
+        None
+    }
+
+    pub(crate) fn verify(self) -> Option<AdoptedWorktree> {
         self.ready().ok()?;
         let held = crate::git_staging::HeldRoots::bind(&self.read).ok()?;
         let (common, admin) =
@@ -243,8 +253,6 @@ impl Creation {
             return None;
         }
         self.ready().ok()?;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        self.path_guard.keep();
         Some(AdoptedWorktree {
             original: self.original,
             worktree: self.destination,

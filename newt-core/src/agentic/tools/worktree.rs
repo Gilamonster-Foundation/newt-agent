@@ -375,6 +375,18 @@ fn record_verified_creation(
     }
 }
 
+fn report_leftover(
+    presentation: &mut dyn ToolPresentation,
+    candidate: &Creation,
+    mut result: String,
+) -> String {
+    if let Some(notice) = candidate.leftover_notice() {
+        presentation.preview(&notice, 0);
+        result.push_str(&format!("\n{notice}"));
+    }
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     presentation: &mut dyn ToolPresentation,
@@ -466,7 +478,11 @@ pub(super) async fn execute(
                 if let Some(slot) = collab.execution {
                     let _ = slot.set(crate::ExecOutcome::Denied);
                 }
-                return format!("capability denied: {reason}");
+                return report_leftover(
+                    presentation,
+                    candidate,
+                    format!("capability denied: {reason}"),
+                );
             }
         }
     } else {
@@ -487,7 +503,11 @@ pub(super) async fn execute(
             if let Some(slot) = execution {
                 let _ = slot.set(crate::ExecOutcome::Denied);
             }
-            return format!("capability denied: {reason}");
+            return report_leftover(
+                presentation,
+                candidate,
+                format!("capability denied: {reason}"),
+            );
         }
     }
     let mut result = if let Some(policy) = &policy {
@@ -579,6 +599,9 @@ pub(super) async fn execute(
         )
         .await
     };
+    if let Some(candidate) = &candidate {
+        result = report_leftover(presentation, candidate, result);
+    }
     if let (Some(session), Some(candidate)) = (session, candidate) {
         if matches!(
             execution.and_then(|slot| slot.get()),

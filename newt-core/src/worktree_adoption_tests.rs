@@ -14,6 +14,11 @@ pub(crate) fn fixture(nested: bool) -> (tempfile::TempDir, AdoptedWorktree, Path
     for dir in [&worktree, &admin, &unrelated, &common.join("objects")] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     let policy = AdoptedWorktree {
         original: original.canonicalize().unwrap(),

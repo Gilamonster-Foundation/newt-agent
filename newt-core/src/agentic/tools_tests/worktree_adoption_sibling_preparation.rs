@@ -66,9 +66,9 @@ fn sibling_round2_missing_parent_refuses_without_mutation() {
     assert!(!policy.worktree.join("missing").exists());
 }
 
-/// #2757: cancellation/refusal drops an owned empty leaf, never its siblings.
+/// #2757: cancellation/refusal retains the empty leaf; no cleanup unlinks any path.
 #[test]
-fn sibling_round2_drop_rolls_back_only_owned_empty_leaf() {
+fn sibling_round3_drop_retains_empty_leaf() {
     let (_temp, policy, neighbor) = crate::worktree_adoption::tests::fixture(false);
     std::fs::remove_dir(&policy.worktree).unwrap();
     std::fs::write(neighbor.join("sentinel"), "keep").unwrap();
@@ -83,8 +83,8 @@ fn sibling_round2_drop_rolls_back_only_owned_empty_leaf() {
     assert!(policy.worktree.is_dir());
     drop(candidate);
     assert!(
-        !policy.worktree.exists(),
-        "cancelled creation left its leaf behind"
+        policy.worktree.is_dir(),
+        "cancelled creation must retain its leaf"
     );
     assert_eq!(
         std::fs::read_to_string(neighbor.join("sentinel")).unwrap(),

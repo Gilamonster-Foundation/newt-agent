@@ -45,6 +45,16 @@ impl PermissionGate for AllowOnce {
     }
 }
 
+#[derive(Default)]
+struct Notices(Vec<String>);
+impl ToolPresentation for Notices {
+    fn preview(&mut self, text: &str, _: usize) {
+        self.0.push(text.into());
+    }
+    fn document(&mut self, _: &str) {}
+    fn override_result(&mut self, _: String) {}
+}
+
 struct ReadOnly;
 impl PermissionGate for ReadOnly {
     fn refresh_caveats(&mut self, base: &Caveats) -> PermissionDecision {
@@ -112,25 +122,57 @@ async fn sibling_grant_once_creates_and_keeps_task_readable_writable() {
             } else {
                 "git worktree add -b failed ../failed-task nonexistent-start"
             };
-            let (text, outcome) = super::round2_tests::dispatch(
-                serde_json::json!({"command":command}),
-                &root,
+            let mut notices = Notices::default();
+            let outcome = std::sync::OnceLock::new();
+            let text = execute(
+                &mut notices,
+                "run_command",
+                &serde_json::json!({"command":command}),
+                root.to_str().unwrap(),
+                false,
+                20,
                 &failed_base,
-                &session,
-                Some(&mut failed_gate),
+                &mut crate::agentic::NoMcp,
+                ToolCollaborators {
+                    worktree_session: Some(&session),
+                    permission_gate: Some(&mut failed_gate),
+                    execution: Some(&outcome),
+                    ..Default::default()
+                },
+                false,
+                PromptDisposition::Act,
             )
             .await;
+            let outcome = outcome.get().copied();
+            assert!(
+                notices.0.iter().any(|n| n
+                    == &format!(
+                        "left empty directory {}; remove it if unwanted",
+                        failed_target.display()
+                    )),
+                "operator missed notice: {:?}",
+                notices.0
+            );
             assert_ne!(
                 outcome,
                 Some(ExecOutcome::Passed),
                 "failure control: {text}"
             );
             assert!(
-                !failed_target.exists(),
-                "failure left empty owned leaf: {text}"
+                failed_target.is_dir(),
+                "failure must retain the empty leaf: {text}"
             );
+            assert!(
+                text.contains(&format!(
+                    "left empty directory {}; remove it if unwanted",
+                    failed_target.display()
+                )),
+                "missing leftover notice: {text}"
+            );
+            assert_eq!(std::fs::read_dir(&failed_target).unwrap().count(), 0);
             assert!(failed_gate.2.is_empty());
             assert!(session.snapshot().is_none());
+            std::fs::remove_dir(&failed_target).unwrap();
         }
         let mut gate = AllowOnce::default();
         let (text, outcome) = super::round2_tests::dispatch(

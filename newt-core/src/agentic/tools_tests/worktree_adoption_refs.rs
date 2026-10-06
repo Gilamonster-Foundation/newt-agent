@@ -393,7 +393,15 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
     );
     assert_eq!(std::fs::read(root.join(".git/HEAD")).unwrap(), head);
     assert!(session.snapshot().is_none());
-    assert!(!root.join("task").exists());
+    assert!(root.join("task").is_dir());
+    assert_eq!(std::fs::read_dir(root.join("task")).unwrap().count(), 0);
+    assert!(
+        text.contains(&format!(
+            "left empty directory {}; remove it if unwanted",
+            root.join("task").display()
+        )),
+        "{text}"
+    );
 
     let (text, outcome) = run(
         "git worktree add -b fresh task missing-start",
