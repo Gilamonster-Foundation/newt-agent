@@ -293,9 +293,16 @@ fn command_budget_2747_catalog_and_dispatch_agree() {
 #[tokio::test]
 async fn command_budget_2747_host_dispatch_carries_captured_budget() {
     let budget = crate::RunCommandBudget::from_configured(Some("17"));
-    let envelope = super::shell::host_shell_dispatch("printf ready", ".", None, None, budget)
-        .await
-        .unwrap();
+    let envelope = super::shell::host_shell_dispatch(
+        super::shell::ShellRoute::BashSh,
+        "printf ready",
+        ".",
+        None,
+        None,
+        budget,
+    )
+    .await
+    .unwrap();
     assert_eq!(envelope["timeout_secs"], 17);
     assert_eq!(envelope["exit_code"], 0);
     assert_eq!(envelope["stdout"], "ready");
