@@ -674,6 +674,142 @@ pub(super) fn turn_heartbeat_line(
     format!("still working — {mins}m elapsed, round {round} of {limit}")
 }
 
+/// The one operator-visible row for the prose a model sends WITH a tool
+/// batch. Pure, no ANSI, no I/O.
+///
+/// Every provider loop replays that prose into history and shows none of it:
+/// a model that says "extracting the denial helpers next" before its
+/// `write_file` is silent on the operator's screen, while the same sentence
+/// with NO call behind it is nudged as a stall. This keeps the first sentence
+/// of what is readable and drops what is not:
+///
+/// - inline `<think>` blocks (a no-op on the chat wires, which filter before
+///   this runs; the Anthropic wire carries text blocks only);
+/// - a tool call the recovery pass lifted out of content — a fenced block, a
+///   bare JSON object or array, a `<function=…>` / `<tool>…</tool>` tag form —
+///   from the line it starts on to the end of its paragraph, so the arguments
+///   are not printed a second time under the `⚙` line that already shows them;
+/// - Markdown heading lines and leading list markers (structure, not prose).
+///
+/// The width is the caller's (`reply_cols(term_cols())`) so this stays pure;
+/// the row is fitted with `…` through [`crate::tty::fit_line`], the one
+/// cell-aware truncator. `None` when nothing readable remains.
+pub(super) fn tool_round_narration(content: &str, max_cols: usize) -> Option<String> {
+    let (clean, _) = crate::reasoning::ThinkFilter::filter_complete(content, false);
+    // A unit is one paragraph or one list item: the sentence search never
+    // runs across either boundary, so two list items do not fuse into one
+    // "sentence" and a soft-wrapped paragraph still joins back together.
+    let mut units: Vec<String> = Vec::new();
+    let mut paragraph = String::new();
+    let mut in_fence = false;
+    let mut skip_paragraph = false;
+    for raw in clean.lines() {
+        let line = raw.trim();
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if line.is_empty() {
+            skip_paragraph = false;
+            if !paragraph.is_empty() {
+                units.push(std::mem::take(&mut paragraph));
+            }
+            continue;
+        }
+        if skip_paragraph || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with(['{', '[', '<']) {
+            skip_paragraph = true;
+            continue;
+        }
+        let (text, is_item) = strip_list_marker(line);
+        // A call glued to the prose on one line ("Reading it now: {…}",
+        // "Opening it <function=…>") is cut where the call starts; the rest
+        // of the paragraph is the call's.
+        let (text, glued_call) = cut_at_call_start(text);
+        if glued_call {
+            skip_paragraph = true;
+        }
+        if text.is_empty() {
+            continue;
+        }
+        if is_item {
+            if !paragraph.is_empty() {
+                units.push(std::mem::take(&mut paragraph));
+            }
+            units.push(text.to_string());
+        } else {
+            if !paragraph.is_empty() {
+                paragraph.push(' ');
+            }
+            paragraph.push_str(text);
+        }
+    }
+    if !paragraph.is_empty() {
+        units.push(paragraph);
+    }
+    let first = units.into_iter().next()?;
+    let one_row: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence = first_sentence(&one_row);
+    if sentence.is_empty() {
+        return None;
+    }
+    let fit = crate::tty::fit_line(sentence, max_cols);
+    Some(format!("{}{}{}", fit.head, fit.fade, fit.ellipsis))
+}
+
+/// Prose up to the first fenced-block, JSON or tag opener on the line, and
+/// whether one was found.
+fn cut_at_call_start(text: &str) -> (&str, bool) {
+    let cut = ["```", "{", "<"]
+        .iter()
+        .filter_map(|needle| text.find(needle))
+        .min();
+    match cut {
+        Some(i) => (text[..i].trim_end(), true),
+        None => (text, false),
+    }
+}
+
+/// `- item`, `* item`, `3. item`, `3) item` → (`item`, true); anything else is
+/// returned as-is with `false`.
+fn strip_list_marker(line: &str) -> (&str, bool) {
+    if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        return (rest.trim_start(), true);
+    }
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let after = &line[digits..];
+        if let Some(rest) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
+            return (rest.trim_start(), true);
+        }
+    }
+    (line, false)
+}
+
+/// Up to and including the first `.`, `!` or `?` that ends a word (followed by
+/// whitespace or the end), so `lib.rs` and `e.g.` inside a token do not cut.
+fn first_sentence(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(b, b'.' | b'!' | b'?')
+            && bytes
+                .get(i + 1)
+                .is_none_or(|next| next.is_ascii_whitespace())
+        {
+            return &text[..=i];
+        }
+    }
+    text
+}
+
 /// Seconds between committed time markers; 0 = off.
 ///
 /// **Off by default, seeded per turn by the surface** — the same shape as

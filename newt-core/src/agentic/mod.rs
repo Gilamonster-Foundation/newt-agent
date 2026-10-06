@@ -3898,6 +3898,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
+            commit_tool_round_narration(&probe_content, false, color);
         }
         // Phase 2: every call in the batch is valid — execute in order. `flatten`
         // yields nothing (so this runs zero tools) when the batch was rejected.
@@ -8813,6 +8814,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
+            commit_tool_round_narration(&oa_content, false, color);
         }
         // Phase 2: every call is valid — execute in order (empty when rejected).
         for (call_index, (tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
@@ -11348,6 +11350,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
+            commit_tool_round_narration(&oa_content, printed_live, color);
         }
         // Phase 2: every call is valid — execute in order (empty when rejected).
         for (call_index, (tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
@@ -13076,6 +13079,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         for item in &echo {
             input.push(item.clone());
         }
+        commit_tool_round_narration(&text, false, color);
         let batch = smart_harness
             .map(|harness| {
                 let mut messages = Vec::with_capacity(input.len() + 1);
@@ -13783,12 +13787,32 @@ fn commit_reasoning_fold(
         return;
     }
     let block = shown.join("\n");
-    emit_reasoning(&block, color);
+    emit_notice_line(crate::tty::Level::Thinking, "", &block, color);
 }
 
-fn emit_reasoning(text: &str, color: bool) {
-    let notice = crate::tty::Notice::new(crate::tty::Level::Thinking, "", text);
+/// One permanent, arbiter-cooperating stdout line in a named register: live
+/// ephemerals (a tool or thinking spinner) are erased first, and nothing
+/// gates on capability, so a piped or headless run receives the same bytes
+/// the `⚙` header does. Reasoning folds, and the tool-round narration below,
+/// share this one writer so the two cannot drift into two ways of saying it.
+fn emit_notice_line(level: crate::tty::Level, glyph: &str, text: &str, color: bool) {
+    let notice = crate::tty::Notice::new(level, glyph, text).gap(2);
     crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, notice.writer(color));
+}
+
+/// The one row for the prose a model sent WITH this tool batch — what every
+/// loop used to replay into history and show to nobody. Dim and `·`-glyphed:
+/// secondary detail under the `⚙` lines that follow, never the `▸` of a reply.
+/// Skipped when the wire already streamed the text live (Anthropic) and when
+/// nothing readable remains once the call text itself is dropped.
+fn commit_tool_round_narration(content: &str, already_printed: bool, color: bool) {
+    if already_printed {
+        return;
+    }
+    let cols = display::reply_cols(crate::tty::term_cols());
+    if let Some(line) = display::tool_round_narration(content, cols) {
+        emit_notice_line(crate::tty::Level::Dim, "·", &line, color);
+    }
 }
 
 /// The streaming half of a [`ThinkingFold`]: it owns the partial-line buffer
@@ -13854,7 +13878,7 @@ impl ReasoningTrickle {
         let Some(line) = self.fold.closing_line(elapsed, recovery) else {
             return;
         };
-        emit_reasoning(&line, color);
+        emit_notice_line(crate::tty::Level::Thinking, "", &line, color);
     }
 }
 
