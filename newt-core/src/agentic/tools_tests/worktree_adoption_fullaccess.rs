@@ -164,6 +164,75 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         .0
         .iter()
         .any(|line| line.contains("original checkout remains writable")));
+
+    // #2766 round 2: Git resolves parent traversal after following the cwd
+    // symlink. The lexical sibling under `main` is a different tree.
+    let elsewhere = temp.path().join("elsewhere");
+    let repo = elsewhere.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        let output =
+            crate::agentic::tools::tests::git_shell_grant::hermetic_git(&repo, temp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::os::unix::fs::symlink(&repo, root.join("link")).unwrap();
+    for (branch, args) in [
+        (
+            "via-c",
+            serde_json::json!({"command":"git -C link worktree add -b via-c ../via-c"}),
+        ),
+        (
+            "via-cwd",
+            serde_json::json!({"command":"git worktree add -b via-cwd ../via-cwd", "cwd":"link"}),
+        ),
+        (
+            "via-cd",
+            serde_json::json!({"command":"cd link && git worktree add -b via-cd ../via-cd"}),
+        ),
+    ] {
+        let outcome = std::sync::OnceLock::new();
+        let text = execute(
+            &mut presentation,
+            "run_command",
+            &args,
+            root.to_str().unwrap(),
+            false,
+            20,
+            &Caveats::top(),
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                worktree_session: Some(&session),
+                execution: Some(&outcome),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+        )
+        .await;
+        assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Passed), "{text}");
+        let actual = elsewhere.join(branch).canonicalize().unwrap();
+        assert!(actual.join(".git").is_file());
+        assert!(!root.join(branch).exists());
+        assert_task_handoff(&session, &actual, branch);
+        assert!(session.snapshot().is_none());
+    }
 }
 
 /// #2750: ambient bypass stays unarmed; full authority with confinement still
