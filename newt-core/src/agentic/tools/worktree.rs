@@ -125,6 +125,7 @@ fn possible_creation(source: &str) -> bool {
 /// Keep absence distinct from an unresolved attempt. Once creation appears,
 /// neither an ambiguous sibling nor failed candidate resolution may fall open.
 fn creation_admission(
+    bypass: bool,
     name: &str,
     args: &serde_json::Value,
     workspace: &str,
@@ -132,7 +133,10 @@ fn creation_admission(
     engine: crate::ShellEngine,
     trusted_git: impl FnOnce(&Caveats) -> Result<PathBuf, ()>,
 ) -> Result<Option<(Creation, String)>, ()> {
-    if name != "run_command"
+    // Creation verification exists to arm confinement, which ambient execution
+    // deliberately disables. Do not probe metadata or pin Git in that mode.
+    if bypass
+        || name != "run_command"
         || !args
             .get("command")
             .and_then(|v| v.as_str())
@@ -357,6 +361,8 @@ impl PermissionGate for Guard<'_, '_> {
     }
 }
 
+const UNARMED_NOTICE: &str = "Warning: worktree protection is not armed because OCAP is disabled; the original checkout remains writable under existing permissions. Use a confined session for automatic original-checkout protection.";
+
 /// Verified creation can only arm a fence when the executor honors it. The
 /// bypass is frozen launch policy; broad grants alone do not disable adoption.
 fn record_verified_creation(
@@ -365,7 +371,10 @@ fn record_verified_creation(
     bypass: bool,
 ) -> String {
     if bypass {
-        format!("Task worktree created: {}. Warning: worktree protection is not armed because OCAP is disabled; the original checkout remains writable under existing permissions. Use a confined session for automatic original-checkout protection.", adopted.worktree.display())
+        format!(
+            "Task worktree created: {}. {UNARMED_NOTICE}",
+            adopted.worktree.display()
+        )
     } else {
         let notice = format!(
             "Adopted task worktree: {}. The original checkout and shared config are now read-only for this task. Use git -c user.name=… -c user.email=… for per-command identity. Any uncommitted changes in the original checkout are now read-only; copy them into the new worktree and commit there, or ask the operator for /permissions worktree-lift.",
@@ -439,6 +448,7 @@ pub(super) async fn execute(
             .unwrap_or(std::borrow::Cow::Borrowed(args));
     let admission = session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
         creation_admission(
+            bypass,
             name,
             &normalized,
             workspace,
@@ -637,6 +647,19 @@ pub(super) async fn execute(
                 result.push_str(&format!("\n{hint}"));
             }
         }
+    }
+    // This describes launch policy, not verified creation success. Recognition
+    // is text-only so even unsupported platforms never enter the verifier.
+    if bypass
+        && session.is_some()
+        && name == "run_command"
+        && normalized
+            .get("command")
+            .and_then(|value| value.as_str())
+            .is_some_and(possible_creation)
+    {
+        presentation.preview(UNARMED_NOTICE, 0);
+        result.push_str(&format!("\n{UNARMED_NOTICE}"));
     }
     if let Some(candidate) = &candidate {
         result = report_leftover(presentation, candidate, result);

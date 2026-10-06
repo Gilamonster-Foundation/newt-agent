@@ -114,6 +114,7 @@ fn worktree_adoption_round3_ambiguous_attempts_fail_closed() {
         assert!(possible_creation(source), "not recognized: {source}");
         assert!(
             creation_admission(
+                false,
                 "run_command",
                 &serde_json::json!({"command":source}),
                 root.to_str().unwrap(),
@@ -140,6 +141,7 @@ fn worktree_adoption_round3_exact_creation_and_noncreation_controls() {
             .to_owned(),
     ] {
         let admission = creation_admission(
+            false,
             "run_command",
             &serde_json::json!({"command":source}),
             root.to_str().unwrap(),
@@ -168,6 +170,7 @@ fn worktree_adoption_round3_exact_creation_and_noncreation_controls() {
         assert!(!possible_creation(source), "{source}");
         assert!(
             creation_admission(
+                false,
                 "run_command",
                 &serde_json::json!({"command":source}),
                 root.to_str().unwrap(),

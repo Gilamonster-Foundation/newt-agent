@@ -56,6 +56,8 @@ impl ToolPresentation for Notices {
 /// #2750: ground the adoption decision in real Git creation followed by actual
 /// host-shell execution in the task worktree. No kernel fence is available in
 /// this explicit bypass mode; arming one must not strand the session.
+/// #2763 also grounds bypass admission for standalone and compound creations,
+/// including destinations the confined verifier rejects.
 /// Selected explicitly by ci.yml's Linux `test` job (ambient worktree proof).
 #[cfg(unix)]
 #[tokio::test]
@@ -72,7 +74,8 @@ async fn adoption_2750_full_access_creation_then_task_command() {
     assert!(ocap_disabled() && full_access_requested());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("main");
-    let task = temp.path().join("task");
+    let task = root.join("task");
+    let compound = root.join("compound");
     std::fs::create_dir(&root).unwrap();
     for args in [
         vec!["init", "-q", "-b", "main"],
@@ -103,6 +106,7 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         serde_json::json!({"command": format!("git worktree add -b task '{}'", task.display())}),
         serde_json::json!({"command":"printf adoption_2750_ready", "cwd":task}),
         serde_json::json!({"command":"printf ambient > original_probe", "cwd":root}),
+        serde_json::json!({"command": format!("git worktree add -b compound '{}' && printf ready > '{}/probe'", compound.display(), compound.display())}),
     ]
     .iter()
     .enumerate()
@@ -138,6 +142,11 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         }
     }
     assert!(task.join(".git").is_file());
+    assert!(compound.join(".git").is_file());
+    assert_eq!(
+        std::fs::read_to_string(compound.join("probe")).unwrap(),
+        "ready"
+    );
     assert_eq!(
         std::fs::read_to_string(root.join("original_probe")).unwrap(),
         "ambient"
@@ -177,4 +186,36 @@ fn adoption_2750_decision_keeps_confined_protection() {
         assert_eq!(notice.contains("Any uncommitted changes"), !bypass);
         assert_eq!(notice.contains("/permissions worktree-lift"), !bypass);
     }
+}
+
+/// #2763: bypass routing must not depend on platform metadata verification or
+/// trusted Git resolution. Confined attempts still fail closed on opaque batches.
+#[test]
+fn adoption_2763_bypass_skips_creation_verification() {
+    for command in [
+        "git worktree add -b task task",
+        "git worktree add -b task task && echo ready > task/probe",
+    ] {
+        let args = serde_json::json!({"command": command});
+        let admission = creation_admission(
+            true,
+            "run_command",
+            &args,
+            ".",
+            &Caveats::top(),
+            crate::ShellEngine::Host,
+            |_| panic!("bypass must not resolve trusted Git"),
+        );
+        assert!(matches!(admission, Ok(None)), "{command}");
+    }
+    assert!(creation_admission(
+        false,
+        "run_command",
+        &serde_json::json!({"command":"git worktree add -b task task && echo ready > task/probe"}),
+        ".",
+        &Caveats::top(),
+        crate::ShellEngine::Host,
+        |_| panic!("confined compound must fail before Git resolution"),
+    )
+    .is_err());
 }
