@@ -36,6 +36,9 @@
 #   - ambient worktree dispatch proof (#2750), .github/workflows/ci.yml test job:
 #     explicitly runs the exact ignored fullaccess_tests::adoption_2750_full_access_creation_then_task_command
 #     in newt-core's worktree module. Real Git/host shell, Linux CI only.
+#   - ambient publication dispatch proof (#2765), .github/workflows/ci.yml test job:
+#     explicitly runs the exact ignored publication::tests::publication_2765_plain_git_dispatch
+#     in newt-core's native_git module. Local bare remote and gh stub, Linux CI only.
 #   - worktree nudge dispatch proof (#2761), .github/workflows/ci.yml test job:
 #     explicitly runs the exact ignored nudge::tests::worktree_nudge_dispatch_result
 #     test in newt-core's worktree module. Real Git/host shell, Linux CI only;

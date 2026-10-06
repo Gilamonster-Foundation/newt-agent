@@ -210,6 +210,10 @@ jobs:
         # .githooks/pre-push. Unix fixture; selected explicitly on Linux.
         # --exact reaches the ignored dispatch test, including operator preview.
         run: cargo test -p newt-core --lib agentic::tools::worktree::fullaccess_tests::adoption_2750_full_access_creation_then_task_command -- --ignored --exact
+      - name: ambient publication dispatch proof (#2765)
+        # HOOK PARITY: CI-only real Git/host-shell proof, named in
+        # .githooks/pre-push. Local bare remote and gh stub; no forge calls.
+        run: cargo test -p newt-core --lib agentic::tools::native_git::publication::tests::publication_2765_plain_git_dispatch -- --ignored --exact
       - name: worktree nudge dispatch proof (#2761)
         # HOOK PARITY: CI-only real Git/host-shell proof, named in
         # .githooks/pre-push. Select the ignored production-annotation test

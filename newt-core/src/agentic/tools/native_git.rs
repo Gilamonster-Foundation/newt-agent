@@ -2,6 +2,7 @@
 //! Keep the caller's shell source unchanged and preserve the embedded adapter's
 //! destructive-operation confirmations while the command interface migrates.
 
+pub(super) mod publication;
 pub(super) mod push_command;
 
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
