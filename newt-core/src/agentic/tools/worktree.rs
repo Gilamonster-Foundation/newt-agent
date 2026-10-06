@@ -422,6 +422,21 @@ pub(super) async fn execute(
 ) -> String {
     let bypass = ocap_disabled();
     let session = collab.worktree_session;
+    // #2771: choose the file-tool base once, before both the adoption fence
+    // and native dispatch. This changes path resolution, never authority.
+    // Shell calls (including routed file reads) retain their explicit cwd.
+    let task_root = session.and_then(|session| {
+        matches!(
+            name,
+            "read_file" | "write_file" | "edit_file" | "delete_file" | "list_dir" | "find" | "grep"
+        )
+        .then(|| session.task_root())
+        .flatten()
+    });
+    let workspace = task_root
+        .as_deref()
+        .and_then(Path::to_str)
+        .unwrap_or(workspace);
     let objective = collab.prompt_context.map(|context| context.active_text());
     let command_directory = collab.command_directory;
     let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);

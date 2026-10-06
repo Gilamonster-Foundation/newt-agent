@@ -13,23 +13,31 @@ use std::path::{Path, PathBuf};
 pub struct WorktreeSession {
     adopted: std::sync::Mutex<Option<AdoptedWorktree>>,
     // Advisory working state, independent of whether confinement is armed.
-    task_hint: std::sync::Mutex<Option<String>>,
+    task_worktree: std::sync::Mutex<Option<(PathBuf, String)>>,
     pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
 }
 impl WorktreeSession {
     /// Explicit operator lift, also used at the existing new-task boundary.
     pub fn lift(&self) {
         *self.adopted.lock().expect("worktree session lock") = None;
-        *self.task_hint.lock().expect("worktree hint lock") = None;
+        *self.task_worktree.lock().expect("worktree hint lock") = None;
     }
     pub(crate) fn record_task_worktree(&self, path: &Path, branch: &str) {
-        *self.task_hint.lock().expect("worktree hint lock") = Some(format!(
-            "Task worktree: {} (branch {branch}) — run commands there, not in the original checkout.",
-            path.display()
-        ));
+        *self.task_worktree.lock().expect("worktree hint lock") =
+            Some((path.to_owned(), branch.to_owned()));
     }
     pub(crate) fn task_hint(&self) -> Option<String> {
-        self.task_hint.lock().expect("worktree hint lock").clone()
+        self.task_worktree.lock().expect("worktree hint lock").as_ref().map(|(path, branch)| format!(
+            "Task worktree: {} (branch {branch}) — run commands there, not in the original checkout.",
+            path.display()
+        ))
+    }
+    pub(crate) fn task_root(&self) -> Option<PathBuf> {
+        self.task_worktree
+            .lock()
+            .expect("worktree hint lock")
+            .as_ref()
+            .map(|(path, _)| path.clone())
     }
     pub(crate) fn snapshot(&self) -> Option<AdoptedWorktree> {
         self.adopted.lock().expect("worktree session lock").clone()
