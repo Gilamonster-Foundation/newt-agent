@@ -1,6 +1,6 @@
 //! The shared dispatch guard for session worktree adoption (#2733).
 use super::*;
-use crate::worktree_adoption::{AdoptedWorktree, Creation};
+use crate::worktree_adoption::{task_path_literal, AdoptedWorktree, Creation};
 use crate::Caveats;
 use std::path::{Path, PathBuf};
 
@@ -389,12 +389,12 @@ fn record_verified_creation(
     if bypass {
         format!(
             "Task worktree created: {}. {UNARMED_NOTICE}",
-            adopted.worktree.display()
+            task_path_literal(&adopted.worktree)
         )
     } else {
         let notice = format!(
             "Adopted task worktree: {}. The original checkout and shared config are now read-only for this task. Use git -c user.name=… -c user.email=… for per-command identity. Any uncommitted changes in the original checkout are now read-only; copy them into the new worktree and commit there, or ask the operator for /permissions worktree-lift.",
-            adopted.worktree.display()
+            task_path_literal(&adopted.worktree)
         );
         session.adopt(adopted);
         notice
@@ -507,7 +507,7 @@ pub(super) async fn execute(
         (normalized.get(key)?.as_str()? == child_path.to_str()?).then(|| {
             format!(
                 "Commands now run in the task worktree {}",
-                child_path.display()
+                task_path_literal(child_path)
             )
         })
     });
@@ -771,7 +771,7 @@ pub(super) async fn execute(
         } else if execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Failed) {
             result.push_str(&format!(
                 "\nTask worktree: {}. The original checkout remains read-only.",
-                policy.worktree.display()
+                task_path_literal(&policy.worktree)
             ));
         }
     }

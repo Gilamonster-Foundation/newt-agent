@@ -104,7 +104,7 @@ async fn shell_task_cwd_2780_actual_git_and_lift() {
     assert!(notices.is_empty());
     session.record_task_worktree(&policy.worktree, "task");
     let hint = format!(
-        "Commands now run in the task worktree {}",
+        "Commands now run in the task worktree `{}`",
         dunce::simplified(&policy.worktree).display()
     );
     // Explicit selection must neither emit nor consume the default notice.

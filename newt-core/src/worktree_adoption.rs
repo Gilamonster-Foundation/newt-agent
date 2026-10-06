@@ -8,6 +8,23 @@ mod destination;
 use crate::{Caveats, Scope};
 use std::path::{Path, PathBuf};
 
+/// Display a task locator literally in model/operator Markdown (#2783).
+/// Simplification is presentation-only; stored paths retain their authority identity.
+pub(crate) fn task_path_literal(path: &Path) -> String {
+    let path = dunce::simplified(path).to_string_lossy();
+    let longest = path.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let delimiter = "`".repeat(longest + 1);
+    let pad = if path.starts_with('`')
+        || path.ends_with('`')
+        || (path.starts_with(' ') && path.ends_with(' ') && !path.chars().all(|c| c == ' '))
+    {
+        " "
+    } else {
+        ""
+    };
+    format!("{delimiter}{pad}{path}{pad}{delimiter}")
+}
+
 /// Owned by a session, shared across turns; a fresh task starts empty.
 #[derive(Debug, Default)]
 pub struct WorktreeSession {
@@ -32,7 +49,7 @@ impl WorktreeSession {
     pub(crate) fn task_hint(&self) -> Option<String> {
         self.task_worktree.lock().expect("worktree hint lock").as_ref().map(|(path, branch)| format!(
             "Task worktree: {} (branch {branch}) — run commands there, not in the original checkout.",
-            path.display()
+            task_path_literal(path)
         ))
     }
     /// Routing needs a reciprocal link to THIS repository, not just advisory
@@ -169,7 +186,7 @@ impl AdoptedWorktree {
         })
     }
     pub(crate) fn notice(&self) -> String {
-        format!("capability denied: the original checkout is read-only after worktree adoption; write in {} instead. Shared Git config stays read-only; use git -c user.name=… -c user.email=… for per-command identity. Only the operator can lift this with /permissions worktree-lift.", self.worktree.display())
+        format!("capability denied: the original checkout is read-only after worktree adoption; write in {} instead. Shared Git config stays read-only; use git -c user.name=… -c user.email=… for per-command identity. Only the operator can lift this with /permissions worktree-lift.", task_path_literal(&self.worktree))
     }
     pub(crate) fn attenuate(&self, authority: &Caveats) -> Caveats {
         let mut out = authority.clone();
@@ -292,7 +309,7 @@ impl Creation {
         if self.path_guard.left_empty() {
             return Some(format!(
                 "left empty directory {}; remove it if unwanted",
-                self.destination.display()
+                task_path_literal(&self.destination)
             ));
         }
         None

@@ -419,7 +419,7 @@ mod handoff_tests {
                 workspace,
                 Some(&crate::ExecOutcome::Passed),
             );
-            let expected = format!("Task worktree: {} (branch observed-task) — run commands there, not in the original checkout.", task.canonicalize().unwrap().display());
+            let expected = format!("Task worktree: `{}` (branch observed-task) — run commands there, not in the original checkout.", dunce::simplified(&task.canonicalize().unwrap()).display());
             assert_eq!(session.task_hint().as_deref(), Some(expected.as_str()));
             assert!(session.snapshot().is_none());
             session.lift();

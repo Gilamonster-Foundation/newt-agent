@@ -386,8 +386,8 @@ fn assert_task_handoff(
         prompt_read::PromptReadContext,
     };
     let expected = format!(
-        "Task worktree: {} (branch {branch}) — run commands there, not in the original checkout.",
-        path.display()
+        "Task worktree: `{}` (branch {branch}) — run commands there, not in the original checkout.",
+        dunce::simplified(path).display()
     );
     for action in [CompressAction::Summarized, CompressAction::StaticFallback] {
         let mut messages =
@@ -662,5 +662,74 @@ async fn relative_task_root_unlinked_is_advisory_only() {
         .await;
         assert_eq!(out.trim(), "original", "{bypass}: {out}");
         assert!(session.task_hint().is_some());
+    }
+}
+
+/// #2783: real handoff and compaction text must preserve a Windows-style task
+/// path through the production Markdown renderer. Windows also exercises the
+/// verbatim prefix returned by canonicalize; no filesystem or clock is needed.
+#[cfg(feature = "markdown")]
+#[test]
+fn handoff_2783_task_path_survives_model_and_operator_rendering() {
+    use crate::agentic::{
+        apply_post_compaction_continuation, cap_exit_progress,
+        compress::CompressAction,
+        markdown::{render_markdown, RenderOpts},
+        prompt_read::PromptReadContext,
+    };
+    for (plain, literal) in [
+        (r"C:\repo\.worktrees\task", r"`C:\repo\.worktrees\task`"),
+        (
+            r"C:\repo name\.worktrees\[task]",
+            r"`C:\repo name\.worktrees\[task]`",
+        ),
+        (
+            r"C:\repo\.worktrees\task`",
+            r"`` C:\repo\.worktrees\task` ``",
+        ),
+    ] {
+        let input = if cfg!(windows) {
+            format!(r"\\?\{plain}")
+        } else {
+            plain.into()
+        };
+        let session = crate::worktree_adoption::WorktreeSession::default();
+        session.record_task_worktree(Path::new(&input), "task-branch");
+        let captured = cap_exit_progress(Some(&session), None, None).unwrap();
+        let displayed = crate::tty::width::strip_ansi(&render_markdown(
+            &captured,
+            RenderOpts {
+                color: true,
+                cols: 1000,
+            },
+        ));
+        assert_eq!(displayed, format!("Task worktree: {plain} (branch task-branch) — run commands there, not in the original checkout."));
+        assert!(captured.contains(literal), "{captured}");
+        assert!(!captured.contains(r"\\?\"), "{captured}");
+        for action in [CompressAction::Summarized, CompressAction::StaticFallback] {
+            let mut messages =
+                vec![serde_json::json!({"role":"system", "content":"compacted history"})];
+            apply_post_compaction_continuation(
+                Some(&session),
+                &mut messages,
+                &mut 1,
+                action,
+                None,
+                PromptReadContext::new(None, "Continue the task", None),
+                true,
+                |_| true,
+            );
+            let model = messages.last().unwrap()["content"].as_str().unwrap();
+            assert!(model.contains(literal), "{model}");
+            assert!(!model.contains(r"\\?\"), "{model}");
+            let displayed = crate::tty::width::strip_ansi(&render_markdown(
+                model,
+                RenderOpts {
+                    color: true,
+                    cols: 1000,
+                },
+            ));
+            assert!(displayed.contains(plain), "{displayed}");
+        }
     }
 }
