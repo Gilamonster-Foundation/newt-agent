@@ -135,6 +135,8 @@ agent-harness-py = { path = "agent-harness-py", version = "=0.8.0" }
 agent-toolchain = { path = "agent-toolchain", version = "0.1.0" }
 # Core utilities
 anyhow = "1.0"
+# Git and other Windows children need ordinary path spellings where equivalent.
+dunce = "1.0.5"
 thiserror = "2.0"
 libc = "0.2"
 # Object-bound filesystem capability (newt-core::fs_cap, step-52.1): a safe

@@ -37,6 +37,7 @@ harness = false
 agent-toolchain = { workspace = true, features = ["embedded-git"] }
 agent-harness.workspace = true
 anyhow.workspace = true
+dunce.workspace = true
 async-trait.workspace = true
 # Step 13.2: Diffy computes the observed delta; NewtUI owns its shared model
 # and Markdown projection. Core keeps terminal/renderer features disabled.

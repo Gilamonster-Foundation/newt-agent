@@ -384,9 +384,14 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
 ) -> anyhow::Result<Option<String>> {
     // Prediction and execution share the same call-local cwd projection; the
     // original model arguments still reach the invocation/audit boundary.
-    let presentation_args =
-        shell::command_args_with_default_cwd(name, args, workspace, collab.default_command_cwd)
-            .unwrap_or(std::borrow::Cow::Borrowed(args));
+    let presentation_args = shell::command_args_with_default_cwd(
+        name,
+        args,
+        workspace,
+        collab.default_command_cwd,
+        collab.worktree_session,
+    )
+    .unwrap_or(std::borrow::Cow::Borrowed(args));
     let (presentation_name, presentation_detail) = tool_presentation(
         name,
         presentation_args.as_ref(),

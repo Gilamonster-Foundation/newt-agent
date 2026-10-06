@@ -180,32 +180,58 @@ fn shell_env_passthrough() -> Vec<String> {
     }
 }
 
-/// Supply the operator's command default without changing the recorded model
-/// arguments, workspace identity, or any grant. Presentation uses the same
-/// projection as dispatch so it cannot predict a root-relative file redirect.
+/// Directory operand used by the command tools, including their aliases.
+pub(super) fn command_cwd_key(name: &str) -> Option<&'static str> {
+    let name = match resolve_tool_alias(name) {
+        Some(AliasOutcome::Rewrite(canonical)) => canonical,
+        _ => name,
+    };
+    match name {
+        "run_command" | "build_exec" => Some("cwd"),
+        "lifecycle" => Some("dir"),
+        _ => None,
+    }
+}
+
+/// Supply the bound task-worktree default (#2780), or the operator's existing
+/// shell default, without changing workspace identity or any grant. Display,
+/// admission and execution all use this projection. Explicit operands win;
+/// a leading cd is subsequently resolved against this default by the shell.
 pub(super) fn command_args_with_default_cwd<'a>(
     name: &str,
     args: &'a serde_json::Value,
     workspace: &str,
     default_cwd: Option<&std::path::Path>,
+    session: Option<&crate::worktree_adoption::WorktreeSession>,
 ) -> Result<std::borrow::Cow<'a, serde_json::Value>, &'static str> {
-    let is_command = name == "run_command"
+    let Some(key) = command_cwd_key(name) else {
+        return Ok(std::borrow::Cow::Borrowed(args));
+    };
+    if args.get(key).is_some() || !args.is_object() {
+        return Ok(std::borrow::Cow::Borrowed(args));
+    }
+    let task_root = session.and_then(|session| session.task_root(std::path::Path::new(workspace)));
+    // Without a task, preserve the existing lifecycle/build defaults.
+    let is_shell = name == "run_command"
         || matches!(
             resolve_tool_alias(name),
             Some(AliasOutcome::Rewrite("run_command"))
         );
+    let default_cwd = task_root
+        .as_deref()
+        .or_else(|| is_shell.then_some(default_cwd).flatten());
     let Some(default_cwd) = default_cwd.filter(|cwd| *cwd != std::path::Path::new(workspace))
     else {
         return Ok(std::borrow::Cow::Borrowed(args));
     };
-    if !is_command || args.get("cwd").is_some() || !args.is_object() {
-        return Ok(std::borrow::Cow::Borrowed(args));
-    }
-    let cwd = default_cwd.to_str().ok_or(
+    // #2780: canonical Windows roots have a verbatim prefix that Git may
+    // interpret as non-local. Keep binding checks canonical, but pass the
+    // equivalent ordinary spelling to children on every command route.
+    let cwd = dunce::simplified(default_cwd).to_str().ok_or(
         "error: the command working directory is not valid UTF-8; select a UTF-8 directory",
     )?;
     let mut projected = args.clone();
-    projected["cwd"] = serde_json::Value::String(cwd.to_owned());
+    projected[key] = serde_json::Value::String(cwd.to_owned());
     Ok(std::borrow::Cow::Owned(projected))
 }
 

@@ -3805,11 +3805,16 @@ async fn execute_authorized_tool(
         None => name,
     };
 
-    let command_args =
-        match shell::command_args_with_default_cwd(name, args, workspace, default_command_cwd) {
-            Ok(args) => args,
-            Err(error) => return host_return(error.to_owned()),
-        };
+    let command_args = match shell::command_args_with_default_cwd(
+        name,
+        args,
+        workspace,
+        default_command_cwd,
+        worktree_session,
+    ) {
+        Ok(args) => args,
+        Err(error) => return host_return(error.to_owned()),
+    };
     let args = command_args.as_ref();
 
     // Eligible file reads and lifecycle commands use the governed built-ins.
@@ -4393,7 +4398,8 @@ async fn execute_authorized_tool(
             let command_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
             let run_cwd = resolve_exec_cwd(&command_cwd, cd_path.as_deref());
             if let Err((error, outcome)) = shell::existing_exec_cwd(std::path::Path::new(&run_cwd)) {
-                let previous = default_command_cwd.unwrap_or_else(|| std::path::Path::new(workspace));
+                let task_root = worktree_session.and_then(|session| session.task_root(std::path::Path::new(workspace)));
+                let previous = task_root.as_deref().or(default_command_cwd).unwrap_or_else(|| std::path::Path::new(workspace));
                 return host_return(executed((
                     format!("{error}; default working directory remains {}", previous.display()),
                     outcome,

@@ -14,6 +14,7 @@ pub struct WorktreeSession {
     adopted: std::sync::Mutex<Option<AdoptedWorktree>>,
     // Advisory working state, independent of whether confinement is armed.
     task_worktree: std::sync::Mutex<Option<(PathBuf, String)>>,
+    pub(crate) command_cwd_notice_shown: std::sync::atomic::AtomicBool,
     pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
 }
 impl WorktreeSession {
@@ -21,6 +22,8 @@ impl WorktreeSession {
     pub fn lift(&self) {
         *self.adopted.lock().expect("worktree session lock") = None;
         *self.task_worktree.lock().expect("worktree hint lock") = None;
+        self.command_cwd_notice_shown
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
     pub(crate) fn record_task_worktree(&self, path: &Path, branch: &str) {
         *self.task_worktree.lock().expect("worktree hint lock") =

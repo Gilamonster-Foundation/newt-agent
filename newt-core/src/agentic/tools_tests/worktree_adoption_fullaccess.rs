@@ -215,10 +215,12 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         );
     }
     std::os::unix::fs::symlink(&repo, root.join("link")).unwrap();
+    // #2780: these relative link operands intentionally belong to the original
+    // checkout, not the newly selected task default. Make that base explicit.
     for (branch, args) in [
         (
             "via-c",
-            serde_json::json!({"command":"git -C link worktree add -b via-c ../via-c"}),
+            serde_json::json!({"command":"git -C link worktree add -b via-c ../via-c", "cwd":root}),
         ),
         (
             "via-cwd",
@@ -226,7 +228,7 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         ),
         (
             "via-cd",
-            serde_json::json!({"command":"cd link && git worktree add -b via-cd ../via-cd"}),
+            serde_json::json!({"command":"cd link && git worktree add -b via-cd ../via-cd", "cwd":root}),
         ),
     ] {
         let outcome = std::sync::OnceLock::new();
