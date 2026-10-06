@@ -142,13 +142,23 @@ async fn find_error_uses_the_same_spill_boundary() {
     )
     .await;
 
-    assert_eq!(out, "error: no such path 'missing'");
+    // #2771: the root reaches both the model result and the existing display
+    // block; long platform-specific temp paths may wrap in the latter.
     assert_eq!(
-        rendered,
-        "⚙  find: missing (name=*.rs, type=f)\n\
-             ▒ error: no such path 'missing'\n\
-             …\n"
+        out,
+        format!(
+            "error: no such path 'missing'\nresolved against {}",
+            ws.path().display()
+        )
     );
+    assert!(
+        rendered
+            .starts_with("⚙  find: missing (name=*.rs, type=f)\n▒ error: no such path 'missing'\n"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("resolved against"), "{rendered}");
+    assert!(rendered.ends_with("…\n"), "{rendered}");
+    assert_eq!(rendered.matches("⚙  find:").count(), 1);
 }
 
 struct EmptyRemote;

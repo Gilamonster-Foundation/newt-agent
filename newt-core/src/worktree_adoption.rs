@@ -13,23 +13,64 @@ use std::path::{Path, PathBuf};
 pub struct WorktreeSession {
     adopted: std::sync::Mutex<Option<AdoptedWorktree>>,
     // Advisory working state, independent of whether confinement is armed.
-    task_hint: std::sync::Mutex<Option<String>>,
+    task_worktree: std::sync::Mutex<Option<(PathBuf, String)>>,
     pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
 }
 impl WorktreeSession {
     /// Explicit operator lift, also used at the existing new-task boundary.
     pub fn lift(&self) {
         *self.adopted.lock().expect("worktree session lock") = None;
-        *self.task_hint.lock().expect("worktree hint lock") = None;
+        *self.task_worktree.lock().expect("worktree hint lock") = None;
     }
     pub(crate) fn record_task_worktree(&self, path: &Path, branch: &str) {
-        *self.task_hint.lock().expect("worktree hint lock") = Some(format!(
-            "Task worktree: {} (branch {branch}) — run commands there, not in the original checkout.",
-            path.display()
-        ));
+        *self.task_worktree.lock().expect("worktree hint lock") =
+            Some((path.to_owned(), branch.to_owned()));
     }
     pub(crate) fn task_hint(&self) -> Option<String> {
-        self.task_hint.lock().expect("worktree hint lock").clone()
+        self.task_worktree.lock().expect("worktree hint lock").as_ref().map(|(path, branch)| format!(
+            "Task worktree: {} (branch {branch}) — run commands there, not in the original checkout.",
+            path.display()
+        ))
+    }
+    /// Routing needs a reciprocal link to THIS repository, not just advisory
+    /// command success. This portable metadata check grants no file authority.
+    pub(crate) fn task_root(&self, workspace: &Path) -> Option<PathBuf> {
+        let root = self
+            .task_worktree
+            .lock()
+            .expect("worktree hint lock")
+            .as_ref()?
+            .0
+            .clone()
+            .canonicalize()
+            .ok()?;
+        let gitfile = root.join(".git");
+        if !std::fs::symlink_metadata(&gitfile).ok()?.is_file() {
+            return None;
+        }
+        let original_admin = crate::workspace_key::discover_git_dir(workspace)?
+            .canonicalize()
+            .ok()?;
+        let common = match std::fs::read_to_string(original_admin.join("commondir")) {
+            Ok(text) if !text.trim().is_empty() => {
+                original_admin.join(text.trim()).canonicalize().ok()?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => original_admin,
+            _ => return None,
+        };
+        let admin = crate::workspace_key::resolve_gitdir_file(&gitfile, &root)?
+            .canonicalize()
+            .ok()?;
+        if !admin.is_dir() || admin.parent()? != common.join("worktrees") {
+            return None;
+        }
+        let backlink = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+        if backlink.trim().is_empty()
+            || admin.join(backlink.trim()).canonicalize().ok()? != gitfile.canonicalize().ok()?
+        {
+            return None;
+        }
+        Some(root)
     }
     pub(crate) fn snapshot(&self) -> Option<AdoptedWorktree> {
         self.adopted.lock().expect("worktree session lock").clone()

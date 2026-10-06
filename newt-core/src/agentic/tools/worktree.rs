@@ -422,6 +422,29 @@ pub(super) async fn execute(
 ) -> String {
     let bypass = ocap_disabled();
     let session = collab.worktree_session;
+    // #2771: choose the file-tool base once, before both the adoption fence
+    // and native dispatch. This changes path resolution, never authority.
+    // Shell calls (including routed file reads) retain their explicit cwd.
+    let task_root = session.and_then(|session| {
+        matches!(
+            name,
+            "read_file" | "write_file" | "edit_file" | "delete_file" | "list_dir" | "find" | "grep"
+        )
+        .then(|| session.task_root(Path::new(workspace)))
+        .flatten()
+    });
+    // Absolute searches retain the original workspace-only boundary. Only
+    // relative operands select the task's search root; no fence is widened.
+    let absolute_search = matches!(name, "find" | "grep")
+        && args
+            .get("path")
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| Path::new(p).is_absolute());
+    let workspace = task_root
+        .as_deref()
+        .filter(|_| !absolute_search)
+        .and_then(Path::to_str)
+        .unwrap_or(workspace);
     let objective = collab.prompt_context.map(|context| context.active_text());
     let command_directory = collab.command_directory;
     let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);

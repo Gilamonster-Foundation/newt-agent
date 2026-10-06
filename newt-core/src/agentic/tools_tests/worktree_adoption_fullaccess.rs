@@ -165,6 +165,28 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         .iter()
         .any(|line| line.contains("original checkout remains writable")));
 
+    // #2771: genuine creation enables relative file routing.
+    std::fs::write(root.join("routing_probe"), "original routing marker").unwrap();
+    std::fs::write(task.join("routing_probe"), "task routing marker").unwrap();
+    let out = execute(
+        &mut presentation,
+        "read_file",
+        &serde_json::json!({"path":"routing_probe"}),
+        root.to_str().unwrap(),
+        false,
+        20,
+        &Caveats::top(),
+        &mut crate::agentic::NoMcp,
+        ToolCollaborators {
+            worktree_session: Some(&session),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+    )
+    .await;
+    assert!(out.contains("task routing marker"), "{out}");
+
     // #2766 round 2: Git resolves parent traversal after following the cwd
     // symlink. The lexical sibling under `main` is a different tree.
     let elsewhere = temp.path().join("elsewhere");
@@ -233,6 +255,43 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         assert_task_handoff(&session, &actual, branch);
         assert!(session.snapshot().is_none());
     }
+    // #2771: a successful executable named git cannot select a foreign checkout.
+    use std::os::unix::fs::PermissionsExt;
+    let fake_dir = temp.path().join("fakebin");
+    std::fs::create_dir(&fake_dir).unwrap();
+    let fake = fake_dir.join("git");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let foreign = elsewhere.join("via-c");
+    std::fs::write(foreign.join("routing_probe"), "foreign routing marker").unwrap();
+    let outcome = std::sync::OnceLock::new();
+    let out = execute(&mut presentation, "run_command",
+        &serde_json::json!({"command":format!("'{}' worktree add -b forged '{}'", fake.display(), foreign.display())}),
+        root.to_str().unwrap(), false, 20, &Caveats::top(), &mut crate::agentic::NoMcp,
+        ToolCollaborators { worktree_session: Some(&session), execution: Some(&outcome), ..Default::default() }, false, PromptDisposition::Act).await;
+    assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Passed), "{out}");
+    assert!(session
+        .task_hint()
+        .unwrap()
+        .contains(foreign.to_string_lossy().as_ref()));
+    let out = execute(
+        &mut presentation,
+        "read_file",
+        &serde_json::json!({"path":"routing_probe"}),
+        root.to_str().unwrap(),
+        false,
+        20,
+        &Caveats::top(),
+        &mut crate::agentic::NoMcp,
+        ToolCollaborators {
+            worktree_session: Some(&session),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+    )
+    .await;
+    assert!(out.contains("original routing marker"), "{out}");
 }
 
 /// #2750: ambient bypass stays unarmed; full authority with confinement still
@@ -373,4 +432,233 @@ fn assert_task_handoff(
     );
     let captured = cap_exit_progress(Some(session), None, None).unwrap_or_default();
     assert!(captured.contains(&expected), "{captured}");
+}
+
+/// #2771: native dispatch regression for relative file operands after confined
+/// creation. Grounds path routing in real files while retaining adoption fences.
+#[cfg(unix)]
+#[tokio::test]
+async fn relative_task_root_confined() {
+    relative_task_root(false).await;
+}
+
+/// #2771: recorded ambient worktrees must also become the file-tool base.
+#[tokio::test]
+async fn relative_task_root_ambient() {
+    relative_task_root(true).await;
+}
+
+async fn relative_task_root(bypass: bool) {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let _bypass = EnvVar::set("NEWT_DISABLE_OCAP", if bypass { "1" } else { "0" });
+    let (temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
+    let original = temp.path().join("main").canonicalize().unwrap();
+    let task = policy.worktree.clone();
+    let admin = original.join(".git/worktrees/task");
+    std::fs::write(task.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::write(admin.join("gitdir"), task.join(".git").to_str().unwrap()).unwrap();
+    std::fs::write(admin.join("HEAD"), "ref: refs/heads/task\n").unwrap();
+    std::fs::write(original.join("probe.txt"), "original marker\n").unwrap();
+    std::fs::write(task.join("probe.txt"), "task marker\n").unwrap();
+    let session = crate::worktree_adoption::WorktreeSession::default();
+    let authority = Caveats {
+        fs_write: crate::Scope::only([
+            original.to_string_lossy().into_owned(),
+            task.to_string_lossy().into_owned(),
+        ]),
+        ..Caveats::top()
+    };
+    struct Quiet;
+    impl ToolPresentation for Quiet {
+        fn preview(&mut self, _: &str, _: usize) {}
+        fn document(&mut self, _: &str) {}
+        fn override_result(&mut self, _: String) {}
+    }
+    let call = |name: &'static str, args: serde_json::Value| {
+        let session = &session;
+        let authority = &authority;
+        let original = &original;
+        async move {
+            execute(
+                &mut Quiet,
+                name,
+                &args,
+                original.to_str().unwrap(),
+                false,
+                20,
+                authority,
+                &mut crate::agentic::NoMcp,
+                ToolCollaborators {
+                    worktree_session: Some(session),
+                    ..Default::default()
+                },
+                false,
+                PromptDisposition::Act,
+            )
+            .await
+        }
+    };
+    let read = || serde_json::json!({"path":"probe.txt"});
+    assert!(call("read_file", read()).await.contains("original marker"));
+    let out = call(
+        "write_file",
+        serde_json::json!({"path":"before.txt", "content":"original"}),
+    )
+    .await;
+    assert!(original.join("before.txt").exists(), "{out}");
+    assert!(!task.join("before.txt").exists());
+    record_verified_creation(&session, policy, bypass);
+    assert_eq!(session.snapshot().is_none(), bypass);
+    let out = call("read_file", read()).await;
+    assert!(out.contains("task marker"), "{out}");
+    let out = call(
+        "write_file",
+        serde_json::json!({"path":"created.txt","content":"new task file\n"}),
+    )
+    .await;
+    assert!(task.join("created.txt").is_file(), "{out}");
+    assert!(!original.join("created.txt").exists());
+    let out = call("edit_file", serde_json::json!({"path":"probe.txt","old_string":"task marker","new_string":"edited task"})).await;
+    assert_eq!(
+        std::fs::read_to_string(task.join("probe.txt")).unwrap(),
+        "edited task\n",
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(original.join("probe.txt")).unwrap(),
+        "original marker\n"
+    );
+    let out = call("list_dir", serde_json::json!({"path":"."})).await;
+    assert!(
+        out.contains("created.txt") && !out.contains("before.txt"),
+        "{out}"
+    );
+    let out = call(
+        "find",
+        serde_json::json!({"path":".", "name":"created.txt"}),
+    )
+    .await;
+    assert!(out.contains("created.txt"), "{out}");
+    let out = call(
+        "grep",
+        serde_json::json!({"path":".", "pattern":"edited task"}),
+    )
+    .await;
+    assert!(out.contains("edited task"), "{out}");
+    for (tool, args, expected) in [
+        (
+            "find",
+            serde_json::json!({"path":original, "name":"before.txt"}),
+            "before.txt",
+        ),
+        (
+            "grep",
+            serde_json::json!({"path":original, "pattern":"original marker"}),
+            "original marker",
+        ),
+    ] {
+        let out = call(tool, args).await;
+        assert!(out.contains(expected), "absolute {tool}: {out}");
+    }
+    // The absolute search boundary has not expanded to the sibling task.
+    for tool in ["find", "grep"] {
+        let out = call(
+            tool,
+            serde_json::json!({"path":task, "pattern":"edited task"}),
+        )
+        .await;
+        assert!(out.contains("workspace-only"), "absolute {tool}: {out}");
+    }
+    let out = call("write_file", serde_json::json!({"path":"copied.txt", "content":"", "copy_from":{"path":"probe.txt", "start_line":1, "end_line":1}})).await;
+    assert_eq!(
+        std::fs::read_to_string(task.join("copied.txt")).unwrap(),
+        "edited task\n",
+        "{out}"
+    );
+    let out = call("delete_file", serde_json::json!({"path":"created.txt"})).await;
+    assert!(!task.join("created.txt").exists(), "{out}");
+    let out = call("read_file", serde_json::json!({"path":"missing.txt"})).await;
+    assert!(
+        out.contains(&format!("resolved against {}", task.display())),
+        "{out}"
+    );
+    let out = call(
+        "read_file",
+        serde_json::json!({"path":original.join("probe.txt")}),
+    )
+    .await;
+    assert!(
+        out.contains("original marker"),
+        "absolute reads unchanged: {out}"
+    );
+    let out = call(
+        "write_file",
+        serde_json::json!({"path":original.join("absolute.txt"),"content":"absolute"}),
+    )
+    .await;
+    assert_eq!(original.join("absolute.txt").exists(), bypass, "{out}");
+    if !bypass {
+        assert!(out.contains("read-only"), "{out}");
+    }
+    session.lift();
+    assert!(call("read_file", read()).await.contains("original marker"));
+}
+
+/// #2771: a missing file must name the base used even without a task worktree.
+#[test]
+fn relative_task_root_missing_error_names_base() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_str().unwrap();
+    let out = FileIoError::io(
+        &std::io::ErrorKind::NotFound.into(),
+        &temp.path().join("missing.txt"),
+        "error: missing file".into(),
+    )
+    .render(root, &crate::Scope::All);
+    assert!(out.contains(&format!("resolved against {root}")), "{out}");
+}
+
+/// #2771 round 2: unlinked advisory roots must not redirect native file tools,
+/// even when ambient file authority permits both destinations.
+#[tokio::test]
+async fn relative_task_root_unlinked_is_advisory_only() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    for bypass in ["0", "1"] {
+        let _bypass = EnvVar::set("NEWT_DISABLE_OCAP", bypass);
+        let (temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
+        let root = temp.path().join("main");
+        let task = policy.worktree;
+        std::fs::write(root.join("probe"), "original").unwrap();
+        std::fs::write(task.join("probe"), "forged").unwrap();
+        let session = crate::worktree_adoption::WorktreeSession::default();
+        session.record_task_worktree(&task, "task");
+        struct Quiet;
+        impl ToolPresentation for Quiet {
+            fn preview(&mut self, _: &str, _: usize) {}
+            fn document(&mut self, _: &str) {}
+            fn override_result(&mut self, _: String) {}
+        }
+        let out = execute(
+            &mut Quiet,
+            "read_file",
+            &serde_json::json!({"path":"probe"}),
+            root.to_str().unwrap(),
+            false,
+            20,
+            &Caveats::top(),
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                worktree_session: Some(&session),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+        )
+        .await;
+        assert_eq!(out.trim(), "original", "{bypass}: {out}");
+        assert!(session.task_hint().is_some());
+    }
 }

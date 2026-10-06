@@ -98,7 +98,7 @@ fn git_identity(start: &Path) -> Option<(String, String)> {
 /// `git rev-parse --git-dir` discovery: a *directory* is the git dir
 /// itself; a *file* is a worktree/submodule pointer (`gitdir: <path>`)
 /// resolved relative to the directory containing it.
-fn discover_git_dir(start: &Path) -> Option<PathBuf> {
+pub(crate) fn discover_git_dir(start: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(dir) = current {
         let dot_git = dir.join(".git");
@@ -115,7 +115,7 @@ fn discover_git_dir(start: &Path) -> Option<PathBuf> {
 
 /// Resolve a `.git` *file*'s `gitdir: <path>` pointer (linked worktrees,
 /// submodules). A relative path is relative to the dir holding the file.
-fn resolve_gitdir_file(dot_git: &Path, containing_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_gitdir_file(dot_git: &Path, containing_dir: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(dot_git).ok()?;
     let target = text.lines().next()?.trim().strip_prefix("gitdir:")?.trim();
     if target.is_empty() {

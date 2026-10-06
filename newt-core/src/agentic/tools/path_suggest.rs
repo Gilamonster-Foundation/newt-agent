@@ -25,10 +25,11 @@ impl FileIoError {
         if self.kind != Some(std::io::ErrorKind::NotFound) {
             return self.text;
         }
+        let text = format!("{}\nresolved against {workspace}", self.text);
         let Some(path) = self.operand.to_str() else {
-            return self.text;
+            return text;
         };
-        suggest(self.text, path, workspace, read)
+        suggest(text, path, workspace, read)
     }
 }
 
