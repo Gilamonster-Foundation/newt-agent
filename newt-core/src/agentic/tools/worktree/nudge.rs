@@ -18,37 +18,75 @@ pub(super) fn branch_in_place(
         return None;
     }
     let inspection = agent_bridle::inspect_shell(command).ok()?;
-    let first = inspection.commands.first()?;
-    // Only the leading, literal command establishes this advisory. Trailing
-    // output filters (including the reported tail pipeline) are harmless.
+    // #2778: this is advisory syntax recognition, not evidence that a
+    // conditional segment ran. Inspect every literal segment, never quoted
+    // operands, shell substitutions or delegated child commands.
     if !inspection.constructs.is_empty()
-        || !first.descendant_execs.is_empty()
-        || !first.program.as_deref().is_some_and(resembles_git)
-        || !command.trim_start().starts_with(first.source.trim_start())
-        || !first.source.trim_start().starts_with(first.argv.first()?)
+        || !inspection.commands.iter().any(|command| {
+            if !command.descendant_execs.is_empty()
+                || !command.program.as_deref().is_some_and(resembles_git)
+                || !command
+                    .argv
+                    .first()
+                    .is_some_and(|word| command.source.trim_start().starts_with(word))
+            {
+                return false;
+            }
+            let Some(words) = command
+                .argv
+                .iter()
+                .map(|word| literal(word))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return false;
+            };
+            let Ok((verb, args, same_repository)) = invocation(&words) else {
+                return false;
+            };
+            same_repository
+                && matches!(args, [flag, _] | [flag, _, _]
+                if (verb == "checkout" && flag == "-b") || (verb == "switch" && flag == "-c"))
+        })
     {
         return None;
     }
-    let words = first
-        .argv
-        .iter()
-        .map(|word| literal(word))
-        .collect::<Option<Vec<_>>>()?;
-    let (verb, args, same_repository) = invocation(&words).ok()?;
-    if !same_repository
-        || !matches!(args, [flag, _] | [flag, _, _]
-        if (verb == "checkout" && flag == "-b") || (verb == "switch" && flag == "-c"))
-    {
-        return None;
-    }
-    // Reuse bounded metadata reads; an unknown checkout silently gets no hint.
-    let held = crate::git_staging::HeldRoots::bind(read).ok()?;
-    let (common, admin) =
-        crate::git_staging::discover_git_dirs(&cwd.canonicalize().ok()?, &held).ok()?;
-    if common != admin || session.branch_nudge_shown.swap(true, Relaxed) {
+    normal_checkout(cwd, read)?;
+    if session.branch_nudge_shown.swap(true, Relaxed) {
         return None;
     }
     Some(HINT)
+}
+
+/// Advisory-only discovery on every platform: a normal .git directory is
+/// enough evidence for a reminder. Gitfiles (linked/submodule/separate-git-dir),
+/// symlinks and unknown metadata receive none. No file contents or grants are
+/// read here; confinement/adoption still uses its own held-handle verification.
+fn normal_checkout(cwd: &Path, read: &crate::Scope<String>) -> Option<()> {
+    let cwd = cwd.canonicalize().ok()?;
+    for dir in cwd.ancestors() {
+        let dot_git = dir.join(".git");
+        if !crate::permits_path(read, &dot_git.to_string_lossy()) {
+            return None;
+        }
+        match std::fs::symlink_metadata(&dot_git) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    return None;
+                }
+                let common = dot_git.join("commondir");
+                if !crate::permits_path(read, &common.to_string_lossy()) {
+                    return None;
+                }
+                return match std::fs::symlink_metadata(common) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(()),
+                    _ => None,
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// #2766: record the existing destination and observed branch after a successful
@@ -109,7 +147,7 @@ fn unarmed_task_location(args: &serde_json::Value, workspace: &str) -> Option<(P
     Some((path, branch.to_owned()))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -126,6 +164,9 @@ mod tests {
         for command in [
             "git checkout -b task",
             "git switch -c task",
+            "git worktree add ../task task 2>&1 || git checkout -b task 2>&1",
+            "git status && git switch -c task",
+            "false && git checkout -b task",
             "git checkout -b task 2>&1 | tail -3 && git branch --show-current",
         ] {
             let temp = fixture();
@@ -171,7 +212,10 @@ mod tests {
             "git checkout task",
             "git switch task",
             "git log --grep='checkout -b task'",
-            "false && git checkout -b task",
+            "false || echo 'git checkout -b task'",
+            "echo 'git switch -c task' && git status",
+            "git -C elsewhere checkout -b task",
+            "sh -c 'git checkout -b task'",
         ] {
             assert!(
                 branch_in_place(
@@ -205,6 +249,29 @@ mod tests {
         );
     }
 
+    /// #2778: advisory discovery is portable, scoped, and conservative about
+    /// unknown or shared admin metadata, including from a child cwd.
+    #[test]
+    fn worktree_nudge_2778_metadata_scope_and_unknown_checkout() {
+        let temp = fixture();
+        let child = temp.path().join("src");
+        std::fs::create_dir(&child).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let scope = crate::Scope::only([root.to_string_lossy().into_owned()]);
+        assert_eq!(normal_checkout(&child, &scope), Some(()));
+        assert!(normal_checkout(&child, &crate::Scope::none()).is_none());
+        std::fs::write(root.join(".git/commondir"), "../shared").unwrap();
+        assert!(normal_checkout(&child, &scope).is_none());
+        let unknown = tempfile::tempdir().unwrap();
+        let scope = crate::Scope::only([unknown
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()]);
+        assert!(normal_checkout(unknown.path(), &scope).is_none());
+    }
+
     /// #2761: linked worktrees use a distinct Git admin directory and need no
     /// reminder, including from a child cwd. No subprocess or authority grant.
     #[test]
@@ -236,8 +303,9 @@ mod tests {
             Some(HINT)
         );
     }
-    /// #2761: the actual dispatch result carries the reminder after the live
-    /// leading-cd/output-filter shape, and only once across later commands.
+    /// #2761/#2778: actual dispatch carries the reminder after a failed
+    /// worktree add and compound branch fallback, only once across later commands.
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "real Git and host shell; explicit result annotation proof"]
     async fn worktree_nudge_dispatch_result() {
@@ -267,10 +335,11 @@ mod tests {
         }
         for (index, command) in [
             format!(
-                "cd '{}' && git checkout -b first 2>&1 | tail -3 && git branch --show-current",
+                "cd '{}' && git worktree add task first 2>&1 || git checkout -b first 2>&1",
                 temp.path().display()
             ),
-            "git switch -c second".into(),
+            "git checkout -b second 2>&1 | tail -3 && git branch --show-current".into(),
+            "git switch -c third".into(),
         ]
         .iter()
         .enumerate()

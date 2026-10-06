@@ -48,8 +48,15 @@ pub(super) fn creation_failure_hint(
         ["-b" | "-B", branch, _] | ["-b" | "-B", branch, _, _] => *branch,
         _ => return None,
     };
+    let stderr = envelope.get("stderr")?.as_str()?;
+    // #2778: without -b the final operand must already name a ref. Do not
+    // suggest creating it when -b was present and the missing ref is a start point.
+    let invalid_reference = format!("fatal: invalid reference: {branch}");
+    if args.len() == 2 && stderr.lines().any(|line| line == invalid_reference) {
+        return Some("\nWorktree hint: To create a new branch for the worktree, use `git worktree add -b <name> <path>`.");
+    }
     let prefix = format!("fatal: '{branch}' is already used by worktree at ");
-    envelope.get("stderr")?.as_str()?.lines().any(|line| line.starts_with(&prefix)).then_some(
+    stderr.lines().any(|line| line.starts_with(&prefix)).then_some(
         "\nWorktree hint: if you switched the original to that branch, switch it back with `git switch -`. To create a new task branch, pick a new branch name and run `git worktree add -b <new-branch> <path> [<start>]` as a standalone command."
     )
 }
@@ -775,3 +782,71 @@ mod nested_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tools_tests/worktree_adoption_sibling.rs"]
 mod sibling_tests;
+
+#[cfg(test)]
+mod invalid_reference_tests {
+    use super::*;
+
+    /// #2778: only the missing explicit branch of worktree add gets -b advice.
+    #[test]
+    fn worktree_invalid_reference_2778_requires_matching_git_failure() {
+        let hint = "\nWorktree hint: To create a new branch for the worktree, use `git worktree add -b <name> <path>`.";
+        let failed = |stderr: &str| serde_json::json!({"exit_code":128,"stderr":stderr});
+        for command in [
+            "git worktree add ../task task",
+            "git -C repo worktree add '../task path' task",
+        ] {
+            assert_eq!(
+                creation_failure_hint(command, &failed("fatal: invalid reference: task\r\n")),
+                Some(hint)
+            );
+        }
+        for (command, envelope) in [
+            (
+                "git worktree add ../task task",
+                failed("prefix fatal: invalid reference: task"),
+            ),
+            (
+                "git worktree add ../task task",
+                failed("fatal: invalid reference: task-extra"),
+            ),
+            (
+                "git worktree add ../task task",
+                failed("fatal: invalid reference: other"),
+            ),
+            (
+                "git checkout task",
+                failed("fatal: invalid reference: task"),
+            ),
+            (
+                "echo 'git worktree add ../task task'",
+                failed("fatal: invalid reference: task"),
+            ),
+            (
+                "git worktree add -b task ../task missing",
+                failed("fatal: invalid reference: missing"),
+            ),
+            (
+                "git worktree add ../task task",
+                serde_json::json!({"exit_code":0,"stderr":"fatal: invalid reference: task"}),
+            ),
+            (
+                "git worktree add ../task task",
+                serde_json::json!({"exit_code":128,"stdout":"fatal: invalid reference: task","stderr":""}),
+            ),
+            (
+                "git worktree add ../task task",
+                serde_json::json!({"exit_code":128,"stderr":"fatal: invalid reference: task","denied":true}),
+            ),
+            (
+                "echo fake; git worktree add ../task task",
+                failed("fatal: invalid reference: task"),
+            ),
+        ] {
+            assert!(
+                creation_failure_hint(command, &envelope).is_none(),
+                "{command}: {envelope}"
+            );
+        }
+    }
+}
