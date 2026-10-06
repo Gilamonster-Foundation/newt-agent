@@ -10,17 +10,20 @@ use std::path::{Path, PathBuf};
 
 /// Owned by a session, shared across turns; a fresh task starts empty.
 #[derive(Debug, Default)]
-pub struct WorktreeSession(std::sync::Mutex<Option<AdoptedWorktree>>);
+pub struct WorktreeSession {
+    adopted: std::sync::Mutex<Option<AdoptedWorktree>>,
+    pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
+}
 impl WorktreeSession {
     /// Explicit operator lift, also used at the existing new-task boundary.
     pub fn lift(&self) {
-        *self.0.lock().expect("worktree session lock") = None;
+        *self.adopted.lock().expect("worktree session lock") = None;
     }
     pub(crate) fn snapshot(&self) -> Option<AdoptedWorktree> {
-        self.0.lock().expect("worktree session lock").clone()
+        self.adopted.lock().expect("worktree session lock").clone()
     }
     pub(crate) fn adopt(&self, candidate: AdoptedWorktree) {
-        let mut state = self.0.lock().expect("worktree session lock");
+        let mut state = self.adopted.lock().expect("worktree session lock");
         if state.is_none() {
             *state = Some(candidate);
         }
