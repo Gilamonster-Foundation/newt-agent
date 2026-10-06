@@ -224,7 +224,10 @@ pub(super) fn command_args_with_default_cwd<'a>(
     else {
         return Ok(std::borrow::Cow::Borrowed(args));
     };
-    let cwd = default_cwd.to_str().ok_or(
+    // #2780: canonical Windows roots have a verbatim prefix that Git may
+    // interpret as non-local. Keep binding checks canonical, but pass the
+    // equivalent ordinary spelling to children on every command route.
+    let cwd = dunce::simplified(default_cwd).to_str().ok_or(
         "error: the command working directory is not valid UTF-8; select a UTF-8 directory",
     )?;
     let mut projected = args.clone();

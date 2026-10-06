@@ -4428,6 +4428,7 @@ dependencies = [
  "content-addressable",
  "crossterm",
  "diffy",
+ "dunce",
  "globset",
  "grep-regex",
  "grep-searcher",

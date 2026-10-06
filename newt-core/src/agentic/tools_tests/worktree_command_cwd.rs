@@ -16,6 +16,18 @@ impl ToolPresentation for Notices {
 fn fixture() -> (tempfile::TempDir, AdoptedWorktree) {
     let (temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
     crate::worktree_adoption::tests::link(&policy);
+    // Git metadata uses repository-relative locators, not Rust's Windows
+    // canonical/verbatim API spelling (which Git treats as non-local).
+    std::fs::write(
+        policy.worktree.join(".git"),
+        "gitdir: ../main/.git/worktrees/task\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("main/.git/worktrees/task/gitdir"),
+        "../../../../task/.git\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(temp.path().join("main/.git/refs/heads")).unwrap();
     std::fs::write(
         temp.path().join("main/.git/worktrees/task/HEAD"),
@@ -93,7 +105,7 @@ async fn shell_task_cwd_2780_actual_git_and_lift() {
     session.record_task_worktree(&policy.worktree, "task");
     let hint = format!(
         "Commands now run in the task worktree {}",
-        policy.worktree.display()
+        dunce::simplified(&policy.worktree).display()
     );
     // Explicit selection must neither emit nor consume the default notice.
     let (out, _, notices) = call(
@@ -110,7 +122,10 @@ async fn shell_task_cwd_2780_actual_git_and_lift() {
         let (out, cwd, notices) =
             call(&session, &original, "run_command", args(), &Caveats::top()).await;
         assert_eq!(out.lines().next(), Some("task"), "{out}");
-        assert_eq!(cwd, Some(policy.worktree.clone()));
+        assert_eq!(
+            cwd.as_ref().map(|path| path.canonicalize().unwrap()),
+            Some(policy.worktree.clone())
+        );
         assert_eq!(out.contains(&hint), first, "{out}");
         assert_eq!(notices.iter().any(|text| text.contains(&hint)), first);
     }
@@ -287,5 +302,32 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
                 original.to_str().unwrap()
             ));
         }
+    }
+}
+
+/// #2780 round 2: all task cwd projections must use child-compatible spellings.
+/// Windows canonicalization supplies the verbatim prefix; Unix is unchanged.
+#[test]
+fn shell_task_cwd_2780_projected_paths_are_child_compatible() {
+    let (temp, policy) = fixture();
+    let original = temp.path().join("main").canonicalize().unwrap();
+    let session = WorktreeSession::default();
+    session.record_task_worktree(&policy.worktree, "task");
+    #[cfg(windows)]
+    assert!(policy.worktree.to_str().unwrap().starts_with(r"\\?\"));
+    for name in ["run_command", "bash", "build_exec", "lifecycle"] {
+        let args = serde_json::json!({"command":"git branch --show-current"});
+        let projected = shell::command_args_with_default_cwd(
+            name,
+            &args,
+            original.to_str().unwrap(),
+            None,
+            Some(&session),
+        )
+        .unwrap();
+        let key = shell::command_cwd_key(name).unwrap();
+        let cwd = projected[key].as_str().unwrap();
+        assert!(!cwd.starts_with(r"\\?\"), "{name}: {cwd}");
+        assert_eq!(Path::new(cwd).canonicalize().unwrap(), policy.worktree);
     }
 }

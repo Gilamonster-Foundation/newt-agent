@@ -503,8 +503,13 @@ pub(super) async fn execute(
             return None;
         }
         let task = session?.task_root(Path::new(workspace))?;
-        (normalized.get(key)?.as_str()? == task.to_str()?)
-            .then(|| format!("Commands now run in the task worktree {}", task.display()))
+        let child_path = dunce::simplified(&task);
+        (normalized.get(key)?.as_str()? == child_path.to_str()?).then(|| {
+            format!(
+                "Commands now run in the task worktree {}",
+                child_path.display()
+            )
+        })
     });
     let admission = session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
         creation_admission(
