@@ -14,8 +14,9 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 - "Captured working state: Plan:" rendered its ✓/→/☐ steps as one wrapped
   paragraph on the styled surface, because the ledger's single newlines are
   Markdown soft breaks. The captured block now ends each line with a
-  CommonMark hard break; the plain surface and the model-facing bytes are
-  unchanged.
+  CommonMark hard break (two trailing spaces). The plain surface is visually
+  unchanged, but its lines now carry those trailing spaces; the model-facing
+  bytes are unchanged.
 
 ### Fixed — a governed commit is no longer refused in a default-permission Linux session (#2693)
 
