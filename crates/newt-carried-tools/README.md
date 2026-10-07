@@ -10,7 +10,7 @@ BusyBox-w32 is GPLv2 (LICENSE-busybox); its corresponding-source URL ships along
 
 ```powershell
 cargo build -p newt-carried-tools --release --locked
-cargo build -p newt-cli --bin newt-ambient-brush --release --locked
+cargo build -p newt-agent --bin newt-ambient-brush --release --locked
 ./scripts/windows/Install-CarriedTools.ps1 `
   -BinaryPath target/release/newt-carried-tools.exe -NewtDirectory <release-dir>
 Copy-Item target/release/newt-ambient-brush.exe <release-dir>/tools/
