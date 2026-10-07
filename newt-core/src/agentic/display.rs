@@ -278,23 +278,74 @@ pub fn gauge_level(used: u32, budget: u32) -> GaugeLevel {
     }
 }
 
+/// Why the loop believes the last request overflowed the model's context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverflowReason {
+    /// The model returned nothing for a prompt already past the share of its
+    /// window where an empty reply usually means overflow.
+    EmptyReplyNearWindow {
+        prompt_tokens: u32,
+        window: u32,
+        trigger_pct: u32,
+    },
+    /// The backend refused the request as too large; the loop derived a
+    /// smaller budget to retry under.
+    Refused {
+        request_estimate: Option<u32>,
+        window: Option<u32>,
+        trim_to: u32,
+    },
+}
+
+/// The overflow notice, pure. Every number it prints is one the decision was
+/// made on: a prompt size beside the share of the window that triggered, or
+/// the refused request beside the budget the retry will fit. The line it
+/// replaces put the previous round's usage beside the window with a `>`
+/// between them and read "74,256 tokens > 83,885 safe window", which is
+/// false as written and was reported as such (2026-10-07).
+pub(crate) fn overflow_notice_text(reason: &OverflowReason, model: &str, attempt: u32) -> String {
+    match *reason {
+        OverflowReason::EmptyReplyNearWindow {
+            prompt_tokens,
+            window,
+            trigger_pct,
+        } => format!(
+            "⚠  context overflow likely — {model} returned nothing at {} prompt tokens, past \
+             {trigger_pct}% of its {}-token window\n⟳  trimming context and retrying (attempt \
+             {attempt}/2)…",
+            fmt_tokens(prompt_tokens),
+            fmt_tokens(window)
+        ),
+        OverflowReason::Refused {
+            request_estimate,
+            window,
+            trim_to,
+        } => {
+            let request = match request_estimate {
+                Some(n) => format!("a request of about {} tokens", fmt_tokens(n)),
+                None => "the request".to_string(),
+            };
+            let window = match window {
+                Some(w) => format!(" (window {})", fmt_tokens(w)),
+                None => " as too large".to_string(),
+            };
+            format!(
+                "⚠  context overflow — {model} refused {request}{window}; trimming to {}\n⟳  \
+                 retrying (attempt {attempt}/2)…",
+                fmt_tokens(trim_to)
+            )
+        }
+    }
+}
+
 /// Print a context-overflow adaptation notice to the TUI stream.
 pub(crate) fn emit_overflow_notice(
     color: bool,
-    usage: Option<&crate::TokenUsage>,
-    safe_context: Option<u32>,
+    reason: &OverflowReason,
     model: &str,
     attempt: u32,
 ) {
-    let token_str = usage
-        .map(|u| format!("{} tokens", fmt_tokens(u.input_tokens)))
-        .unwrap_or_else(|| "unknown tokens".to_string());
-    let safe_str = safe_context
-        .map(|s| format!(" > {} safe window for {model}", fmt_tokens(s)))
-        .unwrap_or_default();
-    let msg = format!(
-        "⚠  context overflow likely ({token_str}{safe_str})\n⟳  trimming context and retrying (attempt {attempt}/2)…"
-    );
+    let msg = overflow_notice_text(reason, model, attempt);
     if color {
         execute!(
             io::stdout(),

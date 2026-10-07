@@ -2877,8 +2877,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
-                                accumulated_usage.as_ref(),
-                                Some(new_budget.min(u32::MAX as usize) as u32),
+                                &display::OverflowReason::Refused {
+                                    request_estimate: Some(
+                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
+                                            as u32,
+                                    ),
+                                    window: recovered_window,
+                                    trim_to: new_budget.min(u32::MAX as usize) as u32,
+                                },
                                 model,
                                 cw_retries + 1,
                             );
@@ -3607,8 +3613,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 if overflow_likely && overflow_retries < 2 {
                     emit_overflow_notice(
                         color,
-                        merged.as_ref(),
-                        safe_context,
+                        &display::OverflowReason::EmptyReplyNearWindow {
+                            prompt_tokens: merged.as_ref().map_or(0, |u| u.input_tokens),
+                            window: safe_context.unwrap_or(0),
+                            trigger_pct: 85,
+                        },
                         model,
                         overflow_retries + 1,
                     );
@@ -7860,8 +7869,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
-                                accumulated_usage.as_ref(),
-                                Some(new_budget.min(u32::MAX as usize) as u32),
+                                &display::OverflowReason::Refused {
+                                    request_estimate: Some(
+                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
+                                            as u32,
+                                    ),
+                                    window: recovered_window,
+                                    trim_to: new_budget.min(u32::MAX as usize) as u32,
+                                },
                                 model,
                                 cw_retries + 1,
                             );
@@ -10499,8 +10514,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                             .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
-                                accumulated_usage.as_ref(),
-                                Some(new_budget.min(u32::MAX as usize) as u32),
+                                &display::OverflowReason::Refused {
+                                    request_estimate: Some(
+                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
+                                            as u32,
+                                    ),
+                                    window: recovered_window,
+                                    trim_to: new_budget.min(u32::MAX as usize) as u32,
+                                },
                                 model,
                                 cw_retries + 1,
                             );
