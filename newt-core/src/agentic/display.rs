@@ -691,31 +691,31 @@ pub(super) fn turn_heartbeat_line(
     format!("still working — {mins}m elapsed, round {round} of {limit}")
 }
 
-/// The one operator-visible row for the prose a model sends WITH a tool
-/// batch. Pure, no ANSI, no I/O.
+/// The readable prose a model sends WITH a tool batch, as rows. Pure, no
+/// ANSI, no I/O.
 ///
 /// Every provider loop replays that prose into history and shows none of it:
 /// a model that says "extracting the denial helpers next" before its
 /// `write_file` is silent on the operator's screen, while the same sentence
-/// with NO call behind it is nudged as a stall. This keeps the first sentence
-/// of what is readable and drops what is not:
+/// with NO call behind it is nudged as a stall. This keeps what is readable
+/// and drops what is not:
 ///
 /// - inline `<think>` blocks (a no-op on the chat wires, which filter before
 ///   this runs; the Anthropic wire carries text blocks only);
 /// - a tool call the recovery pass lifted out of content — a fenced block, a
 ///   bare JSON object or array, a `<function=…>` / `<tool>…</tool>` tag form —
-///   from the line it starts on to the end of its paragraph, so the arguments
-///   are not printed a second time under the `⚙` line that already shows them;
+///   from where it starts (even mid-line) to the end of its paragraph, so the
+///   arguments are not printed a second time under the `⚙` line that already
+///   shows them;
 /// - Markdown heading lines and leading list markers (structure, not prose).
 ///
-/// The width is the caller's (`reply_cols(term_cols())`) so this stays pure;
-/// the row is fitted with `…` through [`crate::tty::fit_line`], the one
-/// cell-aware truncator. `None` when nothing readable remains.
-pub(super) fn tool_round_narration(content: &str, max_cols: usize) -> Option<String> {
+/// One row per paragraph or list item, whitespace collapsed; nothing is cut
+/// short here. The caller bounds the rows the way a tool result is bounded
+/// (the first `[tui] spill_lines` rows commit, the rest fold behind the spill
+/// marker), so a long explanation is kept whole and raised with `/spill open`.
+pub(super) fn tool_round_prose(content: &str) -> Vec<String> {
     let (clean, _) = crate::reasoning::ThinkFilter::filter_complete(content, false);
-    // A unit is one paragraph or one list item: the sentence search never
-    // runs across either boundary, so two list items do not fuse into one
-    // "sentence" and a soft-wrapped paragraph still joins back together.
+    // A unit is one paragraph or one list item.
     let mut units: Vec<String> = Vec::new();
     let mut paragraph = String::new();
     let mut in_fence = false;
@@ -769,14 +769,11 @@ pub(super) fn tool_round_narration(content: &str, max_cols: usize) -> Option<Str
     if !paragraph.is_empty() {
         units.push(paragraph);
     }
-    let first = units.into_iter().next()?;
-    let one_row: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
-    let sentence = first_sentence(&one_row);
-    if sentence.is_empty() {
-        return None;
-    }
-    let fit = crate::tty::fit_line(sentence, max_cols);
-    Some(format!("{}{}{}", fit.head, fit.fade, fit.ellipsis))
+    units
+        .into_iter()
+        .map(|unit| unit.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|row| !row.is_empty())
+        .collect()
 }
 
 /// Prose up to the first fenced-block, JSON or tag opener on the line, and
@@ -809,22 +806,6 @@ fn strip_list_marker(line: &str) -> (&str, bool) {
         }
     }
     (line, false)
-}
-
-/// Up to and including the first `.`, `!` or `?` that ends a word (followed by
-/// whitespace or the end), so `lib.rs` and `e.g.` inside a token do not cut.
-fn first_sentence(text: &str) -> &str {
-    let bytes = text.as_bytes();
-    for (i, b) in bytes.iter().enumerate() {
-        if matches!(b, b'.' | b'!' | b'?')
-            && bytes
-                .get(i + 1)
-                .is_none_or(|next| next.is_ascii_whitespace())
-        {
-            return &text[..=i];
-        }
-    }
-    text
 }
 
 /// Seconds between committed time markers; 0 = off.

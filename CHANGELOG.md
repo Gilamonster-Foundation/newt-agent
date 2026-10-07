@@ -11,9 +11,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Added — the operator sees what the model is doing, and approves its first plan
 
-- The prose a model sends together with a tool call is now shown as one `▹`
-  row above that batch's `⚙` headers, in a new themeable `narration` role
-  (magenta by default), on every wire and on the piped path; it used to be replayed into history and shown to nobody. A tick of an
+- The prose a model sends together with a tool call is now shown as `▹`
+  rows above that batch's `⚙` headers, in a new themeable `narration` role
+  (magenta by default), folded like tool output (the first `[tui]
+  spill_lines` rows, the rest behind `/spill open N`), on every wire and on
+  the piped path; it used to be replayed into history and shown to nobody. A tick of an
   existing plan shows as `step 3 of 7: …` instead of the whole `<plan>` block.
 - Plan-before-act: under initiative `patient` or `measured` (the default),
   the first multi-step `update_plan` of an acting turn enters the Plan phase

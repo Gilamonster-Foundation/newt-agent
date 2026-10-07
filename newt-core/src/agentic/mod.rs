@@ -3904,7 +3904,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
-            commit_tool_round_narration(&probe_content, false, color);
+            commit_tool_round_narration(
+                &probe_content,
+                false,
+                completed_spill_renderer.as_deref(),
+                color,
+            );
         }
         // Phase 2: every call in the batch is valid — execute in order. `flatten`
         // yields nothing (so this runs zero tools) when the batch was rejected.
@@ -8881,7 +8886,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
-            commit_tool_round_narration(&oa_content, false, color);
+            commit_tool_round_narration(
+                &oa_content,
+                false,
+                completed_spill_renderer.as_deref(),
+                color,
+            );
         }
         // Phase 2: every call is valid — execute in order (empty when rejected).
         for (call_index, (tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
@@ -11427,7 +11437,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
-            commit_tool_round_narration(&oa_content, printed_live, color);
+            commit_tool_round_narration(
+                &oa_content,
+                printed_live,
+                completed_spill_renderer.as_deref(),
+                color,
+            );
         }
         // Phase 2: every call is valid — execute in order (empty when rejected).
         for (call_index, (tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
@@ -13166,7 +13181,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         for item in &echo {
             input.push(item.clone());
         }
-        commit_tool_round_narration(&text, false, color);
+        commit_tool_round_narration(&text, false, completed_spill_renderer.as_deref(), color);
         let batch = smart_harness
             .map(|harness| {
                 let mut messages = Vec::with_capacity(input.len() + 1);
@@ -13893,21 +13908,62 @@ fn emit_notice_line(level: crate::tty::Level, glyph: &str, text: &str, color: bo
     crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, notice.writer(color));
 }
 
-/// The one row for the prose a model sent WITH this tool batch — what every
-/// loop used to replay into history and show to nobody. `▹`-glyphed, the
-/// hollow sibling of the `▸` reply marker, in the theme's `narration` colour:
-/// the model's interim voice above the `⚙` lines that follow, told apart from
-/// its reply, its reasoning, and the operator's own text.
-/// Skipped when the wire already streamed the text live (Anthropic) and when
-/// nothing readable remains once the call text itself is dropped.
-fn commit_tool_round_narration(content: &str, already_printed: bool, color: bool) {
+/// The prose a model sent WITH this tool batch — what every loop used to
+/// replay into history and show to nobody — bounded the way a tool result
+/// and a reasoning block are: the first `[tui] spill_lines` rows commit, the
+/// rest are retained behind the one fold marker so `/spill open <id>` raises
+/// the whole of it, and the conversation spine is never buried. Rows are
+/// `▹`-glyphed, the hollow sibling of the `▸` reply marker, in the theme's
+/// `narration` colour, so the model's interim voice is told apart from its
+/// reply, its reasoning, and the operator's own text. Skipped when the wire
+/// already streamed the text live (Anthropic) and when nothing readable
+/// remains once the call text itself is dropped.
+fn commit_tool_round_narration(
+    content: &str,
+    already_printed: bool,
+    retain: Option<&dyn CompletedSpillRenderer>,
+    color: bool,
+) {
     if already_printed {
         return;
     }
-    let cols = display::reply_cols(crate::tty::term_cols());
-    if let Some(line) = display::tool_round_narration(content, cols) {
-        emit_notice_line(crate::tty::Level::Narration, "▹", &line, color);
+    let rows = display::tool_round_prose(content);
+    if rows.is_empty() {
+        return;
     }
+    let budget = display::spill_lines();
+    let shown = if budget == 0 {
+        rows.len()
+    } else {
+        rows.len().min(budget)
+    };
+    let width = display::reply_cols(crate::tty::term_cols());
+    for (i, row) in rows.iter().take(shown).enumerate() {
+        for (j, line) in crate::tty::wrap_line(row, width).into_iter().enumerate() {
+            let glyph = if i == 0 && j == 0 { "▹" } else { " " };
+            emit_notice_line(crate::tty::Level::Narration, glyph, &line, color);
+        }
+    }
+    let hidden = rows.len() - shown;
+    if hidden == 0 {
+        return;
+    }
+    // Retain BEFORE printing the marker, so the id names a body that is
+    // already there — the same order the reasoning fold keeps.
+    let body = rows.join("\n");
+    let retained = retain.and_then(|r| r.retain_completed(&body));
+    let hint = retained
+        .zip(retain)
+        .map(|(id, renderer)| renderer.recovery_hint(id));
+    let recovery = hint
+        .as_deref()
+        .map_or_else(display::Recovery::default, display::Recovery::Command);
+    emit_notice_line(
+        crate::tty::Level::Dim,
+        "▲",
+        &display::Fold::lines(hidden, recovery).marker(),
+        color,
+    );
 }
 
 /// The streaming half of a [`ThinkingFold`]: it owns the partial-line buffer

@@ -40,14 +40,18 @@ Read from the code (derived, not run):
 
 ### 1. The prose that arrives with a tool call is shown
 
-`display::tool_round_narration` is a pure builder: it strips inline think
+`display::tool_round_prose` is a pure builder: it strips inline think
 blocks, drops any paragraph that is the tool call itself (a fenced block, a
 bare JSON object or array, a `<function=…>` or `<tool>…</tool>` form, from
-the line it starts on), drops heading lines and list markers, keeps the first
-sentence of the first remaining unit, and fits it to the reply width with
-the shared `…` treatment.
+where it starts, even mid-line), drops heading lines and list markers, and
+returns one row per paragraph or list item with nothing cut short. The
+emitter bounds the rows the way a tool result and a reasoning block are
+bounded: the first `[tui] spill_lines` rows commit, the rest are retained
+behind the one fold marker (`▲ N lines hidden [/spill open N]`), so a long
+explanation is kept whole and raised on demand rather than cut to a
+sentence (the operator's call, 2026-10-07, after a row was cut at "(e.g.").
 
-`commit_tool_round_narration` emits that row once per validated batch, from
+`commit_tool_round_narration` emits those rows once per validated batch, from
 the same point in all four loops (inside the accepted-batch branch, after
 whole-batch validation and before the first side effect; a rejected batch
 prints its rejection rows and no narration), through `emit_notice_line`: the writer the reasoning fold

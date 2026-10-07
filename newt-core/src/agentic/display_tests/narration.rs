@@ -1,102 +1,89 @@
 use super::*;
 
-/// The prose a model sends WITH a tool call becomes one readable row: first
-/// sentence, think blocks gone, the call text itself never echoed.
+fn rows(content: &str) -> Vec<String> {
+    tool_round_prose(content)
+}
+
+/// The prose a model sends WITH a tool call becomes readable rows, one per
+/// paragraph or list item: think blocks gone, the call text itself never
+/// echoed, nothing cut short.
 #[test]
-fn narration_keeps_the_first_readable_sentence_and_drops_the_call() {
-    let cases: &[(&str, Option<&str>)] = &[
+fn narration_keeps_the_readable_prose_and_drops_the_call() {
+    let cases: &[(&str, &[&str])] = &[
         // Native call, plain prose: the sentence, verbatim.
-        ("Let me look at the file.", Some("Let me look at the file.")),
-        // Two sentences: only the first.
+        ("Let me look at the file.", &["Let me look at the file."]),
+        // Two sentences stay together; nothing is cut at a period.
         (
             "First I check the tests. Then I edit.",
-            Some("First I check the tests."),
+            &["First I check the tests. Then I edit."],
         ),
+        (
+            "The crates are at the top level (e.g. newt-core, newt-tui). Next I read.",
+            &["The crates are at the top level (e.g. newt-core, newt-tui). Next I read."],
+        ),
+        // Two paragraphs are two rows.
+        ("Para one.\n\nPara two.", &["Para one.", "Para two."]),
         // Recovered bare-JSON call: nothing readable.
-        (r#"{"name":"read_file","arguments":{"path":"a.rs"}}"#, None),
+        (r#"{"name":"read_file","arguments":{"path":"a.rs"}}"#, &[]),
         // Prose, blank line, fenced JSON call.
         (
             "I'll read the file.\n\n```json\n{\"name\":\"read_file\"}\n```",
-            Some("I'll read the file."),
+            &["I'll read the file."],
         ),
         // Prose then JSON in the SAME paragraph: the call is cut, not joined.
         (
             "Reading it now:\n{\n  \"name\": \"read_file\",\n  \"arguments\": {}\n}",
-            Some("Reading it now:"),
+            &["Reading it now:"],
         ),
         // Paired think block, then prose, then a root-tag call.
         (
             "<think>plan</think>\n\nLet me read that now.\n\n<read_file><path>x</path></read_file>",
-            Some("Let me read that now."),
+            &["Let me read that now."],
         ),
         // Unterminated think: the tail is reasoning, the head is prose.
-        ("Reading now<think>cut off mid-thought", Some("Reading now")),
+        ("Reading now<think>cut off mid-thought", &["Reading now"]),
         // Function-tag dialect with a stray closer (the observed qwen3 shape).
         (
             "First I check the tests. Then I edit.\n\n<function=run_command>\n<parameter=command>ls</parameter>\n</function>\n</tool_call>",
-            Some("First I check the tests."),
+            &["First I check the tests. Then I edit."],
         ),
-        // Heading and list markers are structure, not narration.
+        // Heading lines are structure; list items are rows of their own.
         (
             "## Plan\n1. Read the config then edit.\n2. Run the tests.",
-            Some("Read the config then edit."),
+            &["Read the config then edit.", "Run the tests."],
         ),
-        ("- extract denials.rs\n- extract find_tool.rs", Some("extract denials.rs")),
-        // A dotted token does not end the sentence.
         (
-            "Opening newt-core/src/lib.rs to find the seam. Then edit.",
-            Some("Opening newt-core/src/lib.rs to find the seam."),
+            "- extract denials.rs\n- extract find_tool.rs",
+            &["extract denials.rs", "extract find_tool.rs"],
         ),
         // A call glued to the prose on ONE line is cut where it starts: the
         // ⚙ header already shows the arguments.
-        (
-            "Here is config: {\"debug\": true}",
-            Some("Here is config:"),
-        ),
+        ("Here is config: {\"debug\": true}", &["Here is config:"]),
         (
             "Reading it now: {\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}",
-            Some("Reading it now:"),
+            &["Reading it now:"],
         ),
         (
             "Opening the file <function=read_file><parameter=path>a.rs</parameter></function>",
-            Some("Opening the file"),
+            &["Opening the file"],
         ),
         // Nothing readable.
-        ("", None),
-        ("   \n\n", None),
-        ("</tool_call>", None),
-        ("```\nls -la\n```", None),
+        ("", &[]),
+        ("   \n\n", &[]),
+        ("</tool_call>", &[]),
+        ("```\nls -la\n```", &[]),
     ];
     for (content, expected) in cases {
-        assert_eq!(
-            tool_round_narration(content, 80).as_deref(),
-            *expected,
-            "content: {content:?}"
-        );
+        assert_eq!(rows(content), *expected, "content: {content:?}");
     }
 }
 
-/// The row is fitted to the caller's width with the shared `…` treatment and
-/// never exceeds it.
+/// Whitespace collapses within a row: a soft-wrapped paragraph joins back
+/// together, and runs of spaces do not survive.
 #[test]
-fn narration_is_fitted_to_the_column_budget() {
-    let long = "x".repeat(120);
-    let row = tool_round_narration(&long, 75).expect("prose");
-    assert!(row.ends_with('…'), "{row}");
-    assert!(crate::tty::width::str_width(&row) <= 75, "{row}");
-    // Under the budget: untouched, no ellipsis.
+fn narration_collapses_whitespace_within_a_row() {
     assert_eq!(
-        tool_round_narration("Short.", 75).as_deref(),
-        Some("Short.")
-    );
-}
-
-/// Whitespace collapses to one row: a multi-line paragraph is still one
-/// sentence, and runs of spaces do not survive.
-#[test]
-fn narration_collapses_whitespace_into_one_row() {
-    assert_eq!(
-        tool_round_narration("Reading   the\n  config\tfile now.\nThen more.", 80).as_deref(),
-        Some("Reading the config file now.")
+        rows("Reading   the\n  config\tfile now.\nThen more."),
+        vec!["Reading the config file now. Then more."]
     );
 }
