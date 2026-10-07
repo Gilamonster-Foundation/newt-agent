@@ -922,6 +922,15 @@ const BARE_CONTINUATION_PHRASES: &[&str] = &[
     "retry",
     "try again",
     "try now",
+    // What is left of "let's go" / "let's land it" once `prompt_intake`'s
+    // collaborative opener is stripped: a nudge, not a proposal. The other
+    // consumer, `chat.rs`'s `upgrade_origin_for_interrupted_objective`, then
+    // links a bare "go" to the interrupted objective — the intended reading
+    // there too.
+    "go",
+    "land it",
+    "ship it",
+    "do it",
 ];
 
 /// Is this operator input a BARE continuation — a nudge like "continue" /
@@ -983,6 +992,11 @@ mod bare_continuation_tests {
             "try again?",
             "try now?",
             "continue?",
+            // The remainder of a collaborative opener ("let's go").
+            "go",
+            "land it",
+            "ship it",
+            "do it",
         ] {
             assert!(is_bare_continuation(input), "{input:?} must link");
         }

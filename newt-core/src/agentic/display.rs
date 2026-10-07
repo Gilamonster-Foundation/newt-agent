@@ -278,23 +278,74 @@ pub fn gauge_level(used: u32, budget: u32) -> GaugeLevel {
     }
 }
 
+/// Why the loop believes the last request overflowed the model's context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverflowReason {
+    /// The model returned nothing for a prompt already past the share of its
+    /// window where an empty reply usually means overflow.
+    EmptyReplyNearWindow {
+        prompt_tokens: u32,
+        window: u32,
+        trigger_pct: u32,
+    },
+    /// The backend refused the request as too large; the loop derived a
+    /// smaller budget to retry under.
+    Refused {
+        request_estimate: Option<u32>,
+        window: Option<u32>,
+        trim_to: u32,
+    },
+}
+
+/// The overflow notice, pure. Every number it prints is one the decision was
+/// made on: a prompt size beside the share of the window that triggered, or
+/// the refused request beside the budget the retry will fit. The line it
+/// replaces put the previous round's usage beside the window with a `>`
+/// between them and read "74,256 tokens > 83,885 safe window", which is
+/// false as written and was reported as such (2026-10-07).
+pub(crate) fn overflow_notice_text(reason: &OverflowReason, model: &str, attempt: u32) -> String {
+    match *reason {
+        OverflowReason::EmptyReplyNearWindow {
+            prompt_tokens,
+            window,
+            trigger_pct,
+        } => format!(
+            "⚠  context overflow likely — {model} returned nothing at {} prompt tokens, past \
+             {trigger_pct}% of its {}-token window\n⟳  trimming context and retrying (attempt \
+             {attempt}/2)…",
+            fmt_tokens(prompt_tokens),
+            fmt_tokens(window)
+        ),
+        OverflowReason::Refused {
+            request_estimate,
+            window,
+            trim_to,
+        } => {
+            let request = match request_estimate {
+                Some(n) => format!("a request of about {} tokens", fmt_tokens(n)),
+                None => "the request".to_string(),
+            };
+            let window = match window {
+                Some(w) => format!(" (window {})", fmt_tokens(w)),
+                None => " as too large".to_string(),
+            };
+            format!(
+                "⚠  context overflow — {model} refused {request}{window}; trimming to {}\n⟳  \
+                 retrying (attempt {attempt}/2)…",
+                fmt_tokens(trim_to)
+            )
+        }
+    }
+}
+
 /// Print a context-overflow adaptation notice to the TUI stream.
 pub(crate) fn emit_overflow_notice(
     color: bool,
-    usage: Option<&crate::TokenUsage>,
-    safe_context: Option<u32>,
+    reason: &OverflowReason,
     model: &str,
     attempt: u32,
 ) {
-    let token_str = usage
-        .map(|u| format!("{} tokens", fmt_tokens(u.input_tokens)))
-        .unwrap_or_else(|| "unknown tokens".to_string());
-    let safe_str = safe_context
-        .map(|s| format!(" > {} safe window for {model}", fmt_tokens(s)))
-        .unwrap_or_default();
-    let msg = format!(
-        "⚠  context overflow likely ({token_str}{safe_str})\n⟳  trimming context and retrying (attempt {attempt}/2)…"
-    );
+    let msg = overflow_notice_text(reason, model, attempt);
     if color {
         execute!(
             io::stdout(),
@@ -434,22 +485,39 @@ pub(crate) fn print_retry_indicator(
 fn tool_call_lines(name: &str, detail: &str, cols: usize) -> Vec<String> {
     // #1153: WORD-WRAP the full detail across as many lines as it needs — the
     // operator must be able to audit exactly what command/path ran, so the
-    // command is never truncated with `…`. Continuation lines are indented to
-    // align under the detail. Keep the "⚙  {name}: " prefix whole (it's short).
+    // command is never truncated with `…`. Keep the "⚙  {name}: " prefix whole
+    // (it's short).
+    //
+    // Two shapes. A detail that fits in a line or two hangs under itself,
+    // aligned past the name. A detail that runs longer than that, or carries
+    // its own line breaks (a question, a multi-line script), is a BLOCK: the
+    // name alone on the first row, the text below it at the glyph margin —
+    // a twenty-column hanging indent on a twelve-row prompt wastes a third
+    // of the terminal and reads as a column, not a paragraph.
     let prefix_w = 3 + name.chars().count() + 2; // "⚙  " + name + ": "
-    let detail_w = cols.saturating_sub(prefix_w).max(8);
-    let wrapped = wrap_to_width(detail, detail_w);
-    let indent = " ".repeat(prefix_w);
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(i, line)| {
-            if i == 0 {
-                format!("⚙  {name}: {line}")
-            } else {
-                format!("{indent}{line}")
-            }
-        })
+    let hanging_w = cols.saturating_sub(prefix_w).max(8);
+    let hanging = wrap_to_width(detail, hanging_w);
+    if hanging.len() <= 2 && !detail.contains('\n') {
+        let indent = " ".repeat(prefix_w);
+        return hanging
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    format!("⚙  {name}: {line}")
+                } else {
+                    format!("{indent}{line}")
+                }
+            })
+            .collect();
+    }
+    let block_w = cols.saturating_sub(3).max(8);
+    std::iter::once(format!("⚙  {name}:"))
+        .chain(
+            wrap_to_width(detail, block_w)
+                .into_iter()
+                .map(|line| format!("   {line}")),
+        )
         .collect()
 }
 
@@ -672,6 +740,123 @@ pub(super) fn turn_heartbeat_line(
 ) -> String {
     let mins = elapsed.as_secs() / 60;
     format!("still working — {mins}m elapsed, round {round} of {limit}")
+}
+
+/// The readable prose a model sends WITH a tool batch, as rows. Pure, no
+/// ANSI, no I/O.
+///
+/// Every provider loop replays that prose into history and shows none of it:
+/// a model that says "extracting the denial helpers next" before its
+/// `write_file` is silent on the operator's screen, while the same sentence
+/// with NO call behind it is nudged as a stall. This keeps what is readable
+/// and drops what is not:
+///
+/// - inline `<think>` blocks (a no-op on the chat wires, which filter before
+///   this runs; the Anthropic wire carries text blocks only);
+/// - a tool call the recovery pass lifted out of content — a fenced block, a
+///   bare JSON object or array, a `<function=…>` / `<tool>…</tool>` tag form —
+///   from where it starts (even mid-line) to the end of its paragraph, so the
+///   arguments are not printed a second time under the `⚙` line that already
+///   shows them;
+/// - Markdown heading lines and leading list markers (structure, not prose).
+///
+/// One row per paragraph or list item, whitespace collapsed; nothing is cut
+/// short here. The caller bounds the rows the way a tool result is bounded
+/// (the first `[tui] spill_lines` rows commit, the rest fold behind the spill
+/// marker), so a long explanation is kept whole and raised with `/spill open`.
+pub(super) fn tool_round_prose(content: &str) -> Vec<String> {
+    let (clean, _) = crate::reasoning::ThinkFilter::filter_complete(content, false);
+    // A unit is one paragraph or one list item.
+    let mut units: Vec<String> = Vec::new();
+    let mut paragraph = String::new();
+    let mut in_fence = false;
+    let mut skip_paragraph = false;
+    for raw in clean.lines() {
+        let line = raw.trim();
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if line.is_empty() {
+            skip_paragraph = false;
+            if !paragraph.is_empty() {
+                units.push(std::mem::take(&mut paragraph));
+            }
+            continue;
+        }
+        if skip_paragraph || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with(['{', '[', '<']) {
+            skip_paragraph = true;
+            continue;
+        }
+        let (text, is_item) = strip_list_marker(line);
+        // A call glued to the prose on one line ("Reading it now: {…}",
+        // "Opening it <function=…>") is cut where the call starts; the rest
+        // of the paragraph is the call's.
+        let (text, glued_call) = cut_at_call_start(text);
+        if glued_call {
+            skip_paragraph = true;
+        }
+        if text.is_empty() {
+            continue;
+        }
+        if is_item {
+            if !paragraph.is_empty() {
+                units.push(std::mem::take(&mut paragraph));
+            }
+            units.push(text.to_string());
+        } else {
+            if !paragraph.is_empty() {
+                paragraph.push(' ');
+            }
+            paragraph.push_str(text);
+        }
+    }
+    if !paragraph.is_empty() {
+        units.push(paragraph);
+    }
+    units
+        .into_iter()
+        .map(|unit| unit.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
+/// Prose up to the first fenced-block, JSON or tag opener on the line, and
+/// whether one was found.
+fn cut_at_call_start(text: &str) -> (&str, bool) {
+    let cut = ["```", "{", "<"]
+        .iter()
+        .filter_map(|needle| text.find(needle))
+        .min();
+    match cut {
+        Some(i) => (text[..i].trim_end(), true),
+        None => (text, false),
+    }
+}
+
+/// `- item`, `* item`, `3. item`, `3) item` → (`item`, true); anything else is
+/// returned as-is with `false`.
+fn strip_list_marker(line: &str) -> (&str, bool) {
+    if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        return (rest.trim_start(), true);
+    }
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let after = &line[digits..];
+        if let Some(rest) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
+            return (rest.trim_start(), true);
+        }
+    }
+    (line, false)
 }
 
 /// Seconds between committed time markers; 0 = off.

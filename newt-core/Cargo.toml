@@ -289,3 +289,8 @@ proptest = "1"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "shell_discovery"
+path = "tests/shell_discovery.rs"
+harness = false

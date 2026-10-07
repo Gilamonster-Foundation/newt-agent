@@ -1350,6 +1350,10 @@ struct PlanModeState {
     /// taking it. Separate from `active` so the clamp itself is untouched
     /// until approval — the whole point of the request/approve split.
     exit_requested: std::sync::atomic::AtomicBool,
+    /// Plan-before-act: the current turn is the implementing turn an
+    /// approval seeded, so the executor must not ask about that plan again.
+    /// Set at prompt comprehension from the input's origin, every turn.
+    implementing_approved: std::sync::atomic::AtomicBool,
 }
 
 impl PlanModeState {
@@ -1357,10 +1361,17 @@ impl PlanModeState {
         self.active.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    fn set_implementing_approved(&self, seeded_by_approval: bool) {
+        self.implementing_approved
+            .store(seeded_by_approval, std::sync::atomic::Ordering::Release);
+    }
+
     fn clear(&self) {
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
         self.exit_requested
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.implementing_approved
             .store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -1389,6 +1400,11 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
 
     fn exit_requested(&self) -> bool {
         self.exit_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn implementing_approved_plan(&self) -> bool {
+        self.implementing_approved
             .load(std::sync::atomic::Ordering::Acquire)
     }
 }
@@ -5797,6 +5813,17 @@ fn synthetic_altitude_persona(altitude: newt_core::Altitude) -> Persona {
     }
 }
 
+/// `[tui] narration_intent_line`: the sentence appended when the knob is on.
+/// It asks for prose PLUS the call in one reply — prose alone is what the
+/// narrate-then-stop rescue nudges — and avoids mechanism words a weak model
+/// would echo back.
+const NARRATION_INTENT_LINE: &str = "**Say what you are doing.** Before each tool call, state in \
+     one short sentence what you are about to do and why; then make the call in the same reply.";
+
+pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
+    enabled.then_some(NARRATION_INTENT_LINE)
+}
+
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: Option<&str>,
@@ -5836,6 +5863,11 @@ fn build_system_prompt_with_persona(
         );
     }
 
+    // Resolved once and shared with the skills index below; the ratchet in
+    // newt-core/tests/resolve_publishes_ratchet.rs pins the publishing resolve
+    // count per file.
+    let cfg = crate::migration_notices::read(|report| newt_core::Config::resolve(report));
+
     // Per-session plan instruction (issue #220). Injected here, with the
     // resolved per-session path, rather than baked into DEFAULT_SOUL — so the
     // path is dynamic AND custom soul.md users still get the guidance. The path
@@ -5850,15 +5882,24 @@ fn build_system_prompt_with_persona(
          re-reading the whole codebase.\n"
     ));
 
+    // `[tui] narration_intent_line` (opt-in): appended here like the plan
+    // sentence, so every identity gets it and no soul text carries it.
+    let intent = cfg
+        .as_ref()
+        .ok()
+        .and_then(|c| c.tui.as_ref())
+        .is_some_and(|t| t.narration_intent_line);
+    if let Some(line) = narration_intent_line(intent) {
+        ctx.push_str(&format!("\n{line}\n"));
+    }
+
     // Progressive disclosure: inject ONLY the skills index (one
     // `name: description (when to use: …)` line per installed skill) — never
     // the bodies. Bodies load on demand when the model calls the `use_skill`
     // tool. Skills come from the one resolver `use_skill` also reads (#2331):
     // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
     // missing dir contributes nothing.
-    let skills_dirs = crate::migration_notices::read(|report| newt_core::Config::resolve(report))
-        .map(|c| c.skill_search_dirs())
-        .unwrap_or_default();
+    let skills_dirs = cfg.map(|c| c.skill_search_dirs()).unwrap_or_default();
     if let Some(index) = skills_index_for_prompt(&skills_dirs) {
         ctx.push('\n');
         ctx.push_str(&index);

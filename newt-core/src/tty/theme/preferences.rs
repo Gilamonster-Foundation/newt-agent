@@ -53,6 +53,7 @@ pub fn builtins() -> Vec<Theme> {
                 (Role::Spill, Color::DarkGrey),
                 (Role::SelectedValue, Color::DarkBlue),
                 (Role::ModalTitle, Color::DarkBlue),
+                (Role::Narration, Color::DarkMagenta),
             ],
         ),
         Theme::builtin().overlaid(
@@ -62,6 +63,7 @@ pub fn builtins() -> Vec<Theme> {
                 (Role::HumanText, Color::Cyan),
                 (Role::Text, Color::Green),
                 (Role::Accent, Color::Green),
+                (Role::Narration, Color::DarkGreen),
             ],
         ),
     ]

@@ -8,6 +8,37 @@ fn tool_call_lines_wrap_without_losing_the_command() {
     );
 }
 
+/// A long or multi-line detail is a block under the name, at the glyph
+/// margin, rather than a hanging column; nothing is dropped either way.
+#[test]
+fn tool_call_lines_render_long_details_as_a_block() {
+    let question = "The largest file is mod.rs (11,726 lines). It already declares many \
+                    submodules.\n\nHow would you like to split it? My recommendation: pure \
+                    code-motion first, then narrow the seam.";
+    let lines = tool_call_lines("request_user_input", question, 60);
+    assert_eq!(lines[0], "⚙  request_user_input:");
+    assert!(lines.len() > 3, "{lines:?}");
+    assert!(
+        lines[1..].iter().all(|l| l.starts_with("   ")),
+        "every detail row sits at the glyph margin: {lines:?}"
+    );
+    assert!(lines.iter().all(|l| l.chars().count() <= 60), "{lines:?}");
+    let rejoined: String = lines[1..]
+        .iter()
+        .map(|l| l.trim_start_matches("   "))
+        .collect::<Vec<_>>()
+        .join("");
+    assert_eq!(
+        rejoined.replace('\n', ""),
+        question.replace('\n', ""),
+        "the whole question survives"
+    );
+    // Two hanging rows is still the compact shape.
+    let two = tool_call_lines("grep", &"x ".repeat(40), 60);
+    assert!(two[0].starts_with("⚙  grep: "), "{two:?}");
+    assert_eq!(two.len(), 2, "{two:?}");
+}
+
 #[test]
 fn wrap_to_width_never_drops_and_hard_splits_long_tokens() {
     // #1153: the full command must survive — reassembling the wrap yields

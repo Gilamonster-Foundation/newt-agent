@@ -472,6 +472,17 @@ fn config_helpers_read_from_passed_config_not_disk() {
 }
 
 #[test]
+fn narration_intent_line_is_absent_by_default_and_present_when_enabled() {
+    // `[tui] narration_intent_line` is opt-in: off appends nothing.
+    assert_eq!(narration_intent_line(false), None);
+    let line = narration_intent_line(true).expect("enabled appends the sentence");
+    assert!(line.contains("Before each tool call"));
+    // Prose without a tool call is what the narration rescue nudges, so the
+    // sentence asks for prose PLUS the call, never prose alone.
+    assert!(line.contains("in the same reply"));
+}
+
+#[test]
 fn tool_round_limit_commands_parse_expected_forms() {
     assert_eq!(
         parse_tool_round_limit_command("/rounds").unwrap(),
