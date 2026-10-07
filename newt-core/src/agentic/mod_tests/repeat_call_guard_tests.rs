@@ -516,6 +516,48 @@ fn does_not_steer_successful_write_capable_run_command() {
     );
 }
 
+/// A skill body is held once it is read: the exact repeat of a `use_skill`
+/// load is steered instead of re-serving 100-200 lines, while a different
+/// skill still loads.
+#[test]
+fn a_repeated_skill_load_is_steered_not_reloaded() {
+    let args = serde_json::json!({"name": "repository-roadmap"});
+    let body = "# Repository Roadmap\n\nRead ROADMAP.md first.";
+    assert!(matches!(
+        RepeatCallGuard::classify_repeat_memo("use_skill", &args, true, body, None),
+        Some(RepeatMemo::EvidenceObserved { .. })
+    ));
+    let (_dir, workspace, caveats) = read_memo_fixture("src/lib.rs", "x");
+    let mut g = RepeatCallGuard::default();
+    assert!(
+        g.repeat_steer("use_skill", &args).is_none(),
+        "the first load runs"
+    );
+    g.record(
+        "use_skill",
+        &args,
+        true,
+        body,
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    let steer = g
+        .repeat_steer("use_skill", &args)
+        .expect("the exact repeat is steered");
+    assert!(
+        steer.contains("already observed skill `repository-roadmap`"),
+        "{steer}"
+    );
+    assert!(
+        g.repeat_steer("use_skill", &serde_json::json!({"name": "green-the-board"}))
+            .is_none(),
+        "a different skill still loads"
+    );
+}
+
 #[test]
 fn classifier_leaves_ordinary_successes_repeatable() {
     // #2637: a bare read (no offset/limit) is ALSO an ordinary, non-refusing

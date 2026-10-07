@@ -123,10 +123,20 @@ turn (Explain, Research) may plan its reading, and approval there would seed
 an implementing turn the operator never asked for.
 
 A Plan-disposition turn (operator `/mode plan`, or intake inferring Plan)
-is not armed by the executor; it reaches the same hook through
-`plan_approval_due`, which now also fires when the ledger gained a
-multi-step plan during the turn, not only when a `render_report` draft was
-presented.
+is not armed by the executor. Instead `pending_plan_approval_handoff`, which
+every loop already calls after each recorded batch, requests exit on the
+model's behalf once the turn has recorded a multi-step plan (fresh against
+the ledger as the turn began) and a round adds no evidence: the question
+comes after one idle round, not after the no-progress brake. The hook's
+`plan_approval_due` also fires when the ledger gained a multi-step plan
+during the turn, not only when a `render_report` draft was presented.
+
+Measured on 2026-10-07 before that rule: under the Plan disposition a 35B
+model recorded its plan, then re-loaded the same two skills round after
+round (41 `use_skill` calls of 72 in the turn) until the twelve-round
+no-progress brake stopped it; the approval question then followed anyway.
+The repeat guard now steers an exact repeat of a skill load instead of
+re-serving its body.
 
 ## Opt-in: ask the model for one sentence of intent
 

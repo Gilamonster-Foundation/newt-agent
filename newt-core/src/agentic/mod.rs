@@ -2172,6 +2172,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    // Plan-before-act: the ledger as this turn began (see `PlanRoundFacts`).
+    let plan_at_turn_start = step_ledger
+        .map(|ledger| ledger.snapshot())
+        .unwrap_or_default();
     let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
@@ -4209,6 +4213,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
+            PlanRoundFacts {
+                disposition: prompt_disposition,
+                step_ledger,
+                plan_at_turn_start: &plan_at_turn_start,
+                progressed: round_modified_workspace || round_progress,
+            },
             smart_harness,
             cancel,
             &mut end_reason,
@@ -4543,6 +4553,24 @@ impl RepeatCallGuard {
                 subject: format!("read-only shell probe `{command}`"),
                 advice: "use the observed output above, change the query, inspect a different \
                          file, or make the next edit/test decision.",
+            });
+        }
+        if name == "use_skill" && !result.trim().is_empty() {
+            // A skill body is procedural knowledge the model holds once it
+            // has read it. A weak model re-loads the same skill round after
+            // round (41 of 72 calls in one measured Plan turn, 2026-10-07),
+            // and every load is 100-200 lines of context that proves nothing
+            // new. The exact repeat is steered; a different skill still loads.
+            let skill = args
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            return Some(RepeatMemo::EvidenceObserved {
+                subject: format!("skill `{skill}`"),
+                advice: "its body is already in your context above — follow it instead of \
+                         loading it again. If your plan is recorded, stop here so the \
+                         operator can approve it.",
             });
         }
         if let Some(path) = Self::bare_read_file_path(name, args) {
@@ -5682,12 +5710,45 @@ fn readonly_completion_handoff(
 /// An explicit exit request is a handoff, not another planning round. Observe
 /// it only after the whole batch has been recorded; later calls in that batch
 /// still see the Plan clamp. The caller alone consumes and approves the request.
+/// What the approval handoff knows about the round that just ended: the
+/// Plan-disposition half of plan-before-act reads these to decide that the
+/// operator's answer is the next useful event.
+struct PlanRoundFacts<'a> {
+    disposition: PromptDisposition,
+    step_ledger: Option<&'a dyn StepLedger>,
+    /// The ledger as the turn began, so only a plan recorded THIS turn can
+    /// end it — a plan carried over from an earlier turn asks nothing.
+    plan_at_turn_start: &'a scheduled::PlanSnapshot,
+    /// The round added evidence or changed the workspace.
+    progressed: bool,
+}
+
 fn pending_plan_approval_handoff(
     control: Option<&dyn PlanModeControl>,
+    round: PlanRoundFacts<'_>,
     harness: Option<&smart_harness::SmartHarness>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     end_reason: &mut Option<&mut Option<crate::TurnEndReason>>,
 ) -> anyhow::Result<Option<String>> {
+    // Plan-before-act, the Plan-disposition half. A turn that may not act,
+    // whose multi-step plan was recorded this turn, and whose latest round
+    // added nothing, has reached the operator's decision: request exit on
+    // the model's behalf — the same request `exit_plan_mode` records — so
+    // the question comes after one idle round. Measured without this on
+    // 2026-10-07: a 35B model re-loaded the same two skills for twelve idle
+    // rounds until the no-progress brake stopped it, then was asked anyway.
+    if let Some(control) = control {
+        let plan_recorded = round.step_ledger.is_some_and(|ledger| {
+            scheduled::fresh_multi_step_plan(round.plan_at_turn_start, &ledger.snapshot())
+        });
+        if !control.exit_requested()
+            && round.disposition == PromptDisposition::Plan
+            && !round.progressed
+            && plan_recorded
+        {
+            let _ = control.request_exit();
+        }
+    }
     if !control.is_some_and(PlanModeControl::exit_requested) {
         return Ok(None);
     }
@@ -7107,6 +7168,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    // Plan-before-act: the ledger as this turn began (see `PlanRoundFacts`).
+    let plan_at_turn_start = step_ledger
+        .map(|ledger| ledger.snapshot())
+        .unwrap_or_default();
     let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
@@ -9148,6 +9213,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         }
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
+            PlanRoundFacts {
+                disposition: prompt_disposition,
+                step_ledger,
+                plan_at_turn_start: &plan_at_turn_start,
+                progressed: round_modified_workspace || round_progress,
+            },
             smart_harness,
             cancel,
             &mut end_reason,
@@ -9890,6 +9961,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    // Plan-before-act: the ledger as this turn began (see `PlanRoundFacts`).
+    let plan_at_turn_start = step_ledger
+        .map(|ledger| ledger.snapshot())
+        .unwrap_or_default();
     let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
@@ -11674,6 +11749,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
+            PlanRoundFacts {
+                disposition: prompt_disposition,
+                step_ledger,
+                plan_at_turn_start: &plan_at_turn_start,
+                progressed: round_modified_workspace || round_progress,
+            },
             smart_harness,
             cancel,
             &mut end_reason,
@@ -12344,6 +12425,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    // Plan-before-act: the ledger as this turn began (see `PlanRoundFacts`).
+    let plan_at_turn_start = step_ledger
+        .map(|ledger| ledger.snapshot())
+        .unwrap_or_default();
     let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
@@ -13415,6 +13500,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
+            PlanRoundFacts {
+                disposition: prompt_disposition,
+                step_ledger,
+                plan_at_turn_start: &plan_at_turn_start,
+                progressed: round_modified_workspace || round_progress,
+            },
             smart_harness,
             cancel,
             &mut end_reason,

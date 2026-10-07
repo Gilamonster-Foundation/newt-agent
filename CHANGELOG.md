@@ -26,6 +26,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   `do it`, `proceed`) approves. Approval seeds the implementing turn with
   the ledger plan when no draft was presented. Each plan asks once; the
   next task's plan asks again.
+- A Plan turn whose multi-step plan was recorded this turn now hands off to
+  the operator after one idle round instead of after the no-progress brake;
+  and an exact repeat of a `use_skill` load is steered ("already in your
+  context above") instead of re-serving the body — a 35B model re-loaded the
+  same two skills 41 times in one measured turn.
 - A long or multi-line tool-call detail (a `request_user_input` question, a
   script) now renders as a block under the tool name at the glyph margin
   instead of a hanging column, and a free-text question's modal says
