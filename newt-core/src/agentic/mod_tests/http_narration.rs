@@ -519,7 +519,11 @@ fn readonly_completion_handoff_preserves_the_disclosure_boundary() {
         &crate::Scope::All,
         &capability_check::Evidence::default(),
         Some(&filter),
-        None,
+        &claim_check::TurnClaims::capture(
+            workspace.path().to_str().unwrap(),
+            &crate::Scope::All,
+            None,
+        ),
         &self_verify::VerificationLedger::default(),
     );
     assert!(reply.contains("Let me check the current implementation"));

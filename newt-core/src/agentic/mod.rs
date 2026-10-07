@@ -2177,7 +2177,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // claim in the final report can be checked against whether HEAD actually
     // moved. `None` (off-repo, or the read scope refuses the probe) must
     // never manufacture a false refutation — see `claim_check::TurnGitEvidence`.
-    let head_before = claim_check::git_head(workspace, &caveats.fs_read);
+    let turn_claims =
+        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -3255,7 +3256,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 harness.outcome(reason, &text)?;
@@ -3303,7 +3304,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -3806,7 +3807,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             return Ok((probe_content, false, accumulated_usage, hallucination_count));
@@ -4254,7 +4255,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             &caveats.fs_read,
             &capability_evidence,
             disclosure,
-            head_before.as_deref(),
+            &turn_claims,
             &verification,
         );
         harness.outcome(cap_reason, &text)?;
@@ -4295,7 +4296,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         &caveats.fs_read,
         &capability_evidence,
         disclosure,
-        head_before.as_deref(),
+        &turn_claims,
         &verification,
     );
     if let Some(slot) = &mut end_reason {
@@ -5652,7 +5653,7 @@ fn readonly_completion_handoff(
     read_scope: &crate::Scope<String>,
     capability_evidence: &capability_check::Evidence,
     disclosure: Option<&crate::ocap::DisclosureFilter>,
-    head_before: Option<&str>,
+    turn_claims: &claim_check::TurnClaims<'_>,
     verification: &self_verify::VerificationLedger,
 ) -> String {
     if let Some(slot) = end_reason {
@@ -5671,7 +5672,7 @@ fn readonly_completion_handoff(
         read_scope,
         capability_evidence,
         disclosure,
-        head_before,
+        turn_claims,
         verification,
     )
 }
@@ -6343,19 +6344,15 @@ fn finalize_final_text(
     disclosure: Option<&crate::ocap::DisclosureFilter>,
     // #2683: HEAD captured before this turn's tool calls ran, so a
     // "committed" claim can be checked against whether HEAD actually moved.
-    head_before: Option<&str>,
+    turn_claims: &claim_check::TurnClaims<'_>,
     verification: &self_verify::VerificationLedger,
 ) -> String {
     let text = capability_check::annotate_unobserved_probe(text, capability_evidence);
-    let text = claim_check::annotate_in_context(
+    let text = turn_claims.annotate(
         text,
         workspace,
         verification.claim_directories(),
         read_scope,
-    );
-    let text = claim_check::annotate_action_claims(
-        text,
-        claim_check::collect_git_evidence(workspace, read_scope, head_before).as_ref(),
     );
     let text = verification.annotate_cargo_claim(text);
     let text = verification.annotate_pr_claim(text);
@@ -7111,7 +7108,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // claim in the final report can be checked against whether HEAD actually
     // moved. `None` (off-repo, or the read scope refuses the probe) must
     // never manufacture a false refutation — see `claim_check::TurnGitEvidence`.
-    let head_before = claim_check::git_head(workspace, &caveats.fs_read);
+    let turn_claims =
+        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -8320,7 +8318,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 harness.outcome(reason, &text)?;
@@ -8364,7 +8362,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -8681,7 +8679,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             return Ok((out, false, accumulated_usage, hallucination_count));
@@ -9194,7 +9192,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             &caveats.fs_read,
             &capability_evidence,
             disclosure,
-            head_before.as_deref(),
+            &turn_claims,
             &verification,
         );
         harness.outcome(cap_reason, &text)?;
@@ -9253,7 +9251,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         &caveats.fs_read,
         &capability_evidence,
         disclosure,
-        head_before.as_deref(),
+        &turn_claims,
         &verification,
     );
     if let Some(slot) = &mut end_reason {
@@ -9893,7 +9891,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // claim in the final report can be checked against whether HEAD actually
     // moved. `None` (off-repo, or the read scope refuses the probe) must
     // never manufacture a false refutation — see `claim_check::TurnGitEvidence`.
-    let head_before = claim_check::git_head(workspace, &caveats.fs_read);
+    let turn_claims =
+        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -10655,7 +10654,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             // Finalization can append evidence warnings or redact content;
@@ -10905,7 +10904,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 harness.outcome(reason, &text)?;
@@ -10948,7 +10947,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -11233,7 +11232,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             let streamed = streamed && out == oa_content;
@@ -11719,7 +11718,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             &caveats.fs_read,
             &capability_evidence,
             disclosure,
-            head_before.as_deref(),
+            &turn_claims,
             &verification,
         );
         harness.outcome(cap_reason, &text)?;
@@ -11770,7 +11769,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         &caveats.fs_read,
         &capability_evidence,
         disclosure,
-        head_before.as_deref(),
+        &turn_claims,
         &verification,
     );
     if let Some(slot) = &mut end_reason {
@@ -12346,7 +12345,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // claim in the final report can be checked against whether HEAD actually
     // moved. `None` (off-repo, or the read scope refuses the probe) must
     // never manufacture a false refutation — see `claim_check::TurnGitEvidence`.
-    let head_before = claim_check::git_head(workspace, &caveats.fs_read);
+    let turn_claims =
+        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -12800,7 +12800,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -12906,7 +12906,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 harness.outcome(reason, &text)?;
@@ -12938,7 +12938,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &caveats.fs_read,
                     &capability_evidence,
                     disclosure,
-                    head_before.as_deref(),
+                    &turn_claims,
                     &verification,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -12983,7 +12983,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             return Ok((text, false, accumulated_usage, hallucination_count));
@@ -13450,7 +13450,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             &caveats.fs_read,
             &capability_evidence,
             disclosure,
-            head_before.as_deref(),
+            &turn_claims,
             &verification,
         );
         harness.outcome(cap_reason, &text)?;
@@ -13559,7 +13559,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             if let Some(slot) = &mut end_reason {
@@ -13613,7 +13613,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             if let Some(slot) = &mut end_reason {
@@ -13645,7 +13645,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             if let Some(slot) = &mut end_reason {
@@ -13669,7 +13669,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &caveats.fs_read,
                 &capability_evidence,
                 disclosure,
-                head_before.as_deref(),
+                &turn_claims,
                 &verification,
             );
             if let Some(slot) = &mut end_reason {
@@ -13691,7 +13691,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &caveats.fs_read,
         &capability_evidence,
         disclosure,
-        head_before.as_deref(),
+        &turn_claims,
         &verification,
     );
     if let Some(slot) = &mut end_reason {

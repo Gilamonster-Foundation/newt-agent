@@ -528,3 +528,6 @@ mod capability_grounding;
 
 #[path = "http_ollama_initiative.rs"]
 mod ollama_initiative;
+
+#[path = "claimcheck_task_root.rs"]
+mod claimcheck_task_root_tests;
