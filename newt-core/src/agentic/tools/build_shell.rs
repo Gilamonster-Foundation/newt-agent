@@ -19,6 +19,27 @@ pub(super) fn build_program(source: &str) -> Option<String> {
     })
 }
 
+/// Select the specialized build fence independently of build-time budgeting.
+pub(super) fn confined_build_program(source: &str, ocap_disabled: bool) -> Option<String> {
+    // The ordinary shell path owns host execution and explicit exec floors.
+    // Do not create a confined build request or scratch lease before it runs.
+    (!ocap_disabled).then(|| build_program(source)).flatten()
+}
+
+/// Preserve ordinary shell source instead of translating builds to build_exec.
+pub(super) fn route_for_ocap(
+    decision: crate::agentic::routing::RouteDecision,
+    ocap_disabled: bool,
+) -> crate::agentic::routing::RouteDecision {
+    use crate::agentic::routing::RouteDecision;
+    match decision {
+        RouteDecision::Route {
+            tool: "build_exec", ..
+        } if ocap_disabled => RouteDecision::Exec,
+        decision => decision,
+    }
+}
+
 /// Time budgets distinguish actual build work from version/help probes.
 pub(super) fn has_build_work(source: &str) -> bool {
     find_build_program(source, crate::agentic::routing::is_build_work).is_some()
@@ -235,5 +256,103 @@ mod tests {
         ] {
             assert!(build_program(source).is_none(), "{source}");
         }
+    }
+    /// #2784: classified builds must reach the ordinary host route when OCAP
+    /// is disabled, on Windows as well as Unix; confined builds retain their fence.
+    #[test]
+    fn disabled_ocap_builds_reach_the_portable_host_route() {
+        use super::super::shell::{select_shell_route, ShellRoute};
+        for source in [
+            "cargo check",
+            "cargo check --quiet 2>&1",
+            "cargo check 2>&1 | head",
+            "cd task && cargo check",
+            "printf before; cargo check",
+        ] {
+            assert!(
+                super::has_build_work(source),
+                "budget classification: {source}"
+            );
+            assert!(
+                super::confined_build_program(source, false).is_some(),
+                "confined: {source}"
+            );
+            assert!(
+                super::confined_build_program(source, true).is_none(),
+                "host: {source}"
+            );
+            for windows in [false, true] {
+                assert_eq!(
+                    select_shell_route(
+                        true,
+                        false,
+                        false,
+                        true,
+                        windows,
+                        crate::ShellEngine::SafeSubset
+                    ),
+                    if windows {
+                        ShellRoute::Cmd
+                    } else {
+                        ShellRoute::BashSh
+                    }
+                );
+                assert!(
+                    matches!(
+                        select_shell_route(
+                            true,
+                            false,
+                            false,
+                            false,
+                            windows,
+                            crate::ShellEngine::SafeSubset
+                        ),
+                        ShellRoute::Bridled(_)
+                    ),
+                    "an explicit exec floor still wins"
+                );
+            }
+        }
+    }
+    /// #2784: the earlier argv build route must not bypass the host decision.
+    #[test]
+    fn disabled_ocap_builds_keep_original_source_at_l2() {
+        use crate::agentic::routing::{RouteDecision, RouteTable};
+        for source in [
+            "cargo check",
+            "cargo check 2>&1 | tail -5",
+            "timeout 10 cargo check",
+        ] {
+            let decision = RouteTable::builtin().classify(
+                source,
+                std::path::Path::new("."),
+                &crate::Scope::All,
+            );
+            assert!(
+                matches!(
+                    decision,
+                    RouteDecision::Route {
+                        tool: "build_exec",
+                        ..
+                    }
+                ),
+                "{source}: {decision:?}"
+            );
+            assert_eq!(super::route_for_ocap(decision.clone(), false), decision);
+            assert_eq!(
+                super::route_for_ocap(decision, true),
+                RouteDecision::Exec,
+                "{source}"
+            );
+        }
+        let read = RouteDecision::Route {
+            tool: "read_file",
+            args: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        assert_eq!(
+            super::route_for_ocap(read.clone(), true),
+            read,
+            "read routing stays governed"
+        );
     }
 }

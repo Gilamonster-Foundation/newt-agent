@@ -3834,6 +3834,7 @@ async fn execute_authorized_tool(
                 std::path::Path::new(workspace),
                 &caveats.fs_read,
             );
+            let decision = build_shell::route_for_ocap(decision, ocap_disabled());
             let decision = match decision {
                 super::routing::RouteDecision::Route { tool: "find", .. }
                     if smart_harness.is_some() =>
@@ -4457,7 +4458,7 @@ async fn execute_authorized_tool(
                     return executed(result);
                 }
             }
-            if let Some(program) = build_shell::build_program(cmd) {
+            if let Some(program) = build_shell::confined_build_program(cmd, ocap_disabled()) {
                 // #2636 (round1 finding 3): a build denial is NEVER eligible
                 // for #2628 replay. `build_shell::execute` enforces the
                 // calibrated build fence and explicitly forbids re-running

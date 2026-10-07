@@ -201,8 +201,9 @@ async fn shell_task_cwd_2780_lifecycle_default() {
     assert!(out.contains("no command configured"), "{out}");
 }
 
-/// #2780: direct and shell-routed builds use the task directory in both modes,
-/// but still require build approval. A recording denial prevents any child run.
+/// #2780/#2784: builds use the task directory in both modes. Confined/direct
+/// builds require build approval; an explicit exec floor keeps even an
+/// OCAP-disabled shell from running. A recording denial prevents any child run.
 #[tokio::test]
 async fn shell_task_cwd_2780_build_routes_keep_authority() {
     #[derive(Default)]
@@ -266,6 +267,7 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
         ] {
             let mut gate = Gate::default();
             let execution = std::sync::OnceLock::new();
+            let directory = std::sync::OnceLock::new();
             let result = execute(
                 &mut Notices::default(),
                 name,
@@ -277,6 +279,8 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
                 &mut crate::agentic::NoMcp,
                 ToolCollaborators {
                     worktree_session: Some(&session),
+                    command_directory: Some(&directory),
+                    exec_floor: Some(&caveats.exec),
                     permission_gate: Some(&mut gate),
                     execution: Some(&execution),
                     ..Default::default()
@@ -292,11 +296,21 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
             );
             assert_eq!(gate.0.len(), 1, "{bypass} {name}: {result}");
             let (requested, target) = &gate.0[0];
-            assert_eq!(
-                Path::new(target),
-                policy.worktree,
-                "{bypass} {name}: {result}"
-            );
+            if bypass == "1" && name == "run_command" {
+                // Ordinary shell admission asks for exec, not a build fence.
+                assert_eq!(target, "cargo", "{result}");
+                assert_eq!(
+                    directory.get().and_then(|cwd| cwd.canonicalize().ok()),
+                    Some(policy.worktree.clone()),
+                    "host-mode commands retain the bound task cwd"
+                );
+            } else {
+                assert_eq!(
+                    Path::new(target),
+                    policy.worktree,
+                    "{bypass} {name}: {result}"
+                );
+            }
             assert!(!crate::permits_path(
                 &requested.fs_write,
                 original.to_str().unwrap()
