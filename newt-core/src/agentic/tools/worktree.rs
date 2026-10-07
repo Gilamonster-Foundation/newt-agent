@@ -769,6 +769,7 @@ pub(super) async fn execute(
         if let Some(notice) = before.record(
             session,
             Path::new(workspace),
+            &normalized,
             execution.and_then(|slot| slot.get()),
         ) {
             presentation.preview(&notice, 0);

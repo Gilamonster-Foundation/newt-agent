@@ -55,21 +55,40 @@ async fn worktree_detect_2791_compound_routes_tools() {
             "fixture",
         ],
     ] {
-        let out = std::process::Command::new("git")
-            .current_dir(&root)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        real_git(&root, &args);
     }
+    // #2792: an unrelated invocation cannot claim an externally created tree,
+    // whether the session is empty or already has an advisory task binding.
+    for (name, prior) in [
+        ("external-empty", None),
+        ("external-bound", Some("external-empty")),
+    ] {
+        let session = WorktreeSession::default();
+        if let Some(prior) = prior {
+            session.record_task_worktree(&temp.path().join(prior), prior);
+        }
+        let previous = session.task_root(&root);
+        let before = detect::Snapshot::before(&root, &crate::Scope::All).unwrap();
+        real_git(&root, &["status", "--short"]);
+        real_git(
+            &root,
+            &["worktree", "add", "-b", name, &format!("../{name}")],
+        );
+        let notice = before.record(
+            &session,
+            &root,
+            &serde_json::json!({"command":"git status --short"}),
+            Some(&crate::ExecOutcome::Passed),
+        );
+        assert_eq!(
+            session.task_root(&root),
+            previous,
+            "unrelated status captured another process's checkout"
+        );
+        let notice = notice.expect("unmatched candidate must be advisory");
+        assert!(notice.contains(name), "{notice}");
+    }
+
     let session = WorktreeSession::default();
     let outcome = std::sync::OnceLock::new();
     let text = execute(
@@ -193,7 +212,12 @@ fn worktree_detect_2791_zero_or_multiple_preserve_state() {
     let session = WorktreeSession::default();
     let before = detect::Snapshot::before(&root, &crate::Scope::All).unwrap();
     assert!(before
-        .record(&session, &root, Some(&crate::ExecOutcome::Passed))
+        .record(
+            &session,
+            &root,
+            &serde_json::json!({"command":"git worktree add -b task ../task"}),
+            Some(&crate::ExecOutcome::Passed)
+        )
         .is_none());
     assert!(session.task_hint().is_none());
     let old = add_metadata(temp.path(), "old");
@@ -202,7 +226,12 @@ fn worktree_detect_2791_zero_or_multiple_preserve_state() {
     add_metadata(temp.path(), "one");
     add_metadata(temp.path(), "two");
     let notice = before
-        .record(&session, &root, Some(&crate::ExecOutcome::Passed))
+        .record(
+            &session,
+            &root,
+            &serde_json::json!({"command":"git worktree add -b task ../task"}),
+            Some(&crate::ExecOutcome::Passed),
+        )
         .unwrap();
     assert!(notice.contains("Multiple new worktrees"));
     assert_eq!(session.task_root(&root), Some(old));
@@ -218,14 +247,24 @@ fn worktree_detect_2791_linked_origin_and_once_only() {
     let task = add_metadata(temp.path(), "task");
     let session = WorktreeSession::default();
     let text = before
-        .record(&session, &original, Some(&crate::ExecOutcome::Passed))
+        .record(
+            &session,
+            &original,
+            &serde_json::json!({"command":"git worktree add -b task ../task"}),
+            Some(&crate::ExecOutcome::Passed),
+        )
         .unwrap();
     assert!(text.contains("branch task"));
     assert_eq!(session.task_root(&original), Some(task));
     assert!(session.snapshot().is_none());
     let before = detect::Snapshot::before(&original, &crate::Scope::All).unwrap();
     assert!(before
-        .record(&session, &original, Some(&crate::ExecOutcome::Passed))
+        .record(
+            &session,
+            &original,
+            &serde_json::json!({"command":"git worktree add -b task ../task"}),
+            Some(&crate::ExecOutcome::Passed)
+        )
         .is_none());
 }
 
@@ -261,7 +300,17 @@ fn worktree_detect_2791_rejects_unproven_candidates() {
             "unobserved" => None,
             _ => Some(&crate::ExecOutcome::Passed),
         };
-        assert!(before.record(&session, &root, outcome).is_none(), "{case}");
+        assert!(
+            before
+                .record(
+                    &session,
+                    &root,
+                    &serde_json::json!({"command":"git worktree add -b task ../task"}),
+                    outcome
+                )
+                .is_none(),
+            "{case}"
+        );
         assert_eq!(session.task_root(&root), Some(old), "{case}");
     }
 }
@@ -278,7 +327,12 @@ fn worktree_detect_2791_preserves_adoption_and_unknown_snapshot() {
     let before = detect::Snapshot::before(&root, &crate::Scope::All).unwrap();
     add_metadata(temp.path(), "later");
     assert!(before
-        .record(&session, &root, Some(&crate::ExecOutcome::Passed))
+        .record(
+            &session,
+            &root,
+            &serde_json::json!({"command":"git worktree add -b task ../task"}),
+            Some(&crate::ExecOutcome::Passed)
+        )
         .is_none());
     assert_eq!(session.task_root(&root), Some(policy.worktree));
     assert!(session.snapshot().is_some());
@@ -287,4 +341,95 @@ fn worktree_detect_2791_preserves_adoption_and_unknown_snapshot() {
     let root = temp.path().join("main");
     std::fs::write(root.join(".git/worktrees"), "not a directory").unwrap();
     assert!(detect::Snapshot::before(&root, &crate::Scope::All).is_none());
+}
+
+fn real_git(root: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// #2792: only a destination operand from an inspected creation stage can
+/// attribute a candidate. Resolve cwd/-C before comparing canonical paths;
+/// quoted lookalikes, branch/start-point operands and expansions cannot bind.
+#[test]
+fn worktree_detect_2792_destination_provenance() {
+    for (command, cwd, matches) in [
+        (
+            "git worktree add -b task ../task 2>&1 | cat && echo done",
+            None,
+            true,
+        ),
+        (
+            "echo ready; git worktree add ../task task; git status",
+            None,
+            true,
+        ),
+        ("git worktree add -B task -- ../task", None, true),
+        ("git -C sub -C .. worktree add ../task", None, true),
+        (
+            "cd sub && git worktree add ../../task && echo done",
+            None,
+            true,
+        ),
+        ("git worktree add ../../task", Some("sub"), true),
+        ("git worktree add ../task", Some("sub"), false),
+        ("git status", None, false),
+        ("echo 'git worktree add ../task'", None, false),
+        ("echo git worktree add ../task", None, false),
+        (
+            "git worktree add -b task ../different && echo ../task",
+            None,
+            false,
+        ),
+        ("git worktree add -b ../task ../different", None, false),
+        ("git worktree add ../different ../task", None, false),
+        ("git worktree add \"$DEST\"", None, false),
+        (
+            "echo before && cd sub && git worktree add ../task",
+            None,
+            false,
+        ),
+        ("sh -c 'git worktree add ../task'", None, false),
+        ("git worktree add --unknown ../task", None, false),
+    ] {
+        let temp = metadata_repo();
+        let root = temp.path().join("main");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let before = detect::Snapshot::before(&root, &crate::Scope::All).unwrap();
+        let task = add_metadata(temp.path(), "task");
+        let session = WorktreeSession::default();
+        let mut args = serde_json::json!({"command":command});
+        if let Some(cwd) = cwd {
+            args["cwd"] = cwd.into();
+        }
+        let notice = before
+            .record(&session, &root, &args, Some(&crate::ExecOutcome::Passed))
+            .unwrap();
+        assert_eq!(
+            session.task_root(&root).is_some(),
+            matches,
+            "{command}: {notice}"
+        );
+        assert!(
+            notice.contains(&crate::worktree_adoption::task_path_literal(&task)),
+            "{notice}"
+        );
+        assert_eq!(
+            notice.contains("routing is unchanged"),
+            !matches,
+            "{notice}"
+        );
+    }
 }
