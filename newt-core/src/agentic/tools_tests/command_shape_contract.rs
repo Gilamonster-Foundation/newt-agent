@@ -159,14 +159,24 @@ async fn check(row: Row) {
     let gh = bin.join(if cfg!(windows) { "gh.exe" } else { "gh" });
     let executable = std::env::current_exe().unwrap();
     if std::fs::hard_link(&executable, &gh).is_err() {
-        std::fs::copy(executable, gh).unwrap();
+        std::fs::copy(&executable, &gh).unwrap();
     }
-    let mut paths = vec![bin];
+    let mut paths = vec![bin.clone()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     let paths = std::env::join_paths(paths).unwrap();
     let _paths = EnvVar::set("NEWT_EXEC_PATHS", paths.to_str().unwrap());
+    let _ambient_path = EnvVar::set("PATH", paths.to_str().unwrap());
+    #[cfg(windows)]
+    let _pathext = EnvVar::set("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+    // #2811: Windows ambient execution consumes PATH, not NEWT_EXEC_PATHS.
+    // Assert before any PR command so a broken fixture never reaches a forge.
+    assert_eq!(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).next(),
+        Some(bin.clone()),
+        "the inert gh fixture must win ambient PATH lookup"
+    );
     let _bypass = EnvVar::set(
         "NEWT_DISABLE_OCAP",
         if row.mode == Mode::Plain { "1" } else { "0" },
@@ -196,6 +206,37 @@ async fn check(row: Row) {
         &Scope::All,
         Some(&session),
     );
+    if row.mode == Mode::Plain && row.command.starts_with("gh pr ") {
+        // A harmless probe must identify libtest before any publication-shaped
+        // command runs. Even a broken lookup can only reach host gh --help.
+        let route = shell::select_shell_route(
+            true,
+            false,
+            false,
+            true,
+            cfg!(windows),
+            crate::config::windows_cmd_enabled(),
+            crate::ambient_brush::installed(),
+            crate::ShellEngine::Brush,
+        );
+        let probe = shell::host_shell_dispatch(
+            route,
+            "gh --help",
+            task.to_str().unwrap(),
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            probe["exit_code"] == 0
+                && probe["stdout"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("--test-threads")),
+            "plain gh must resolve to the inert libtest child before PR execution"
+        );
+    }
     let (name, args) = if row.command == "read_file marker" {
         ("read_file", serde_json::json!({"path":"marker"}))
     } else {
@@ -286,6 +327,21 @@ async fn check(row: Row) {
             crate::agentic::claim_check::git_head(task.to_str().unwrap(), &Scope::All).unwrap();
         let remote = temp.path().join("remote.git/refs/heads/task");
         assert_eq!(std::fs::read_to_string(remote).unwrap().trim(), expected);
+    }
+    if row.command == "which gh" {
+        // Both plain and confined discovery must name this fixture, not host gh.
+        let normalize = |s: &str| {
+            let path = s.replace("\\\\", "\\").replace('\\', "/");
+            if cfg!(windows) {
+                path.to_ascii_lowercase()
+            } else {
+                path
+            }
+        };
+        assert!(
+            normalize(&out).contains(&normalize(&gh.to_string_lossy())),
+            "gh discovery must identify the inert fixture: {out}"
+        );
     }
     if row.claim.is_empty() {
         assert!(out.contains(row.contains), "{}: {out}", row.command);
