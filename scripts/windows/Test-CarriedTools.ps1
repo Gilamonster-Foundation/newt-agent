@@ -1,8 +1,19 @@
 # Native grounding of crates/newt-carried-tools/src/tests.rs and the staged layout.
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$ToolsDirectory)
+param(
+    [Parameter(Mandatory)][string]$ToolsDirectory,
+    [switch]$RequireRunnerTemp
+)
 $ErrorActionPreference = 'Stop'
 $tools = (Resolve-Path -LiteralPath $ToolsDirectory).Path
+# Regression for restored target/carried-package/tools: CI staging must not be cached.
+if ($RequireRunnerTemp) {
+    if (!$env:RUNNER_TEMP) { throw 'RUNNER_TEMP is required for uncached CI staging.' }
+    $tempRoot = (Resolve-Path -LiteralPath $env:RUNNER_TEMP).Path.TrimEnd('\') + '\'
+    if (!$tools.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'CI carried tools must be staged under RUNNER_TEMP, outside cached target/.'
+    }
+}
 $fixture = Join-Path (Split-Path $tools) ('test space-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $fixture | Out-Null
 $utf8 = New-Object System.Text.UTF8Encoding($false)
