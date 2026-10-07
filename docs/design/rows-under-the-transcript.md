@@ -35,7 +35,11 @@ reply cannot be stolen (#1950: this thread already owns stdin through a
 prompt window, or the turn watcher's read token is held for the query), then
 applies `place_below_cursor`, a pure rule:
 
-- the frame opens on the cursor's row;
+- with the cursor at column zero, the frame opens on that row; otherwise
+  it opens on the next row, leaving the partial transcript line intact;
+- an occupied cursor row reserves one screen row outside the frame, so an
+  oversized request is clamped to the remaining rows (a one-row screen
+  cannot grant such a placed lease);
 - if it would run off the bottom, the transcript scrolls up by the deficit
   (newlines from the bottom row, the cockpit presenter's byte plan), unless
   somebody holds rows, since the scroll would move theirs too;
@@ -47,7 +51,11 @@ applies `place_below_cursor`, a pure rule:
 The rows are handed out blank (per-row `Clear(CurrentLine)`, never `ESC[J`,
 which runs to the end of the screen through the holder below) with the
 cursor parked on the first of them, and the lease records where the cursor
-goes back to.
+goes back to, with its column preserved and its row adjusted for scrolling.
+For an uncontested partial line, output after closing appends to that line.
+A contested `Shift` still may paint over transcript rows above a bottom holder;
+returning the cursor does not restore that overwritten text. This change does
+not claim transcript preservation for that inherited placement path.
 
 **One release.** `RegionLease::drop` for a lease minted this way erases
 exactly its rows and ends with `MoveTo(return_to)`. A lease from
@@ -88,7 +96,9 @@ granted_height`, red with the rule deleted, green with it kept).
   of the bottom rows, near the bottom (scrolling), and shifted above a
   holder; each asserts the committed line's row and the cursor's. A fifth
   keeps the terminal silent and asserts the frame still opens, answers, and
-  hands the terminal back.
+  hands the terminal back. The partial-line regression writes a sentinel with
+  no trailing newline and checks the replayed screen while the frame is open
+  and after it closes, both with and without scrolling.
 
 ## Next
 
