@@ -162,7 +162,11 @@ fn creation_admission(
         return Err(());
     }
     let candidate = creation(name, args, workspace, caveats).ok_or(())?;
-    let source = git_identity::pin(args["command"].as_str().ok_or(())?, &trusted_git(caveats)?)?;
+    let source = git_identity::pin(
+        args["command"].as_str().ok_or(())?,
+        &trusted_git(caveats)?,
+        caveats,
+    )?;
     Ok(Some((candidate, source)))
 }
 
@@ -287,10 +291,11 @@ fn creation_batch_is_read_only_after_add(
                     )
                 }
             }
-            // Only literal bare builtins have a known implementation here.
-            // Exec authority (even for a basename like tail) does not certify
-            // read-only behavior. External displays run separately, AFTER
-            // adoption; refusing them also closes PATH substitution (#2733).
+            // #2810: bounded stdin-only tail is read-only, but its basename
+            // is not identity. pin() authenticates and pins its executable
+            // before the batch may run with creation authority.
+            Some("tail") => super::super::routing::parse_trim_spec(&words.join(" ")).is_some(),
+            // Only actual shell builtins have an intrinsic implementation.
             Some(program) => display_builtin(program, engine),
             None => false,
         }

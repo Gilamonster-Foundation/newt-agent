@@ -95,3 +95,73 @@ async fn worktree_adoption_round6_untrusted_host_git_refuses_dispatch() {
         "unchanged"
     );
 }
+
+/// #2810: a literal bounded stdin display can accompany creation; operands,
+/// dynamic evaluation, writes and follow mode cannot certify a read-only batch.
+#[test]
+fn worktree_2810_tail_shape_is_bounded_and_literal() {
+    for tail in ["tail -5", "tail -n 5"] {
+        assert!(
+            creation_batch_is_read_only_after_add(
+                &serde_json::json!({"command":format!("git worktree add -b task ../task 2>&1 | {tail} && git status --short")}),
+                crate::ShellEngine::Brush,
+            ),
+            "{tail}"
+        );
+    }
+    for tail in [
+        "tail -f",
+        "tail -5 victim",
+        "tail -n +5",
+        "tail -0",
+        "tail -$N",
+        "tail -5 > victim",
+        "./tail -5",
+        "tail $(echo -5)",
+        "tail -5 && git clean -fd",
+        "tail -5 && git worktree add -b other ../other",
+    ] {
+        assert!(
+            !creation_batch_is_read_only_after_add(
+                &serde_json::json!({"command":format!("git worktree add -b task ../task 2>&1 | {tail}")}),
+                crate::ShellEngine::Brush,
+            ),
+            "{tail}"
+        );
+    }
+}
+
+/// #2810: the real resolver must reject a writable PATH replacement, even
+/// when its literal argv would be a valid display. No creation may start.
+#[cfg(unix)]
+#[test]
+fn worktree_2810_writable_tail_is_not_a_display_identity() {
+    use crate::agentic::tools::disable_ocap_tests::EnvVar;
+    use std::os::unix::fs::PermissionsExt;
+    let _env = crate::process_env::lock();
+    let (temp, _, _) = crate::worktree_adoption::tests::fixture(false);
+    let root = temp.path().join("main");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let tail = bin.join("tail");
+    std::fs::write(&tail, "must never execute").unwrap();
+    std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _venv = EnvVar::unset("NEWT_VENV");
+    let _virtual_env = EnvVar::unset("VIRTUAL_ENV");
+    let _paths = EnvVar::set("NEWT_EXEC_PATHS", bin.to_str().unwrap());
+    let caveats = Caveats {
+        fs_write: crate::Scope::only([temp.path().to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let admission = creation_admission(
+        false,
+        "run_command",
+        &serde_json::json!({"command":"git worktree add -b task ../fresh 2>&1 | tail -5 && git status --short"}),
+        root.to_str().unwrap(),
+        &caveats,
+        crate::ShellEngine::Brush,
+        |_| Ok(PathBuf::from("/fixture/git")),
+    );
+    assert!(admission.is_err());
+    assert!(!temp.path().join("fresh").exists());
+}

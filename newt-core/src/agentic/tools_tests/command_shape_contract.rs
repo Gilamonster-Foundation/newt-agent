@@ -6,8 +6,7 @@
 //! uses a local bare remote or an inert child, never credentials or a forge.
 //! Existing detailed regressions retain responsibility for broker internals.
 //! Linux/Windows ordinary CI runs these; there is no ordinary macOS core test
-//! job yet. A narrowly matched `should_panic` marks the measured main defect;
-//! it executes normally and an unexpected pass fails the suite. Confined
+//! job yet. Confined
 //! discovery on Windows needs the AppContainer feature.
 use super::*;
 use crate::caveats::Caveats;
@@ -267,6 +266,10 @@ async fn check(row: Row) {
         "{}: {out}",
         row.command
     );
+    // #2810: recording a task path alone is not confined adoption.
+    if row.mode == Mode::Confined && row.setup == Setup::Fresh && row.bound {
+        assert!(session.snapshot().is_some(), "{}: {out}", row.command);
+    }
     if let Some(kind) = row.gate {
         assert!(
             gate.0.iter().any(|r| r.kind == kind),
@@ -369,9 +372,8 @@ commit_claim, Plain, Bound, "git status --short", Some(Passed), Task, true, fals
 true_push_claim, Plain, Publish, "git push origin task", Some(Passed), Task, true, false, "Pushed: origin/task is live.", None, "Pushed: origin/task is live.";
 true_commit_claim, Plain, Bound, "git -c commit.gpgsign=false commit --allow-empty -m contract", Some(Passed), Task, true, false, "HEAD moved", None, "I committed the change locally.";
 #[cfg(unix)]
-// #2801 known-main failure: literal read-only output wrapper is refused.
-#[should_panic(expected = "git worktree add -b task ../task 2>&1 | tail -5 && git status --short: capability denied: cannot verify this worktree creation and its surrounding commands")]
-confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Passed), Original, true, false, "", None, "";
+// #2810: verified read-only output wrappers retain confined adoption.
+confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Passed), Original, true, false, "?? marker", None, "";
 #[cfg(unix)]
 confined_missing_b, Confined, Fresh, "git worktree add ../task absent", Some(Failed), Original, false, false, "-b", None, "";
 nested_plain, Plain, Fresh, "git worktree add -b task .worktrees/task", Some(Passed), Original, true, false, "", None, "";
