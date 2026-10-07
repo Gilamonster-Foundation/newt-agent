@@ -11,18 +11,25 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Added — the operator sees what the model is doing, and approves its first plan
 
-- The prose a model sends together with a tool call is now shown as one dim
-  `·` row above that batch's `⚙` headers, on every wire and on the piped
-  path; it used to be replayed into history and shown to nobody. A tick of an
+- The prose a model sends together with a tool call is now shown as one `▹`
+  row above that batch's `⚙` headers, in a new themeable `narration` role
+  (magenta by default), on every wire and on the piped path; it used to be replayed into history and shown to nobody. A tick of an
   existing plan shows as `step 3 of 7: …` instead of the whole `<plan>` block.
 - Plan-before-act: under initiative `patient` or `measured` (the default),
   the first multi-step `update_plan` of an acting turn enters the Plan phase
   on the model's behalf and ends the turn at `Approve this plan? [y/N/discuss]`;
   later calls in that batch are clamped. `decisive` and `eager` set the plan
-  silently; `/mode full-auto` approves without asking. Approval seeds the
-  implementing turn with the ledger plan when no draft was presented, and a
-  bare continuation typed at the question (`go`, `do it`, `proceed`) is a
-  yes. Each plan asks once; the next task's plan asks again.
+  silently; `/mode full-auto` approves without asking. The question is the
+  same selection form a permission prompt uses (no / yes / discuss, `n` the
+  default), and `discuss` opens one free-text follow-up fed back to the
+  model; on a text-only surface `y`, `yes`, or a bare continuation (`go`,
+  `do it`, `proceed`) approves. Approval seeds the implementing turn with
+  the ledger plan when no draft was presented. Each plan asks once; the
+  next task's plan asks again.
+- A long or multi-line tool-call detail (a `request_user_input` question, a
+  script) now renders as a block under the tool name at the glyph margin
+  instead of a hanging column, and a free-text question's modal says
+  "question — type your answer" with no selection hints.
 - A prompt whose asks open collaboratively ("let's …", "we should …") is
   classified Plan before the action needles; bare continuations ("let's go")
   and direct verbs ("let's commit this", "let's run the tests") still act.

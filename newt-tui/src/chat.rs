@@ -449,7 +449,17 @@ fn run_plan_approval(
         HumanQuestionOutcome::Answer("y".to_string())
     } else {
         match gate {
-            Some(gate) => gate.ask_question(question),
+            // A decision is a selection, not a text box: the same form a
+            // permission prompt uses, with `discuss` opening the one
+            // free-text follow-up whose words go back to the model.
+            Some(gate) => {
+                match gate.ask_choice(question, newt_core::agentic::PLAN_APPROVAL_CHOICES) {
+                    HumanQuestionOutcome::Answer(answer) if answer == "discuss" => {
+                        gate.ask_question("What should change? ")
+                    }
+                    other => other,
+                }
+            }
             None => HumanQuestionOutcome::Unavailable,
         }
     };
@@ -487,18 +497,18 @@ fn run_plan_approval(
             };
             effects.notice = match (entry, seeded) {
                 (_, true) if auto_approve => {
-                    "▸  plan auto-approved under /mode full-auto — implementing."
+                    "plan auto-approved under /mode full-auto — implementing."
                 }
                 (PlanEntry::OperatorSelected, true) => {
-                    "▸  plan approved — switched to /mode dev; implementing."
+                    "plan approved — switched to /mode dev; implementing."
                 }
-                (_, true) => "▸  plan approved — implementing.",
+                (_, true) => "plan approved — implementing.",
                 (PlanEntry::OperatorSelected, false) => {
-                    "▸  plan approved — switched to /mode dev. Send a message to begin \
+                    "plan approved — switched to /mode dev. Send a message to begin \
                      implementation."
                 }
                 (_, false) => {
-                    "▸  plan approved — clamp lifted. Send a message to begin implementation."
+                    "plan approved — clamp lifted. Send a message to begin implementation."
                 }
             }
             .to_string();
@@ -510,7 +520,7 @@ fn run_plan_approval(
             // question) runs as the next turn's input — queued the same way a
             // harness retry is, but tagged OperatorContinuation since it is
             // honestly operator-authored.
-            effects.notice = format!("▸  staying in plan mode — you said: {feedback}");
+            effects.notice = format!("staying in plan mode — you said: {feedback}");
             if let Some(parent) = parent {
                 effects.queued = Some(PendingPlanTurn {
                     text: feedback,
@@ -520,7 +530,7 @@ fn run_plan_approval(
             }
         }
         PlanVerdict::StayClamped { feedback: None } => {
-            effects.notice = "▸  plan not approved — staying in plan mode.".to_string();
+            effects.notice = "plan not approved — staying in plan mode.".to_string();
         }
     }
     effects

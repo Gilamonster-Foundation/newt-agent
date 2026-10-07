@@ -301,12 +301,13 @@ pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use observation::{ShellObservation, SHELL_OBSERVATION_PREFIX};
 pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeControl};
 pub use permissions::{
-    append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
-    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
-    BOUND_REASON_PREFIX,
+    append_denial, load_denials, widen_caveats, ChoiceSpec, DenialKind, HumanQuestionOutcome,
+    PermissionAction, PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest,
+    PersistentDenial, BOUND_REASON_PREFIX,
 };
 pub use plan_mode::{
     plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,
+    PLAN_APPROVAL_CHOICES,
 };
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
@@ -13802,8 +13803,10 @@ fn emit_notice_line(level: crate::tty::Level, glyph: &str, text: &str, color: bo
 }
 
 /// The one row for the prose a model sent WITH this tool batch — what every
-/// loop used to replay into history and show to nobody. Dim and `·`-glyphed:
-/// secondary detail under the `⚙` lines that follow, never the `▸` of a reply.
+/// loop used to replay into history and show to nobody. `▹`-glyphed, the
+/// hollow sibling of the `▸` reply marker, in the theme's `narration` colour:
+/// the model's interim voice above the `⚙` lines that follow, told apart from
+/// its reply, its reasoning, and the operator's own text.
 /// Skipped when the wire already streamed the text live (Anthropic) and when
 /// nothing readable remains once the call text itself is dropped.
 fn commit_tool_round_narration(content: &str, already_printed: bool, color: bool) {
@@ -13812,7 +13815,7 @@ fn commit_tool_round_narration(content: &str, already_printed: bool, color: bool
     }
     let cols = display::reply_cols(crate::tty::term_cols());
     if let Some(line) = display::tool_round_narration(content, cols) {
-        emit_notice_line(crate::tty::Level::Dim, "·", &line, color);
+        emit_notice_line(crate::tty::Level::Narration, "▹", &line, color);
     }
 }
 

@@ -53,7 +53,7 @@
 //! |---|---|---|
 //! | `print_newt` / `newt_line` narration | `agentic::display` | [`Durable::Note`] `{ Level::Info, "▸" }` |
 //! | `print_harness_notice` (the amber "newt:" register) | `agentic::display` | [`Durable::Note`] `{ Level::Warn, "⚠" }` |
-//! | `commit_tool_round_narration` (the model's prose beside a tool batch) | `agentic` | [`Durable::Note`] `{ Level::Dim, "·" }` |
+//! | `commit_tool_round_narration` (the model's prose beside a tool batch) | `agentic` | [`Durable::Note`] `{ Level::Narration, "▹" }` |
 //! | `step_change_line` shown for a ticked plan | `agentic::scheduled` via `ToolPresentation::override_result` | [`Durable::Note`] `{ Level::Dim, "→" }` |
 //! | [`Notice`] emitted directly | `tty::widgets::notice` | [`Durable::Note`] with that same [`Level`] + glyph |
 //! | `Spinner` frames + stage labels | `tty::spinner` | [`Frame`] |

@@ -51,9 +51,12 @@ the shared `…` treatment.
 the same point in all four loops (inside the accepted-batch branch, after
 whole-batch validation and before the first side effect; a rejected batch
 prints its rejection rows and no narration), through `emit_notice_line`: the writer the reasoning fold
-already used, widened to take a level and a glyph. The row is `Level::Dim`
-with the `·` glyph, two-space gap, so it reads as secondary detail under the
-`⚙` headers that follow and never as a `▸` reply. The Anthropic streamed arm
+already used, widened to take a level and a glyph. The row is
+`Level::Narration` with the `▹` glyph, two-space gap: the hollow sibling of
+the `▸` reply marker, in the theme's `narration` role (magenta in the built-in
+theme, retunable like every role, e.g. `NEWT_THEME=narration=140`), so the
+model's interim voice is told apart from its reply, its reasoning and the
+operator's own text at a glance. The Anthropic streamed arm
 skips it, since that wire already printed the text live.
 
 Reach is identical to the `⚙` header: stdout, erased ephemerals first, no
@@ -91,7 +94,7 @@ Everything after that is the existing handoff:
 | later calls in the same batch are clamped | dispatcher promotion to `Plan` when `is_plan_mode()` |
 | the turn ends after the batch | `pending_plan_approval_handoff` → `TurnEndReason::AwaitingOperator` |
 | the operator sees the plan | the turn-end hook prints the ledger block when no draft was presented |
-| the question | `run_plan_approval` → `Approve this plan? [y/N/discuss]`; `y`, `yes`, or a bare continuation (`go`, `do it`, `proceed`) approves |
+| the question | `run_plan_approval` → `PermissionGate::ask_choice` with `PLAN_APPROVAL_CHOICES` (no / yes / discuss, `no` default), the same selection form a permission prompt uses; `discuss` opens one free-text follow-up; a text-only gate falls back to `ask_question`, where `y`, `yes`, or a bare continuation (`go`, `do it`, `proceed`) approves |
 | approval | `set_plan_mode(false)` (the `ModelDuringAct` row: restores what the turn already held), the seed names the ledger plan when no draft exists |
 | denial or discussion | the clamp stays, exactly as for a model that called `enter_plan_mode` |
 

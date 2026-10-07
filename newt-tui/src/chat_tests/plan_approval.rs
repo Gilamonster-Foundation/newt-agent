@@ -353,6 +353,45 @@ impl PermissionGate for ScriptedGate {
             .pop()
             .expect("a scripted outcome per question")
     }
+    fn ask_choice(
+        &mut self,
+        question: &str,
+        options: &[newt_core::agentic::ChoiceSpec],
+    ) -> HumanQuestionOutcome {
+        assert_eq!(
+            options.iter().map(|o| o.id).collect::<Vec<_>>(),
+            vec!["no", "yes", "discuss"],
+            "the plan question offers exactly its three answers, no first"
+        );
+        self.ask_question(question)
+    }
+}
+
+/// `discuss` is a selection that opens one free-text follow-up; the words
+/// typed there are the feedback the model receives, under the clamp.
+#[test]
+fn discuss_opens_one_follow_up_and_feeds_its_text_back() {
+    let states = ConversationModeStates::default();
+    let a = objective("A");
+    presented_plan(&states, &a, "# plan A");
+    let mut gate = ScriptedGate::new([answer("discuss"), answer("split transport first")]);
+    let effects = approve(&mut gate, &states, PlanEntry::ModelDuringAct, Some(&a));
+    assert_eq!(gate.asked.len(), 2, "{:?}", gate.asked);
+    assert!(
+        gate.asked[1].starts_with("What should change"),
+        "{:?}",
+        gate.asked
+    );
+    assert!(states.plan.is_plan_mode(), "the clamp stays");
+    let (input, origin) = effects.queued.expect("the feedback runs next").into_input();
+    let ReadOutcome::Line(text) = input else {
+        panic!("a line of input")
+    };
+    assert_eq!(text, "split transport first");
+    assert!(matches!(
+        origin,
+        ModelInputOrigin::OperatorContinuation { .. }
+    ));
 }
 
 fn answer(text: &str) -> HumanQuestionOutcome {

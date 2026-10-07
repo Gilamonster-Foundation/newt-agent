@@ -159,6 +159,31 @@ pub enum PlanVerdict {
 /// accepted decision's `discuss` and `edit` responses both land here today,
 /// since the alt-screen editor `edit` would open is out of this design's
 /// scope — is kept verbatim as feedback rather than being parsed further.
+/// The three answers a plan question offers, in presentation order; `no` is
+/// the default a blank submission resolves to (fail-closed, like the terminal
+/// prompt's `[y/N/discuss]`). `discuss` opens a free-text follow-up whose text
+/// is fed back to the model.
+pub const PLAN_APPROVAL_CHOICES: &[super::permissions::ChoiceSpec] = &[
+    super::permissions::ChoiceSpec {
+        id: "no",
+        label: "no — stay in plan mode",
+        key: "n",
+        role: newt_interaction::SemanticRole::Deny,
+    },
+    super::permissions::ChoiceSpec {
+        id: "yes",
+        label: "yes — implement this plan",
+        key: "y",
+        role: newt_interaction::SemanticRole::Allow,
+    },
+    super::permissions::ChoiceSpec {
+        id: "discuss",
+        label: "discuss — tell the model what to change",
+        key: "d",
+        role: newt_interaction::SemanticRole::Value,
+    },
+];
+
 #[must_use]
 pub fn plan_verdict(
     _entry: PlanEntry,

@@ -434,22 +434,39 @@ pub(crate) fn print_retry_indicator(
 fn tool_call_lines(name: &str, detail: &str, cols: usize) -> Vec<String> {
     // #1153: WORD-WRAP the full detail across as many lines as it needs — the
     // operator must be able to audit exactly what command/path ran, so the
-    // command is never truncated with `…`. Continuation lines are indented to
-    // align under the detail. Keep the "⚙  {name}: " prefix whole (it's short).
+    // command is never truncated with `…`. Keep the "⚙  {name}: " prefix whole
+    // (it's short).
+    //
+    // Two shapes. A detail that fits in a line or two hangs under itself,
+    // aligned past the name. A detail that runs longer than that, or carries
+    // its own line breaks (a question, a multi-line script), is a BLOCK: the
+    // name alone on the first row, the text below it at the glyph margin —
+    // a twenty-column hanging indent on a twelve-row prompt wastes a third
+    // of the terminal and reads as a column, not a paragraph.
     let prefix_w = 3 + name.chars().count() + 2; // "⚙  " + name + ": "
-    let detail_w = cols.saturating_sub(prefix_w).max(8);
-    let wrapped = wrap_to_width(detail, detail_w);
-    let indent = " ".repeat(prefix_w);
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(i, line)| {
-            if i == 0 {
-                format!("⚙  {name}: {line}")
-            } else {
-                format!("{indent}{line}")
-            }
-        })
+    let hanging_w = cols.saturating_sub(prefix_w).max(8);
+    let hanging = wrap_to_width(detail, hanging_w);
+    if hanging.len() <= 2 && !detail.contains('\n') {
+        let indent = " ".repeat(prefix_w);
+        return hanging
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    format!("⚙  {name}: {line}")
+                } else {
+                    format!("{indent}{line}")
+                }
+            })
+            .collect();
+    }
+    let block_w = cols.saturating_sub(3).max(8);
+    std::iter::once(format!("⚙  {name}:"))
+        .chain(
+            wrap_to_width(detail, block_w)
+                .into_iter()
+                .map(|line| format!("   {line}")),
+        )
         .collect()
 }
 
