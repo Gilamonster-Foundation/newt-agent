@@ -460,6 +460,208 @@ async fn explain_discovery_finds_mcp_but_dispatch_requires_permission() {
     assert!(!asked.contains("review__fetch_change"), "{asked}");
 }
 
+/// A session Plan-mode control that also answers `exit_requested`, so a
+/// test can see a pending approval without consuming it.
+#[derive(Default)]
+struct ApprovalControl(
+    std::sync::atomic::AtomicBool,
+    std::sync::atomic::AtomicBool,
+    std::sync::atomic::AtomicBool,
+);
+
+impl crate::agentic::PlanModeControl for ApprovalControl {
+    fn is_plan_mode(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_plan_mode(&self, active: bool) -> Result<(), String> {
+        self.0.store(active, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn request_exit(&self) -> Result<(), String> {
+        self.1.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn exit_requested(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn take_exit_requested(&self) -> bool {
+        self.1.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn implementing_approved_plan(&self) -> bool {
+        self.2.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+fn two_step_plan() -> serde_json::Value {
+    serde_json::json!({ "plan": [
+        { "step": "inspect", "status": "in_progress" },
+        { "step": "repair", "status": "pending" }
+    ] })
+}
+
+/// Plan-before-act: the first multi-step plan an acting turn sets, under an
+/// initiative level that looks before it acts, enters the Plan phase on the
+/// model's behalf and requests the operator's approval — then a tick of the
+/// same plan asks nothing more.
+#[tokio::test]
+async fn a_fresh_multi_step_plan_under_a_looking_initiative_requests_approval() {
+    use crate::agentic::PlanModeControl as _;
+    let _initiative =
+        crate::initiative::scoped_effective_initiative(crate::initiative::Initiative::Measured);
+    let ws = tempfile::TempDir::new().unwrap();
+    let ledger = crate::agentic::scheduled::SessionStepLedger::default();
+    let control = ApprovalControl::default();
+
+    let out = run_scheduled_tool("update_plan", &two_step_plan(), &ws, &ledger, &control).await;
+    assert!(out.starts_with("<plan>\n"), "{out}");
+    assert!(out.contains("awaiting operator approval"), "{out}");
+    assert!(
+        control.is_plan_mode(),
+        "the clamp is on for the rest of the batch"
+    );
+    assert!(
+        control.exit_requested(),
+        "the turn-end hook is owed a question"
+    );
+
+    // A write later in the same batch is clamped, not run.
+    let write = run_scheduled_tool(
+        "write_file",
+        &serde_json::json!({ "path": "early.txt", "content": "no" }),
+        &ws,
+        &ledger,
+        &control,
+    )
+    .await;
+    assert!(
+        write.contains("is not available for this request"),
+        "{write}"
+    );
+    assert!(!ws.path().join("early.txt").exists());
+
+    // The hook consumed the request; a tick of the same plan is silent.
+    assert!(control.take_exit_requested());
+    let tick = run_scheduled_tool(
+        "update_plan",
+        &serde_json::json!({ "plan": [
+            { "step": "inspect", "status": "completed" },
+            { "step": "repair", "status": "in_progress" }
+        ] }),
+        &ws,
+        &ledger,
+        &control,
+    )
+    .await;
+    assert!(!tick.contains("awaiting operator approval"), "{tick}");
+    assert!(!control.exit_requested());
+}
+
+/// The levels chosen for models that must be pushed to act are not held at a
+/// question: decisive and eager set the plan and keep going.
+#[tokio::test]
+async fn an_acting_initiative_sets_the_plan_silently() {
+    use crate::agentic::PlanModeControl as _;
+    let _initiative =
+        crate::initiative::scoped_effective_initiative(crate::initiative::Initiative::Eager);
+    let ws = tempfile::TempDir::new().unwrap();
+    let ledger = crate::agentic::scheduled::SessionStepLedger::default();
+    let control = ApprovalControl::default();
+
+    let out = run_scheduled_tool("update_plan", &two_step_plan(), &ws, &ledger, &control).await;
+    assert!(out.starts_with("<plan>\n"), "{out}");
+    assert!(!out.contains("awaiting operator approval"), "{out}");
+    assert!(!control.is_plan_mode());
+    assert!(!control.exit_requested());
+}
+
+/// The implementing turn an approval seeded carries the operator's decision:
+/// when the model records the approved plan in the ledger, nothing asks again.
+#[tokio::test]
+async fn an_approved_plans_implementing_turn_is_not_asked_again() {
+    use crate::agentic::PlanModeControl as _;
+    let _initiative =
+        crate::initiative::scoped_effective_initiative(crate::initiative::Initiative::Measured);
+    let ws = tempfile::TempDir::new().unwrap();
+    let ledger = crate::agentic::scheduled::SessionStepLedger::default();
+    let control = ApprovalControl::default();
+    control.2.store(true, std::sync::atomic::Ordering::Release);
+
+    let out = run_scheduled_tool("update_plan", &two_step_plan(), &ws, &ledger, &control).await;
+    assert!(out.starts_with("<plan>\n"), "{out}");
+    assert!(!out.contains("awaiting operator approval"), "{out}");
+    assert!(!control.is_plan_mode());
+    assert!(!control.exit_requested());
+}
+
+/// An evidence turn may plan its reading without being halted at a question
+/// whose "yes" would seed an implementing turn nobody asked for.
+#[tokio::test]
+async fn a_research_turn_sets_its_plan_without_requesting_approval() {
+    use crate::agentic::PlanModeControl as _;
+    let _initiative =
+        crate::initiative::scoped_effective_initiative(crate::initiative::Initiative::Measured);
+    let ws = tempfile::TempDir::new().unwrap();
+    let ledger = crate::agentic::scheduled::SessionStepLedger::default();
+    let control = ApprovalControl::default();
+    let out = run_scheduled_tool_with_disposition(
+        "update_plan",
+        &two_step_plan(),
+        &ws,
+        &ledger,
+        &control,
+        PromptDisposition::Research,
+    )
+    .await;
+    assert!(out.starts_with("<plan>\n"), "{out}");
+    assert!(!out.contains("awaiting operator approval"), "{out}");
+    assert!(!control.is_plan_mode());
+    assert!(!control.exit_requested());
+}
+
+/// A single-step plan is not a plan worth a question, and a turn already in
+/// the Plan phase is headed for the approval hook anyway — neither asks.
+#[tokio::test]
+async fn single_step_and_plan_phase_plans_do_not_request_approval() {
+    use crate::agentic::PlanModeControl as _;
+    let _initiative =
+        crate::initiative::scoped_effective_initiative(crate::initiative::Initiative::Patient);
+    let ws = tempfile::TempDir::new().unwrap();
+
+    let ledger = crate::agentic::scheduled::SessionStepLedger::default();
+    let control = ApprovalControl::default();
+    let one = run_scheduled_tool(
+        "update_plan",
+        &serde_json::json!({ "plan": [{ "step": "inspect", "status": "in_progress" }] }),
+        &ws,
+        &ledger,
+        &control,
+    )
+    .await;
+    assert!(one.starts_with("<plan>\n"), "{one}");
+    assert!(!control.exit_requested());
+
+    let ledger = crate::agentic::scheduled::SessionStepLedger::default();
+    let control = ApprovalControl::default();
+    let planned = run_scheduled_tool_with_disposition(
+        "update_plan",
+        &two_step_plan(),
+        &ws,
+        &ledger,
+        &control,
+        PromptDisposition::Plan,
+    )
+    .await;
+    assert!(planned.starts_with("<plan>\n"), "{planned}");
+    assert!(!planned.contains("awaiting operator approval"), "{planned}");
+    assert!(!control.is_plan_mode());
+    assert!(!control.exit_requested());
+}
+
 /// Plan is a read-only workspace disposition with one explicit
 /// control-plane write: the harness-owned step ledger.
 #[tokio::test]

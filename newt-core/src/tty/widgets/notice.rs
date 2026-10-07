@@ -68,6 +68,10 @@ pub enum Level {
     Dim,
     /// Model reasoning, independently configurable from the final response.
     Thinking,
+    /// The model speaking mid-turn: the sentence beside a tool batch. Its own
+    /// register, so the operator tells intent from the `▸` reply and from
+    /// reasoning at a glance; the colour is the theme's `narration` role.
+    Narration,
     /// Diagnostics behind a debug/trace flag.
     Debug,
 }
@@ -77,6 +81,7 @@ impl Level {
         let color = match self {
             Self::Info => return None,
             Self::Thinking => return Some(theme.style(Role::Thinking)),
+            Self::Narration => return Some(theme.style(Role::Narration)),
             Self::Ok => CtColor::DarkGreen,
             Self::Warn => CtColor::DarkYellow,
             Self::Loud => CtColor::Red,
@@ -281,6 +286,7 @@ mod tests {
             Level::Loud,
             Level::Dim,
             Level::Thinking,
+            Level::Narration,
             Level::Debug,
         ] {
             assert!(!Notice::new(level, "⚠", "text").line().contains('\u{1b}'));

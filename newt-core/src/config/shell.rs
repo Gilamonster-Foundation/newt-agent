@@ -88,9 +88,11 @@ impl std::str::FromStr for ShellEngine {
 /// unset) is deliberately distinct from an explicit choice: an unset engine lets
 /// `[intake]` — operator overrides for prompt-disposition inference (#1260).
 ///
-/// Disposition inference is three needle lists + a trailing-`?` fallback,
-/// held as pure data ([`crate::agentic::DispositionLexicon`]). This table
-/// lets an operator retune it without a code change — the three-Cs shape.
+/// Disposition inference is five lists — three needle lists, the
+/// collaborative openers and the direct verbs that keep an opener an order —
+/// and a trailing-`?` fallback, held as pure data
+/// ([`crate::agentic::DispositionLexicon`]). This table lets an operator
+/// retune it without a code change — the three-Cs shape.
 /// Each present list REPLACES its built-in default wholesale (droppable,
 /// predictable — no merge ambiguity); an absent list keeps the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +110,14 @@ pub struct IntakeConfig {
     /// default list when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<Vec<String>>,
+    /// Openers that read a prompt as **Plan** when every ask starts with one
+    /// (`"let's "`, `"we should "`). Replaces the default list when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaborative: Option<Vec<String>>,
+    /// Verbs that keep a collaborative opener an order (`"commit"`, `"run"`).
+    /// Replaces the default list when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_verbs: Option<Vec<String>>,
     /// Where a prompt matching NO list but ending in `?` lands:
     /// `"explain"` (default), `"research"`, or `"act"` — the #1257 fallback
     /// cliff, made explicit and tunable. Unknown values fall back to explain.
@@ -158,6 +168,12 @@ impl IntakeConfig {
         }
         if let Some(list) = &self.explain {
             lex.explain = list.clone();
+        }
+        if let Some(list) = &self.collaborative {
+            lex.collaborative = list.clone();
+        }
+        if let Some(list) = &self.direct_verbs {
+            lex.direct_verbs = list.clone();
         }
         match self.question_mark_disposition.as_deref() {
             Some("research") => {
@@ -576,6 +592,7 @@ mod shell_engine_tests {
         let cfg: IntakeConfig = toml::from_str(
             r#"
                 explain = ["tell me about"]
+                collaborative = ["let us "]
                 question_mark_disposition = "research"
             "#,
         )
@@ -590,6 +607,11 @@ mod shell_engine_tests {
             lex.explain,
             vec!["tell me about".to_string()],
             "a present list REPLACES its default wholesale"
+        );
+        assert_eq!(
+            lex.collaborative,
+            vec!["let us ".to_string()],
+            "the opener list replaces its default wholesale too"
         );
         assert_eq!(
             lex.action,

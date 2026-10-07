@@ -3491,6 +3491,18 @@ const EXIT_PLAN_MODE_REQUESTED: &str = "exit requested. Awaiting operator approv
      remain clamped to Plan reads and the plan ledger until approved. If asked, continue drafting \
      with update_plan / render_report; do not assume approval.";
 
+/// Plan-before-act: the ack appended to the first multi-step `update_plan` an
+/// acting turn sets under an initiative level that looks before it acts. The
+/// harness has entered the Plan phase on the model's behalf and asked for the
+/// operator's answer, exactly as if the model had called `enter_plan_mode`
+/// then `exit_plan_mode` itself: later calls in this batch are clamped, the
+/// turn ends at the approval question, and approval seeds the implementing
+/// turn with this plan. The model's first instinct (set the plan) is widened
+/// into the collaboration the operator asked for; nothing new to learn.
+const PLAN_APPROVAL_REQUESTED: &str = "plan recorded — awaiting operator approval before \
+     implementation. Tool calls are limited to reads and the plan ledger until approved; do not \
+     assume approval. If asked, refine the plan with update_plan.";
+
 /// The exit-approved guidance. Under an initiative level that [`requires an
 /// edit`](crate::initiative::Initiative::exit_plan_requires_edit) on plan exit
 /// (Decisive / Eager), it appends a MANDATORY-EDIT directive so the model
@@ -4007,9 +4019,47 @@ async fn execute_authorized_tool(
         // `scheduled` feature is on). Replaces plan_set + plan_advance.
         "update_plan" => match step_ledger {
             Some(ledger) => {
+                let before = ledger.snapshot();
                 let mut out =
                     super::scheduled::execute_update_plan(args, ledger, color, tool_output_lines);
                 if tool_result_ok(&out) {
+                    let after = ledger.snapshot();
+                    // Plan-before-act: a fresh multi-step plan in an ACTING
+                    // turn, under a level that looks before it acts, is
+                    // presented for approval before any mutation. Only Act:
+                    // an evidence turn (Explain, Research) may plan its
+                    // reading, and approval would seed an implementing turn
+                    // the operator never asked for. Entering Plan can only
+                    // attenuate a turn already validated for Act
+                    // (plan_mode.rs); the request mints nothing, and the
+                    // turn-end hook's approval restores only what the turn
+                    // already held. A Plan-phase turn is already headed for
+                    // that hook, and the implementing turn an approval seeded
+                    // carries the operator's decision: neither is asked twice.
+                    if super::scheduled::fresh_multi_step_plan(&before, &after)
+                        && disposition == PromptDisposition::Act
+                        && crate::initiative::effective_initiative().asks_before_acting()
+                    {
+                        if let Some(control) = plan_mode_control
+                            .filter(|control| !control.implementing_approved_plan())
+                        {
+                            match control
+                                .set_plan_mode(true)
+                                .and_then(|()| control.request_exit())
+                            {
+                                Ok(()) => {
+                                    out.push_str("\n\n");
+                                    out.push_str(PLAN_APPROVAL_REQUESTED);
+                                }
+                                Err(error) => {
+                                    out.push_str(&format!(
+                                        "\nwarning: plan approval unavailable: {error}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let mut artifact_warning = false;
                     if let (Some(sink), Some(context)) = (artifact_sink, artifact_context) {
                         let plan = ledger.snapshot();
                         if !plan.is_empty() {
@@ -4020,7 +4070,17 @@ async fn execute_authorized_tool(
                                     format!("warning: failed to record plan artifact: {error}");
                                 out.push('\n');
                                 out.push_str(&warning);
+                                artifact_warning = true;
                             }
+                        }
+                    }
+                    // The operator sees a tick as one row; a new or rewritten
+                    // plan keeps the full block the model receives, and so
+                    // does a tick whose artifact record failed, so that
+                    // warning is never hidden behind the row.
+                    if !artifact_warning {
+                        if let Some(line) = super::scheduled::step_change_line(&before, &after) {
+                            presentation.override_result(line);
                         }
                     }
                 }

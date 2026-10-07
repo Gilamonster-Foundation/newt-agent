@@ -229,14 +229,21 @@ mod terminal {
             frame,
             frame.area(),
             &crate::modal::Chrome {
+                // A free-text question is not a list to pick from: its chrome
+                // names the question and the keys that answer it, nothing
+                // about selecting.
                 title: if view.selected().is_some() {
                     "decision required"
+                } else if input.options.is_none() {
+                    "question — type your answer"
                 } else {
                     "input required"
                 },
-                hint: Some(
-                    "F4 inspect · Esc cancel · ↑↓ select · Enter confirm · PgUp/PgDn scroll",
-                ),
+                hint: Some(if input.options.is_none() {
+                    "Enter send · Esc cancel · F4 inspect · PgUp/PgDn scroll"
+                } else {
+                    "F4 inspect · Esc cancel · ↑↓ select · Enter confirm · PgUp/PgDn scroll"
+                }),
                 ..crate::modal::Chrome::default()
             },
         );
