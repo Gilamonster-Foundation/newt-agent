@@ -26,6 +26,33 @@ fn repeated_plain_read_maps_the_whole_file() {
     assert!(map.contains("Pages already served: 1-2000"), "{map}");
 }
 
+/// A third identical plain read is served the first unread page, not the map
+/// again: the map names the offset once, and the repeat delivers it.
+#[test]
+#[cfg(feature = "ast")]
+fn a_third_plain_read_advances_past_the_map() {
+    let source = large_rust();
+    let mut history = ReadHistory::default();
+    history.read("large.rs", &source, None, None, None, false);
+    let map = history.read("large.rs", &source, None, None, None, false);
+    assert!(map.contains("Whole-file outline"), "{map}");
+    let third = history.read("large.rs", &source, None, None, None, false);
+    assert!(
+        !third.contains("Whole-file outline"),
+        "the map was served twice: {third}"
+    );
+    assert!(
+        third.contains("fn target()") && !third.starts_with("fn first()"),
+        "the repeat must deliver the first unread page: {third}"
+    );
+    // And a fourth, with every page now served, says so rather than looping.
+    let fourth = history.read("large.rs", &source, None, None, None, false);
+    assert!(
+        fourth.starts_with("All file pages already served this turn"),
+        "{fourth}"
+    );
+}
+
 /// #2745: explicit requests remain byte-for-byte the existing paging output.
 #[test]
 fn explicit_offset_and_small_file_are_unchanged() {
