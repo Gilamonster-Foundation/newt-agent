@@ -549,9 +549,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           cargo build -p newt-carried-tools --locked
           if ($LASTEXITCODE -ne 0) { throw 'carried-tools build failed' }
-          New-Item -ItemType Directory -Force target/carried-package | Out-Null
-          ./scripts/windows/Install-CarriedTools.ps1 -BinaryPath target/debug/newt-carried-tools.exe -NewtDirectory target/carried-package
-          ./scripts/windows/Test-CarriedTools.ps1 -ToolsDirectory target/carried-package/tools
+          # target/ is cached; every invocation needs a fresh, uncached stage.
+          $packageDirectory = Join-Path $env:RUNNER_TEMP ('carried-package-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $packageDirectory | Out-Null
+          ./scripts/windows/Install-CarriedTools.ps1 -BinaryPath target/debug/newt-carried-tools.exe -NewtDirectory $packageDirectory
+          ./scripts/windows/Test-CarriedTools.ps1 -ToolsDirectory (Join-Path $packageDirectory 'tools') -RequireRunnerTemp
       - name: Stage trusted AppContainer launcher for ordinary tests
         if: always()
         # Ordinary workspace tests also execute confined native commands.
