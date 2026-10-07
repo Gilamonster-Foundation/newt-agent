@@ -4373,6 +4373,9 @@ enum RepeatMemo {
         subject: String,
         advice: &'static str,
     },
+    /// Procedural content is still in context. Reuse succeeds cheaply; unlike
+    /// persistent outcome evidence, compaction/workspace changes release it.
+    SkillRead,
     /// #2555/#2637: a successful, argument-bare `read_file` (no explicit
     /// `offset`/`limit`) — the shape that loops when a weak model re-pages
     /// the same file. Per the harness-design doctrine this NEVER refuses the
@@ -4462,7 +4465,7 @@ impl RepeatCallGuard {
             // memo silently (content unchanged) or drops it and lets a real
             // read run (content changed / freshness unprovable) — this arm is
             // unreachable in practice, kept only so the match stays exhaustive.
-            RepeatMemo::ReadRange { .. } => return None,
+            RepeatMemo::ReadRange { .. } | RepeatMemo::SkillRead => return None,
         };
         // disclosure-gate-live-path (#5): the steer is a SYNTHETIC model-ingress
         // message re-injected as a `{"role":"tool"}` turn, bypassing the
@@ -4570,22 +4573,7 @@ impl RepeatCallGuard {
             });
         }
         if name == "use_skill" && !result.trim().is_empty() {
-            // A skill body is procedural knowledge the model holds once it
-            // has read it. A weak model re-loads the same skill round after
-            // round (41 of 72 calls in one measured Plan turn, 2026-10-07),
-            // and every load is 100-200 lines of context that proves nothing
-            // new. The exact repeat is steered; a different skill still loads.
-            let skill = args
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim();
-            return Some(RepeatMemo::EvidenceObserved {
-                subject: format!("skill `{skill}`"),
-                advice: "its body is already in your context above — follow it instead of \
-                         loading it again. If your plan is recorded, stop here so the \
-                         operator can approve it.",
-            });
+            return Some(RepeatMemo::SkillRead);
         }
         if let Some(path) = Self::bare_read_file_path(name, args) {
             // #2637 review P1: the identity must describe exactly the bytes
@@ -4629,6 +4617,20 @@ impl RepeatCallGuard {
         args: &serde_json::Value,
         read_scope: ReadScope<'_>,
     ) -> Option<String> {
+        // Skills are already served procedural content, not refusal evidence.
+        // A short success avoids repeating their body while it remains in context.
+        if name == "use_skill"
+            && matches!(
+                self.repeat_memos.get(&Self::key(name, args)),
+                Some(RepeatMemo::SkillRead)
+            )
+        {
+            let skill = args
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            return Some(format!("Skill `{skill}` is loaded in the current context."));
+        }
         let path = Self::bare_read_file_path(name, args)?;
         let key = Self::key(name, args);
         let Some(RepeatMemo::ReadRange {
@@ -4684,7 +4686,9 @@ impl RepeatCallGuard {
             self.repeat_memos.retain(|_, memo| {
                 !matches!(
                     memo,
-                    RepeatMemo::Failure { .. } | RepeatMemo::ReadRange { .. }
+                    RepeatMemo::Failure { .. }
+                        | RepeatMemo::ReadRange { .. }
+                        | RepeatMemo::SkillRead
                 )
             });
         }
@@ -4707,15 +4711,16 @@ impl RepeatCallGuard {
         self.fails_by_tool.values().sum()
     }
 
-    /// #2555: release every `ReadRange` memo. Called at the ONE checkpoint
+    /// #2555/#2799: release context-held file and skill read memos. Called at the ONE checkpoint
     /// each backend loop's compaction reaches once it actually fires
     /// (`record_compaction_artifact` for the three legacy chat loops;
     /// `compact_responses_input`'s `Compacted` outcome for the Responses
     /// loop) — never on a rejected/no-op compaction attempt, which changed
     /// nothing the model could have already seen.
     fn release_read_memos(&mut self) {
-        self.repeat_memos
-            .retain(|_, memo| !matches!(memo, RepeatMemo::ReadRange { .. }));
+        self.repeat_memos.retain(|_, memo| {
+            !matches!(memo, RepeatMemo::ReadRange { .. } | RepeatMemo::SkillRead)
+        });
     }
 }
 
@@ -13945,6 +13950,25 @@ fn commit_tool_round_narration(
     retain: Option<&dyn CompletedSpillRenderer>,
     color: bool,
 ) {
+    emit_tool_round_narration(
+        content,
+        already_printed,
+        retain,
+        display::reply_cols(crate::tty::term_cols()),
+        display::spill_lines(),
+        |level, glyph, text| emit_notice_line(level, glyph, text, color),
+    );
+}
+
+/// The production narration path with layout and output injected for testing.
+fn emit_tool_round_narration(
+    content: &str,
+    already_printed: bool,
+    retain: Option<&dyn CompletedSpillRenderer>,
+    width: usize,
+    budget: usize,
+    mut emit: impl FnMut(crate::tty::Level, &str, &str),
+) {
     if already_printed {
         return;
     }
@@ -13952,20 +13976,20 @@ fn commit_tool_round_narration(
     if rows.is_empty() {
         return;
     }
-    let budget = display::spill_lines();
+    let rendered: Vec<_> = rows
+        .iter()
+        .flat_map(|row| crate::tty::wrap_line(row, width))
+        .collect();
     let shown = if budget == 0 {
-        rows.len()
+        rendered.len()
     } else {
-        rows.len().min(budget)
+        rendered.len().min(budget)
     };
-    let width = display::reply_cols(crate::tty::term_cols());
-    for (i, row) in rows.iter().take(shown).enumerate() {
-        for (j, line) in crate::tty::wrap_line(row, width).into_iter().enumerate() {
-            let glyph = if i == 0 && j == 0 { "▹" } else { " " };
-            emit_notice_line(crate::tty::Level::Narration, glyph, &line, color);
-        }
+    for (i, line) in rendered.iter().take(shown).enumerate() {
+        let glyph = if i == 0 { "▹" } else { " " };
+        emit(crate::tty::Level::Narration, glyph, line);
     }
-    let hidden = rows.len() - shown;
+    let hidden = rendered.len() - shown;
     if hidden == 0 {
         return;
     }
@@ -13979,11 +14003,10 @@ fn commit_tool_round_narration(
     let recovery = hint
         .as_deref()
         .map_or_else(display::Recovery::default, display::Recovery::Command);
-    emit_notice_line(
+    emit(
         crate::tty::Level::Dim,
         "▲",
         &display::Fold::lines(hidden, recovery).marker(),
-        color,
     );
 }
 
@@ -14247,3 +14270,7 @@ mod observation_hook_tests;
 #[cfg(test)]
 #[path = "mod_tests/attribution_epoch_tests.rs"]
 mod attribution_epoch_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/narration_output.rs"]
+mod narration_output_tests;

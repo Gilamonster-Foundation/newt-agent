@@ -516,46 +516,43 @@ fn does_not_steer_successful_write_capable_run_command() {
     );
 }
 
-/// A skill body is held once it is read: the exact repeat of a `use_skill`
-/// load is steered instead of re-serving 100-200 lines, while a different
-/// skill still loads.
+/// PR #2799: repeats of context-held skills are cheap successes, never refusal
+/// protocols. Workspace changes and committed compaction allow a fresh load.
 #[test]
-fn a_repeated_skill_load_is_steered_not_reloaded() {
-    let args = serde_json::json!({"name": "repository-roadmap"});
-    let body = "# Repository Roadmap\n\nRead ROADMAP.md first.";
-    assert!(matches!(
-        RepeatCallGuard::classify_repeat_memo("use_skill", &args, true, body, None),
-        Some(RepeatMemo::EvidenceObserved { .. })
-    ));
+fn skill_2799_reuse_is_success_and_context_scoped() {
+    let args = serde_json::json!({"name":"repository-roadmap"});
     let (_dir, workspace, caveats) = read_memo_fixture("src/lib.rs", "x");
-    let mut g = RepeatCallGuard::default();
-    assert!(
-        g.repeat_steer("use_skill", &args).is_none(),
-        "the first load runs"
-    );
-    g.record(
-        "use_skill",
-        &args,
-        true,
-        body,
-        None,
-        ReadScope {
-            workspace: &workspace,
-            caveats: &caveats,
-        },
-    );
-    let steer = g
-        .repeat_steer("use_skill", &args)
-        .expect("the exact repeat is steered");
-    assert!(
-        steer.contains("already observed skill `repository-roadmap`"),
-        "{steer}"
-    );
-    assert!(
-        g.repeat_steer("use_skill", &serde_json::json!({"name": "green-the-board"}))
-            .is_none(),
-        "a different skill still loads"
-    );
+    let scope = ReadScope {
+        workspace: &workspace,
+        caveats: &caveats,
+    };
+    let mut guard = RepeatCallGuard::default();
+    for compact in [true, false] {
+        assert!(guard.cached_read("use_skill", &args, scope).is_none());
+        guard.record("use_skill", &args, true, "# Read the roadmap", None, scope);
+        assert!(guard.repeat_steer("use_skill", &args).is_none());
+        assert_eq!(
+            guard.cached_read("use_skill", &args, scope).as_deref(),
+            Some("Skill `repository-roadmap` is loaded in the current context.")
+        );
+        assert!(guard
+            .cached_read("use_skill", &serde_json::json!({"name":"other"}), scope)
+            .is_none());
+        if compact {
+            guard.release_read_memos();
+        } else {
+            guard.record(
+                "write_file",
+                &serde_json::json!({"path":"SKILL.md","content":"changed"}),
+                true,
+                "wrote file",
+                None,
+                scope,
+            );
+        }
+        assert!(guard.cached_read("use_skill", &args, scope).is_none());
+        assert!(guard.repeat_steer("use_skill", &args).is_none());
+    }
 }
 
 #[test]

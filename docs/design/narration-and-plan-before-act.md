@@ -45,8 +45,8 @@ blocks, drops any paragraph that is the tool call itself (a fenced block, a
 bare JSON object or array, a `<function=…>` or `<tool>…</tool>` form, from
 where it starts, even mid-line), drops heading lines and list markers, and
 returns one row per paragraph or list item with nothing cut short. The
-emitter bounds the rows the way a tool result and a reasoning block are
-bounded: the first `[tui] spill_lines` rows commit, the rest are retained
+emitter wraps the prose to the current reply width first, then bounds the
+rendered terminal rows: the first `[tui] spill_lines` rows commit, the rest are retained
 behind the one fold marker (`▲ N lines hidden [/spill open N]`), so a long
 explanation is kept whole and raised on demand rather than cut to a
 sentence (the operator's call, 2026-10-07, after a row was cut at "(e.g.").
@@ -139,8 +139,11 @@ Measured on 2026-10-07 before that rule: under the Plan disposition a 35B
 model recorded its plan, then re-loaded the same two skills round after
 round (41 `use_skill` calls of 72 in the turn) until the twelve-round
 no-progress brake stopped it; the approval question then followed anyway.
-The repeat guard now steers an exact repeat of a skill load instead of
-re-serving its body.
+The repeat guard now returns a short successful reuse receipt for an exact
+repeat while the skill body remains in context, instead of re-serving the
+body or refusing the call. Committed compaction and successful workspace
+changes release that memo, just like a file-read memo, so the next identical
+load executes and returns the skill body again.
 
 ## Opt-in: ask the model for one sentence of intent
 
@@ -182,10 +185,19 @@ All in the mocked unit tier:
   without a draft; approval seeds the ledger plan when no draft exists;
   full-auto approves without asking.
 
-Emission of the narration row is not asserted: the loop has no injectable
-operator writer, the same gap the heartbeat line lives with. The row builder
-and the emitter are tested separately; the live run is the evidence for the
-composition.
+The production narration emitter has injectable width, row budget and output.
+`mod_tests/narration_output.rs` exercises that seam with one long paragraph
+and mixed paragraphs at a narrow width, asserting the emitted row count,
+actual hidden-row count, complete retained body and retention-before-marker
+ordering. Streamed/empty and unlimited-budget controls share the same path.
+The provider-loop call sites retain their existing wiring.
+
+`compression_loop_tests::compaction_2799_releases_skill_reuse_in_real_loop`
+runs repeated skill loads through the actual chat loop and committed
+compaction. Request-length drops and summarizer calls identify compaction
+independently of tool events; the next skill event must be a fresh successful
+load, while intervening repeats are successful cache reuse. The guard's unit
+test also covers invalidation after a successful workspace change.
 
 ## Known gaps
 
