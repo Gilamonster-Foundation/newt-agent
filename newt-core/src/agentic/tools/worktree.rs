@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::native_git::{invocation, is_git as resembles_git, literal};
 pub(super) mod branch;
+mod detect;
 #[path = "worktree_git.rs"]
 mod git_identity;
 mod nudge;
@@ -596,6 +597,9 @@ pub(super) async fn execute(
             );
         }
     }
+    let before = (name == "run_command" && session.is_some())
+        .then(|| detect::Snapshot::before(Path::new(workspace), &caveats.fs_read))
+        .flatten();
     let mut result = if let Some(policy) = &policy {
         let refuse_git = name == "git"
             && !matches!(
@@ -761,6 +765,16 @@ pub(super) async fn execute(
             }
         }
     }
+    if let (Some(session), Some(before)) = (session, before) {
+        if let Some(notice) = before.record(
+            session,
+            Path::new(workspace),
+            execution.and_then(|slot| slot.get()),
+        ) {
+            presentation.preview(&notice, 0);
+            result.push_str(&format!("\n{notice}"));
+        }
+    }
     if let Some(policy) = &policy {
         // Shell denials are classified from their structured filesystem evidence
         // at dispatch. An exec miss or pending grant is not an adoption fence.
@@ -885,3 +899,7 @@ mod invalid_reference_tests {
 #[cfg(test)]
 #[path = "../tools_tests/worktree_command_cwd.rs"]
 mod command_cwd_tests;
+
+#[cfg(test)]
+#[path = "../tools_tests/worktree_detect.rs"]
+mod detect_tests;
