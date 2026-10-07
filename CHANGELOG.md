@@ -9,6 +9,14 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Fixed — the tool-round-cap handoff shows one plan step per line
+
+- "Captured working state: Plan:" rendered its ✓/→/☐ steps as one wrapped
+  paragraph on the styled surface, because the ledger's single newlines are
+  Markdown soft breaks. The captured block now ends each line with a
+  CommonMark hard break; the plain surface and the model-facing bytes are
+  unchanged.
+
 ### Fixed — a governed commit is no longer refused in a default-permission Linux session (#2693)
 
 - The native commit broker's own `git` re-dispatch (`NativeGitBroker`) minted
