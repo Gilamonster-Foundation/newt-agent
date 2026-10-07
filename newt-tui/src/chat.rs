@@ -445,8 +445,8 @@ fn run_plan_approval(
             "Approve this plan? [y/N/discuss] "
         }
     };
-    let outcome = if auto_approve {
-        HumanQuestionOutcome::Answer("y".to_string())
+    let verdict = if auto_approve {
+        PlanVerdict::Approved
     } else {
         match gate {
             // A decision is a selection, not a text box: the same form a
@@ -455,16 +455,25 @@ fn run_plan_approval(
             Some(gate) => {
                 match gate.ask_choice(question, newt_core::agentic::PLAN_APPROVAL_CHOICES) {
                     HumanQuestionOutcome::Answer(answer) if answer == "discuss" => {
-                        gate.ask_question("What should change? ")
+                        // The decision is already Discussion. Its free text is
+                        // feedback, never a second approval/rejection answer.
+                        PlanVerdict::StayClamped {
+                            feedback: match gate.ask_question("What should change? ") {
+                                HumanQuestionOutcome::Answer(text) if !text.trim().is_empty() => {
+                                    Some(text)
+                                }
+                                _ => None,
+                            },
+                        }
                     }
-                    other => other,
+                    other => plan_verdict(entry, other),
                 }
             }
-            None => HumanQuestionOutcome::Unavailable,
+            None => PlanVerdict::StayClamped { feedback: None },
         }
     };
     let mut effects = PlanApprovalEffects::default();
-    match plan_verdict(entry, outcome) {
+    match verdict {
         PlanVerdict::Approved => {
             if let Err(error) = plan_state.set_plan_mode(false) {
                 effects.notice = format!("plan approval: {error}");
@@ -516,9 +525,9 @@ fn run_plan_approval(
         PlanVerdict::StayClamped {
             feedback: Some(feedback),
         } => {
-            // Genuine operator text (their own answer to the approval
-            // question) runs as the next turn's input — queued the same way a
-            // harness retry is, but tagged OperatorContinuation since it is
+            // Genuine operator text (approval-question feedback or the
+            // discussion follow-up) runs as the next turn's input — queued like a
+            // harness retry, but tagged OperatorContinuation since it is
             // honestly operator-authored.
             effects.notice = format!("staying in plan mode — you said: {feedback}");
             if let Some(parent) = parent {

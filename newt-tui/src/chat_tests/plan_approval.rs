@@ -737,3 +737,76 @@ fn the_presented_snapshot_is_the_saved_markdown_byte_for_byte() {
     assert_eq!(shown.draft.markdown, "# Title\n\n1. step one\n");
     assert_eq!(shown.draft.revision, 1);
 }
+
+/// PR #2799 review: choosing discuss binds the follow-up to feedback, even
+/// when its verbatim text would approve or reject the separate decision prompt.
+#[test]
+fn discussion_2799_cannot_be_reinterpreted_as_approval_or_rejection() {
+    for entry in [
+        PlanEntry::ModelDuringAct,
+        PlanEntry::OperatorSelected,
+        PlanEntry::IntakeInferred,
+    ] {
+        for feedback in ["yes", "continue", "go", "no", "  yes\n"] {
+            let states = ConversationModeStates::default();
+            let parent = objective("A");
+            presented_plan(&states, &parent, "# plan A");
+            let mut gate = ScriptedGate::new([answer("discuss"), answer(feedback)]);
+            let effects = approve(&mut gate, &states, entry, Some(&parent));
+            assert!(
+                states.plan.is_plan_mode(),
+                "{entry:?}/{feedback:?}: clamp lifted"
+            );
+            assert!(!effects.switch_to_dev, "discussion cannot switch mode");
+            let (input, origin) = effects.queued.expect("verbatim feedback turn").into_input();
+            let ReadOutcome::Line(text) = input else {
+                panic!("feedback line")
+            };
+            assert_eq!(text, feedback);
+            assert!(matches!(
+                origin,
+                ModelInputOrigin::OperatorContinuation { .. }
+            ));
+            assert!(
+                states
+                    .plan_draft
+                    .take_approved(parent.active().root_prompt_id())
+                    .is_some(),
+                "discussion consumed approval snapshot"
+            );
+            assert_eq!(gate.asked.len(), 2);
+        }
+    }
+}
+
+/// PR #2799 review: cancelling the discussion (or losing input) cannot approve
+/// the plan, discard its snapshot, or seed an implementing turn.
+#[test]
+fn discussion_2799_unanswered_follow_up_retains_clamp_and_snapshot() {
+    for outcome in [
+        HumanQuestionOutcome::Cancelled,
+        HumanQuestionOutcome::Unavailable,
+        HumanQuestionOutcome::InputClosed,
+        HumanQuestionOutcome::ExitRequested,
+        answer(""),
+    ] {
+        let states = ConversationModeStates::default();
+        let parent = objective("A");
+        presented_plan(&states, &parent, "# plan A");
+        let mut gate = ScriptedGate::new([answer("discuss"), outcome.clone()]);
+        let effects = approve(
+            &mut gate,
+            &states,
+            PlanEntry::OperatorSelected,
+            Some(&parent),
+        );
+        assert!(states.plan.is_plan_mode(), "{outcome:?}");
+        assert!(!effects.switch_to_dev);
+        assert!(effects.queued.is_none());
+        assert!(states
+            .plan_draft
+            .take_approved(parent.active().root_prompt_id())
+            .is_some());
+        assert_eq!(gate.asked.len(), 2);
+    }
+}
