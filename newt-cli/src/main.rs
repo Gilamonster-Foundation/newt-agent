@@ -20,6 +20,14 @@ fn main() -> Result<()> {
             newt_core::netguard::run_guard_and_exec(argv);
         }
     }
+    // Ordinary ambient interpreter, separate from authenticated worker dispatch.
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__ambient-brush")) {
+        let code = newt_cli::stack::run_on_cli_stack("ambient-brush", || {
+            newt_cli::stack::build_cli_runtime()?.block_on(newt_core::ambient_brush::run())
+        })?;
+        std::process::exit(code);
+    }
     // Windows' default main-thread stack (~1 MB) overflows on the large clap
     // command tree during `Cli::parse()` before any diagnostics are printed.
     // Keep parse + dispatch behind Newt's explicit CLI stack policy. (#747)

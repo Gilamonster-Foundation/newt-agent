@@ -753,16 +753,8 @@ fn shell_dialect_2775_catalog_matches_injected_route() {
             description.contains(sentence),
             "{host_bypass}/{windows}: {description}"
         );
-        if host_bypass && windows {
-            assert!(description.contains("cmd.exe /C"));
-            assert!(!description.contains("%ERRORLEVEL%"));
-            assert!(description.contains("POSIX ; and $? are not supported"));
-            assert!(description
-                .contains("run_command already returns the exit status — do not echo it."));
-        } else {
-            assert!(description.contains("POSIX"));
-            assert!(!description.contains("cmd.exe"));
-        }
+        assert!(description.contains("POSIX"));
+        assert!(!description.contains("cmd.exe"));
     }
 }
 
@@ -778,8 +770,9 @@ fn shell_dialect_2775_execution_and_description_share_route() {
                 for lease in [false, true] {
                     for floor in [false, true] {
                         for engine in [SafeSubset, Host, Brush] {
-                            let route =
-                                select_shell_route(bypass, broker, lease, floor, windows, engine);
+                            let route = select_shell_route(
+                                bypass, broker, lease, floor, windows, true, engine,
+                            );
                             let defs =
                                 crate::agentic::tools::catalog::tool_definitions_with_dialect(
                                     Default::default(),
@@ -822,4 +815,57 @@ fn shell_dialect_2775_execution_and_description_share_route() {
             }
         }
     }
+}
+
+/// #2776: Windows ambient commands default to the carried POSIX interpreter.
+#[test]
+fn windows_2776_ambient_defaults_to_posix() {
+    let sentence = super::shell::shell_dialect_sentence(true, true);
+    assert!(sentence.contains("POSIX shell syntax"), "{sentence}");
+    assert!(!sentence.contains("cmd.exe"));
+}
+
+/// #2776: selecting Brush syntax cannot bypass a broker, lease or exec floor.
+#[test]
+fn windows_2776_default_route_and_child_environment() {
+    use super::shell::{
+        host_shell_command, select_shell_route, ShellRoute, CHILD_STRIPPED_AUTHORITY_ENV,
+    };
+    let engine = crate::ShellEngine::SafeSubset;
+    assert!(matches!(
+        select_shell_route(false, false, false, true, true, false, engine),
+        ShellRoute::Bridled(_)
+    ));
+    assert_eq!(
+        select_shell_route(true, false, false, true, true, false, engine),
+        ShellRoute::AmbientBrush
+    );
+    for (broker, lease, floor) in [
+        (true, false, true),
+        (false, true, true),
+        (false, false, false),
+    ] {
+        assert!(matches!(
+            select_shell_route(true, broker, lease, floor, true, false, engine),
+            ShellRoute::Bridled(_)
+        ));
+    }
+    let child = host_shell_command(ShellRoute::AmbientBrush, false, "echo hi", ".").unwrap();
+    let child = child.as_std();
+    let exe = std::env::current_exe().unwrap();
+    assert_eq!(child.get_program(), exe.as_os_str());
+    assert_eq!(child.get_args().collect::<Vec<_>>(), ["__ambient-brush"]);
+    let env = child
+        .get_envs()
+        .collect::<std::collections::HashMap<_, _>>();
+    for key in CHILD_STRIPPED_AUTHORITY_ENV {
+        assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&None), "{key}");
+    }
+    let path = env[std::ffi::OsStr::new("PATH")].unwrap();
+    assert_eq!(
+        std::env::split_paths(path).next().unwrap(),
+        dunce::simplified(&exe).parent().unwrap().join("tools")
+    );
+    assert!(ShellRoute::AmbientBrush.sentence().contains("POSIX"));
+    assert!(ShellRoute::Cmd.sentence().contains("cmd.exe /C"));
 }

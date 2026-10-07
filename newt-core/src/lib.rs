@@ -336,3 +336,6 @@ pub use workflows::{
     WorkflowClassifierConfig, WorkflowConfig, WorkflowSteerer, WorkflowStep,
 };
 pub use workspace_key::workspace_key_v2;
+
+/// Supervised ambient Windows interpreter.
+pub mod ambient_brush;

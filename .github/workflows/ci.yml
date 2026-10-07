@@ -597,6 +597,10 @@ jobs:
         # of the inward layer's runtime closure (#1828); enabling it here is
         # what keeps the published JSON Schemas from going stale unnoticed.
         run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
+      # HOOK PARITY: .githooks/pre-push runs scoped format/lint/tests;
+      # this Windows-native process-tree proof is CI-only on Unix hosts.
+      - name: Windows ambient Brush route (#2776)
+        run: cargo test -p newt-agent --test windows_ambient_brush -- --nocapture
       # The #1746 ConPTY spike's whole product is EVIDENCE, and libtest captures
       # stdout on success — so the probes' verdict lines never reach the log in
       # the workspace test above. Re-run just those probes with --nocapture so

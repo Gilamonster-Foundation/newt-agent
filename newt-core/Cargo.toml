@@ -186,6 +186,8 @@ tree-sitter-tags = { version = "0.27", optional = true }
 tree-sitter-rust = { version = "0.24.2", optional = true }
 
 [target."cfg(windows)".dependencies]
+brush-core = { package = "brush-ocap-core", version = "=0.6.0-rc.1" }
+brush-builtins = { package = "brush-ocap-builtins", version = "=0.3.0-rc.1" }
 # Held directory identity for managed build scratch; already used by ignore.
 same-file = "1"
 # #1030 collision fix, Windows side: `pid_is_alive`'s `OpenProcess`-based

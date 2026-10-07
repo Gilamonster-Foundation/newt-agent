@@ -664,6 +664,7 @@ pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ShellRoute {
     Cmd,
+    AmbientBrush,
     BashSh,
     Bridled(crate::ShellEngine),
 }
@@ -676,11 +677,16 @@ pub(super) fn select_shell_route(
     has_lease: bool,
     floor_permits: bool,
     windows: bool,
+    windows_cmd: bool,
     engine: crate::ShellEngine,
 ) -> ShellRoute {
     if bypass_enabled && !has_broker && !has_lease && floor_permits {
         if windows {
-            ShellRoute::Cmd
+            if windows_cmd {
+                ShellRoute::Cmd
+            } else {
+                ShellRoute::AmbientBrush
+            }
         } else {
             ShellRoute::BashSh
         }
@@ -697,7 +703,7 @@ impl ShellRoute {
     pub(super) fn sentence(self) -> &'static str {
         match self {
             Self::Cmd => "Commands run under cmd.exe /C: chain with &&; POSIX ; and $? are not supported. run_command already returns the exit status — do not echo it.",
-            Self::BashSh | Self::Bridled(_) => "Commands use POSIX shell syntax; the selected engine may restrict shell constructs.",
+            Self::AmbientBrush | Self::BashSh | Self::Bridled(_) => "Commands use POSIX shell syntax; the selected engine may restrict shell constructs.",
         }
     }
 }
@@ -711,6 +717,7 @@ pub fn run_command_dialect_sentence() -> &'static str {
         false,
         true,
         cfg!(windows),
+        crate::config::windows_cmd_enabled(),
         shell_engine(),
     )
     .sentence()
@@ -724,6 +731,7 @@ pub fn shell_dialect_sentence(host_bypass: bool, windows: bool) -> &'static str 
         false,
         true,
         windows,
+        false,
         crate::ShellEngine::SafeSubset,
     )
     .sentence()
@@ -1020,6 +1028,7 @@ async fn dispatch_bridled_shell_with_floor(
         execution_lease.is_some(),
         true,
         cfg!(windows),
+        crate::config::windows_cmd_enabled(),
         shell_engine(),
     ) else {
         unreachable!("bridled dispatch cannot bypass confinement")
@@ -1270,6 +1279,7 @@ pub(super) async fn exec_confined_command_with_broker(
         execution_lease.is_some(),
         exec_floor_permits(exec_floor, cmd),
         cfg!(windows),
+        crate::config::windows_cmd_enabled(),
         shell_engine(),
     );
     let host_bypass = !matches!(route, ShellRoute::Bridled(_));
@@ -1289,7 +1299,11 @@ pub(super) async fn exec_confined_command_with_broker(
         let mut live = LiveOutputSession::start(live_tool_output);
         let run = host_shell_dispatch(
             route,
-            &cmd_with_venv,
+            if route == ShellRoute::AmbientBrush {
+                cmd
+            } else {
+                &cmd_with_venv
+            },
             cwd,
             live.as_ref().map(LiveOutputSession::relay),
             timeout_secs,
@@ -2101,6 +2115,7 @@ pub(super) const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
     "NEWT_UNSAFE_HOST_EXEC",
     "NEWT_BENCH_OCAP",
     "NEWT_SHELL_ENGINE",
+    "NEWT_WINDOWS_CMD",
     "NEWT_SHELL_ENV_PASSTHROUGH",
     "NEWT_WRITE_PATHS",
     "NEWT_READ_PATHS",
@@ -2135,10 +2150,27 @@ pub(super) fn host_shell_command(
     cmd: &str,
     cwd: &str,
 ) -> std::io::Result<tokio::process::Command> {
+    let executable = if route == ShellRoute::AmbientBrush {
+        std::env::current_exe()?
+    } else {
+        std::path::PathBuf::new()
+    };
+    host_shell_command_at(route, fallback, cmd, cwd, &executable)
+}
+
+fn host_shell_command_at(
+    route: ShellRoute,
+    fallback: bool,
+    cmd: &str,
+    cwd: &str,
+    executable: &std::path::Path,
+) -> std::io::Result<tokio::process::Command> {
+    use std::ffi::OsStr;
     use std::process::Stdio;
-    let (program, flag) = match route {
-        ShellRoute::Cmd => ("cmd", "/C"),
-        ShellRoute::BashSh => (if fallback { "sh" } else { "bash" }, "-c"),
+    let (program, flag): (&OsStr, &str) = match route {
+        ShellRoute::Cmd => (OsStr::new("cmd"), "/C"),
+        ShellRoute::AmbientBrush => (executable.as_os_str(), "__ambient-brush"),
+        ShellRoute::BashSh => (OsStr::new(if fallback { "sh" } else { "bash" }), "-c"),
         ShellRoute::Bridled(_) => {
             return Err(std::io::Error::other(
                 "bridled route cannot construct an ambient child",
@@ -2146,9 +2178,39 @@ pub(super) fn host_shell_command(
         }
     };
     let mut c = tokio::process::Command::new(program);
-    c.args([flag, cmd])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
+    c.arg(flag);
+    if route == ShellRoute::AmbientBrush {
+        let tools = dunce::simplified(executable)
+            .parent()
+            .ok_or_else(|| std::io::Error::other("executable has no parent"))?
+            .join("tools");
+        let mut paths = vec![tools];
+        // Windows PATH uses semicolons, not a POSIX export prefix. Preserve
+        // the operator's virtualenv using the native executable directory.
+        if let Some(venv) =
+            std::env::var_os("NEWT_VENV").or_else(|| std::env::var_os("VIRTUAL_ENV"))
+        {
+            paths.push(std::path::Path::new(&venv).join(if cfg!(windows) {
+                "Scripts"
+            } else {
+                "bin"
+            }));
+            c.env("VIRTUAL_ENV", venv);
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        let path = std::env::join_paths(paths).map_err(std::io::Error::other)?;
+        c.env("PATH", path);
+    } else {
+        c.arg(cmd);
+    }
+    c.current_dir(cwd)
+        .stdin(if route == ShellRoute::AmbientBrush {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -2226,9 +2288,8 @@ pub(super) async fn host_shell_output_with_timeout(
     }
 }
 
-/// INTERIM (#297) host shell selection on Windows: `cmd /C`, the same shape
-/// as [`build_check_shell`]. Bounded by [`host_exec_timeout`] with
-/// `kill_on_drop` so a hung child cannot wedge the turn.
+/// Windows ambient selection: supervised Brush by default, cmd on explicit
+/// opt-out. Both use the existing command wall and live output drain.
 #[cfg(windows)]
 pub(super) async fn host_shell_output(
     route: ShellRoute,
@@ -2248,9 +2309,41 @@ pub(super) async fn host_shell_output_with_timeout(
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     timeout: std::time::Duration,
 ) -> std::io::Result<HostShellRun> {
-    let mut cmd_builder = host_shell_command(route, false, cmd, cwd)?;
-    let mut child = cmd_builder.spawn()?;
+    let cmd_builder = host_shell_command(route, false, cmd, cwd)?;
+    supervise_windows_shell(
+        cmd_builder,
+        (route == ShellRoute::AmbientBrush).then_some(cmd),
+        live,
+        timeout,
+    )
+    .await
+}
 
+#[cfg(windows)]
+async fn supervise_windows_shell(
+    mut cmd_builder: tokio::process::Command,
+    script: Option<&str>,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout: std::time::Duration,
+) -> std::io::Result<HostShellRun> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = cmd_builder.spawn()?;
+    // The runner waits on stdin. No command can start before job assignment.
+    // Closing this non-inherited handle kills the entire tree on every exit,
+    // including timeout and future cancellation. Refuse if assignment fails.
+    let _job = if script.is_some() {
+        Some(
+            crate::confined_exec::WindowsJob::for_process(
+                child
+                    .raw_handle()
+                    .ok_or_else(|| std::io::Error::other("missing child handle"))?,
+            )
+            .ok_or_else(|| std::io::Error::other("cannot supervise ambient Brush process tree"))?,
+        )
+    } else {
+        None
+    };
+    let mut stdin = child.stdin.take();
     let stdout = child
         .stdout
         .take()
@@ -2260,6 +2353,15 @@ pub(super) async fn host_shell_output_with_timeout(
         .take()
         .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
     let completed = async {
+        if let Some(script) = script {
+            let mut input = stdin
+                .take()
+                .ok_or_else(|| std::io::Error::other("Brush stdin was not piped"))?;
+            let encoded = serde_json::to_vec(script).map_err(std::io::Error::other)?;
+            input.write_all(&encoded).await?;
+            input.shutdown().await?;
+            drop(input);
+        }
         let (status, stdout, stderr) = tokio::try_join!(
             child.wait(),
             drain_host_pipe(
@@ -3255,4 +3357,34 @@ mod dispatch_caveats_tests {
         let widened = dispatch_caveats_for_command("cargo --version", &none_caveats);
         assert_eq!(widened.net, crate::caveats::Scope::none());
     }
+}
+
+#[cfg(all(windows, feature = "test-util"))]
+pub(crate) async fn test_windows_ambient_dispatch(
+    executable: &std::path::Path,
+    cmd: &str,
+    cwd: &str,
+    windows_cmd: bool,
+    timeout: std::time::Duration,
+) -> std::io::Result<serde_json::Value> {
+    let route = select_shell_route(
+        true,
+        false,
+        false,
+        true,
+        true,
+        windows_cmd,
+        crate::ShellEngine::SafeSubset,
+    );
+    let command = host_shell_command_at(route, false, cmd, cwd, executable)?;
+    let run = supervise_windows_shell(
+        command,
+        (route == ShellRoute::AmbientBrush).then_some(cmd),
+        None,
+        timeout,
+    )
+    .await?;
+    Ok(
+        serde_json::json!({"exit_code":run.exit_code,"stdout":decode_shell_stream(&run.stdout),"stderr":decode_shell_stream(&run.stderr),"timed_out":run.timed_out}),
+    )
 }

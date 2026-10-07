@@ -289,10 +289,11 @@ mod tests {
                         false,
                         true,
                         windows,
+                        false,
                         crate::ShellEngine::SafeSubset
                     ),
                     if windows {
-                        ShellRoute::Cmd
+                        ShellRoute::AmbientBrush
                     } else {
                         ShellRoute::BashSh
                     }
@@ -305,6 +306,7 @@ mod tests {
                             false,
                             false,
                             windows,
+                            false,
                             crate::ShellEngine::SafeSubset
                         ),
                         ShellRoute::Bridled(_)
