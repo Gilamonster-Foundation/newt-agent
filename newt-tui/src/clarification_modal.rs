@@ -136,6 +136,13 @@ fn draw(frame: &mut ratatui::Frame, batch: &str, hint: &str, answer: &str) {
 
 /// Run the modal's event loop on an already-positioned terminal (the
 /// cockpit's real-terminal handoff, mirroring `interaction_view::present_in`).
+///
+/// `#[cfg(unix)]` to match its only caller, [`present_in`], exactly as that
+/// function is gated and for the same reason: the live cockpit is unix-only,
+/// so on Windows this has nobody to serve and `-D warnings` correctly calls
+/// it dead (measured on the Windows CI leg). The classic [`present`] opens
+/// its own frame per pass and drives [`read_until_resize`] directly.
+#[cfg(unix)]
 fn run(terminal: &mut InlineTerm, batch: &str, hint: &str) -> io::Result<ReadOutcome> {
     let mut input = FreeTextInput {
         answer: String::new(),
