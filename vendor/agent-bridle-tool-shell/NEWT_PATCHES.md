@@ -10,6 +10,11 @@ temporary dependency override, not a second shell implementation.
 
 Integration changes:
 
+- #2796: Unix Brush and POSIX host entrypoints supply `which` through the
+  existing `command -v` builtin, so discovery works without an external which.
+  The same wrapper is shared with Newt's ambient Bash/sh route; PATH lookup
+  does not confer execution authority. Windows carried discovery is separate.
+
 - #2732: reuse the safe-subset stage supervisor for the sandboxed host shell.
   A configured deadline terminates/reaps the process group and reports a bounded
   timeout envelope. Deterministic tests inject elapsed time into the shared

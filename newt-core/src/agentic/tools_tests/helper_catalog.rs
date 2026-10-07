@@ -787,9 +787,16 @@ fn shell_dialect_2775_execution_and_description_share_route() {
                                     child.get_program(),
                                     if windows { "cmd" } else { "bash" }
                                 );
+                                let script = if windows {
+                                    "echo hello".to_owned()
+                                } else {
+                                    agent_bridle_tool_shell::with_posix_command_discovery(
+                                        "echo hello",
+                                    )
+                                };
                                 assert_eq!(
                                     child.get_args().collect::<Vec<_>>(),
-                                    [if windows { "/C" } else { "-c" }, "echo hello"]
+                                    [if windows { "/C" } else { "-c" }, script.as_str()]
                                 );
                                 assert_eq!(description.contains("cmd.exe /C"), windows);
                                 if !windows {
@@ -871,4 +878,17 @@ fn windows_2776_default_route_and_child_environment() {
     );
     assert!(ShellRoute::AmbientBrush.sentence().contains("POSIX"));
     assert!(ShellRoute::Cmd.sentence().contains("cmd.exe /C"));
+}
+
+/// #2796: all provider catalogs carry the publication recipe, whatever the dialect.
+#[test]
+fn publish_2796_catalog_guidance() {
+    for dialect in ["", "POSIX", "cmd.exe /C"] {
+        let defs = crate::agentic::tools::catalog::tool_definitions_with_dialect(
+            Default::default(),
+            dialect,
+        );
+        let description = defs[0]["function"]["description"].as_str().unwrap();
+        assert!(description.contains("To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials."), "{description}");
+    }
 }
