@@ -595,32 +595,46 @@ mod region_lease_door {
         );
     }
 
-    /// Writers that own rows but cannot yet NAME them.
-    ///
-    /// They paint cursor-relative — `MoveUp` then
-    /// `Clear(ClearType::FromCursorDown)` — so they claim "from here down"
-    /// rather than an absolute range. The live tool-output viewport was the
-    /// other entry here until it moved onto the arbiter's placement
-    /// (`Terminal::lease_below_cursor_quiet`): it now holds a `RegionLease`
-    /// for rows the arbiter named, and the one cursor-relative rewind it keeps
-    /// is the reflow case, inside those rows.
-    ///
-    /// Enumerated so they stay countable and this list may only shrink.
-    const CURSOR_RELATIVE_CLAIMS: &[(&str, &str)] = &[(
-        "lean_input.rs",
-        "rows_above_cursor, on the plain-scroller path that #1803's \
-         migration notice moves to wyvern-agent",
-    )];
+    /// Cursor-relative clear-to-screen-end holdouts, even when they hold leases.
+    /// Live spill paints ordinary frames on leased absolute rows, but width
+    /// reflow still uses MoveUp plus Clear(FromCursorDown); the stale lease
+    /// does not bound that clear. Keep that limitation visible in the ratchet.
+    const CURSOR_RELATIVE_CLAIMS: &[(&str, &str)] = &[
+        (
+            "lean_input.rs",
+            "rows_above_cursor on the plain-scroller path",
+        ),
+        (
+            "live_spill.rs",
+            "width-reflow cleanup rewinds and clears from the cursor down",
+        ),
+    ];
+
+    fn cursor_relative_claim(body: &str) -> bool {
+        body.contains("Clear(ClearType::FromCursorDown)")
+            && (body.contains(concat!("Move", "Up("))
+                || !(body.contains("RegionLease") || body.contains("lease_bottom_rows")))
+    }
+
+    #[test]
+    fn a_lease_does_not_hide_cursor_relative_reflow_cleanup() {
+        assert!(cursor_relative_claim(concat!(
+            "RegionLease; Move",
+            "Up(3); Clear(ClearType::FromCursorDown)"
+        )));
+        assert!(!cursor_relative_claim(
+            "RegionLease; MoveTo(0, top); Clear(ClearType::FromCursorDown)"
+        ));
+    }
 
     /// The cursor-relative holdouts are exactly the declared ones.
     ///
     /// Not a permission list: a NEW writer that paints from the cursor down
     /// is a new unarbitrated region, and it fails here until someone either
     /// leases it or argues it onto this list. The list started at two (#1979)
-    /// and is at one.
+    /// and remains at two until live spill no longer clears cursor-relative.
     #[test]
     fn cursor_relative_region_painters_are_the_declared_holdouts() {
-        const NEEDLE: &str = "Clear(ClearType::FromCursorDown)";
         let files = sources();
         assert!(
             files.len() > 10,
@@ -629,12 +643,7 @@ mod region_lease_door {
         );
         let mut found: Vec<&str> = Vec::new();
         for (name, body) in &files {
-            if !body.contains(NEEDLE) {
-                continue;
-            }
-            // A file that leases its rows is painting INSIDE what it owns —
-            // `InlineGuard::drop` erasing its own viewport, for instance.
-            if body.contains("RegionLease") || body.contains("lease_bottom_rows") {
+            if !cursor_relative_claim(body) {
                 continue;
             }
             found.push(name.as_str());
