@@ -165,9 +165,10 @@ async fn adoption_2750_full_access_creation_then_task_command() {
         .iter()
         .any(|line| line.contains("original checkout remains writable")));
 
-    // #2771: genuine creation enables relative file routing.
+    // #2791: the latest compound creation also updates relative file routing.
+    assert_task_handoff(&session, &compound, "compound");
     std::fs::write(root.join("routing_probe"), "original routing marker").unwrap();
-    std::fs::write(task.join("routing_probe"), "task routing marker").unwrap();
+    std::fs::write(compound.join("routing_probe"), "task routing marker").unwrap();
     let out = execute(
         &mut presentation,
         "read_file",

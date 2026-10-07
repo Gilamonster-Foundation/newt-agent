@@ -55,29 +55,23 @@ impl WorktreeSession {
     /// Routing needs a reciprocal link to THIS repository, not just advisory
     /// command success. This portable metadata check grants no file authority.
     pub(crate) fn task_root(&self, workspace: &Path) -> Option<PathBuf> {
-        let root = self
+        let path = self
             .task_worktree
             .lock()
             .expect("worktree hint lock")
             .as_ref()?
             .0
-            .clone()
-            .canonicalize()
-            .ok()?;
+            .clone();
+        Self::bound_task_root(&path, workspace)
+    }
+
+    pub(crate) fn bound_task_root(path: &Path, workspace: &Path) -> Option<PathBuf> {
+        let root = path.canonicalize().ok()?;
         let gitfile = root.join(".git");
         if !std::fs::symlink_metadata(&gitfile).ok()?.is_file() {
             return None;
         }
-        let original_admin = crate::workspace_key::discover_git_dir(workspace)?
-            .canonicalize()
-            .ok()?;
-        let common = match std::fs::read_to_string(original_admin.join("commondir")) {
-            Ok(text) if !text.trim().is_empty() => {
-                original_admin.join(text.trim()).canonicalize().ok()?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => original_admin,
-            _ => return None,
-        };
+        let common = common_git_dir(workspace)?;
         let admin = crate::workspace_key::resolve_gitdir_file(&gitfile, &root)?
             .canonicalize()
             .ok()?;
@@ -100,6 +94,18 @@ impl WorktreeSession {
         if state.is_none() {
             *state = Some(candidate);
         }
+    }
+}
+
+/// Shared repository locator for reciprocal task binding and discovery.
+pub(crate) fn common_git_dir(workspace: &Path) -> Option<PathBuf> {
+    let admin = crate::workspace_key::discover_git_dir(workspace)?
+        .canonicalize()
+        .ok()?;
+    match std::fs::read_to_string(admin.join("commondir")) {
+        Ok(text) if !text.trim().is_empty() => admin.join(text.trim()).canonicalize().ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(admin),
+        _ => None,
     }
 }
 
