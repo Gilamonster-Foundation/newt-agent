@@ -98,6 +98,9 @@ struct OutputState {
     /// its rows. See [`physical_rows`].
     painted_lines: Vec<String>,
     painted_generation: Option<u64>,
+    /// A visible frame was erased, but its replacement could not be placed.
+    /// Keep this request until a watcher tick can retry, or its owner ends.
+    placement_retry: Option<u64>,
     /// The rows the painted frame occupies, from the placer.
     frame: Option<Frame>,
     placer: Placer,
@@ -288,6 +291,7 @@ impl LiveSpillRenderer {
                 writer,
                 painted_lines: Vec::new(),
                 painted_generation: None,
+                placement_retry: None,
                 frame: None,
                 placer,
                 registration: None,
@@ -367,8 +371,8 @@ impl LiveSpillRenderer {
         self.scroll(SpillView::half_page_down)
     }
 
-    // Only reached through the unix-only keyboard watcher (`SpillInput::refresh_geometry`
-    // in lib.rs); no test calls this directly, unlike scroll_up/scroll_down/toggle_expanded.
+    // The unix keyboard watcher checks geometry and pending replacements
+    // between stdin polls; it must never block behind terminal output.
     #[cfg(unix)]
     pub(crate) fn refresh_geometry(&self) -> bool {
         let Some(mut state) = self.try_lock_state() else {
@@ -393,8 +397,22 @@ impl LiveSpillRenderer {
                 state.max_rows,
                 state.drawable,
             );
+        let generation = state.generation;
+        let drawable = state.drawable;
         drop(state);
-        if changed {
+        // Never block the stdin watcher behind a paint that may itself be
+        // waiting for its read token. A refused replacement remains pending
+        // even after sync_geometry consumed the resize; the next tick retries.
+        let retry = drawable
+            && generation.is_some_and(|generation| !self.is_abandoned(generation))
+            && self.output.try_lock().is_ok_and(|output| {
+                output.placement_retry == generation
+                    && !output
+                        .registration
+                        .as_ref()
+                        .is_some_and(newt_core::tty::EphemeralRegistration::suspended)
+            });
+        if changed || retry {
             self.repaint_async();
         }
         true
@@ -852,6 +870,8 @@ fn paint_generation(
     // would be a round trip per chunk. Anything else (first paint, a
     // resize, an expand, a frame left by another generation) erases what is
     // up and places afresh.
+    let replacing =
+        output.painted_generation == Some(generation) || output.placement_retry == Some(generation);
     let in_place = match (&output.frame, output.painted_generation) {
         (Some(frame), Some(previous)) => {
             previous == generation
@@ -885,6 +905,9 @@ fn paint_generation(
         (frame._lease, frame.place)
     } else {
         let Some(placed) = (output.placer)(wanted) else {
+            // First placement still reports failure for the caller's plain
+            // output fallback. Only an erased viewport owes a replacement.
+            output.placement_retry = replacing.then_some(generation);
             return;
         };
         placed
@@ -929,6 +952,7 @@ fn paint_generation(
         discard_generation(&mut output, generation);
         return;
     }
+    output.placement_retry = None;
     output.painted_lines.clone_from(&lines);
     output.painted_generation = Some(generation);
     output.frame = Some(Frame {
@@ -985,6 +1009,9 @@ fn erase_generation(
     if is_abandoned(abandoned_through, generation) {
         discard_generation(&mut output, generation);
         return;
+    }
+    if output.placement_retry == Some(generation) {
+        output.placement_retry = None;
     }
     if output.painted_generation == Some(generation) {
         erase_output(
@@ -1081,6 +1108,9 @@ fn erase_output(
 /// Forget a frame without touching the terminal: its rows go back to the
 /// arbiter and whatever is painted stays as residue.
 fn discard_generation(output: &mut OutputState, generation: u64) {
+    if output.placement_retry == Some(generation) {
+        output.placement_retry = None;
+    }
     if output.painted_generation == Some(generation) {
         output.painted_lines.clear();
         output.painted_generation = None;

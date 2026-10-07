@@ -1593,3 +1593,135 @@ fn height_only_shrink_replaces_before_repaint() {
 fn height_only_shrink_finishes_without_another_chunk() {
     height_only_shrink(false);
 }
+
+/// #2809: a refused replacement must not consume the only resize event.
+#[cfg(unix)]
+fn refused_resize_retries_on_the_next_tick(completed: bool) {
+    use newt_core::agentic::CompletedSpillRenderer;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let term = ModelTerminal::new(80);
+    let geometry = Arc::new(Mutex::new((80, 24)));
+    let measured = geometry.clone();
+    let refuse = Arc::new(AtomicBool::new(false));
+    let refusal = refuse.clone();
+    let mut placed = term.placer();
+    let renderer = LiveSpillRenderer::with_writer_and_geometry(
+        term.clone(),
+        Box::new(move |height| {
+            (!refusal.load(Ordering::Relaxed))
+                .then(|| placed(height))
+                .flatten()
+        }),
+        3,
+        false,
+        move || Some(*measured.lock().unwrap()),
+    )
+    .unwrap();
+    let generation = if completed {
+        assert!(renderer.render_completed("retained output\n", 80, 3) > 0);
+        super::COMPLETED_GENERATION
+    } else {
+        renderer.start(1);
+        renderer.write(1, ToolOutputStream::Stdout, b"retained output\n");
+        1
+    };
+    for columns in [12, 80] {
+        term.screen.lock().unwrap().resize(columns);
+        *geometry.lock().unwrap() = (columns, 24);
+        super::sync_geometry(&mut renderer.lock_state());
+        refuse.store(true, Ordering::Relaxed);
+        paint_generation(
+            &renderer.state,
+            &renderer.output,
+            &renderer.abandoned_through,
+            generation,
+        );
+        assert!(
+            renderer.output.lock().unwrap().frame.is_none(),
+            "old frame erased, placement refused"
+        );
+        for available in [false, true] {
+            refuse.store(!available, Ordering::Relaxed);
+            // A virtual watcher tick: retain the request, then drive its worker
+            // synchronously. No sleeps or real terminal timing in this witness.
+            renderer.repaint_running.store(true, Ordering::Release);
+            let before = renderer.repaint_requested.load(Ordering::Acquire);
+            let bytes_before = term.bytes.lock().unwrap().len();
+            renderer.refresh_geometry();
+            assert!(
+                renderer.repaint_requested.load(Ordering::Acquire) > before,
+                "unchanged geometry must retry the refused replacement"
+            );
+            super::run_input_repaint(
+                &renderer.state,
+                &renderer.output,
+                &renderer.abandoned_through,
+                &renderer.repaint_requested,
+                &renderer.repaint_running,
+            );
+            if !available {
+                assert!(renderer.output.lock().unwrap().frame.is_none());
+                assert_eq!(
+                    term.bytes.lock().unwrap().len(),
+                    bytes_before,
+                    "another refusal must not erase the already erased frame again"
+                );
+            }
+        }
+        let output = renderer.output.lock().unwrap();
+        assert_eq!(output.frame.as_ref().unwrap().columns, columns);
+        assert_eq!(output.painted_generation, Some(generation));
+        assert!(!output.painted_lines.is_empty());
+    }
+    // Ending ownership cancels a refused replacement; it must not reappear
+    // over the caller's subsequent canonical output.
+    term.screen.lock().unwrap().resize(40);
+    *geometry.lock().unwrap() = (40, 24);
+    super::sync_geometry(&mut renderer.lock_state());
+    refuse.store(true, Ordering::Relaxed);
+    paint_generation(
+        &renderer.state,
+        &renderer.output,
+        &renderer.abandoned_through,
+        generation,
+    );
+    if completed {
+        renderer.erase();
+    } else {
+        renderer.finish(generation);
+    }
+    refuse.store(false, Ordering::Relaxed);
+    let before = renderer.repaint_requested.load(Ordering::Acquire);
+    assert!(!renderer.refresh_geometry());
+    assert_eq!(renderer.repaint_requested.load(Ordering::Acquire), before);
+    assert!(renderer.output.lock().unwrap().placement_retry.is_none());
+    assert!(renderer.output.lock().unwrap().frame.is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn refused_live_resize_retries_without_another_resize_or_chunk() {
+    refused_resize_retries_on_the_next_tick(false);
+}
+
+#[test]
+#[cfg(unix)]
+fn refused_completed_resize_retries_without_another_resize_or_chunk() {
+    refused_resize_retries_on_the_next_tick(true);
+}
+
+/// #2809: a first-placement refusal belongs to the plain-output fallback;
+/// it must not later open an unsolicited frame over that canonical output.
+#[test]
+#[cfg(unix)]
+fn refused_first_placement_does_not_schedule_a_late_frame() {
+    use newt_core::agentic::CompletedSpillRenderer;
+    use std::sync::atomic::Ordering;
+    let renderer =
+        LiveSpillRenderer::with_writer(SharedWriter::default(), Box::new(|_| None), 80, 3, false);
+    assert_eq!(renderer.render_completed("fallback\n", 80, 3), 0);
+    renderer.repaint_running.store(true, Ordering::Release);
+    renderer.refresh_geometry();
+    assert_eq!(renderer.repaint_requested.load(Ordering::Acquire), 0);
+    assert!(renderer.output.lock().unwrap().frame.is_none());
+}
