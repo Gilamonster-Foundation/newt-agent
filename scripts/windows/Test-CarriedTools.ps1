@@ -52,6 +52,16 @@ try {
     Check-Tool echo @('carried','echo') 0 "carried echo`n"
     Check-Tool tr @('a-z','A-Z') 0 "B`nA`nA`n" "b`na`na`n"
     Check-Tool grep @('-n','alpha','data.txt') 0 "1:alpha`n3:alpha beta`n"
+    # #2790: BRE interior anchors / leading stars are literals, not rg operators.
+    Check-Tool grep @('a^b') 0 "a^b`n" "a^b`nab`n"
+    Check-Tool grep @('a$b') 0 ('a$b' + "`n") ('a$b' + "`nab`n")
+    Check-Tool grep @('*') 0 "*alpha`n" "*alpha`nalpha`n"
+    Check-Tool grep @('^*') 0 "*alpha`n" "*alpha`nalpha*`n"
+    Check-Tool grep @('^*alpha$') 0 "*alpha`n" "*alpha`n*alphabeta`n"
+    Check-Tool grep @('^alpha$') 0 "alpha`n" "alpha`nalphabet`nxalpha`n"
+    Check-Tool grep @('^a*$') 0 "aaa`n" "aaa`naba`n"
+    Check-Tool grep @('\(*\)') 2 '' "*`n"
+    Check-Tool grep @('a**') 2 '' "aaa`n"
     Check-Tool grep @('-E','alpha|beta','data.txt') 0 "alpha`nbeta`nalpha beta`n"
     Check-Tool grep @('-c','absent','data.txt') 1 "0`n"
     Check-Tool grep @('-c','alpha','data.txt') 0 "2`n"
