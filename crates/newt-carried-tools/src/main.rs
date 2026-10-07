@@ -1,4 +1,5 @@
 //! Ordinary ambient helpers: independent of confined private worker dispatch.
+mod which;
 use std::ffi::OsStr;
 use std::path::Path;
 fn main() {
@@ -24,6 +25,7 @@ fn main() {
         "cut" => uu_cut::uumain(std::env::args_os()),
         "echo" => uu_echo::uumain(std::env::args_os()),
         "grep" => grep(&args[1..]),
+        "which" => which::run(&args[1..]),
         _ => {
             eprintln!(
                 "Invoke an installed tool name (cat, head, grep, ...), not newt-carried-tools."

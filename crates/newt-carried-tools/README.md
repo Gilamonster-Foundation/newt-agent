@@ -4,13 +4,16 @@ Standalone ambient command pack for #2776. This crate does not change Newt's
 shell routing or authorize any confined/private worker dispatch. License follows
 the workspace; uutils 0.12.0 is MIT (LICENSE-uutils). The ripgrep archive carries
 its own COPYING, LICENSE-MIT and UNLICENSE, retained by the installer.
+BusyBox-w32 is GPLv2 (LICENSE-busybox); its corresponding-source URL ships alongside.
 
 ## Build and install (Windows x86-64)
 
 ```powershell
 cargo build -p newt-carried-tools --release --locked
+cargo build -p newt-agent --bin newt-ambient-brush --release --locked
 ./scripts/windows/Install-CarriedTools.ps1 `
   -BinaryPath target/release/newt-carried-tools.exe -NewtDirectory <release-dir>
+Copy-Item target/release/newt-ambient-brush.exe <release-dir>/tools/
 ./scripts/windows/Test-CarriedTools.ps1 -ToolsDirectory <release-dir>/tools
 ```
 
@@ -18,16 +21,21 @@ The release directory must exist and must not contain `tools`. Installation
 stages into a temporary directory, verifies the pinned upstream archive before
 extraction, then moves the completed tools directory into place. It never edits
 PATH or overwrites a live installation. `-RipgrepArchive` permits offline use of
-the exact same verified archive. Build the multicall for the destination OS.
+the exact same verified archive. `-BusyboxArchive` similarly accepts the pinned
+BusyBox executable (upstream distributes it uncompressed). Build the multicall for the destination OS.
 
 PR 2's layout contract, relative to `newt.exe`:
 
 ```text
 tools/newt-carried-tools.exe
-tools/{cat,head,tail,wc,ls,mkdir,rm,cp,mv,sort,uniq,tr,cut,echo,grep}.exe
+tools/{cat,head,tail,wc,ls,mkdir,rm,cp,mv,sort,uniq,tr,cut,echo,grep,which}.exe
+tools/{sed,awk,xargs}.exe
+tools/newt-ambient-brush.exe
 tools/rg.exe
 tools/ripgrep-{COPYING,LICENSE-MIT,UNLICENSE}
 tools/LICENSE-uutils
+tools/LICENSE-busybox
+tools/busybox-SOURCE.txt
 ```
 
 Per-name executables are hardlinks where supported, otherwise byte copies.
@@ -35,8 +43,9 @@ Archives that do not preserve hardlinks may expand their size; installers can
 recreate them using this script. Invocation dispatches by executable basename.
 `grep.exe` invokes only the absolute adjacent `rg.exe`, with inherited stdio,
 never a shell or PATH search. PR 2 must prepend this tools directory to its
-sanitized child PATH so descendants can also resolve names. No xargs is shipped:
-it belongs to findutils and needs its own native validation.
+sanitized child PATH so descendants can also resolve names. Only sed, awk and xargs are exposed from BusyBox: there is no busybox.exe,
+sh.exe or applet installation step. This limits PATH exposure, not the compiled
+capabilities of the upstream multicall binary.
 
 All 14 uutils crates are pinned to 0.12.0. The installer obtains upstream ripgrep
 14.1.1 x86_64-pc-windows-msvc.zip, pinned SHA256
@@ -46,6 +55,28 @@ Newt's Chocolatey packaging, not a new Newt artifact identity scheme. Update the
 version, archive pin and native evidence together. Other architectures are not
 packaged by this installer. This PR provides staging; wiring release distribution
 and default-on shell selection belongs to the following integration.
+
+## Added commands (#2795)
+
+BusyBox-w32 **FRP-6075-g169694ebd**, x64 Unicode build (Windows 10 1903+),
+is pinned at `https://frippery.org/files/busybox/busybox-w64u-FRP-6075-g169694ebd.exe`
+with SHA256 `6e263d154d8548d1eb936f65d1d8312c80df31c45974e48d6335e4dcc0f4f34c`.
+The GPLv2 license is copied verbatim from that release's source tarball.
+`busybox-SOURCE.txt` points to its corresponding source tarball on frippery.org.
+Checksums are verified before copying executables into the completed pack;
+corruption aborts installation and removes staging. Native tests cover renamed
+hardlinks and independent copies, plus Brush pipelines and quoting for
+`sed -n '2,3p'`, `sed -i 's/x/y/'`, `awk '{print $1}'`, `xargs -n1`, and `xargs -I{}`.
+These are BusyBox applets, not a claim of full GNU utility compatibility.
+
+`which [-a] [--] command ...` is implemented here with no additional dependency.
+It searches PATH in order and, on Windows, PATHEXT in order (default
+`.COM;.EXE;.BAT;.CMD` when unset). Explicit paths are checked directly;
+recognized extensions are not appended twice. `-a` prints every distinct match;
+by default only the first is printed. Exit 1 means at least one command was not
+found; malformed options or no names exit 2. On Unix, matches must be regular
+files with executable permission bits. On Windows, files must have a PATHEXT
+extension. It reports paths, never executes the located commands.
 
 ## Bounded grep contract
 
