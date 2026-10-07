@@ -165,3 +165,38 @@ fn worktree_2810_writable_tail_is_not_a_display_identity() {
     assert!(admission.is_err());
     assert!(!temp.path().join("fresh").exists());
 }
+
+/// #2810 round 2: admission must keep tail's stdin attached to the pipeline,
+/// not a file or replacement descriptor. Git's own 2>&1 remains supported.
+#[cfg(unix)]
+#[test]
+fn worktree_2810_admission_refuses_tail_input_redirects() {
+    use crate::agentic::tools::disable_ocap_tests::EnvVar;
+    let _env = crate::process_env::lock();
+    let (temp, _, _) = crate::worktree_adoption::tests::fixture(false);
+    let root = temp.path().join("main");
+    let _venv = EnvVar::unset("NEWT_VENV");
+    let _virtual_env = EnvVar::unset("VIRTUAL_ENV");
+    let _paths = EnvVar::set("NEWT_EXEC_PATHS", "/usr/bin:/bin");
+    let caveats = Caveats {
+        fs_write: crate::Scope::only([temp.path().to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let admit = |redirect: &str| {
+        creation_admission(
+            false,
+            "run_command",
+            &serde_json::json!({"command":format!("git worktree add -b task ../fresh 2>&1 | tail -5 {redirect} && git status --short")}),
+            root.to_str().unwrap(),
+            &caveats,
+            crate::ShellEngine::Brush,
+            |_| Ok(PathBuf::from("/fixture/git")),
+        )
+    };
+    assert!(admit("").is_ok_and(|candidate| candidate.is_some()));
+    let accepted: Vec<_> = ["< victim", "<&3", "0<&3"]
+        .into_iter()
+        .filter(|redirect| admit(redirect).is_ok())
+        .collect();
+    assert!(accepted.is_empty(), "admitted tail redirects: {accepted:?}");
+}

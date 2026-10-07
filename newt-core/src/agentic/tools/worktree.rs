@@ -294,7 +294,12 @@ fn creation_batch_is_read_only_after_add(
             // #2810: bounded stdin-only tail is read-only, but its basename
             // is not identity. pin() authenticates and pins its executable
             // before the batch may run with creation authority.
-            Some("tail") => super::super::routing::parse_trim_spec(&words.join(" ")).is_some(),
+            Some("tail") => {
+                // #2810: stdin must remain the pipeline, not a file or a
+                // replacement descriptor. Git's 2>&1 is on the Git stage.
+                c.redirects.is_empty()
+                    && super::super::routing::parse_trim_spec(&words.join(" ")).is_some()
+            }
             // Only actual shell builtins have an intrinsic implementation.
             Some(program) => display_builtin(program, engine),
             None => false,
