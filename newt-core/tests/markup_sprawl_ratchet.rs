@@ -1747,28 +1747,41 @@ fn the_real_workspace_root_set_is_unchanged() {
     let roots = production_roots(&workspace_root());
     assert_eq!(
         roots.len(),
-        27,
-        "26 production members + newt-web; a change here rescopes every \
+        28,
+        "27 production members + newt-web; a change here rescopes every \
          law and every baseline. Moved 21 -> 22 by #1828 A2.0, which adds \
          the `newt-interaction` protocol crate; 22 -> 23 by the \
          `crates/newt-launch` launch-configuration crate; 23 -> 24 by \
          `agent-frame`, the derivation kernel incubated here through 0.1.0 \
          (#2246); 24 -> 26 adds agent-harness and agent-harness-py for \
          the smart-harness implementation of #2243; 26 -> 27 adds the \
-         extractable agent-toolchain crate. All production laws also scan \
+         extractable agent-toolchain crate; 27 -> 28 adds the standalone \
+         `crates/newt-carried-tools` command pack (#2776). All production laws also scan \
          these new crates; their existing baselines do not increase"
     );
-    for member in ["agent-harness", "agent-harness-py", "agent-toolchain"] {
+    for member in [
+        "agent-harness",
+        "agent-harness-py",
+        "agent-toolchain",
+        "crates/newt-carried-tools",
+    ] {
         assert!(roots.contains(&workspace_root().join(member).join("src")));
     }
     let toolchain_lib = workspace_root().join("agent-toolchain/src/lib.rs");
+    let carried_lib = workspace_root().join("crates/newt-carried-tools/src/lib.rs");
+    let mut scanned_carried = false;
     let mut scanned_toolchain = false;
     for_each_production_line(&roots, &no_extra_skips, &mut |path, _, _| {
         scanned_toolchain |= path == toolchain_lib;
+        scanned_carried |= path == carried_lib;
     });
     assert!(
         scanned_toolchain,
         "the production-law walker must visit the new agent-toolchain crate"
+    );
+    assert!(
+        scanned_carried,
+        "#2776: production laws must scan the carried command pack"
     );
     let names: Vec<String> = roots
         .iter()
