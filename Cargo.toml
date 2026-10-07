@@ -18,6 +18,7 @@ members = [
     "newt-scheduler",
     "newt-git",
     "crates/newt-launch",
+    "crates/newt-carried-tools",
     "crates/newt-tuner",
     "newt-eval",
     "newt-agent-py",
