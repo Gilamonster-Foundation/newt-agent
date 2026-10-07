@@ -33,8 +33,8 @@ pub use context::{
 pub use crew::{Crew, CrewBudgets, CrewPolicyConfig};
 pub use dropin::*;
 pub(crate) use layering::{
-    expand_tilde, find_ancestor_dir, find_project_config_from, home_dir, merge_project_overlay,
-    merge_toml, strip_control_plane,
+    expand_tilde, find_ancestor_dir, find_project_config_from, find_project_file_from, home_dir,
+    merge_project_overlay, merge_toml, strip_control_plane,
 };
 pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use loadout::{Loadout, LoadoutSettings};
