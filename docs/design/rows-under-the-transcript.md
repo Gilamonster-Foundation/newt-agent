@@ -117,6 +117,17 @@ The query is bounded: it waits up to 300 ms for the turn watcher's stdin
 token, and a terminal that lets the query time out is not asked again for a
 minute (a frame on every tool chunk cannot pay two seconds each time); in
 both cases the frame is painted nowhere rather than somewhere guessed.
+A queued quiet query reserves the next stdin turn: the polling watcher cannot
+reacquire ahead of it and starve the bounded wait. This also applies to first
+placement, before any existing frame or screen-height comparison is involved.
+
+If placement refuses after erasing a visible frame, that generation retains a
+replacement request. Later watcher ticks retry even though geometry is now
+unchanged; the request survives repeated refusals and clears on success or
+when the viewport is finished or discarded. The watcher checks this without
+blocking on the output lock, which the waiting painter may hold. A first
+placement refusal still belongs to the caller's plain-output fallback and
+does not schedule a late frame over that output.
 
 `cursor_relative_region_painters_are_the_declared_holdouts` retains its
 `live_spill.rs` entry for that width-reflow limitation: holding a lease does
