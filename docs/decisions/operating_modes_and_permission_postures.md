@@ -34,9 +34,9 @@ and a posture never silently changes the requested workflow.
   next-turn-only: it cannot change the disposition, caveats, or permissions
   already frozen for the current turn. Protected ask, research, explanation,
   and plan intake wins over a stored action style. Before the model makes a
-  selection, a deterministic fallback maps action, research, and explanation
-  intake to `dev`, `diagnose`, and `chat`, with explicit planning or
-  administration language selecting those bounded styles.
+  selection, a deterministic fallback maps action, research, explanation, and
+  plan intake to `dev`, `diagnose`, `chat`, and `plan`, with explicit planning
+  or administration language selecting those bounded styles.
 - `full-auto` — carry safe, in-scope work to completion with minimal
   interruption; it still cannot bypass permissions or unresolved human
   decisions.

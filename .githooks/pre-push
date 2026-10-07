@@ -39,9 +39,10 @@
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
 #   - packaged carried commands (#2776), .github/workflows/ci.yml Windows job:
-#     builds newt-carried-tools, verifies the pinned rg archive, stages per-name
-#     executables, and runs scripts/windows/Test-CarriedTools.ps1 natively.
-#     Portable argv translation tests remain in the scoped Rust test gate.
+#     builds newt-carried-tools and the Brush runner, verifies pinned rg/BusyBox,
+#     stages only approved per-name executables, and runs scripts/windows/Test-CarriedTools.ps1 natively.
+#     Native Brush checks cover sed/awk/xargs/which (#2795).
+#     Portable argv translation and PATH/PATHEXT tests remain in the scoped Rust gate.
 #   - ambient worktree dispatch proof (#2750), .github/workflows/ci.yml test job:
 #     explicitly runs the exact ignored fullaccess_tests::adoption_2750_full_access_creation_then_task_command
 #     in newt-core's worktree module. Real Git/host shell, Linux CI only.

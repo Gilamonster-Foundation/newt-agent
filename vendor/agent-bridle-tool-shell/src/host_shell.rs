@@ -269,7 +269,7 @@ impl Tool for HostShellTool {
         let mut command = ConfinedCommand::new(&self.shell)
             .new_process_group()
             .arg("-c")
-            .arg(&cmd)
+            .arg(crate::with_posix_command_discovery(&cmd))
             .sandbox_policy(Arc::clone(&self.sandbox))
             .stdin(agent_bridle_core::ConfinedStdio::Null)
             .stdout(agent_bridle_core::ConfinedStdio::Piped)

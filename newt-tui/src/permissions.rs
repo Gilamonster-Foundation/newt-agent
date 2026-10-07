@@ -650,6 +650,47 @@ fn decision_scope(choice: PromptChoice) -> &'static str {
     }
 }
 
+/// A small named-choice form for one question, as an interaction: the
+/// decision shape a permission prompt has, offered to any asker with a few
+/// named answers (a plan approval's yes / no / discuss). The first option is
+/// the default a blank submission resolves to.
+pub(crate) fn choice_form(
+    question: &str,
+    options: &[newt_core::agentic::ChoiceSpec],
+) -> SurfaceInteraction {
+    let choices: Vec<ChoiceOption> = options
+        .iter()
+        .map(|option| ChoiceOption {
+            id: OptionId::new(option.id).expect(WIRE_NAMES_ARE_OPTION_IDS),
+            role: option.role,
+            label: option.label.to_string(),
+            key: option.key.to_string(),
+            aliases: Vec::new(),
+        })
+        .collect();
+    let controls = vec![Control {
+        id: ControlId::new(DECISION_CONTROL).expect(WIRE_NAMES_ARE_OPTION_IDS),
+        kind: ControlKind::Choice { options: choices },
+        label: String::new(),
+        requirement: Requirement::Required,
+    }];
+    let kind = if newt_interaction::controls_are_decision_shaped(&controls) {
+        InteractionKind::Confirm
+    } else {
+        InteractionKind::Choice
+    };
+    let definition = InteractionDefinition {
+        note: Some(MODAL_CONTROL_HINT.into()),
+        ..InteractionDefinition::new(kind, question.to_string(), controls)
+    };
+    let interaction = SurfaceInteraction::blocking(definition);
+    match options.first() {
+        Some(first) => interaction
+            .with_default_option(OptionId::new(first.id).expect(WIRE_NAMES_ARE_OPTION_IDS)),
+        None => interaction,
+    }
+}
+
 /// The free-text form for one question, as a definition.
 ///
 /// Split out by C1 (#1862) so the SESSION can build the semantic form while
@@ -1950,6 +1991,40 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 HumanQuestionOutcome::Cancelled
             }
             // Ctrl-C / Ctrl-D: cancel the turn AND request exit.
+            HumanQuestionOutcome::ExitRequested => {
+                self.apply_control(PromptChoice::Exit);
+                HumanQuestionOutcome::ExitRequested
+            }
+            other => other,
+        }
+    }
+
+    fn ask_choice(
+        &mut self,
+        question: &str,
+        options: &[newt_core::agentic::ChoiceSpec],
+    ) -> HumanQuestionOutcome {
+        // Same seam as `ask_question`: the session builds the form, whichever
+        // surface owns the terminal renders and reads it, and the control
+        // side effects stay here.
+        let interaction = choice_form(question, options);
+        let outcome = match self.ask_surface {
+            Some(ask) => ask(&interaction),
+            None => {
+                let w =
+                    Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionQuestion);
+                present_on_terminal(&w, &interaction)
+            }
+        };
+        match outcome {
+            // A blank submission is the default option, never an empty answer.
+            HumanQuestionOutcome::Answer(answer) => {
+                HumanQuestionOutcome::Answer(interaction.answer_or_default(&answer).to_string())
+            }
+            HumanQuestionOutcome::Cancelled => {
+                self.apply_control(PromptChoice::Back);
+                HumanQuestionOutcome::Cancelled
+            }
             HumanQuestionOutcome::ExitRequested => {
                 self.apply_control(PromptChoice::Exit);
                 HumanQuestionOutcome::ExitRequested

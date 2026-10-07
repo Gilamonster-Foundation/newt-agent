@@ -252,6 +252,71 @@ pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
     )))
 }
 
+/// The operator's one-row view of an `update_plan` that moved an EXISTING
+/// plan along: `step 3 of 7: extract denials.rs`, or `plan complete: 7 of 7
+/// done` once every step is done. `None` when the plan is new or its steps
+/// were rewritten — the full `<plan>` block is the right view then — and
+/// when nothing is active. Pure; the executor shows this in place of the
+/// block the model still receives.
+///
+/// "The same plan" means the same ordered descriptions: a tick moves only
+/// statuses, a rewrite changes words, and a rewrite deserves the block.
+#[must_use]
+pub fn step_change_line(before: &PlanSnapshot, after: &PlanSnapshot) -> Option<String> {
+    if before.is_empty() || !same_plan(before, after) {
+        return None;
+    }
+    let total = after.len();
+    let done = after
+        .steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Done)
+        .count();
+    match after
+        .steps
+        .iter()
+        .position(|s| s.status == StepStatus::Active)
+    {
+        Some(active) => Some(format!(
+            "step {} of {total}: {}",
+            active + 1,
+            truncate(&after.steps[active].description, STEP_DESC_CAP)
+        )),
+        None if done == total => Some(format!("plan complete: {done} of {total} done")),
+        None => None,
+    }
+}
+
+fn same_plan(a: &PlanSnapshot, b: &PlanSnapshot) -> bool {
+    a.len() == b.len()
+        && a.steps
+            .iter()
+            .zip(&b.steps)
+            .all(|(x, y)| x.description == y.description)
+}
+
+/// Whether this `update_plan` produced a multi-step plan worth presenting to
+/// the operator first: there was no multi-step plan before, the previous one
+/// had finished, or an unrelated plan (no step in common) replaced it. A tick
+/// or an amendment that keeps a step is not fresh, so one plan asks for
+/// approval once, and the next task's plan asks again. (Reuses
+/// `plan_reseat_pointer`'s multi-step threshold.)
+#[must_use]
+pub fn fresh_multi_step_plan(before: &PlanSnapshot, after: &PlanSnapshot) -> bool {
+    if after.len() < 2 {
+        return false;
+    }
+    if before.len() < 2 {
+        return true;
+    }
+    let before_finished = before.steps.iter().all(|s| s.status == StepStatus::Done);
+    let shares_a_step = before
+        .steps
+        .iter()
+        .any(|b| after.steps.iter().any(|a| a.description == b.description));
+    before_finished || !shares_a_step
+}
+
 // ---------------------------------------------------------------------------
 // Tool schemas (advertised only when the feature is on + a ledger is present)
 // ---------------------------------------------------------------------------
@@ -617,6 +682,94 @@ mod tests {
             "total cap bounds the block"
         );
         assert!(capped.contains("plan truncated"), "{capped}");
+    }
+
+    fn snapshot(steps: &[(&str, StepStatus)]) -> PlanSnapshot {
+        PlanSnapshot {
+            steps: steps
+                .iter()
+                .map(|(d, status)| Step {
+                    description: (*d).to_string(),
+                    status: *status,
+                })
+                .collect(),
+        }
+    }
+
+    /// A tick of an existing plan is one row; a new or rewritten plan is not
+    /// narrated (the block is), and a finished plan says so.
+    #[test]
+    fn step_change_line_narrates_ticks_and_completion_only() {
+        use StepStatus::{Active, Done, Todo};
+        let fresh = snapshot(&[("inspect", Active), ("repair", Todo)]);
+        assert_eq!(
+            step_change_line(&PlanSnapshot::default(), &fresh),
+            None,
+            "new plan"
+        );
+        let ticked = snapshot(&[("inspect", Done), ("repair", Active)]);
+        assert_eq!(
+            step_change_line(&fresh, &ticked).as_deref(),
+            Some("step 2 of 2: repair")
+        );
+        // A redundant resend of the same state is cheap and silent: the same row.
+        assert_eq!(
+            step_change_line(&ticked, &ticked).as_deref(),
+            Some("step 2 of 2: repair")
+        );
+        let rewritten = snapshot(&[("inspect", Done), ("repair the parser", Active)]);
+        assert_eq!(step_change_line(&ticked, &rewritten), None, "rewritten");
+        let grown = snapshot(&[("inspect", Done), ("repair", Active), ("test", Todo)]);
+        assert_eq!(step_change_line(&ticked, &grown), None, "grown");
+        let finished = snapshot(&[("inspect", Done), ("repair", Done)]);
+        assert_eq!(
+            step_change_line(&ticked, &finished).as_deref(),
+            Some("plan complete: 2 of 2 done")
+        );
+        let parked = snapshot(&[("inspect", Done), ("repair", Todo)]);
+        assert_eq!(step_change_line(&ticked, &parked), None, "nothing active");
+    }
+
+    /// One plan asks once: only the transition from "no multi-step plan" to
+    /// "a multi-step plan" is fresh.
+    #[test]
+    fn fresh_multi_step_plan_fires_once() {
+        use StepStatus::{Active, Done, Todo};
+        let none = PlanSnapshot::default();
+        let one = snapshot(&[("inspect", Active)]);
+        let two = snapshot(&[("inspect", Active), ("repair", Todo)]);
+        let ticked = snapshot(&[("inspect", Done), ("repair", Active)]);
+        let three = snapshot(&[("inspect", Done), ("repair", Active), ("test", Todo)]);
+        assert!(fresh_multi_step_plan(&none, &two));
+        assert!(fresh_multi_step_plan(&one, &two));
+        assert!(
+            !fresh_multi_step_plan(&none, &one),
+            "single step never asks"
+        );
+        assert!(!fresh_multi_step_plan(&two, &ticked), "a tick is not fresh");
+        assert!(
+            !fresh_multi_step_plan(&two, &three),
+            "an amendment is not fresh"
+        );
+        let finished = snapshot(&[("inspect", Done), ("repair", Done)]);
+        let next_task = snapshot(&[("read the loader", Active), ("rewrite it", Todo)]);
+        assert!(
+            fresh_multi_step_plan(&finished, &next_task),
+            "after completion, the next plan asks"
+        );
+        assert!(
+            fresh_multi_step_plan(&ticked, &next_task),
+            "an unrelated plan mid-flight asks"
+        );
+        let reworded = snapshot(&[
+            ("inspect", Done),
+            ("repair the parser", Active),
+            ("test", Todo),
+        ]);
+        assert!(
+            !fresh_multi_step_plan(&ticked, &reworded),
+            "a rewrite keeping a step is an amendment"
+        );
     }
 
     #[test]

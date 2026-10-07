@@ -516,6 +516,45 @@ fn does_not_steer_successful_write_capable_run_command() {
     );
 }
 
+/// PR #2799: repeats of context-held skills are cheap successes, never refusal
+/// protocols. Workspace changes and committed compaction allow a fresh load.
+#[test]
+fn skill_2799_reuse_is_success_and_context_scoped() {
+    let args = serde_json::json!({"name":"repository-roadmap"});
+    let (_dir, workspace, caveats) = read_memo_fixture("src/lib.rs", "x");
+    let scope = ReadScope {
+        workspace: &workspace,
+        caveats: &caveats,
+    };
+    let mut guard = RepeatCallGuard::default();
+    for compact in [true, false] {
+        assert!(guard.cached_read("use_skill", &args, scope).is_none());
+        guard.record("use_skill", &args, true, "# Read the roadmap", None, scope);
+        assert!(guard.repeat_steer("use_skill", &args).is_none());
+        assert_eq!(
+            guard.cached_read("use_skill", &args, scope).as_deref(),
+            Some("Skill `repository-roadmap` is loaded in the current context.")
+        );
+        assert!(guard
+            .cached_read("use_skill", &serde_json::json!({"name":"other"}), scope)
+            .is_none());
+        if compact {
+            guard.release_read_memos();
+        } else {
+            guard.record(
+                "write_file",
+                &serde_json::json!({"path":"SKILL.md","content":"changed"}),
+                true,
+                "wrote file",
+                None,
+                scope,
+            );
+        }
+        assert!(guard.cached_read("use_skill", &args, scope).is_none());
+        assert!(guard.repeat_steer("use_skill", &args).is_none());
+    }
+}
+
 #[test]
 fn classifier_leaves_ordinary_successes_repeatable() {
     // #2637: a bare read (no offset/limit) is ALSO an ordinary, non-refusing

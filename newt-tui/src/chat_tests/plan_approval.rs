@@ -92,6 +92,7 @@ fn a_plan_turn_that_presented_a_draft_is_asked_even_without_the_model_flag() {
         /* model_entered_plan */ false,
         /* exit_requested */ false,
         /* presented_draft */ true,
+        false
     ));
 }
 
@@ -104,6 +105,7 @@ fn a_plan_turn_with_no_draft_is_not_asked() {
         false,
         false,
         /* presented_draft */ false,
+        false
     ));
 }
 
@@ -117,9 +119,11 @@ fn model_entered_plan_with_a_draft_is_asked_and_a_plain_act_turn_is_not() {
         /* model_entered_plan */ true,
         false,
         /* presented_draft */ true,
+        false
     ));
     assert!(!plan_approval_due(
         PromptDisposition::Act,
+        false,
         false,
         false,
         false
@@ -135,11 +139,13 @@ fn an_exit_request_is_always_asked() {
         false,
         /* exit_requested */ true,
         /* presented_draft */ false,
+        false
     ));
     assert!(plan_approval_due(
         PromptDisposition::Plan,
         false,
         true,
+        false,
         false
     ));
 }
@@ -155,10 +161,92 @@ fn a_non_plan_disposition_is_not_asked_without_an_exit_request() {
         PromptDisposition::Research,
     ] {
         assert!(
-            !plan_approval_due(disposition, false, false, true),
+            !plan_approval_due(disposition, false, false, true, false),
             "{disposition:?} is not a plan turn"
         );
     }
+}
+
+/// A Plan turn that set a multi-step plan in the harness ledger drafted a
+/// plan the operator can read, so it is asked even with no `render_report`
+/// draft; an Act turn's first plan reaches the hook as an exit request
+/// instead, never through this flag alone.
+#[test]
+fn a_plan_turn_that_set_a_ledger_plan_is_asked_without_a_draft() {
+    assert!(plan_approval_due(
+        PromptDisposition::Plan,
+        false,
+        false,
+        /* presented_draft */ false,
+        /* set_plan_this_turn */ true,
+    ));
+    assert!(!plan_approval_due(
+        PromptDisposition::Act,
+        false,
+        false,
+        false,
+        /* set_plan_this_turn */ true,
+    ));
+}
+
+/// With no presented draft, approval seeds implementation from the ledger's
+/// own `<plan>` block — the plan the operator just read.
+#[test]
+fn approval_seeds_the_ledger_plan_when_no_draft_was_presented() {
+    let states = ConversationModeStates::default();
+    let a = objective("refactor the parser");
+    states.plan.set_plan_mode(true).unwrap();
+    let mut gate = ScriptedGate::new([answer("y")]);
+    let block = "<plan>\n✓ 1. inspect\n→ 2. repair\n</plan>";
+    let effects = run_plan_approval(
+        Some(&mut gate),
+        PlanEntry::ModelDuringAct,
+        &states.plan,
+        &states.plan_draft,
+        Some(&a),
+        PlanApprovalSeed {
+            exit_guidance: "GUIDANCE",
+            ledger_plan: Some(block),
+        },
+        false,
+    );
+    assert!(!states.plan.is_plan_mode(), "clamp lifted");
+    let (input, _) = effects.queued.expect("one continuation").into_input();
+    let ReadOutcome::Line(text) = input else {
+        panic!("a line of input")
+    };
+    assert!(text.contains("approved the plan below"), "{text}");
+    assert!(text.contains(block), "{text}");
+}
+
+/// `/mode full-auto` answers the question for the operator: nothing is
+/// asked, the clamp lifts, the seed runs, and the notice says why.
+#[test]
+fn full_auto_approves_without_asking() {
+    let states = ConversationModeStates::default();
+    let a = objective("A");
+    presented_plan(&states, &a, "# plan A");
+    let mut gate = ScriptedGate::new([]);
+    let effects = run_plan_approval(
+        Some(&mut gate),
+        PlanEntry::ModelDuringAct,
+        &states.plan,
+        &states.plan_draft,
+        Some(&a),
+        PlanApprovalSeed {
+            exit_guidance: "GUIDANCE",
+            ledger_plan: None,
+        },
+        true,
+    );
+    assert!(gate.asked.is_empty(), "no question under full-auto");
+    assert!(!states.plan.is_plan_mode(), "clamp lifted");
+    assert!(effects.queued.is_some());
+    assert!(
+        effects.notice.contains("auto-approved"),
+        "{}",
+        effects.notice
+    );
 }
 
 /// #2424: the seeded implementation turn carries the approved draft when
@@ -196,6 +284,25 @@ fn approval_intake_resumes_as_act_even_when_the_text_quotes_a_plan() {
     );
     assert_eq!(
         plan_approval_intake(&text, &lexicon).disposition(),
+        PromptDisposition::Act
+    );
+}
+
+/// The same decision holds when the seeded text itself opens collaboratively
+/// (the one wording intake reads as Plan on its own): approval is the
+/// operator's decision, so `resume_with` keeps Act rather than re-clamping
+/// the turn.
+#[test]
+fn approval_intake_resumes_as_act_even_when_the_text_opens_collaboratively() {
+    let lexicon = newt_core::agentic::DispositionLexicon::default();
+    let text = "let's refactor the parser";
+    assert_eq!(
+        newt_core::agentic::PromptIntake::analyze_with(text, &lexicon).disposition(),
+        PromptDisposition::Plan,
+        "control: on its own this wording reads as Plan"
+    );
+    assert_eq!(
+        plan_approval_intake(text, &lexicon).disposition(),
         PromptDisposition::Act
     );
 }
@@ -246,6 +353,45 @@ impl PermissionGate for ScriptedGate {
             .pop()
             .expect("a scripted outcome per question")
     }
+    fn ask_choice(
+        &mut self,
+        question: &str,
+        options: &[newt_core::agentic::ChoiceSpec],
+    ) -> HumanQuestionOutcome {
+        assert_eq!(
+            options.iter().map(|o| o.id).collect::<Vec<_>>(),
+            vec!["no", "yes", "discuss"],
+            "the plan question offers exactly its three answers, no first"
+        );
+        self.ask_question(question)
+    }
+}
+
+/// `discuss` is a selection that opens one free-text follow-up; the words
+/// typed there are the feedback the model receives, under the clamp.
+#[test]
+fn discuss_opens_one_follow_up_and_feeds_its_text_back() {
+    let states = ConversationModeStates::default();
+    let a = objective("A");
+    presented_plan(&states, &a, "# plan A");
+    let mut gate = ScriptedGate::new([answer("discuss"), answer("split transport first")]);
+    let effects = approve(&mut gate, &states, PlanEntry::ModelDuringAct, Some(&a));
+    assert_eq!(gate.asked.len(), 2, "{:?}", gate.asked);
+    assert!(
+        gate.asked[1].starts_with("What should change"),
+        "{:?}",
+        gate.asked
+    );
+    assert!(states.plan.is_plan_mode(), "the clamp stays");
+    let (input, origin) = effects.queued.expect("the feedback runs next").into_input();
+    let ReadOutcome::Line(text) = input else {
+        panic!("a line of input")
+    };
+    assert_eq!(text, "split transport first");
+    assert!(matches!(
+        origin,
+        ModelInputOrigin::OperatorContinuation { .. }
+    ));
 }
 
 fn answer(text: &str) -> HumanQuestionOutcome {
@@ -288,7 +434,11 @@ fn approve(
         &states.plan,
         &states.plan_draft,
         parent,
-        "GUIDANCE",
+        PlanApprovalSeed {
+            exit_guidance: "GUIDANCE",
+            ledger_plan: None,
+        },
+        false,
     )
 }
 
@@ -371,7 +521,11 @@ fn every_non_approval_outcome_queues_nothing_and_keeps_the_clamp() {
         &states.plan,
         &states.plan_draft,
         Some(&a),
-        "GUIDANCE",
+        PlanApprovalSeed {
+            exit_guidance: "GUIDANCE",
+            ledger_plan: None,
+        },
+        false,
     );
     assert!(effects.queued.is_none());
     assert!(states.plan.is_plan_mode());
@@ -582,4 +736,77 @@ fn the_presented_snapshot_is_the_saved_markdown_byte_for_byte() {
     let shown = presented_plan(&states, &a, "# Title\n\n1. step one\n");
     assert_eq!(shown.draft.markdown, "# Title\n\n1. step one\n");
     assert_eq!(shown.draft.revision, 1);
+}
+
+/// PR #2799 review: choosing discuss binds the follow-up to feedback, even
+/// when its verbatim text would approve or reject the separate decision prompt.
+#[test]
+fn discussion_2799_cannot_be_reinterpreted_as_approval_or_rejection() {
+    for entry in [
+        PlanEntry::ModelDuringAct,
+        PlanEntry::OperatorSelected,
+        PlanEntry::IntakeInferred,
+    ] {
+        for feedback in ["yes", "continue", "go", "no", "  yes\n"] {
+            let states = ConversationModeStates::default();
+            let parent = objective("A");
+            presented_plan(&states, &parent, "# plan A");
+            let mut gate = ScriptedGate::new([answer("discuss"), answer(feedback)]);
+            let effects = approve(&mut gate, &states, entry, Some(&parent));
+            assert!(
+                states.plan.is_plan_mode(),
+                "{entry:?}/{feedback:?}: clamp lifted"
+            );
+            assert!(!effects.switch_to_dev, "discussion cannot switch mode");
+            let (input, origin) = effects.queued.expect("verbatim feedback turn").into_input();
+            let ReadOutcome::Line(text) = input else {
+                panic!("feedback line")
+            };
+            assert_eq!(text, feedback);
+            assert!(matches!(
+                origin,
+                ModelInputOrigin::OperatorContinuation { .. }
+            ));
+            assert!(
+                states
+                    .plan_draft
+                    .take_approved(parent.active().root_prompt_id())
+                    .is_some(),
+                "discussion consumed approval snapshot"
+            );
+            assert_eq!(gate.asked.len(), 2);
+        }
+    }
+}
+
+/// PR #2799 review: cancelling the discussion (or losing input) cannot approve
+/// the plan, discard its snapshot, or seed an implementing turn.
+#[test]
+fn discussion_2799_unanswered_follow_up_retains_clamp_and_snapshot() {
+    for outcome in [
+        HumanQuestionOutcome::Cancelled,
+        HumanQuestionOutcome::Unavailable,
+        HumanQuestionOutcome::InputClosed,
+        HumanQuestionOutcome::ExitRequested,
+        answer(""),
+    ] {
+        let states = ConversationModeStates::default();
+        let parent = objective("A");
+        presented_plan(&states, &parent, "# plan A");
+        let mut gate = ScriptedGate::new([answer("discuss"), outcome.clone()]);
+        let effects = approve(
+            &mut gate,
+            &states,
+            PlanEntry::OperatorSelected,
+            Some(&parent),
+        );
+        assert!(states.plan.is_plan_mode(), "{outcome:?}");
+        assert!(!effects.switch_to_dev);
+        assert!(effects.queued.is_none());
+        assert!(states
+            .plan_draft
+            .take_approved(parent.active().root_prompt_id())
+            .is_some());
+        assert_eq!(gate.asked.len(), 2);
+    }
 }

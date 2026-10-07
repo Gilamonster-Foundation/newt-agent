@@ -278,6 +278,13 @@ tool calls, and seq 305 after its single nudge was spent.
 *Failure mode:* a model in a genuine narration loop burns cap+N
 rounds; keep it small and per-model-tunable.
 
+- Sibling knob `[tui] narration_intent_line` (default false): appends one
+  sentence to the system prompt asking the model to say, in one short
+  sentence, what it is about to do before each tool call and then make the
+  call in the same reply. Opt-in, because new model-facing prompt text must
+  earn its place from a live run (CLAUDE.md, "Harness design"); off, nothing
+  changes.
+
 **L4 — finish honest cap-exit (Phase 27.5).** When rounds were
 dominated by hallucination corrections / repeats / dead rounds, the
 banner should say that instead of "raise `[tui].max_tool_rounds`"

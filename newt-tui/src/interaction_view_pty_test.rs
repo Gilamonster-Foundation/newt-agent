@@ -1156,7 +1156,11 @@ fn the_interaction_frame_never_enters_the_alternate_screen() {
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_clean_close_leaves_the_terminal_exactly_as_it_was_found() {
-    assert_restored("clean", &drive("clean"));
+    let out = drive("clean");
+    assert_restored("clean", &out);
+    // PR #2799: a raw-mode guard must not consume the caller's input through
+    // a cursor query. The release byte must reach the child's own reader.
+    assert!(!out.screen.contains("\x1b[6n"), "{:?}", out.screen);
 }
 
 /// **The failure path.** The one that turns a bug into a wrecked terminal,
