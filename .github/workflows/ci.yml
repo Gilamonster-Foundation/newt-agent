@@ -549,7 +549,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           cargo build -p newt-carried-tools --locked
           if ($LASTEXITCODE -ne 0) { throw 'carried-tools build failed' }
-          cargo build -p newt-cli --bin newt-ambient-brush --locked
+          cargo build -p newt-agent --bin newt-ambient-brush --locked
           if ($LASTEXITCODE -ne 0) { throw 'ambient Brush build failed' }
           # target/ is cached; every invocation needs a fresh, uncached stage.
           $packageDirectory = Join-Path $env:RUNNER_TEMP ('carried-package-' + [guid]::NewGuid().ToString('N'))
