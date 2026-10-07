@@ -47,7 +47,7 @@ mod terminal {
     use newt_core::tty::{ControlReader, Echo, PromptLine};
     use newt_core::HumanQuestionOutcome;
     use newt_interaction::{ControlKind, SemanticRole};
-    use ratatui::layout::{Constraint, Layout, Position, Rect};
+    use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span as TuiSpan};
     use ratatui::widgets::{Paragraph, Wrap};
@@ -70,25 +70,6 @@ mod terminal {
     pub(crate) struct InlineGuard {
         /// Restores EXACTLY the mode this frame found — see below.
         _raw: RawModeGuard,
-        /// Where the transcript's cursor was when the frame opened, read in
-        /// raw mode before any viewport moved it; `None` when the terminal
-        /// did not answer (the cockpit case, which owns its own rows).
-        home: Option<Position>,
-        /// Whether the frame was PARKED below the transcript (a lease the
-        /// prompt holder shifted above the bottom rows) rather than opened at
-        /// the cursor. Only a parked frame owes the cursor back: a frame that
-        /// opened at the cursor scrolled the transcript to make room, and
-        /// `home` no longer names its last line.
-        parked: bool,
-    }
-
-    /// The row the cursor returns to once a frame is erased. A parked frame
-    /// left the transcript's last line untouched somewhere above, so the next
-    /// committed line belongs right under it, not at the bottom of the screen
-    /// where the frame was — the blank between the two was the complaint
-    /// (2026-10-06 and 2026-10-07, a permission prompt each time).
-    pub(crate) fn cursor_home_after_frame(home: Option<Position>, parked: bool) -> Option<u16> {
-        parked.then_some(home?.y)
     }
 
     impl InlineGuard {
@@ -102,24 +83,9 @@ mod terminal {
             // termios, so each frame restores what IT found and nesting
             // composes. `a_nested_frame_does_not_restore_the_terminal_early`
             // is the PTY test that caught this version doing it wrong.
-            let _raw = RawModeGuard::enter()?;
-            // Raw mode first: the cursor query is answered on this path
-            // only once the terminal is raw (the module doc of
-            // `inline_viewport` records why).
-            let home = crossterm::cursor::position()
-                .ok()
-                .map(|(x, y)| Position { x, y });
             Ok(Self {
-                _raw,
-                home,
-                parked: false,
+                _raw: RawModeGuard::enter()?,
             })
-        }
-
-        /// Record that the frame was parked below the transcript, so the
-        /// cursor is owed back on drop.
-        pub(crate) fn parked(&mut self) {
-            self.parked = true;
         }
     }
 
@@ -134,9 +100,6 @@ mod terminal {
                 crossterm::cursor::MoveToColumn(0),
                 Clear(ClearType::FromCursorDown)
             );
-            if let Some(row) = cursor_home_after_frame(self.home, self.parked) {
-                let _ = crossterm::execute!(out, crossterm::cursor::MoveTo(0, row));
-            }
         }
     }
 
@@ -329,21 +292,13 @@ mod terminal {
     fn inline_reader(interaction: &SurfaceInteraction) -> io::Result<ModalReader> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let height = requested_rows(interaction, cols).min(rows).max(1);
-        let mut guard = InlineGuard::enter()?;
+        let guard = InlineGuard::enter()?;
         // #1950: through the ONE inline constructor. A permission frame that
         // will not open is a decision the operator never gets to make.
         // #1979: Shift, for `config_panel`'s reason — a permission frame opens
         // DURING a turn, over whatever is already pinned to the bottom.
         let lease =
             crate::inline_viewport::lease_bottom_rows(height, newt_core::tty::OnCollision::Shift)?;
-        // The same test `inline_terminal` applies before it parks the cursor
-        // on the lease's top row: a lease the holder shifted above the bottom
-        // rows is drawn below the transcript, not at it.
-        if let newt_core::tty::Region::Rows { top, height } = lease.region() {
-            if top.saturating_add(height) < rows {
-                guard.parked();
-            }
-        }
         let terminal = crate::inline_viewport::inline_terminal(lease)?;
         let mut reader = ModalReader::new(terminal, interaction, false)?;
         reader._inline = Some(guard);
@@ -636,22 +591,6 @@ mod terminal {
                     label: String::new(), requirement: Requirement::Required,
                 }],
             ))
-        }
-
-        #[test]
-        fn the_cursor_returns_to_the_transcript_only_after_a_parked_frame() {
-            let home = Some(Position { x: 0, y: 3 });
-            assert_eq!(cursor_home_after_frame(home, true), Some(3));
-            assert_eq!(
-                cursor_home_after_frame(home, false),
-                None,
-                "opened at the cursor: it scrolled"
-            );
-            assert_eq!(
-                cursor_home_after_frame(None, true),
-                None,
-                "no answer, no guess"
-            );
         }
 
         #[test]
