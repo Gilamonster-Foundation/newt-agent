@@ -2666,13 +2666,17 @@ async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
         &mut gate,
     )
     .await;
+    // #2691: `python` is an interpreter basename, so `inspect_shell` refuses to
+    // project it and `requests_are_replay_safe` fails closed: the exec grant
+    // is queued for the model's re-issue, never replayed in-call. The
+    // venv-style spelling is the point of this fixture (a649356c), so pin that
+    // contract here rather than rename the symlink.
     assert!(
-        result.lines().any(|line| line == "EXACT_EXEC_OK"),
-        "real sandbox result: {result}"
-    );
-    assert!(
-        !result.starts_with("error:"),
-        "child must exit successfully: {result}"
+        result.starts_with(&format!(
+            "granted: the operator allowed exec for '{}'. Retry the original operation now.",
+            executable.display()
+        )),
+        "an interpreter grant is queued, not replayed in-call: {result}"
     );
     assert_eq!(
         gate.asks,
@@ -2685,6 +2689,25 @@ async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
     let granted = crate::agentic::widen_caveats(
         &base,
         &[(DenialKind::Exec, executable.to_string_lossy().into_owned())],
+    );
+    // The model's re-issue under the queued grant is the real Seatbelt launch:
+    // `process-exec*` re-allows the symlink's canonical image and the exact
+    // string grant pins it pre-spawn.
+    let launched = run_tool(
+        "run_command",
+        serde_json::json!({"command": command}),
+        &root,
+        &granted,
+        None,
+    )
+    .await;
+    assert!(
+        launched.lines().any(|line| line == "EXACT_EXEC_OK"),
+        "real sandbox result: {launched}"
+    );
+    assert!(
+        !launched.starts_with("error:"),
+        "child must exit successfully: {launched}"
     );
     let denied = run_tool(
         "run_command",
@@ -4326,6 +4349,13 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
     let ws = tempfile::tempdir().unwrap();
     let path_a = ws.path().join("a.txt").to_string_lossy().into_owned();
     let workspace_str = ws.path().to_string_lossy().into_owned();
+    // touch(1) is /bin/touch on Linux but only /usr/bin/touch on macOS, and
+    // the replay spawns argv[0] verbatim (no PATH lookup); probe the spelling
+    // the way agent-bridle's own spawn tests do.
+    let touch = ["/usr/bin/touch", "/bin/touch"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("touch(1) at a known absolute path");
     let base = Caveats {
         fs_write: crate::caveats::Scope::none(),
         fs_read: crate::caveats::Scope::none(),
@@ -4351,7 +4381,7 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
         };
         let mut pending_slot: Option<super::super::PendingRerun> =
             Some(super::super::PendingRerun {
-                cmd: format!("/bin/touch {path_a}"),
+                cmd: format!("{touch} {path_a}"),
                 cwd: workspace_str.clone(),
                 declared: missing.clone(),
                 missing: missing.clone(),
@@ -4402,7 +4432,7 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
         };
         let mut pending_slot: Option<super::super::PendingRerun> =
             Some(super::super::PendingRerun {
-                cmd: format!("/bin/touch {path_a}"),
+                cmd: format!("{touch} {path_a}"),
                 cwd: workspace_str.clone(),
                 declared: missing.clone(),
                 missing: missing.clone(),
@@ -4452,7 +4482,7 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
         };
         let mut pending_slot: Option<super::super::PendingRerun> =
             Some(super::super::PendingRerun {
-                cmd: format!("/bin/touch {path_a}"),
+                cmd: format!("{touch} {path_a}"),
                 cwd: workspace_str.clone(),
                 declared: missing.clone(),
                 missing: missing.clone(),
