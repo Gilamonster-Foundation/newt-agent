@@ -40,7 +40,8 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    expand_tilde, find_project_config_from, home_dir, merge_toml, ArrayMergeStrategy, Config,
+    expand_tilde, find_project_config_from, find_project_file_from, home_dir, merge_toml,
+    ArrayMergeStrategy, Config,
 };
 use crate::error::{NewtError, Result};
 
@@ -706,7 +707,7 @@ impl AgentIdentity {
             // The walk-up above only matches dirs that already host a
             // `config.toml`. Also honor a standalone `.newt/agent-identity.toml`
             // with no sibling config (an agent may ship identity alone).
-            if let Some(found) = find_identity_walkup(start, home) {
+            if let Some(found) = find_project_file_from(start, home, AGENT_IDENTITY_FILENAME) {
                 return Ok((
                     Self::load(&found)?.untrusted_workspace(),
                     IdentitySource::Workspace(found),
@@ -861,23 +862,6 @@ impl AgentIdentity {
     pub fn github_app(&self) -> Option<&GithubApp> {
         self.github_app.as_ref()
     }
-}
-
-/// Walk up from `start` (stopping before `home` and at the filesystem root)
-/// looking for a standalone `.newt/agent-identity.toml`. Innermost wins.
-fn find_identity_walkup(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let mut dir = Some(start);
-    while let Some(current) = dir {
-        if home == Some(current) {
-            break;
-        }
-        let candidate = current.join(".newt").join(AGENT_IDENTITY_FILENAME);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        dir = current.parent();
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,6 +1256,47 @@ svc = {{ file = '{}' }}
             IdentitySource::System(PathBuf::from("/etc/newt/agent-identity.toml"))
                 .label()
                 .contains("system")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn home_identity_survives_a_symlinked_home() {
+        // macOS: $HOME may say /var/... while the walk from current_dir() says
+        // /private/var/... — the stop-at-home must compare resolved paths, or
+        // the operator's own identity file is read as an untrusted workspace
+        // one and its signing key dropped (the `newt identity` CLI test
+        // `identity_missing_signing_key_is_clean_not_panic` failed exactly so
+        // on macOS).
+        let root = TempDir::new().unwrap();
+        let real_home = root.path().join("real-home");
+        let ws = real_home.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        write_identity(
+            &real_home,
+            r#"
+[agent-identity]
+name = "keyed-agent[bot]"
+signing_key = "/nonexistent/vault/path/identity.pem"
+"#,
+        );
+        // An identity ABOVE home must never be reached either.
+        write_identity(
+            root.path(),
+            r#"
+[agent-identity]
+name = "above-home[bot]"
+"#,
+        );
+        let linked_home = root.path().join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+
+        let (id, src) = AgentIdentity::resolve_from(Some(&ws), Some(&linked_home)).unwrap();
+        assert_eq!(id.name, "keyed-agent[bot]");
+        assert!(!matches!(src, IdentitySource::Workspace(_)), "{src:?}");
+        assert!(
+            id.signing_key.is_some(),
+            "a home file keeps its signing key"
         );
     }
 

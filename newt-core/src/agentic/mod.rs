@@ -251,7 +251,8 @@ pub use prompt_read::{
     SessionPromptStore, StorePromptSource,
 };
 pub use scheduled::{
-    plan_block, plan_reseat_pointer, PlanSnapshot, SessionStepLedger, Step, StepLedger, StepStatus,
+    fresh_multi_step_plan, plan_block, plan_reseat_pointer, step_change_line, PlanSnapshot,
+    SessionStepLedger, Step, StepLedger, StepStatus,
 };
 pub use scratchpad::{
     scratchpad_state_block, working_memory_head, ScratchpadStore, SessionScratchpadStore,
@@ -300,12 +301,13 @@ pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use observation::{ShellObservation, SHELL_OBSERVATION_PREFIX};
 pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeControl};
 pub use permissions::{
-    append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
-    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
-    BOUND_REASON_PREFIX,
+    append_denial, load_denials, widen_caveats, ChoiceSpec, DenialKind, HumanQuestionOutcome,
+    PermissionAction, PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest,
+    PersistentDenial, BOUND_REASON_PREFIX,
 };
 pub use plan_mode::{
     plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,
+    PLAN_APPROVAL_CHOICES,
 };
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
@@ -2170,6 +2172,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    // Plan-before-act: the ledger as this turn began (see `PlanRoundFacts`).
+    let plan_at_turn_start = step_ledger
+        .map(|ledger| ledger.snapshot())
+        .unwrap_or_default();
     let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
@@ -2872,8 +2878,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
-                                accumulated_usage.as_ref(),
-                                Some(new_budget.min(u32::MAX as usize) as u32),
+                                &display::OverflowReason::Refused {
+                                    request_estimate: Some(
+                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
+                                            as u32,
+                                    ),
+                                    window: recovered_window,
+                                    trim_to: new_budget.min(u32::MAX as usize) as u32,
+                                },
                                 model,
                                 cw_retries + 1,
                             );
@@ -3602,8 +3614,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 if overflow_likely && overflow_retries < 2 {
                     emit_overflow_notice(
                         color,
-                        merged.as_ref(),
-                        safe_context,
+                        &display::OverflowReason::EmptyReplyNearWindow {
+                            prompt_tokens: merged.as_ref().map_or(0, |u| u.input_tokens),
+                            window: safe_context.unwrap_or(0),
+                            trigger_pct: 85,
+                        },
                         model,
                         overflow_retries + 1,
                     );
@@ -3898,6 +3913,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 round_usage,
                 truncation_suspect,
                 round_est_raw,
+            );
+            commit_tool_round_narration(
+                &probe_content,
+                false,
+                completed_spill_renderer.as_deref(),
+                color,
             );
         }
         // Phase 2: every call in the batch is valid — execute in order. `flatten`
@@ -4207,6 +4228,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
+            PlanRoundFacts {
+                disposition: prompt_disposition,
+                step_ledger,
+                plan_at_turn_start: &plan_at_turn_start,
+                progressed: round_modified_workspace || round_progress,
+            },
             smart_harness,
             cancel,
             &mut end_reason,
@@ -4347,6 +4374,9 @@ enum RepeatMemo {
         subject: String,
         advice: &'static str,
     },
+    /// Procedural content is still in context. Reuse succeeds cheaply; unlike
+    /// persistent outcome evidence, compaction/workspace changes release it.
+    SkillRead,
     /// #2555/#2637: a successful, argument-bare `read_file` (no explicit
     /// `offset`/`limit`) — the shape that loops when a weak model re-pages
     /// the same file. Per the harness-design doctrine this NEVER refuses the
@@ -4436,7 +4466,7 @@ impl RepeatCallGuard {
             // memo silently (content unchanged) or drops it and lets a real
             // read run (content changed / freshness unprovable) — this arm is
             // unreachable in practice, kept only so the match stays exhaustive.
-            RepeatMemo::ReadRange { .. } => return None,
+            RepeatMemo::ReadRange { .. } | RepeatMemo::SkillRead => return None,
         };
         // disclosure-gate-live-path (#5): the steer is a SYNTHETIC model-ingress
         // message re-injected as a `{"role":"tool"}` turn, bypassing the
@@ -4543,6 +4573,9 @@ impl RepeatCallGuard {
                          file, or make the next edit/test decision.",
             });
         }
+        if name == "use_skill" && !result.trim().is_empty() {
+            return Some(RepeatMemo::SkillRead);
+        }
         if let Some(path) = Self::bare_read_file_path(name, args) {
             // #2637 review P1: the identity must describe exactly the bytes
             // SERVED (`result`), never a separate reread of the path —
@@ -4585,6 +4618,20 @@ impl RepeatCallGuard {
         args: &serde_json::Value,
         read_scope: ReadScope<'_>,
     ) -> Option<String> {
+        // Skills are already served procedural content, not refusal evidence.
+        // A short success avoids repeating their body while it remains in context.
+        if name == "use_skill"
+            && matches!(
+                self.repeat_memos.get(&Self::key(name, args)),
+                Some(RepeatMemo::SkillRead)
+            )
+        {
+            let skill = args
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            return Some(format!("Skill `{skill}` is loaded in the current context."));
+        }
         let path = Self::bare_read_file_path(name, args)?;
         let key = Self::key(name, args);
         let Some(RepeatMemo::ReadRange {
@@ -4640,7 +4687,9 @@ impl RepeatCallGuard {
             self.repeat_memos.retain(|_, memo| {
                 !matches!(
                     memo,
-                    RepeatMemo::Failure { .. } | RepeatMemo::ReadRange { .. }
+                    RepeatMemo::Failure { .. }
+                        | RepeatMemo::ReadRange { .. }
+                        | RepeatMemo::SkillRead
                 )
             });
         }
@@ -4663,15 +4712,16 @@ impl RepeatCallGuard {
         self.fails_by_tool.values().sum()
     }
 
-    /// #2555: release every `ReadRange` memo. Called at the ONE checkpoint
+    /// #2555/#2799: release context-held file and skill read memos. Called at the ONE checkpoint
     /// each backend loop's compaction reaches once it actually fires
     /// (`record_compaction_artifact` for the three legacy chat loops;
     /// `compact_responses_input`'s `Compacted` outcome for the Responses
     /// loop) — never on a rejected/no-op compaction attempt, which changed
     /// nothing the model could have already seen.
     fn release_read_memos(&mut self) {
-        self.repeat_memos
-            .retain(|_, memo| !matches!(memo, RepeatMemo::ReadRange { .. }));
+        self.repeat_memos.retain(|_, memo| {
+            !matches!(memo, RepeatMemo::ReadRange { .. } | RepeatMemo::SkillRead)
+        });
     }
 }
 
@@ -5680,12 +5730,45 @@ fn readonly_completion_handoff(
 /// An explicit exit request is a handoff, not another planning round. Observe
 /// it only after the whole batch has been recorded; later calls in that batch
 /// still see the Plan clamp. The caller alone consumes and approves the request.
+/// What the approval handoff knows about the round that just ended: the
+/// Plan-disposition half of plan-before-act reads these to decide that the
+/// operator's answer is the next useful event.
+struct PlanRoundFacts<'a> {
+    disposition: PromptDisposition,
+    step_ledger: Option<&'a dyn StepLedger>,
+    /// The ledger as the turn began, so only a plan recorded THIS turn can
+    /// end it — a plan carried over from an earlier turn asks nothing.
+    plan_at_turn_start: &'a scheduled::PlanSnapshot,
+    /// The round added evidence or changed the workspace.
+    progressed: bool,
+}
+
 fn pending_plan_approval_handoff(
     control: Option<&dyn PlanModeControl>,
+    round: PlanRoundFacts<'_>,
     harness: Option<&smart_harness::SmartHarness>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     end_reason: &mut Option<&mut Option<crate::TurnEndReason>>,
 ) -> anyhow::Result<Option<String>> {
+    // Plan-before-act, the Plan-disposition half. A turn that may not act,
+    // whose multi-step plan was recorded this turn, and whose latest round
+    // added nothing, has reached the operator's decision: request exit on
+    // the model's behalf — the same request `exit_plan_mode` records — so
+    // the question comes after one idle round. Measured without this on
+    // 2026-10-07: a 35B model re-loaded the same two skills for twelve idle
+    // rounds until the no-progress brake stopped it, then was asked anyway.
+    if let Some(control) = control {
+        let plan_recorded = round.step_ledger.is_some_and(|ledger| {
+            scheduled::fresh_multi_step_plan(round.plan_at_turn_start, &ledger.snapshot())
+        });
+        if !control.exit_requested()
+            && round.disposition == PromptDisposition::Plan
+            && !round.progressed
+            && plan_recorded
+        {
+            let _ = control.request_exit();
+        }
+    }
     if !control.is_some_and(PlanModeControl::exit_requested) {
         return Ok(None);
     }
@@ -7110,6 +7193,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    // Plan-before-act: the ledger as this turn began (see `PlanRoundFacts`).
+    let plan_at_turn_start = step_ledger
+        .map(|ledger| ledger.snapshot())
+        .unwrap_or_default();
     let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
@@ -7794,8 +7881,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
-                                accumulated_usage.as_ref(),
-                                Some(new_budget.min(u32::MAX as usize) as u32),
+                                &display::OverflowReason::Refused {
+                                    request_estimate: Some(
+                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
+                                            as u32,
+                                    ),
+                                    window: recovered_window,
+                                    trim_to: new_budget.min(u32::MAX as usize) as u32,
+                                },
                                 model,
                                 cw_retries + 1,
                             );
@@ -8820,6 +8913,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
+            commit_tool_round_narration(
+                &oa_content,
+                false,
+                completed_spill_renderer.as_deref(),
+                color,
+            );
         }
         // Phase 2: every call is valid — execute in order (empty when rejected).
         for (call_index, (tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
@@ -9151,6 +9250,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         }
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
+            PlanRoundFacts {
+                disposition: prompt_disposition,
+                step_ledger,
+                plan_at_turn_start: &plan_at_turn_start,
+                progressed: round_modified_workspace || round_progress,
+            },
             smart_harness,
             cancel,
             &mut end_reason,
@@ -9893,6 +9998,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    // Plan-before-act: the ledger as this turn began (see `PlanRoundFacts`).
+    let plan_at_turn_start = step_ledger
+        .map(|ledger| ledger.snapshot())
+        .unwrap_or_default();
     let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
@@ -10418,8 +10527,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                             .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
-                                accumulated_usage.as_ref(),
-                                Some(new_budget.min(u32::MAX as usize) as u32),
+                                &display::OverflowReason::Refused {
+                                    request_estimate: Some(
+                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
+                                            as u32,
+                                    ),
+                                    window: recovered_window,
+                                    trim_to: new_budget.min(u32::MAX as usize) as u32,
+                                },
                                 model,
                                 cw_retries + 1,
                             );
@@ -11356,6 +11471,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
+            commit_tool_round_narration(
+                &oa_content,
+                printed_live,
+                completed_spill_renderer.as_deref(),
+                color,
+            );
         }
         // Phase 2: every call is valid — execute in order (empty when rejected).
         for (call_index, (tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
@@ -11677,6 +11798,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
+            PlanRoundFacts {
+                disposition: prompt_disposition,
+                step_ledger,
+                plan_at_turn_start: &plan_at_turn_start,
+                progressed: round_modified_workspace || round_progress,
+            },
             smart_harness,
             cancel,
             &mut end_reason,
@@ -12347,6 +12474,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::default();
+    // Plan-before-act: the ledger as this turn began (see `PlanRoundFacts`).
+    let plan_at_turn_start = step_ledger
+        .map(|ledger| ledger.snapshot())
+        .unwrap_or_default();
     let mut read_history = tools::ReadHistory::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
@@ -13085,6 +13216,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         for item in &echo {
             input.push(item.clone());
         }
+        commit_tool_round_narration(&text, false, completed_spill_renderer.as_deref(), color);
         let batch = smart_harness
             .map(|harness| {
                 let mut messages = Vec::with_capacity(input.len() + 1);
@@ -13418,6 +13550,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
+            PlanRoundFacts {
+                disposition: prompt_disposition,
+                step_ledger,
+                plan_at_turn_start: &plan_at_turn_start,
+                progressed: round_modified_workspace || round_progress,
+            },
             smart_harness,
             cancel,
             &mut end_reason,
@@ -13792,12 +13930,93 @@ fn commit_reasoning_fold(
         return;
     }
     let block = shown.join("\n");
-    emit_reasoning(&block, color);
+    emit_notice_line(crate::tty::Level::Thinking, "", &block, color);
 }
 
-fn emit_reasoning(text: &str, color: bool) {
-    let notice = crate::tty::Notice::new(crate::tty::Level::Thinking, "", text);
+/// One permanent, arbiter-cooperating stdout line in a named register: live
+/// ephemerals (a tool or thinking spinner) are erased first, and nothing
+/// gates on capability, so a piped or headless run receives the same bytes
+/// the `⚙` header does. Reasoning folds, and the tool-round narration below,
+/// share this one writer so the two cannot drift into two ways of saying it.
+fn emit_notice_line(level: crate::tty::Level, glyph: &str, text: &str, color: bool) {
+    let notice = crate::tty::Notice::new(level, glyph, text).gap(2);
     crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, notice.writer(color));
+}
+
+/// The prose a model sent WITH this tool batch — what every loop used to
+/// replay into history and show to nobody — bounded the way a tool result
+/// and a reasoning block are: the first `[tui] spill_lines` rows commit, the
+/// rest are retained behind the one fold marker so `/spill open <id>` raises
+/// the whole of it, and the conversation spine is never buried. Rows are
+/// `▹`-glyphed, the hollow sibling of the `▸` reply marker, in the theme's
+/// `narration` colour, so the model's interim voice is told apart from its
+/// reply, its reasoning, and the operator's own text. Skipped when the wire
+/// already streamed the text live (Anthropic) and when nothing readable
+/// remains once the call text itself is dropped.
+fn commit_tool_round_narration(
+    content: &str,
+    already_printed: bool,
+    retain: Option<&dyn CompletedSpillRenderer>,
+    color: bool,
+) {
+    emit_tool_round_narration(
+        content,
+        already_printed,
+        retain,
+        display::reply_cols(crate::tty::term_cols()),
+        display::spill_lines(),
+        |level, glyph, text| emit_notice_line(level, glyph, text, color),
+    );
+}
+
+/// The production narration path with layout and output injected for testing.
+fn emit_tool_round_narration(
+    content: &str,
+    already_printed: bool,
+    retain: Option<&dyn CompletedSpillRenderer>,
+    width: usize,
+    budget: usize,
+    mut emit: impl FnMut(crate::tty::Level, &str, &str),
+) {
+    if already_printed {
+        return;
+    }
+    let rows = display::tool_round_prose(content);
+    if rows.is_empty() {
+        return;
+    }
+    let rendered: Vec<_> = rows
+        .iter()
+        .flat_map(|row| crate::tty::wrap_line(row, width))
+        .collect();
+    let shown = if budget == 0 {
+        rendered.len()
+    } else {
+        rendered.len().min(budget)
+    };
+    for (i, line) in rendered.iter().take(shown).enumerate() {
+        let glyph = if i == 0 { "▹" } else { " " };
+        emit(crate::tty::Level::Narration, glyph, line);
+    }
+    let hidden = rendered.len() - shown;
+    if hidden == 0 {
+        return;
+    }
+    // Retain BEFORE printing the marker, so the id names a body that is
+    // already there — the same order the reasoning fold keeps.
+    let body = rows.join("\n");
+    let retained = retain.and_then(|r| r.retain_completed(&body));
+    let hint = retained
+        .zip(retain)
+        .map(|(id, renderer)| renderer.recovery_hint(id));
+    let recovery = hint
+        .as_deref()
+        .map_or_else(display::Recovery::default, display::Recovery::Command);
+    emit(
+        crate::tty::Level::Dim,
+        "▲",
+        &display::Fold::lines(hidden, recovery).marker(),
+    );
 }
 
 /// The streaming half of a [`ThinkingFold`]: it owns the partial-line buffer
@@ -13863,7 +14082,7 @@ impl ReasoningTrickle {
         let Some(line) = self.fold.closing_line(elapsed, recovery) else {
             return;
         };
-        emit_reasoning(&line, color);
+        emit_notice_line(crate::tty::Level::Thinking, "", &line, color);
     }
 }
 
@@ -14060,3 +14279,7 @@ mod observation_hook_tests;
 #[cfg(test)]
 #[path = "mod_tests/attribution_epoch_tests.rs"]
 mod attribution_epoch_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/narration_output.rs"]
+mod narration_output_tests;

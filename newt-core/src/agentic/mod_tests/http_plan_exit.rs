@@ -53,6 +53,91 @@ impl PlanDraftSink for DraftSlot {
     }
 }
 
+/// Plan-before-act, the Plan-disposition half: a turn that may not act, whose
+/// multi-step plan was recorded this turn, hands off to the operator after
+/// one idle round; a round that added evidence keeps going, an Act turn is
+/// never exited here (the executor arm owns that), and a plan carried over
+/// from an earlier turn asks nothing.
+#[test]
+fn a_plan_turn_whose_plan_is_recorded_hands_off_after_one_idle_round() {
+    use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+    let ledger = SessionStepLedger::default();
+    let before = ledger.snapshot();
+    ledger.set_plan(&["inspect".to_string(), "repair".to_string()]);
+    let facts = |disposition, progressed, start| PlanRoundFacts {
+        disposition,
+        step_ledger: Some(&ledger as &dyn StepLedger),
+        plan_at_turn_start: start,
+        progressed,
+    };
+
+    let control = ApprovalControl::default();
+    let mut reason = None;
+    let mut slot = Some(&mut reason);
+    let kept_going = pending_plan_approval_handoff(
+        Some(&control),
+        facts(PromptDisposition::Plan, true, &before),
+        None,
+        None,
+        &mut slot,
+    )
+    .unwrap();
+    assert!(
+        kept_going.is_none(),
+        "a round with new evidence keeps the turn"
+    );
+    assert!(!control.exit_requested());
+
+    let handed_off = pending_plan_approval_handoff(
+        Some(&control),
+        facts(PromptDisposition::Plan, false, &before),
+        None,
+        None,
+        &mut slot,
+    )
+    .unwrap();
+    assert!(
+        handed_off.is_some(),
+        "an idle round with the plan recorded ends the turn"
+    );
+    assert!(control.exit_requested(), "requested on the model's behalf");
+    assert_eq!(
+        slot.as_deref().cloned(),
+        Some(Some(crate::TurnEndReason::AwaitingOperator))
+    );
+
+    let act = ApprovalControl::default();
+    assert!(pending_plan_approval_handoff(
+        Some(&act),
+        facts(PromptDisposition::Act, false, &before),
+        None,
+        None,
+        &mut None,
+    )
+    .unwrap()
+    .is_none());
+    assert!(
+        !act.exit_requested(),
+        "an Act turn is the executor arm's to pause"
+    );
+
+    let carried = ledger.snapshot();
+    let later = ApprovalControl::default();
+    assert!(pending_plan_approval_handoff(
+        Some(&later),
+        facts(PromptDisposition::Plan, false, &carried),
+        None,
+        None,
+        &mut None,
+    )
+    .unwrap()
+    .is_none());
+    assert!(
+        !later.exit_requested(),
+        "a plan from an earlier turn asks nothing"
+    );
+}
+
 fn approval_response(wire: &str, first: bool) -> ResponseTemplate {
     let calls = [
         ("enter_plan_mode", serde_json::json!({})),

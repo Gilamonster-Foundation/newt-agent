@@ -34,6 +34,7 @@ pub(crate) fn tool_definitions_with_dialect(
                 "name": "run_command",
                 "description": format!("{} {} {}", "Run a command in the workspace shell and return its output and exit status. \
                                 Use ordinary commands, including git, with their normal arguments. \
+                                To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials. \
                                 File access, execution, and networking are governed by the session's \
                                 OCAP grants. Needed authority is approved before execution. \
                                 Optional fs_read/fs_write arrays declare additional absolute paths \

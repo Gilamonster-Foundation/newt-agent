@@ -29,6 +29,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Supply portable `which` without depending on an external utility. Lookup uses
+/// the selected POSIX shell's own `command -v`, including its current PATH.
+/// Apply only at a POSIX interpreter boundary, after inspecting the user command.
+pub fn with_posix_command_discovery(command: &str) -> String {
+    format!("which() {{ command -v -- \"$@\"; }}\n{command}")
+}
+
 #[cfg(all(feature = "brush", any(target_os = "linux", target_os = "macos")))]
 mod broker_runtime;
 #[cfg(all(feature = "brush", any(target_os = "linux", target_os = "macos")))]

@@ -18,6 +18,43 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   unchanged, but its lines now carry those trailing spaces; the model-facing
   bytes are unchanged.
 
+### Added — the operator sees what the model is doing, and approves its first plan
+
+- The prose a model sends together with a tool call is now shown as `▹`
+  rows above that batch's `⚙` headers, in a new themeable `narration` role
+  (magenta by default), folded like tool output (the first `[tui]
+  spill_lines` rows, the rest behind `/spill open N`), on every wire and on
+  the piped path; it used to be replayed into history and shown to nobody. A tick of an
+  existing plan shows as `step 3 of 7: …` instead of the whole `<plan>` block.
+- Plan-before-act: under initiative `patient` or `measured` (the default),
+  the first multi-step `update_plan` of an acting turn enters the Plan phase
+  on the model's behalf and ends the turn at `Approve this plan? [y/N/discuss]`;
+  later calls in that batch are clamped. `decisive` and `eager` set the plan
+  silently; `/mode full-auto` approves without asking. The question is the
+  same selection form a permission prompt uses (no / yes / discuss, `n` the
+  default), and `discuss` opens one free-text follow-up fed back to the
+  model; on a text-only surface `y`, `yes`, or a bare continuation (`go`,
+  `do it`, `proceed`) approves. Approval seeds the implementing turn with
+  the ledger plan when no draft was presented. Each plan asks once; the
+  next task's plan asks again.
+- A Plan turn whose multi-step plan was recorded this turn now hands off to
+  the operator after one idle round instead of after the no-progress brake;
+  and an exact repeat of a `use_skill` load is steered ("already in your
+  context above") instead of re-serving the body — a 35B model re-loaded the
+  same two skills 41 times in one measured turn.
+- A long or multi-line tool-call detail (a `request_user_input` question, a
+  script) now renders as a block under the tool name at the glyph margin
+  instead of a hanging column, and a free-text question's modal says
+  "question — type your answer" with no selection hints.
+- A prompt whose asks open collaboratively ("let's …", "we should …") is
+  classified Plan before the action needles; bare continuations ("let's go")
+  and direct verbs ("let's commit this", "let's run the tests") still act.
+  Both lists live in `DispositionLexicon` and the `[intake]` table.
+- `[tui] narration_intent_line` (default false) appends one sentence asking
+  the model to state its intent before each tool call, in the same reply as
+  the call.
+- Design: `docs/design/narration-and-plan-before-act.md`.
+
 ### Fixed — a governed commit is no longer refused in a default-permission Linux session (#2693)
 
 - The native commit broker's own `git` re-dispatch (`NativeGitBroker`) minted

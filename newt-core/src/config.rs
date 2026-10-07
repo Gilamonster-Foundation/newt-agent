@@ -33,8 +33,8 @@ pub use context::{
 pub use crew::{Crew, CrewBudgets, CrewPolicyConfig};
 pub use dropin::*;
 pub(crate) use layering::{
-    expand_tilde, find_ancestor_dir, find_project_config_from, home_dir, merge_project_overlay,
-    merge_toml, strip_control_plane,
+    expand_tilde, find_ancestor_dir, find_project_config_from, find_project_file_from, home_dir,
+    merge_project_overlay, merge_toml, strip_control_plane,
 };
 pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use loadout::{Loadout, LoadoutSettings};
@@ -634,6 +634,13 @@ pub struct TuiConfig {
     #[serde(default = "default_narration_nudge_cap")]
     pub narration_nudge_cap: usize,
 
+    /// Append one sentence to the system prompt asking the model to state, in
+    /// one short sentence, what it is about to do before each tool call.
+    /// Default: false. Off, nothing changes; on, the sentence is appended at
+    /// prompt build time, never baked into the identity text.
+    #[serde(default = "default_narration_intent_line")]
+    pub narration_intent_line: bool,
+
     /// Tool-call permission policy for the interactive TUI: which tools the
     /// model may invoke and over which targets. This is a *preset that selects
     /// an attenuation* — the host (`newt-identity`) lowers it into a signed,
@@ -804,6 +811,10 @@ fn default_narration_nudge_cap() -> usize {
     1
 }
 
+fn default_narration_intent_line() -> bool {
+    false
+}
+
 fn default_connect_timeout_secs() -> u64 {
     5
 }
@@ -906,6 +917,7 @@ impl Default for TuiConfig {
             max_tool_rounds: default_max_tool_rounds(),
             workflow_grace_rounds: default_workflow_grace_rounds(),
             narration_nudge_cap: default_narration_nudge_cap(),
+            narration_intent_line: default_narration_intent_line(),
             permissions: ToolPermissions::default(),
             debug: None,
             trace: None,

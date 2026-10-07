@@ -1731,3 +1731,108 @@ async fn lone_hwm_budget_fails_open_and_does_not_bail() {
         "the loop kept dispatching past the latch instead of bailing"
     );
 }
+
+/// PR #2799 finding 3: a committed real-loop compaction releases use_skill
+/// evidence; an identical load must execute again, never claim missing context
+/// is still present. In-context repeats remain successful cheap reuse.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn compaction_2799_releases_skill_reuse_in_real_loop() {
+    use crate::agentic::tools::disable_ocap_tests::EnvVar;
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 0,
+        },
+        ..Default::default()
+    });
+    let ws = tempfile::tempdir().unwrap();
+    let skill = ws.path().join("skills/compaction-fixture-2799");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        format!(
+            "---\nname: compaction-fixture-2799\ndescription: Test context reuse\n---\n{}",
+            "Skill content marker: inspect the fixture before modifying it.\n".repeat(64)
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        ws.path().join("config.toml"),
+        format!(
+            "[skills]\nsearch = [{}]\n",
+            serde_json::to_string(&ws.path().join("skills").to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+    let _config = EnvVar::set("NEWT_CONFIG_DIR", ws.path().to_str().unwrap());
+    let server = MockServer::start().await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let observed = log.clone();
+    Mock::given(method("POST")).and(path("/api/chat"))
+        .respond_with(move |req: &Request| {
+            let body = body_json(req);
+            if body.get("tools").is_some() {
+                observed.lock().unwrap().push(body["messages"].as_array().unwrap().len());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content":"", "tool_calls":[
+                        {"function":{"name":"apply_patch","arguments":{}}},
+                        {"function":{"name":"use_skill","arguments":{"name":"compaction-fixture-2799"}}}
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"message":{"content":"skill haul done"}}))
+            }
+        }).mount(&server).await;
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let summarizer = canned_summarizer(prompts.clone());
+    let workspace = ws.path().to_string_lossy().to_string();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let messages = msgs();
+    let mut state = CompressState::new();
+    let mut events = Vec::new();
+    let mut c = ctx(&uri, &messages, &caveats, &workspace);
+    c.max_tool_rounds = 30;
+    c.mid_loop_trim_threshold = 15;
+    c.mid_loop_trim_tokens = None;
+    c.summarizer = Some(&*summarizer);
+    c.compress_state = Some(&mut state);
+    c.tool_events = Some(&mut events);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
+    assert_eq!(reply, "skill haul done");
+    let events: Vec<_> = events.iter().filter(|e| e.tool == "use_skill").collect();
+    assert!(
+        events[0].ok,
+        "the fixture must genuinely load first: {:?}",
+        events[0]
+    );
+    let log = log.lock().unwrap();
+    assert_eq!(events.len(), log.len());
+    let committed: Vec<_> = (1..log.len()).filter(|&r| log[r] < log[r - 1]).collect();
+    assert!(
+        committed.len() >= 2,
+        "exercise repeated committed compaction"
+    );
+    assert_eq!(committed.len(), prompts.lock().unwrap().len());
+    for &round in &committed {
+        assert!(
+            events[round].ok,
+            "post-compaction skill load was refused in round {round}: {:?}",
+            events[round]
+        );
+        assert!(
+            !events[round].from_cache,
+            "post-compaction skill must load again"
+        );
+    }
+    for (round, event) in events.iter().enumerate().skip(1) {
+        assert!(event.ok, "skill reuse is success, not a refusal");
+        assert_eq!(
+            event.from_cache,
+            !committed.contains(&round),
+            "round {round}"
+        );
+    }
+}
