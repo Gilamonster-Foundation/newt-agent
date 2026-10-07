@@ -121,6 +121,14 @@ struct Inner {
     prompt_owner: Option<std::thread::ThreadId>,
     prompt_depth: usize,
     watcher_reading: bool,
+    /// Quiet cursor queries waiting for the current stdin read to finish.
+    quiet_waiters: usize,
+}
+
+impl Inner {
+    fn watcher_can_read(&self) -> bool {
+        self.prompt_owner.is_none() && !self.watcher_reading && self.quiet_waiters == 0
+    }
 }
 
 fn arbiter() -> &'static (Mutex<Inner>, Condvar) {
@@ -352,22 +360,27 @@ impl StdinQuiet {
         let mut state = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let me = std::thread::current().id();
         let deadline = std::time::Instant::now() + wait;
-        loop {
+        state.quiet_waiters += 1;
+        let acquired = loop {
             if state.prompt_owner == Some(me) {
-                return Some(Self { _watcher: None });
+                break Some(Self { _watcher: None });
             }
             if state.prompt_owner.is_none() && !state.watcher_reading {
                 state.watcher_reading = true;
-                return Some(Self {
+                break Some(Self {
                     _watcher: Some(WatcherStdinGuard),
                 });
             }
-            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break None;
+            };
             state = cv
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
-        }
+        };
+        state.quiet_waiters -= 1;
+        acquired
     }
 }
 
@@ -1244,10 +1257,12 @@ fn enter_prompt_line_mode() -> io::Result<libc::termios> {
 pub struct WatcherStdinGuard;
 
 /// Try to take the watcher's read token. `None` means a prompt owns stdin (or
-/// another watcher read is in flight) and the caller must not read.
+/// another watcher read or waiting quiet query owns the next turn) and the
+/// caller must not read. Yielding to a queued query prevents a polling watcher
+/// from repeatedly reacquiring stdin throughout the query's bounded wait.
 pub fn try_watch_stdin() -> Option<WatcherStdinGuard> {
     let mut state = lock();
-    if state.prompt_owner.is_some() || state.watcher_reading {
+    if !state.watcher_can_read() {
         return None;
     }
     state.watcher_reading = true;

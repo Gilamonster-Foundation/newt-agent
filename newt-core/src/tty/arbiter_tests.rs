@@ -1023,3 +1023,65 @@ fn a_forced_relocation_lands_where_a_checked_one_is_refused() {
     );
     assert_eq!(block.region(), rows(2, 4));
 }
+
+/// #2809: the next watcher poll must yield to an already waiting cursor
+/// query, rather than reacquiring the token until its 300ms budget expires.
+#[test]
+fn quiet_query_waiter_has_priority_over_the_next_watcher_poll() {
+    let mut state = super::Inner::default();
+    assert!(state.watcher_can_read());
+    state.quiet_waiters = 1;
+    assert!(
+        !state.watcher_can_read(),
+        "a waiting query gets the next read turn"
+    );
+    state.quiet_waiters = 0;
+    assert!(state.watcher_can_read());
+}
+
+/// #2809: timeout must release priority; taking the token still excludes
+/// watcher reads until the quiet query guard is dropped.
+#[test]
+#[serial_test::serial(tty_arbiter)]
+fn quiet_query_timeout_releases_priority() {
+    let watcher = try_watch_stdin().unwrap();
+    assert!(super::StdinQuiet::take_within(std::time::Duration::ZERO).is_none());
+    assert_eq!(super::lock().quiet_waiters, 0);
+    drop(watcher);
+    let quiet = super::StdinQuiet::take_within(std::time::Duration::ZERO).unwrap();
+    assert_eq!(super::lock().quiet_waiters, 0);
+    assert!(try_watch_stdin().is_none());
+    drop(quiet);
+    assert!(try_watch_stdin().is_some());
+}
+
+/// #2809: witness a real waiting query registering its priority and acquiring
+/// the read token when the current watcher finishes; no terminal I/O needed.
+#[test]
+#[serial_test::serial(tty_arbiter)]
+fn quiet_query_registers_priority_until_the_watcher_finishes() {
+    let watcher = try_watch_stdin().unwrap();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let query = std::thread::spawn(move || {
+        let quiet = super::StdinQuiet::take_within(crate::test_guard::HANG_GUARD);
+        acquired_tx.send(quiet.is_some()).unwrap();
+        crate::test_guard::recv_guarded(&release_rx, "release quiet query");
+        drop(quiet);
+    });
+    let deadline = std::time::Instant::now() + crate::test_guard::HANG_GUARD;
+    while super::lock().quiet_waiters == 0 {
+        assert!(std::time::Instant::now() < deadline, "query never queued");
+        std::thread::yield_now();
+    }
+    drop(watcher);
+    assert!(crate::test_guard::recv_guarded(
+        &acquired_rx,
+        "query takes the next turn"
+    ));
+    assert_eq!(super::lock().quiet_waiters, 0);
+    assert!(try_watch_stdin().is_none());
+    release_tx.send(()).unwrap();
+    query.join().unwrap();
+    assert!(try_watch_stdin().is_some());
+}
