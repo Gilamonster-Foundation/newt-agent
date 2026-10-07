@@ -9,6 +9,24 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Fixed — the line after a permission frame, a clarification frame or a panel prints directly under the transcript
+
+- A frame that was shifted above something holding the bottom rows used to
+  be parked rows below the transcript, and when it closed the cursor stayed
+  there: the next committed line landed near the bottom of the screen under
+  a band of blank rows (seen live on 2026-10-06 and 2026-10-07). The tty
+  arbiter now places those rows itself: `Terminal::lease_below_cursor`
+  queries the cursor once, with stdin's other reader quiesced, leases the
+  rows under it (scrolling the transcript by the deficit when the frame
+  would not fit), hands them out blank, and erases exactly them and puts the
+  cursor back when the lease drops. The permission modal, the clarification
+  modal and every operator panel open on that lease as a `Fixed` viewport,
+  with no cursor query inside ratatui and no cursor-relative erase of their
+  own; a terminal that does not answer the query gets the bottom-anchored
+  placement it had before, never a guessed row. A resize closes and re-opens
+  a placed frame instead of ratatui's `resize`, whose `ESC[J` ran through
+  the rows below.
+
 ### Fixed — a governed commit is no longer refused in a default-permission Linux session (#2693)
 
 - The native commit broker's own `git` re-dispatch (`NativeGitBroker`) minted

@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
+use crossterm::cursor::MoveTo;
 use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
@@ -224,6 +225,107 @@ fn shift_clear_of(held: &[(u64, Region)], want: Region) -> Option<Region> {
     None
 }
 
+/// Where a frame opens when the arbiter places it under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Placement {
+    /// The first granted row.
+    pub(crate) top: u16,
+    /// Rows granted: the request, clamped to the screen.
+    pub(crate) height: u16,
+    /// Rows the transcript scrolls up by first, so the frame fits on screen.
+    pub(crate) scroll: u16,
+    /// Where the cursor goes back to when the lease drops: the transcript's
+    /// end, after the scroll.
+    pub(crate) return_to: (u16, u16),
+}
+
+/// The placement rule behind [`Terminal::lease_below_cursor`], pure so it is
+/// table-tested without a terminal.
+///
+/// The frame opens on the cursor's row. If it would run off the bottom, the
+/// transcript scrolls up by the deficit, unless somebody holds rows, since
+/// the scroll would move theirs too. A request that would land on a holder
+/// or scroll one is CONTESTED and follows `policy`: refused, taken as
+/// declared, or shifted to the nearest free rows above the holder exactly as
+/// a bottom-anchored [`OnCollision::Shift`] lease is, with the cursor still
+/// returned to where it was. The shift is about where the FRAME goes.
+pub(crate) fn place_below_cursor(
+    cursor: (u16, u16),
+    screen_rows: u16,
+    height: u16,
+    held: &[(u64, Region)],
+    policy: OnCollision,
+) -> Option<Placement> {
+    let rows = screen_rows.max(1);
+    let height = height.clamp(1, rows);
+    let (x, y) = (cursor.0, cursor.1.min(rows - 1));
+    // Never larger than `y`, because `height` is no larger than `rows`.
+    let overflow = y.saturating_add(height).saturating_sub(rows);
+    let natural = Placement {
+        top: y - overflow,
+        height,
+        scroll: overflow,
+        return_to: (x, y - overflow),
+    };
+    let wanted = Region::Rows {
+        top: natural.top,
+        height,
+    };
+    let contested =
+        held.iter().any(|(_, h)| h.intersects(wanted)) || (overflow > 0 && !held.is_empty());
+    if !contested {
+        return Some(natural);
+    }
+    match policy {
+        OnCollision::Refuse => None,
+        OnCollision::SuspendHolder => Some(natural),
+        OnCollision::Shift => {
+            let bottom = Region::Rows {
+                top: rows - height,
+                height,
+            };
+            let Region::Rows { top, height } = shift_clear_of(held, bottom)? else {
+                return None;
+            };
+            Some(Placement {
+                top,
+                height,
+                scroll: 0,
+                return_to: (x, y),
+            })
+        }
+    }
+}
+
+/// Erase `height` rows from `top`, each on its own — never `ESC[J`, which runs
+/// to the end of the SCREEN and takes the rows of whoever holds the space
+/// below. (`panel::clear_own_rows`'s rule, stated once, here.)
+fn blank_rows(w: &mut LineWriter<'_>, top: u16, height: u16) -> io::Result<()> {
+    for row in top..top.saturating_add(height) {
+        queue!(w, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    Ok(())
+}
+
+/// Proof that a cursor query's reply cannot be taken by another reader of
+/// stdin (#1950): either this thread already owns stdin through a
+/// [`PromptWindow`], or the turn watcher's read token is held for as long as
+/// this lives.
+struct StdinQuiet {
+    _watcher: Option<WatcherStdinGuard>,
+}
+
+impl StdinQuiet {
+    fn take() -> Option<Self> {
+        if lock().prompt_owner == Some(std::thread::current().id()) {
+            return Some(Self { _watcher: None });
+        }
+        try_watch_stdin().map(|watcher| Self {
+            _watcher: Some(watcher),
+        })
+    }
+}
+
 /// Which rows a writer owns.
 ///
 /// Absolute, resolved by the caller against the screen it already measured —
@@ -411,13 +513,30 @@ impl TerminalTaker {
 /// vocabularies over one authority — this table and `line_held` live in the
 /// same [`Inner`], so a single lock orders every ownership decision.
 ///
-/// Drop returns the rows. It does NOT erase them: what a region contains is
-/// the holder's business (ratatui restores its own viewport, the pager leaves
-/// the alternate screen), and an arbiter that also erased would be painting
-/// through a surface that already cleaned up.
+/// Drop returns the rows. For rows the HOLDER placed
+/// ([`Terminal::lease_region`]) it does NOT erase them: what such a region
+/// contains is the holder's business (ratatui restores its own viewport, the
+/// pager leaves the alternate screen), and an arbiter that also erased would
+/// be painting through a surface that already cleaned up. For rows the
+/// ARBITER placed ([`Terminal::lease_below_cursor`]) the opposite holds, for
+/// the mirror reason: it blanked them on the way in and it alone knows the
+/// row the transcript ends on, so it erases exactly those rows and puts the
+/// cursor back there. Nobody else can — that number lives nowhere else.
 pub struct RegionLease {
     id: u64,
     region: Region,
+    /// `Some` only when the arbiter placed the rows — see
+    /// [`Terminal::lease_below_cursor`] and the type-level doc.
+    cursor: Option<CursorReturn>,
+}
+
+/// Where a lease minted by [`Terminal::lease_below_cursor`] puts the cursor
+/// back, and the stream it erases its rows on first.
+#[derive(Debug, Clone, Copy)]
+struct CursorReturn {
+    x: u16,
+    y: u16,
+    sink: Sink,
 }
 
 impl RegionLease {
@@ -426,6 +545,15 @@ impl RegionLease {
     #[must_use]
     pub fn region(&self) -> Region {
         self.region
+    }
+
+    /// Where the cursor goes back to when this lease drops, when the arbiter
+    /// placed the rows ([`Terminal::lease_below_cursor`]); `None` for rows
+    /// the holder placed itself ([`Terminal::lease_region`]). A surface opens
+    /// a viewport on the first kind without asking the terminal anything.
+    #[must_use]
+    pub fn cursor_return(&self) -> Option<(u16, u16)> {
+        self.cursor.map(|back| (back.x, back.y))
     }
 
     /// Move or resize the held rows, keeping ownership CONTINUOUS.
@@ -471,6 +599,14 @@ impl RegionLease {
 
 impl Drop for RegionLease {
     fn drop(&mut self) {
+        // Erase first and outside the lock, as every writer here paints
+        // outside it; then return the rows.
+        if let (Some(back), Region::Rows { top, height }) = (self.cursor, self.region) {
+            back.sink.with(|w| {
+                let _ =
+                    blank_rows(w, top, height).and_then(|()| execute!(w, MoveTo(back.x, back.y)));
+            });
+        }
         let (m, cv) = arbiter();
         let mut state = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.regions.retain(|(id, _)| *id != self.id);
@@ -722,7 +858,92 @@ impl Terminal {
         Some(RegionLease {
             id,
             region: granted,
+            cursor: None,
         })
+    }
+
+    /// Lease `height` rows directly under the cursor — the row the transcript
+    /// ends on — handed out blank with the cursor parked on their first row,
+    /// and have the cursor put back where it was when the lease drops.
+    ///
+    /// **This is the one lease that erases on drop**, because it is the one
+    /// whose rows the arbiter placed. Before it, every inline frame decided
+    /// "where does the transcript end" for itself: by a cursor query inside
+    /// ratatui, by parking arithmetic on a shifted lease, by counting the rows
+    /// it had painted. Each was right until the first surprise. A lease
+    /// shifted above a bottom holder parked the frame rows below the
+    /// transcript, and on close the next committed line landed down there
+    /// under a band of blank rows. The number all of those frames needed is
+    /// captured here once, at the mint, and spent once, at the drop.
+    ///
+    /// The query is made with stdin's other reader quiesced (#1950): either
+    /// this thread already owns stdin through a [`PromptWindow`], or the turn
+    /// watcher's read token is held for the query's duration, so the `ESC[6n`
+    /// reply cannot be taken by someone else. When neither holds, when the
+    /// terminal does not answer, or when the rows are contested under
+    /// [`OnCollision::Refuse`], this returns `Ok(None)` and the caller falls
+    /// back to a bottom-anchored [`Terminal::lease_region`] and the behaviour
+    /// it had before. **It never guesses a row.** [`place_below_cursor`] is the
+    /// placement rule, pure and table-tested; the real-terminal half is
+    /// `newt-tui`'s `interaction_view_pty_test`.
+    pub fn lease_below_cursor(
+        height: u16,
+        policy: OnCollision,
+        sink: Sink,
+    ) -> io::Result<Option<RegionLease>> {
+        // A pipe answers no query and must not be sent one.
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(None);
+        }
+        let cursor = {
+            let Some(_quiet) = StdinQuiet::take() else {
+                return Ok(None);
+            };
+            match crossterm::cursor::position() {
+                Ok(cursor) => cursor,
+                Err(_) => return Ok(None),
+            }
+        };
+        let (_, rows) = crossterm::terminal::size()?;
+        let (lease, scroll) = {
+            let mut state = lock();
+            let Some(place) = place_below_cursor(cursor, rows, height, &state.regions, policy)
+            else {
+                return Ok(None);
+            };
+            state.next_id += 1;
+            let id = state.next_id;
+            let region = Region::Rows {
+                top: place.top,
+                height: place.height,
+            };
+            state.regions.push((id, region));
+            let (x, y) = place.return_to;
+            let lease = RegionLease {
+                id,
+                region,
+                cursor: Some(CursorReturn { x, y, sink }),
+            };
+            (lease, place.scroll)
+        };
+        let Region::Rows { top, height } = lease.region else {
+            return Ok(None);
+        };
+        // Paint outside the lock, as every other writer here does. The scroll
+        // is the cockpit presenter's byte plan: newlines from the bottom row
+        // push the transcript up by exactly the deficit, into scrollback.
+        sink.with(|w| {
+            if scroll > 0 {
+                queue!(w, MoveTo(0, rows.saturating_sub(1)))?;
+                for _ in 0..scroll {
+                    queue!(w, Print("\n"))?;
+                }
+            }
+            blank_rows(w, top, height)?;
+            queue!(w, MoveTo(0, top))?;
+            w.flush()
+        })?;
+        Ok(Some(lease))
     }
 
     /// Register an ephemeral so [`Terminal::suspend_for_prompt`] can erase it.

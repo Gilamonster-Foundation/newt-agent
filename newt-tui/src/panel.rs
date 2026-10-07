@@ -137,9 +137,12 @@ impl PanelRawGuard {
 /// body. Shifting mints the nearest free rows ABOVE the holder, which is the
 /// anchor-above-the-prompt fix expressed as the mint's policy rather than as a
 /// special case in the fallback.
+/// Placed under the transcript when the terminal says where that is
+/// (`inline_viewport::lease_below_transcript`), so the cursor comes back
+/// there when the panel closes and the next line prints under the last one.
 pub(crate) fn make_terminal(height: u16) -> io::Result<InlineTerm> {
     let lease =
-        crate::inline_viewport::lease_bottom_rows(height, newt_core::tty::OnCollision::Shift)?;
+        crate::inline_viewport::lease_below_transcript(height, newt_core::tty::OnCollision::Shift)?;
     crate::inline_viewport::inline_terminal(lease)
 }
 
