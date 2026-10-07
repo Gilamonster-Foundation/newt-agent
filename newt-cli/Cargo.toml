@@ -1,5 +1,6 @@
 [package]
 name = "newt-agent"
+default-run = "newt"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +16,10 @@ categories = ["command-line-utilities", "development-tools"]
 [[bin]]
 name = "newt"
 path = "src/main.rs"
+
+[[bin]]
+name = "newt-ambient-brush"
+path = "src/ambient_brush_main.rs"
 
 [lib]
 name = "newt_cli"
@@ -112,8 +117,16 @@ regex.workspace = true
 # entry yet; version matches newt-core's direct dep.
 serial_test = "3"
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+newt-core = { workspace = true, features = ["test-util"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(windows)'.dependencies]
+brush-core = { package = "brush-ocap-core", version = "=0.6.0-rc.1" }
+brush-builtins = { package = "brush-ocap-builtins", version = "=0.3.0-rc.1" }

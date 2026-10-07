@@ -178,6 +178,10 @@ impl IntakeConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
+    /// Opt out of the Windows ambient Brush route and use cmd.exe /C.
+    /// This selects syntax only; it never enables ambient execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_cmd: Option<bool>,
     /// The selected engine, or `None` to accept the context default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<ShellEngine>,
@@ -617,5 +621,44 @@ mod shell_engine_tests {
             cfg.intake.as_ref().and_then(|i| i.action.clone()),
             Some(vec!["deploy".to_string()])
         );
+    }
+}
+
+static WINDOWS_CMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_windows_cmd(value: bool) {
+    WINDOWS_CMD.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The operator's ambient Windows dialect preference, independent of authority.
+pub fn windows_cmd_enabled() -> bool {
+    windows_cmd_choice(
+        WINDOWS_CMD.load(std::sync::atomic::Ordering::Relaxed),
+        std::env::var("NEWT_WINDOWS_CMD").ok().as_deref(),
+    )
+}
+
+fn windows_cmd_choice(configured: bool, explicit: Option<&str>) -> bool {
+    explicit
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(configured)
+}
+
+#[cfg(test)]
+mod windows_cmd_tests {
+    #[test]
+    fn windows_2776_config_defaults_to_brush_and_accepts_cmd_opt_out() {
+        let default: super::ShellConfig = toml::from_str("").unwrap();
+        assert_eq!(default.windows_cmd, None);
+        let cmd: super::ShellConfig = toml::from_str("windows_cmd = true").unwrap();
+        assert_eq!(cmd.windows_cmd, Some(true));
+        assert_eq!(cmd.engine, None, "dialect does not grant authority");
+        assert!(!super::windows_cmd_choice(false, None));
+        assert!(super::windows_cmd_choice(true, None));
+        assert!(
+            super::windows_cmd_choice(false, Some("1")),
+            "CLI opt-out wins"
+        );
+        assert!(!super::windows_cmd_choice(true, Some("0")));
     }
 }

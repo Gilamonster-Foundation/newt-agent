@@ -886,7 +886,7 @@ fn drain_pipe(pipe: Option<impl Read>) -> Vec<u8> {
 }
 
 #[cfg(target_os = "windows")]
-struct WindowsJob {
+pub(crate) struct WindowsJob {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
@@ -894,6 +894,10 @@ struct WindowsJob {
 impl WindowsJob {
     fn for_child(child: &std::process::Child) -> Option<Self> {
         use std::os::windows::io::AsRawHandle;
+        Self::for_process(child.as_raw_handle())
+    }
+
+    pub(crate) fn for_process(process: std::os::windows::io::RawHandle) -> Option<Self> {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -928,7 +932,7 @@ impl WindowsJob {
             return None;
         }
 
-        let process = child.as_raw_handle() as HANDLE;
+        let process = process as HANDLE;
         // SAFETY: both handles are live. Failure is possible when the host has
         // already assigned the process to a non-breakaway job; in that case the
         // executor keeps the immediate-child kill fallback.

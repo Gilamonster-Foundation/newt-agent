@@ -267,6 +267,11 @@ pub struct Cli {
     #[arg(long, visible_alias = "yolo", global = true, default_value_t = false)]
     pub disable_ocap: bool,
 
+    /// Use cmd.exe /C instead of Brush for Windows ambient commands.
+    /// Overrides [shell] windows_cmd; does not disable confinement.
+    #[arg(long, global = true, default_value_t = false)]
+    pub windows_cmd: bool,
+
     /// Override the configured `[tui.permissions]` preset with `full_access`
     /// for THIS invocation — session authority becomes unrestricted (fs fence,
     /// net leash, and exec allowlist all lifted; `write_file` behaves exactly
@@ -1139,6 +1144,10 @@ fn validate_launch_options(cli: &Cli) -> anyhow::Result<()> {
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     validate_launch_options(&cli)?;
+    if cli.windows_cmd {
+        // Same startup-only publication seam as the other shell switches.
+        unsafe { std::env::set_var("NEWT_WINDOWS_CMD", "1") };
+    }
     // #1303 clause B: install the one-time mouse-capture panic-release hook at
     // binary entry, before any turn can enable capture. It emits
     // `DisableMouseCapture` ONLY when capture is currently active, so the
@@ -1178,12 +1187,15 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     if let Some(ref venv) = venv_path {
         unsafe { std::env::set_var("NEWT_VENV", venv) };
         // Also prepend to the process PATH for non-bridle code paths.
-        let venv_bin = format!("{venv}/bin");
-        let mut path = std::env::var("PATH").unwrap_or_default();
-        if !path.split(':').any(|p| p == venv_bin) {
-            path = format!("{venv_bin}:{path}");
+        let venv_bin =
+            std::path::Path::new(venv).join(if cfg!(windows) { "Scripts" } else { "bin" });
+        let mut paths = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !paths.contains(&venv_bin) {
+            paths.insert(0, venv_bin);
         }
-        unsafe { std::env::set_var("PATH", path) };
+        unsafe { std::env::set_var("PATH", std::env::join_paths(paths)?) };
     }
 
     // --exec-path: store as colon-separated NEWT_EXEC_PATHS so the TUI can
@@ -3058,5 +3070,17 @@ mod tests {
             }
             other => panic!("expected worker command, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod windows_cmd_flag_tests {
+    use super::*;
+    #[test]
+    fn windows_2776_cmd_flag_is_explicit_and_does_not_grant_authority() {
+        let cli = Cli::try_parse_from(["newt", "--windows-cmd"]).unwrap();
+        assert!(cli.windows_cmd);
+        assert!(!cli.disable_ocap);
+        assert!(!Cli::try_parse_from(["newt"]).unwrap().windows_cmd);
     }
 }

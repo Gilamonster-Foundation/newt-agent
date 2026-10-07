@@ -89,7 +89,7 @@ use redact::{redact_arg_secrets, redact_url_secrets};
 pub use shell::{
     confined_default_engine, full_access_default_engine, mcp_stdio_env_passthrough,
     ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
-    shell_env_passthrough_default, IntakeConfig, ShellConfig, ShellEngine,
+    shell_env_passthrough_default, windows_cmd_enabled, IntakeConfig, ShellConfig, ShellEngine,
 };
 use tools::{
     default_max_output_tokens, default_output_cap_chars_per_token, default_output_head_tokens,
@@ -1732,6 +1732,12 @@ impl Config {
     /// copies resolved values into process-global slots, it never edits the
     /// config.
     pub fn publish_runtime_settings(&self) {
+        shell::set_windows_cmd(
+            self.shell
+                .as_ref()
+                .and_then(|s| s.windows_cmd)
+                .unwrap_or(false),
+        );
         // #726: push the resolved `[tools] max_output_tokens` into the
         // process-wide model-facing output budget without threading a new
         // `usize` through `ChatCtx` + `execute_tool` + every call site.

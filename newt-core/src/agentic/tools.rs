@@ -6071,3 +6071,6 @@ mod smart_tool_completion_tests;
 #[cfg(test)]
 #[path = "tools_tests/sibling_worktree_build.rs"]
 mod sibling_worktree_build_tests;
+
+#[cfg(all(windows, feature = "test-util"))]
+pub(crate) use shell::test_windows_ambient_dispatch;
