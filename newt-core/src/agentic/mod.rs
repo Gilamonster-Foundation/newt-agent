@@ -6328,7 +6328,16 @@ fn cap_exit_advice(max_tool_rounds: usize, wasted_calls: usize) -> &'static str 
 
 fn cap_exit_progress_block(label: &str, progress: Option<&str>) -> String {
     match progress {
-        Some(p) => format!("\n\n{label}:\n{}", humanize_cap_exit_progress(p)),
+        Some(p) => {
+            // The ledger is one step per line, but a bare newline inside a
+            // Markdown paragraph is a soft break that the styled surface folds
+            // into a space (`markdown/emitter.rs`, `Event::SoftBreak`). Two
+            // trailing spaces are a CommonMark hard break: one step per
+            // rendered line, and invisible on the plain surface, which prints
+            // the bytes verbatim (`display::print_newt`).
+            let body = format!("{label}:\n{}", humanize_cap_exit_progress(p));
+            format!("\n\n{}", body.replace('\n', "  \n"))
+        }
         None => String::new(),
     }
 }

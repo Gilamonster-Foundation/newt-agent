@@ -971,3 +971,66 @@ async fn finalizer_refutes_cargo_success_with_observed_failure() {
     assert!(text.contains("claim check (#2718)"), "{text}");
     assert!(text.contains("Failed in"), "{text}");
 }
+
+/// The captured ledger must stay one step per RENDERED line. The handoff is a
+/// non-streamed reply (`cap_exit_model_reply` returns `streamed = false`), so
+/// the styled surface renders it whole through `render_markdown`, where a bare
+/// newline inside a paragraph is a soft break folded into a space
+/// (`markdown/emitter.rs`). The older fixtures here are hand-written
+/// `1. [ ] …` strings, not `build_plan_block`'s `☐ 1. …` shape, so they never
+/// exercised it: measured live on 2026-10-07, the steps of a capped refactor
+/// turn came out as one wrapped paragraph. Under `--no-default-features` the
+/// renderer is a passthrough and the raw bytes are already one step per line,
+/// so the pin holds there too.
+#[test]
+fn cap_exit_handoff_keeps_one_plan_step_per_rendered_line() {
+    use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+    use crate::agentic::scratchpad::{ScratchpadStore, SessionScratchpadStore};
+    let ledger = SessionStepLedger::default();
+    ledger.set_plan(&[
+        "inventory".to_string(),
+        "verify".to_string(),
+        "extract".to_string(),
+    ]);
+    // ✓ 1. inventory / → 2. verify / ☐ 3. extract: all three glyphs.
+    ledger.advance();
+    let pad = SessionScratchpadStore::default();
+    pad.set("cwd", "/work".to_string());
+    let progress = cap_exit_progress(
+        None,
+        Some(&ledger as &dyn StepLedger),
+        Some(&pad as &dyn ScratchpadStore),
+    )
+    .expect("non-empty progress");
+    let text = cap_exit_progress_handoff(25, None, "Next steps: finish.", true, Some(&progress));
+    // Wide on purpose: before the fix the folded paragraph fit on ONE physical
+    // line, so every position below was equal and the ordering failed.
+    let rendered = crate::agentic::render_markdown(
+        &text,
+        crate::agentic::RenderOpts {
+            color: true,
+            cols: 200,
+        },
+    );
+    let lines: Vec<&str> = rendered.lines().collect();
+    let line_of = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} missing from the rendered handoff: {rendered}"))
+    };
+    let order = [
+        line_of("Captured working state:"),
+        line_of("Plan:"),
+        line_of("inventory"),
+        line_of("verify"),
+        line_of("extract"),
+        line_of("Current state:"),
+        line_of("cwd"),
+    ];
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "the label, 'Plan:', each step and the state must each land on their \
+         own rendered line, in order; got {order:?} in: {rendered}"
+    );
+}

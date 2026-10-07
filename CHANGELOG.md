@@ -19,6 +19,15 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   identical outlines. No refusal and nothing new for the model to learn: the
   read it already makes delivers the page.
 
+### Fixed — the tool-round-cap handoff shows one plan step per line
+
+- "Captured working state: Plan:" rendered its ✓/→/☐ steps as one wrapped
+  paragraph on the styled surface, because the ledger's single newlines are
+  Markdown soft breaks. The captured block now ends each line with a
+  CommonMark hard break (two trailing spaces). The plain surface is visually
+  unchanged, but its lines now carry those trailing spaces; the model-facing
+  bytes are unchanged.
+
 ### Added — the operator sees what the model is doing, and approves its first plan
 
 - The prose a model sends together with a tool call is now shown as `▹`
