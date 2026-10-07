@@ -2,7 +2,7 @@
 
 use crate::completed_spill::CompletedSpillArchive;
 use crate::spill_view::{SpillStream, SpillView};
-use crossterm::cursor::{MoveTo, MoveToColumn, MoveUp};
+use crossterm::cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp};
 use crossterm::queue;
 use crossterm::style::{Color, ContentStyle, Print, ResetColor, SetForegroundColor, StyledContent};
 use crossterm::terminal::{Clear, ClearType};
@@ -24,6 +24,7 @@ struct RenderState {
     view: Option<SpillView>,
     file_change: Option<RichFileChange>,
     columns: usize,
+    terminal_rows: usize,
     collapsed_rows: usize,
     max_rows: usize,
     desired_rows: usize,
@@ -69,6 +70,7 @@ struct Frame {
     /// has been reflowed by the terminal, so its rows are no longer the ones
     /// the placement granted; see [`erase_output`].
     columns: usize,
+    terminal_rows: usize,
 }
 
 /// Asks where `height` rows may open under the transcript. Production asks the
@@ -150,8 +152,10 @@ impl TerminalWriter {
 /// Width-shrink cleanup follows the primary-screen reflow used by mainstream
 /// terminal emulators: a painted logical line is rewrapped at the new column
 /// count. ANSI exposes no portable reflow capability query, so this is an
-/// assumption, not a probe. Normal painting and same-width cleanup use exact
-/// row counts.
+/// assumption, not a probe. Normal painting and unchanged-size cleanup use
+/// exact absolute rows.
+/// Height-only resize cleanup follows the retained cursor with bounded line
+/// clears, then obtains a fresh placement before repainting.
 ///
 /// **Reflow is a REQUIREMENT of the rich tier, not a caveat** (#1426, decided
 /// 2026-07-27 — see `docs/decisions/lean_rich_tui_morphologies.md`). An emulator
@@ -162,10 +166,10 @@ impl TerminalWriter {
 ///
 /// The frame's rows come from the tty arbiter's placement under the
 /// transcript (`Terminal::lease_below_cursor_quiet`): painted at absolute
-/// rows, erased as exactly those rows, with the cursor put back where the
-/// transcript ended. The cursor-relative rewind (`MoveUp` by the painted
-/// height) survives only for the reflow case above, where the placement's
-/// rows are no longer true and the terminal's own cursor is the better guide.
+/// rows, erased as exactly those rows at unchanged geometry, with the cursor
+/// put back where the transcript ended. Resize cleanup follows the retained
+/// cursor because the old absolute rows are no longer true. Width reflow still
+/// uses `MoveUp` plus `Clear(FromCursorDown)`; it is not a bounded-row clear.
 pub(crate) struct LiveSpillRenderer {
     state: Arc<Mutex<RenderState>>,
     output: Arc<Mutex<OutputState>>,
@@ -272,6 +276,7 @@ impl LiveSpillRenderer {
                 view: None,
                 file_change: None,
                 columns,
+                terminal_rows,
                 collapsed_rows,
                 max_rows,
                 desired_rows,
@@ -374,6 +379,7 @@ impl LiveSpillRenderer {
         }
         let before = (
             state.columns,
+            state.terminal_rows,
             state.collapsed_rows,
             state.max_rows,
             state.drawable,
@@ -382,6 +388,7 @@ impl LiveSpillRenderer {
         let changed = before
             != (
                 state.columns,
+                state.terminal_rows,
                 state.collapsed_rows,
                 state.max_rows,
                 state.drawable,
@@ -495,27 +502,29 @@ impl newt_core::tty::Ephemeral for LiveSpillRenderer {
     /// the question and the operator's typed answer, deleting both. A wedged
     /// stdout blocks everything anyway; a skipped erase corrupts.
     fn erase(&self) {
-        // Re-sync geometry BEFORE reading `columns`. `erase_output` erases the
-        // placed rows when the width is the one the frame was painted at, and
-        // re-wraps `painted_lines` at the new width otherwise; a stale width
-        // would take the first path on a reflowed frame and strand its extra
-        // rows. `finish` takes exactly this precaution, and
-        // `finish_rechecks_geometry_even_without_another_output_chunk` is the
-        // test pinning it.
+        // Re-sync both dimensions before cleanup. A height-only resize can
+        // scroll the placement even when frame height is unchanged; a width
+        // resize reflows the painted lines. Finish takes the same precaution.
         //
         // Scoped so `state` is released before `output` is taken: every other
         // path here locks state-then-output and drops state in between.
-        let columns = {
+        let (columns, terminal_rows) = {
             let mut state = self.lock_state();
             let _ = sync_geometry(&mut state);
-            state.columns
+            (state.columns, state.terminal_rows)
         };
         let mut output = self
             .output
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(generation) = output.painted_generation {
-            erase_output(&mut output, columns, &self.abandoned_through, generation);
+            erase_output(
+                &mut output,
+                columns,
+                terminal_rows,
+                &self.abandoned_through,
+                generation,
+            );
         }
     }
 
@@ -609,6 +618,7 @@ impl LiveToolOutput for LiveSpillRenderer {
         }
         let _ = sync_geometry(&mut state);
         let columns = state.columns;
+        let terminal_rows = state.terminal_rows;
         // #1303 step 6 (DEFERRED — clean seam): the post-completion overlay
         // attaches HERE. Instead of dropping the finished `SpillView`, a
         // retain-overlay would move it (or its `lines` + `dropped_lines`) into a
@@ -622,7 +632,13 @@ impl LiveToolOutput for LiveSpillRenderer {
         state.file_change = None;
         state.generation = None;
         drop(state);
-        erase_generation(&self.output, &self.abandoned_through, generation, columns);
+        erase_generation(
+            &self.output,
+            &self.abandoned_through,
+            generation,
+            columns,
+            terminal_rows,
+        );
     }
 
     fn abandon(&self, generation: u64) {
@@ -722,6 +738,7 @@ fn sync_geometry(state: &mut RenderState) -> bool {
         state.drawable = false;
         return false;
     };
+    state.terminal_rows = terminal_rows;
     let Some((collapsed_rows, max_rows)) =
         viewport_geometry(state.desired_rows, columns, terminal_rows)
     else {
@@ -809,6 +826,7 @@ fn paint_generation(
                 }),
                 state.color,
                 state.columns,
+                state.terminal_rows,
                 state
                     .file_change
                     .as_ref()
@@ -817,7 +835,7 @@ fn paint_generation(
             )
         })
     };
-    let Some((lines, color, columns, styles)) = snapshot else {
+    let Some((lines, color, columns, terminal_rows, styles)) = snapshot else {
         return;
     };
     if is_abandoned(abandoned_through, generation) {
@@ -840,6 +858,7 @@ fn paint_generation(
                 && !is_abandoned(abandoned_through, previous)
                 && frame.place.height == wanted
                 && frame.columns == columns
+                && frame.terminal_rows == terminal_rows
         }
         _ => false,
     };
@@ -848,7 +867,13 @@ fn paint_generation(
             if is_abandoned(abandoned_through, previous) {
                 discard_generation(&mut output, previous);
             } else {
-                erase_output(&mut output, columns, abandoned_through, previous);
+                erase_output(
+                    &mut output,
+                    columns,
+                    terminal_rows,
+                    abandoned_through,
+                    previous,
+                );
             }
         }
     }
@@ -910,6 +935,7 @@ fn paint_generation(
         _lease: lease,
         place,
         columns,
+        terminal_rows,
     });
 }
 
@@ -951,6 +977,7 @@ fn erase_generation(
     abandoned_through: &AtomicU64,
     generation: u64,
     columns: usize,
+    terminal_rows: usize,
 ) {
     let mut output = output
         .lock()
@@ -960,17 +987,25 @@ fn erase_generation(
         return;
     }
     if output.painted_generation == Some(generation) {
-        erase_output(&mut output, columns, abandoned_through, generation);
+        erase_output(
+            &mut output,
+            columns,
+            terminal_rows,
+            abandoned_through,
+            generation,
+        );
     }
 }
 
 /// Take the frame off the screen and put the cursor back where the
 /// transcript ended.
 ///
-/// At the width the frame was painted at, that is exactly the rows the
+/// At the screen size the frame was painted at, that is exactly the rows the
 /// placement granted (`blank_rows`, never `ESC[J`, which would take whatever
 /// holds the rows below) and a move to the placement's return point: the
-/// arbiter's own release, on this writer. At any other width the terminal
+/// arbiter's own release, on this writer. Height-only changes use bounded
+/// cursor-relative line clears because the terminal may have scrolled. At any
+/// other width the terminal
 /// has reflowed the frame, its rows are no longer the granted ones, and the
 /// cursor the terminal kept parked under the frame is the better guide:
 /// rewind by the painted lines re-wrapped at the NEW width (the reflow rule
@@ -980,6 +1015,7 @@ fn erase_generation(
 fn erase_output(
     output: &mut OutputState,
     columns: usize,
+    terminal_rows: usize,
     abandoned_through: &AtomicU64,
     generation: u64,
 ) {
@@ -993,10 +1029,35 @@ fn erase_output(
         return;
     }
     let mut batch = Vec::new();
-    if frame.columns == columns {
+    if frame.columns == columns && frame.terminal_rows == terminal_rows {
         let _ = blank_rows(&mut batch, frame.place.top, frame.place.height);
         let (x, y) = frame.place.return_to;
         let _ = queue!(&mut batch, MoveTo(x, y));
+    } else if frame.columns == columns {
+        // Height-only resizing may scroll (or reveal scrollback). Absolute
+        // rows are stale, but the cursor remains parked under the frame.
+        // Clear only its surviving rows, then restore the transcript's
+        // relative return point. No clear-to-screen-end on this path.
+        let height = frame.place.height;
+        let visible = height.min(u16::try_from(terminal_rows).unwrap_or(u16::MAX).max(1));
+        if height > 1 {
+            let _ = queue!(&mut batch, MoveUp(height - 1));
+        }
+        let _ = queue!(&mut batch, MoveToColumn(0));
+        for row in 0..visible {
+            let _ = queue!(&mut batch, Clear(ClearType::CurrentLine));
+            if row + 1 < visible {
+                let _ = queue!(&mut batch, MoveDown(1));
+            }
+        }
+        let parked = frame.place.top.saturating_add(height.saturating_sub(1));
+        let (x, y) = frame.place.return_to;
+        if parked > y {
+            let _ = queue!(&mut batch, MoveUp(parked - y));
+        } else if y > parked {
+            let _ = queue!(&mut batch, MoveDown(y - parked));
+        }
+        let _ = queue!(&mut batch, MoveToColumn(x));
     } else {
         let physical_rows = output
             .painted_lines
@@ -1249,7 +1310,7 @@ impl CompletedSpillRenderer for LiveSpillRenderer {
     /// committed excerpt above the frame is the durable record. No-op when
     /// no completed viewport is up (never touches a live generation).
     fn erase(&self) {
-        let columns = {
+        let (columns, terminal_rows) = {
             let mut state = self.lock_state();
             if state.generation != Some(COMPLETED_GENERATION) {
                 return;
@@ -1260,13 +1321,14 @@ impl CompletedSpillRenderer for LiveSpillRenderer {
             state.view = None;
             state.file_change = None;
             state.generation = None;
-            state.columns
+            (state.columns, state.terminal_rows)
         };
         erase_generation(
             &self.output,
             &self.abandoned_through,
             COMPLETED_GENERATION,
             columns,
+            terminal_rows,
         );
     }
 }

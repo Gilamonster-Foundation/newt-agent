@@ -311,6 +311,10 @@ impl ScreenModel {
             // captured while mouse capture toggles doesn't panic.
             ("?1000" | "?1002" | "?1003" | "?1006" | "?1015", 'h' | 'l') => {}
             (_, 'A') => self.cursor_row = self.cursor_row.saturating_sub(amount),
+            (_, 'B') => {
+                self.cursor_row += amount;
+                self.ensure_cursor_row();
+            }
             (_, 'G') => self.cursor_col = amount.saturating_sub(1),
             // Absolute moves (`MoveTo`): the frame is painted on the rows the
             // arbiter placed it on, so the model honours CUP.
@@ -1505,4 +1509,87 @@ mod completed {
         assert!(renderer.render_completed("done-1\ndone-2\n", 80, 3) > 0);
         assert!(CompletedSpillRenderer::is_active(renderer.as_ref()));
     }
+}
+
+/// #2809: a height-only shrink scrolls to retain the parked cursor. The frame
+/// keeps its six-row size; neither repaint nor finish may use its old row 18.
+fn height_only_shrink(repaint: bool) {
+    let term = ModelTerminal::new(80);
+    let geometry = Arc::new(Mutex::new((80, 24)));
+    let measured = geometry.clone();
+    let placed_geometry = geometry.clone();
+    let screen = term.screen.clone();
+    let placer: Placer = Box::new(move |height| {
+        let screen = screen.lock().unwrap();
+        let rows = placed_geometry.lock().unwrap().1 as u16;
+        newt_core::tty::place_below_cursor(
+            (screen.cursor_col as u16, screen.cursor_row as u16),
+            rows,
+            height,
+            &[],
+            OnCollision::Shift,
+        )
+        .map(|place| (None, place))
+    });
+    let renderer =
+        LiveSpillRenderer::with_writer_and_geometry(term.clone(), placer, 3, false, move || {
+            Some(*measured.lock().unwrap())
+        })
+        .unwrap();
+    for row in 0..18 {
+        term.print(&format!("transcript-{row}\r\n"));
+    }
+    renderer.start(1);
+    renderer.write(1, ToolOutputStream::Stdout, b"old frame\n");
+    let place = renderer
+        .output
+        .lock()
+        .unwrap()
+        .frame
+        .as_ref()
+        .unwrap()
+        .place;
+    assert_eq!((place.top, place.height, place.rows), (18, 6, 24));
+    {
+        // Primary-screen shrink retaining cursor row 23: four rows enter
+        // scrollback, and the frame moves from 18..23 to 14..19.
+        let mut screen = term.screen.lock().unwrap();
+        assert_eq!(screen.cursor_row, 23);
+        screen.rows.drain(..4);
+        screen.continued.drain(..4);
+        screen.cursor_row -= 4;
+    }
+    *geometry.lock().unwrap() = (80, 20);
+    if repaint {
+        renderer.write(1, ToolOutputStream::Stdout, b"new frame\n");
+        let place = renderer
+            .output
+            .lock()
+            .unwrap()
+            .frame
+            .as_ref()
+            .unwrap()
+            .place;
+        assert_eq!((place.top, place.height, place.rows), (14, 6, 20));
+    }
+    renderer.finish(1); // also covers resize after the last chunk
+    assert_eq!(term.screen.lock().unwrap().cursor_row, 14);
+    term.print("completion\r\n");
+    let mut expected: Vec<_> = (4..18).map(|row| format!("transcript-{row}")).collect();
+    expected.push("completion".into());
+    assert_eq!(
+        term.rows(),
+        expected,
+        "no stale frame and no lost transcript"
+    );
+}
+
+#[test]
+fn height_only_shrink_replaces_before_repaint() {
+    height_only_shrink(true);
+}
+
+#[test]
+fn height_only_shrink_finishes_without_another_chunk() {
+    height_only_shrink(false);
 }
