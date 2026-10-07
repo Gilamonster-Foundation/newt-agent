@@ -90,10 +90,27 @@ granted_height`, red with the rule deleted, green with it kept).
   keeps the terminal silent and asserts the frame still opens, answers, and
   hands the terminal back.
 
-## Next
+## Second step: the live viewport
 
-The live viewport (`live_spill.rs`) moves onto the same lease: its
-`MoveUp` rewind and painted-row accounting go, `Ephemeral::erase` becomes
-the lease's clear, and `cursor_relative_region_painters_are_the_declared_two`
-loses its entry. The cockpit presenter is unchanged: it owns its pty and its
-block's top row already is the transcript's end.
+`live_spill.rs` takes its rows from `Terminal::lease_below_cursor_quiet`,
+the same query and placement rule with none of the arbiter's bytes: the
+renderer paints and erases through its own writer (its unit tier replays
+those bytes on a screen model, which the arbiter's stream would bypass) and
+holds the `RegionLease` for the rows. A frame is placed once per generation
+and repainted in place on every chunk; a resize, an expand, or a frame left
+by another generation erases what is up and places afresh. The erase is
+`blank_rows` plus a move to the placement's return point, the arbiter's own
+release on this writer. One cursor-relative rewind survives, for a frame
+whose width changed under it: a reflowing terminal has re-wrapped its rows,
+the placement no longer names them, and the cursor the terminal kept parked
+under the frame is the better guide. `abandon` still touches nothing: the
+rows go back to the arbiter silently and the residue stays.
+
+The query is bounded: it waits up to 300 ms for the turn watcher's stdin
+token, and a terminal that lets the query time out is not asked again for a
+minute (a frame on every tool chunk cannot pay two seconds each time); in
+both cases the frame is painted nowhere rather than somewhere guessed.
+
+`cursor_relative_region_painters_are_the_declared_holdouts` lost its
+`live_spill.rs` entry. The cockpit presenter is unchanged: it owns its pty
+and its block's top row already is the transcript's end.

@@ -597,34 +597,29 @@ mod region_lease_door {
 
     /// Writers that own rows but cannot yet NAME them.
     ///
-    /// Both paint cursor-relative — `MoveUp` then
+    /// They paint cursor-relative — `MoveUp` then
     /// `Clear(ClearType::FromCursorDown)` — so they claim "from here down"
-    /// rather than an absolute range. A `Region` needs absolute rows, and
-    /// neither writer knows its own top: learning it means a DSR cursor query,
-    /// which #1950/#1952 established is exactly the thing that cannot be
-    /// relied on. Migrating them is a redesign, not a field.
+    /// rather than an absolute range. The live tool-output viewport was the
+    /// other entry here until it moved onto the arbiter's placement
+    /// (`Terminal::lease_below_cursor_quiet`): it now holds a `RegionLease`
+    /// for rows the arbiter named, and the one cursor-relative rewind it keeps
+    /// is the reflow case, inside those rows.
     ///
     /// Enumerated so they stay countable and this list may only shrink.
-    const CURSOR_RELATIVE_CLAIMS: &[(&str, &str)] = &[
-        (
-            "live_spill.rs",
-            "N rows below the cursor; already registers as an ephemeral, so a \
-             prompt erases it — it lacks exclusion, not visibility",
-        ),
-        (
-            "lean_input.rs",
-            "rows_above_cursor, on the plain-scroller path that #1803's \
-             migration notice moves to wyvern-agent",
-        ),
-    ];
+    const CURSOR_RELATIVE_CLAIMS: &[(&str, &str)] = &[(
+        "lean_input.rs",
+        "rows_above_cursor, on the plain-scroller path that #1803's \
+         migration notice moves to wyvern-agent",
+    )];
 
-    /// The cursor-relative holdouts are exactly the two declared ones.
+    /// The cursor-relative holdouts are exactly the declared ones.
     ///
-    /// Not a permission list: a THIRD writer that paints from the cursor down
+    /// Not a permission list: a NEW writer that paints from the cursor down
     /// is a new unarbitrated region, and it fails here until someone either
-    /// leases it or argues it onto this list.
+    /// leases it or argues it onto this list. The list started at two (#1979)
+    /// and is at one.
     #[test]
-    fn cursor_relative_region_painters_are_the_declared_two() {
+    fn cursor_relative_region_painters_are_the_declared_holdouts() {
         const NEEDLE: &str = "Clear(ClearType::FromCursorDown)";
         let files = sources();
         assert!(

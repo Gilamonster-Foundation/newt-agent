@@ -1,8 +1,9 @@
-use super::LiveSpillRenderer;
+use super::{LiveSpillRenderer, Placer};
 // #1410: the gate tests drive the paint path directly, standing in for the
 // `run_input_repaint` painter that a geometry change wakes.
 use super::paint_generation;
 use crate::spill_view::display_width;
+use newt_core::tty::{OnCollision, Placement};
 use newt_core::{LiveToolOutput, ToolOutputStream};
 use std::io::Write;
 #[cfg(unix)]
@@ -30,11 +31,14 @@ fn rich_changes_reproject_on_resize_and_share_completed_cleanup() {
     let geometry = Arc::new(Mutex::new((18, 30)));
     let measured = geometry.clone();
     let writer = SharedWriter::default();
-    let renderer =
-        LiveSpillRenderer::with_writer_and_geometry(writer.clone(), 12, true, move || {
-            Some(*measured.lock().unwrap())
-        })
-        .unwrap();
+    let renderer = LiveSpillRenderer::with_writer_and_geometry(
+        writer.clone(),
+        fixed_placer(),
+        12,
+        true,
+        move || Some(*measured.lock().unwrap()),
+    )
+    .unwrap();
     assert!(renderer.render_file_change(&receipt, &receipt, change, 18, 12) > 0);
     let first = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
     assert!(
@@ -110,6 +114,89 @@ struct CountingWriter(Arc<std::sync::atomic::AtomicUsize>);
 impl Write for CountingWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A placement that ignores the screen: the frame opens at row 0 and the
+/// cursor returns there. For the pins that count bytes and batches, not rows.
+fn fixed_placer() -> Placer {
+    Box::new(|height| {
+        Some((
+            None,
+            Placement {
+                top: 0,
+                height,
+                scroll: 0,
+                return_to: (0, 0),
+                rows: u16::MAX,
+            },
+        ))
+    })
+}
+
+/// The in-memory terminal: every byte the renderer writes lands on a screen
+/// model at once, and the renderer's placement asks that model where the
+/// cursor is, the way the arbiter asks a real terminal. Unbounded in height,
+/// so a placement never scrolls; the PTY tier covers scrolling.
+#[derive(Clone)]
+struct ModelTerminal {
+    screen: Arc<Mutex<ScreenModel>>,
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl ModelTerminal {
+    fn new(width: usize) -> Self {
+        Self {
+            screen: Arc::new(Mutex::new(ScreenModel::new(width))),
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The arbiter's placement rule, fed this model's cursor.
+    fn placer(&self) -> Placer {
+        let screen = self.screen.clone();
+        Box::new(move |height| {
+            let screen = screen.lock().unwrap();
+            let cursor = (
+                u16::try_from(screen.cursor_col).unwrap_or(u16::MAX),
+                u16::try_from(screen.cursor_row).unwrap_or(u16::MAX),
+            );
+            newt_core::tty::place_below_cursor(cursor, u16::MAX, height, &[], OnCollision::Shift)
+                .map(|place| (None, place))
+        })
+    }
+
+    /// A canonical write, as `print_newt` would make it.
+    fn print(&self, text: &str) {
+        self.clone().write_all(text.as_bytes()).unwrap();
+    }
+
+    fn rows(&self) -> Vec<String> {
+        self.screen.lock().unwrap().nonempty_rows()
+    }
+
+    fn all_rows(&self) -> Vec<String> {
+        self.screen.lock().unwrap().rows.clone()
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.bytes.lock().unwrap().clone()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.lock().unwrap().len()
+    }
+}
+
+impl Write for ModelTerminal {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.screen.lock().unwrap().apply(bytes);
+        self.bytes.lock().unwrap().extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -225,6 +312,14 @@ impl ScreenModel {
             ("?1000" | "?1002" | "?1003" | "?1006" | "?1015", 'h' | 'l') => {}
             (_, 'A') => self.cursor_row = self.cursor_row.saturating_sub(amount),
             (_, 'G') => self.cursor_col = amount.saturating_sub(1),
+            // Absolute moves (`MoveTo`): the frame is painted on the rows the
+            // arbiter placed it on, so the model honours CUP.
+            (_, 'H') => {
+                let mut parts = body.split(';').map(|p| p.parse::<usize>().unwrap_or(1));
+                self.cursor_row = parts.next().unwrap_or(1).max(1) - 1;
+                self.cursor_col = parts.next().unwrap_or(1).max(1) - 1;
+                self.ensure_cursor_row();
+            }
             ("2", 'K') => {
                 self.ensure_cursor_row();
                 self.rows[self.cursor_row].clear();
@@ -356,9 +451,13 @@ fn blocked_terminal_write_does_not_block_interrupt_or_watcher_shutdown() {
     let geometry = Arc::new(Mutex::new((80usize, 6usize)));
     let geometry_for_renderer = geometry.clone();
     let renderer = Arc::new(
-        LiveSpillRenderer::with_writer_and_geometry(writer.clone(), 3, false, move || {
-            Some(*geometry_for_renderer.lock().unwrap())
-        })
+        LiveSpillRenderer::with_writer_and_geometry(
+            writer.clone(),
+            fixed_placer(),
+            3,
+            false,
+            move || Some(*geometry_for_renderer.lock().unwrap()),
+        )
         .unwrap(),
     );
     renderer.start(1);
@@ -478,7 +577,13 @@ fn blocked_terminal_write_does_not_block_interrupt_or_watcher_shutdown() {
 #[test]
 fn a_registered_viewport_paints_nothing_while_a_prompt_is_up() {
     let writer = SharedWriter::default();
-    let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+    let renderer = Arc::new(LiveSpillRenderer::with_writer(
+        writer.clone(),
+        fixed_placer(),
+        80,
+        3,
+        false,
+    ));
     renderer.register_for_test();
 
     renderer.start(1);
@@ -523,7 +628,13 @@ fn a_registered_viewport_paints_nothing_while_a_prompt_is_up() {
 #[test]
 fn an_unregistered_viewport_is_what_the_bug_looked_like() {
     let writer = SharedWriter::default();
-    let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+    let renderer = Arc::new(LiveSpillRenderer::with_writer(
+        writer.clone(),
+        fixed_placer(),
+        80,
+        3,
+        false,
+    ));
     // deliberately NOT registered
 
     renderer.start(1);
@@ -553,7 +664,13 @@ fn erase_is_idempotent_and_writes_nothing_when_nothing_is_painted() {
     use newt_core::tty::Ephemeral as _;
 
     let writer = SharedWriter::default();
-    let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+    let renderer = Arc::new(LiveSpillRenderer::with_writer(
+        writer.clone(),
+        fixed_placer(),
+        80,
+        3,
+        false,
+    ));
     renderer.register_for_test();
 
     // Nothing painted yet: erase must be a no-op, not a blind rewind.
@@ -583,7 +700,13 @@ fn erase_is_idempotent_and_writes_nothing_when_nothing_is_painted() {
 fn dropping_the_renderer_deregisters_it() {
     let writer = SharedWriter::default();
     {
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.register_for_test();
         renderer.start(1);
         renderer.write(1, ToolOutputStream::Stdout, b"a\n");
@@ -605,8 +728,8 @@ fn dropping_the_renderer_deregisters_it() {
 
 #[test]
 fn renderer_paints_fixed_rows_and_erases_before_completion() {
-    let writer = SharedWriter::default();
-    let renderer = LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false);
+    let term = ModelTerminal::new(80);
+    let renderer = LiveSpillRenderer::with_writer(term.clone(), term.placer(), 80, 3, false);
 
     renderer.start(1);
     renderer.write(1, ToolOutputStream::Stdout, b"a\nb\nc\nd\n");
@@ -620,26 +743,33 @@ fn renderer_paints_fixed_rows_and_erases_before_completion() {
             "⧉ Space to expand · ↑↓ scroll"
         ]
     );
+    assert!(
+        term.rows()
+            .iter()
+            .any(|row| row.contains("▲ 1 more line above")),
+        "the frame reached the screen: {:?}",
+        term.rows()
+    );
 
     renderer.finish(1);
     assert!(!renderer.is_active());
-    let bytes = writer.0.lock().unwrap().clone();
-    let rendered = String::from_utf8_lossy(&bytes);
-    assert!(rendered.contains("▲ 1 more line above"));
     assert!(
-        rendered.contains("\u{1b}[5A"),
-        "frame was not rewound: {rendered:?}"
+        term.rows().is_empty(),
+        "frame rows survived the erase: {:?}",
+        term.rows()
     );
+    let rendered = String::from_utf8_lossy(&term.bytes()).into_owned();
     assert!(
-        rendered.contains("\u{1b}[J"),
-        "frame was not erased: {rendered:?}"
+        rendered.contains("\u{1b}[2K") && !rendered.contains("\u{1b}[J"),
+        "the frame's own rows are erased one by one, never from the cursor to \
+         the end of the screen: {rendered:?}"
     );
 }
 
 #[test]
 fn each_paint_and_erase_is_one_writer_batch() {
     let writer = CountingWriter::default();
-    let renderer = LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false);
+    let renderer = LiveSpillRenderer::with_writer(writer.clone(), fixed_placer(), 80, 3, false);
     renderer.start(1);
 
     renderer.write(1, ToolOutputStream::Stdout, b"visible\n");
@@ -659,21 +789,19 @@ fn each_paint_and_erase_is_one_writer_batch() {
 
 #[test]
 fn same_width_finish_erases_only_the_live_frame_not_the_audit_line() {
-    let writer = SharedWriter::default();
-    let renderer = LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false);
+    let term = ModelTerminal::new(80);
+    let renderer = LiveSpillRenderer::with_writer(term.clone(), term.placer(), 80, 3, false);
+    term.print("audit line\r\n");
     renderer.start(1);
     renderer.write(1, ToolOutputStream::Stdout, b"visible\n");
     renderer.finish(1);
-
-    let mut screen = ScreenModel::new(80);
-    screen.apply(b"audit line\r\n");
-    screen.apply(&writer.0.lock().unwrap());
-    assert_eq!(screen.nonempty_rows(), ["audit line"]);
+    assert_eq!(term.rows(), ["audit line"]);
 }
 
 #[test]
 fn arrows_are_consumed_only_during_an_active_frame() {
-    let renderer = LiveSpillRenderer::with_writer(SharedWriter::default(), 80, 3, false);
+    let renderer =
+        LiveSpillRenderer::with_writer(SharedWriter::default(), fixed_placer(), 80, 3, false);
     assert!(!renderer.scroll_up());
 
     renderer.start(1);
@@ -689,7 +817,7 @@ fn arrows_are_consumed_only_during_an_active_frame() {
 #[test]
 fn writes_after_finish_cannot_reopen_or_repaint_the_frame() {
     let writer = SharedWriter::default();
-    let renderer = LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false);
+    let renderer = LiveSpillRenderer::with_writer(writer.clone(), fixed_placer(), 80, 3, false);
     renderer.start(1);
     renderer.write(1, ToolOutputStream::Stdout, b"visible\n");
     renderer.finish(1);
@@ -703,28 +831,28 @@ fn writes_after_finish_cannot_reopen_or_repaint_the_frame() {
 
 #[test]
 fn abandoned_frame_is_not_erased_after_canonical_output_can_resume() {
-    let writer = SharedWriter::default();
-    let renderer = LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false);
+    let term = ModelTerminal::new(80);
+    let renderer = LiveSpillRenderer::with_writer(term.clone(), term.placer(), 80, 3, false);
     renderer.start(1);
     renderer.write(1, ToolOutputStream::Stdout, b"old frame\n");
-    let before_abandon = writer.0.lock().unwrap().len();
+    let before_abandon = term.len();
 
     renderer.abandon(1);
     renderer.finish(1);
     assert_eq!(
-        writer.0.lock().unwrap().len(),
+        term.len(),
         before_abandon,
         "abandon and a delayed finish must perform no terminal I/O"
     );
 
     renderer.start(2);
     renderer.write(2, ToolOutputStream::Stdout, b"new frame\n");
-    let bytes = writer.0.lock().unwrap();
-    let next_frame = String::from_utf8_lossy(&bytes[before_abandon..]);
-    assert!(next_frame.contains("new frame"));
+    let rows = term.rows();
+    let old = rows.iter().position(|row| row.contains("old frame"));
+    let new = rows.iter().position(|row| row.contains("new frame"));
     assert!(
-        !next_frame.contains("\u{1b}[5A") && !next_frame.contains("\u{1b}[J"),
-        "a new generation must not erase an abandoned frame from the new cursor: {next_frame:?}"
+        old.is_some() && new.is_some() && old < new,
+        "a new generation opens UNDER an abandoned frame and never erases it: {rows:?}"
     );
 }
 
@@ -741,7 +869,8 @@ fn rule7_abandon_releases_mouse_capture_without_renderer_io() {
     use std::sync::{Arc, Mutex};
 
     let renderer_writer = SharedWriter::default();
-    let renderer = LiveSpillRenderer::with_writer(renderer_writer.clone(), 80, 3, false);
+    let renderer =
+        LiveSpillRenderer::with_writer(renderer_writer.clone(), fixed_placer(), 80, 3, false);
     let mouse_sink = Arc::new(Mutex::new(Vec::<u8>::new()));
     let released =
         || String::from_utf8_lossy(&mouse_sink.lock().unwrap()).contains("\u{1b}[?1006l");
@@ -801,7 +930,8 @@ fn screen_model_tolerates_mouse_capture_sequences() {
 
 #[test]
 fn stale_generation_cannot_touch_a_retry_frame() {
-    let renderer = LiveSpillRenderer::with_writer(SharedWriter::default(), 80, 3, false);
+    let renderer =
+        LiveSpillRenderer::with_writer(SharedWriter::default(), fixed_placer(), 80, 3, false);
     renderer.start(1);
     renderer.write(1, ToolOutputStream::Stdout, b"first\n");
     renderer.finish(1);
@@ -827,11 +957,14 @@ fn terminal_resize_erases_old_geometry_and_reclips_the_frame() {
     let writer = SharedWriter::default();
     let geometry = Arc::new(Mutex::new((80usize, 8usize)));
     let geometry_for_renderer = geometry.clone();
-    let renderer =
-        LiveSpillRenderer::with_writer_and_geometry(writer.clone(), 5, false, move || {
-            Some(*geometry_for_renderer.lock().unwrap())
-        })
-        .unwrap();
+    let renderer = LiveSpillRenderer::with_writer_and_geometry(
+        writer.clone(),
+        fixed_placer(),
+        5,
+        false,
+        move || Some(*geometry_for_renderer.lock().unwrap()),
+    )
+    .unwrap();
     renderer.start(1);
     renderer.write(
         1,
@@ -955,11 +1088,14 @@ fn width_shrink_erases_the_reflowed_physical_frame_without_stale_rows() {
     let writer = SharedWriter::default();
     let geometry = Arc::new(Mutex::new((80usize, 8usize)));
     let geometry_for_renderer = geometry.clone();
-    let renderer =
-        LiveSpillRenderer::with_writer_and_geometry(writer.clone(), 5, false, move || {
-            Some(*geometry_for_renderer.lock().unwrap())
-        })
-        .unwrap();
+    let renderer = LiveSpillRenderer::with_writer_and_geometry(
+        writer.clone(),
+        fixed_placer(),
+        5,
+        false,
+        move || Some(*geometry_for_renderer.lock().unwrap()),
+    )
+    .unwrap();
     renderer.start(1);
     renderer.write(
         1,
@@ -991,12 +1127,17 @@ fn finish_rechecks_geometry_even_without_another_output_chunk() {
     let calls = Arc::new(AtomicUsize::new(0));
     let geometry_for_renderer = geometry.clone();
     let calls_for_renderer = calls.clone();
-    let renderer =
-        LiveSpillRenderer::with_writer_and_geometry(SharedWriter::default(), 5, false, move || {
+    let renderer = LiveSpillRenderer::with_writer_and_geometry(
+        SharedWriter::default(),
+        fixed_placer(),
+        5,
+        false,
+        move || {
             calls_for_renderer.fetch_add(1, Ordering::Relaxed);
             Some(*geometry_for_renderer.lock().unwrap())
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     renderer.start(1);
     renderer.write(1, ToolOutputStream::Stdout, b"a\nb\nc\nd\ne\n");
     let before_finish = calls.load(Ordering::Relaxed);
@@ -1012,11 +1153,14 @@ fn finish_rechecks_geometry_even_without_another_output_chunk() {
 
 #[test]
 fn boundary_control_expands_to_available_rows_and_collapses_again() {
-    let renderer =
-        LiveSpillRenderer::with_writer_and_geometry(SharedWriter::default(), 3, false, || {
-            Some((80, 20))
-        })
-        .unwrap();
+    let renderer = LiveSpillRenderer::with_writer_and_geometry(
+        SharedWriter::default(),
+        fixed_placer(),
+        3,
+        false,
+        || Some((80, 20)),
+    )
+    .unwrap();
     renderer.start(1);
     renderer.write(
         1,
@@ -1051,9 +1195,13 @@ fn toggle_survives_transient_model_lock_contention() {
     use std::time::Duration;
 
     let renderer = Arc::new(
-        LiveSpillRenderer::with_writer_and_geometry(SharedWriter::default(), 3, false, || {
-            Some((80, 20))
-        })
+        LiveSpillRenderer::with_writer_and_geometry(
+            SharedWriter::default(),
+            fixed_placer(),
+            3,
+            false,
+            || Some((80, 20)),
+        )
         .unwrap(),
     );
     renderer.start(1);
@@ -1106,7 +1254,13 @@ mod completed {
     #[test]
     fn completed_viewport_paints_and_reports_rows() {
         let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
 
         let rows = renderer.render_completed("l1\nl2\nl3\nl4\nl5\n", 80, 3);
         assert!(rows > 0, "a completed render paints physical rows");
@@ -1126,7 +1280,13 @@ mod completed {
     #[test]
     fn completed_viewport_scrolls_and_repaints() {
         let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.render_completed("l1\nl2\nl3\nl4\nl5\nl6\n", 80, 3);
         assert!(renderer.scroll_up(), "a completed viewport accepts scroll");
 
@@ -1154,7 +1314,13 @@ mod completed {
     #[test]
     fn live_abandonment_cannot_gag_a_completed_viewport() {
         let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.abandon(7);
 
         let rows = renderer.render_completed("after-abandon\n", 80, 3);
@@ -1167,7 +1333,13 @@ mod completed {
     #[test]
     fn completed_erase_rewinds_once_and_deactivates() {
         let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.render_completed("l1\nl2\nl3\n", 80, 3);
         let painted = writer.0.lock().unwrap().len();
 
@@ -1188,17 +1360,21 @@ mod completed {
     /// the rewind math is exact.
     #[test]
     fn completed_erase_leaves_a_clean_screen() {
-        let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let term = ModelTerminal::new(80);
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            term.clone(),
+            term.placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.render_completed("alpha\nbeta\ngamma\n", 80, 3);
         CompletedSpillRenderer::erase(renderer.as_ref());
 
-        let mut screen = ScreenModel::new(80);
-        screen.apply(&writer.0.lock().unwrap());
+        let rows = term.all_rows();
         assert!(
-            screen.rows.iter().all(|row| row.trim().is_empty()),
-            "no frame residue after erase: {:?}",
-            screen.rows
+            rows.iter().all(|row| row.trim().is_empty()),
+            "no frame residue after erase: {rows:?}"
         );
     }
 
@@ -1208,7 +1384,13 @@ mod completed {
     #[test]
     fn a_live_viewport_is_never_stomped_by_completed_rendering() {
         let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.start(3);
         renderer.write(3, ToolOutputStream::Stdout, b"live-line\n");
 
@@ -1239,7 +1421,13 @@ mod completed {
     #[test]
     fn discard_clears_bookkeeping_without_touching_the_terminal() {
         let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.render_completed("l1\nl2\n", 80, 3);
         let painted = writer.0.lock().unwrap().len();
 
@@ -1262,7 +1450,13 @@ mod completed {
     #[test]
     fn discard_leaves_a_live_viewport_alone() {
         let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.start(5);
         renderer.write(5, ToolOutputStream::Stdout, b"live-line\n");
 
@@ -1280,18 +1474,16 @@ mod completed {
     /// shows — the caller positions subsequent output with it.
     #[test]
     fn reported_rows_match_the_screen_model() {
-        let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let term = ModelTerminal::new(80);
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            term.clone(),
+            term.placer(),
+            80,
+            3,
+            false,
+        ));
         let rows = renderer.render_completed("l1\nl2\nl3\nl4\nl5\n", 80, 3);
-
-        let mut screen = ScreenModel::new(80);
-        screen.apply(&writer.0.lock().unwrap());
-        let visible = screen
-            .rows
-            .iter()
-            .filter(|row| !row.trim().is_empty())
-            .count();
-        assert_eq!(rows, visible, "reported rows == painted rows");
+        assert_eq!(rows, term.rows().len(), "reported rows == painted rows");
     }
 
     /// After the live hand-off (`finish`), completed rendering takes the
@@ -1299,7 +1491,13 @@ mod completed {
     #[test]
     fn completed_rendering_takes_over_after_the_live_handoff() {
         let writer = SharedWriter::default();
-        let renderer = Arc::new(LiveSpillRenderer::with_writer(writer.clone(), 80, 3, false));
+        let renderer = Arc::new(LiveSpillRenderer::with_writer(
+            writer.clone(),
+            fixed_placer(),
+            80,
+            3,
+            false,
+        ));
         renderer.start(4);
         renderer.write(4, ToolOutputStream::Stdout, b"live\n");
         renderer.finish(4);

@@ -726,6 +726,7 @@ fn placed(top: u16, height: u16, scroll: u16, return_to: (u16, u16)) -> Option<P
         height,
         scroll,
         return_to,
+        rows: 24,
     })
 }
 

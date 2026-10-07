@@ -698,6 +698,8 @@ pub(crate) struct Pump<'a> {
     answer_dsr: bool,
     /// The screen height the replay scrolls at.
     pub(crate) rows: usize,
+    /// Transcript offset just past the last query answered.
+    answered_through: usize,
 }
 
 impl<'a> Pump<'a> {
@@ -708,20 +710,33 @@ impl<'a> Pump<'a> {
             mark: 0,
             answer_dsr,
             rows,
+            answered_through: 0,
         }
     }
 
     pub(crate) fn pump(&mut self) {
+        const QUERY: &str = "\x1b[6n";
         let chunk = self.pty.screen();
-        for (at, _) in chunk.match_indices("\x1b[6n") {
-            if self.answer_dsr {
-                let seen = format!("{}{}", self.transcript, &chunk[..at]);
-                let (_, (row, col)) =
-                    crate::interaction_view_pty_test::erasing_screen(&seen, self.rows);
-                self.pty.type_in(&format!("\x1b[{};{}R", row + 1, col + 1));
-            }
-        }
+        // Search from just before the chunk, so a query split across two
+        // reads is still answered once.
+        let from = self.transcript.len().saturating_sub(QUERY.len() - 1);
         self.transcript.push_str(&chunk);
+        if !self.answer_dsr {
+            return;
+        }
+        let mut at = from;
+        while let Some(found) = self.transcript[at..].find(QUERY) {
+            let query = at + found;
+            if query >= self.answered_through {
+                let (_, (row, col)) = crate::interaction_view_pty_test::erasing_screen(
+                    &self.transcript[..query],
+                    self.rows,
+                );
+                self.pty.type_in(&format!("\x1b[{};{}R", row + 1, col + 1));
+                self.answered_through = query + QUERY.len();
+            }
+            at = query + QUERY.len();
+        }
     }
 
     pub(crate) fn mark(&mut self) {

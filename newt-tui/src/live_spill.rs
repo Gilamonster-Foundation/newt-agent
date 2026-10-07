@@ -2,13 +2,14 @@
 
 use crate::completed_spill::CompletedSpillArchive;
 use crate::spill_view::{SpillStream, SpillView};
-use crossterm::cursor::{MoveToColumn, MoveUp};
+use crossterm::cursor::{MoveTo, MoveToColumn, MoveUp};
 use crossterm::queue;
 use crossterm::style::{Color, ContentStyle, Print, ResetColor, SetForegroundColor, StyledContent};
 use crossterm::terminal::{Clear, ClearType};
 use newt_core::{LiveToolOutput, ToolOutputStream};
 // #1640: CompletedSpillRenderer trait for Rich TUI completed spill rendering
 use newt_core::agentic::{write_file_change_row, CompletedSpillRenderer, FileChangePresentation};
+use newt_core::tty::{blank_rows, OnCollision, Placement, RegionLease, Terminal};
 use std::io::Write;
 #[cfg(any(unix, test))]
 use std::sync::atomic::AtomicBool;
@@ -56,13 +57,48 @@ impl RichFileChange {
     }
 }
 
+/// Where the frame's rows are: the arbiter's placement under the transcript
+/// (`Terminal::lease_below_cursor_quiet`), held for as long as the frame is up.
+struct Frame {
+    /// The arbiter's registration of the rows; returned silently when the
+    /// frame goes. `None` for the in-memory test renderers, which place
+    /// against a screen model and register nothing.
+    _lease: Option<RegionLease>,
+    place: Placement,
+    /// The width the frame was painted at. A frame erased at another width
+    /// has been reflowed by the terminal, so its rows are no longer the ones
+    /// the placement granted; see [`erase_output`].
+    columns: usize,
+}
+
+/// Asks where `height` rows may open under the transcript. Production asks the
+/// arbiter; the unit tier asks its screen model. `None` means the frame is
+/// painted nowhere this time, never somewhere guessed.
+type Placer = Box<dyn FnMut(u16) -> Option<(Option<RegionLease>, Placement)> + Send>;
+
+/// The arbiter's placement: one cursor query with stdin's other reader
+/// quiesced, the rows under it (the transcript scrolled by the deficit when
+/// they do not fit), shifted above a holder exactly as a permission frame is.
+fn arbiter_placer() -> Placer {
+    Box::new(|height| {
+        Terminal::lease_below_cursor_quiet(height, OnCollision::Shift)
+            .ok()
+            .flatten()
+            .map(|(lease, place)| (Some(lease), place))
+    })
+}
+
 struct OutputState {
     writer: TerminalWriter,
-    /// The exact lines last painted, kept so a later erase can re-wrap them at
-    /// whatever width the terminal is NOW and rewind the right number of rows.
-    /// Widths alone were not enough — see [`physical_rows`].
+    /// The exact lines last painted, kept for the one erase that cannot use
+    /// the placement: a frame whose width changed under it has been reflowed
+    /// by the terminal, and only re-wrapping these at the NEW width recovers
+    /// its rows. See [`physical_rows`].
     painted_lines: Vec<String>,
     painted_generation: Option<u64>,
+    /// The rows the painted frame occupies, from the placer.
+    frame: Option<Frame>,
+    placer: Placer,
     /// Arbiter registration (#1410). Present for the real stdout viewport;
     /// `None` for the `#[cfg(test)]` in-memory renderers, which register
     /// explicitly (`register_for_test`) when a test wants the suspend gate.
@@ -124,9 +160,12 @@ impl TerminalWriter {
 /// Assuming no-reflow instead would leave stale rows on *every* shrink in the
 /// common case in order to be safe in the rare one.
 ///
-/// No height clamp is needed here: `MoveUp` already saturates at row 0, so
-/// bounding the count changes the emitted bytes without changing where the
-/// cursor lands.
+/// The frame's rows come from the tty arbiter's placement under the
+/// transcript (`Terminal::lease_below_cursor_quiet`): painted at absolute
+/// rows, erased as exactly those rows, with the cursor put back where the
+/// transcript ended. The cursor-relative rewind (`MoveUp` by the painted
+/// height) survives only for the reflow case above, where the placement's
+/// rows are no longer true and the terminal's own cursor is the better guide.
 pub(crate) struct LiveSpillRenderer {
     state: Arc<Mutex<RenderState>>,
     output: Arc<Mutex<OutputState>>,
@@ -152,6 +191,7 @@ impl LiveSpillRenderer {
     ) -> Option<Arc<Self>> {
         let me = Arc::new(Self::with_output_and_geometry(
             TerminalWriter::Stdout,
+            arbiter_placer(),
             rows,
             color,
             Some(completed_archive),
@@ -187,11 +227,12 @@ impl LiveSpillRenderer {
     #[cfg(test)]
     fn with_writer(
         writer: impl Write + Send + 'static,
+        placer: Placer,
         columns: usize,
         rows: usize,
         color: bool,
     ) -> Self {
-        Self::with_writer_and_geometry(writer, rows, color, move || {
+        Self::with_writer_and_geometry(writer, placer, rows, color, move || {
             Some((columns, rows.saturating_add(3)))
         })
         .expect("fixed test geometry is drawable")
@@ -200,12 +241,14 @@ impl LiveSpillRenderer {
     #[cfg(test)]
     fn with_writer_and_geometry(
         writer: impl Write + Send + 'static,
+        placer: Placer,
         desired_rows: usize,
         color: bool,
         geometry: impl Fn() -> Option<(usize, usize)> + Send + Sync + 'static,
     ) -> Option<Self> {
         Self::with_output_and_geometry(
             TerminalWriter::Other(Box::new(writer)),
+            placer,
             desired_rows,
             color,
             None,
@@ -215,6 +258,7 @@ impl LiveSpillRenderer {
 
     fn with_output_and_geometry(
         writer: TerminalWriter,
+        placer: Placer,
         desired_rows: usize,
         color: bool,
         completed_archive: Option<Arc<CompletedSpillArchive>>,
@@ -239,6 +283,8 @@ impl LiveSpillRenderer {
                 writer,
                 painted_lines: Vec::new(),
                 painted_generation: None,
+                frame: None,
+                placer,
                 registration: None,
             })),
             abandoned_through: Arc::new(AtomicU64::new(0)),
@@ -449,12 +495,11 @@ impl newt_core::tty::Ephemeral for LiveSpillRenderer {
     /// the question and the operator's typed answer, deleting both. A wedged
     /// stdout blocks everything anyway; a skipped erase corrupts.
     fn erase(&self) {
-        // Re-sync geometry BEFORE reading `columns`. `erase_output` re-wraps
-        // `painted_lines` at it to recover the physical row count, so a
-        // stale width makes `MoveUp` land *inside* the frame and strands the
-        // rows above it permanently (nothing else clears them — the erase
-        // discards its own bookkeeping unconditionally). `finish` takes exactly
-        // this precaution, and
+        // Re-sync geometry BEFORE reading `columns`. `erase_output` erases the
+        // placed rows when the width is the one the frame was painted at, and
+        // re-wraps `painted_lines` at the new width otherwise; a stale width
+        // would take the first path on a reflowed frame and strand its extra
+        // rows. `finish` takes exactly this precaution, and
         // `finish_rechecks_geometry_even_without_another_output_chunk` is the
         // test pinning it.
         //
@@ -780,26 +825,62 @@ fn paint_generation(
         return;
     }
 
-    if let Some(previous) = output.painted_generation {
-        if is_abandoned(abandoned_through, previous) {
-            discard_generation(&mut output, previous);
-        } else {
-            erase_output(&mut output, columns, abandoned_through, previous);
+    // The frame plus the row the cursor parks on below it, so canonical
+    // output after an abandon lands under the residue, never inside it.
+    let height = u16::try_from(lines.as_ref().map_or(0, Vec::len)).unwrap_or(u16::MAX);
+    let wanted = height.saturating_add(1);
+    // Repaint IN PLACE when the frame is already up at this size and width:
+    // every tool chunk comes through here, and a cursor query per chunk
+    // would be a round trip per chunk. Anything else (first paint, a
+    // resize, an expand, a frame left by another generation) erases what is
+    // up and places afresh.
+    let in_place = match (&output.frame, output.painted_generation) {
+        (Some(frame), Some(previous)) => {
+            previous == generation
+                && !is_abandoned(abandoned_through, previous)
+                && frame.place.height == wanted
+                && frame.columns == columns
+        }
+        _ => false,
+    };
+    if !in_place {
+        if let Some(previous) = output.painted_generation {
+            if is_abandoned(abandoned_through, previous) {
+                discard_generation(&mut output, previous);
+            } else {
+                erase_output(&mut output, columns, abandoned_through, previous);
+            }
         }
     }
     let Some(lines) = lines else {
         return;
     };
+    let (lease, place) = if in_place {
+        let frame = output.frame.take().expect("checked above");
+        (frame._lease, frame.place)
+    } else {
+        let Some(placed) = (output.placer)(wanted) else {
+            return;
+        };
+        placed
+    };
 
-    // Each explicit line may occupy more physical rows after the terminal
-    // reflows it at a narrower width. `painted_lines` preserves enough
-    // information for the next erase to rewind that resized footprint.
+    // `painted_lines` is kept for the reflow erase; see `OutputState`.
     let mut batch = Vec::new();
+    if !in_place && place.scroll > 0 {
+        let _ = queue!(&mut batch, MoveTo(0, place.rows.saturating_sub(1)));
+        for _ in 0..place.scroll {
+            let _ = queue!(&mut batch, Print("\n"));
+        }
+    }
     if color {
         let _ = queue!(&mut batch, SetForegroundColor(Color::DarkGrey));
     }
     for (index, line) in lines.iter().enumerate() {
-        let _ = queue!(&mut batch, MoveToColumn(0), Clear(ClearType::CurrentLine),);
+        let row = place
+            .top
+            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        let _ = queue!(&mut batch, MoveTo(0, row), Clear(ClearType::CurrentLine));
         if let Some(styled) = styles
             .as_ref()
             .filter(|_| color)
@@ -809,11 +890,12 @@ fn paint_generation(
         } else {
             let _ = queue!(&mut batch, Print(line));
         }
-        let _ = queue!(&mut batch, Print("\r\n"));
     }
     if color {
         let _ = queue!(&mut batch, ResetColor);
     }
+    // Park on the row under the frame, inside the placement.
+    let _ = queue!(&mut batch, MoveTo(0, place.top.saturating_add(height)));
     let wrote = output
         .writer
         .write_batch(&batch, || !is_abandoned(abandoned_through, generation))
@@ -824,6 +906,11 @@ fn paint_generation(
     }
     output.painted_lines.clone_from(&lines);
     output.painted_generation = Some(generation);
+    output.frame = Some(Frame {
+        _lease: lease,
+        place,
+        columns,
+    });
 }
 
 #[cfg(any(unix, test))]
@@ -877,6 +964,18 @@ fn erase_generation(
     }
 }
 
+/// Take the frame off the screen and put the cursor back where the
+/// transcript ended.
+///
+/// At the width the frame was painted at, that is exactly the rows the
+/// placement granted (`blank_rows`, never `ESC[J`, which would take whatever
+/// holds the rows below) and a move to the placement's return point: the
+/// arbiter's own release, on this writer. At any other width the terminal
+/// has reflowed the frame, its rows are no longer the granted ones, and the
+/// cursor the terminal kept parked under the frame is the better guide:
+/// rewind by the painted lines re-wrapped at the NEW width (the reflow rule
+/// of the rich tier, #1426) and clear from there. The rows go back to the
+/// arbiter either way, silently, when the frame drops.
 #[allow(dead_code)]
 fn erase_output(
     output: &mut OutputState,
@@ -884,22 +983,33 @@ fn erase_output(
     abandoned_through: &AtomicU64,
     generation: u64,
 ) {
+    let Some(frame) = output.frame.take() else {
+        output.painted_lines.clear();
+        output.painted_generation = None;
+        return;
+    };
     if output.painted_lines.is_empty() {
         output.painted_generation = None;
         return;
     }
-    let physical_rows = output
-        .painted_lines
-        .iter()
-        .map(|line| physical_rows(line, columns))
-        .sum::<usize>();
     let mut batch = Vec::new();
-    let _ = queue!(
-        &mut batch,
-        MoveUp(u16::try_from(physical_rows).unwrap_or(u16::MAX)),
-        MoveToColumn(0),
-        Clear(ClearType::FromCursorDown)
-    );
+    if frame.columns == columns {
+        let _ = blank_rows(&mut batch, frame.place.top, frame.place.height);
+        let (x, y) = frame.place.return_to;
+        let _ = queue!(&mut batch, MoveTo(x, y));
+    } else {
+        let physical_rows = output
+            .painted_lines
+            .iter()
+            .map(|line| physical_rows(line, columns))
+            .sum::<usize>();
+        let _ = queue!(
+            &mut batch,
+            MoveUp(u16::try_from(physical_rows).unwrap_or(u16::MAX)),
+            MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        );
+    }
     let _ = output
         .writer
         .write_batch(&batch, || !is_abandoned(abandoned_through, generation));
@@ -907,10 +1017,13 @@ fn erase_output(
     output.painted_generation = None;
 }
 
+/// Forget a frame without touching the terminal: its rows go back to the
+/// arbiter and whatever is painted stays as residue.
 fn discard_generation(output: &mut OutputState, generation: u64) {
     if output.painted_generation == Some(generation) {
         output.painted_lines.clear();
         output.painted_generation = None;
+        output.frame = None;
     }
 }
 

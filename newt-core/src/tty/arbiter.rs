@@ -24,7 +24,7 @@
 
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
@@ -227,16 +227,19 @@ fn shift_clear_of(held: &[(u64, Region)], want: Region) -> Option<Region> {
 
 /// Where a frame opens when the arbiter places it under the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Placement {
+pub struct Placement {
     /// The first granted row.
-    pub(crate) top: u16,
+    pub top: u16,
     /// Rows granted: the request, clamped to the screen.
-    pub(crate) height: u16,
+    pub height: u16,
     /// Rows the transcript scrolls up by first, so the frame fits on screen.
-    pub(crate) scroll: u16,
+    pub scroll: u16,
     /// Where the cursor goes back to when the lease drops: the transcript's
     /// end, after the scroll.
-    pub(crate) return_to: (u16, u16),
+    pub return_to: (u16, u16),
+    /// The screen height the placement was made against; the scroll is
+    /// newlines from its last row.
+    pub rows: u16,
 }
 
 /// The placement rule behind [`Terminal::lease_below_cursor`], pure so it is
@@ -249,7 +252,7 @@ pub(crate) struct Placement {
 /// declared, or shifted to the nearest free rows above the holder exactly as
 /// a bottom-anchored [`OnCollision::Shift`] lease is, with the cursor still
 /// returned to where it was. The shift is about where the FRAME goes.
-pub(crate) fn place_below_cursor(
+pub fn place_below_cursor(
     cursor: (u16, u16),
     screen_rows: u16,
     height: u16,
@@ -266,6 +269,7 @@ pub(crate) fn place_below_cursor(
         height,
         scroll: overflow,
         return_to: (x, y - overflow),
+        rows,
     };
     let wanted = Region::Rows {
         top: natural.top,
@@ -292,6 +296,7 @@ pub(crate) fn place_below_cursor(
                 height,
                 scroll: 0,
                 return_to: (x, y),
+                rows,
             })
         }
     }
@@ -299,8 +304,10 @@ pub(crate) fn place_below_cursor(
 
 /// Erase `height` rows from `top`, each on its own — never `ESC[J`, which runs
 /// to the end of the SCREEN and takes the rows of whoever holds the space
-/// below. (`panel::clear_own_rows`'s rule, stated once, here.)
-fn blank_rows(w: &mut LineWriter<'_>, top: u16, height: u16) -> io::Result<()> {
+/// below. (`panel::clear_own_rows`'s rule, stated once, here.) Public so a
+/// writer that owns its own output (the live tool-output viewport) erases the
+/// rows the arbiter placed the same way the arbiter does.
+pub fn blank_rows<W: Write>(w: &mut W, top: u16, height: u16) -> io::Result<()> {
     for row in top..top.saturating_add(height) {
         queue!(w, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
     }
@@ -315,14 +322,72 @@ struct StdinQuiet {
     _watcher: Option<WatcherStdinGuard>,
 }
 
+/// How long a cursor query waits for the turn watcher to finish its current
+/// read before giving up. The watcher holds its token across one `poll` of
+/// stdin, so this only has to outlast that; a frame that could not be placed
+/// is painted nowhere rather than somewhere guessed.
+const QUIET_WAIT: Duration = Duration::from_millis(300);
+
+/// How long the arbiter stops asking after a terminal failed to answer the
+/// cursor query. The query times out after two seconds, and a viewport that
+/// opens on every tool chunk cannot pay that each time; the fallback is the
+/// same either way, so the question is asked again only after this long.
+const SILENT_HOLD_OFF: Duration = Duration::from_secs(60);
+
+/// Seconds since the epoch until which the terminal is treated as silent.
+static DSR_SILENT_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 impl StdinQuiet {
-    fn take() -> Option<Self> {
-        if lock().prompt_owner == Some(std::thread::current().id()) {
-            return Some(Self { _watcher: None });
+    /// Quiesce stdin's other reader, waiting up to `wait` for the turn
+    /// watcher to release its token. `None` when another thread owns stdin
+    /// through a prompt or the token did not come free in time.
+    fn take_within(wait: Duration) -> Option<Self> {
+        let (m, cv) = arbiter();
+        let mut state = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let me = std::thread::current().id();
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if state.prompt_owner == Some(me) {
+                return Some(Self { _watcher: None });
+            }
+            if state.prompt_owner.is_none() && !state.watcher_reading {
+                state.watcher_reading = true;
+                return Some(Self {
+                    _watcher: Some(WatcherStdinGuard),
+                });
+            }
+            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+            state = cv
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
-        try_watch_stdin().map(|watcher| Self {
-            _watcher: Some(watcher),
-        })
+    }
+}
+
+/// Where the cursor is, asked with stdin's other reader quiesced, or `None`
+/// when it cannot be asked safely, when the terminal is in its silent
+/// hold-off, or when it did not answer (which starts the hold-off).
+fn cursor_position_quiet() -> Option<(u16, u16)> {
+    if now_secs() < DSR_SILENT_UNTIL.load(Ordering::Relaxed) {
+        return None;
+    }
+    let _quiet = StdinQuiet::take_within(QUIET_WAIT)?;
+    match crossterm::cursor::position() {
+        Ok(cursor) => Some(cursor),
+        Err(_) => {
+            DSR_SILENT_UNTIL.store(
+                now_secs().saturating_add(SILENT_HOLD_OFF.as_secs()),
+                Ordering::Relaxed,
+            );
+            None
+        }
     }
 }
 
@@ -891,59 +956,67 @@ impl Terminal {
         policy: OnCollision,
         sink: Sink,
     ) -> io::Result<Option<RegionLease>> {
-        // A pipe answers no query and must not be sent one.
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return Ok(None);
-        }
-        let cursor = {
-            let Some(_quiet) = StdinQuiet::take() else {
-                return Ok(None);
-            };
-            match crossterm::cursor::position() {
-                Ok(cursor) => cursor,
-                Err(_) => return Ok(None),
-            }
-        };
-        let (_, rows) = crossterm::terminal::size()?;
-        let (lease, scroll) = {
-            let mut state = lock();
-            let Some(place) = place_below_cursor(cursor, rows, height, &state.regions, policy)
-            else {
-                return Ok(None);
-            };
-            state.next_id += 1;
-            let id = state.next_id;
-            let region = Region::Rows {
-                top: place.top,
-                height: place.height,
-            };
-            state.regions.push((id, region));
-            let (x, y) = place.return_to;
-            let lease = RegionLease {
-                id,
-                region,
-                cursor: Some(CursorReturn { x, y, sink }),
-            };
-            (lease, place.scroll)
-        };
-        let Region::Rows { top, height } = lease.region else {
+        let Some((mut lease, place)) = Self::lease_below_cursor_quiet(height, policy)? else {
             return Ok(None);
         };
+        let (x, y) = place.return_to;
+        lease.cursor = Some(CursorReturn { x, y, sink });
         // Paint outside the lock, as every other writer here does. The scroll
         // is the cockpit presenter's byte plan: newlines from the bottom row
         // push the transcript up by exactly the deficit, into scrollback.
         sink.with(|w| {
-            if scroll > 0 {
-                queue!(w, MoveTo(0, rows.saturating_sub(1)))?;
-                for _ in 0..scroll {
+            if place.scroll > 0 {
+                queue!(w, MoveTo(0, place.rows.saturating_sub(1)))?;
+                for _ in 0..place.scroll {
                     queue!(w, Print("\n"))?;
                 }
             }
-            blank_rows(w, top, height)?;
-            queue!(w, MoveTo(0, top))?;
+            blank_rows(w, place.top, place.height)?;
+            queue!(w, MoveTo(0, place.top))?;
             w.flush()
         })?;
         Ok(Some(lease))
+    }
+
+    /// [`Terminal::lease_below_cursor`] for a writer that owns its output:
+    /// the same query, the same placement rule, the same registration, and
+    /// NO bytes. The caller scrolls by `scroll`, paints inside the rows, and
+    /// erases them itself with [`blank_rows`] and a move to `return_to`; the
+    /// lease it gets back returns the rows silently when dropped. The live
+    /// tool-output viewport is this caller: its paint and erase are batches
+    /// on its own writer, and its unit tier replays those bytes on a screen
+    /// model, which the arbiter's stream would bypass.
+    pub fn lease_below_cursor_quiet(
+        height: u16,
+        policy: OnCollision,
+    ) -> io::Result<Option<(RegionLease, Placement)>> {
+        // A pipe answers no query and must not be sent one.
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(None);
+        }
+        let Some(cursor) = cursor_position_quiet() else {
+            return Ok(None);
+        };
+        let (_, rows) = crossterm::terminal::size()?;
+        let mut state = lock();
+        let Some(place) = place_below_cursor(cursor, rows, height, &state.regions, policy) else {
+            return Ok(None);
+        };
+        state.next_id += 1;
+        let id = state.next_id;
+        let region = Region::Rows {
+            top: place.top,
+            height: place.height,
+        };
+        state.regions.push((id, region));
+        Ok(Some((
+            RegionLease {
+                id,
+                region,
+                cursor: None,
+            },
+            place,
+        )))
     }
 
     /// Register an ephemeral so [`Terminal::suspend_for_prompt`] can erase it.

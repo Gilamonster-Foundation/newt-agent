@@ -26,6 +26,17 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   placement it had before, never a guessed row. A resize closes and re-opens
   a placed frame instead of ratatui's `resize`, whose `ESC[J` ran through
   the rows below.
+- The live tool-output viewport (and the completed frame it becomes) now
+  takes its rows from the same placement: one cursor query with the stdin
+  watcher quiesced, the transcript scrolled by the deficit when the frame
+  does not fit, rows painted at absolute positions and repainted in place
+  on every chunk, and an erase of exactly those rows with the cursor
+  returned to where the transcript ended. The cursor-relative `MoveUp`
+  rewind that stranded rows when its count was wrong (a stale width, a
+  stray line, a scroll) survives only for a frame whose width changed under
+  it, where the terminal has reflowed it. A terminal that fails to answer
+  the cursor query is not asked again for a minute, and gets no frame
+  rather than a guessed one.
 
 ### Fixed — a governed commit is no longer refused in a default-permission Linux session (#2693)
 
