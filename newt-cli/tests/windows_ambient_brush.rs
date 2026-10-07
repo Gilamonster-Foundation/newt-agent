@@ -6,15 +6,22 @@ use newt_core::ambient_brush::test_dispatch;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-fn executable() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_newt"))
+fn install_runner(root: &Path) -> PathBuf {
+    // The embedding host deliberately has no CLI/Brush dispatch entrypoint.
+    let host = root.join("embedding-server.exe");
+    std::fs::write(&host, b"not a CLI interpreter").unwrap();
+    let runner = newt_core::ambient_brush::runner_path(&host);
+    std::fs::create_dir(runner.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_newt-ambient-brush"), &runner).unwrap();
+    host
 }
 
 #[tokio::test]
 async fn windows_2776_posix_pipeline_cd_redirect_and_exit_status() {
     let temp = tempfile::tempdir().unwrap();
+    let executable = install_runner(temp.path());
     std::fs::create_dir(temp.path().join("space dir")).unwrap();
-    let result = test_dispatch(executable(),
+    let result = test_dispatch(&executable,
         "echo alpha | { read value; echo \"$value\"; }; cd 'space dir'; echo beta > result.txt; echo $?; false",
         temp.path().to_str().unwrap(), false, Duration::from_secs(30)).await.unwrap();
     assert_eq!(result["exit_code"], 1, "{result}");
@@ -29,7 +36,7 @@ async fn windows_2776_posix_pipeline_cd_redirect_and_exit_status() {
         "beta"
     );
     let missing = test_dispatch(
-        executable(),
+        &executable,
         "newt_missing_2776",
         temp.path().to_str().unwrap(),
         false,
@@ -47,8 +54,9 @@ async fn windows_2776_posix_pipeline_cd_redirect_and_exit_status() {
 #[tokio::test]
 async fn windows_2776_descendants_inherit_carried_tools_path_and_cmd_opt_out() {
     let temp = tempfile::tempdir().unwrap();
+    let executable = install_runner(temp.path());
     let result = test_dispatch(
-        executable(),
+        &executable,
         "cmd.exe /C set PATH",
         temp.path().to_str().unwrap(),
         false,
@@ -67,10 +75,10 @@ async fn windows_2776_descendants_inherit_carried_tools_path_and_cmd_opt_out() {
         .expect("descendant PATH");
     assert_eq!(
         std::env::split_paths(path).next().unwrap(),
-        executable().parent().unwrap().join("tools")
+        executable.parent().unwrap().join("tools")
     );
     let cmd = test_dispatch(
-        executable(),
+        &executable,
         "echo cmd-route & exit /b 7",
         temp.path().to_str().unwrap(),
         true,
@@ -117,10 +125,11 @@ async fn started_descendant(path: PathBuf) -> Process {
 
 async fn descendant_teardown(cancel: bool) {
     let temp = tempfile::tempdir().unwrap();
+    let executable = install_runner(temp.path());
     // ASCII Set-Content avoids Windows PowerShell's UTF-16 output default.
     let script = "powershell.exe -NoProfile -Command '[System.IO.File]::WriteAllText(\"pid.txt\", [string]$PID); Start-Sleep -Seconds 300'";
     let mut run = Box::pin(test_dispatch(
-        executable(),
+        &executable,
         script,
         temp.path().to_str().unwrap(),
         false,
@@ -165,15 +174,16 @@ async fn windows_2776_timeout_kills_descendants() {
 async fn windows_2776_partial_script_is_refused_before_evaluation() {
     use tokio::io::AsyncWriteExt;
     let temp = tempfile::tempdir().unwrap();
-    let mut child = tokio::process::Command::new(executable())
-        .arg("__ambient-brush")
-        .current_dir(temp.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+    let executable = install_runner(temp.path());
+    let mut child =
+        tokio::process::Command::new(newt_core::ambient_brush::runner_path(&executable))
+            .current_dir(temp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
     let mut input = child.stdin.take().unwrap();
     input
         .write_all(b"\"echo partial > unintended.txt")
@@ -187,4 +197,23 @@ async fn windows_2776_partial_script_is_refused_before_evaluation() {
         .unwrap();
     assert!(!output.status.success());
     assert!(!temp.path().join("unintended.txt").exists());
+}
+
+/// #2789: an embedding consumer without the separately installed runner keeps
+/// a working ambient route; its own entrypoint is never launched as a shell.
+#[tokio::test]
+async fn windows_2776_missing_runner_executes_cmd_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("server-without-brush.exe");
+    let result = test_dispatch(
+        &host,
+        "echo cmd-fallback & exit /b 9",
+        temp.path().to_str().unwrap(),
+        false,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["exit_code"], 9, "{result}");
+    assert!(result["stdout"].as_str().unwrap().contains("cmd-fallback"));
 }

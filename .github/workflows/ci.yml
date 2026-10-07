@@ -599,6 +599,7 @@ jobs:
         run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
       # HOOK PARITY: .githooks/pre-push runs scoped format/lint/tests;
       # this Windows-native process-tree proof is CI-only on Unix hosts.
+      # Tests stage the dedicated runner beside a non-CLI embedding host path.
       - name: Windows ambient Brush route (#2776)
         run: cargo test -p newt-agent --test windows_ambient_brush -- --nocapture
       # The #1746 ConPTY spike's whole product is EVIDENCE, and libtest captures

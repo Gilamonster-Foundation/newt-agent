@@ -771,7 +771,7 @@ fn shell_dialect_2775_execution_and_description_share_route() {
                     for floor in [false, true] {
                         for engine in [SafeSubset, Host, Brush] {
                             let route = select_shell_route(
-                                bypass, broker, lease, floor, windows, true, engine,
+                                bypass, broker, lease, floor, windows, true, true, engine,
                             );
                             let defs =
                                 crate::agentic::tools::catalog::tool_definitions_with_dialect(
@@ -833,11 +833,11 @@ fn windows_2776_default_route_and_child_environment() {
     };
     let engine = crate::ShellEngine::SafeSubset;
     assert!(matches!(
-        select_shell_route(false, false, false, true, true, false, engine),
+        select_shell_route(false, false, false, true, true, false, true, engine),
         ShellRoute::Bridled(_)
     ));
     assert_eq!(
-        select_shell_route(true, false, false, true, true, false, engine),
+        select_shell_route(true, false, false, true, true, false, true, engine),
         ShellRoute::AmbientBrush
     );
     for (broker, lease, floor) in [
@@ -846,15 +846,18 @@ fn windows_2776_default_route_and_child_environment() {
         (false, false, false),
     ] {
         assert!(matches!(
-            select_shell_route(true, broker, lease, floor, true, false, engine),
+            select_shell_route(true, broker, lease, floor, true, false, true, engine),
             ShellRoute::Bridled(_)
         ));
     }
     let child = host_shell_command(ShellRoute::AmbientBrush, false, "echo hi", ".").unwrap();
     let child = child.as_std();
     let exe = std::env::current_exe().unwrap();
-    assert_eq!(child.get_program(), exe.as_os_str());
-    assert_eq!(child.get_args().collect::<Vec<_>>(), ["__ambient-brush"]);
+    assert_eq!(
+        child.get_program(),
+        crate::ambient_brush::runner_path(&exe).as_os_str()
+    );
+    assert_eq!(child.get_args().count(), 0);
     let env = child
         .get_envs()
         .collect::<std::collections::HashMap<_, _>>();

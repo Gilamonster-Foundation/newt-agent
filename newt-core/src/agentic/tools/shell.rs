@@ -671,6 +671,7 @@ pub(super) enum ShellRoute {
 
 /// Keep command-specific clamps in this decision, rather than inferring the
 /// shell from the session's OCAP switch alone. A broker always needs Brush.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn select_shell_route(
     bypass_enabled: bool,
     has_broker: bool,
@@ -678,11 +679,12 @@ pub(super) fn select_shell_route(
     floor_permits: bool,
     windows: bool,
     windows_cmd: bool,
+    runner_available: bool,
     engine: crate::ShellEngine,
 ) -> ShellRoute {
     if bypass_enabled && !has_broker && !has_lease && floor_permits {
         if windows {
-            if windows_cmd {
+            if windows_cmd || !runner_available {
                 ShellRoute::Cmd
             } else {
                 ShellRoute::AmbientBrush
@@ -697,6 +699,17 @@ pub(super) fn select_shell_route(
             engine
         })
     }
+}
+
+fn missing_runner_notice(
+    route: ShellRoute,
+    opted_out: bool,
+    shown: &std::sync::atomic::AtomicBool,
+) -> Option<&'static str> {
+    (route == ShellRoute::Cmd
+        && !opted_out
+        && !shown.swap(true, std::sync::atomic::Ordering::Relaxed))
+    .then_some("carried brush not installed; using cmd")
 }
 
 impl ShellRoute {
@@ -718,12 +731,13 @@ pub fn run_command_dialect_sentence() -> &'static str {
         true,
         cfg!(windows),
         crate::config::windows_cmd_enabled(),
+        crate::ambient_brush::installed(),
         shell_engine(),
     )
     .sentence()
 }
 
-/// Pure session-default guidance for callers with injected platform/authority.
+/// Pure session-default guidance with injected platform/authority and an installed runner.
 pub fn shell_dialect_sentence(host_bypass: bool, windows: bool) -> &'static str {
     select_shell_route(
         host_bypass,
@@ -732,6 +746,7 @@ pub fn shell_dialect_sentence(host_bypass: bool, windows: bool) -> &'static str 
         true,
         windows,
         false,
+        true,
         crate::ShellEngine::SafeSubset,
     )
     .sentence()
@@ -1029,6 +1044,7 @@ async fn dispatch_bridled_shell_with_floor(
         true,
         cfg!(windows),
         crate::config::windows_cmd_enabled(),
+        crate::ambient_brush::installed(),
         shell_engine(),
     ) else {
         unreachable!("bridled dispatch cannot bypass confinement")
@@ -1280,6 +1296,7 @@ pub(super) async fn exec_confined_command_with_broker(
         exec_floor_permits(exec_floor, cmd),
         cfg!(windows),
         crate::config::windows_cmd_enabled(),
+        crate::ambient_brush::installed(),
         shell_engine(),
     );
     let host_bypass = !matches!(route, ShellRoute::Bridled(_));
@@ -1296,13 +1313,22 @@ pub(super) async fn exec_confined_command_with_broker(
     }
 
     if host_bypass {
+        static FALLBACK_SHOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if let Some(notice) =
+            missing_runner_notice(route, crate::config::windows_cmd_enabled(), &FALLBACK_SHOWN)
+        {
+            presentation.preview(notice, 1);
+        }
         let mut live = LiveOutputSession::start(live_tool_output);
         let run = host_shell_dispatch(
             route,
-            if route == ShellRoute::AmbientBrush {
-                cmd
-            } else {
+            if route == ShellRoute::BashSh {
                 &cmd_with_venv
+            } else {
+                // Neither the dedicated runner nor cmd needs a POSIX export
+                // prefix. Windows PATH is supplied in the child environment.
+                cmd
             },
             cwd,
             live.as_ref().map(LiveOutputSession::relay),
@@ -2167,9 +2193,10 @@ fn host_shell_command_at(
 ) -> std::io::Result<tokio::process::Command> {
     use std::ffi::OsStr;
     use std::process::Stdio;
+    let runner = crate::ambient_brush::runner_path(executable);
     let (program, flag): (&OsStr, &str) = match route {
         ShellRoute::Cmd => (OsStr::new("cmd"), "/C"),
-        ShellRoute::AmbientBrush => (executable.as_os_str(), "__ambient-brush"),
+        ShellRoute::AmbientBrush => (runner.as_os_str(), ""),
         ShellRoute::BashSh => (OsStr::new(if fallback { "sh" } else { "bash" }), "-c"),
         ShellRoute::Bridled(_) => {
             return Err(std::io::Error::other(
@@ -2178,7 +2205,9 @@ fn host_shell_command_at(
         }
     };
     let mut c = tokio::process::Command::new(program);
-    c.arg(flag);
+    if route != ShellRoute::AmbientBrush {
+        c.arg(flag);
+    }
     if route == ShellRoute::AmbientBrush {
         let tools = dunce::simplified(executable)
             .parent()
@@ -3374,6 +3403,7 @@ pub(crate) async fn test_windows_ambient_dispatch(
         true,
         true,
         windows_cmd,
+        crate::ambient_brush::runner_available(executable),
         crate::ShellEngine::SafeSubset,
     );
     let command = host_shell_command_at(route, false, cmd, cwd, executable)?;
@@ -3387,4 +3417,98 @@ pub(crate) async fn test_windows_ambient_dispatch(
     Ok(
         serde_json::json!({"exit_code":run.exit_code,"stdout":decode_shell_stream(&run.stdout),"stderr":decode_shell_stream(&run.stderr),"timed_out":run.timed_out}),
     )
+}
+
+#[cfg(test)]
+mod ambient_runner_tests {
+    use super::*;
+
+    /// #2776/#2789: a core consumer must launch the adjacent dedicated runner,
+    /// never re-execute its own (possibly server) binary as an interpreter.
+    #[test]
+    fn windows_2776_non_cli_consumer_selects_dedicated_runner() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("embedding-server.exe");
+        let runner = root.path().join("tools").join(format!(
+            "newt-ambient-brush{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::create_dir(runner.parent().unwrap()).unwrap();
+        std::fs::write(&runner, b"fixture").unwrap();
+        let command =
+            host_shell_command_at(ShellRoute::AmbientBrush, false, "echo hello", ".", &host)
+                .unwrap();
+        assert_eq!(command.as_std().get_program(), runner.as_os_str());
+        assert_eq!(command.as_std().get_args().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod missing_ambient_runner_tests {
+    use super::*;
+    /// #2789: missing carried runner restores cmd with matching dialect and
+    /// one notice, without changing any of the authority route clamps.
+    #[test]
+    fn windows_2776_missing_runner_falls_back_with_one_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("not-the-cli.exe");
+        // A similarly named sibling outside tools/ is never a candidate.
+        std::fs::write(
+            root.path().join(format!(
+                "newt-ambient-brush{}",
+                std::env::consts::EXE_SUFFIX
+            )),
+            b"wrong directory",
+        )
+        .unwrap();
+        let available = crate::ambient_brush::runner_available(&host);
+        assert!(!available);
+        let route = select_shell_route(
+            true,
+            false,
+            false,
+            true,
+            true,
+            false,
+            available,
+            crate::ShellEngine::SafeSubset,
+        );
+        assert_eq!(route, ShellRoute::Cmd);
+        assert!(route.sentence().contains("cmd.exe /C"));
+        let child = host_shell_command_at(route, false, "echo hello", ".", &host).unwrap();
+        assert_eq!(child.as_std().get_program(), "cmd");
+        let shown = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            missing_runner_notice(route, true, &shown),
+            None,
+            "explicit opt-out is silent"
+        );
+        assert_eq!(
+            missing_runner_notice(route, false, &shown),
+            Some("carried brush not installed; using cmd")
+        );
+        assert_eq!(missing_runner_notice(route, false, &shown), None);
+        for (bypass, broker, lease, floor) in [
+            (false, false, false, true),
+            (true, true, false, true),
+            (true, false, true, true),
+            (true, false, false, false),
+        ] {
+            let route = select_shell_route(
+                bypass,
+                broker,
+                lease,
+                floor,
+                true,
+                false,
+                available,
+                crate::ShellEngine::SafeSubset,
+            );
+            assert!(matches!(route, ShellRoute::Bridled(_)));
+            assert_eq!(
+                missing_runner_notice(route, false, &std::sync::atomic::AtomicBool::new(false)),
+                None
+            );
+        }
+    }
 }

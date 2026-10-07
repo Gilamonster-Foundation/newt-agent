@@ -32,7 +32,8 @@
 #
 # Windows-only native ambient Brush proof (#2776): windows_ambient_brush
 # runs under .github/workflows/ci.yml Windows job; Unix scopes compile its
-# empty cfg(windows) binary. Includes POSIX syntax, cmd opt-out and tree kill.
+# empty cfg(windows) binary. Includes dedicated-runner selection from a non-CLI
+# host, missing-runner cmd fallback, POSIX syntax, cmd opt-out and tree kill.
 #
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named

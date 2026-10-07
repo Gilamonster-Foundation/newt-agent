@@ -290,6 +290,7 @@ mod tests {
                         true,
                         windows,
                         false,
+                        true,
                         crate::ShellEngine::SafeSubset
                     ),
                     if windows {
@@ -307,6 +308,7 @@ mod tests {
                             false,
                             windows,
                             false,
+                            true,
                             crate::ShellEngine::SafeSubset
                         ),
                         ShellRoute::Bridled(_)
