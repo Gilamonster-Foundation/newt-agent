@@ -31,6 +31,7 @@ ALLOWLIST = REPO / "docs" / "security" / "spawn-inventory.toml"
 # crates whose spawns we still want inventoried. (Pure library crates with no
 # subprocess use are simply absent from the allowlist and expected to stay so.)
 SCAN_ROOTS = [
+    "crates/newt-carried-tools/src",
     "newt-core/src",
     "newt-cli/src",
     "newt-tui/src",
