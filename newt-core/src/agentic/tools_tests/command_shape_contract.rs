@@ -74,6 +74,48 @@ struct Row {
     claim: &'static str,
 }
 
+fn discovery_names_fixture(out: &str, fixture: &str) -> bool {
+    let normalize = |s: &str| {
+        s.replace("\\\\", "\\")
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    };
+    // Shells may translate the temp root. Keep the unique directory and both
+    // trailing components, with boundaries so another fixture cannot match.
+    let fixture = normalize(fixture);
+    let mut components: Vec<_> = fixture.rsplit('/').take(3).collect();
+    components.reverse();
+    let suffix = format!("/{}", components.join("/"));
+    let suffix = suffix.strip_suffix(".exe").unwrap_or(&suffix);
+    normalize(out)
+        .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`'))
+        .any(|path| path.strip_suffix(".exe").unwrap_or(path).ends_with(suffix))
+}
+
+/// #2811: MSYS discovery rewrites the temp root and may omit .exe.
+#[test]
+fn discovery_matches_unique_fixture_across_windows_path_forms() {
+    let fixture = r"C:\Temp\.tmpUnique123\bin\gh.exe";
+    for found in [
+        "/tmp/.tmpUnique123/bin/gh",
+        "C:/Temp/.TMPUNIQUE123/bin/GH.EXE",
+        r"C:\Temp\.tmpUnique123\bin\gh.exe",
+        r"C:\\Temp\\.tmpUnique123\\bin\\gh.exe",
+    ] {
+        assert!(discovery_names_fixture(found, fixture), "{found}");
+    }
+    for found in [
+        "/usr/bin/gh",
+        "/tmp/.tmpOther/bin/gh",
+        "/tmp/prefix.tmpUnique123/bin/gh",
+        "/tmp/.tmpUnique123/bin/gh-evil",
+        "/tmp/.tmpUnique123/bin/gh.exe.bak",
+        "/tmp/.tmpUnique123/bin/gh/child",
+    ] {
+        assert!(!discovery_names_fixture(found, fixture), "{found}");
+    }
+}
+
 async fn check(row: Row) {
     let _lock = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
@@ -330,16 +372,8 @@ async fn check(row: Row) {
     }
     if row.command == "which gh" {
         // Both plain and confined discovery must name this fixture, not host gh.
-        let normalize = |s: &str| {
-            let path = s.replace("\\\\", "\\").replace('\\', "/");
-            if cfg!(windows) {
-                path.to_ascii_lowercase()
-            } else {
-                path
-            }
-        };
         assert!(
-            normalize(&out).contains(&normalize(&gh.to_string_lossy())),
+            discovery_names_fixture(&out, &gh.to_string_lossy()),
             "gh discovery must identify the inert fixture: {out}"
         );
     }
