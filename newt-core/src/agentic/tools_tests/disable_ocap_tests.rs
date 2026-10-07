@@ -2609,3 +2609,24 @@ async fn confined_git_ignores_ambient_config_and_carries_the_agent_identity() {
     let identity = crate::AgentIdentity::resolve().unwrap_or_default();
     assert!(out.contains(&identity.email), "{out}");
 }
+
+/// #2796: host Bash and fallback sh discover tools even with no external which.
+#[cfg(unix)]
+#[tokio::test]
+async fn which_2796_ambient_host_routes() {
+    let _guard = env_lock().await;
+    use super::shell::{host_shell_command, ShellRoute};
+    let root = tempfile::tempdir().unwrap();
+    for fallback in [false, true] {
+        let mut command = host_shell_command(
+            ShellRoute::BashSh,
+            fallback,
+            "PATH=; which printf && ! which missing_2796",
+            root.path().to_str().unwrap(),
+        )
+        .unwrap();
+        let out = command.output().await.unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(out.stdout, b"printf\n");
+    }
+}

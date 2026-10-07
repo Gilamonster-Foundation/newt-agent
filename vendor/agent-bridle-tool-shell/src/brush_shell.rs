@@ -942,6 +942,8 @@ pub(crate) fn run_in_brush(
             .set_global("PS4", ps4)
             .map_err(|e| ToolError::Exec(brush_io("pin readonly PS4", &e)))?;
 
+        #[cfg(unix)]
+        let cmd = crate::with_posix_command_discovery(&cmd);
         let result = shell.run_dash_c_command(cmd).await.map_err(|e| {
             // A policy-marked terminating error must retain its actual reason.
             if e.is_terminating() {
