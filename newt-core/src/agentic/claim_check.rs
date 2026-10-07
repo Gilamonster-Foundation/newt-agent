@@ -21,6 +21,9 @@
 //! is unverified, not missing, and is not probed. This lexical boundary does
 //! not provide symlink isolation for paths that start inside the workspace.
 
+mod turn;
+pub(crate) use turn::TurnClaims;
+
 /// Path-like tokens in assistant prose — the same recognition rule as the
 /// crew planner's claim check (`newt-cli/src/crew.rs::path_tokens`): a token
 /// containing a `/` with a short alphanumeric extension. Chat-prose
@@ -106,7 +109,24 @@ const LISTED_CLAIMS: usize = 8;
 /// Append distinct missing and unverified annotations, preserving the prose
 /// exactly. `Some` is an in-workspace existence result; `None` means the
 /// checker cannot inspect the claim. Both lists share the existing display cap.
-fn annotate_path_claims(mut text: String, mut resolve: impl FnMut(&str) -> Option<bool>) -> String {
+#[cfg(test)]
+fn annotate_path_claims(text: String, resolve: impl FnMut(&str) -> Option<bool>) -> String {
+    annotate_path_claims_at(text, resolve, None)
+}
+
+fn annotate_path_claims_at(
+    mut text: String,
+    mut resolve: impl FnMut(&str) -> Option<bool>,
+    root: Option<&std::path::Path>,
+) -> String {
+    let location = root
+        .map(|path| {
+            format!(
+                " (root {})",
+                crate::worktree_adoption::task_path_literal(path)
+            )
+        })
+        .unwrap_or_default();
     let mut missing = Vec::new();
     let mut unverified = Vec::new();
     for claim in asserted_path_claims(&text) {
@@ -137,7 +157,7 @@ fn annotate_path_claims(mut text: String, mut resolve: impl FnMut(&str) -> Optio
             String::new()
         };
         text = format!(
-            "{text}\n\n⚠ claim check (#867): cited path(s) {label}: {}{overflow} \
+            "{text}\n\n⚠ claim check (#867): cited path(s) {label}{location}: {}{overflow} \
              — verify these before acting on the summary above.",
             listed.join(", ")
         );
@@ -222,9 +242,10 @@ pub(crate) fn workspace_resolver(workspace: &str) -> impl FnMut(&str) -> bool {
 /// Final-answer wiring (cap-exit AND normal finish): annotate `text` against
 /// the real workspace tree without treating an uninspected claim as missing.
 pub(crate) fn annotate_against_workspace(text: String, workspace: &str) -> String {
-    annotate_path_claims(
+    annotate_path_claims_at(
         text,
         workspace_claim_resolver(workspace, std::path::Path::exists),
+        Some(std::path::Path::new(workspace)),
     )
 }
 
@@ -249,17 +270,21 @@ pub(crate) fn annotate_in_context(
         .iter()
         .map(|root| workspace_claim_resolver(&root.to_string_lossy(), std::path::Path::exists))
         .collect();
-    annotate_path_claims(text, |claim| {
-        let mut inspected = false;
-        for resolve in &mut resolvers {
-            match resolve(claim) {
-                Some(true) => return Some(true),
-                Some(false) => inspected = true,
-                None => {}
+    annotate_path_claims_at(
+        text,
+        |claim| {
+            let mut inspected = false;
+            for resolve in &mut resolvers {
+                match resolve(claim) {
+                    Some(true) => return Some(true),
+                    Some(false) => inspected = true,
+                    None => {}
+                }
             }
-        }
-        (inspected && !uninspected).then_some(false)
-    })
+            (inspected && !uninspected).then_some(false)
+        },
+        Some(std::path::Path::new(workspace)),
+    )
 }
 
 /// Ledger cap: enough to name every file a real investigation touches while
@@ -303,7 +328,7 @@ impl ObservedPaths {
 }
 
 /// #1214/#2683: the observed local branch inventory and commit evidence,
-/// handed to [`annotate_action_claims`] as pure data. This is not execution
+/// handed to [`annotate_action_claims_at`] as pure data. This is not execution
 /// evidence for pushes, pull requests, or tests.
 pub(crate) struct TurnGitEvidence {
     /// Local branch names that exist right now.
@@ -312,8 +337,8 @@ pub(crate) struct TurnGitEvidence {
     /// before any of this turn's tool calls ran). `None` means no baseline
     /// was captured (off-repo at turn start, or the read scope refused the
     /// probe) — absence of a baseline must never manufacture a fact that was
-    /// never observed, so [`annotate_action_claims`] adds no commit-facts
-    /// note at all when this is `None`.
+    /// never observed. A changed task root can still report current dirt, but
+    /// explicitly has no same-checkout HEAD comparison.
     pub head_before: Option<String>,
     /// HEAD's sha right now (end of turn) — always present once
     /// [`collect_git_evidence`] returns `Some` at all, since reading it is
@@ -321,7 +346,7 @@ pub(crate) struct TurnGitEvidence {
     pub head_now: String,
     /// #2683 round 2 (PR #2688 review): the workspace's CURRENT status
     /// snapshot, when it could be read — reported verbatim by
-    /// [`annotate_action_claims`] as "uncommitted changes", never
+    /// [`annotate_action_claims_at`] as "uncommitted changes", never
     /// cross-referenced against the files the claim's own text names (round
     /// 3, PR #2688 review round 2, finding 1: that cross-reference is what
     /// produced false "not committed" verdicts on a claim that correctly
@@ -786,15 +811,18 @@ pub(crate) fn claims_completed_action(text: &str, action: &str) -> bool {
 /// --porcelain` listing side by side, with no claim-to-file mapping at all,
 /// can never manufacture that false refutation — the operator reads the
 /// facts against their own claim text.
-fn commit_facts_note(before: &str, now: &str, dirty: Option<&StatusSnapshot>) -> String {
-    let head = if before == now {
-        "HEAD did not move".to_string()
-    } else {
-        format!(
+fn commit_facts_note(before: Option<&str>, now: &str, dirty: Option<&StatusSnapshot>) -> String {
+    let head = match before {
+        None => format!(
+            "HEAD is `{}`; no same-checkout baseline (workspace changed during turn)",
+            short_sha(now)
+        ),
+        Some(before) if before == now => "HEAD did not move".to_string(),
+        Some(before) => format!(
             "HEAD moved from `{}` to `{}`",
             short_sha(before),
             short_sha(now)
-        )
+        ),
     };
     let changes = match dirty {
         None => "not probed".to_string(),
@@ -834,7 +862,17 @@ fn short_sha(sha: &str) -> &str {
 /// whether tests passed, an existing commit was pushed, or a pull request
 /// was opened — do not turn a keyword in prose into an accusation about
 /// those.
-pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvidence>) -> String {
+#[cfg(test)]
+fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvidence>) -> String {
+    annotate_action_claims_at(text, evidence, None, false)
+}
+
+fn annotate_action_claims_at(
+    text: String,
+    evidence: Option<&TurnGitEvidence>,
+    root: Option<&std::path::Path>,
+    root_changed: bool,
+) -> String {
     let Some(ev) = evidence else { return text };
     let mut notes: Vec<String> = Vec::new();
     for b in claimed_branches(&text) {
@@ -853,13 +891,18 @@ pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvid
             notes.join("; ")
         );
     }
-    if commit_claimed {
-        if let Some(before) = ev.head_before.as_deref() {
-            text = format!(
-                "{text}\n\n⚠ claim check (#2683): {}",
-                commit_facts_note(before, &ev.head_now, ev.dirty_paths.as_ref())
-            );
-        }
+    if commit_claimed && (ev.head_before.is_some() || root_changed) {
+        let location = root
+            .map(|path| format!("in {}: ", crate::worktree_adoption::task_path_literal(path)))
+            .unwrap_or_default();
+        text = format!(
+            "{text}\n\n⚠ claim check (#2683): {location}{}",
+            commit_facts_note(
+                ev.head_before.as_deref(),
+                &ev.head_now,
+                ev.dirty_paths.as_ref()
+            )
+        );
     }
     text
 }

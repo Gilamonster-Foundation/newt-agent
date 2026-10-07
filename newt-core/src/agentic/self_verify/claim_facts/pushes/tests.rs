@@ -101,7 +101,11 @@ fn push_2769_finalizer_and_updated_facts() {
         &crate::Scope::All,
         &crate::agentic::capability_check::Evidence::default(),
         None,
-        None,
+        &crate::agentic::claim_check::TurnClaims::capture(
+            root.path().to_str().unwrap(),
+            &crate::Scope::All,
+            None,
+        ),
         &ledger,
     );
     assert!(text.contains("#2769"), "{text}");

@@ -227,7 +227,11 @@ fn cap_exit_finalizer_applies_workspace_claim_checks() {
         &crate::Scope::All,
         &capability_check::Evidence::default(),
         None,
-        None,
+        &claim_check::TurnClaims::capture(
+            &workspace.path().to_string_lossy(),
+            &crate::Scope::All,
+            None,
+        ),
         &self_verify::VerificationLedger::default(),
     );
     assert!(
@@ -370,9 +374,11 @@ fn cap_exit_finalizer_adds_a_facts_note_when_head_did_not_move_in_a_real_repo() 
     std::fs::write(workspace.path().join("a.txt"), "one\n").unwrap();
     git(&["add", "a.txt"]);
     git(&["commit", "-q", "-m", "init"]);
-    let head_before =
-        claim_check::git_head(&workspace.path().to_string_lossy(), &crate::Scope::All)
-            .expect("HEAD exists after the initial commit");
+    let head_before = claim_check::TurnClaims::capture(
+        &workspace.path().to_string_lossy(),
+        &crate::Scope::All,
+        None,
+    );
     // The turn only staged a further edit — exactly the measured bug — so
     // HEAD at finalize time is IDENTICAL to `head_before`.
     std::fs::write(workspace.path().join("a.txt"), "one\ntwo\n").unwrap();
@@ -384,7 +390,7 @@ fn cap_exit_finalizer_adds_a_facts_note_when_head_did_not_move_in_a_real_repo() 
         &crate::Scope::All,
         &capability_check::Evidence::default(),
         None,
-        Some(&head_before),
+        &head_before,
         &self_verify::VerificationLedger::default(),
     );
     assert!(
@@ -422,9 +428,11 @@ fn cap_exit_finalizer_facts_note_names_a_file_still_dirty_when_head_moved_in_a_r
     std::fs::write(workspace.path().join("src/a.txt"), "one\n").unwrap();
     git(&["add", "src/a.txt"]);
     git(&["commit", "-q", "-m", "init"]);
-    let head_before =
-        claim_check::git_head(&workspace.path().to_string_lossy(), &crate::Scope::All)
-            .expect("HEAD exists after the initial commit");
+    let head_before = claim_check::TurnClaims::capture(
+        &workspace.path().to_string_lossy(),
+        &crate::Scope::All,
+        None,
+    );
 
     // The turn's actual edit: staged but never committed.
     std::fs::write(workspace.path().join("src/a.txt"), "one\ntwo\n").unwrap();
@@ -445,7 +453,7 @@ fn cap_exit_finalizer_facts_note_names_a_file_still_dirty_when_head_moved_in_a_r
         &crate::Scope::All,
         &capability_check::Evidence::default(),
         None,
-        Some(&head_before),
+        &head_before,
         &self_verify::VerificationLedger::default(),
     );
     assert!(
@@ -957,7 +965,7 @@ async fn finalizer_refutes_cargo_success_with_observed_failure() {
         &crate::Scope::All,
         &capability_check::Evidence::default(),
         None,
-        None,
+        &claim_check::TurnClaims::capture(root, &crate::Scope::All, None),
         &ledger,
     );
     assert!(text.contains("claim check (#2718)"), "{text}");

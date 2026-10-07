@@ -117,3 +117,5 @@
 # environment. Fixed read-only config/exec-path argv; helpers are never executed.
 "newt-core/src/git_staging/tool_diagnostics.rs" = { count = 1, class = "trusted-infra" }
 "newt-core/src/agentic/tools/dependency_fetch_inputs.rs" = { count = 1, class = "test", note = "#2731 owner-only fetch-copy regression: a fixed /bin/sh command sets umask 002 and execs the current test binary with one exact test filter. The executable is passed as a positional argument, not shell interpolation. Test-only, no model/repository-controlled argv or network; subprocess isolation keeps the process-global umask out of the parallel test runner." }
+
+"newt-core/src/agentic/mod_tests/claimcheck_task_root.rs" = { count = 1, class = "test", note = "#2787: fixed-argv Git fixture creates owned temporary repositories and a linked task checkout. Environment cleared, private HOME/config/templates, fixed test identity, no inherited Git overrides, no shell or model-controlled input. Grounds final-answer root selection and HEAD/status facts in real Git metadata." }

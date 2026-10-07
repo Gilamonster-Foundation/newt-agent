@@ -135,7 +135,11 @@ fn issue_2741_finalizer_checks_pr_claims() {
         &crate::Scope::All,
         &crate::agentic::capability_check::Evidence::default(),
         None,
-        None,
+        &crate::agentic::claim_check::TurnClaims::capture(
+            root.path().to_str().unwrap(),
+            &crate::Scope::All,
+            None,
+        ),
         &VerificationLedger::default(),
     );
     assert!(got.contains("Unverified"), "{got}");
@@ -171,7 +175,11 @@ fn final_claim(ledger: &VerificationLedger, text: &str) -> String {
         &crate::Scope::All,
         &crate::agentic::capability_check::Evidence::default(),
         None,
-        None,
+        &crate::agentic::claim_check::TurnClaims::capture(
+            root.path().to_str().unwrap(),
+            &crate::Scope::All,
+            None,
+        ),
         ledger,
     )
 }
