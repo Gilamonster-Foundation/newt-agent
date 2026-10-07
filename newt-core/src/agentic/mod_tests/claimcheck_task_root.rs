@@ -35,7 +35,9 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     std::fs::write(temp.path().join("empty-config"), "").unwrap();
     std::fs::create_dir(temp.path().join("templates")).unwrap();
     let original = temp.path().join("original");
-    let task = temp.path().join("task [bound]");
+    // #2787 round 2: an input spelling need not equal the canonical task
+    // locator (Windows temp roots can use short names). Exercise that on all OSes.
+    let task = temp.path().join(".").join("task [bound]");
     std::fs::create_dir(&original).unwrap();
     git(&original, temp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(original.join("tracked.txt"), "base\n").unwrap();
@@ -65,10 +67,9 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     (temp, original, task)
 }
 
-async fn check(bound: bool, citation: bool, wire: &str) {
-    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+async fn check(bound: bool, citation: bool, wire: &str) -> Vec<serde_json::Value> {
+    use crate::agentic::tools::disable_ocap_tests::env_lock;
     let _lock = env_lock().await;
-    let _stream = EnvVar::set("NEWT_ANTHROPIC_STREAM", "off");
     let (_temp, original, task) = fixture();
     let session = crate::worktree_adoption::WorktreeSession::default();
     if bound {
@@ -92,8 +93,18 @@ async fn check(bound: bool, citation: bool, wire: &str) {
         }
         _ => serde_json::json!({"message":{"role":"assistant","content":summary},"done":true}),
     };
+    let anthropic = wire == "anthropic";
     Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            // Honor the request without changing any process-global provider
+            // mode. Other Anthropic fixtures own their own serial env lane.
+            if anthropic && body["stream"] == true {
+                crate::agentic::anthropic_loop_tests::sse_text_reply(&[summary], 10, 5)
+            } else {
+                ResponseTemplate::new(200).set_body_json(reply.clone())
+            }
+        })
         .mount(&server)
         .await;
     let uri = server.uri();
@@ -116,9 +127,13 @@ async fn check(bound: bool, citation: bool, wire: &str) {
     }
     .unwrap();
     if !citation || !bound {
-        let root = if bound { &task } else { &original };
+        let root = if bound {
+            task.canonicalize().unwrap()
+        } else {
+            original.clone()
+        };
         assert!(
-            text.contains(&format!("`{}`", dunce::simplified(root).display())),
+            text.contains(&format!("`{}`", dunce::simplified(&root).display())),
             "{wire}: {text}"
         );
     }
@@ -136,6 +151,13 @@ async fn check(bound: bool, citation: bool, wire: &str) {
             assert!(text.contains("uncommitted changes: none"), "{text}");
         }
     }
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect()
 }
 
 /// #2787: a task-only citation verifies; without a binding it remains missing.
@@ -187,7 +209,8 @@ fn claimcheck_2787_root_changes_and_authority() {
         &[],
         &crate::Scope::All,
     );
-    let task_text = dunce::simplified(&task).display().to_string();
+    let canonical_task = task.canonicalize().unwrap();
+    let task_text = dunce::simplified(&canonical_task).display().to_string();
     assert!(
         missing.contains(&format!("root `{task_text}`")),
         "{missing}"
@@ -251,5 +274,20 @@ fn claimcheck_2787_root_changes_and_authority() {
             dunce::simplified(&original).display()
         )),
         "{missing}"
+    );
+}
+
+/// #2787 round 2: the fixture must honor the Anthropic lane's streaming mode,
+/// not mutate it under a different lock and race sibling provider tests.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn claimcheck_2787_anthropic_fixture_preserves_streaming_mode() {
+    let _lock = crate::agentic::tools::disable_ocap_tests::env_lock().await;
+    let _env = crate::agentic::anthropic_loop_tests::test_env(true);
+    let requests = check(false, true, "anthropic").await;
+    assert!(!requests.is_empty());
+    assert!(
+        requests.iter().all(|body| body["stream"] == true),
+        "fixture must preserve streaming requests"
     );
 }

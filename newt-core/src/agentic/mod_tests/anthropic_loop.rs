@@ -240,7 +240,7 @@ fn sse(frames: &[serde_json::Value]) -> ResponseTemplate {
 }
 
 /// An SSE stream that answers with plain text and full usage.
-fn sse_text_reply(parts: &[&str], input: u64, output: u64) -> ResponseTemplate {
+pub(super) fn sse_text_reply(parts: &[&str], input: u64, output: u64) -> ResponseTemplate {
     let mut frames = vec![
         serde_json::json!({"type": "message_start",
             "message": {"model": "claude-test", "usage": {"input_tokens": input}}}),
