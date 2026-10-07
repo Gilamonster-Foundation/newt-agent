@@ -257,7 +257,10 @@ async fn missing_cwd_2773_build_routes() {
         .await;
         assert_eq!(outcome, crate::ExecOutcome::Unavailable, "{text}");
         assert!(text.contains("does not exist; no command ran"), "{text}");
-        assert!(text.contains(&missing.display().to_string()), "{text}");
+        assert!(
+            text.contains(&dunce::simplified(&missing).display().to_string()),
+            "{text}"
+        );
         assert!(!text.contains("capability denied"), "{text}");
         assert!(gate.0.is_empty());
     }
@@ -321,7 +324,10 @@ async fn missing_cwd_2773_dispatch_keeps_previous_directory() {
                 "{result}"
             );
             assert!(result.contains("working directory remains"), "{result}");
-            assert!(result.contains(&previous.display().to_string()), "{result}");
+            assert!(
+                result.contains(&dunce::simplified(&previous).display().to_string()),
+                "{result}"
+            );
             assert_eq!(execution.get(), Some(&crate::ExecOutcome::Unavailable));
             assert!(
                 directory.get().is_none(),

@@ -45,7 +45,10 @@ async fn path_suggest_wrong_prefix_across_file_tools() {
             );
             assert_eq!(out.matches("did you mean").count(), 1, "{out}");
             assert!(
-                out.contains(&format!("resolved against {}", ws.path().display())),
+                out.contains(&format!(
+                    "resolved against `{}`",
+                    dunce::simplified(ws.path()).display()
+                )),
                 "{tool}: {out}"
             );
         }
@@ -126,27 +129,34 @@ fn path_suggest_bounded_suffix_and_plain_error_controls() {
         )
         .render(root, scope)
     };
+    let display_root = dunce::simplified(ws.path()).display();
     assert_eq!(
         hint("one/two/src/item.rs", &Scope::All),
-        format!("error: missing\nresolved against {root}\ndid you mean src/item.rs?")
+        format!("error: missing\nresolved against `{display_root}`\ndid you mean src/item.rs?")
     );
     for path in ["one/two/absent.rs", "wrong/../src/item.rs"] {
         assert_eq!(
             hint(path, &Scope::All),
-            format!("error: missing\nresolved against {root}")
+            format!("error: missing\nresolved against `{display_root}`")
         );
     }
     assert_eq!(
         hint("wrong/src/item.rs", &Scope::none()),
-        format!("error: missing\nresolved against {root}")
+        format!("error: missing\nresolved against `{display_root}`")
     );
     assert_eq!(
         hint(&format!("{}src/item.rs", "wrong/".repeat(33)), &Scope::All),
-        format!("error: missing\nresolved against {}", ws.path().display())
+        format!(
+            "error: missing\nresolved against `{}`",
+            dunce::simplified(ws.path()).display()
+        )
     );
     assert_eq!(
         hint(&format!("{}/src/item.rs", "x".repeat(4096)), &Scope::All),
-        format!("error: missing\nresolved against {}", ws.path().display())
+        format!(
+            "error: missing\nresolved against `{}`",
+            dunce::simplified(ws.path()).display()
+        )
     );
     assert_eq!(
         super::super::FileIoError::from("capability denied: fs_read".to_string())
@@ -174,7 +184,10 @@ fn path_suggest_symlink_escape_is_not_a_candidate() {
     };
     assert_eq!(
         hint("wrong/escape/secret.rs", &Scope::All),
-        format!("error: missing\nresolved against {}", ws.path().display())
+        format!(
+            "error: missing\nresolved against `{}`",
+            dunce::simplified(ws.path()).display()
+        )
     );
     touch(ws.path(), "private/secret.rs");
     std::fs::create_dir(ws.path().join("allowed")).unwrap();
@@ -182,7 +195,10 @@ fn path_suggest_symlink_escape_is_not_a_candidate() {
     let scope = Scope::only([ws.path().join("allowed").to_string_lossy().into_owned()]);
     assert_eq!(
         hint("wrong/allowed/link/secret.rs", &scope),
-        format!("error: missing\nresolved against {}", ws.path().display())
+        format!(
+            "error: missing\nresolved against `{}`",
+            dunce::simplified(ws.path()).display()
+        )
     );
 }
 

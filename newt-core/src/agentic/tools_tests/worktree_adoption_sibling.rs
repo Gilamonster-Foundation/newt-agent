@@ -147,7 +147,7 @@ async fn sibling_grant_once_creates_and_keeps_task_readable_writable() {
             assert!(
                 notices.0.iter().any(|n| n
                     == &format!(
-                        "left empty directory {}; remove it if unwanted",
+                        "left empty directory `{}`; remove it if unwanted",
                         failed_target.display()
                     )),
                 "operator missed notice: {:?}",
@@ -164,7 +164,7 @@ async fn sibling_grant_once_creates_and_keeps_task_readable_writable() {
             );
             assert!(
                 text.contains(&format!(
-                    "left empty directory {}; remove it if unwanted",
+                    "left empty directory `{}`; remove it if unwanted",
                     failed_target.display()
                 )),
                 "missing leftover notice: {text}"

@@ -266,7 +266,7 @@ pub(super) fn existing_exec_cwd(
         (
             format!(
                 "error: working directory {} {reason}; no command ran",
-                cwd.display()
+                crate::worktree_adoption::task_path_literal(cwd)
             ),
             ExecOutcome::Unavailable,
         )

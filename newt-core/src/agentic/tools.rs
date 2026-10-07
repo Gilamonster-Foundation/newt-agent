@@ -4401,7 +4401,7 @@ async fn execute_authorized_tool(
                 let task_root = worktree_session.and_then(|session| session.task_root(std::path::Path::new(workspace)));
                 let previous = task_root.as_deref().or(default_command_cwd).unwrap_or_else(|| std::path::Path::new(workspace));
                 return host_return(executed((
-                    format!("{error}; default working directory remains {}", previous.display()),
+                    format!("{error}; default working directory remains {}", crate::worktree_adoption::task_path_literal(previous)),
                     outcome,
                 )));
             }
