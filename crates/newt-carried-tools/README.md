@@ -60,6 +60,11 @@ No GNU long-option surface is claimed.
 - Hidden and ignored files are searched. Input is treated as text, including
   binary input; GNU binary-file messages and locale collation are not provided.
 - Default regex supports literals, `.`, `*`, anchors and simple bracket classes.
+  `^` anchors only at pattern start and `$` only at pattern end; elsewhere
+  they are literal. A leading `*`, including immediately after the initial
+  `^`, is literal. Other `*` operators repeat the preceding atom; ambiguous
+  repeated quantifiers (for example `a**`) are refused. Groups, including
+  `\(*\)`, remain outside this subset and receive a supported-set refusal.
   ERE-only punctuation is escaped, so `alpha|beta` is literal in default mode.
   BRE escapes for groups, repetitions, word boundaries or backreferences and
   nested/POSIX bracket syntax are rejected. Use `-E` for rg's regex dialect
