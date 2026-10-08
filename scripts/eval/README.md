@@ -170,3 +170,18 @@ Offline tests run in `just eval-selftest` and the matching CI lint step:
 ```bash
 python -m unittest discover -s scripts/eval/tests -v
 ```
+
+Transcript ingestion reads only the last 4 MiB by default; configure this with
+`--transcript-tail-mib N` (a positive integer). It seeks past old redraws and
+bounds the read to a snapshot of the file size, even while a live log grows.
+A cropped first terminal line is discarded. If the final report has scrolled
+outside that window, claims fail with a hint to enlarge it. Prompt-echo counts
+cover only the retained tail and remain incomplete; a trusted `--input-log`
+still supplies complete counts independently.
+
+`--transcript` is optional. Without it, claims are **UNGRADED**, never PASS.
+The other criteria still run; an otherwise passing run renders UNGRADED overall
+and exits 1. Any failed criterion still renders FAIL. A supplied but unreadable
+transcript remains an input error (exit 2). The Linux transcript regression
+uses a 256 MiB synthetic file under a fixed 128 MiB address-space limit, with
+no timing threshold.

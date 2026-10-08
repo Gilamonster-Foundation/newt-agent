@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 
+from refactor_transcript import read_tail, positive_mib
 from refactor_claims import check_claims, final_summary, operator_inputs
 
 # Reuse the eval scoreboard's crate-vector-pinned content addressing, not a
@@ -371,25 +372,41 @@ def grade(args: argparse.Namespace, command=run) -> dict:
     except EvidenceError as exc:
         row("fresh_clone_check", False, str(exc))
 
-    raw = args.transcript.read_text(errors="replace")
-    try:
-        summary = final_summary(raw)
-        test_log = args.test_log.read_text() if args.test_log else ""
-        claims = check_claims(raw, facts, test_log)
-        row("claims", all(c["status"] == "verified" for c in claims), claims)
-    except ValueError as exc:
-        summary = ""
-        row("claims", False, str(exc))
+    raw = ""
+    summary = ""
+    if args.transcript is None:
+        criteria["claims"] = {
+            "status": "UNGRADED",
+            "evidence": "no transcript supplied",
+        }
+    else:
+        raw = read_tail(args.transcript, getattr(args, "transcript_tail_mib", 4))
+        try:
+            summary = final_summary(raw)
+            test_log = args.test_log.read_text() if args.test_log else ""
+            claims = check_claims(raw, facts, test_log)
+            row("claims", all(c["status"] == "verified" for c in claims), claims)
+        except ValueError as exc:
+            row(
+                "claims", False, str(exc) + "; increase --transcript-tail-mib if needed"
+            )
+    inputs = operator_inputs(
+        raw,
+        args.input_log.read_text() if getattr(args, "input_log", None) else None,
+    )
+    if not inputs["complete"]:
+        inputs["scope"] = (
+            "retained transcript tail only; "
+            if args.transcript
+            else "no transcript supplied; "
+        ) + inputs["scope"]
     return {
         "pass": all(v["status"] == "PASS" for v in criteria.values()),
         "seed": seed,
         "head": head,
         "branch": args.branch,
         "criteria": criteria,
-        "operator_inputs": operator_inputs(
-            raw,
-            args.input_log.read_text() if getattr(args, "input_log", None) else None,
-        ),
+        "operator_inputs": inputs,
         "summary": summary,
         "errors": errors,
     }
@@ -398,7 +415,10 @@ def grade(args: argparse.Namespace, command=run) -> dict:
 def render(report: dict) -> None:
     for name, result in report["criteria"].items():
         print(f'{result["status"]:4} {name}', file=sys.stderr)
-    print("PASS" if report["pass"] else "FAIL", file=sys.stderr)
+    verdict = "PASS" if report["pass"] else "UNGRADED"
+    if any(row["status"] == "FAIL" for row in report["criteria"].values()):
+        verdict = "FAIL"
+    print(verdict, file=sys.stderr)
 
 
 def main() -> int:
@@ -415,7 +435,15 @@ def main() -> int:
         type=int,
         help="run start Unix seconds, before worktree creation",
     )
-    parser.add_argument("--transcript", type=Path)
+    parser.add_argument(
+        "--transcript", type=Path, help="optional; absent claims are UNGRADED"
+    )
+    parser.add_argument(
+        "--transcript-tail-mib",
+        type=positive_mib,
+        default=4,
+        help="maximum transcript tail in MiB (positive integer; default: 4)",
+    )
     parser.add_argument(
         "--test-log",
         type=Path,
@@ -439,7 +467,6 @@ def main() -> int:
                 "github",
                 "crate",
                 "started_at",
-                "transcript",
             ):
                 if getattr(args, name) is None:
                     parser.error("missing --" + name.replace("_", "-"))
