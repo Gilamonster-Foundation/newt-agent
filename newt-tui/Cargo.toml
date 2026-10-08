@@ -82,6 +82,8 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [features]
+# Explicit native test adapter; absent from production builds.
+native-permission-test = []
 # TTY-only active-tool viewport (#1235). It has no dependency cost, but remains
 # independently severable from headless/wyvern builds.
 live-spill = []
@@ -148,3 +150,9 @@ workspace = true
 [[example]]
 name = "rich_tui_spike"
 required-features = ["rich-tui"]
+
+[[test]]
+name = "exec_grant_retry_loop"
+path = "tests/exec_grant_retry_loop.rs"
+harness = false
+required-features = ["native-permission-test"]
