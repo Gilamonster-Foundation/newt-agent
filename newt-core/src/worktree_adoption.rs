@@ -35,40 +35,6 @@ pub struct WorktreeSession {
     pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
 }
 impl WorktreeSession {
-    /// Dispatch a command while retaining this session's worktree adoption.
-    /// Uses the same guard and broker path as an inference-loop tool call.
-    pub async fn execute_command(
-        &self,
-        command: &str,
-        workspace: &Path,
-        caveats: &Caveats,
-        git_tool: Option<&dyn crate::agentic::GitTool>,
-    ) -> String {
-        use crate::agentic::tools::{execute_tool_with_collaborators, ToolCollaborators};
-        let execution = std::sync::OnceLock::new();
-        execute_tool_with_collaborators(
-            "run_command",
-            &serde_json::json!({"command": command}),
-            &workspace.to_string_lossy(),
-            false,
-            200,
-            caveats,
-            &mut crate::NoMcp,
-            ToolCollaborators {
-                worktree_session: Some(self),
-                execution: Some(&execution),
-                git_tool,
-                ..Default::default()
-            },
-            false,
-            crate::agentic::PromptDisposition::Act,
-            None,
-        )
-        .await
-        .expect("command dispatch has no durable completion writer")
-        .expect("command dispatch has no cancellation flag")
-    }
-
     /// Explicit operator lift, also used at the existing new-task boundary.
     pub fn lift(&self) {
         *self.adopted.lock().expect("worktree session lock") = None;
