@@ -35,7 +35,7 @@ jobs:
         run: sudo chmod g-w /Applications
       # Libtest substitutes SafeSubset for Brush. Keep portable routing and
       # refusal controls here; native positives run the production binary below.
-      # Row (c): plan_mode includes PR #2814's blank => approve once it lands.
+      # Row (c): plan_mode includes PR #2814's blank => approve regression.
       - name: Run portable routing and broker refusal controls
         env:
           NEWT_EXEC_PATHS: /usr/bin:/bin
@@ -52,22 +52,20 @@ jobs:
           set -o pipefail
           nice -n 10 cargo test --locked -p newt-core --test native_git_broker_pipeline \
             -- --confined-contract 2>&1 | tee macos-native-contract.log
-      # This assertion remains real and fails until the dependent production
-      # fix lands. A tolerated failure is NOT a passed publication contract.
-      - name: Governed commit and task-ref publication (needs PR 2818)
+      # Required production publication proof after integrating PR #2818.
+      - name: Governed commit and task-ref publication
         id: publication
-        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
           nice -n 10 cargo test --locked -p newt-core --test native_git_broker_pipeline \
-            -- --confined-contract --require-2818 2>&1 | tee macos-publication-contract.log
-      - name: Report dependent publication outcome
+            -- --confined-contract --publication 2>&1 | tee macos-publication-contract.log
+      - name: Report required publication outcome
         if: always()
         env:
           PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
         run: |
-          echo "Governed commit/task-ref publication (requires PR #2818): $PUBLICATION_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          echo "Governed commit/task-ref publication (required): $PUBLICATION_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve per-row evidence
         if: always()
         uses: actions/upload-artifact@v4
