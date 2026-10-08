@@ -2833,6 +2833,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     // `/api/chat`) falls back to a cap derived from the current send
                     // budget / the `num_ctx` ceiling, so the turn self-heals.
                     let overflow = cw_overflow::is_context_overflow(&e.to_string());
+                    // Record the rejected size BEFORE increasing estimation slack.
+                    let refused_tokens = cw_overflow::parse_context_window_error(&e.to_string())
+                        .map(|(tokens, _)| usize::try_from(tokens).unwrap_or(usize::MAX))
+                        .unwrap_or_else(|| calibrate_up(round_est_raw, cal));
                     if overflow {
                         cal = compress_state.calibration.overflow(cal);
                         tool_tokens_real = calibrate_up(tool_tokens, cal);
@@ -2861,6 +2865,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     send_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
                                 )
                             })
+                            .and_then(|budget| {
+                                cw_overflow::recovery_target(
+                                    budget,
+                                    refused_tokens,
+                                    effective_input_ceiling,
+                                )
+                            })
                         {
                             if let Some(context_window) = recovered_window {
                                 emit_context_window_400(&mut on_round_usage, context_window);
@@ -2880,8 +2891,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 color,
                                 &display::OverflowReason::Refused {
                                     request_estimate: Some(
-                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
-                                            as u32,
+                                        refused_tokens.min(u32::MAX as usize) as u32
                                     ),
                                     window: recovered_window,
                                     trim_to: new_budget.min(u32::MAX as usize) as u32,
@@ -7832,6 +7842,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     // though no `num_ctx` field rides on this wire.
                     let overflow =
                         crate::retry::classify(&e) == crate::retry::Retryability::ContextExceeded;
+                    // Record the rejected size BEFORE increasing estimation slack.
+                    let refused_tokens = cw_overflow::parse_context_window_error(&e.to_string())
+                        .map(|(tokens, _)| usize::try_from(tokens).unwrap_or(usize::MAX))
+                        .unwrap_or_else(|| calibrate_up(round_est_raw, cal));
                     if overflow {
                         cal = compress_state.calibration.overflow(cal);
                         tool_tokens_real = calibrate_up(tool_tokens, cal);
@@ -7863,6 +7877,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     send_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
                                 )
                             })
+                            .and_then(|budget| {
+                                cw_overflow::recovery_target(
+                                    budget,
+                                    refused_tokens,
+                                    effective_input_ceiling,
+                                )
+                            })
                         {
                             if let Some(context_window) = recovered_window {
                                 emit_context_window_400(&mut on_round_usage, context_window);
@@ -7883,8 +7904,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 color,
                                 &display::OverflowReason::Refused {
                                     request_estimate: Some(
-                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
-                                            as u32,
+                                        refused_tokens.min(u32::MAX as usize) as u32
                                     ),
                                     window: recovered_window,
                                     trim_to: new_budget.min(u32::MAX as usize) as u32,
@@ -10485,6 +10505,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     // numberless overflows fall back to deriving a tightened
                     // cap from the current send budget.
                     let overflow = cw_overflow::is_context_overflow(&e.to_string());
+                    // Record the rejected size BEFORE increasing estimation slack.
+                    let refused_tokens = cw_overflow::parse_context_window_error(&e.to_string())
+                        .map(|(tokens, _)| usize::try_from(tokens).unwrap_or(usize::MAX))
+                        .unwrap_or_else(|| calibrate_up(round_est_raw, cal));
                     if overflow {
                         cal = compress_state.calibration.overflow(cal);
                         tool_tokens_real = calibrate_up(tool_tokens, cal);
@@ -10513,6 +10537,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     send_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
                                 )
                             })
+                            .and_then(|budget| {
+                                cw_overflow::recovery_target(
+                                    budget,
+                                    refused_tokens,
+                                    effective_input_ceiling,
+                                )
+                            })
                         {
                             if let Some(context_window) = recovered_window {
                                 emit_context_window_400(&mut on_round_usage, context_window);
@@ -10529,8 +10560,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 color,
                                 &display::OverflowReason::Refused {
                                     request_estimate: Some(
-                                        calibrate_up(round_est_raw, cal).min(u32::MAX as usize)
-                                            as u32,
+                                        refused_tokens.min(u32::MAX as usize) as u32
                                     ),
                                     window: recovered_window,
                                     trim_to: new_budget.min(u32::MAX as usize) as u32,
@@ -12749,6 +12779,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         tools_supported.then_some(tools.as_slice()),
                         estimation,
                     );
+                    // Record the rejected size BEFORE increasing estimation slack.
+                    let refused_tokens = cw_overflow::parse_context_window_error(&e.to_string())
+                        .map(|(tokens, _)| usize::try_from(tokens).unwrap_or(usize::MAX))
+                        .unwrap_or_else(|| calibrate_up(round_est_raw, cal));
                     if overflow {
                         cal = compress_state.calibration.overflow(cal);
                         budget_state.set_tool_schema_tokens(calibrate_up(
@@ -12775,6 +12809,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                     budget_state
                                         .soft_send_budget()
                                         .unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
+                                )
+                            })
+                            .and_then(|budget| {
+                                cw_overflow::recovery_target(
+                                    budget,
+                                    refused_tokens,
+                                    budget_state.actionable_input_budget(),
                                 )
                             })
                         {
