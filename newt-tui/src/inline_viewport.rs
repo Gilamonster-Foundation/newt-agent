@@ -55,7 +55,7 @@ use std::io::{self, Write};
 
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
-use ratatui::layout::{Position, Size};
+use ratatui::layout::{Position, Rect, Size};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 /// Where an inline surface's bytes go.
@@ -307,24 +307,37 @@ pub(crate) fn inline_terminal(lease: newt_core::tty::RegionLease) -> io::Result<
             ))
         }
     };
+    let placed = lease.cursor_return().is_some();
     let mut backend = AnchoredBackend::with_lease(PanelOut::Stdout(io::stdout()), Some(lease));
-    // A lease a holder SHIFTED above the bottom rows: park the cursor on its
-    // top row before ratatui looks at it. An inline viewport opens at the
-    // CURSOR (a terminal that answers the query reports it) and emits its
-    // opening newlines from there, so a cursor left anywhere else puts the
-    // viewport outside the rows this surface leased, scrolling the holder
-    // below it or erasing its first row on the next clear. A bottom-anchored
-    // lease (the prompt) keeps ratatui's own placement: it scrolls the
-    // transcript up to make room, where a park would paint over it.
-    if top.saturating_add(height) < backend.size()?.height {
-        backend.set_cursor_position(Position { x: 0, y: top })?;
-    }
-    Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )
+    let viewport = if placed {
+        // The arbiter placed these rows under the transcript, handed them out
+        // blank, and returns the cursor when the lease drops
+        // (`Terminal::lease_below_cursor`): open exactly there. `Fixed`, not
+        // `Inline`, so ratatui neither queries the cursor nor emits opening
+        // newlines, the two moves whose answers this surface no longer owns.
+        // The cockpit's panels have opened this way since #2574
+        // (`cockpit_panel_terminal`), for the same reason.
+        Viewport::Fixed(Rect::new(0, top, backend.size()?.width, height))
+    } else {
+        // A bottom-anchored lease (the prompt editor's, or the fallback for a
+        // terminal that did not answer the arbiter's query): ratatui's own
+        // placement. A lease a holder SHIFTED above the bottom rows: park the
+        // cursor on its top row before ratatui looks at it. An inline
+        // viewport opens at the CURSOR and emits its opening newlines from
+        // there, so a cursor left anywhere else puts the viewport outside the
+        // rows this surface leased, scrolling the holder below it. (Measured:
+        // without this, a panel re-opened after a grow beside a holder on a
+        // silent terminal ran its newlines from the old panel's last row and
+        // scrolled the holder's rows away, `a_panel_beside_a_row_holder_
+        // stays_open_at_its_granted_height`.) A bottom-anchored lease keeps
+        // ratatui's placement, which scrolls the transcript up to make room,
+        // where a park would paint over it.
+        if top.saturating_add(height) < backend.size()?.height {
+            backend.set_cursor_position(Position { x: 0, y: top })?;
+        }
+        Viewport::Inline(height)
+    };
+    Terminal::with_options(backend, TerminalOptions { viewport })
 }
 
 /// A panel drawn into rows the COCKPIT already reserved, on the real terminal.
@@ -374,6 +387,30 @@ pub(crate) fn lease_bottom_rows(
     let top = screen.height.saturating_sub(height);
     newt_core::tty::Terminal::lease_region(newt_core::tty::Region::Rows { top, height }, policy)
         .ok_or_else(|| io::Error::other("another surface already owns these rows"))
+}
+
+/// Lease `height` rows under the transcript, where a frame belongs, or, when
+/// the terminal will not say where that is, the bottom rows as before.
+///
+/// The first is `Terminal::lease_below_cursor`: the rows come blank, the
+/// cursor goes back to the transcript's end when the lease drops, and
+/// [`inline_terminal`] opens them as a `Fixed` viewport with no cursor query
+/// of its own. The second is [`lease_bottom_rows`] and ratatui's `Inline`
+/// placement, which a surface reaches only when the terminal did not answer
+/// or could not safely be asked: it keeps the placement it had before the
+/// arbiter owned the row, and never guesses one.
+pub(crate) fn lease_below_transcript(
+    height: u16,
+    policy: newt_core::tty::OnCollision,
+) -> io::Result<newt_core::tty::RegionLease> {
+    match newt_core::tty::Terminal::lease_below_cursor(
+        height,
+        policy,
+        newt_core::tty::Sink::Stdout,
+    )? {
+        Some(lease) => Ok(lease),
+        None => lease_bottom_rows(height, policy),
+    }
 }
 
 /// The cursor position for a caller that is not building a ratatui terminal —

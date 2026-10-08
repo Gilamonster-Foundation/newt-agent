@@ -41,7 +41,6 @@ mod terminal {
     use newt_core::markup::spans::Emphasis;
 
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use crossterm::terminal::{Clear, ClearType};
     use newt_core::interaction_surface::SurfaceInteraction;
     use newt_core::tty::raw_mode::RawModeGuard;
     use newt_core::tty::{ControlReader, Echo, PromptLine};
@@ -86,20 +85,6 @@ mod terminal {
             Ok(Self {
                 _raw: RawModeGuard::enter()?,
             })
-        }
-    }
-
-    impl Drop for InlineGuard {
-        fn drop(&mut self) {
-            // Erase the reserved region before handing the terminal back, or
-            // the next committed line prints over a live widget frame. The
-            // raw-mode restore is `_raw`'s Drop, which runs after this body.
-            let mut out = io::stdout();
-            let _ = crossterm::execute!(
-                out,
-                crossterm::cursor::MoveToColumn(0),
-                Clear(ClearType::FromCursorDown)
-            );
         }
     }
 
@@ -290,19 +275,35 @@ mod terminal {
     }
 
     fn inline_reader(interaction: &SurfaceInteraction) -> io::Result<ModalReader> {
+        let guard = InlineGuard::enter()?;
+        let (terminal, cleanup) = open_frame(interaction)?;
+        let mut reader = ModalReader::new(terminal, interaction, cleanup)?;
+        reader._inline = Some(guard);
+        Ok(reader)
+    }
+
+    /// The frame's rows, and who erases them when it closes: under the
+    /// transcript when the arbiter can place them, the bottom rows otherwise
+    /// (`inline_viewport::lease_below_transcript`). Called again on a resize.
+    fn open_frame(
+        interaction: &SurfaceInteraction,
+    ) -> io::Result<(crate::inline_viewport::InlineTerm, Cleanup)> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let height = requested_rows(interaction, cols).min(rows).max(1);
-        let guard = InlineGuard::enter()?;
         // #1950: through the ONE inline constructor. A permission frame that
         // will not open is a decision the operator never gets to make.
         // #1979: Shift, for `config_panel`'s reason — a permission frame opens
         // DURING a turn, over whatever is already pinned to the bottom.
-        let lease =
-            crate::inline_viewport::lease_bottom_rows(height, newt_core::tty::OnCollision::Shift)?;
-        let terminal = crate::inline_viewport::inline_terminal(lease)?;
-        let mut reader = ModalReader::new(terminal, interaction, false)?;
-        reader._inline = Some(guard);
-        Ok(reader)
+        let lease = crate::inline_viewport::lease_below_transcript(
+            height,
+            newt_core::tty::OnCollision::Shift,
+        )?;
+        let cleanup = if lease.cursor_return().is_some() {
+            Cleanup::Lease
+        } else {
+            Cleanup::Viewport
+        };
+        Ok((crate::inline_viewport::inline_terminal(lease)?, cleanup))
     }
 
     /// Same modal on the cockpit's saved real terminal. The presenter owns
@@ -462,13 +463,34 @@ mod terminal {
         }
     }
 
+    /// Who erases the frame's rows when the reader closes, and what a resize
+    /// does to it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Cleanup {
+        /// The cockpit presenter reserved the rows and cleans them up; a
+        /// resize re-seats the frame on the bottom rows it lends.
+        Presenter,
+        /// The arbiter placed the rows and erases them when the lease drops,
+        /// returning the cursor to the transcript
+        /// (`Terminal::lease_below_cursor`). A resize closes and re-opens the
+        /// frame: a `Fixed` viewport never re-measures, and ratatui's own
+        /// `resize`/`clear` run `ESC[J` to the end of the screen, through
+        /// whatever holds the rows below.
+        Lease,
+        /// A bottom-anchored `Inline` viewport, kept for a terminal that does
+        /// not answer the cursor query: ratatui's `clear` erases it on drop,
+        /// and its own autoresize follows a resize.
+        Viewport,
+    }
+
     /// Pollable shared dialog: web verdicts and terminal answers keep their
     /// existing arbitration loop while drawing and decoding the same window.
     pub(crate) struct ModalReader {
-        terminal: crate::inline_viewport::InlineTerm,
+        /// `None` only after a resize closed the frame and re-opening failed.
+        terminal: Option<crate::inline_viewport::InlineTerm>,
         input: ModalInput,
         interaction: SurfaceInteraction,
-        fixed: bool,
+        cleanup: Cleanup,
         _raw: RawModeGuard,
         // The inline guard took raw mode first, so it must restore it LAST.
         _inline: Option<InlineGuard>,
@@ -478,13 +500,13 @@ mod terminal {
         fn new(
             terminal: crate::inline_viewport::InlineTerm,
             interaction: &SurfaceInteraction,
-            fixed: bool,
+            cleanup: Cleanup,
         ) -> io::Result<Self> {
             Ok(Self {
-                terminal,
+                terminal: Some(terminal),
                 input: ModalInput::new(interaction),
                 interaction: interaction.clone(),
-                fixed,
+                cleanup,
                 _raw: RawModeGuard::enter()?,
                 _inline: None,
             })
@@ -495,7 +517,7 @@ mod terminal {
         terminal: crate::inline_viewport::InlineTerm,
         interaction: &SurfaceInteraction,
     ) -> io::Result<ModalReader> {
-        ModalReader::new(terminal, interaction, true)
+        ModalReader::new(terminal, interaction, Cleanup::Presenter)
     }
 
     pub(crate) fn reader_for_shared_decision(
@@ -517,37 +539,52 @@ mod terminal {
 
     impl Drop for ModalReader {
         fn drop(&mut self) {
-            if !self.fixed {
+            if self.cleanup == Cleanup::Viewport {
                 // A web verdict or unwind must erase the entire viewport
-                // before its inline guard gives raw mode back.
-                let _ = self.terminal.clear();
+                // before its inline guard gives raw mode back. (A leased frame
+                // is erased by its lease, when the terminal field drops.)
+                if let Some(terminal) = &mut self.terminal {
+                    let _ = terminal.clear();
+                }
             }
         }
     }
 
     impl ControlReader for ModalReader {
         fn poll(&mut self, timeout: Duration) -> io::Result<Option<PromptLine>> {
+            let terminal = self
+                .terminal
+                .as_mut()
+                .ok_or_else(|| io::Error::other("the interaction frame has no viewport"))?;
             let input = &mut self.input;
-            self.terminal.draw(|f| draw(f, input))?;
+            terminal.draw(|f| draw(f, input))?;
+            let area = terminal.get_frame().area();
             if !event::poll(timeout)? {
                 return Ok(None);
             }
             let event = event::read()?;
             if let Event::Resize(cols, rows) = event {
-                if self.fixed {
-                    let height = requested_rows(&self.interaction, cols).min(rows);
-                    self.terminal.clear()?;
-                    self.terminal.resize(Rect::new(
-                        0,
-                        rows.saturating_sub(height),
-                        cols,
-                        height,
-                    ))?;
+                match self.cleanup {
+                    Cleanup::Presenter => {
+                        let height = requested_rows(&self.interaction, cols).min(rows);
+                        terminal.clear()?;
+                        terminal.resize(Rect::new(0, rows.saturating_sub(height), cols, height))?;
+                    }
+                    Cleanup::Lease => {
+                        // Close, so the lease returns the cursor to the
+                        // transcript; then re-open from there, on the
+                        // resized screen.
+                        self.terminal = None;
+                        let (terminal, cleanup) = open_frame(&self.interaction)?;
+                        self.terminal = Some(terminal);
+                        self.cleanup = cleanup;
+                    }
+                    Cleanup::Viewport => {}
                 }
                 self.input.scroll = 0;
                 return Ok(None);
             }
-            Ok(self.input.event(event, self.terminal.get_frame().area()))
+            Ok(self.input.event(event, area))
         }
     }
 

@@ -24,7 +24,6 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{Clear, ClearType};
 use newt_core::tty::raw_mode::RawModeGuard;
 use newt_core::tty::OnCollision;
 use ratatui::layout::{Constraint, Layout};
@@ -137,17 +136,45 @@ fn draw(frame: &mut ratatui::Frame, batch: &str, hint: &str, answer: &str) {
 
 /// Run the modal's event loop on an already-positioned terminal (the
 /// cockpit's real-terminal handoff, mirroring `interaction_view::present_in`).
+///
+/// `#[cfg(unix)]` to match its only caller, [`present_in`], exactly as that
+/// function is gated and for the same reason: the live cockpit is unix-only,
+/// so on Windows this has nobody to serve and `-D warnings` correctly calls
+/// it dead (measured on the Windows CI leg). The classic [`present`] opens
+/// its own frame per pass and drives [`read_until_resize`] directly.
+#[cfg(unix)]
 fn run(terminal: &mut InlineTerm, batch: &str, hint: &str) -> io::Result<ReadOutcome> {
     let mut input = FreeTextInput {
         answer: String::new(),
     };
     loop {
+        if let Some(outcome) = read_until_resize(terminal, batch, hint, &mut input)? {
+            return Ok(outcome);
+        }
+    }
+}
+
+/// Draw and read until the operator is done, or `None` when the terminal was
+/// resized, so a caller that owns the frame's rows can re-open it at the new
+/// size. (The cockpit's rows are the presenter's, so [`run`] carries on.)
+fn read_until_resize(
+    terminal: &mut InlineTerm,
+    batch: &str,
+    hint: &str,
+    input: &mut FreeTextInput,
+) -> io::Result<Option<ReadOutcome>> {
+    loop {
         terminal.draw(|f| draw(f, batch, hint, &input.answer))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        if let Step::Done(outcome) = input.event(event::read()?) {
-            return Ok(outcome);
+        match event::read()? {
+            Event::Resize(..) => return Ok(None),
+            event => {
+                if let Step::Done(outcome) = input.event(event) {
+                    return Ok(Some(outcome));
+                }
+            }
         }
     }
 }
@@ -182,23 +209,36 @@ pub(crate) fn present_in(
 /// Present the modal on a freshly leased region of the classic (non-cockpit)
 /// terminal, mirroring `interaction_view::present`.
 pub(crate) fn present(batch: &str, hint: &str) -> io::Result<ReadOutcome> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let height = requested_rows(batch, cols).min(rows).max(1);
     let _raw = RawModeGuard::enter()?;
-    let lease = crate::inline_viewport::lease_bottom_rows(height, OnCollision::Shift)?;
-    let mut terminal = crate::inline_viewport::inline_terminal(lease)?;
-    terminal.clear()?;
-    let outcome = run(&mut terminal, batch, hint);
-    // Erase the reserved region before handing the terminal back, or the next
-    // committed line prints over a live modal frame — `interaction_view::
-    // InlineGuard`'s drop does the same thing for the same reason.
-    let mut out = io::stdout();
-    let _ = crossterm::execute!(
-        out,
-        crossterm::cursor::MoveToColumn(0),
-        Clear(ClearType::FromCursorDown)
-    );
-    outcome
+    let mut input = FreeTextInput {
+        answer: String::new(),
+    };
+    // Each pass opens the frame afresh; a resize ends a pass, and the answer
+    // typed so far carries over to the next.
+    loop {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let height = requested_rows(batch, cols).min(rows).max(1);
+        let lease = crate::inline_viewport::lease_below_transcript(height, OnCollision::Shift)?;
+        // Rows the arbiter placed come blank and are erased when the lease
+        // drops, with the cursor returned to the transcript
+        // (`Terminal::lease_below_cursor`). The bottom-anchored fallback is
+        // ratatui's `Inline` viewport, which has to be cleared on open (a
+        // fresh back buffer repaints only what the frame touches) and erased
+        // on close, as `interaction_view::ModalReader` does for the same
+        // reason.
+        let erase_here = lease.cursor_return().is_none();
+        let mut terminal = crate::inline_viewport::inline_terminal(lease)?;
+        if erase_here {
+            terminal.clear()?;
+        }
+        let outcome = read_until_resize(&mut terminal, batch, hint, &mut input);
+        if erase_here {
+            let _ = terminal.clear();
+        }
+        if let Some(outcome) = outcome? {
+            return Ok(outcome);
+        }
+    }
 }
 
 #[cfg(test)]

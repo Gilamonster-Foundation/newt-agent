@@ -52,16 +52,6 @@ fn interaction_view_child() {
     let Some(mode) = std::env::var_os("NEWT_INTERACTION_PTY_CHILD") else {
         return;
     };
-    // HOLD the guard until the parent has sampled the tty. Exiting immediately
-    // is a race the parent loses: the restore would run before the first
-    // `is_raw()` read, and the test would "pass" without ever having observed
-    // raw mode — which is exactly what the `raw_during` control refuses to
-    // accept. One blocking byte-read makes the window deterministic.
-    let hold = || {
-        use std::io::Read as _;
-        let mut byte = [0u8; 1];
-        let _ = std::io::stdin().read(&mut byte);
-    };
     match mode.to_string_lossy().as_ref() {
         // The ordinary path: the frame closes and the scope ends.
         "clean" => {
@@ -148,6 +138,14 @@ fn interaction_view_child() {
             drop(spinner);
             println!("OUTCOME:{outcome:?}");
         }
+        // **Where the next line lands.** The four placements the arbiter
+        // decides for a frame under the transcript; see `committed_frame_case`.
+        "committed_frame" => committed_frame_case(5, false, true, false),
+        "committed_frame_held" => committed_frame_case(5, true, false, false),
+        "committed_frame_scroll" => committed_frame_case(22, false, true, false),
+        "committed_frame_contested" => committed_frame_case(18, true, false, false),
+        "committed_frame_partial" => committed_frame_case(5, false, true, true),
+        "committed_frame_partial_scroll" => committed_frame_case(23, false, true, true),
         "cockpit_resize" => {
             crate::cockpit::presenter::panel_resize_case();
         }
@@ -188,6 +186,76 @@ fn interaction_view_child() {
         }
         other => panic!("unknown child mode {other:?}"),
     }
+}
+
+/// HOLD the child until the parent has sampled the tty. Exiting immediately
+/// is a race the parent loses: the restore would run before the first
+/// `is_raw()` read, and the test would "pass" without ever having observed
+/// raw mode — which is exactly what the `raw_during` control refuses to
+/// accept. One blocking byte-read makes the window deterministic.
+fn hold() {
+    use std::io::Read as _;
+    let mut byte = [0u8; 1];
+    let _ = std::io::stdin().read(&mut byte);
+}
+
+/// The bottom rows a `committed_frame_held` child keeps, painted with these
+/// sentinels: the prompt editor's shape, as `panel_raw_mode_pty_test` makes it.
+const FRAME_HOLDER_ROWS: u16 = 3;
+const FRAME_HOLDER_SENTINEL: &str = "HOLDER-ROW";
+
+/// The row under the transcript, after a frame.
+///
+/// From a cleared screen (libtest's own progress line shares this pty), print
+/// `lines` transcript rows, keep the bottom rows when `held`, open the real
+/// `present` frame — under a prompt window when `window`, which is the pair
+/// `RichSurface::present_interaction` makes — and commit one more line the
+/// moment it closes. The parent replays the bytes with erases and reads where
+/// that line landed.
+fn committed_frame_case(lines: u16, held: bool, window: bool, partial: bool) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    write!(out, "\x1b[2J\x1b[H").expect("clear");
+    for n in 0..lines {
+        writeln!(out, "TRANSCRIPT-{n:02}").expect("print");
+    }
+    out.flush().expect("flush");
+    let holder = held.then(|| {
+        let (_, rows) = crossterm::terminal::size().expect("size");
+        let holder = crate::inline_viewport::lease_bottom_rows(
+            FRAME_HOLDER_ROWS,
+            newt_core::tty::OnCollision::Refuse,
+        )
+        .expect("the holder takes the bottom rows first");
+        for r in 0..FRAME_HOLDER_ROWS {
+            write!(
+                out,
+                "\x1b[{};1H{FRAME_HOLDER_SENTINEL}-{r}",
+                rows - FRAME_HOLDER_ROWS + r + 1
+            )
+            .expect("paint");
+        }
+        // Back to the transcript's end, where a turn leaves the cursor.
+        write!(out, "\x1b[{};1H", lines + 1).expect("park");
+        out.flush().expect("flush");
+        holder
+    });
+    if partial {
+        write!(out, "PARTIAL-END").expect("partial sentinel without newline");
+        out.flush().expect("flush partial sentinel");
+    }
+    let interaction = fixture_interaction();
+    let window = window.then(|| {
+        newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::RichSurfaceModal,
+        )
+    });
+    let (outcome, _) = crate::interaction_view::present(&interaction).expect("the frame runs");
+    drop(window);
+    println!("COMMITTED-AFTER-FRAME");
+    drop(holder);
+    println!("OUTCOME:{outcome:?}");
+    hold();
 }
 
 /// A permission-shaped interaction with labels long enough that a narrow
@@ -1410,6 +1478,264 @@ fn a_narrow_terminal_wraps_rather_than_overflowing() {
         "the body vanished at {COLS} columns rather than wrapping: {flat:?}"
     );
     assert!(f.tail.contains("OUTCOME:"), "the frame did not answer");
+}
+
+/// Pump until `needle` is on the REPLAYED screen. Not on the byte stream: a
+/// fresh frame is painted against an empty back buffer, so ratatui skips the
+/// blank cells and emits each word as its own run with a cursor move before
+/// it; a two-word label never arrives as one run of bytes.
+fn painted(pump: &mut crate::panel_raw_mode_pty_test::Pump<'_>, needle: &str, rows: usize) -> bool {
+    let deadline = Instant::now() + REACH_TIMEOUT;
+    loop {
+        pump.pump();
+        if erasing_grid(&pump.transcript, rows)
+            .iter()
+            .any(|row| row.contains(needle))
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What a `committed_frame*` child left on a 24x80 screen: the grid replayed
+/// with erases up to the child's `OUTCOME:` marker, the cursor at that point,
+/// and the whole byte stream for the failure message.
+struct Committed {
+    grid: Vec<String>,
+    open_grid: Vec<String>,
+    cursor: (usize, usize),
+    stream: String,
+}
+
+/// Drive one `committed_frame*` child. With `answer_queries`, every cursor
+/// report is answered truthfully from a replay of what the child painted
+/// (`Pump`), as a terminal would; without it the terminal stays silent, which
+/// is the fallback the arbiter must never guess through.
+fn drive_committed_frame(mode: &str, answer_queries: bool) -> Committed {
+    const ROWS: usize = 24;
+    let pty = Pty::open();
+    pty.resize(ROWS as u16, 80);
+    let mut child = spawn_child(&pty, mode);
+    let mut pump = crate::panel_raw_mode_pty_test::Pump::new(&pty, answer_queries, ROWS);
+    let mut open_grid = Vec::new();
+    let result = (|| -> Result<(), String> {
+        // The deny option, as the frame spells it: `[d]eny (default)`.
+        if !painted(&mut pump, "(default)", ROWS) {
+            return Err("the frame never painted its options".into());
+        }
+        open_grid = erasing_grid(&pump.transcript, ROWS);
+        // Enter takes the default (deny); the frame closes and the child
+        // commits the line this test is about.
+        pty.type_in("\r");
+        pump.until("OUTCOME:").ok_or("the frame never answered")?;
+        Ok(())
+    })();
+    let raw_after = pty.is_raw();
+    // Release the hold, whatever happened. The child is back in cooked mode
+    // by now, so its one-byte read needs a whole line.
+    pty.type_in("x\n");
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    pump.pump();
+    let stream = pump.transcript;
+    assert!(result.is_ok(), "{mode}: {result:?}; stream={stream:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{mode}: {status:?}; stream={stream:?}"
+    );
+    assert!(
+        !raw_after,
+        "{mode}: the terminal was left RAW; stream={stream:?}"
+    );
+    let before_outcome = stream.split("OUTCOME:").next().unwrap_or_default();
+    let (grid, cursor) = erasing_screen(before_outcome, ROWS);
+    Committed {
+        grid,
+        open_grid,
+        cursor,
+        stream,
+    }
+}
+
+/// The frame is gone from the replayed screen: none of its chrome or text.
+fn assert_frame_erased(mode: &str, c: &Committed) {
+    for needle in ["╭", "╰", "run_command", "(default)", "decision required"] {
+        assert!(
+            !c.grid.iter().any(|row| row.contains(needle)),
+            "{mode}: {needle:?} is still on screen after the frame closed: {:#?}\nstream={:?}",
+            c.grid,
+            c.stream
+        );
+    }
+}
+
+/// The committed line sits directly under the transcript's last row, and the
+/// cursor is on the row after it.
+fn assert_committed_under(mode: &str, c: &Committed, last: &str) {
+    let k = c
+        .grid
+        .iter()
+        .position(|row| row.trim_end() == last)
+        .unwrap_or_else(|| panic!("{mode}: {last} is not on screen: {:#?}", c.grid));
+    assert_eq!(
+        c.grid.get(k + 1).map(|row| row.trim_end()),
+        Some("COMMITTED-AFTER-FRAME"),
+        "{mode}: the line committed after the frame is not directly under \
+         {last}: {:#?}\nstream={:?}",
+        c.grid,
+        c.stream
+    );
+    assert_eq!(
+        c.cursor,
+        (k + 2, 0),
+        "{mode}: the cursor did not come back to the transcript: {:#?}",
+        c.grid
+    );
+}
+
+/// **Grounds `place_below_cursor`'s `a_frame_opens_on_the_cursor_row…` row
+/// against a real terminal.** The frame opens where the transcript ends, and
+/// when it closes the next committed line lands on the row the frame's top
+/// row was: no blank band, and nothing of the frame left.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn after_a_frame_the_next_line_prints_directly_under_the_transcript() {
+    let c = drive_committed_frame("committed_frame", true);
+    assert_committed_under("committed_frame", &c, "TRANSCRIPT-04");
+    assert_frame_erased("committed_frame", &c);
+    assert!(
+        c.grid[6..].iter().all(|row| row.is_empty()),
+        "rows under the committed line are not blank: {:#?}",
+        c.grid
+    );
+}
+
+/// #2800: grounds the pure partial-row erase test in the real frame lifecycle.
+/// The sentinel has no newline: it must survive both opening and closing,
+/// including deficit scrolling, and subsequent output must append to it.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_partial_transcript_line_survives_opening_and_closing_a_frame() {
+    for mode in ["committed_frame_partial", "committed_frame_partial_scroll"] {
+        let c = drive_committed_frame(mode, true);
+        assert!(
+            c.open_grid
+                .iter()
+                .any(|row| row.trim_end() == "PARTIAL-END"),
+            "{mode}: opening erased the partial line: {:#?}; stream={:?}",
+            c.open_grid,
+            c.stream
+        );
+        let row = c
+            .grid
+            .iter()
+            .position(|row| row.trim_end() == "PARTIAL-ENDCOMMITTED-AFTER-FRAME")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{mode}: closing lost the line or its return column: {:#?}; stream={:?}",
+                    c.grid, c.stream
+                )
+            });
+        assert_eq!(c.cursor, (row + 1, 0));
+        assert_frame_erased(mode, &c);
+    }
+}
+
+/// **The operator's report (2026-10-06/07), reproduced.** Something holds
+/// the bottom rows, so a bottom-anchored lease was shifted above it and the
+/// frame was PARKED rows below the transcript; the next committed line used
+/// to land there, under a band of blank rows. With the arbiter placing the
+/// rows under the transcript the holder is left alone and the line lands
+/// where it belongs. Grounds `a_holder_below_a_frame_that_fits_is_not_a_
+/// collision`.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn after_a_frame_beside_a_row_holder_the_next_line_prints_under_the_transcript() {
+    let c = drive_committed_frame("committed_frame_held", true);
+    assert_committed_under("committed_frame_held", &c, "TRANSCRIPT-04");
+    assert_frame_erased("committed_frame_held", &c);
+    for r in 0..usize::from(FRAME_HOLDER_ROWS) {
+        assert!(
+            c.grid[21 + r].contains(&format!("{FRAME_HOLDER_SENTINEL}-{r}")),
+            "holder row {r} was erased or overwritten: {:#?}\nstream={:?}",
+            c.grid,
+            c.stream
+        );
+    }
+}
+
+/// **A frame that does not fit scrolls the transcript, not the other way
+/// round.** With the cursor near the bottom the arbiter scrolls the
+/// transcript up by exactly the deficit; the committed line still sits under
+/// its last row. Grounds `a_frame_that_runs_off_the_bottom_scrolls_the_
+/// transcript_by_the_deficit`.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_frame_near_the_bottom_scrolls_the_transcript_and_the_next_line_follows_it() {
+    let c = drive_committed_frame("committed_frame_scroll", true);
+    assert_committed_under("committed_frame_scroll", &c, "TRANSCRIPT-21");
+    assert_frame_erased("committed_frame_scroll", &c);
+    assert!(
+        !c.grid.iter().any(|row| row.contains("TRANSCRIPT-00")),
+        "the frame could not have fit without scrolling, yet row 0 is still \
+         there: {:#?}",
+        c.grid
+    );
+}
+
+/// **Contested rows: the frame shifts above the holder, the cursor still
+/// comes back.** The transcript's tail is under the frame (that is what a
+/// shift costs, and what the pre-arbiter frame did too), the holder's rows
+/// are untouched, and the committed line lands where the cursor was. Grounds
+/// `contested_rows_follow_the_policy_and_a_shift_still_returns_the_cursor`.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_frame_shifted_above_a_holder_still_returns_the_cursor_to_the_transcript() {
+    let c = drive_committed_frame("committed_frame_contested", true);
+    assert_eq!(
+        c.grid[18].trim_end(),
+        "COMMITTED-AFTER-FRAME",
+        "the committed line is not on the cursor's row: {:#?}\nstream={:?}",
+        c.grid,
+        c.stream
+    );
+    assert_eq!(c.cursor, (19, 0), "{:#?}", c.grid);
+    assert_frame_erased("committed_frame_contested", &c);
+    for r in 0..usize::from(FRAME_HOLDER_ROWS) {
+        assert!(
+            c.grid[21 + r].contains(&format!("{FRAME_HOLDER_SENTINEL}-{r}")),
+            "holder row {r} was erased or overwritten: {:#?}",
+            c.grid
+        );
+    }
+}
+
+/// **A silent terminal gets no guess.** When nothing answers the cursor query
+/// the arbiter declines, the frame opens on a bottom-anchored lease as it
+/// always did, still answers, and still hands the terminal back. Where the
+/// committed line lands is NOT asserted: that is the pre-arbiter behaviour,
+/// kept rather than replaced by an invented row.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_terminal_that_does_not_report_the_cursor_still_gets_a_frame_and_no_guess() {
+    let c = drive_committed_frame("committed_frame", false);
+    assert!(
+        c.grid
+            .iter()
+            .any(|row| row.trim_end() == "COMMITTED-AFTER-FRAME"),
+        "{:#?}",
+        c.grid
+    );
+    assert_frame_erased("committed_frame/silent", &c);
 }
 
 /// Drive the active-turn lifecycle: spinner up, then the frame opens over it.

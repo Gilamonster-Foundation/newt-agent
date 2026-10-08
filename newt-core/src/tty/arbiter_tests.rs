@@ -704,6 +704,179 @@ fn an_inner_region_returns_without_disturbing_the_outer_one() {
     drop(reclaimed);
 }
 
+// ---- rows under the transcript: the placement rule, pure --------------
+
+fn place(
+    cursor: (u16, u16),
+    height: u16,
+    held: &[Region],
+    policy: OnCollision,
+) -> Option<Placement> {
+    let held: Vec<(u64, Region)> = held
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (i as u64 + 1, *r))
+        .collect();
+    place_below_cursor(cursor, 24, height, &held, policy)
+}
+
+fn placed(top: u16, height: u16, scroll: u16, return_to: (u16, u16)) -> Option<Placement> {
+    Some(Placement {
+        top,
+        height,
+        scroll,
+        return_to,
+    })
+}
+
+/// At column zero the frame opens on the cursor's row and returns there, so
+/// the next committed line lands directly under the transcript. The partial
+/// row case is tested separately below. The real-terminal half is `newt-tui`'s
+/// `interaction_view_pty_test` (`after_a_frame_…`).
+#[test]
+fn a_frame_opens_on_the_cursor_row_and_returns_the_cursor_there() {
+    assert_eq!(
+        place((0, 5), 6, &[], OnCollision::Shift),
+        placed(5, 6, 0, (0, 5))
+    );
+}
+
+/// #2800: a non-newline-terminated transcript must never be in the erase band.
+/// Byte assertions ground the geometry in the actual per-row erase writer.
+#[test]
+fn a_partial_transcript_row_survives_frame_erasure() {
+    for (cursor, expected) in [
+        ((11, 5), placed(6, 6, 0, (11, 5))),
+        ((11, 20), placed(18, 6, 3, (11, 17))),
+        ((11, 23), placed(18, 6, 6, (11, 17))),
+    ] {
+        let actual = place(cursor, 6, &[], OnCollision::Refuse).expect("placement");
+        let expected = expected.unwrap();
+        // Windows may execute these commands through the console API instead
+        // of writing ANSI to a byte sink. Geometry is checked on every target.
+        #[cfg(not(windows))]
+        {
+            let mut bytes = Vec::new();
+            blank_rows(
+                &mut super::LineWriter(&mut bytes),
+                actual.top,
+                actual.height,
+            )
+            .unwrap();
+            let expected_bytes: String = (expected.top..expected.top + expected.height)
+                .map(|row| format!("\x1b[{};1H\x1b[2K", row + 1))
+                .collect();
+            assert_eq!(
+                bytes,
+                expected_bytes.as_bytes(),
+                "cursor {cursor:?}: erase must start below committed text"
+            );
+            assert!(
+                !String::from_utf8(bytes)
+                    .unwrap()
+                    .contains(&format!("\x1b[{};1H\x1b[2K", actual.return_to.1 + 1)),
+                "the return row must not be erased on open or close"
+            );
+        }
+        assert_eq!(actual, expected);
+    }
+}
+
+/// #2800: reserve the partial transcript row even for oversized frame requests.
+#[test]
+fn a_partial_row_limits_the_frame_to_the_remaining_screen() {
+    assert_eq!(
+        place((11, 5), 40, &[], OnCollision::Shift),
+        placed(1, 23, 5, (11, 0))
+    );
+    assert_eq!(
+        place_below_cursor((11, 0), 1, 1, &[], OnCollision::Refuse),
+        None
+    );
+}
+
+#[test]
+fn a_frame_that_runs_off_the_bottom_scrolls_the_transcript_by_the_deficit() {
+    // Cursor on row 20 of 24, six rows wanted: two short.
+    assert_eq!(
+        place((0, 20), 6, &[], OnCollision::Shift),
+        placed(18, 6, 2, (0, 18))
+    );
+    // Exactly fits: no scroll.
+    assert_eq!(
+        place((0, 18), 6, &[], OnCollision::Shift),
+        placed(18, 6, 0, (0, 18))
+    );
+}
+
+#[test]
+fn a_frame_taller_than_the_screen_is_clamped_to_it() {
+    assert_eq!(
+        place((0, 5), 40, &[], OnCollision::Shift),
+        placed(0, 24, 5, (0, 0))
+    );
+    assert_eq!(
+        place((0, 5), 0, &[], OnCollision::Shift),
+        placed(5, 1, 0, (0, 5))
+    );
+}
+
+/// A holder below the frame — the prompt editor on the bottom rows — is left
+/// alone when the frame fits above it, whatever the policy.
+#[test]
+fn a_holder_below_a_frame_that_fits_is_not_a_collision() {
+    let prompt = [rows(21, 3)];
+    for policy in [
+        OnCollision::Refuse,
+        OnCollision::Shift,
+        OnCollision::SuspendHolder,
+    ] {
+        assert_eq!(
+            place((0, 5), 6, &prompt, policy),
+            placed(5, 6, 0, (0, 5)),
+            "{policy:?}"
+        );
+    }
+}
+
+/// Contested rows — the frame would land on a holder, or would have to
+/// scroll one — follow the declared policy, and a shift keeps the cursor's
+/// return where it was: the shift is about where the FRAME goes.
+#[test]
+fn contested_rows_follow_the_policy_and_a_shift_still_returns_the_cursor() {
+    let prompt = [rows(21, 3)];
+    // Lands on the holder.
+    assert_eq!(place((0, 18), 6, &prompt, OnCollision::Refuse), None);
+    assert_eq!(
+        place((0, 18), 6, &prompt, OnCollision::SuspendHolder),
+        placed(18, 6, 0, (0, 18))
+    );
+    assert_eq!(
+        place((0, 18), 6, &prompt, OnCollision::Shift),
+        placed(15, 6, 0, (0, 18))
+    );
+    // Would scroll the holder: contested even though no row overlaps.
+    let above = [rows(0, 4)];
+    assert_eq!(place((0, 20), 6, &above, OnCollision::Refuse), None);
+    assert_eq!(
+        place((0, 20), 6, &above, OnCollision::Shift),
+        placed(18, 6, 0, (0, 20))
+    );
+    // Nowhere to shift to.
+    assert_eq!(place((0, 18), 6, &[rows(0, 24)], OnCollision::Shift), None);
+}
+
+#[test]
+fn the_whole_screen_refuses_every_placement_but_a_declared_take() {
+    let screen = [Region::WholeScreen];
+    assert_eq!(place((0, 5), 6, &screen, OnCollision::Refuse), None);
+    assert_eq!(place((0, 5), 6, &screen, OnCollision::Shift), None);
+    assert_eq!(
+        place((0, 5), 6, &screen, OnCollision::SuspendHolder),
+        placed(5, 6, 0, (0, 5))
+    );
+}
+
 /// **#2027 (red-first): #2019's shape, at the arbiter.**
 ///
 /// `/settings` acquired its own prompt window while the cockpit had an
