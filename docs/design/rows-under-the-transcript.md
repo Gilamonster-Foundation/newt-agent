@@ -144,3 +144,11 @@ does not schedule a late frame over that output.
 not make a cursor-relative clear-to-screen-end bounded by the leased rows.
 The cockpit presenter is unchanged: it owns its pty and its block's top row
 already is the transcript's end.
+
+A grant must fit the complete live frame plus its blank parking row. The
+partial-transcript rule can clamp a full-screen expanded request by one row;
+the live painter declines that grant before emitting any scroll or paint bytes.
+It leaves no frame to erase on finish or abandon and does not schedule a
+placement retry for that undersized grant. Collapsing the view can fit again.
+This reuses the no-frame fallback instead of introducing a second layout pass
+that would have to keep plain and styled file-change rows in agreement.
