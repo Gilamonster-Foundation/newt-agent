@@ -304,6 +304,7 @@ async fn yolo_exec_never_prompts_but_fs_prompting_still_works() {
     // record count IS the prompt count — zero after the exec call proves
     // the gate was never reached.
     let mut gate = PromptPermissionGate {
+        pending_command_retries: Default::default(),
         ask_surface: None,
         #[cfg(feature = "rich-tui")]
         open_panel: None,
@@ -363,6 +364,7 @@ async fn yolo_exec_never_prompts_but_fs_prompting_still_works() {
     // fs prompting is unaffected: an out-of-fence read consults the gate
     // and the allow-once answer turns the denial into the real contents.
     let mut gate = PromptPermissionGate {
+        pending_command_retries: Default::default(),
         ask_surface: None,
         #[cfg(feature = "rich-tui")]
         open_panel: None,
