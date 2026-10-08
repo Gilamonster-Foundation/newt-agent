@@ -78,6 +78,48 @@ pub(super) fn apply_responses(
     Ok(cap)
 }
 
+/// A provider's explicit output-cap termination is not a usable completion.
+pub(super) fn output_limited(json: &Value) -> bool {
+    json["error"].is_null()
+        && (json["choices"][0]["finish_reason"] == "length"
+            || (json["status"] == "incomplete"
+                && json["incomplete_details"]["reason"] == "max_output_tokens"))
+}
+
+/// Retain only visible assistant prose; never parse or recover capped tool calls.
+pub(super) fn partial_responses_text(json: &Value) -> String {
+    let text = json["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item["type"] == "message" && (item["role"].is_null() || item["role"] == "assistant")
+        })
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "output_text")
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        json["output_text"].as_str().unwrap_or_default().to_string()
+    } else {
+        text
+    }
+}
+
+pub(super) fn output_limit_notice(text: String, usage: Option<crate::TokenUsage>) -> String {
+    let count = usage.map_or_else(
+        || "token usage unavailable".to_string(),
+        |usage| format!("{} generated tokens", usage.output_tokens),
+    );
+    let notice = format!("(model output limit reached; response truncated; {count}. No tool calls from this response were executed. Continuation requires a new operator request.)");
+    if text.is_empty() {
+        notice
+    } else {
+        format!("{notice}\n\n{text}")
+    }
+}
+
 /// An ephemeral transport deadline, never persisted or used as identity.
 #[derive(Clone, Copy)]
 struct Deadline(tokio::time::Instant);
