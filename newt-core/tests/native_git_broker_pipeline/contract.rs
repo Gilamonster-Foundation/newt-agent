@@ -1,14 +1,17 @@
 //! Production Brush counterpart of the libtest command-shape/adoption rows.
 //! Grounds session binding, kernel ref protection, and governed publication.
-//! `--require-2818` runs the positive commit/ref publication row pending PR #2818.
+//! `--publication` runs the positive commit/ref publication row (PR #2818 integrated).
 #[path = "contract_chat.rs"]
 mod chat;
+#[path = "contract_diagnostics.rs"]
+mod diagnostics;
 
 use super::native::{real_git, real_git_output, TrailerGitTool};
 use newt_core::{worktree_adoption::WorktreeSession, Caveats, Scope};
 use std::path::{Path, PathBuf};
 
 pub fn run() {
+    diagnostics::regression();
     let home = tempfile::tempdir().unwrap();
     // Set environment before starting any worker/runtime; never use operator config.
     for key in [
@@ -63,7 +66,7 @@ pub fn run() {
         .build()
         .unwrap()
         .block_on(async {
-            if std::env::args().any(|arg| arg == "--require-2818") {
+            if std::env::args().any(|arg| arg == "--publication") {
                 governed_publication().await;
             } else {
                 for wrapper in [false, true] {
@@ -295,14 +298,11 @@ async fn governed_publication() {
         &session,
         &main,
         &caveats,
-        "git add payload && git commit -m contract",
+        "git add payload && git commit -m contract && printf 'CONTRACT_COMMIT_COMPLETED\\n'",
     )
     .await;
     let new = real_git_output(&task, &["rev-parse", "HEAD"]);
-    assert_ne!(
-        old, new,
-        "NEEDS PR #2818: governed commit/publication failed: {out}"
-    );
+    assert_ne!(old, new, "governed commit/publication failed: {out}");
     assert!(
         real_git_output(&task, &["log", "-1", "--format=%B"])
             .contains("native-git-broker-pipeline-fixture"),
@@ -324,11 +324,14 @@ async fn governed_publication() {
     // #2813: ref movement alone is insufficient: Git can publish the commit
     // and still fail its AUTO_MERGE cleanup against shared packed refs.
     assert!(
-        !out.contains("packed-refs.lock")
-            && !out.contains("Operation not permitted")
-            && !out.contains("Permission denied")
-            && !out.contains("error:"),
-        "NEEDS PR #2818: governed commit cleanup failed after publication: {out}"
+        diagnostics::clean(&out),
+        "governed commit cleanup failed after publication: {out}"
     );
+    assert!(
+        out.lines().any(|line| line == "CONTRACT_COMMIT_COMPLETED"),
+        "governed command did not complete: {out}"
+    );
+    // Preserve every cache diagnostic next to verified completion/outcomes.
+    println!("{out}");
     println!("PASS governed_commit_and_task_ref_publication");
 }
