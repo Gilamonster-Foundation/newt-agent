@@ -4753,3 +4753,7 @@ fn cold_cache_fetch_cannot_bypass_denial_or_ceiling() {
         assert_eq!(gate.base, base);
     }
 }
+
+#[cfg(unix)]
+#[path = "exec_grant_retry.rs"]
+mod exec_grant_retry;
