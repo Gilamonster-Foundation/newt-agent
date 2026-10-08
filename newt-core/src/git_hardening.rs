@@ -709,7 +709,7 @@ pub(crate) fn publish_detached_head(
         Path::new("HEAD"),
         &format!("{new}\n"),
         Some(old),
-        Some((admin, verified_reflog_entry)),
+        Some(verified_reflog_entry),
     )
 }
 
@@ -719,7 +719,7 @@ fn write_lockfile_checked(
     rel: &Path,
     content: &str,
     expected: Option<&str>,
-    head_reflog: Option<(&agent_bridle_fdguard::GrantedRoot, &str)>,
+    head_reflog: Option<&str>,
 ) -> Result<(), String> {
     use std::io::{Read as _, Write as _};
     let lock_rel = lock_path(rel);
@@ -751,10 +751,10 @@ fn write_lockfile_checked(
     // Keep HEAD.lock through both writes. A failed CAS appends nothing; a
     // failed log append leaves HEAD unchanged. The admin handle is the SAME
     // object as workspace (dup above), with no shared-log authority added.
-    if let Some((admin, entry)) = head_reflog {
+    if let Some(entry) = head_reflog {
         let appended = workspace
             .create_dir_all(Path::new("logs"))
-            .and_then(|()| admin.open_write(Path::new("logs/HEAD"), true))
+            .and_then(|()| workspace.append_regular(Path::new("logs/HEAD")))
             .and_then(|mut log| {
                 log.write_all(entry.as_bytes())
                     .and_then(|()| log.sync_all())

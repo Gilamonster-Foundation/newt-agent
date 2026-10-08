@@ -18,6 +18,9 @@ impl CommitView {
     pub fn publish(&self, old: &str, new: &str, verified_commit: &[u8]) -> Result<(), String> {
         // Derive the entry only from the policy-verified object, never from
         // logs/HEAD in the child-writable view. Preserve its committer/date.
+        if verified_commit.contains(&0) {
+            return Err("commit contains embedded NUL".into());
+        }
         let commit = std::str::from_utf8(verified_commit).map_err(|e| e.to_string())?;
         let (headers, message) = commit.split_once("\n\n").ok_or("commit lacks message")?;
         let mut committers = headers
@@ -197,6 +200,42 @@ fn seed(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    /// #2813 / PR #2818 round 4: formatter rejection must be local, even if
+    /// native Git already rejects NUL messages before calling the publisher.
+    #[test]
+    fn private_commit_formatter_refuses_nul_with_regular_control() {
+        for message in [
+            "subject\0injection",
+            "subject\n\nbody\0injection",
+            "normal subject",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let old = "1".repeat(40);
+            let new = "2".repeat(40);
+            std::fs::write(directory.path().join("HEAD"), &old).unwrap();
+            let admin = agent_bridle_fdguard::GrantedRoot::acquire(
+                &directory.path().canonicalize().unwrap(),
+            )
+            .unwrap();
+            let view = CommitView { directory, admin };
+            let commit = format!("tree {}\nparent {old}\nauthor Fixture <fixture@example.test> 1 +0000\ncommitter Fixture <fixture@example.test> 1 +0000\n\n{message}\n", "3".repeat(40));
+            let result = view.publish(&old, &new, commit.as_bytes());
+            if message.contains('\0') {
+                assert!(result.is_err(), "formatter accepted embedded NUL");
+                assert_eq!(
+                    std::fs::read_to_string(view.directory.path().join("HEAD")).unwrap(),
+                    old
+                );
+                assert!(!view.directory.path().join("logs/HEAD").exists());
+                assert!(!view.directory.path().join("HEAD.lock").exists());
+            } else {
+                result.unwrap();
+                assert_eq!(std::fs::read_to_string(view.directory.path().join("logs/HEAD")).unwrap(),
+                    format!("{old} {new} Fixture <fixture@example.test> 1 +0000\tcommit: normal subject\n"));
+            }
+        }
+    }
 
     /// #2813: an earlier child may replace the view pathname while the broker
     /// prepares it. Host writes must stay in the held directory, not the link.

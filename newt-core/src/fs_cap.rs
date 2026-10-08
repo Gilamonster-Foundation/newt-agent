@@ -188,6 +188,24 @@ impl WorkspaceDir {
         Ok(file)
     }
 
+    /// Append only to a regular file beneath the held root. Nonblocking open
+    /// refuses a readerless FIFO; descriptor validation also rejects a FIFO
+    /// with a reader, before any bytes are written. Never follow the final link.
+    pub(crate) fn append_regular(&self, rel: &Path) -> io::Result<File> {
+        let file = File::from(self.resolve(
+            rel,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::from_raw_mode(0o644),
+        )?);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
     /// Read a granted regular file, including a grant naming the file itself.
     /// An exact grant exposes only its basename, never the parent capability;
     /// following a final link would grant a different object, even next door.
