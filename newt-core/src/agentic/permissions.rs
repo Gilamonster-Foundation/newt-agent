@@ -346,6 +346,20 @@ pub trait PermissionGate {
     /// no-op: gates with no such queue have nothing to hold.
     fn queue_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
 
+    /// Hold an approved exec denial for this exact command and working directory.
+    /// Interpreters cannot be projected by shell inspection. Binding the invocation
+    /// lets its explicit retry use exact granted paths without replaying effects.
+    fn queue_command_retry(&mut self, _command: &str, _cwd: &str, requests: &[PermissionRequest]) {
+        for request in requests {
+            self.queue_pending_once(request.kind, &request.target);
+        }
+    }
+
+    /// Consume a matching invocation-bound grant without creating standing authority.
+    fn apply_command_retry(&mut self, _command: &str, _cwd: &str, base: &Caveats) -> Caveats {
+        base.clone()
+    }
+
     /// #2691 round 3 (P2): called BEFORE a dispatch runs (`shell.rs`,
     /// `exec_confined_command_with_broker`'s top), once per exec target the
     /// about-to-run command statically needs. When `(kind, target)` is
