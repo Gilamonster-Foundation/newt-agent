@@ -1,4 +1,4 @@
-The refactor is finished and committed in the worktree newt-agent-refactor-lab-refactor on branch step-01-refactor-agentic-mod:
+The refactor is finished and committed in the worktree refactor-lab on branch step-01-refactor-agentic-mod:
 
 • mod.rs: ~11,726 lines → 856 lines (92% reduction)
 • 8 new submodules (agent_loop, tool_recovery, nudge, hallucination, compress, metrics, util, budget), each under ~1,000 lines, wired back via mod + pub use
