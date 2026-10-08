@@ -141,9 +141,47 @@ pub fn core_recover_overflow(
     Some(derived.min(u32::MAX as u64) as u32)
 }
 
+/// Compose a proposed recovery input cap with the refused request and the
+/// already-output-reserved input ceiling shared by all provider paths.
+pub(super) fn recovery_target(
+    proposed: usize,
+    refused: usize,
+    input_ceiling: Option<usize>,
+) -> Option<usize> {
+    // The proposed cap already reserves output against any newly learned
+    // server window. Leave at least one token below it and the existing input
+    // ceiling; a floor must never raise a rejected request's target.
+    let ceiling = input_ceiling
+        .map_or(proposed, |ceiling| proposed.min(ceiling))
+        .min(refused);
+    ceiling.checked_sub(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The observed refusal was ~80,039 tokens while the stale configured
+    /// budget produced an 83,885-token target. Recovery must shrink the request,
+    /// including when a known window leaves less room after reserving output.
+    #[test]
+    fn recovery_target_is_below_refused_request_and_reserved_window() {
+        for (proposed, refused, ceiling) in [
+            (83_885, 80_039, Some(104_857)),
+            (100_000, 80_039, Some(65_536)),
+            (100_000, 80_039, None),
+            (1_024, 100, Some(1_024)),
+            (1, 1, Some(1)),
+            (usize::MAX, usize::MAX, Some(usize::MAX)),
+        ] {
+            let target = recovery_target(proposed, refused, ceiling).unwrap();
+            assert!(target < refused, "{target} >= refused {refused}");
+            assert!(ceiling.is_none_or(|ceiling| target < ceiling));
+            assert!(target <= proposed);
+        }
+        assert_eq!(recovery_target(0, 80_039, Some(0)), None);
+        assert_eq!(recovery_target(83_885, 0, None), None);
+    }
 
     #[test]
     fn detects_llamacpp_numberless_overflow() {
