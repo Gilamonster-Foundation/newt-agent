@@ -197,12 +197,14 @@ also have independent output and total-duration limits:
 - `NEWT_GENERATION_TIMEOUT_SECS` (positive integer, default **900**) bounds each
   attempt from sending the request through reading its final body byte, including
   header latency. Receiving bytes resets the idle timer, never this timer.
-- `NEWT_GENERATION_REPEAT_LIMIT` (default **8**, 0 or 1 disables detection) stops
-  a Chat SSE stream whose text suffix repeats a 64–256-byte block that many times.
+- `NEWT_GENERATION_REPEAT_LIMIT` is **off by default**. Set an integer of at
+  least 2 (for example, 8) to opt in to stopping a Chat SSE stream whose text
+  suffix repeats a 64–256-byte block that many times. Unset, invalid, 0 and 1
+  settings leave detection disabled.
   Content and reasoning deltas count; SSE scaffolding and tool arguments do not.
-  This conservative heuristic can stop intentionally repetitive output; raise
-  the limit or disable it for those workloads. It does not inspect non-streamed
-  JSON Responses output.
+  This heuristic can stop intentionally repetitive output; enable it only when
+  that tradeoff is acceptable. The output cap and total deadline remain the hard
+  bounds. It does not inspect non-streamed JSON Responses output.
 
 Invalid or zero maximum/timeout settings use the defaults. Chat-compatible
 servers receive `max_tokens`; first-party OpenAI receives
@@ -219,3 +221,15 @@ reported usage is retained. The notice gives the reported output-token count
 when present, otherwise says the count is unavailable rather than treating bytes
 as tokens. Summary fallbacks retain the notice with captured progress. Closing
 the client response does not guarantee immediate server-side slot reclamation.
+
+Provider-reported output exhaustion (`finish_reason: length` on Chat, or Responses
+`status: incomplete` with `incomplete_details.reason: max_output_tokens`) stops
+the turn before tool recovery, argument validation, completion classification or
+dispatch. Newt retains reported usage and visible partial prose with an explicit
+truncation notice. No tool from that response runs, even if another call in the
+same batch has complete arguments. The same notice and usage retention apply to
+tools-disabled summaries. The primary turn is marked failed, not completed.
+There is no automatic repair, continuation or thinking-off re-ask after this
+hard stop: endpoint continuation declarations and the legacy `overflow_retry`
+preference do not override it. The operator may issue a new request to continue,
+reduce the requested output, or explicitly change the configured cap.
