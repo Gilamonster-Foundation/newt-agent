@@ -139,19 +139,19 @@ fn stopped(reason: &str, bytes: usize, class: ErrorClass) -> anyhow::Error {
 }
 
 /// Start the clock at the actual send, including headers, not after first output.
-pub(super) async fn execute(
-    client: &reqwest::Client,
+pub(super) fn execute<'a>(
+    client: &'a reqwest::Client,
     request: reqwest::Request,
-    failure: &str,
-) -> anyhow::Result<reqwest::Response> {
-    // Keep the guard future off the already-large agent-loop stack.
+    failure: &'a str,
+) -> impl std::future::Future<Output = anyhow::Result<reqwest::Response>> + 'a {
+    // Return the box directly: an async wrapper would retain another request
+    // slot in every enclosing attempt/provider future (#2824).
     Box::pin(execute_with_duration(
         client,
         request,
         failure,
         total_duration(),
     ))
-    .await
 }
 
 async fn execute_with_duration(
@@ -184,7 +184,18 @@ async fn execute_with_duration(
 }
 
 /// Read while preserving partial bytes and dropping the response on either bound.
-pub(super) async fn read(
+pub(super) fn read(
+    response: reqwest::Response,
+    bytes: &mut Vec<u8>,
+) -> impl std::future::Future<Output = anyhow::Result<Option<reqwest::Error>>> + '_ {
+    // #2824: the timeout and checked-reader state otherwise propagates through
+    // every provider/retry/cancellation future and overflows coverage stacks.
+    // Keep response ownership inside the box: dropping the caller still cancels
+    // the read, while the borrowed buffer retains bytes already received.
+    Box::pin(read_bounded(response, bytes))
+}
+
+async fn read_bounded(
     response: reqwest::Response,
     bytes: &mut Vec<u8>,
 ) -> anyhow::Result<Option<reqwest::Error>> {
@@ -221,6 +232,18 @@ pub(super) fn append_notice(text: &mut String, error: &anyhow::Error) {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    /// #2824: deadline/repetition state must not inflate every provider caller.
+    #[test]
+    fn bounds_2824_read_future_keeps_transport_state_off_caller_stack() {
+        fn returned_size<T, F>(_: impl FnOnce(T) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let mut bytes = Vec::new();
+        let size = returned_size(|response| read(response, &mut bytes));
+        eprintln!("bounded reader future: {size} bytes");
+        assert!(size <= 512, "bounded reader future occupies {size} bytes");
+    }
 
     /// #2782: an injected total bound includes the wait for response headers.
     #[tokio::test]
