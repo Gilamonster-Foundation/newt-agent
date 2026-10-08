@@ -414,9 +414,9 @@ struct PlanApprovalEffects {
 /// #2424: ask the human and turn the verdict into effects. Approval lifts the
 /// clamp and seeds implementation from the snapshot that was PRESENTED under
 /// this objective (consumed, so one "yes" seeds one turn); a discussion
-/// answer queues as operator-authored text; everything else — reject, empty,
+/// answer queues as operator-authored text; a blank submission approves. Reject,
 /// cancel, no gate, no operator, closed input — leaves the clamp in place and
-/// queues nothing. No gate outcome other than an explicit answer can widen
+/// queues nothing. No gate outcome other than a submitted answer can widen
 /// what the model may do.
 fn run_plan_approval(
     gate: Option<&mut dyn newt_core::agentic::PermissionGate>,
@@ -440,9 +440,9 @@ fn run_plan_approval(
     // their explicit act too: the question says so, and approval switches
     // the mode (design row 3).
     let question = match entry {
-        PlanEntry::OperatorSelected => "Approve this plan and switch to /mode dev? [y/N/discuss] ",
+        PlanEntry::OperatorSelected => "Approve this plan and switch to /mode dev? [Y/n/discuss] ",
         PlanEntry::ModelDuringAct | PlanEntry::IntakeInferred => {
-            "Approve this plan? [y/N/discuss] "
+            "Approve this plan? [Y/n/discuss] "
         }
     };
     let verdict = if auto_approve {

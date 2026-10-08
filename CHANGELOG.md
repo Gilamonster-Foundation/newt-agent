@@ -9,6 +9,12 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — plan approval defaults to yes
+
+- Plan approval offers yes, no, then discuss, with `[Y/n/discuss]` guidance.
+  Submitting a blank answer approves the displayed plan. Cancellation, exit,
+  unavailable input, and closed or failed input keep the plan clamp in place.
+
 ### Fixed — the line after a permission frame, a clarification frame or a panel prints directly under the transcript
 
 - A frame that was shifted above something holding the bottom rows used to
