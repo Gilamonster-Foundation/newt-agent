@@ -1307,3 +1307,158 @@ fn prewarm_applies_is_url_equality_modulo_trailing_slash() {
         "http://other:11434"
     ));
 }
+
+/// #2248: endpoint + model + OpenAI kind must discover the served window
+/// without engine/serving hints, and a learned input floor cannot shrink it.
+#[serial_test::serial(real_fs)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_2248_minimal_openai_props_reaches_the_dispatch_budget() {
+    let _pin = ConfigDirPin::new();
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let model = "example/model:Q8_0";
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": model}, {"id": "other-model"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .and(query_param("model", model))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "default_generation_settings": {"n_ctx": 131072}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut choice = BackendChoice::synthesized(
+        "minimal",
+        server.uri(),
+        newt_core::BackendKind::Openai,
+        Some(model.into()),
+    );
+    choice.declared_model = Some(model.into());
+    choice.configured_kind = Some(newt_core::BackendKind::Openai);
+    choice.api_needs_probe = true;
+    assert!(choice.route_serving().is_none());
+    let _ = adopt_backend_choice(&mut choice, None);
+    assert_eq!(choice.active_model.as_deref(), Some(model));
+    assert_eq!(choice.context_window, Some(131072));
+    let cached = crate::probe::CapabilityEntry {
+        max_ok_input: Some(24646),
+        safe_context: Some(24646),
+        ..Default::default()
+    };
+    let cfg = newt_core::Config::default();
+    let community = newt_core::tuning::CommunityTunings::default();
+    let resolved = crate::context_window::resolve(crate::context_window::facts_for(
+        &cfg,
+        choice.kind,
+        model,
+        choice.context_window,
+        &cached,
+        &community,
+        None,
+        None,
+    ));
+    assert_eq!(resolved.full_window, Some(131072));
+    assert_eq!(resolved.safe_context, Some(104857));
+    let budget = newt_core::agentic::initial_context_input_budget(
+        choice.kind,
+        choice.api,
+        resolved.num_ctx,
+        80,
+        None,
+        None,
+        Default::default(),
+        Default::default(),
+        resolved.max_ok_input,
+        resolved.safe_context,
+    );
+    assert_eq!(
+        budget,
+        Some(104857),
+        "learned 24646 must not cap the probed window"
+    );
+}
+
+/// #2248/#2815: requested launch capacity is not the effective served slot.
+#[serial_test::serial(real_fs)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_2248_effective_props_overrides_requested_launch_budget() {
+    let _pin = ConfigDirPin::new();
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let model = "example/model:Q8_0";
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": model, "status": {"value": "loaded",
+                "args": ["llama-server", "-c", "262144", "-np", "2"]}},
+                {"id": "other-model"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .and(query_param("model", model))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "default_generation_settings": {"n_ctx": 65536}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut choice = BackendChoice::synthesized(
+        "minimal",
+        server.uri(),
+        newt_core::BackendKind::Openai,
+        Some(model.into()),
+    );
+    choice.declared_model = Some(model.into());
+    choice.configured_kind = Some(newt_core::BackendKind::Openai);
+    choice.api_needs_probe = true;
+    assert!(choice.route_serving().is_none());
+    let _ = adopt_backend_choice(&mut choice, None);
+    assert_eq!(choice.active_model.as_deref(), Some(model));
+    assert_eq!(choice.context_window, Some(65536));
+    let cached = crate::probe::CapabilityEntry {
+        max_ok_input: Some(24646),
+        safe_context: Some(24646),
+        ..Default::default()
+    };
+    let cfg = newt_core::Config::default();
+    let community = newt_core::tuning::CommunityTunings::default();
+    let resolved = crate::context_window::resolve(crate::context_window::facts_for(
+        &cfg,
+        choice.kind,
+        model,
+        choice.context_window,
+        &cached,
+        &community,
+        None,
+        None,
+    ));
+    assert_eq!(resolved.full_window, Some(65536));
+    assert_eq!(resolved.safe_context, Some(52428));
+    let budget = newt_core::agentic::initial_context_input_budget(
+        choice.kind,
+        choice.api,
+        resolved.num_ctx,
+        80,
+        None,
+        None,
+        Default::default(),
+        Default::default(),
+        resolved.max_ok_input,
+        resolved.safe_context,
+    );
+    assert_eq!(
+        budget,
+        Some(52428),
+        "learned 24646 must not cap the probed window"
+    );
+}

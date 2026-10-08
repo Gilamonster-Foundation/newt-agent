@@ -42,6 +42,11 @@
 #     .github/workflows/ci.yml Windows job (actions/cache requires CI), and
 #     scripts/test_carried_cache.py in its lint job (workflow contract).
 #     Cache hits still pass through Install-CarriedTools.ps1 SHA256 verification.
+#   - macOS executable basename pins (PR #2816), newt-tui-pty.yml macOS job:
+#     installs gh when absent, stages a root-owned copy outside Homebrew,
+#     runs macos_exec_basenames explicitly with --ignored,
+#     and runs session_capability:: constructor tests. Requires native Seatbelt;
+#     portable trust regressions remain in the scoped Rust tests below.
 #   - packaged carried commands (#2776), .github/workflows/ci.yml Windows job:
 #     builds newt-carried-tools and the Brush runner, verifies pinned rg/BusyBox,
 #     stages only approved per-name executables, and runs scripts/windows/Test-CarriedTools.ps1 natively.

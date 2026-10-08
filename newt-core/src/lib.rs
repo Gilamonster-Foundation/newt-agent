@@ -339,3 +339,5 @@ pub use workspace_key::workspace_key_v2;
 
 /// Supervised ambient Windows interpreter.
 pub mod ambient_brush;
+
+pub mod exec_grants;
