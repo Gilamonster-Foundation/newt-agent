@@ -37,6 +37,7 @@ pub(crate) struct SessionCapability {
 
 impl SessionCapability {
     /// Establish the session capability from the configured policy + per-user key.
+    #[cfg(test)]
     pub(crate) fn establish(
         tui: Option<newt_core::TuiConfig>,
         key_path: Option<&std::path::Path>,
@@ -44,26 +45,44 @@ impl SessionCapability {
         delegation: Option<newt_identity::VerifiedDelegation>,
     ) -> Self {
         let policy = policy_for(tui, workspace);
-        Self::from_policy(policy, key_path, delegation)
+        Self::from_policy(policy, key_path, delegation, None)
     }
 
     /// Establish an operator-reviewed launch policy independently of mutable
     /// configuration. Saved profile edits are applied by a new process only.
+    #[cfg(test)]
     pub(crate) fn establish_frozen(
         policy: newt_core::Caveats,
         key_path: Option<&std::path::Path>,
         delegation: Option<newt_identity::VerifiedDelegation>,
     ) -> Self {
-        let mut session = Self::from_policy(policy, key_path, delegation);
+        let mut session = Self::from_policy(policy, key_path, delegation, None);
         session.frozen_at_launch = true;
         session
+    }
+
+    /// Saved approvals must participate in pin exclusions before signing.
+    /// They remain recalled grants, not additions to the signed base policy.
+    pub(crate) fn establish_launch(
+        policy: newt_core::Caveats,
+        key_path: Option<&std::path::Path>,
+        frozen: bool,
+        permissions: &crate::permissions::PermissionPromptState,
+    ) -> anyhow::Result<Self> {
+        let writes = permissions.recalled_caveats(&policy, None)?.fs_write;
+        let mut session = Self::from_policy(policy, key_path, None, Some(&writes));
+        session.frozen_at_launch = frozen;
+        Ok(session)
     }
 
     fn from_policy(
         policy: newt_core::Caveats,
         key_path: Option<&std::path::Path>,
         delegation: Option<newt_identity::VerifiedDelegation>,
+        effective_writes: Option<&newt_core::Scope<String>>,
     ) -> Self {
+        #[cfg(not(target_os = "macos"))]
+        let _ = effective_writes;
         // A delegated session inherits its ceiling; it does not establish one.
         //
         // `key_path` is deliberately still accepted and deliberately still
@@ -99,8 +118,8 @@ impl SessionCapability {
         let (policy, exec_pins, exec_notice) = {
             let mut policy = policy;
             let path = newt_core::exec_grants::dispatch_path();
-            let (pins, unresolved) =
-                newt_core::exec_grants::resolve_basenames(&mut policy, path.as_deref());
+            let writes = effective_writes.unwrap_or(&policy.fs_write).clone();
+            let (pins, unresolved) = pin_exec_policy(&mut policy, &writes, path.as_deref());
             let notice = (!unresolved.is_empty()).then(|| format!(
                 "Executable grants kept as basenames (not found or untrusted on PATH): {}. Confined execution may need an explicit trusted executable path.", unresolved.join(", ")));
             (policy, pins, notice)
@@ -222,7 +241,10 @@ mod macos_tests {
             net: newt_core::Scope::none(),
             ..newt_core::Caveats::top()
         };
-        let session = SessionCapability::establish_frozen(policy.clone(), Some(&key), None);
+        let permissions = crate::permissions::PermissionPromptState::default();
+        let session =
+            SessionCapability::establish_launch(policy.clone(), Some(&key), true, &permissions)
+                .unwrap();
         let newt_core::Scope::Only(grants) = &session.caveats().exec else {
             panic!("session must retain restricted exec");
         };
@@ -234,16 +256,113 @@ mod macos_tests {
         assert_eq!(session.caveats().fs_write, policy.fs_write);
         let signed = newt_identity::enforced_caveats(session.op.as_ref().unwrap()).unwrap();
         assert_eq!(signed.exec, session.caveats().exec);
+        let unrestricted_writes = newt_core::Caveats {
+            fs_write: newt_core::Scope::All,
+            ..policy.clone()
+        };
+        let mut session = SessionCapability::establish_launch(
+            unrestricted_writes.clone(),
+            None,
+            true,
+            &permissions,
+        )
+        .unwrap();
+        assert_eq!(session.caveats(), &unrestricted_writes);
+        assert!(session.take_exec_notice().unwrap().contains("echo"));
+        assert!(session.take_exec_notice().is_none());
         let missing = newt_core::Caveats {
             exec: newt_core::Scope::only(["newt-nonexistent-exec-fixture-421".into()]),
             ..policy
         };
-        let mut session = SessionCapability::establish_frozen(missing.clone(), None, None);
+        let mut session =
+            SessionCapability::establish_launch(missing.clone(), None, true, &permissions).unwrap();
         assert_eq!(session.caveats().exec, missing.exec);
         assert!(session
             .take_exec_notice()
             .unwrap()
             .contains("newt-nonexistent-exec-fixture-421"));
         assert!(session.take_exec_notice().is_none());
+    }
+}
+
+// Keep the trust calculation portable even though only macOS expands sessions.
+#[cfg(any(all(test, unix), target_os = "macos"))]
+fn pin_exec_policy(
+    policy: &mut newt_core::Caveats,
+    effective_writes: &newt_core::Scope<String>,
+    path: Option<&std::ffi::OsStr>,
+) -> (newt_core::exec_grants::ExecPins, Vec<String>) {
+    let mut lookup = policy.clone();
+    lookup.fs_write = effective_writes.clone();
+    let result = newt_core::exec_grants::resolve_basenames(&mut lookup, path);
+    // Recalled authority excludes paths; it does not widen the signed base.
+    policy.exec = lookup.exec;
+    result
+}
+
+#[cfg(all(test, unix))]
+mod pin_tests {
+    use super::*;
+    use newt_core::{Caveats, DenialKind, Scope};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// PR #2816: a recalled saved write approval must exclude its executable
+    /// directory before the session captures any implicit absolute exec grant.
+    #[test]
+    fn saved_write_grant_excludes_exec_pin() {
+        let _env = newt_core::process_env::lock();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = temp.path().canonicalize().unwrap();
+        let program = bin.join("gh");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = Caveats {
+            exec: Scope::only(["gh".into()]),
+            fs_write: Scope::none(),
+            ..Caveats::top()
+        };
+        let mut state = crate::permissions::PermissionPromptState::default();
+        let mut trusted = policy.clone();
+        let writes = state.recalled_caveats(&policy, None).unwrap().fs_write;
+        assert!(
+            pin_exec_policy(&mut trusted, &writes, Some(bin.as_os_str()))
+                .1
+                .is_empty()
+        );
+        assert_ne!(trusted.exec, policy.exec);
+        state
+            .durable_grants
+            .insert((DenialKind::FsWrite, bin.to_string_lossy().into_owned()));
+        let writes = state.recalled_caveats(&policy, None).unwrap().fs_write;
+        assert!(newt_core::caveats::permits_path(
+            &writes,
+            program.to_str().unwrap()
+        ));
+        let mut denied = policy.clone();
+        assert_eq!(
+            pin_exec_policy(&mut denied, &writes, Some(bin.as_os_str())).1,
+            ["gh"]
+        );
+        assert_eq!(denied, policy);
+        #[cfg(target_os = "macos")]
+        {
+            use crate::disable_ocap_session_tests::EnvVar;
+            let _venv = EnvVar::unset("NEWT_VENV");
+            let _virtual_env = EnvVar::unset("VIRTUAL_ENV");
+            let _paths = EnvVar::set("NEWT_EXEC_PATHS", bin.to_str().unwrap());
+            let _path = EnvVar::set("PATH", "/usr/bin:/bin");
+            let key = temp.path().join("identity.pem");
+            for frozen in [false, true] {
+                let mut session =
+                    SessionCapability::establish_launch(policy.clone(), Some(&key), frozen, &state)
+                        .unwrap();
+                assert_eq!(session.caveats(), &policy);
+                assert!(session.take_exec_notice().unwrap().contains("gh"));
+                assert!(session.take_exec_notice().is_none());
+                let signed = newt_identity::enforced_caveats(session.op.as_ref().unwrap()).unwrap();
+                assert_eq!(signed.exec, policy.exec);
+            }
+        }
     }
 }
