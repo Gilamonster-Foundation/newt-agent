@@ -15,13 +15,16 @@ impl Default for Watch {
             repeats: std::env::var("NEWT_GENERATION_REPEAT_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(8),
+                .unwrap_or(0),
         }
     }
 }
 
 impl Watch {
     pub(super) fn observe(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        if self.repeats < 2 {
+            return Ok(());
+        }
         self.pending.extend_from_slice(chunk);
         while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
             let line: Vec<_> = self.pending.drain(..=end).collect();
@@ -76,4 +79,41 @@ fn repeated(text: &[u8], repeats: usize) -> bool {
         let suffix = &text[text.len() - width..];
         (2..=repeats).all(|n| &text[text.len() - n * width..text.len() - (n - 1) * width] == suffix)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agentic::tools::disable_ocap_tests::EnvVar;
+
+    fn repeated_frame() -> Vec<u8> {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":"x".repeat(64)}}]})
+        )
+        .into_bytes()
+    }
+
+    /// #2824: legitimate repetitive output is allowed unless the operator opts in.
+    #[test]
+    fn repetition_is_disabled_without_operator_opt_in() {
+        let _env = crate::process_env::lock();
+        let _unset = EnvVar::unset("NEWT_GENERATION_REPEAT_LIMIT");
+        let mut watch = Watch::default();
+        for _ in 0..20 {
+            watch
+                .observe(&repeated_frame())
+                .expect("heuristic must default off");
+        }
+    }
+
+    #[test]
+    fn explicit_repetition_threshold_retains_detection() {
+        let _env = crate::process_env::lock();
+        let _limit = EnvVar::set("NEWT_GENERATION_REPEAT_LIMIT", "3");
+        let mut watch = Watch::default();
+        watch.observe(&repeated_frame()).unwrap();
+        watch.observe(&repeated_frame()).unwrap();
+        assert!(watch.observe(&repeated_frame()).is_err());
+    }
 }
