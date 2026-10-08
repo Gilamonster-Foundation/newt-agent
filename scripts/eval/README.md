@@ -71,3 +71,76 @@ an **isolated `$HOME`** and reads plan-ledger / cap-salvage / dangling-narration
 Full method, dgx1 substrate, and the per-lever cells:
 [`docs/design/evidence/next-loop-levers-testplan.md`](../../docs/design/evidence/next-loop-levers-testplan.md).
 The endpoint template (host stays local) is `loop-template.example`.
+
+## Refactor-run grading (#2804)
+
+`grade_refactor.py` grades the seed-to-branch diff and the run's final claims.
+It prints a content-addressed JSON envelope on stdout and PASS/FAIL per criterion
+on stderr. Exit codes: 0 all criteria pass, 1 failed/unverifiable criterion,
+2 invalid invocation or report. No model is called; GitHub commands only read.
+
+```bash
+python scripts/eval/grade_refactor.py \
+  --repo ./lab --worktree ./lab-refactor --seed <seed-sha> \
+  --branch refactor-agentic --github example/refactor-lab --crate newt-core \
+  --started-at <run-start-unix-seconds> --transcript ./run.raw > verdict.json
+python scripts/eval/grade_refactor.py --verify-report verdict.json
+```
+
+Use a trusted grader checkout, outside the run being graded. Preserve the local
+worktree and its reflogs until grading finishes. `--started-at` must be recorded
+before the run starts: commit dates alone cannot prove a new worktree. Missing
+or expired reflogs fail the worktree criterion. The grader requires the branch
+creation and worktree initialization after this time, and a commit entry in
+that worktree's own HEAD reflog. A checkout of an existing commit is insufficient.
+
+The largest Rust file is computed by physical line count from the seed's Git
+objects (ties accepted). The committed diff must touch it. Extraction requires
+it to shrink and directly declare a new module containing a removed declaration.
+This is structural evidence, not proof of semantic equivalence. Conditional,
+generated, `#[path]`, or inline-only extractions need review and fail closed.
+
+Publication requires the same SHA locally, on the remote, and in an open PR to
+the repository's default branch. A fresh `--no-local` clone of the remote branch
+must have that SHA and pass `cargo check -p <crate>`. Clone, check, and temporary
+build cache are cleaned afterward. Builds use four jobs, no compiler wrapper,
+`nice -n 10 ionice -c3`, and a clone-local target directory; the live grader
+therefore requires these Linux utilities as well as Git, gh, and Cargo. Builds
+are real code execution: grade only the intended lab repository. Unit tests
+replace all Git/GitHub/build commands and require no network.
+
+The raw tmux transcript parser recognizes the recorded `Summary` report and
+final refactor/deliverable starts, removes ANSI controls, and stops at harness
+annotations. It checks commit hashes, push claims, PR numbers/repository,
+merged state, numeric `.rs` line counts, and test totals. Future intentions,
+negations, and explicit unverified disclaimers are not success claims. Unknown
+summary formats fail rather than silently passing. This deterministic parser
+is not a general natural-language truth detector; retain the extracted summary
+in the report for review.
+
+Test counts cannot be proved by Git or `cargo check`. Supply an independent
+`--test-log` captured for the graded head to verify them (the final cargo test
+result is used); otherwise they are marked `unverifiable`, not fabricated.
+A contradicted or unverifiable claim fails the claims criterion independently
+of whether the refactor itself passed. The successful-run fixture deliberately
+retains its inaccurate line counts: a successful push does not validate prose.
+
+Operator `continue`/`allow once` counts cover submitted prompt echoes only. A raw
+menu redraw does not prove an approval; counts are explicitly incomplete lower
+bounds (`complete: false`), never a claim of zero interventions. The original
+transcript remains the authority for manual input accounting when echoes are
+missing. Supply `--input-log` from the driver (one submitted input per line)
+to obtain complete counts; uppercase `A` is not counted as allow-once.
+
+The report reuses the eval scoreboard's existing crate-vector-pinned
+`newt_conformance` content encoder. `--verify-report` recomputes its CID before
+rendering; no mutable history or second hashing implementation is introduced.
+Do not publish raw transcripts/verdicts without redaction. The three bundled
+fixtures are trimmed real final reports with local paths and repository owners
+replaced; terminal endpoints and redraws are omitted.
+
+Offline tests run in `just eval-selftest` and the matching CI lint step:
+
+```bash
+python -m unittest discover -s scripts/eval/tests -v
+```
