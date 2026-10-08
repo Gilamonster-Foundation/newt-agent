@@ -252,6 +252,21 @@ pub(super) fn preflight_responses_request(
     Ok(())
 }
 
+/// Split a served window into admitted input and remaining output capacity.
+/// An explicit output reservation can lower the input ceiling. A stricter input
+/// limit (including overflow recovery's one-token reduction) leaves more output
+/// capacity; that capacity is still subject to the generation cap at dispatch.
+/// Both admission and generation use this split so a safety margin is counted
+/// once, and input + output capacity never exceeds the served window.
+pub(super) fn context_window_split(
+    window: u32,
+    input_limit: usize,
+    output_reserve: u32,
+) -> (usize, u32) {
+    let input = input_limit.min(window.saturating_sub(output_reserve) as usize);
+    (input, window - input as u32)
+}
+
 /// Authoritative input-token ceiling implied by a declared context window.
 ///
 /// A backend's context window contains both input and generated output. The
@@ -268,8 +283,12 @@ pub(super) fn num_ctx_input_ceiling(
     num_ctx.map(|context_window| {
         let percentage_ceiling =
             crate::config::input_percentage_ceiling(context_window, input_ceiling_pct) as usize;
-        let output_reserved = context_window.saturating_sub(max_output_tokens.unwrap_or(0));
-        percentage_ceiling.min(output_reserved as usize)
+        context_window_split(
+            context_window,
+            percentage_ceiling,
+            max_output_tokens.unwrap_or(0),
+        )
+        .0
     })
 }
 
