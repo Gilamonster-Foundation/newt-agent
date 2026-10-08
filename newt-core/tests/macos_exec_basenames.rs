@@ -22,11 +22,20 @@ fn run() {
         net: Scope::none(),
         ..Caveats::top()
     };
+    let trust = newt_core::git_staging::TrustContext::bind(&caveats.fs_write).unwrap();
+    // CI records why its ambient Homebrew selection is unsuitable, while the
+    // actual proof uses a controlled copy of the same real executable.
+    if let Some(ambient) = std::env::var_os("NEWT_TEST_AMBIENT_GH") {
+        eprintln!(
+            "AMBIENT_GH_TRUST: {:?}",
+            newt_core::git_staging::trust_check(std::path::Path::new(&ambient), &trust)
+        );
+    }
     let path = newt_core::exec_grants::dispatch_path().expect("native gh PATH required");
+    let unresolved = newt_core::exec_grants::resolve_basenames(&mut caveats, Some(&path)).1;
     assert!(
-        newt_core::exec_grants::resolve_basenames(&mut caveats, Some(&path))
-            .1
-            .is_empty()
+        unresolved.is_empty(),
+        "unresolved={unresolved:?}, PATH={path:?}"
     );
     let Scope::Only(grants) = &caveats.exec else {
         panic!("exec must stay confined")
