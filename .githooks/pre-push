@@ -39,7 +39,8 @@
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
 #   - macOS executable basename pins (PR #2816), newt-tui-pty.yml macOS job:
-#     installs gh when absent, runs macos_exec_basenames explicitly with --ignored,
+#     installs gh when absent, stages a root-owned copy outside Homebrew,
+#     runs macos_exec_basenames explicitly with --ignored,
 #     and runs session_capability:: constructor tests. Requires native Seatbelt;
 #     portable trust regressions remain in the scoped Rust tests below.
 #   - packaged carried commands (#2776), .github/workflows/ci.yml Windows job:
