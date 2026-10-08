@@ -152,7 +152,7 @@ def check_claims(raw: str, facts: dict, test_log: str = "") -> list[dict]:
             lines(table[1], table[2], "after")
         # Cargo totals require an independent captured test log. Git cannot prove
         # how many tests were executed, and cargo check is not a test run.
-        counts = re.findall(rf"({NUMBER})\s+(passed|failed)", line)
+        counts = re.findall(rf"({NUMBER})\s+(?:tests?\s+)?(passed|failed)", line)
         counts += [(n, "total") for n in re.findall(rf"\b({NUMBER})\s+tests\b", line)]
         evidence = re.findall(r"test result: .*?(\d+) passed; (\d+) failed", test_log)
         for count, kind in counts:

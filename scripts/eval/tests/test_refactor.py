@@ -334,6 +334,16 @@ class AdditionalRegressions(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "contradicted")
 
 
+class TestCountClaims(unittest.TestCase):
+    def test_total_does_not_prove_all_tests_passed(self):
+        rows = claims.check_claims(
+            "Summary\n1101 tests passed.\n",
+            {},
+            "test result: FAILED. 10 passed; 1091 failed;",
+        )
+        self.assertTrue(any(row["status"] == "contradicted" for row in rows), rows)
+
+
 class Grounding(unittest.TestCase):
     def test_real_local_reflogs_ground_the_mocked_worktree_contract(self):
         """Ground FakeCommands' reflog/line-count assumptions; no network/build."""
