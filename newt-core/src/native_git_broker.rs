@@ -675,6 +675,15 @@ impl NativeCommitSession {
         updates: &str,
         control: &BrokerControl,
     ) -> Result<(), String> {
+        // Git 2.54+ reports preparing before locking or resolving symbolic refs.
+        // It is only a notification: do not retain a candidate, approve bytes,
+        // or consume attribution here. The locked prepared event still performs
+        // every destination, ancestry, message and signing check below; committed
+        // cannot succeed without that verified candidate. This also covers the
+        // pre-lock AUTO_MERGE cleanup notification after publication (#2813).
+        if phase == "preparing" {
+            return Ok(());
+        }
         // Git removes its temporary AUTO_MERGE tree reference after publishing
         // a commit, even when it is absent (zero -> zero). This is native
         // cleanup under the admitted gitdir write grant, never another commit.
