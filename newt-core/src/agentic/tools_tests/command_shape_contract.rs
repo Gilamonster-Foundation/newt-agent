@@ -208,6 +208,10 @@ async fn check(row: Row) {
         std::fs::copy(&executable, &gh).unwrap();
     }
     let mut paths = vec![bin.clone()];
+    // Keep dispatch on the same system Git used by hermetic setup, not a
+    // runner's group-writable Homebrew prefix. The inert gh fixture stays first.
+    #[cfg(unix)]
+    paths.push(PathBuf::from("/usr/bin"));
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
