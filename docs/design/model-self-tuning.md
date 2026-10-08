@@ -339,3 +339,27 @@ makes the missing prior non-fatal.
   confidence.
 - Changing generation behavior for thinking models (e.g. sending
   `options.think`) — Step 20.2 probes it; acting on it is its own step.
+
+## Metadata discovery for slow OpenAI-compatible routers (#2248)
+
+The short startup probe first reads the selected model's `/v1/models`
+metadata. A loaded llama.cpp router may provide `status.args`: explicit
+positive `-c`/`--ctx-size` and `-np`/`--parallel` values give a per-slot
+window by division. Automatic values, omitted parallelism and unified-KV
+layouts remain unknown; a sibling model's window is never substituted.
+
+The fallback is `GET /props?model=<URL-encoded model id>`, reading positive
+`default_generation_settings.n_ctx` (or top-level `n_ctx`). Bare router
+`/props` describes the router and can return zero. These shapes and routing
+are documented in the upstream [server API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#get-props-get-server-global-properties)
+and [routing guide](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#routing-requests).
+
+When startup cannot discover a window, the interactive session retries once
+per endpoint/model in a background task with a 30-second bound. It consumes
+matching results at turn boundaries and before budget resolution; an active
+turn keeps its existing budget. Unknown stays `?`, and a failed retry reports
+one notice. Successful discovery feeds the existing window resolver, so a
+smaller learned `max_ok_input` cannot pin the later turn to that old value.
+The background task is cancelled when the session ends. No inference request
+is used to discover the limit, and no longer synchronous cache probe blocks
+OpenAI input handling.
