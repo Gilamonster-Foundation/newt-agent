@@ -86,55 +86,74 @@ def reflog_entries(text: str) -> list[tuple[str, int, str]]:
     return entries
 
 
-def extraction(before: dict[str, str], after: dict[str, str], target: str) -> list[str]:
-    """Find new directly declared modules containing code removed from target.
+@cache
+def syntax_helper() -> Path:
+    """Build only trusted grader code, offline, once per grading process."""
+    root = Path(__file__).resolve().parents[2]
+    prefix = [
+        "env",
+        "RUSTC_WRAPPER=",
+        "CARGO_BUILD_JOBS=4",
+        "nice",
+        "-n",
+        "10",
+        "ionice",
+        "-c3",
+    ]
+    run(
+        [
+            *prefix,
+            "cargo",
+            "build",
+            "--offline",
+            "--locked",
+            "-p",
+            "newt-refactor-evidence",
+        ],
+        root,
+    )
+    return (
+        root
+        / "target"
+        / "debug"
+        / (
+            "newt-refactor-evidence.exe"
+            if os.name == "nt"
+            else "newt-refactor-evidence"
+        )
+    )
 
-    This is structural extraction evidence, not a semantic equivalence proof.
-    A comment mentioning `mod` or an empty orphan file is not evidence.
-    """
+
+def extraction(before: dict[str, str], after: dict[str, str], target: str) -> list[str]:
+    """Require a parsed unconditional item moved into a directly wired module."""
     old, new = before[target], after.get(target, "")
     if not new or line_count(new) >= line_count(old):
         return []
-
-    # Comments/strings may contain convincing declarations. Mask those before
-    # matching real, line-oriented out-of-line mod declarations.
-    def source_code(text: str) -> str:
-        # Deliberately support only a small lexical subset, not guessed Rust
-        # semantics. Reject even markers inside literals/comments: false
-        # negatives are preferable to certifying inactive declarations.
-        if re.search(r'/\*|\b(?:br|cr|r)#*"|#\s*!?\s*\[', text):
-            raise EvidenceError(
-                "unsupported Rust syntax: block comments, raw strings, or attributes"
-            )
-        return re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"', "", text, flags=re.S)
-
-    masked = source_code(new)
     directory = PurePosixPath(target).parent
     if PurePosixPath(target).name not in ("mod.rs", "lib.rs", "main.rs"):
         directory /= PurePosixPath(target).stem
-    removed = {line.strip() for line in source_code(old).splitlines()} - {
-        line.strip() for line in masked.splitlines()
-    }
     moved = []
-    for declaration in re.finditer(
-        r"(?m)^\s*((?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", masked
-    ):
-        if "cfg" in declaration[1] or "path" in declaration[1]:
-            continue
-        name = declaration[2]
-        for path in (str(directory / (name + ".rs")), str(directory / name / "mod.rs")):
-            if path in before or path not in after:
+    with tempfile.TemporaryDirectory(prefix="refactor-syntax-") as temporary:
+        root = Path(temporary)
+        paths = [root / name for name in ("before.rs", "after.rs", "module.rs")]
+        paths[0].write_text(old)
+        paths[1].write_text(new)
+        for path in sorted(after.keys() - before.keys()):
+            candidate = PurePosixPath(path)
+            if candidate.suffix != ".rs":
                 continue
-            code = {line.strip() for line in source_code(after[path]).splitlines()}
-            # A moved function/type declaration avoids accepting braces/comments
-            # as the only shared text. This deliberately fails closed on formats
-            # it cannot prove (include!, generated modules, #[path], inline-only).
-            if any(
-                re.search(r"\b(?:fn|struct|enum|impl|trait|type|const)\s+\w", line)
-                for line in removed & code
-                if not line.startswith(("//", "/*", "*"))
-            ):
+            if candidate.name == "mod.rs" and candidate.parent.parent == directory:
+                name = candidate.parent.name
+            elif candidate.parent == directory:
+                name = candidate.stem
+            else:
+                continue
+            paths[2].write_text(after[path])
+            output = run([str(syntax_helper()), *map(str, paths), name], root).strip()
+            if output == "MATCH":
                 moved.append(path)
+            elif output != "NONE":
+                raise EvidenceError("invalid Rust syntax helper response")
     return moved
 
 

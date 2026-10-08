@@ -35,6 +35,17 @@ class Claims(unittest.TestCase):
     def test_negation_and_plan_are_not_success_claims(self):
         text = "Summary\nNot committed or pushed. I will open PR #20.\n"
         self.assertEqual(claims.check_claims(text, {}), [])
+        self.assertEqual(
+            claims.check_claims("Summary\nNot committed and pushed.", {}), []
+        )
+
+    def test_coordinated_future_auxiliary_is_not_completed_work(self):
+        """#2804: splitting assertions must retain a shared future auxiliary."""
+        for text in (
+            "Will be committed and pushed.",
+            "Will have committed and pushed.",
+        ):
+            self.assertEqual(claims.check_claims("Summary\n" + text, {}), [])
 
     def test_missing_final_summary_is_not_silently_empty(self):
         with self.assertRaises(ValueError):
@@ -172,6 +183,26 @@ class Grade(unittest.TestCase):
             any(a[:3] == ["gh", "pr", "create"] for a, _ in self.fake.calls)
         )
 
+    def test_real_shaped_extraction_with_unrelated_attributes_passes(self):
+        """#2804 review: unrelated cfg/derive and extracted tests are valid."""
+        shared = (
+            '#[cfg(feature = "markdown")]\nmod markdown;\n'
+            "#[derive(Debug)]\nstruct State;\n"
+        )
+        self.fake.trees[SEED][TARGET] = shared + OLD
+        self.fake.trees[HEAD][TARGET] = (
+            shared + NEW + "fn moved() { extracted::moved() }\n"
+        )
+        self.fake.trees[HEAD]["crate/src/extracted.rs"] = (
+            "/// Newly documented public helper.\npub fn moved() {}\n"
+            "#[cfg(test)]\nmod tests { #[test] fn smoke() {} }\n"
+        )
+        result = self.grade()
+        self.assertEqual(result["criteria"]["extraction"]["status"], "PASS", result)
+        self.assertEqual(
+            result["criteria"]["worktree_commit"]["status"], "PASS", result
+        )
+
     def test_seed_largest_is_computed_not_hardcoded(self):
         self.fake.trees[SEED]["unexpected.rs"] = "// big\n" * 50
         self.fake.trees[HEAD]["unexpected.rs"] = "// big\n" * 50
@@ -247,7 +278,8 @@ class Grade(unittest.TestCase):
                 self.fake.trees[HEAD]["crate/src/extracted.rs"] = module
                 row = self.grade()["criteria"]["extraction"]
                 self.assertEqual(row["status"], "FAIL", row)
-                self.assertIn("unsupported", str(row["evidence"]).lower())
+                if module.startswith("#["):
+                    self.assertIn("unsupported", str(row["evidence"]).lower())
 
     def test_report_tampering_is_rejected_by_production_verifier(self):
         envelope = grader.seal(self.grade())
@@ -342,6 +374,21 @@ class AdditionalRegressions(unittest.TestCase):
                 "Committed deadbee and pushed, opened PR #1378, not merged.",
                 {"commit", "push", "pr"},
             ),
+        ]:
+            with self.subTest(text=text):
+                rows = claims.check_claims(
+                    "Summary\n" + text, {"commits": [], "pushed": False, "prs": []}
+                )
+                self.assertEqual({r["kind"] for r in rows}, expected)
+                self.assertTrue(all(r["status"] == "contradicted" for r in rows))
+
+    def test_future_plan_does_not_hide_completed_assertion(self):
+        """#2804 review: a later or earlier plan cannot erase completed work."""
+        for text, expected in [
+            ("Pushed and will open PR #20.", {"push"}),
+            ("Committed deadbee and will run tests.", {"commit"}),
+            ("Will open PR #20 and have pushed.", {"push"}),
+            ("Will run tests and committed deadbee.", {"commit"}),
         ]:
             with self.subTest(text=text):
                 rows = claims.check_claims(

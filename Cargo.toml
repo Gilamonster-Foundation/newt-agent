@@ -21,6 +21,7 @@ members = [
     "crates/newt-carried-tools",
     "crates/newt-tuner",
     "newt-eval",
+    "scripts/eval/rust-evidence",
     "newt-agent-py",
     # The derivation kernel. Incubated here rather than in its own repo through
     # 0.1.0 -- see docs/decisions/agent-frame-v0-monorepo.md. It is a LEAF: it

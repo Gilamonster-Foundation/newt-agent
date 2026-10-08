@@ -102,10 +102,21 @@ objects (ties accepted). The committed diff must touch it. Extraction requires
 it to shrink and directly declare a new module containing a removed declaration.
 This is structural evidence, not proof of semantic equivalence. Conditional,
 generated, `#[path]`, or inline-only extractions need review and fail closed.
-The lightweight recognizer conservatively refuses block comments (including
-nested comments), raw strings, and all attributes in the source/target evidence,
-with an explicit unsupported-syntax FAIL. Even harmless occurrences require
-manual review; it is not a Rust parser and adds no parser dependency.
+A small syn-based helper parses top-level Rust items; comments, raw strings,
+macro bodies, and unrelated conditional/test sections cannot supply evidence.
+Candidate modules/file roots must have only doc attributes; moved declarations
+may have doc/derive attributes. Conditional or custom attributes affecting those
+candidates explicitly fail as unsupported (cfg is not evaluated). Unrelated
+attributes are ignored. Functions are compared by parsed signature and body,
+allowing new visibility/documentation and a forwarding wrapper left behind.
+This remains structural evidence, not macro expansion or semantic equivalence.
+
+The grader builds the trusted `newt-refactor-evidence` workspace helper offline
+once per process in its own checkout's target directory. Cargo dependencies
+must already be cached (normal workspace setup); an unavailable helper fails
+grading. syn and quote were already locked workspace dependencies. Offline
+Python tests exercise this real parser, including a sanitized positive shaped
+like the passing extraction and inactive-text negative controls.
 
 Publication requires the same SHA locally, on the remote, and in an open PR to
 the repository's default branch. A fresh `--no-local` clone of the remote branch

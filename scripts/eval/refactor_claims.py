@@ -88,17 +88,30 @@ def check_claims(raw: str, facts: dict, test_log: str = "") -> list[dict]:
             None if actual is None else actual == expected,
         )
 
-    # Split sentence/contrast clauses without splitting thousands separators or
-    # file/URL dots. A later "not merged" must not erase earlier publication.
-    clauses = re.split(
-        r"\n|;|\bbut\b|,(?!\d)|(?<=[.!?])\s+|\band\s+(?=not\b|never\b)",
-        summary,
-        flags=re.I,
-    )
-    for line in clauses:
-        # A disclaimer, future plan, or quoted earlier claim isn't a success claim.
+    # Sentence/contrast boundaries reset context. Within coordination, an
+    # explicit future/negative assertion must not hide a completed assertion.
+    clauses = re.split(r"\n|;|\bbut\b|,(?!\d)|(?<=[.!?])\s+", summary, flags=re.I)
+    assertions = []
+    for clause in clauses:
+        negative = False
+        future_auxiliary = False
+        for assertion in re.split(r"\band\b", clause, flags=re.I):
+            explicit = re.match(r"\s*(?:I|we|have|has|already)\b", assertion, re.I)
+            if explicit:
+                negative = False
+                future_auxiliary = False
+            negative = negative or bool(
+                re.search(r"\b(?:not|never|cannot|can't)\b", assertion, re.I)
+            )
+            future_auxiliary = future_auxiliary or bool(
+                re.search(r"\b(?:will|would)\s+(?:be|have)\b", assertion, re.I)
+            )
+            if not negative and not future_auxiliary:
+                assertions.append(assertion)
+    for line in assertions:
+        # A future plan or quoted earlier claim isn't a completed success claim.
         if re.search(
-            r"\b(?:not |never |unverified|could not|can't |cannot |will |would |earlier turns|before acting|baseline )",
+            r"\b(?:unverified|will |would |earlier turns|before acting|baseline )",
             line,
             re.I,
         ):
