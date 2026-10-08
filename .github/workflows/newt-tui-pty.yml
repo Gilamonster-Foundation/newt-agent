@@ -71,6 +71,12 @@ on:
       - "newt-tui/src/live_spill_pty_tests.rs"
       # chat.rs is also reached by these tests but is deliberately left out: it
       # would fire this tier on nearly every PR (see the scoped-gate note above).
+      # PR #2816: this existing macOS job also proves confined basename exec.
+      - "newt-core/src/exec_grants.rs"
+      - "newt-core/src/git_staging*.rs"
+      - "newt-core/src/git_staging/**"
+      - "newt-core/tests/macos_exec_basenames.rs"
+      - "newt-tui/src/session_capability.rs"
       - "newt-core/src/tty/**"
       - "newt-core/src/agentic/permissions.rs"
       - "tests/pty/**"
@@ -186,6 +192,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: newt-tui-pty-macos
+
+      # HOOK PARITY: CI-only native Seatbelt proof, explicitly named in
+      # .githooks/pre-push; the portable pin tests remain in its scoped gate.
+      - name: Ensure GitHub CLI for confined basename proof
+        run: command -v gh >/dev/null || brew install gh
+
+      - name: Prove confined executable pins and signed session construction
+        run: |
+          cargo test -p newt-core --test macos_exec_basenames -- --ignored
+          cargo test -p newt-tui --lib session_capability:: -- --test-threads=1
 
       # The termios/pty surface, in the order it is layered: the modal's raw
       # guard, then the cockpit's capture and mode restoration on top of it.
