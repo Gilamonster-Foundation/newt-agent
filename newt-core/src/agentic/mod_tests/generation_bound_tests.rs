@@ -139,6 +139,9 @@ async fn bounds_2782_steady_trickle_stops_at_total_deadline() {
 /// repeated SSE scaffolding alone and an ordinary completed response are harmless.
 #[tokio::test]
 async fn bounds_2782_repetition_and_normal_completion() {
+    let _env = crate::process_env::lock();
+    let _enabled =
+        crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_GENERATION_REPEAT_LIMIT", "8");
     for (field, repeated, cap) in [
         ("content", true, false),
         ("reasoning_content", true, false),
