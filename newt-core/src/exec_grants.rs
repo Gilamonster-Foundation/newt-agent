@@ -26,7 +26,7 @@ pub(crate) fn trusted_program(path: &OsStr, caveats: &Caveats, name: &str) -> Re
     Ok(resolved)
 }
 
-/// Executable identities captured at session startup, never re-resolved on reload.
+/// Executable paths captured at session startup, never re-resolved on reload.
 #[derive(Default)]
 pub struct ExecPins(std::collections::BTreeMap<String, String>);
 
@@ -53,7 +53,10 @@ pub fn resolve_basenames(caveats: &mut Caveats, path: Option<&OsStr>) -> (ExecPi
             .iter()
             .filter(|name| !name.is_empty() && !name.contains(['/', '\\']))
         {
+            // Unlike the Git broker's explicitly ambient trust policy, a
+            // restricted exec pin must be outside ALL effective write authority.
             match path
+                .filter(|_| !matches!(caveats.fs_write, Scope::All))
                 .and_then(|path| trusted_program(path, caveats, name).ok())
                 .and_then(|path| path.to_str().map(str::to_owned))
             {
@@ -72,6 +75,21 @@ pub fn resolve_basenames(caveats: &mut Caveats, path: Option<&OsStr>) -> (ExecPi
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    /// PR #2816: ambient writes do not make a restricted executable trustworthy.
+    #[test]
+    fn unrestricted_writes_decline_exec_pins() {
+        let mut policy = Caveats {
+            exec: Scope::only(["sh".into()]),
+            ..Caveats::top()
+        };
+        let before = policy.clone();
+        assert_eq!(
+            resolve_basenames(&mut policy, Some(OsStr::new("/bin"))).1,
+            ["sh"]
+        );
+        assert_eq!(policy, before);
+    }
 
     /// agent-bridle #421: a logical basename must gain its exact trusted path,
     /// but writable/relative lookup must never become a kernel exec grant.
