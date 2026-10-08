@@ -349,10 +349,9 @@ pub trait PermissionGate {
     /// Hold an approved exec denial for this exact command and working directory.
     /// Interpreters cannot be projected by shell inspection. Binding the invocation
     /// lets its explicit retry use exact granted paths without replaying effects.
-    fn queue_command_retry(&mut self, _command: &str, _cwd: &str, requests: &[PermissionRequest]) {
-        for request in requests {
-            self.queue_pending_once(request.kind, &request.target);
-        }
+    /// Gates without invocation-bound storage fail closed; never degrade this
+    /// approval into the older target-only pending queue.
+    fn queue_command_retry(&mut self, _command: &str, _cwd: &str, _requests: &[PermissionRequest]) {
     }
 
     /// Consume a matching invocation-bound grant without creating standing authority.
@@ -521,6 +520,37 @@ impl PermissionRecord {
 
 #[cfg(test)]
 mod tests {
+
+    /// #2823: invocation-bound approval must never fall back to a target-only queue.
+    #[test]
+    fn command_retry_default_does_not_queue_legacy_authority() {
+        #[derive(Default)]
+        struct LegacyGate(Vec<(DenialKind, String)>);
+        impl PermissionGate for LegacyGate {
+            fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+                PermissionDecision::Deny
+            }
+            fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+                HumanQuestionOutcome::Unavailable
+            }
+            fn queue_pending_once(&mut self, kind: DenialKind, target: &str) {
+                self.0.push((kind, target.into()));
+            }
+        }
+        let mut gate = LegacyGate::default();
+        let request = PermissionRequest {
+            tool: "run_command".into(),
+            kind: DenialKind::Exec,
+            target: "/bin/bash".into(),
+            reason: "denied".into(),
+            harness_bound: true,
+        };
+        gate.queue_command_retry("bash script.sh", "/workspace", &[request]);
+        assert!(
+            gate.0.is_empty(),
+            "invocation grant degraded into transferable target authority"
+        );
+    }
     use super::*;
     use crate::caveats::{CaveatsExt as _, CountBound};
 
