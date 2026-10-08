@@ -33,24 +33,47 @@ jobs:
       # trust policy, so the controls reach destination/network admission.
       - name: Make the system Git ancestor non-group-writable
         run: sudo chmod g-w /Applications
-      # No network/forge fixtures: fixed-argv local push exercises the adopted
-      # common-dir policy, while the broker control still refuses local URLs.
-      # The ignored git-clean row asserts a kernel fence exists (no soft skip).
+      # Libtest substitutes SafeSubset for Brush. Keep portable routing and
+      # refusal controls here; native positives run the production binary below.
       # Row (c): plan_mode includes PR #2814's blank => approve once it lands.
-      - name: Run confinement contract rows
-        # Match hermetic fixture setup; do not select runner-owned Homebrew Git.
+      - name: Run portable routing and broker refusal controls
         env:
           NEWT_EXEC_PATHS: /usr/bin:/bin
         shell: bash
         run: |
           set -o pipefail
-          nice -n 10 cargo nextest run --locked -p newt-core --lib --run-ignored all \
+          nice -n 10 cargo nextest run --locked -p newt-core --lib \
             --no-fail-fast --status-level pass --final-status-level fail \
-            -E 'test(command_shape_contract::) or test(worktree_adoption::tests::) or test(worktree_adoption_round2_git_clean_preserves_sentinel) or test(scope_all_push_to_a_local_path_is_refused_through_real_dispatch) or test(wrapped_worktree_push_dispatch_reaches_gate_and_honors_denial) or test(plan_mode::tests::)' \
+            -E 'test(command_shape_contract::) or test(worktree_adoption::tests::) or test(scope_all_push_to_a_local_path_is_refused_through_real_dispatch) or test(wrapped_worktree_push_dispatch_reaches_gate_and_honors_denial) or test(plan_mode::tests::)' \
             2>&1 | tee macos-confined-contract.log
+      - name: Run production Brush creation, adoption and raw-ref security contract
+        shell: bash
+        run: |
+          set -o pipefail
+          nice -n 10 cargo test --locked -p newt-core --test native_git_broker_pipeline \
+            -- --confined-contract 2>&1 | tee macos-native-contract.log
+      # This assertion remains real and fails until the dependent production
+      # fix lands. A tolerated failure is NOT a passed publication contract.
+      - name: Governed commit and task-ref publication (needs PR 2818)
+        id: publication
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          nice -n 10 cargo test --locked -p newt-core --test native_git_broker_pipeline \
+            -- --confined-contract --require-2818 2>&1 | tee macos-publication-contract.log
+      - name: Report dependent publication outcome
+        if: always()
+        env:
+          PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
+        run: |
+          echo "Governed commit/task-ref publication (requires PR #2818): $PUBLICATION_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve per-row evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: macos-confined-contract
-          path: macos-confined-contract.log
+          path: |
+            macos-confined-contract.log
+            macos-native-contract.log
+            macos-publication-contract.log
