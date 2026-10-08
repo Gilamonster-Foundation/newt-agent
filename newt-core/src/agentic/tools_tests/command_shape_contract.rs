@@ -73,6 +73,48 @@ struct Row {
     claim: &'static str,
 }
 
+fn discovery_names_fixture(out: &str, fixture: &str) -> bool {
+    let normalize = |s: &str| {
+        s.replace("\\\\", "\\")
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    };
+    // Shells may translate the temp root. Keep the unique directory and both
+    // trailing components, with boundaries so another fixture cannot match.
+    let fixture = normalize(fixture);
+    let mut components: Vec<_> = fixture.rsplit('/').take(3).collect();
+    components.reverse();
+    let suffix = format!("/{}", components.join("/"));
+    let suffix = suffix.strip_suffix(".exe").unwrap_or(&suffix);
+    normalize(out)
+        .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`'))
+        .any(|path| path.strip_suffix(".exe").unwrap_or(path).ends_with(suffix))
+}
+
+/// #2811: MSYS discovery rewrites the temp root and may omit .exe.
+#[test]
+fn discovery_matches_unique_fixture_across_windows_path_forms() {
+    let fixture = r"C:\Temp\.tmpUnique123\bin\gh.exe";
+    for found in [
+        "/tmp/.tmpUnique123/bin/gh",
+        "C:/Temp/.TMPUNIQUE123/bin/GH.EXE",
+        r"C:\Temp\.tmpUnique123\bin\gh.exe",
+        r"C:\\Temp\\.tmpUnique123\\bin\\gh.exe",
+    ] {
+        assert!(discovery_names_fixture(found, fixture), "{found}");
+    }
+    for found in [
+        "/usr/bin/gh",
+        "/tmp/.tmpOther/bin/gh",
+        "/tmp/prefix.tmpUnique123/bin/gh",
+        "/tmp/.tmpUnique123/bin/gh-evil",
+        "/tmp/.tmpUnique123/bin/gh.exe.bak",
+        "/tmp/.tmpUnique123/bin/gh/child",
+    ] {
+        assert!(!discovery_names_fixture(found, fixture), "{found}");
+    }
+}
+
 async fn check(row: Row) {
     let _lock = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
@@ -158,14 +200,24 @@ async fn check(row: Row) {
     let gh = bin.join(if cfg!(windows) { "gh.exe" } else { "gh" });
     let executable = std::env::current_exe().unwrap();
     if std::fs::hard_link(&executable, &gh).is_err() {
-        std::fs::copy(executable, gh).unwrap();
+        std::fs::copy(&executable, &gh).unwrap();
     }
-    let mut paths = vec![bin];
+    let mut paths = vec![bin.clone()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     let paths = std::env::join_paths(paths).unwrap();
     let _paths = EnvVar::set("NEWT_EXEC_PATHS", paths.to_str().unwrap());
+    let _ambient_path = EnvVar::set("PATH", paths.to_str().unwrap());
+    #[cfg(windows)]
+    let _pathext = EnvVar::set("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+    // #2811: Windows ambient execution consumes PATH, not NEWT_EXEC_PATHS.
+    // Assert before any PR command so a broken fixture never reaches a forge.
+    assert_eq!(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).next(),
+        Some(bin.clone()),
+        "the inert gh fixture must win ambient PATH lookup"
+    );
     let _bypass = EnvVar::set(
         "NEWT_DISABLE_OCAP",
         if row.mode == Mode::Plain { "1" } else { "0" },
@@ -195,6 +247,37 @@ async fn check(row: Row) {
         &Scope::All,
         Some(&session),
     );
+    if row.mode == Mode::Plain && row.command.starts_with("gh pr ") {
+        // A harmless probe must identify libtest before any publication-shaped
+        // command runs. Even a broken lookup can only reach host gh --help.
+        let route = shell::select_shell_route(
+            true,
+            false,
+            false,
+            true,
+            cfg!(windows),
+            crate::config::windows_cmd_enabled(),
+            crate::ambient_brush::installed(),
+            crate::ShellEngine::Brush,
+        );
+        let probe = shell::host_shell_dispatch(
+            route,
+            "gh --help",
+            task.to_str().unwrap(),
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            probe["exit_code"] == 0
+                && probe["stdout"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("--test-threads")),
+            "plain gh must resolve to the inert libtest child before PR execution"
+        );
+    }
     let (name, args) = if row.command == "read_file marker" {
         ("read_file", serde_json::json!({"path":"marker"}))
     } else {
@@ -289,6 +372,13 @@ async fn check(row: Row) {
             crate::agentic::claim_check::git_head(task.to_str().unwrap(), &Scope::All).unwrap();
         let remote = temp.path().join("remote.git/refs/heads/task");
         assert_eq!(std::fs::read_to_string(remote).unwrap().trim(), expected);
+    }
+    if row.command == "which gh" {
+        // Both plain and confined discovery must name this fixture, not host gh.
+        assert!(
+            discovery_names_fixture(&out, &gh.to_string_lossy()),
+            "gh discovery must identify the inert fixture: {out}"
+        );
     }
     if row.claim.is_empty() {
         assert!(out.contains(row.contains), "{}: {out}", row.command);

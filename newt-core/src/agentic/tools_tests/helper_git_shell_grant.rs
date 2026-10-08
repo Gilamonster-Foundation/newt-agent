@@ -7,6 +7,7 @@ const FIXTURE_GIT: &str = "/usr/bin/git";
 /// either being missing would make a quietly-green local run look identical
 /// to one that measured nothing — print an explicit line so a skip is
 /// visible in test output instead (#2686 review round 2).
+#[cfg(target_os = "linux")]
 fn skip_without_real_kernel_fence() -> bool {
     let available = crate::confined_exec::kernel_fs_fence_available()
         && std::path::Path::new(FIXTURE_GIT).exists();
@@ -942,7 +943,12 @@ fn git_shell_widening_grants_read_on_etc_gitconfig() {
 /// machinery, which only round-trips correctly from a `maybe_dispatch`-aware
 /// binary (`newt`/`brush_build_pipeline`'s `harness = false` tests) — never
 /// from the ordinary `cargo test` harness this file runs under.
+///
+/// Linux-only with its two users: the orphan-commit dispatch test below and
+/// `worktree_adoption_refs`, both real-kernel-fence tests.
+#[cfg(target_os = "linux")]
 struct QuietCommitPolicy;
+#[cfg(target_os = "linux")]
 impl agent_toolchain::native_git::CommitPolicy for QuietCommitPolicy {
     fn finalize_message(&self, message: &str) -> Result<String, String> {
         Ok(message.to_string())
@@ -956,7 +962,9 @@ impl agent_toolchain::native_git::CommitPolicy for QuietCommitPolicy {
     fn committed(&self) {}
 }
 
+#[cfg(target_os = "linux")]
 pub(in crate::agentic::tools) struct FixtureGitTool;
+#[cfg(target_os = "linux")]
 impl crate::agentic::git_tool::GitTool for FixtureGitTool {
     fn native_commit_policy(
         &self,
@@ -984,6 +992,14 @@ impl crate::agentic::git_tool::GitTool for FixtureGitTool {
 /// shape is produced by the dispatched command itself, not by an external
 /// mover, so this is reproducible every run rather than a timing-dependent
 /// race.
+///
+/// Linux-only like its siblings: the publication refusal is observable only
+/// after the spawn is ADMITTED. On macOS the forced `safe-subset` engine
+/// declares `StdioPosture::Unaudited`, so Seatbelt resolves a `net: none`
+/// axis `Unknown` and admission refuses L3 BOUND (`ExecOutcome::Denied`)
+/// before any git runs, which is the posture `newt-cli`'s cfg(macos) probe
+/// and doctor tests already pin.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_failure_not_passed() {
     let _env = super::disable_ocap_tests::env_lock().await;
@@ -1067,6 +1083,7 @@ async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_fai
 }
 
 /// Like [`real_git`], but returns trimmed stdout.
+#[cfg(target_os = "linux")]
 fn real_git_output(dir: &std::path::Path, args: &[&str]) -> String {
     let home = tempfile::tempdir().unwrap();
     let output = hermetic_git(dir, home.path()).args(args).output().unwrap();

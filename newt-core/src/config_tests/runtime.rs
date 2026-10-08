@@ -169,6 +169,22 @@ fn tui_narration_nudge_cap_defaults_to_one_and_can_be_raised() {
 }
 
 #[test]
+fn tui_narration_intent_line_defaults_off_and_can_be_enabled() {
+    // Opt-in: new model-facing prompt text earns its place from a live run,
+    // so the function default and the struct default agree on false.
+    assert!(!default_narration_intent_line());
+    assert!(!TuiConfig::default().narration_intent_line);
+
+    // An empty `[tui]` table => serde default kicks in => false.
+    let cfg: Config = toml::from_str("[tui]\n").unwrap();
+    assert!(!cfg.tui.unwrap().narration_intent_line);
+
+    // Explicit opt-in parses.
+    let cfg: Config = toml::from_str("[tui]\nnarration_intent_line = true\n").unwrap();
+    assert!(cfg.tui.unwrap().narration_intent_line);
+}
+
+#[test]
 fn model_tuning_narration_nudge_cap_override_parses() {
     let cfg: Config = toml::from_str(
         r#"

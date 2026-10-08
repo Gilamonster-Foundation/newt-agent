@@ -154,13 +154,26 @@ impl Destination {
 mod tests {
     use super::*;
 
+    /// `GrantedRoot::acquire` wants an absolute, canonical root and refuses
+    /// every symlink component (fdguard `beneath.rs`); production satisfies
+    /// that through `config::resolve_uncreated_path` before `capture`. macOS
+    /// keeps `$TMPDIR` under the `/var -> private/var` symlink, where the
+    /// no-follow walk fails with ENOTDIR, so the fixture resolves it the way
+    /// `execute_permissions.rs` already does. The `TempDir` comes back too:
+    /// dropping it deletes the directory.
+    pub(super) fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        (temp, root)
+    }
+
     /// #2757: swap the parent AFTER its check but BEFORE mkdirat. The mutation
     /// stays in the held parent, the pathname recheck refuses, and Drop preserves it.
     #[test]
     fn sibling_round2_parent_swap_between_check_and_mkdir() {
-        let temp = tempfile::tempdir().unwrap();
-        let parent = temp.path().join("parent");
-        let held = temp.path().join("held");
+        let (_temp, root) = canonical_tempdir();
+        let parent = root.join("parent");
+        let held = root.join("held");
         std::fs::create_dir(&parent).unwrap();
         let mut guard = Destination::capture(&parent.join("task")).unwrap();
         guard.check_parent().unwrap();
@@ -184,12 +197,12 @@ mod tests {
     #[test]
     fn sibling_round3_drop_preserves_replacement_and_contents() {
         for replace in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("task");
+            let (_temp, root) = canonical_tempdir();
+            let path = root.join("task");
             let mut guard = Destination::capture(&path).unwrap();
             guard.prepare().unwrap();
             if replace {
-                std::fs::rename(&path, temp.path().join("held")).unwrap();
+                std::fs::rename(&path, root.join("held")).unwrap();
                 std::fs::create_dir(&path).unwrap();
                 assert!(guard.check().is_err());
             }
@@ -210,8 +223,8 @@ mod tests {
     /// #2757: owner is part of the retained identity, not just dev/ino.
     #[test]
     fn sibling_round2_owner_change_refuses() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut guard = Destination::capture(&temp.path().join("task")).unwrap();
+        let (_temp, root) = canonical_tempdir();
+        let mut guard = Destination::capture(&root.join("task")).unwrap();
         guard.prepare().unwrap();
         // Inject the previously-observed owner; changing filesystem ownership
         // would require privileges and would not be a hermetic unit test.
@@ -222,14 +235,15 @@ mod tests {
 
 #[cfg(test)]
 mod round3_tests {
+    use super::tests::canonical_tempdir;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
     /// #2757: creating a leaf must not grant access to other users.
     #[test]
     fn sibling_round3_leaf_is_private_and_drop_preserves_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("task");
+        let (_temp, root) = canonical_tempdir();
+        let path = root.join("task");
         let mut guard = Destination::capture(&path).unwrap();
         guard.prepare().unwrap();
         assert_eq!(
@@ -245,9 +259,9 @@ mod round3_tests {
     #[test]
     fn sibling_round3_bind_refuses_replacement_contents_or_mode() {
         for nonempty in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("task");
-            let held = temp.path().join("held");
+            let (_temp, root) = canonical_tempdir();
+            let path = root.join("task");
+            let held = root.join("held");
             let mut guard = Destination::capture(&path).unwrap();
             mkdirat(guard.parent.as_fd(), "task", Mode::from_raw_mode(0o700)).unwrap();
             std::fs::rename(&path, &held).unwrap();

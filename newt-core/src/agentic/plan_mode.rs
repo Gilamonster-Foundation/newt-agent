@@ -38,6 +38,14 @@ pub trait PlanModeControl: Send + Sync {
     /// Take-and-clear whether [`Self::request_exit`] was called since the
     /// last take. The turn-end hook calls this once, at most, per turn.
     fn take_exit_requested(&self) -> bool;
+
+    /// Whether the current turn is the implementing turn an approval
+    /// seeded. The executor's plan-before-act arm does not ask about a plan
+    /// the operator just approved when the model records it in the ledger.
+    /// Embedders that never seed such a turn keep the default.
+    fn implementing_approved_plan(&self) -> bool {
+        false
+    }
 }
 
 /// One revision of the model's in-progress Plan-phase draft.
@@ -151,6 +159,31 @@ pub enum PlanVerdict {
 /// accepted decision's `discuss` and `edit` responses both land here today,
 /// since the alt-screen editor `edit` would open is out of this design's
 /// scope — is kept verbatim as feedback rather than being parsed further.
+/// The three answers a plan question offers, in presentation order; `no` is
+/// the default a blank submission resolves to (fail-closed, like the terminal
+/// prompt's `[y/N/discuss]`). `discuss` opens a free-text follow-up whose text
+/// is fed back to the model.
+pub const PLAN_APPROVAL_CHOICES: &[super::permissions::ChoiceSpec] = &[
+    super::permissions::ChoiceSpec {
+        id: "no",
+        label: "no — stay in plan mode",
+        key: "n",
+        role: newt_interaction::SemanticRole::Deny,
+    },
+    super::permissions::ChoiceSpec {
+        id: "yes",
+        label: "yes — implement this plan",
+        key: "y",
+        role: newt_interaction::SemanticRole::Allow,
+    },
+    super::permissions::ChoiceSpec {
+        id: "discuss",
+        label: "discuss — tell the model what to change",
+        key: "d",
+        role: newt_interaction::SemanticRole::Value,
+    },
+];
+
 #[must_use]
 pub fn plan_verdict(
     _entry: PlanEntry,
@@ -164,6 +197,11 @@ pub fn plan_verdict(
     };
     let trimmed = text.trim();
     if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
+        return PlanVerdict::Approved;
+    }
+    // "go", "do it", "proceed", "ship it": the operator's natural yes at a
+    // plan question. The one continuation table decides what counts.
+    if crate::classifiers::is_bare_continuation(trimmed) {
         return PlanVerdict::Approved;
     }
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("n") || trimmed.eq_ignore_ascii_case("no")
@@ -186,6 +224,20 @@ mod tests {
             assert_eq!(
                 plan_verdict(
                     PlanEntry::IntakeInferred,
+                    HumanQuestionOutcome::Answer(text.to_string())
+                ),
+                PlanVerdict::Approved,
+                "{text:?} must approve"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_continuation_at_the_question_approves() {
+        for text in ["go", "do it", "proceed", "go ahead", "ship it", "Continue."] {
+            assert_eq!(
+                plan_verdict(
+                    PlanEntry::ModelDuringAct,
                     HumanQuestionOutcome::Answer(text.to_string())
                 ),
                 PlanVerdict::Approved,

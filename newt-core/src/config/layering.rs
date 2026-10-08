@@ -252,8 +252,22 @@ fn read_array_strategy(value: &toml::Value) -> Option<ArrayMergeStrategy> {
 /// Split out from [`Config::project_config_path`] so it can be unit-tested
 /// against temp directories without mutating the process environment.
 pub(crate) fn find_project_config_from(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    // Compare resolved paths: `$HOME` may name a symlink (macOS `/var` →
-    // `/private/var`) while `current_dir()` is already resolved.
+    find_project_file_from(start, home, "config.toml")
+}
+
+/// The one walk-up for every per-directory `.newt/<file>`: from `start` to
+/// the root, stopping before `$HOME`, returning the first `file` that exists.
+///
+/// Both sides of the stop are compared RESOLVED: `$HOME` may name a symlink
+/// (macOS `/var` → `/private/var`) while `current_dir()` is already resolved.
+/// The identity walk once carried its own copy of this loop without that
+/// rule, and on macOS it walked straight through a symlinked home and read
+/// the operator's identity file as an untrusted workspace one.
+pub(crate) fn find_project_file_from(
+    start: &Path,
+    home: Option<&Path>,
+    file: &str,
+) -> Option<PathBuf> {
     let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let home = home.map(resolve);
     let mut dir = Some(start);
@@ -262,7 +276,7 @@ pub(crate) fn find_project_config_from(start: &Path, home: Option<&Path>) -> Opt
         if home.is_some() && home == Some(resolve(current)) {
             break;
         }
-        let candidate = current.join(".newt").join("config.toml");
+        let candidate = current.join(".newt").join(file);
         if candidate.is_file() {
             return Some(candidate);
         }
