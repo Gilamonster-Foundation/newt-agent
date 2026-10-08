@@ -164,6 +164,26 @@ async fn commit_cleanup_preserves_shared_refs(heredoc: bool, packed: bool) {
         );
         assert_eq!(real_git_output(&wt, &["rev-parse", "HEAD"]), before);
     }
+    if !packed && !heredoc {
+        let before = real_git_output(&wt, &["rev-parse", "HEAD"]);
+        let mut replaceable = caveats.clone();
+        replaceable.fs_write = Scope::only([
+            wt.to_string_lossy().into_owned(),
+            main.to_string_lossy().into_owned(),
+        ]);
+        let refused = dispatch(
+            &wt,
+            "git commit -q --allow-empty -m replaceable-admin",
+            &replaceable,
+            false,
+        )
+        .await;
+        assert!(
+            refused.contains("independently confined admin directory"),
+            "{refused}"
+        );
+        assert_eq!(real_git_output(&wt, &["rev-parse", "HEAD"]), before);
+    }
     if packed && !heredoc {
         let before = real_git_output(&wt, &["rev-parse", "HEAD"]);
         let tree = real_git_output(&wt, &["rev-parse", "HEAD^{tree}"]);

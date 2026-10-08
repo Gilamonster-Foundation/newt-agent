@@ -291,17 +291,10 @@ mod native {
         let own_git = newt_core::git_hardening::own_gitdir_grants(wt);
         let mut read_roots = vec![wt.to_string_lossy().into_owned()];
         read_roots.extend(own_git.read.clone());
-        // #2693: this fixture isolates the EXEC axis (the Kernel/Interceptor
-        // mismatch this issue fixes). The production write floor
-        // (`own_gitdir_shell_write_grant`, `objects/` only — never `refs/`)
-        // is deliberately narrower; a non-default-branch commit through it
-        // refuses on the ref-write axis regardless of exec, which is
-        // issue #2682/#2686's own (separate, already-tracked) fix, not this
-        // one's. Granting the common gitdir here too is a TEST-ONLY widening
-        // so that axis cannot masquerade as this test's result — an
-        // "admitted configuration" for fs/net, so only the exec floor is
-        // under test.
-        let fs_write_roots = std::iter::once(wt.to_string_lossy().into_owned()).chain(own_git.read);
+        // #2813: publication is brokered; exercise the production write roots
+        // rather than hiding ref-boundary failures behind a common-dir grant.
+        let fs_write_roots =
+            std::iter::once(wt.to_string_lossy().into_owned()).chain(own_git.write);
         Caveats {
             fs_read: Scope::only(read_roots),
             fs_write: Scope::only(fs_write_roots),
