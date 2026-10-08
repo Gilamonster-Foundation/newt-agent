@@ -173,9 +173,49 @@ remote service releases its scheduler slot or KV allocation on the same schedule
 
 An accepted answer is returned as generated; no mode sends a second,
 display-only request for it (#2372). A streamed primary request keeps its idle
-read deadline, so a progressing stream continues. Quoting a context-exceeded
+read deadline, so a progressing stream continues within its generation bounds. Quoting a context-exceeded
 message in answer text is ordinary content.
 
 The [decoder tests](../../newt-core/src/agentic/openai_sse_strict_tests.rs)
 and [primary-loop tests](../../newt-core/src/agentic/mod_tests/openai_primary_stream.rs)
 cover these protocol and recovery boundaries without live models.
+
+### Generation bounds (#2782)
+
+Primary and tools-disabled summary requests on Chat Completions and Responses
+also have independent output and total-duration limits:
+
+- `NEWT_GENERATION_MAX_TOKENS` (positive integer, default **16384**) caps the
+  resolved output allowance. The wire cap is further limited to the resolved
+  context window minus the admitted input ceiling on Chat (or its calibrated
+  prompt estimate when no ceiling exists), and minus the calibrated prompt
+  estimate on Responses. Chat counts and sends the same capped body; changing
+  its cap after counting would invalidate exact request admission. A measured
+  prompt at or below the input ceiling therefore fits beside the cap. Without a resolved window,
+  the allowance/maximum still bounds output. An estimate is not an exact server
+  token count; existing context-overflow recovery remains necessary.
+- `NEWT_GENERATION_TIMEOUT_SECS` (positive integer, default **900**) bounds each
+  attempt from sending the request through reading its final body byte, including
+  header latency. Receiving bytes resets the idle timer, never this timer.
+- `NEWT_GENERATION_REPEAT_LIMIT` (default **8**, 0 or 1 disables detection) stops
+  a Chat SSE stream whose text suffix repeats a 64–256-byte block that many times.
+  Content and reasoning deltas count; SSE scaffolding and tool arguments do not.
+  This conservative heuristic can stop intentionally repetitive output; raise
+  the limit or disable it for those workloads. It does not inspect non-streamed
+  JSON Responses output.
+
+Invalid or zero maximum/timeout settings use the defaults. Chat-compatible
+servers receive `max_tokens`; first-party OpenAI receives
+`max_completion_tokens`. Set `NEWT_CHAT_TOKEN_FIELD=max_completion_tokens` for
+proxies requiring the modern field. Responses receives `max_output_tokens`.
+These limits include generated reasoning according to the provider's accounting.
+See the [OpenAI token-counting guide](https://developers.openai.com/api/docs/guides/token-counting)
+and [llama.cpp server schema](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-schema.cpp),
+where both Chat field names alias `n_predict`.
+
+A duration/repetition stop drops the response and fails that attempt without
+an automatic transport retry. Received bytes remain in the existing observation;
+reported usage is retained. The notice gives the reported output-token count
+when present, otherwise says the count is unavailable rather than treating bytes
+as tokens. Summary fallbacks retain the notice with captured progress. Closing
+the client response does not guarantee immediate server-side slot reclamation.

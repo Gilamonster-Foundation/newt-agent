@@ -1247,3 +1247,6 @@ async fn a_mixed_response_on_the_retry_fails_after_exactly_two_attempts() {
         "the answer round is attempted exactly twice"
     );
 }
+
+#[path = "generation_bound_tests.rs"]
+mod generation_bound_tests;

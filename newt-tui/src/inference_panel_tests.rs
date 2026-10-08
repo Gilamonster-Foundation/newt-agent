@@ -207,3 +207,15 @@ fn launch_probe_failures_are_not_reported_as_not_a_router() {
         );
     }
 }
+
+/// #2782: the configured generation maximum is an upper bound, not an exact
+/// max_tokens claim before prompt admission or endpoint field selection.
+#[test]
+fn generation_cap_is_displayed_as_an_upper_bound() {
+    let mut i = inference(&LaunchProbe::Unsupported);
+    i.preview.max_output_tokens = Some(16_384);
+    let row = the_row(&lines(&i), "max output");
+    assert!(row.contains("up to 16,384"), "{row}");
+    assert!(row.contains("may shrink to fit context"), "{row}");
+    assert!(!row.contains("sent as max_tokens"), "{row}");
+}

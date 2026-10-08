@@ -1075,6 +1075,7 @@ async fn final_summary_provider_contracts() {
                         None,
                         Vec::new(),
                         policy,
+                        None,
                         &cap,
                         None,
                     )

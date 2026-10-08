@@ -417,7 +417,7 @@ async fn openai_chat_omits_local_cognition_fields_for_an_unknown_endpoint() {
     c.kind = BackendKind::Openai;
     c.cognition = Some(crate::role_profile::Cognition::Meticulous);
     // #2312 (A6): an explicit allowance is not a declaration that the endpoint
-    // accepts a cap field — no `max_tokens` is guessed onto this wire.
+    // accepts cognition knobs. The independent generation limit still applies.
     c.output_allowance = Some(12_000);
 
     chat_complete(c, &mut NoMcp)
@@ -429,8 +429,8 @@ async fn openai_chat_omits_local_cognition_fields_for_an_unknown_endpoint() {
         .expect("capture lock")
         .clone()
         .expect("request captured");
+    assert_eq!(request["max_tokens"], 12_000);
     for field in [
-        "max_tokens",
         "temperature",
         "top_p",
         "parallel_tool_calls",
@@ -531,15 +531,19 @@ async fn openai_chat_output_allowance_varies_only_the_cap_field() {
 /// so an explicit allowance is SENT even when no cognition dial is set, while
 /// thinking and sampling stay unset. Without this arm the only way to put a
 /// cap on the wire was to set a dial, which also moves thinking/temperature/
-/// top_p. With no allowance the body carries no cap at all (defaults intact).
+/// top_p. With no allowance the independent generation maximum still applies.
 #[tokio::test]
 async fn openai_chat_output_allowance_is_sent_without_a_cognition_dial() {
     let unset = capable_chat_bodies(None, None).await;
     let capped = capable_chat_bodies(None, Some(3_000)).await;
     assert!(!unset.is_empty());
     assert_eq!(unset.len(), capped.len());
-    for (unset, mut capped) in unset.into_iter().zip(capped) {
-        for field in ["max_tokens", "temperature", "top_p", "chat_template_kwargs"] {
+    for (mut unset, mut capped) in unset.into_iter().zip(capped) {
+        assert_eq!(
+            unset.as_object_mut().unwrap().remove("max_tokens"),
+            Some(serde_json::json!(16_384))
+        );
+        for field in ["temperature", "top_p", "chat_template_kwargs"] {
             assert!(
                 unset.get(field).is_none(),
                 "no allowance, no dial: `{field}`"

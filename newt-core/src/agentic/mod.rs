@@ -39,7 +39,9 @@ mod crew_attest;
 mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
+mod generation_bounds;
 mod generation_policy;
+mod generation_repetition;
 pub use generation_policy::{
     preview_chat_generation, projected_cognition, validate_output_allowance, ChatGenerationPreview,
 };
@@ -6629,6 +6631,17 @@ impl CapExit {
             }
             other => other,
         };
+        if let Err(error) = &result {
+            if error.downcast_ref::<generation_bounds::Stopped>().is_some() {
+                let (mut text, streamed, usage) = self.fallback();
+                generation_bounds::append_notice(&mut text, error);
+                return Ok((
+                    text,
+                    streamed,
+                    merge_round_usage(usage, observability::reported_usage(error)),
+                ));
+            }
+        }
         if let Ok((json, attempt)) = result {
             let (content, usage) = extract(json);
             attempt_capture::complete(attempt.as_ref(), usage);
@@ -6860,6 +6873,7 @@ async fn final_summary_openai(
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
+    context_window: Option<u32>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
@@ -6877,6 +6891,15 @@ async fn final_summary_openai(
         "stream_options": {"include_usage": true},
     });
     generation_policy.apply_to_chat_completions_body(&mut body);
+    generation_bounds::apply_chat(
+        &mut body,
+        chat_url,
+        generation_policy.output_allowance,
+        context_window,
+        cap.request_budget.unwrap_or_else(|| {
+            calibrate_up(estimate_tokens(&messages, cap.estimation), cap.calibration)
+        }),
+    )?;
     cap.finish_with_decoder(
         chat_url,
         attempts,
@@ -7070,6 +7093,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let smart_verify = action_nudges && prompt_disposition == PromptDisposition::Act;
     let action_nudges = action_nudges && smart_harness.is_none();
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
+    let mut generation_window = num_ctx;
     let generation_policy = generation_policy::GenerationPolicy::resolve(
         cognition,
         output_allowance,
@@ -7081,8 +7105,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut cognition_drop_used = false;
     // The lower-level policy for the single round that follows the drop.
     let mut retry_policy: Option<(usize, generation_policy::GenerationPolicy)> = None;
-    // Every body this loop sends applies `generation_policy`, so the cap is
-    // server-enforced exactly when the policy projects `max_tokens`.
+    // Initial policy observation; each assembled request below records the
+    // independent generation guard's actual server-enforced cap.
     observability::observe_output_allowance(
         &mut solve_obs,
         generation_policy.output_allowance,
@@ -7683,6 +7707,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 send_budget_authoritative,
                 mid_loop_trim_tokens,
             );
+            let output_cap = generation_bounds::apply_chat(
+                &mut body,
+                &chat_url,
+                round_policy.output_allowance,
+                generation_window,
+                request_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
+            )?;
+            observability::observe_output_allowance(&mut solve_obs, Some(output_cap), true);
             let measured_prompt_tokens = std::sync::atomic::AtomicUsize::new(0);
             let admission_commit_failure = std::sync::OnceLock::new();
             let max_attempts = retry.max_retries.saturating_add(1);
@@ -7865,6 +7897,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             })
                         {
                             if let Some(context_window) = recovered_window {
+                                generation_window = Some(
+                                    generation_window
+                                        .map_or(context_window, |old| old.min(context_window)),
+                                );
                                 emit_context_window_400(&mut on_round_usage, context_window);
                             }
                             // The callback returns the endpoint's full hard window,
@@ -9340,6 +9376,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         api_key,
         trimmed,
         generation_policy,
+        generation_window,
         &cap,
         attempts,
     );
@@ -12281,6 +12318,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // about what it means for this wire instead of silently defaulting.
         emits_leading_reasoning: _,
     } = ctx;
+    let mut generation_window = num_ctx;
     let generation_policy = generation_policy::GenerationPolicy::resolve_responses(
         cognition,
         output_allowance,
@@ -12315,7 +12353,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
-        .timeout(std::time::Duration::from_secs(inference_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let responses_url = format!("{}/v1/responses", url.trim_end_matches('/'));
     let retry = tui_retry_policy(url);
@@ -12690,7 +12728,19 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             if let Some(harness) = smart_harness {
                 harness.record_responses_messages(instructions.as_deref(), &input)?;
             }
-            let body = build_body(&input, if tools_supported { &tools } else { &[] });
+            let mut body = build_body(&input, if tools_supported { &tools } else { &[] });
+            let output_cap = generation_bounds::apply_responses(
+                &mut body,
+                generation_policy.output_allowance,
+                generation_window,
+                estimate_responses_request_real_tokens(
+                    instructions.as_deref(),
+                    &input,
+                    tools_supported.then_some(tools.as_slice()),
+                    estimation,
+                    cal,
+                ),
+            );
             let policy = responses_wire_validation::ResponsesWirePolicy {
                 store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
                 tools_permitted: true,
@@ -12706,6 +12756,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 Some(reason) => anyhow::Error::new(e).context(reason.to_string()),
                 None => anyhow::Error::new(e),
             })?;
+            observability::observe_output_allowance(&mut solve_obs, Some(output_cap?), true);
             let dispatch = dispatch_responses_json(
                 &client,
                 &responses_url,
@@ -12779,6 +12830,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             })
                         {
                             if let Some(context_window) = recovered_window {
+                                generation_window = Some(
+                                    generation_window
+                                        .map_or(context_window, |old| old.min(context_window)),
+                                );
                                 emit_context_window_400(&mut on_round_usage, context_window);
                             }
                             // Tighten the shared state MONOTONICALLY (a recovery may
@@ -13673,7 +13728,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // typed strict-wire gate the rounds use, with `tools_permitted = false` so the
     // final summary can carry NO tools; a proactive-compaction reason (if any) rides
     // its error chain. Only a `ValidatedResponsesRequest` reaches the dispatcher.
-    let body = build_body(&input, &[]);
+    let mut body = build_body(&input, &[]);
+    let output_cap = generation_bounds::apply_responses(
+        &mut body,
+        generation_policy.output_allowance,
+        generation_window,
+        estimate_responses_request_real_tokens(
+            instructions.as_deref(),
+            &input,
+            None,
+            estimation,
+            cal,
+        ),
+    )?;
+    observability::observe_output_allowance(&mut solve_obs, Some(output_cap), true);
     let policy = responses_wire_validation::ResponsesWirePolicy {
         store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
         tools_permitted: false,
@@ -13749,7 +13817,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 error = %error,
                 "Responses cap-exit summary dispatch failed; returning captured progress"
             );
-            let text = finalize_final_text(
+            let mut text = finalize_final_text(
                 cap_exit_fallback(
                     current_tool_round_limit,
                     cap_accumulated,
@@ -13763,6 +13831,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &turn_claims,
                 &verification,
             );
+            generation_bounds::append_notice(&mut text, &error);
             if let Some(slot) = &mut end_reason {
                 **slot = Some(cap_reason);
             }

@@ -145,20 +145,31 @@ tokio::task_local! {
 /// outside this future preserves evidence when a host deadline cancels the
 /// read; dropping the future still releases the in-flight HTTP response.
 pub async fn read_response_bytes_into(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     bytes: &mut Vec<u8>,
 ) -> Option<reqwest::Error> {
+    read_response_bytes_into_checked(response, bytes, |_| Ok(()))
+        .await
+        .expect("unconditional byte observer cannot fail")
+}
+
+pub(crate) async fn read_response_bytes_into_checked(
+    mut response: reqwest::Response,
+    bytes: &mut Vec<u8>,
+    mut observe: impl FnMut(&[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<Option<reqwest::Error>> {
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 bytes.extend_from_slice(&chunk);
+                observe(&chunk)?;
                 #[cfg(test)]
                 let _ = RESPONSE_BYTES_READ.try_with(|count| {
                     count.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
                 });
             }
-            Ok(None) => return None,
-            Err(error) => return Some(error),
+            Ok(None) => return Ok(None),
+            Err(error) => return Ok(Some(error)),
         }
     }
 }

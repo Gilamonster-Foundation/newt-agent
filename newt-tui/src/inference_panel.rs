@@ -4,7 +4,7 @@
 //!
 //! Pure: the caller resolves every fact with the SAME functions the turn loop
 //! uses (`context_window::resolve`, `preview_chat_generation`), so the section
-//! cannot show a value the next request would not carry.
+//! reports policy values and explicitly labels the output cap as an upper bound.
 
 use newt_core::agentic::ChatGenerationPreview;
 use newt_core::backend_probe::{LaunchProbe, LlamaCppLaunch};
@@ -90,7 +90,8 @@ pub(crate) fn gather(
             .and_then(|t| t.output_allowance),
         capability,
         decision.reasoning_replay_scope(),
-    );
+    )
+    .with_generation_bound(choice.kind);
     let launch = LaunchProbe::from_result(tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             let client = reqwest::Client::builder()
@@ -251,7 +252,10 @@ fn thinking_rows(i: &Inference<'_>) -> Vec<LineRow> {
     };
     rows.push(row("sampling", &sampling, &sampling_from));
     let max_output = match (i.preview.max_output_tokens, i.preview.output_allowance) {
-        (Some(sent), _) => (fmt_count(u64::from(sent)), "sent as max_tokens".to_string()),
+        (Some(limit), _) => (
+            format!("up to {}", fmt_count(u64::from(limit))),
+            "request cap; may shrink to fit context".to_string(),
+        ),
         (None, Some(reserved)) => (
             "not sent".to_string(),
             format!("{} reserved locally", fmt_count(u64::from(reserved))),

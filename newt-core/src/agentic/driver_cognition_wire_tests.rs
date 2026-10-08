@@ -109,8 +109,13 @@ async fn cognition_capture_and_projection_agree_on_all_wires_with_smart_on_or_of
                 }
                 _ => {
                     assert!(request.get("reasoning").is_none());
-                    assert!(request.get("max_tokens").is_none());
-                    assert!(outcome.output_allowance.is_none());
+                    if wire == "ollama" {
+                        assert!(request.get("max_tokens").is_none());
+                        assert!(outcome.output_allowance.is_none());
+                    } else {
+                        assert_eq!(request["max_tokens"], 16_384);
+                        assert_eq!(outcome.output_allowance.unwrap().tokens, 16_384);
+                    }
                 }
             }
         }

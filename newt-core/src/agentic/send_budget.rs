@@ -308,16 +308,15 @@ pub(super) fn resolve_responses_budget(
 /// The **Responses** branch PROJECTS from the shared [`ResponsesBudgetState`]
 /// (via [`resolve_responses_budget`]) so the reported budget cannot diverge from
 /// what the Responses loop enforces: that state RESERVES local output via the
-/// cognition dial even though this wire sends no `max_output_tokens`, because a
+/// cognition dial before the dispatch guard selects `max_output_tokens`, because a
 /// declared window (#1526, invariant #4) must still leave room to generate. The
 /// projected value is the state's soft send budget — cached caps composed with
 /// the reserved hard ceiling — exactly what this seam has always returned.
 /// Explicitly capable **Chat Completions** endpoints receive Newt's local
 /// generation policy (its output reserve). **Anthropic** reserves the
 /// `max_tokens` it always sends (#2341). **Ollama and embedded** backends keep
-/// the percentage-only local ceiling. Ceiling-from-an-unsent-value is deliberate
-/// for Responses — the alternative is an over-window request that only a reactive
-/// 400 (or a silent truncation) can catch.
+/// the percentage-only local ceiling. Responses reserves its policy allowance
+/// here; the generation guard additionally limits the wire cap at dispatch.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn initial_context_input_budget(
@@ -560,8 +559,8 @@ pub(super) struct ResponsesBudgetState {
     num_ctx: Option<u32>,
     /// Configured percentage bound (`[context] input_ceiling_pct`).
     input_ceiling_pct: u32,
-    /// Resolved output allowance (this wire sends no `max_output_tokens`, but the
-    /// declared window must still leave room to generate). Reused when a cw-400
+    /// Resolved output allowance reserved before the wire generation guard
+    /// selects the final cap. Reused when a cw-400
     /// recovers the full window into the next input cap.
     output_reserve: Option<u32>,
     /// Declared/believed-safe window; the tool-exposure fallback clip budget.

@@ -102,6 +102,10 @@ async fn openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
     let body = |i: usize| -> serde_json::Value {
         serde_json::from_slice(&reqs[i].body).unwrap_or_default()
     };
+    // #2782: both recovered primary and cap requests reserve output inside
+    // the learned 40k window, above the admitted 32k input ceiling.
+    assert_eq!(body(1)["max_tokens"], 8_000);
+    assert_eq!(body(2)["max_tokens"], 8_000);
     assert!(
         body(1)["messages"].to_string().len() < body(0)["messages"].to_string().len(),
         "recovery must shrink the request before retrying the same logical round"

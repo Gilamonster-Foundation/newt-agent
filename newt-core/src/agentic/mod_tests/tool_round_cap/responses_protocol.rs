@@ -497,13 +497,10 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
         .any(|item| item["role"] == "user" && item["content"].as_str() == Some(exact_task))));
 }
 
-/// #2312 (A1, Responses): this wire declares no output-cap field, so an explicit
-/// allowance is a LOCAL reserve only — the request body is byte-identical
-/// across allowances and carries no guessed `max_output_tokens`, while
-/// `reasoning.effort` still follows cognition. (That the reserve reaches local
-/// admission is pinned by `output_allowance_resolves_once_across_every_budget_surface`.)
+/// #2782: Responses enforces its reserve, capped by the generation maximum.
+/// Changing the cap leaves unrelated cognition and prompt fields unchanged.
 #[tokio::test]
-async fn responses_output_allowance_never_changes_the_request_body() {
+async fn responses_output_allowance_bounds_the_request_body() {
     let address = regex::Regex::new(r"prompt:[0-9a-f-]{36}").expect("regex");
     let mut bodies = Vec::new();
     for (output_allowance, reserved) in
@@ -541,23 +538,20 @@ async fn responses_output_allowance_never_changes_the_request_body() {
         // Pin the per-turn active-prompt address so equality compares what the
         // allowance could change.
         let body = String::from_utf8_lossy(&requests[0].body);
-        let body: serde_json::Value =
+        let mut body: serde_json::Value =
             serde_json::from_str(&address.replace_all(&body, "prompt:ID")).unwrap();
-        assert!(
-            body.get("max_output_tokens").is_none(),
-            "{output_allowance:?}"
-        );
-        // #2312: no cap on the wire, so the reserve is local — the cognition
-        // table's 16,000 when nothing explicit was set.
+        let bounded = reserved.min(16_384);
+        assert_eq!(body["max_output_tokens"], bounded);
         assert_eq!(
             obs.output_allowance,
             Some(crate::agentic::OutputAllowance {
-                tokens: reserved,
-                enforced: crate::agentic::Enforcement::Local,
+                tokens: bounded,
+                enforced: crate::agentic::Enforcement::Server,
             }),
             "{output_allowance:?}"
         );
         assert_eq!(body["reasoning"]["effort"], "high");
+        body.as_object_mut().unwrap().remove("max_output_tokens");
         bodies.push(body);
     }
     assert_eq!(bodies[1], bodies[0]);
@@ -574,6 +568,10 @@ struct ResponsesToolThenMessage;
 impl Respond for ResponsesToolThenMessage {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        assert_eq!(
+            body["max_output_tokens"], 16_384,
+            "#2782: primary and cap summary are bounded"
+        );
         let has_result = body["input"]
             .as_array()
             .is_some_and(|items| items.iter().any(|i| i["type"] == "function_call_output"));
