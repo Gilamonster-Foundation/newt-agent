@@ -1725,3 +1725,142 @@ fn refused_first_placement_does_not_schedule_a_late_frame() {
     assert_eq!(renderer.repaint_requested.load(Ordering::Acquire), 0);
     assert!(renderer.output.lock().unwrap().frame.is_none());
 }
+
+/// #2809/#2800: a partial transcript row clamps a full-screen expanded grant.
+/// Refuse before scrolling or painting; a smaller frame must still park inside
+/// its grant, preserve that transcript, and obey finish/abandon ownership.
+fn partial_line_full_expand(abandon: bool) {
+    let term = ModelTerminal::new(80);
+    for row in 0..5 {
+        term.print(&format!("transcript-{row}\r\n"));
+    }
+    term.print("PARTIAL-END");
+    let before = term.bytes();
+    let transcript = term.all_rows();
+    let grants = Arc::new(Mutex::new(Vec::new()));
+    let recorded = grants.clone();
+    let screen = term.screen.clone();
+    let placer: Placer = Box::new(move |wanted| {
+        let screen = screen.lock().unwrap();
+        let place = newt_core::tty::place_below_cursor(
+            (screen.cursor_col as u16, screen.cursor_row as u16),
+            24,
+            wanted,
+            &[],
+            OnCollision::Shift,
+        )?;
+        recorded.lock().unwrap().push((wanted, place));
+        Some((None, place))
+    });
+    let renderer =
+        LiveSpillRenderer::with_writer_and_geometry(term.clone(), placer, 3, false, || {
+            Some((80, 24))
+        })
+        .unwrap();
+    renderer.start(1);
+    // Drive the view synchronously, without the optional input repaint worker.
+    renderer
+        .lock_state()
+        .view
+        .as_mut()
+        .unwrap()
+        .toggle_expanded();
+    let content = (0..25)
+        .map(|i| format!("content-{i}\n"))
+        .collect::<String>();
+    renderer.write(1, ToolOutputStream::Stdout, content.as_bytes());
+    let (wanted, place) = grants.lock().unwrap()[0];
+    assert_eq!(
+        (
+            wanted,
+            place.top,
+            place.height,
+            place.scroll,
+            place.return_to
+        ),
+        (24, 1, 23, 5, (11, 0))
+    );
+    assert_eq!(
+        term.bytes(),
+        before,
+        "undersized grant must emit no scroll, paint, or parking coordinates"
+    );
+    assert_eq!(term.all_rows(), transcript);
+    assert!(renderer.output.lock().unwrap().frame.is_none());
+    renderer.write(1, ToolOutputStream::Stdout, b"another chunk\n");
+    assert_eq!(
+        term.bytes(),
+        before,
+        "refusal cannot create a repaint/erase cycle"
+    );
+    assert!(renderer.output.lock().unwrap().placement_retry.is_none());
+
+    // Finish/abandon a refused generation cannot erase the partial transcript.
+    if abandon {
+        renderer.abandon(1);
+    } else {
+        renderer.finish(1);
+    }
+    renderer.finish(1);
+    assert_eq!(term.bytes(), before);
+    {
+        let screen = term.screen.lock().unwrap();
+        assert_eq!((screen.cursor_row, screen.cursor_col), (5, 11));
+    }
+
+    // A collapsed next generation fits and paints/parks wholly inside its grant.
+    renderer.start(2);
+    renderer.write(2, ToolOutputStream::Stdout, content.as_bytes());
+    let output = renderer.output.lock().unwrap();
+    let frame = output.frame.as_ref().unwrap();
+    assert_eq!((frame.place.top, frame.place.height), (6, 6));
+    assert_eq!(output.painted_lines.len(), 5);
+    drop(output);
+    let screen = term.screen.lock().unwrap();
+    assert_eq!((screen.cursor_row, screen.cursor_col), (11, 0));
+    assert_eq!(&screen.rows[..6], transcript.as_slice());
+    drop(screen);
+    let painted = term.bytes();
+    let emitted = std::str::from_utf8(&painted[before.len()..]).unwrap();
+    let coordinates: Vec<_> = emitted
+        .split("\x1b[")
+        .skip(1)
+        .filter_map(|sequence| {
+            let end = sequence.find(|ch: char| ('@'..='~').contains(&ch))?;
+            (sequence.as_bytes()[end] == b'H').then(|| sequence[..end].to_owned())
+        })
+        .collect();
+    assert_eq!(
+        coordinates,
+        ["7;1", "8;1", "9;1", "10;1", "11;1", "12;1"],
+        "every paint and parking coordinate must be inside the six-row grant"
+    );
+    if abandon {
+        renderer.abandon(2);
+        renderer.finish(2);
+        assert_eq!(
+            term.bytes(),
+            painted,
+            "abandon must leave residue untouched"
+        );
+        term.print("canonical\r\n");
+        assert_eq!(term.all_rows()[11], "canonical");
+    } else {
+        renderer.finish(2);
+        let screen = term.screen.lock().unwrap();
+        assert_eq!((screen.cursor_row, screen.cursor_col), (5, 11));
+        drop(screen);
+        term.print("canonical\r\n");
+        assert_eq!(term.all_rows()[5], "PARTIAL-ENDcanonical");
+    }
+}
+
+#[test]
+fn partial_line_full_expand_refusal_preserves_finish() {
+    partial_line_full_expand(false);
+}
+
+#[test]
+fn partial_line_full_expand_refusal_preserves_abandon() {
+    partial_line_full_expand(true);
+}

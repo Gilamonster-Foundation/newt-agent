@@ -912,6 +912,13 @@ fn paint_generation(
         };
         placed
     };
+    // A partial transcript row can clamp the grant below the requested size.
+    // Decline before scrolling or painting: the whole frame AND its blank
+    // parking row must fit, including when canonical output follows abandon.
+    if place.height < wanted {
+        output.placement_retry = None;
+        return;
+    }
 
     // `painted_lines` is kept for the reflow erase; see `OutputState`.
     let mut batch = Vec::new();
