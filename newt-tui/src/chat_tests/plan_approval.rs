@@ -360,8 +360,8 @@ impl PermissionGate for ScriptedGate {
     ) -> HumanQuestionOutcome {
         assert_eq!(
             options.iter().map(|o| o.id).collect::<Vec<_>>(),
-            vec!["no", "yes", "discuss"],
-            "the plan question offers exactly its three answers, no first"
+            vec!["yes", "no", "discuss"],
+            "the plan question offers exactly its three answers, yes first"
         );
         self.ask_question(question)
     }
@@ -453,7 +453,7 @@ fn approval_queues_exactly_one_harness_turn_with_the_presented_plan() {
 
     let effects = approve(&mut gate, &states, PlanEntry::ModelDuringAct, Some(&a));
 
-    assert_eq!(gate.asked, vec!["Approve this plan? [y/N/discuss] "]);
+    assert_eq!(gate.asked, vec!["Approve this plan? [Y/n/discuss] "]);
     assert!(!states.plan.is_plan_mode(), "clamp lifted");
     assert!(!effects.switch_to_dev);
     let (input, origin) = effects.queued.expect("one continuation").into_input();
@@ -481,14 +481,14 @@ fn approval_queues_exactly_one_harness_turn_with_the_presented_plan() {
     );
 }
 
-/// Reject, empty answer, cancel, exit, closed input, no operator, no gate:
+/// Reject, cancel, exit, closed/failed input, no operator, no gate:
 /// none of these queue anything, and the clamp stays. No gate outcome other
-/// than an explicit "yes" widens what the model may do.
+/// than a submitted answer widens what the model may do.
 #[test]
 fn every_non_approval_outcome_queues_nothing_and_keeps_the_clamp() {
     let outcomes = [
         answer("n"),
-        answer(""),
+        HumanQuestionOutcome::InputFailed,
         HumanQuestionOutcome::Cancelled,
         HumanQuestionOutcome::ExitRequested,
         HumanQuestionOutcome::InputClosed,
@@ -659,7 +659,7 @@ fn operator_selected_approval_asks_about_the_mode_switch_and_requests_it() {
     let effects = approve(&mut gate, &states, PlanEntry::OperatorSelected, Some(&a));
     assert_eq!(
         gate.asked,
-        vec!["Approve this plan and switch to /mode dev? [y/N/discuss] "]
+        vec!["Approve this plan and switch to /mode dev? [Y/n/discuss] "]
     );
     assert!(effects.switch_to_dev);
     assert!(effects.queued.is_some());
@@ -808,5 +808,40 @@ fn discussion_2799_unanswered_follow_up_retains_clamp_and_snapshot() {
             .take_approved(parent.active().root_prompt_id())
             .is_some());
         assert_eq!(gate.asked.len(), 2);
+    }
+}
+
+/// Submitting a blank accepts the displayed default, including an explicit
+/// /mode plan exit, and seeds one continuation from the presented snapshot.
+#[test]
+fn plan_default_yes_blank_approval_seeds_implementation() {
+    for entry in [
+        PlanEntry::IntakeInferred,
+        PlanEntry::ModelDuringAct,
+        PlanEntry::OperatorSelected,
+    ] {
+        for text in ["", "  "] {
+            let states = ConversationModeStates::default();
+            let parent = objective("A");
+            let shown = presented_plan(&states, &parent, "# approved default");
+            let mut gate = ScriptedGate::new([answer(text)]);
+            let effects = approve(&mut gate, &states, entry, Some(&parent));
+            assert!(!states.plan.is_plan_mode());
+            assert_eq!(effects.switch_to_dev, entry == PlanEntry::OperatorSelected);
+            assert!(gate.asked[0].contains("[Y/n/discuss]"));
+            let (input, origin) = effects.queued.expect("one implementing turn").into_input();
+            let ReadOutcome::Line(line) = input else {
+                panic!("implementation line")
+            };
+            assert!(line.contains(&shown.draft.markdown));
+            assert!(matches!(
+                origin,
+                ModelInputOrigin::HarnessPlanApproval { .. }
+            ));
+            assert!(states
+                .plan_draft
+                .take_approved(parent.active().root_prompt_id())
+                .is_none());
+        }
     }
 }

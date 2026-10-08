@@ -98,7 +98,7 @@ Everything after that is the existing handoff:
 | later calls in the same batch are clamped | dispatcher promotion to `Plan` when `is_plan_mode()` |
 | the turn ends after the batch | `pending_plan_approval_handoff` → `TurnEndReason::AwaitingOperator` |
 | the operator sees the plan | the turn-end hook prints the ledger block when no draft was presented |
-| the question | `run_plan_approval` → `PermissionGate::ask_choice` with `PLAN_APPROVAL_CHOICES` (no / yes / discuss, `no` default), the same selection form a permission prompt uses; `discuss` opens one free-text follow-up; a text-only gate falls back to `ask_question`, where `y`, `yes`, or a bare continuation (`go`, `do it`, `proceed`) approves |
+| the question | `run_plan_approval` → `PermissionGate::ask_choice` with `PLAN_APPROVAL_CHOICES` (yes / no / discuss, `yes` default), the same selection form a permission prompt uses; `discuss` opens one free-text follow-up; a text-only gate falls back to `ask_question`, where a blank submission, `y`, `yes`, or a bare continuation (`go`, `do it`, `proceed`) approves; cancellation, exit, unavailable, closed or failed input never approves |
 | approval | `set_plan_mode(false)` (the `ModelDuringAct` row: restores what the turn already held), the seed names the ledger plan when no draft exists |
 | denial or discussion | the clamp stays, exactly as for a model that called `enter_plan_mode` |
 

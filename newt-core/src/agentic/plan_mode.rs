@@ -149,32 +149,22 @@ pub enum PlanVerdict {
     StayClamped { feedback: Option<String> },
 }
 
-/// Pure: map one approval question's outcome to a verdict. `entry` is
-/// currently unused by the verdict itself (both variants exist for every
-/// entry) but is threaded through so a future refinement (e.g. a stricter
-/// answer grammar for one entry class) is a body change, not a signature one.
-///
-/// Recognizes `y`/`yes` (case-insensitive, trimmed) as approval and
-/// `n`/`no`/an empty line as a plain decline. Any other typed text — the
-/// accepted decision's `discuss` and `edit` responses both land here today,
-/// since the alt-screen editor `edit` would open is out of this design's
-/// scope — is kept verbatim as feedback rather than being parsed further.
-/// The three answers a plan question offers, in presentation order; `no` is
-/// the default a blank submission resolves to (fail-closed, like the terminal
-/// prompt's `[y/N/discuss]`). `discuss` opens a free-text follow-up whose text
-/// is fed back to the model.
+/// The three answers a plan question offers, in presentation order. `yes`
+/// is the default for a blank submission (`[Y/n/discuss]`). Cancellation or
+/// unavailable input is not a submission and never approves. `discuss` opens
+/// a free-text follow-up whose text is fed back to the model.
 pub const PLAN_APPROVAL_CHOICES: &[super::permissions::ChoiceSpec] = &[
-    super::permissions::ChoiceSpec {
-        id: "no",
-        label: "no — stay in plan mode",
-        key: "n",
-        role: newt_interaction::SemanticRole::Deny,
-    },
     super::permissions::ChoiceSpec {
         id: "yes",
         label: "yes — implement this plan",
         key: "y",
         role: newt_interaction::SemanticRole::Allow,
+    },
+    super::permissions::ChoiceSpec {
+        id: "no",
+        label: "no — stay in plan mode",
+        key: "n",
+        role: newt_interaction::SemanticRole::Deny,
     },
     super::permissions::ChoiceSpec {
         id: "discuss",
@@ -184,6 +174,9 @@ pub const PLAN_APPROVAL_CHOICES: &[super::permissions::ChoiceSpec] = &[
     },
 ];
 
+/// Map a submitted answer to approval, decline or verbatim feedback.
+/// Blank, `y`/`yes`, and bare continuation answers approve; `n`/`no` declines.
+/// Non-answer outcomes always retain the clamp, regardless of the default.
 #[must_use]
 pub fn plan_verdict(
     _entry: PlanEntry,
@@ -196,7 +189,10 @@ pub fn plan_verdict(
         return PlanVerdict::StayClamped { feedback: None };
     };
     let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("y")
+        || trimmed.eq_ignore_ascii_case("yes")
+    {
         return PlanVerdict::Approved;
     }
     // "go", "do it", "proceed", "ship it": the operator's natural yes at a
@@ -204,8 +200,7 @@ pub fn plan_verdict(
     if crate::classifiers::is_bare_continuation(trimmed) {
         return PlanVerdict::Approved;
     }
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("n") || trimmed.eq_ignore_ascii_case("no")
-    {
+    if trimmed.eq_ignore_ascii_case("n") || trimmed.eq_ignore_ascii_case("no") {
         return PlanVerdict::StayClamped { feedback: None };
     }
     PlanVerdict::StayClamped {
@@ -217,6 +212,36 @@ pub fn plan_verdict(
 mod tests {
     use super::super::permissions::HumanQuestionOutcome;
     use super::*;
+
+    /// The operator-selected default approves an actually submitted blank;
+    /// missing input remains a separate, non-answer outcome.
+    #[test]
+    fn plan_default_yes_blank_submission_approves() {
+        for entry in [
+            PlanEntry::IntakeInferred,
+            PlanEntry::ModelDuringAct,
+            PlanEntry::OperatorSelected,
+        ] {
+            for text in ["", "   ", "\t\n"] {
+                assert_eq!(
+                    plan_verdict(entry, HumanQuestionOutcome::Answer(text.into())),
+                    PlanVerdict::Approved
+                );
+            }
+        }
+    }
+
+    /// Selection UIs select the first offered answer when Enter is pressed.
+    #[test]
+    fn plan_default_yes_is_the_first_choice() {
+        assert_eq!(
+            PLAN_APPROVAL_CHOICES
+                .iter()
+                .map(|choice| choice.id)
+                .collect::<Vec<_>>(),
+            ["yes", "no", "discuss"]
+        );
+    }
 
     #[test]
     fn yes_approves_case_insensitively_and_trimmed() {
@@ -247,8 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn no_and_empty_decline_with_no_feedback() {
-        for text in ["n", "N", "no", "NO", "", "   "] {
+    fn no_declines_with_no_feedback() {
+        for text in ["n", "N", "no", "NO"] {
             assert_eq!(
                 plan_verdict(
                     PlanEntry::IntakeInferred,
@@ -285,10 +310,16 @@ mod tests {
             HumanQuestionOutcome::InputClosed,
             HumanQuestionOutcome::InputFailed,
         ] {
-            assert_eq!(
-                plan_verdict(PlanEntry::IntakeInferred, outcome),
-                PlanVerdict::StayClamped { feedback: None }
-            );
+            for entry in [
+                PlanEntry::IntakeInferred,
+                PlanEntry::ModelDuringAct,
+                PlanEntry::OperatorSelected,
+            ] {
+                assert_eq!(
+                    plan_verdict(entry, outcome.clone()),
+                    PlanVerdict::StayClamped { feedback: None }
+                );
+            }
         }
     }
 

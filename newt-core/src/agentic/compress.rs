@@ -126,7 +126,7 @@ pub(crate) fn is_compaction_message(m: &Value) -> bool {
 /// which composes it from the approved `render_report` draft plus
 /// `agentic::exit_plan_mode_result`'s initiative guidance) so a transcript or
 /// trace line can be traced back to the code and the knobs that shaped it —
-/// the `[y/N/discuss]` approval answer, `/mode plan` vs an inferred Plan
+/// the `[Y/n/discuss]` approval answer, `/mode plan` vs an inferred Plan
 /// turn, and the session initiative level (`--initiative` / `[initiative]`).
 ///
 /// Classification: it IS a harness-owned user-role message, so it joins
