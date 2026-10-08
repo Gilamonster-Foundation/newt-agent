@@ -23,8 +23,8 @@ pub(super) fn output_cap(
     let maximum = positive_env("NEWT_GENERATION_MAX_TOKENS", 16_384);
     let mut cap = allowance.unwrap_or(maximum).min(maximum);
     if let Some(window) = window {
-        let remaining = u64::from(window).saturating_sub(input as u64);
-        cap = cap.min(u32::try_from(remaining).unwrap_or(u32::MAX));
+        let (_, remaining) = super::send_budget::context_window_split(window, input, 0);
+        cap = cap.min(remaining);
     }
     if cap == 0 {
         return Err(DispatchError::context_exceeded(
