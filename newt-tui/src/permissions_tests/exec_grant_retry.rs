@@ -80,7 +80,7 @@ async fn interpreter_allow_once_executes_the_matching_retry() {
             "approval must not auto-replay a compound command"
         );
         assert_eq!(prompts.get(), 1);
-        let queued = gate.state.pending_command_retries.clone();
+        let queued = gate.pending_command_retries.clone();
         assert_eq!(queued.len(), 1, "{first}");
         let retry = dispatch(&command, &root, &baseline, &mut gate).await;
         assert_eq!(
@@ -89,7 +89,7 @@ async fn interpreter_allow_once_executes_the_matching_retry() {
             "{program}: queued={queued:?}, retry={retry}"
         );
         assert_eq!(prompts.get(), 1, "retry uses the existing once grant");
-        assert!(gate.state.pending_command_retries.is_empty());
+        assert!(gate.pending_command_retries.is_empty());
         assert!(gate.state.pending_once_grants.is_empty());
         assert!(gate.state.session_grants.is_empty());
         let refused = dispatch(&command, &root, &baseline, &mut gate).await;
@@ -124,12 +124,12 @@ fn command_retry_is_exact_one_shot_and_respects_denial_and_clamps() {
         ("/other/bash script.sh", "/ws"),
     ] {
         assert_eq!(gate.apply_command_retry(cmd, cwd, &base), base);
-        assert_eq!(gate.state.pending_command_retries.len(), 1);
+        assert_eq!(gate.pending_command_retries.len(), 1);
     }
     gate.preset_clamp = Some(base.clone());
     assert_eq!(gate.apply_command_retry(command, "/ws", &base), base);
     assert_eq!(
-        gate.state.pending_command_retries.len(),
+        gate.pending_command_retries.len(),
         1,
         "insufficient authority cannot spend the grant"
     );
@@ -146,5 +146,61 @@ fn command_retry_is_exact_one_shot_and_respects_denial_and_clamps() {
         .session_denials
         .insert((DenialKind::Exec, "/bin/bash".into()));
     assert_eq!(gate.apply_command_retry(command, "/ws", &base), base);
-    assert!(gate.state.pending_command_retries.is_empty());
+    assert!(gate.pending_command_retries.is_empty());
+}
+
+/// #2823: an unused interpreter approval must not survive the host turn's gate.
+#[tokio::test]
+async fn unused_approval_expires_when_the_turn_gate_is_dropped() {
+    use crate::disable_ocap_session_tests::EnvVar;
+    let _env = crate::test_env_guard::env_write_guard_async().await;
+    let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    assert!(newt_core::confined_exec::kernel_fs_fence_available());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("script.sh"), "printf ran >> marker\n").unwrap();
+    let base = Caveats {
+        exec: Scope::none(),
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..newt_core::confined_exec::workspace_confined_caveats(&root)
+    };
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    {
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        assert!(dispatch("bash script.sh", &root, &base, &mut gate)
+            .await
+            .starts_with("granted:"));
+        assert_eq!(
+            gate.apply_command_retry("bash unrelated.sh", root.to_str().unwrap(), &base),
+            base
+        );
+        assert!(!root.join("marker").exists());
+    }
+    let mut next_turn = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::Deny],
+        prompts.clone(),
+    );
+    next_turn.conversation_id = "another-conversation".into();
+    let result = dispatch("bash script.sh", &root, &base, &mut next_turn).await;
+    assert_eq!(
+        prompts.get(),
+        2,
+        "unused authority survived turn/conversation boundary: {result}"
+    );
+    assert!(!root.join("marker").exists());
 }
