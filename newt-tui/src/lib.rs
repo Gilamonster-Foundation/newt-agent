@@ -181,6 +181,7 @@ mod mcp_panel;
 mod mcp_token;
 pub mod probe;
 pub mod terminal_hyperlink;
+mod window_discovery;
 mod workspace_state;
 // The TTY rich inline input surface (issue #416). Feature-gated so the default
 // and headless/wyvern builds never compile it in — newt stays amphibious.

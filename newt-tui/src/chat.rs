@@ -1916,6 +1916,10 @@ fn session_body(
     // #1199: the server-declared window from adopt, fresh per session — feeds
     // the budget without the persisted cache.
     let mut inf_context_window: Option<u32> = choice.context_window;
+    let mut window_discovery = crate::window_discovery::WindowDiscovery::default();
+    if let Some(notice) = window_discovery.update(&mut choice, &mut inf_context_window) {
+        print_newt(&notice, color, verbose);
+    }
     // Numbered hard-window rejections are stronger than ordinary probes and
     // must survive into later turns. Keep their provenance separate so a
     // normal discovered window does not defeat an explicit experimental raise.
@@ -2489,9 +2493,10 @@ fn session_body(
     // in place whenever the selected model's resolution changes.
     let mem_budget = {
         let entry = cap_cache.entry(cap_id.clone()).or_default();
-        // Once per model per session, even on failure (Phase 20): the set
-        // insert returning true means this is the first attempt.
-        let updated = ctx_window_probed.insert(cap_id.clone())
+        // OpenAI metadata retries run in window_discovery, never synchronously
+        // on the input thread. Other backends retain their once-per-session probe.
+        let updated = inf_kind != newt_core::BackendKind::Openai
+            && ctx_window_probed.insert(cap_id.clone())
             && probe::ensure_context_window(
                 entry,
                 &inf_url,
@@ -3169,6 +3174,9 @@ fn session_body(
     let mut repeated_failures = newt_core::loop_watch::RepeatedFailureWatch::default();
 
     loop {
+        if let Some(notice) = window_discovery.update(&mut choice, &mut inf_context_window) {
+            print_newt(&notice, color, verbose);
+        }
         // #1709 integration: refresh the embedded git tool's `CommitAttribution`
         // from the LIVE inference model + the resolved identity before this
         // turn's ChatCtx is built, so whatever commit this turn might make is
@@ -7912,6 +7920,13 @@ fn session_body(
                     // alone only early-outs on success). The derivation itself
                     // is `context_window::resolve`, shared with the startup
                     // memory budget and the `/settings` Model section (#2567).
+                    // Metadata retries never wait on the UI thread. Consume a
+                    // matching result before deriving this turn's budget.
+                    if let Some(notice) =
+                        window_discovery.update(&mut choice, &mut inf_context_window)
+                    {
+                        print_newt(&notice, color, verbose);
+                    }
                     let (context_window, eff_estimate_ratio) = {
                         let entry = cap_cache.entry(cap_id.clone()).or_default();
                         // #1199: the server-declared window from session-start
@@ -7922,7 +7937,8 @@ fn session_body(
                         // stale cached None can never starve a discovered
                         // window. The cache still holds the LEARNED facts
                         // (max_ok_input, estimate_ratio).
-                        let updated = inf_context_window.is_none()
+                        let updated = inf_kind != newt_core::BackendKind::Openai
+                            && inf_context_window.is_none()
                             && ctx_window_probed.insert(cap_id.clone())
                             && probe::ensure_context_window(
                                 entry,
