@@ -46,12 +46,7 @@ impl WindowDiscovery {
     }
     /// Starts once per endpoint/model and consumes each result once. No wait on
     /// the input thread; a route switch cannot adopt another model's answer.
-    fn poll(
-        &mut self,
-        endpoint: &str,
-        model: &str,
-        api_key: Option<&str>,
-    ) -> Option<Answer> {
+    fn poll(&mut self, endpoint: &str, model: &str, api_key: Option<&str>) -> Option<Answer> {
         if model.is_empty() {
             return None;
         }
