@@ -253,13 +253,16 @@ pub struct Placement {
 /// The placement rule behind [`Terminal::lease_below_cursor`], pure so it is
 /// table-tested without a terminal.
 ///
-/// The frame opens on the cursor's row. If it would run off the bottom, the
-/// transcript scrolls up by the deficit, unless somebody holds rows, since
+/// At column zero the frame opens on the cursor's row; otherwise it opens
+/// on the next row, preserving the partial line. Its height leaves room for
+/// that occupied row. If it would run off the bottom, the transcript scrolls
+/// up by the deficit, unless somebody holds rows, since
 /// the scroll would move theirs too. A request that would land on a holder
 /// or scroll one is CONTESTED and follows `policy`: refused, taken as
 /// declared, or shifted to the nearest free rows above the holder exactly as
 /// a bottom-anchored [`OnCollision::Shift`] lease is, with the cursor still
-/// returned to where it was. The shift is about where the FRAME goes.
+/// returned to where it was. The shift is about where the FRAME goes; it may
+/// overwrite transcript rows above the holder and does not preserve their text.
 pub fn place_below_cursor(
     cursor: (u16, u16),
     screen_rows: u16,
@@ -268,12 +271,19 @@ pub fn place_below_cursor(
     policy: OnCollision,
 ) -> Option<Placement> {
     let rows = screen_rows.max(1);
-    let height = height.clamp(1, rows);
     let (x, y) = (cursor.0, cursor.1.min(rows - 1));
-    // Never larger than `y`, because `height` is no larger than `rows`.
-    let overflow = y.saturating_add(height).saturating_sub(rows);
+    let occupied = u16::from(x > 0);
+    let available = rows - occupied;
+    if available == 0 {
+        return None;
+    }
+    // Keep an occupied row on screen, including for a full-height request.
+    let height = height.clamp(1, available);
+    let start = y + occupied;
+    // The deficit cannot exceed y, and this subtraction avoids sum overflow.
+    let overflow = height.saturating_sub(rows - start);
     let natural = Placement {
-        top: y - overflow,
+        top: start - overflow,
         height,
         scroll: overflow,
         return_to: (x, y - overflow),
@@ -940,9 +950,11 @@ impl Terminal {
         })
     }
 
-    /// Lease `height` rows directly under the cursor — the row the transcript
-    /// ends on — handed out blank with the cursor parked on their first row,
-    /// and have the cursor put back where it was when the lease drops.
+    /// Lease up to `height` rows at column zero's cursor row, or below an
+    /// occupied cursor row. Hand them out blank with the cursor on their first
+    /// row; on drop, return to the original column and scroll-adjusted row.
+    /// A partial transcript line remains outside an uncontested frame's rows.
+    /// A contested `Shift` can still overwrite transcript above a holder.
     ///
     /// **This is the one lease that erases on drop**, because it is the one
     /// whose rows the arbiter placed. Before it, every inline frame decided

@@ -919,7 +919,7 @@ fn split_single_pipe(command: &str) -> Option<(&str, &str)> {
 /// (bytes), extra operands, or a missing/zero/non-numeric count are all
 /// refused — this is the ONE place that decides the trim shape is safe to
 /// apply, so it stays conservative rather than guessing at intent.
-fn parse_trim_spec(spec: &str) -> Option<Value> {
+pub(super) fn parse_trim_spec(spec: &str) -> Option<Value> {
     let tokens: Vec<&str> = spec.split_ascii_whitespace().collect();
     let mode = match tokens.first().copied() {
         Some("tail") => "tail",

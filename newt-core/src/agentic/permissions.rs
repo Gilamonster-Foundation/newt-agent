@@ -299,6 +299,17 @@ pub enum HumanQuestionOutcome {
 /// The call blocks the agentic loop like a long tool call (issue #263 §6 of
 /// the design notes). Implementations that auto-allow previously
 /// session-granted targets must still return freshly minted caveats.
+/// One answer a [`PermissionGate::ask_choice`] question offers: the wire id
+/// the answer carries, the label a surface shows, the accelerator a keyboard
+/// surface offers, and what picking it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChoiceSpec {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub key: &'static str,
+    pub role: newt_interaction::SemanticRole,
+}
+
 pub trait PermissionGate {
     /// Read current standing authority without prompting or consuming an
     /// allow-once grant. Apply approved grants to the caller's baseline without
@@ -402,6 +413,17 @@ pub trait PermissionGate {
     /// it: implementations without an operator return
     /// [`HumanQuestionOutcome::Unavailable`] rather than blocking.
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome;
+
+    /// Ask the operator to pick one of a few named answers — a plan
+    /// approval's yes / no / discuss — through the same decision form a
+    /// permission prompt uses, so a decision is a selection, not a text box.
+    /// The answer is the chosen option's id. The first option is the default
+    /// a blank submission resolves to. Gates that only gather text (tests,
+    /// legacy embedders) fall back to [`Self::ask_question`], and the typed
+    /// text stands in for an option id.
+    fn ask_choice(&mut self, question: &str, _options: &[ChoiceSpec]) -> HumanQuestionOutcome {
+        self.ask_question(question)
+    }
 }
 
 /// Build the widened *policy* for a re-mint: `base` with each grant's target

@@ -86,3 +86,60 @@ fn compression_notice_visual_preview() {
     }
     println!();
 }
+
+/// Every number in the overflow notice is one the decision used, and no bare
+/// comparison can read as false.
+#[test]
+fn overflow_notice_prints_the_numbers_the_decision_used() {
+    use super::{overflow_notice_text, OverflowReason};
+    let empty = overflow_notice_text(
+        &OverflowReason::EmptyReplyNearWindow {
+            prompt_tokens: 74_256,
+            window: 83_885,
+            trigger_pct: 85,
+        },
+        "ornith",
+        1,
+    );
+    assert!(
+        empty.contains("returned nothing at 74,256 prompt tokens"),
+        "{empty}"
+    );
+    assert!(
+        empty.contains("past 85% of its 83,885-token window"),
+        "{empty}"
+    );
+    assert!(!empty.contains('>'), "no bare comparison: {empty}");
+    assert!(empty.contains("attempt 1/2"), "{empty}");
+
+    let refused = overflow_notice_text(
+        &OverflowReason::Refused {
+            request_estimate: Some(91_204),
+            window: Some(83_885),
+            trim_to: 74_000,
+        },
+        "ornith",
+        2,
+    );
+    assert!(
+        refused.contains(
+            "refused a request of about 91,204 tokens (window 83,885); trimming to 74,000"
+        ),
+        "{refused}"
+    );
+    assert!(refused.contains("attempt 2/2"), "{refused}");
+
+    let blind = overflow_notice_text(
+        &OverflowReason::Refused {
+            request_estimate: None,
+            window: None,
+            trim_to: 60_000,
+        },
+        "ornith",
+        1,
+    );
+    assert!(
+        blind.contains("refused the request as too large; trimming to 60,000"),
+        "{blind}"
+    );
+}

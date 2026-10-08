@@ -140,10 +140,12 @@ fn interaction_view_child() {
         }
         // **Where the next line lands.** The four placements the arbiter
         // decides for a frame under the transcript; see `committed_frame_case`.
-        "committed_frame" => committed_frame_case(5, false, true),
-        "committed_frame_held" => committed_frame_case(5, true, false),
-        "committed_frame_scroll" => committed_frame_case(22, false, true),
-        "committed_frame_contested" => committed_frame_case(18, true, false),
+        "committed_frame" => committed_frame_case(5, false, true, false),
+        "committed_frame_held" => committed_frame_case(5, true, false, false),
+        "committed_frame_scroll" => committed_frame_case(22, false, true, false),
+        "committed_frame_contested" => committed_frame_case(18, true, false, false),
+        "committed_frame_partial" => committed_frame_case(5, false, true, true),
+        "committed_frame_partial_scroll" => committed_frame_case(23, false, true, true),
         "cockpit_resize" => {
             crate::cockpit::presenter::panel_resize_case();
         }
@@ -210,7 +212,7 @@ const FRAME_HOLDER_SENTINEL: &str = "HOLDER-ROW";
 /// `RichSurface::present_interaction` makes — and commit one more line the
 /// moment it closes. The parent replays the bytes with erases and reads where
 /// that line landed.
-fn committed_frame_case(lines: u16, held: bool, window: bool) {
+fn committed_frame_case(lines: u16, held: bool, window: bool, partial: bool) {
     use std::io::Write as _;
     let mut out = std::io::stdout();
     write!(out, "\x1b[2J\x1b[H").expect("clear");
@@ -238,6 +240,10 @@ fn committed_frame_case(lines: u16, held: bool, window: bool) {
         out.flush().expect("flush");
         holder
     });
+    if partial {
+        write!(out, "PARTIAL-END").expect("partial sentinel without newline");
+        out.flush().expect("flush partial sentinel");
+    }
     let interaction = fixture_interaction();
     let window = window.then(|| {
         newt_core::tty::Terminal::suspend_for_prompt(
@@ -1218,7 +1224,11 @@ fn the_interaction_frame_never_enters_the_alternate_screen() {
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_clean_close_leaves_the_terminal_exactly_as_it_was_found() {
-    assert_restored("clean", &drive("clean"));
+    let out = drive("clean");
+    assert_restored("clean", &out);
+    // PR #2799: a raw-mode guard must not consume the caller's input through
+    // a cursor query. The release byte must reach the child's own reader.
+    assert!(!out.screen.contains("\x1b[6n"), "{:?}", out.screen);
 }
 
 /// **The failure path.** The one that turns a bug into a wrecked terminal,
@@ -1496,6 +1506,7 @@ fn painted(pump: &mut crate::panel_raw_mode_pty_test::Pump<'_>, needle: &str, ro
 /// and the whole byte stream for the failure message.
 struct Committed {
     grid: Vec<String>,
+    open_grid: Vec<String>,
     cursor: (usize, usize),
     stream: String,
 }
@@ -1510,11 +1521,13 @@ fn drive_committed_frame(mode: &str, answer_queries: bool) -> Committed {
     pty.resize(ROWS as u16, 80);
     let mut child = spawn_child(&pty, mode);
     let mut pump = crate::panel_raw_mode_pty_test::Pump::new(&pty, answer_queries, ROWS);
+    let mut open_grid = Vec::new();
     let result = (|| -> Result<(), String> {
         // The deny option, as the frame spells it: `[d]eny (default)`.
         if !painted(&mut pump, "(default)", ROWS) {
             return Err("the frame never painted its options".into());
         }
+        open_grid = erasing_grid(&pump.transcript, ROWS);
         // Enter takes the default (deny); the frame closes and the child
         // commits the line this test is about.
         pty.type_in("\r");
@@ -1541,6 +1554,7 @@ fn drive_committed_frame(mode: &str, answer_queries: bool) -> Committed {
     let (grid, cursor) = erasing_screen(before_outcome, ROWS);
     Committed {
         grid,
+        open_grid,
         cursor,
         stream,
     }
@@ -1598,6 +1612,38 @@ fn after_a_frame_the_next_line_prints_directly_under_the_transcript() {
         "rows under the committed line are not blank: {:#?}",
         c.grid
     );
+}
+
+/// #2800: grounds the pure partial-row erase test in the real frame lifecycle.
+/// The sentinel has no newline: it must survive both opening and closing,
+/// including deficit scrolling, and subsequent output must append to it.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_partial_transcript_line_survives_opening_and_closing_a_frame() {
+    for mode in ["committed_frame_partial", "committed_frame_partial_scroll"] {
+        let c = drive_committed_frame(mode, true);
+        assert!(
+            c.open_grid
+                .iter()
+                .any(|row| row.trim_end() == "PARTIAL-END"),
+            "{mode}: opening erased the partial line: {:#?}; stream={:?}",
+            c.open_grid,
+            c.stream
+        );
+        let row = c
+            .grid
+            .iter()
+            .position(|row| row.trim_end() == "PARTIAL-ENDCOMMITTED-AFTER-FRAME")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{mode}: closing lost the line or its return column: {:#?}; stream={:?}",
+                    c.grid, c.stream
+                )
+            });
+        assert_eq!(c.cursor, (row + 1, 0));
+        assert_frame_erased(mode, &c);
+    }
 }
 
 /// **The operator's report (2026-10-06/07), reproduced.** Something holds

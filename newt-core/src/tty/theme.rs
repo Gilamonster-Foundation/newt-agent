@@ -68,6 +68,11 @@ pub enum Role {
 
     /// Model reasoning and its closing label, independent of the final reply.
     Thinking,
+    /// The model's own words mid-turn: the sentence it sends beside a tool
+    /// batch, saying what it is about to do. Distinct from [`Self::AgentText`]
+    /// (the reply) and [`Self::Thinking`] (reasoning), so intent reads apart
+    /// from answer at a glance.
+    Narration,
 
     /// The slab a `!` or `:` command is rendered on.
     CommandBackground,
@@ -140,6 +145,7 @@ pub struct Theme {
     removed: Color,
     removed_background: Color,
     thinking: Color,
+    narration: Color,
     command_background: Color,
     command_background_inactive: Color,
     command_bang: Color,
@@ -208,6 +214,7 @@ impl Theme {
                 b: 32,
             },
             thinking: Color::DarkGrey,
+            narration: Color::Magenta,
             command_background: Color::Rgb {
                 r: 82,
                 g: 82,
@@ -253,6 +260,7 @@ impl Theme {
             Role::Removed => self.removed,
             Role::RemovedBackground => self.removed_background,
             Role::Thinking => self.thinking,
+            Role::Narration => self.narration,
             Role::CommandBackground => self.command_background,
             Role::CommandBackgroundInactive => self.command_background_inactive,
             Role::CommandBang => self.command_bang,
@@ -342,6 +350,7 @@ impl Theme {
                 Role::Removed => self.removed = *color,
                 Role::RemovedBackground => self.removed_background = *color,
                 Role::Thinking => self.thinking = *color,
+                Role::Narration => self.narration = *color,
                 Role::CommandBackground => self.command_background = *color,
                 Role::CommandBackgroundInactive => self.command_background_inactive = *color,
                 Role::CommandBang => self.command_bang = *color,
@@ -436,6 +445,7 @@ pub fn role_from_name(name: &str) -> Option<Role> {
         "removed" => Role::Removed,
         "removed-background" => Role::RemovedBackground,
         "thinking" => Role::Thinking,
+        "narration" => Role::Narration,
         "command-background" => Role::CommandBackground,
         "command-background-inactive" => Role::CommandBackgroundInactive,
         "command-bang" => Role::CommandBang,
@@ -476,6 +486,7 @@ pub const ALL_ROLES: &[Role] = &[
     Role::Removed,
     Role::RemovedBackground,
     Role::Thinking,
+    Role::Narration,
     Role::CommandBackground,
     Role::CommandBackgroundInactive,
     Role::CommandBang,
@@ -515,6 +526,7 @@ pub fn role_name(role: Role) -> &'static str {
         Role::Removed => "removed",
         Role::RemovedBackground => "removed-background",
         Role::Thinking => "thinking",
+        Role::Narration => "narration",
         Role::CommandBackground => "command-background",
         Role::CommandBackgroundInactive => "command-background-inactive",
         Role::CommandBang => "command-bang",
@@ -890,6 +902,18 @@ mod tests {
         assert_eq!(t.color(Role::Identity), Color::DarkMagenta);
     }
 
+    /// The model's mid-turn narration reads apart from its reply, its
+    /// reasoning, and the operator's own text in the default theme.
+    #[test]
+    fn narration_is_distinct_from_reply_thinking_and_human_text() {
+        let t = Theme::builtin();
+        assert_eq!(t.color(Role::Narration), Color::Magenta);
+        assert_ne!(t.color(Role::Narration), t.color(Role::AgentText));
+        assert_ne!(t.color(Role::Narration), t.color(Role::Thinking));
+        assert_ne!(t.color(Role::Narration), t.color(Role::HumanText));
+        assert_ne!(t.color(Role::Narration), t.color(Role::Dim));
+    }
+
     /// Reasoning and activity remain visibly distinct in the default theme.
     #[test]
     fn thinking_and_activity_keep_separate_default_colors() {
@@ -911,7 +935,7 @@ mod tests {
             );
             assert_eq!(name, name.to_ascii_lowercase(), "names are kebab-case");
         }
-        assert_eq!(ALL_ROLES.len(), 34, "add the new role to ALL_ROLES too");
+        assert_eq!(ALL_ROLES.len(), 35, "add the new role to ALL_ROLES too");
         assert_eq!(role_from_name("nonsense"), None);
     }
 

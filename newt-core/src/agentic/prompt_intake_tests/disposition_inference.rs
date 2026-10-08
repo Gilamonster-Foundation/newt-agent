@@ -553,3 +553,116 @@ fn round_3_noun_and_underscore_false_matches_are_fixed() {
         );
     }
 }
+
+/// A prompt that opens collaboratively proposes the work instead of ordering
+/// it, so it reads as `Plan` before any action needle can claim it. The first
+/// row is the exact prompt that otherwise hits BOTH the `refactor` action
+/// needle and the `largest` research needle; "shall we … TOML?" proves the
+/// opener beats the `?` fallback too; the U+2019 row proves the smart
+/// apostrophe, which `to_ascii_lowercase` leaves alone, is its own entry.
+#[test]
+fn a_collaborative_opener_plans_before_the_action_needle_acts() {
+    let lex = DispositionLexicon::default();
+    for prompt in [
+        "let's refactor the largest file",
+        "lets fix the flaky test",
+        "We should split prompt_intake.rs",
+        "how about we drop the cache layer",
+        "I'm thinking we rewrite intake in wyvern",
+        "shall we move the lexicon to TOML?",
+        "Let’s refactor tools.rs",
+    ] {
+        assert_eq!(infer(prompt, &lex), PromptDisposition::Plan, "{prompt:?}");
+    }
+}
+
+/// The opener alone is not a proposal. A bare nudge behind it carries no
+/// objective of its own ([`crate::classifiers::is_bare_continuation`] on the
+/// remainder), so the prompt falls through to the ordinary ladder and acts,
+/// exactly as the nudge does without the opener.
+#[test]
+fn a_bare_continuation_behind_a_collaborative_opener_still_acts() {
+    let lex = DispositionLexicon::default();
+    for prompt in [
+        "let's go",
+        "Let's go!",
+        "let's continue",
+        "lets proceed",
+        "let's land it",
+        "let's ship it",
+        "let's do it",
+    ] {
+        assert_eq!(infer(prompt, &lex), PromptDisposition::Act, "{prompt:?}");
+    }
+}
+
+/// The opener is read at the START of an ask, never anywhere in the prompt:
+/// a mid-clause "we should" is a subordinate clause, and the prompt keeps the
+/// reading its own verb gives it.
+#[test]
+fn a_collaborative_phrase_mid_clause_is_not_an_opener() {
+    let lex = DispositionLexicon::default();
+    for (prompt, expected) in [
+        ("fix the bug we should have caught", PromptDisposition::Act),
+        (
+            "explain why we should pin serde",
+            PromptDisposition::Explain,
+        ),
+    ] {
+        assert_eq!(infer(prompt, &lex), expected, "{prompt:?}");
+    }
+}
+
+/// `extract_atomic_asks_with` splits on lines (and on `;` / `. `), so this
+/// prompt is two asks: one collaborative, one plain imperative. The check is
+/// `all()` over the asks: a proposal is positive evidence read from every
+/// ask, never inferred from one ask among orders, so one plain imperative
+/// keeps the prompt on its ordinary reading, where `fix` acts.
+#[test]
+fn a_mixed_prompt_with_one_collaborative_ask_keeps_its_own_reading() {
+    let prompt = "let's talk about the parser\nthen fix the failing test";
+    assert_eq!(
+        infer(prompt, &DispositionLexicon::default()),
+        PromptDisposition::Act,
+        "one plain imperative among the asks keeps the ordinary reading"
+    );
+}
+
+/// A bounded verb behind the opener is an order, not a proposal: "let's
+/// commit this" asks for the commit. The verbs are lexicon data too.
+#[test]
+fn a_direct_verb_behind_a_collaborative_opener_still_acts() {
+    let lex = DispositionLexicon::default();
+    for prompt in [
+        "let's commit this",
+        "let's push",
+        "lets run the tests",
+        "Let's merge it!",
+        "let's rebase onto main",
+        "we should build and test first",
+    ] {
+        assert_eq!(infer(prompt, &lex), PromptDisposition::Act, "{prompt:?}");
+    }
+    let dropped = DispositionLexicon {
+        direct_verbs: vec![],
+        ..DispositionLexicon::default()
+    };
+    assert_eq!(
+        infer("let's commit this", &dropped),
+        PromptDisposition::Plan
+    );
+}
+
+/// The openers are lexicon data, droppable like every other list: with the
+/// list emptied, the action needle decides exactly as it did before.
+#[test]
+fn collaborative_openers_are_droppable_lexicon_data() {
+    let dropped = DispositionLexicon {
+        collaborative: vec![],
+        ..DispositionLexicon::default()
+    };
+    assert_eq!(
+        infer("let's refactor the largest file", &dropped),
+        PromptDisposition::Act
+    );
+}

@@ -2231,6 +2231,8 @@ fn host_shell_command_at(
         }
         let path = std::env::join_paths(paths).map_err(std::io::Error::other)?;
         c.env("PATH", path);
+    } else if route == ShellRoute::BashSh {
+        c.arg(agent_bridle_tool_shell::with_posix_command_discovery(cmd));
     } else {
         c.arg(cmd);
     }

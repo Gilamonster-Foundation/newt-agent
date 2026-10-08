@@ -730,9 +730,9 @@ fn placed(top: u16, height: u16, scroll: u16, return_to: (u16, u16)) -> Option<P
     })
 }
 
-/// The frame opens ON the cursor's row and the cursor comes back to it, so
-/// the next committed line lands directly under the transcript: the whole
-/// claim, in one table. The real-terminal half is `newt-tui`'s
+/// At column zero the frame opens on the cursor's row and returns there, so
+/// the next committed line lands directly under the transcript. The partial
+/// row case is tested separately below. The real-terminal half is `newt-tui`'s
 /// `interaction_view_pty_test` (`after_a_frame_…`).
 #[test]
 fn a_frame_opens_on_the_cursor_row_and_returns_the_cursor_there() {
@@ -740,10 +740,59 @@ fn a_frame_opens_on_the_cursor_row_and_returns_the_cursor_there() {
         place((0, 5), 6, &[], OnCollision::Shift),
         placed(5, 6, 0, (0, 5))
     );
-    // A partial row keeps its column.
+}
+
+/// #2800: a non-newline-terminated transcript must never be in the erase band.
+/// Byte assertions ground the geometry in the actual per-row erase writer.
+#[test]
+fn a_partial_transcript_row_survives_frame_erasure() {
+    for (cursor, expected) in [
+        ((11, 5), placed(6, 6, 0, (11, 5))),
+        ((11, 20), placed(18, 6, 3, (11, 17))),
+        ((11, 23), placed(18, 6, 6, (11, 17))),
+    ] {
+        let actual = place(cursor, 6, &[], OnCollision::Refuse).expect("placement");
+        let expected = expected.unwrap();
+        // Windows may execute these commands through the console API instead
+        // of writing ANSI to a byte sink. Geometry is checked on every target.
+        #[cfg(not(windows))]
+        {
+            let mut bytes = Vec::new();
+            blank_rows(
+                &mut super::LineWriter(&mut bytes),
+                actual.top,
+                actual.height,
+            )
+            .unwrap();
+            let expected_bytes: String = (expected.top..expected.top + expected.height)
+                .map(|row| format!("\x1b[{};1H\x1b[2K", row + 1))
+                .collect();
+            assert_eq!(
+                bytes,
+                expected_bytes.as_bytes(),
+                "cursor {cursor:?}: erase must start below committed text"
+            );
+            assert!(
+                !String::from_utf8(bytes)
+                    .unwrap()
+                    .contains(&format!("\x1b[{};1H\x1b[2K", actual.return_to.1 + 1)),
+                "the return row must not be erased on open or close"
+            );
+        }
+        assert_eq!(actual, expected);
+    }
+}
+
+/// #2800: reserve the partial transcript row even for oversized frame requests.
+#[test]
+fn a_partial_row_limits_the_frame_to_the_remaining_screen() {
     assert_eq!(
-        place((11, 5), 6, &[], OnCollision::Refuse),
-        placed(5, 6, 0, (11, 5))
+        place((11, 5), 40, &[], OnCollision::Shift),
+        placed(1, 23, 5, (11, 0))
+    );
+    assert_eq!(
+        place_below_cursor((11, 0), 1, 1, &[], OnCollision::Refuse),
+        None
     );
 }
 

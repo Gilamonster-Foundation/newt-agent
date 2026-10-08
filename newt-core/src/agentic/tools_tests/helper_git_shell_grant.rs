@@ -1,67 +1,13 @@
-/// The fixture git, by absolute path: an inherited `PATH` cannot substitute
-/// another binary, and it is the same root-owned `/usr/bin/git` the #2630
-/// exec-path alias is proven against. The kernel-fence tests skip without
-/// it; the rest fail loudly ([`hermetic_git`]).
+pub(in crate::agentic::tools) use super::super::git_fixture::{hermetic_git, hermetic_git_env};
+
 const FIXTURE_GIT: &str = "/usr/bin/git";
-
-/// The explicit, minimal environment every fixture git runs under, for BOTH
-/// the unconfined setup ([`hermetic_git`]) and the confined dispatch (the
-/// `"env"` seam of `dispatch_bridled_shell`): one definition, so "isolated
-/// enough not to touch a real repository" and "isolated enough to be a fair
-/// confinement proof" cannot drift apart. A private `HOME` plus
-/// `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_TEMPLATE_DIR` close the
-/// config and template sources that live outside the process environment
-/// (`/etc/gitconfig`, the operator's `~/.gitconfig`, `~/.config/git`).
-pub(in crate::agentic::tools) fn hermetic_git_env(
-    home: &std::path::Path,
-) -> std::collections::BTreeMap<String, String> {
-    let home = home.to_string_lossy();
-    [
-        ("HOME", home.as_ref()),
-        ("GIT_AUTHOR_NAME", "t"),
-        ("GIT_AUTHOR_EMAIL", "t@example.invalid"),
-        ("GIT_COMMITTER_NAME", "t"),
-        ("GIT_COMMITTER_EMAIL", "t@example.invalid"),
-        ("GIT_CONFIG_NOSYSTEM", "1"),
-        ("GIT_CONFIG_GLOBAL", "/dev/null"),
-        ("GIT_TEMPLATE_DIR", "/dev/null"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
-}
-
-/// Mirror of the vendored core's test-private `hermetic_git_command`
-/// (`vendor/agent-bridle-core/src/sandbox.rs`, bridle PR #407): `env_clear()`
-/// rather than a denylist, so an inherited `GIT_DIR`, `GIT_WORK_TREE`,
-/// `GIT_CEILING_DIRECTORIES`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`,
-/// `GIT_OBJECT_DIRECTORY` or any other ambient git knob cannot leak in,
-/// because nothing is inherited. Proven by
-/// [`hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture`].
-/// Widened to `pub(in crate::agentic::tools)` (#2681 round 3) so the
-/// `execute_tool_branch_tests::permissions` git-broker fixture reuses it
-/// too, rather than a second ad hoc git fixture that inherits the ambient
-/// `GIT_DIR`/`HOME`/hooks.
-pub(in crate::agentic::tools) fn hermetic_git(
-    dir: &std::path::Path,
-    home: &std::path::Path,
-) -> std::process::Command {
-    assert!(
-        std::path::Path::new(FIXTURE_GIT).exists(),
-        "the fixture git {FIXTURE_GIT} is absent"
-    );
-    let mut cmd = std::process::Command::new(FIXTURE_GIT);
-    cmd.current_dir(dir)
-        .env_clear()
-        .envs(hermetic_git_env(home));
-    cmd
-}
 
 /// The real-kernel-fence tests in this file need Landlock AND the
 /// root-owned fixture git; both are present in CI. A bare `return` on
 /// either being missing would make a quietly-green local run look identical
 /// to one that measured nothing — print an explicit line so a skip is
 /// visible in test output instead (#2686 review round 2).
+#[cfg(target_os = "linux")]
 fn skip_without_real_kernel_fence() -> bool {
     let available = crate::confined_exec::kernel_fs_fence_available()
         && std::path::Path::new(FIXTURE_GIT).exists();
@@ -997,7 +943,12 @@ fn git_shell_widening_grants_read_on_etc_gitconfig() {
 /// machinery, which only round-trips correctly from a `maybe_dispatch`-aware
 /// binary (`newt`/`brush_build_pipeline`'s `harness = false` tests) — never
 /// from the ordinary `cargo test` harness this file runs under.
+///
+/// Linux-only with its two users: the orphan-commit dispatch test below and
+/// `worktree_adoption_refs`, both real-kernel-fence tests.
+#[cfg(target_os = "linux")]
 struct QuietCommitPolicy;
+#[cfg(target_os = "linux")]
 impl agent_toolchain::native_git::CommitPolicy for QuietCommitPolicy {
     fn finalize_message(&self, message: &str) -> Result<String, String> {
         Ok(message.to_string())
@@ -1011,7 +962,9 @@ impl agent_toolchain::native_git::CommitPolicy for QuietCommitPolicy {
     fn committed(&self) {}
 }
 
+#[cfg(target_os = "linux")]
 pub(in crate::agentic::tools) struct FixtureGitTool;
+#[cfg(target_os = "linux")]
 impl crate::agentic::git_tool::GitTool for FixtureGitTool {
     fn native_commit_policy(
         &self,
@@ -1039,6 +992,14 @@ impl crate::agentic::git_tool::GitTool for FixtureGitTool {
 /// shape is produced by the dispatched command itself, not by an external
 /// mover, so this is reproducible every run rather than a timing-dependent
 /// race.
+///
+/// Linux-only like its siblings: the publication refusal is observable only
+/// after the spawn is ADMITTED. On macOS the forced `safe-subset` engine
+/// declares `StdioPosture::Unaudited`, so Seatbelt resolves a `net: none`
+/// axis `Unknown` and admission refuses L3 BOUND (`ExecOutcome::Denied`)
+/// before any git runs, which is the posture `newt-cli`'s cfg(macos) probe
+/// and doctor tests already pin.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_failure_not_passed() {
     let _env = super::disable_ocap_tests::env_lock().await;
@@ -1122,6 +1083,7 @@ async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_fai
 }
 
 /// Like [`real_git`], but returns trimmed stdout.
+#[cfg(target_os = "linux")]
 fn real_git_output(dir: &std::path::Path, args: &[&str]) -> String {
     let home = tempfile::tempdir().unwrap();
     let output = hermetic_git(dir, home.path()).args(args).output().unwrap();

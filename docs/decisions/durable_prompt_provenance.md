@@ -132,8 +132,9 @@ assigns one of five effective dispositions:
   disposition; and
 - `plan`: read evidence and update only the harness-owned plan ledger, without
   workspace mutation, command execution, network access, capability grants, or
-  generic MCP tools. This disposition is selected by the harness operating
-  mode rather than inferred from prompt wording.
+  generic MCP tools. This disposition is inferred from a collaborative opener
+  ("let's refactor…", "we should…", "shall we…") or selected by the harness
+  operating mode.
 
 Multiple asks do not imply ambiguity. Intake asks for clarification only when a
 blocking decision lacks provenance from an explicit operator statement, a

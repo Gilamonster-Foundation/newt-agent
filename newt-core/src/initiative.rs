@@ -62,6 +62,16 @@ impl Initiative {
         matches!(self, Self::Decisive | Self::Eager)
     }
 
+    /// Whether the first multi-step plan the model sets in an acting turn is
+    /// presented to the operator for approval before any mutation runs. The
+    /// patient and measured levels look before they act; decisive and eager
+    /// exist for models that must be pushed to act, and holding one of those
+    /// at a question would undo the push.
+    #[must_use]
+    pub fn asks_before_acting(self) -> bool {
+        matches!(self, Self::Patient | Self::Measured)
+    }
+
     /// Stable lowercase label: the wire, config and `/psyche initiative` spelling.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -471,6 +481,16 @@ mod tests {
         assert_eq!(Initiative::default(), Initiative::Measured);
         assert_eq!(Initiative::Measured.read_only_nudge_after(), 3);
         assert!(!Initiative::Measured.exit_plan_requires_edit());
+    }
+
+    /// Plan approval is asked only at the levels that look before acting.
+    #[test]
+    fn approval_is_asked_only_at_the_looking_levels() {
+        let asks: Vec<bool> = Initiative::all()
+            .iter()
+            .map(|l| l.asks_before_acting())
+            .collect();
+        assert_eq!(asks, vec![true, true, false, false]);
     }
 
     /// The built-in rounds: 12/3/2/1. Patient's 12 is the one intended change
