@@ -119,7 +119,8 @@ async fn worktree_adoption_round5_replacement_preserves_sentinel() {
 fn worktree_adoption_round5_pins_every_git_word_without_changing_operands() {
     let source =
         "pwd; git worktree add ../task -b task 2>&1 && echo 'git status; café' ; 'git' status";
-    let pinned = git_identity::pin(source, Path::new("/trusted tool/bin/git")).unwrap();
+    let pinned =
+        git_identity::pin(source, Path::new("/trusted tool/bin/git"), &Caveats::top()).unwrap();
     assert_eq!(pinned, "pwd; '/trusted tool/bin/git' worktree add ../task -b task 2>&1 && echo 'git status; café' ; '/trusted tool/bin/git' status");
     for source in [
         "# git status\ngit status",
@@ -129,7 +130,7 @@ fn worktree_adoption_round5_pins_every_git_word_without_changing_operands() {
         "echo $(git status)",
     ] {
         assert!(
-            git_identity::pin(source, Path::new("/trusted tool/bin/git")).is_err(),
+            git_identity::pin(source, Path::new("/trusted tool/bin/git"), &Caveats::top()).is_err(),
             "{source}"
         );
     }
