@@ -38,6 +38,11 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - native Seatbelt command/adoption contract (#2813),
+#     .github/workflows/macos-confined-contract.yml: command-shape rows,
+#     confined worktree adoption, local-push executor and broker-refusal controls,
+#     and plan approval (PR #2814). Portable tests remain scoped here; native
+#     macOS confinement is CI-only because it needs the macOS kernel.
 #   - packaged carried commands (#2776), .github/workflows/ci.yml Windows job:
 #     builds newt-carried-tools and the Brush runner, verifies pinned rg/BusyBox,
 #     stages only approved per-name executables, and runs scripts/windows/Test-CarriedTools.ps1 natively.
