@@ -73,14 +73,8 @@ fn worktree_adoption_round2_git_clean_operands_are_not_creation() {
 /// counterexample must preserve an untracked sentinel before any adoption;
 /// the legitimate display wrapper must still create and adopt the worktree.
 #[cfg(unix)]
-// #905: the unsafe batch still refuses, but the legitimate creation hits the
-// measured native Net-axis refusal. Any different failure must remain red.
-#[cfg_attr(
-    target_os = "macos",
-    should_panic(
-        expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"
-    )
-)]
+// macOS production counterpart lives in the harness=false native contract.
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 #[ignore = "requires native kernel confinement and git"]
 async fn worktree_adoption_round2_git_clean_preserves_sentinel() {
