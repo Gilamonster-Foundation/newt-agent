@@ -14,6 +14,7 @@ permissions:
 env:
   CARGO_BUILD_JOBS: 4
   RUSTC_WRAPPER: ""
+  CARGO_TERM_COLOR: never
 
 jobs:
   confined-contract-macos:
@@ -24,17 +25,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: taiki-e/install-action@cargo-nextest
       # No network/forge fixtures: fixed-argv local push exercises the adopted
       # common-dir policy, while the broker control still refuses local URLs.
       # The ignored git-clean row asserts a kernel fence exists (no soft skip).
       # Row (c): plan_mode includes PR #2814's blank => approve once it lands.
       - name: Run confinement contract rows
+        # Match hermetic fixture setup; do not select runner-owned Homebrew Git.
+        env:
+          NEWT_EXEC_PATHS: /usr/bin:/bin
         shell: bash
         run: |
           set -o pipefail
           nice -n 10 cargo nextest run --locked -p newt-core --lib --run-ignored all \
-            --status-level all --final-status-level all \
+            --no-fail-fast --status-level pass --final-status-level fail \
             -E 'test(command_shape_contract::) or test(worktree_adoption::tests::) or test(worktree_adoption_round2_git_clean_preserves_sentinel) or test(scope_all_push_to_a_local_path_is_refused_through_real_dispatch) or test(wrapped_worktree_push_dispatch_reaches_gate_and_honors_denial) or test(plan_mode::tests::)' \
             2>&1 | tee macos-confined-contract.log
       - name: Preserve per-row evidence
