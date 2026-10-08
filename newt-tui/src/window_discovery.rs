@@ -198,4 +198,33 @@ mod tests {
     async fn zero_window_stays_unknown() {
         assert!(bounded_window(async { Some(0) }).await.is_err());
     }
+    /// #2248/#2815: dropping the session cancels its in-flight metadata work.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_discovery_cancels_the_pending_probe() {
+        struct Dropped(Option<oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let (answer_tx, answer_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = Dropped(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            let _ = answer_tx.send(Ok(65536));
+        });
+        let mut discovery = WindowDiscovery::default();
+        discovery
+            .pending
+            .insert(("endpoint".into(), "model".into()), (task, answer_rx));
+        started_rx.await.unwrap();
+        drop(discovery);
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("probe cancelled without a wall-clock wait")
+            .expect("probe resources released after abort");
+    }
 }

@@ -343,10 +343,12 @@ makes the missing prior non-fatal.
 ## Metadata discovery for slow OpenAI-compatible routers (#2248)
 
 The short startup probe first reads the selected model's `/v1/models`
-metadata. A loaded llama.cpp router may provide `status.args`: explicit
-positive `-c`/`--ctx-size` and `-np`/`--parallel` values give a per-slot
-window by division. Automatic values, omitted parallelism and unified-KV
-layouts remain unknown; a sibling model's window is never substituted.
+metadata. A loaded llama.cpp router may provide `status.args`, but these
+are requested launch settings, not effective slot capacity. For example,
+`-c 262144 -np 2` suggests 131072 while a training-context cap can make the
+served slot 65536. Launch arguments therefore never establish the budget
+window; it remains unknown until effective metadata arrives. A sibling
+model's window is never substituted.
 
 The fallback is `GET /props?model=<URL-encoded model id>`, reading positive
 `default_generation_settings.n_ctx` (or top-level `n_ctx`). Bare router

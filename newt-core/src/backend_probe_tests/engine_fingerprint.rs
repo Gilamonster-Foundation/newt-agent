@@ -309,10 +309,10 @@ async fn no_props_route_yields_no_window_not_an_error() {
     );
 }
 
-/// #2248: a loaded router model exposes its launch context without waiting
-/// for the busy child's /props. Never borrow a sibling model's window.
+/// #2248/#2815: launch capacity is requested, not effective; training caps
+/// may lower it. Neither raw args nor a sibling model can establish the window.
 #[test]
-fn router_launch_window_is_per_model_and_per_slot() {
+fn router_launch_window_stays_provisional_until_props() {
     for args in [
         serde_json::json!(["llama-server", "-c", "262144", "-np", "2"]),
         serde_json::json!(["llama-server", "--ctx-size=262144", "--parallel=2"]),
@@ -321,7 +321,7 @@ fn router_launch_window_is_per_model_and_per_slot() {
             {"id":"other", "max_model_len":4096},
             {"id":"selected", "status":{"value":"loaded", "args":args}}
         ]});
-        assert_eq!(parse_openai_models_window(&body, "selected"), Some(131072));
+        assert_eq!(parse_openai_models_window(&body, "selected"), None);
     }
 }
 
@@ -340,9 +340,9 @@ fn router_automatic_or_ambiguous_launch_window_stays_unknown() {
     }
 }
 
-/// #2248: fast router metadata avoids asking the busy child's /props at all.
+/// #2248/#2815: unavailable effective metadata must not promote requested args.
 #[tokio::test]
-async fn router_launch_window_avoids_the_slow_props_request() {
+async fn router_launch_window_stays_unknown_when_props_is_unavailable() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -356,13 +356,13 @@ async fn router_launch_window_avoids_the_slow_props_request() {
     Mock::given(method("GET"))
         .and(path("/props"))
         .respond_with(ResponseTemplate::new(503))
-        .expect(0)
+        .expect(1)
         .mount(&server)
         .await;
     assert_eq!(
         api_for(BackendKind::Openai)
             .context_window(&reqwest::Client::new(), &server.uri(), "selected", None)
             .await,
-        Some(131072)
+        None
     );
 }
