@@ -1,0 +1,45 @@
+# HOOK PARITY: .githooks/pre-push scopes portable Rust checks; this native
+# Seatbelt contract is explicitly CI-only there. Keep both lists in sync.
+name: confined command contract (macOS)
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "ci/macos-confined-contract"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 4
+  RUSTC_WRAPPER: ""
+
+jobs:
+  confined-contract-macos:
+    name: command and adoption contract (native Seatbelt)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-nextest
+      # No network/forge fixtures: fixed-argv local push exercises the adopted
+      # common-dir policy, while the broker control still refuses local URLs.
+      # The ignored git-clean row asserts a kernel fence exists (no soft skip).
+      # Row (c): plan_mode includes PR #2814's blank => approve once it lands.
+      - name: Run confinement contract rows
+        shell: bash
+        run: |
+          set -o pipefail
+          nice -n 10 cargo nextest run --locked -p newt-core --lib --run-ignored all \
+            --status-level all --final-status-level all \
+            -E 'test(command_shape_contract::) or test(worktree_adoption::tests::) or test(worktree_adoption_round2_git_clean_preserves_sentinel) or test(scope_all_push_to_a_local_path_is_refused_through_real_dispatch) or test(wrapped_worktree_push_dispatch_reaches_gate_and_honors_denial) or test(plan_mode::tests::)' \
+            2>&1 | tee macos-confined-contract.log
+      - name: Preserve per-row evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-confined-contract
+          path: macos-confined-contract.log
