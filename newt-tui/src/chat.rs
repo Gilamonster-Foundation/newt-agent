@@ -1994,19 +1994,88 @@ fn session_body(
     let workspace_permissions = resolve_tui(&cfg)
         .map(|tui| tui.permissions)
         .unwrap_or_default();
-    let mut cap = match workspace_settings
-        .policy(std::path::Path::new(workspace), &workspace_permissions)?
-    {
-        Some(policy) => SessionCapability::establish_frozen(policy, key_path.as_deref(), None),
-        None => {
-            SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None)
+    let permission_log_path =
+        newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-log.jsonl"));
+    // #904: the durable denylist lives next to the log; load it into the session
+    // state so `[P]ermanently deny` decisions from prior runs still hold.
+    let permission_denials_path =
+        newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-denials.jsonl"));
+    // #904: the user config file that `[A]llow permanently` appends a net host to.
+    let mut permission_state =
+        PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
+    permission_state.durable_grants = durable_grants;
+    permission_state.prompt_default = cfg
+        .tui
+        .as_ref()
+        .and_then(|tui| tui.permissions.prompt_default);
+    // B0b-1 (#1842): the fence the gate checks an answer against. Derived
+    // the same way the store derives its own, and supplied to the
+    // authorizer INDEPENDENTLY of the offer being checked.
+    permission_state.workspace_key = newt_core::workspace_key_v2(workspace).unwrap_or_default();
+    // Track O (#1131): load the durable OCAP policy from `~/.newt/ocap/*.toml`
+    // (beside the config file). The gate consults it before prompting — a
+    // durable deny refuses, a durable approve pre-answers (danger-gated). A
+    // missing store is an empty policy (no behavior change); a malformed file is
+    // skipped loudly so a bad rule never bricks startup.
+    //
+    // #1207: durable approves must be SIGNED by the operator's root key — the
+    // same key the session's operating authority is minted from. Load before
+    // pin capture so signed saved writes participate in executable exclusions.
+    // Unsigned/tampered approve entries are dropped loudly at load, fail-closed
+    // to the prompt; deny/ask load unsigned (narrowing is fail-safe).
+    if let Some(config_path) = user_permission_config_path.as_deref() {
+        // Read-only (mirrors headless's `resolve_ocap_store`, #2532): a
+        // missing/invalid root key folds to "no approves" — `load_store`'s
+        // existing rule — rather than minting an identity.pem as a side
+        // effect of merely checking for signed durable grants.
+        let root_vk = key_path
+            .as_deref()
+            .and_then(|p| newt_identity::load_user_key(p).ok())
+            .map(|user| user.public().as_bytes());
+        let (policy, warnings) = newt_core::ocap_store::load_store(config_path, root_vk);
+        for w in warnings {
+            print_newt(&format!("warning: OCAP policy: {w}"), color, verbose);
         }
-    };
+        permission_state.ocap_policy = policy;
+        // #2524 item 1: fold the just-verified approve-store entries into the
+        // recalled durable grants so a signed `[[fs]]`/`[[exec]]`/`[[net]]`
+        // grant reaches `recalled_caveats` (and hence `startup_caveats` below,
+        // which a spawned MCP child inherits) — not just the prompt-time
+        // pre-answer `evaluate_request` already gave it. `load_store` already
+        // dropped any unsigned/bad-signature entry loudly above, so this can
+        // never fold in anything unverified.
+        let folded = permission_state.fold_ocap_approvals();
+        if folded > 0 {
+            if let Some(path) = permission_log_path.as_deref() {
+                if let Err(e) = newt_core::permission_journal::append_record(
+                    path,
+                    ocap_store_folded_record(&active_conversation_id, folded),
+                ) {
+                    print_newt(
+                        &format!("warning: permission log write failed: {e}"),
+                        color,
+                        verbose,
+                    );
+                }
+            }
+        }
+    }
+    let reviewed_policy =
+        workspace_settings.policy(std::path::Path::new(workspace), &workspace_permissions)?;
+    let frozen = reviewed_policy.is_some();
+    let policy = reviewed_policy.unwrap_or_else(|| policy_for(resolve_tui(&cfg), workspace));
+    let mut cap = SessionCapability::establish_launch(
+        policy,
+        key_path.as_deref(),
+        frozen,
+        &permission_state,
+    )?;
     #[cfg(target_os = "macos")]
     if let Some(notice) = cap.take_exec_notice() {
         print_newt(&notice, color, verbose);
     }
     workspace_settings.protect(cap.caveats())?;
+    permission_state.protection = workspace_settings.protection.clone();
     if workspace_settings.profile.is_some() {
         print_newt("Saved workspace settings active. Changes in /settings workspaces apply after a full Newt restart.", color, verbose);
     }
@@ -2118,73 +2187,6 @@ fn session_body(
     let bang_escape_enabled = resolve_tui(&cfg)
         .map(|t| t.allow_bang_escape)
         .unwrap_or(true);
-    let permission_log_path =
-        newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-log.jsonl"));
-    // #904: the durable denylist lives next to the log; load it into the session
-    // state so `[P]ermanently deny` decisions from prior runs still hold.
-    let permission_denials_path =
-        newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-denials.jsonl"));
-    // #904: the user config file that `[A]llow permanently` appends a net host to.
-    let mut permission_state =
-        PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
-    permission_state.durable_grants = durable_grants;
-    permission_state.protection = workspace_settings.protection.clone();
-    permission_state.prompt_default = cfg
-        .tui
-        .as_ref()
-        .and_then(|tui| tui.permissions.prompt_default);
-    // B0b-1 (#1842): the fence the gate checks an answer against. Derived
-    // the same way the store derives its own, and supplied to the
-    // authorizer INDEPENDENTLY of the offer being checked.
-    permission_state.workspace_key = newt_core::workspace_key_v2(workspace).unwrap_or_default();
-    // Track O (#1131): load the durable OCAP policy from `~/.newt/ocap/*.toml`
-    // (beside the config file). The gate consults it before prompting — a
-    // durable deny refuses, a durable approve pre-answers (danger-gated). A
-    // missing store is an empty policy (no behavior change); a malformed file is
-    // skipped loudly so a bad rule never bricks startup.
-    //
-    // #1207: durable approves must be SIGNED by the operator's root key — the
-    // same key the session's operating authority is minted from (loaded here,
-    // generated on first use, so an interactive session always has one).
-    // Unsigned/tampered approve entries are dropped loudly at load, fail-closed
-    // to the prompt; deny/ask load unsigned (narrowing is fail-safe).
-    if let Some(config_path) = user_permission_config_path.as_deref() {
-        // Read-only (mirrors headless's `resolve_ocap_store`, #2532): a
-        // missing/invalid root key folds to "no approves" — `load_store`'s
-        // existing rule — rather than minting an identity.pem as a side
-        // effect of merely checking for signed durable grants.
-        let root_vk = key_path
-            .as_deref()
-            .and_then(|p| newt_identity::load_user_key(p).ok())
-            .map(|user| user.public().as_bytes());
-        let (policy, warnings) = newt_core::ocap_store::load_store(config_path, root_vk);
-        for w in warnings {
-            print_newt(&format!("warning: OCAP policy: {w}"), color, verbose);
-        }
-        permission_state.ocap_policy = policy;
-        // #2524 item 1: fold the just-verified approve-store entries into the
-        // recalled durable grants so a signed `[[fs]]`/`[[exec]]`/`[[net]]`
-        // grant reaches `recalled_caveats` (and hence `startup_caveats` below,
-        // which a spawned MCP child inherits) — not just the prompt-time
-        // pre-answer `evaluate_request` already gave it. `load_store` already
-        // dropped any unsigned/bad-signature entry loudly above, so this can
-        // never fold in anything unverified.
-        let folded = permission_state.fold_ocap_approvals();
-        if folded > 0 {
-            if let Some(path) = permission_log_path.as_deref() {
-                if let Err(e) = newt_core::permission_journal::append_record(
-                    path,
-                    ocap_store_folded_record(&active_conversation_id, folded),
-                ) {
-                    print_newt(
-                        &format!("warning: permission log write failed: {e}"),
-                        color,
-                        verbose,
-                    );
-                }
-            }
-        }
-    }
     print_newt(
         &ready_line(VERSION, &inf_model, &inf_url, inf_kind),
         color,
