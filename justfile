@@ -336,6 +336,7 @@ bench-publish:
 # HOOK PARITY: runs inside `just check`; mirrors the "eval self-tests
 # (eval-selftest)" step in .github/workflows/ci.yml. Add a line to both.
 eval-selftest:
+    python3 -m unittest discover -s scripts/eval/tests -v
     python3 scripts/eval/bench_scoreboard.py --self-test
     PYTHONPATH=scripts/eval/harbor python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_tb_campaign.py'
     PYTHONPATH=scripts/eval/harbor:scripts/eval/harbor/tests/stubs python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_lanes.py'
