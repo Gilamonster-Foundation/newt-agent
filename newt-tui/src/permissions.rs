@@ -840,11 +840,6 @@ pub(crate) struct PermissionPromptState {
     persistent_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     /// One-shot grants carried from `request_permissions` to its retry.
     pending_once_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
-    /// Exact command/cwd content identities, never basename aliases or standing grants.
-    pending_command_retries: std::collections::BTreeMap<
-        (newt_identity::RawContentId, newt_identity::RawContentId),
-        Vec<(newt_core::DenialKind, String)>,
-    >,
     pub(crate) decisions: Vec<newt_core::PermissionRecord>,
     /// Durable approve/deny policy, read-only during the session.
     pub(crate) ocap_policy: newt_core::ocap_store::PolicySet,
@@ -1161,6 +1156,12 @@ pub(crate) struct PromptPermissionGate<
     'a,
     F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice,
 > {
+    /// Owned by this turn gate; dropping it expires every unused approval.
+    /// Exact command/cwd content identities, never basename aliases or standing grants.
+    pub(crate) pending_command_retries: std::collections::BTreeMap<
+        (newt_identity::RawContentId, newt_identity::RawContentId),
+        Vec<(newt_core::DenialKind, String)>,
+    >,
     pub(crate) state: &'a mut PermissionPromptState,
     /// Enforced caveats at turn start.
     pub(crate) base: newt_core::Caveats,
@@ -1935,7 +1936,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             newt_identity::RawContentId::from_content(command.as_bytes()),
             newt_identity::RawContentId::from_content(cwd.as_bytes()),
         );
-        self.state.pending_command_retries.insert(
+        self.pending_command_retries.insert(
             key,
             requests
                 .iter()
@@ -1954,14 +1955,14 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             newt_identity::RawContentId::from_content(command.as_bytes()),
             newt_identity::RawContentId::from_content(cwd.as_bytes()),
         );
-        let Some(grants) = self.state.pending_command_retries.get(&key) else {
+        let Some(grants) = self.pending_command_retries.get(&key) else {
             return base.clone();
         };
         if grants
             .iter()
             .any(|(kind, target)| self.state.denied(*kind, target))
         {
-            self.state.pending_command_retries.remove(&key);
+            self.pending_command_retries.remove(&key);
             return base.clone();
         }
         let Ok(policy) = self.mint(base, grants) else {
@@ -1973,7 +1974,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         }) {
             return base.clone();
         }
-        self.state.pending_command_retries.remove(&key);
+        self.pending_command_retries.remove(&key);
         policy
     }
 
