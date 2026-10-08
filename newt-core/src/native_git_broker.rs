@@ -412,6 +412,8 @@ impl CommandBroker for NativeGitBroker {
                 head.as_deref()
                     .ok_or_else(|| denied("detached commit has no HEAD"))?,
                 context,
+                &probe,
+                control,
             )?)
         } else {
             None

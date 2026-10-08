@@ -1,6 +1,8 @@
 //! #2813: the transcript command shapes through the real worker and hook image.
 //! Real resources ground the unit fixture (which substitutes safe-subset for Brush).
-use super::native::{init_worktree, real_git, real_git_output, TrailerGitTool};
+use super::native::{
+    init_worktree, init_worktree_format, real_git, real_git_output, TrailerGitTool,
+};
 use newt_core::{Caveats, NoMcp, Scope};
 use std::path::Path;
 
@@ -75,10 +77,17 @@ async fn nested_creation_without_session_is_refused() {
 async fn commit_cleanup_preserves_shared_refs(heredoc: bool, packed: bool) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
-    let (main, wt) = init_worktree(&root);
+    let (main, wt) = init_worktree_format(&root, if packed { "sha256" } else { "sha1" });
     if packed {
         real_git(&main, &["pack-refs", "--all"]);
     }
+    // #2813: private views must resolve config includes at their real origin.
+    std::fs::write(
+        main.join("commit-settings"),
+        "[i18n]\n commitEncoding = ISO-8859-1\n",
+    )
+    .unwrap();
+    real_git(&main, &["config", "include.path", "../commit-settings"]);
     let packed_before = std::fs::read(main.join(".git/packed-refs")).ok();
     let original_head = real_git_output(&main, &["rev-parse", "HEAD"]);
     std::fs::write(wt.join("seed"), "changed by regression").unwrap();
@@ -134,6 +143,10 @@ async fn commit_cleanup_preserves_shared_refs(heredoc: bool, packed: bool) {
     );
     let raw = real_git_output(&wt, &["cat-file", "commit", "HEAD"]);
     assert!(!raw.contains("gpgsig "));
+    assert!(
+        raw.contains("\nencoding ISO-8859-1\n"),
+        "relative config include was lost: {raw}"
+    );
     // The fixture signer deliberately refuses: private views must not turn a
     // required signature failure into an unsigned publication (#2813/#2720).
     if packed {

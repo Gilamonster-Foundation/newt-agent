@@ -266,9 +266,16 @@ mod native {
     }
 
     pub(super) fn init_worktree(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        init_worktree_format(root, "sha1")
+    }
+
+    pub(super) fn init_worktree_format(
+        root: &Path,
+        format: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let main = root.join("main");
         std::fs::create_dir(&main).unwrap();
-        real_git(&main, &["init", "-q"]);
+        real_git(&main, &["init", "-q", &format!("--object-format={format}")]);
         std::fs::write(main.join("seed"), "x").unwrap();
         real_git(&main, &["add", "seed"]);
         real_git(&main, &["commit", "-q", "-m", "init"]);
