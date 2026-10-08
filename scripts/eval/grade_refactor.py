@@ -8,6 +8,7 @@ Only the disposable clone is mutated. GitHub access is read-only.
 from __future__ import annotations
 
 import argparse
+from functools import cache
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -98,6 +99,13 @@ def extraction(before: dict[str, str], after: dict[str, str], target: str) -> li
     # Comments/strings may contain convincing declarations. Mask those before
     # matching real, line-oriented out-of-line mod declarations.
     def source_code(text: str) -> str:
+        # Deliberately support only a small lexical subset, not guessed Rust
+        # semantics. Reject even markers inside literals/comments: false
+        # negatives are preferable to certifying inactive declarations.
+        if re.search(r'/\*|\b(?:br|cr|r)#*"|#\s*!?\s*\[', text):
+            raise EvidenceError(
+                "unsupported Rust syntax: block comments, raw strings, or attributes"
+            )
         return re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"', "", text, flags=re.S)
 
     masked = source_code(new)
@@ -144,6 +152,7 @@ def grade(args: argparse.Namespace, command=run) -> dict:
         output = command(["git", *words], where)
         return output if words[0] == "show" else output.rstrip("\n")
 
+    @cache
     def tree(revision: str) -> dict[str, str]:
         names = git("ls-tree", "-r", "--name-only", "-z", revision).split("\0")
         return {p: git("show", f"{revision}:{p}") for p in names if p.endswith(".rs")}
@@ -151,6 +160,7 @@ def grade(args: argparse.Namespace, command=run) -> dict:
     seed = head = remote_head = None
     before: dict[str, str] = {}
     after: dict[str, str] = {}
+    touched: list[str] = []
     try:
         seed = git("rev-parse", "--verify", args.seed + "^{commit}")
         head = git("rev-parse", "--verify", "refs/heads/" + args.branch + "^{commit}")
@@ -253,6 +263,21 @@ def grade(args: argparse.Namespace, command=run) -> dict:
             and msg.startswith("commit")
             and sha in facts.get("commits", [])
         ]
+        local_extractions = {}
+        for sha in commits_here:
+            parents = git("rev-list", "--parents", "-n", "1", sha).split()
+            # Merge/root commits do not establish which worktree authored the
+            # extraction. Require an actual extraction in a single-parent diff.
+            if len(parents) != 2:
+                continue
+            parent_tree, commit_tree = tree(parents[1]), tree(sha)
+            moved = {
+                p: extraction(parent_tree, commit_tree, p)
+                for p in touched
+                if p in parent_tree
+            }
+            if any(moved.values()):
+                local_extractions[sha] = moved
         new_branch = bool(
             branches
             and branches[-1][1] >= args.started_at
@@ -270,7 +295,7 @@ def grade(args: argparse.Namespace, command=run) -> dict:
             and branch != default
             and new_branch
             and new_worktree
-            and bool(commits_here)
+            and bool(local_extractions)
             and git("rev-parse", "HEAD", where=worktree) == head
         )
         row(
@@ -280,6 +305,7 @@ def grade(args: argparse.Namespace, command=run) -> dict:
                 "new_branch": new_branch,
                 "new_worktree": new_worktree,
                 "commits_in_worktree": commits_here,
+                "extractions_in_worktree": local_extractions,
             },
         )
     except (EvidenceError, ValueError) as exc:

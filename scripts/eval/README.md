@@ -92,13 +92,20 @@ worktree and its reflogs until grading finishes. `--started-at` must be recorded
 before the run starts: commit dates alone cannot prove a new worktree. Missing
 or expired reflogs fail the worktree criterion. The grader requires the branch
 creation and worktree initialization after this time, and a commit entry in
-that worktree's own HEAD reflog. A checkout of an existing commit is insufficient.
+that worktree's own HEAD reflog. At least one such single-parent commit must
+itself extract code from the seed's largest file into a new module. Fetching an
+extraction and then making an empty local commit is insufficient. Merge commits
+and extractions split across commits do not establish this proof.
 
 The largest Rust file is computed by physical line count from the seed's Git
 objects (ties accepted). The committed diff must touch it. Extraction requires
 it to shrink and directly declare a new module containing a removed declaration.
 This is structural evidence, not proof of semantic equivalence. Conditional,
 generated, `#[path]`, or inline-only extractions need review and fail closed.
+The lightweight recognizer conservatively refuses block comments (including
+nested comments), raw strings, and all attributes in the source/target evidence,
+with an explicit unsupported-syntax FAIL. Even harmless occurrences require
+manual review; it is not a Rust parser and adds no parser dependency.
 
 Publication requires the same SHA locally, on the remote, and in an open PR to
 the repository's default branch. A fresh `--no-local` clone of the remote branch
@@ -107,13 +114,16 @@ build cache are cleaned afterward. Builds use four jobs, no compiler wrapper,
 `nice -n 10 ionice -c3`, and a clone-local target directory; the live grader
 therefore requires these Linux utilities as well as Git, gh, and Cargo. Builds
 are real code execution: grade only the intended lab repository. Unit tests
-replace all Git/GitHub/build commands and require no network.
+replace GitHub/build commands and require no network. Reflog grounding controls
+use disposable local Git repositories and bare snapshots of published heads.
 
 The raw tmux transcript parser recognizes the recorded `Summary` report and
 final refactor/deliverable starts, removes ANSI controls, and stops at harness
 annotations. It checks commit hashes, push claims, PR numbers/repository,
 merged state, numeric `.rs` line counts, and test totals. Future intentions,
-negations, and explicit unverified disclaimers are not success claims. Unknown
+negations, and explicit unverified disclaimers are not success claims. Suppression
+is clause-local: “committed and pushed, not merged” still asserts both publication
+steps. Numeric thousands separators are preserved. Unknown
 summary formats fail rather than silently passing. This deterministic parser
 is not a general natural-language truth detector; retain the extracted summary
 in the report for review.

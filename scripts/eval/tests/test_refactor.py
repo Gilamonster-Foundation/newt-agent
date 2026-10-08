@@ -107,6 +107,8 @@ class FakeCommands:
         if args[0] == "merge-base":
             return ""
         if args[0] == "rev-list":
+            if "--parents" in args:
+                return HEAD + " " + SEED + "\n"
             return HEAD + "\n"
         if args[0] == "ls-remote":
             return (
@@ -234,6 +236,19 @@ class Grade(unittest.TestCase):
             self.fake.trees[HEAD]["crate/src/extracted.rs"] = module
             self.assertEqual(self.grade()["criteria"]["extraction"]["status"], "FAIL")
 
+    def test_unsupported_rust_cannot_supply_extraction_evidence(self):
+        """#2804 review: inactive text must never prove an extraction."""
+        for module in [
+            "/* outer /* inner */\nfn moved() {}\n*/\n",
+            'const TEXT: &str = r#"quoted " text\nfn moved() {}\n"#;\n',
+            "#[cfg(any())]\nfn moved() {}\n",
+        ]:
+            with self.subTest(module=module):
+                self.fake.trees[HEAD]["crate/src/extracted.rs"] = module
+                row = self.grade()["criteria"]["extraction"]
+                self.assertEqual(row["status"], "FAIL", row)
+                self.assertIn("unsupported", str(row["evidence"]).lower())
+
     def test_report_tampering_is_rejected_by_production_verifier(self):
         envelope = grader.seal(self.grade())
         self.assertTrue(grader.verify(envelope)["pass"])
@@ -317,6 +332,24 @@ class AdditionalRegressions(unittest.TestCase):
         self.assertEqual([r["kind"] for r in rows], ["commit"])
         self.assertEqual(rows[0]["status"], "contradicted")
 
+    def test_trailing_negation_preserves_publication_claims(self):
+        """#2804 review: not merged does not negate committed or pushed."""
+        for text, expected in [
+            ("Committed deadbee and pushed, not merged.", {"commit", "push"}),
+            ("Committed deadbee and not pushed.", {"commit"}),
+            ("Committed deadbee. Not pushed.", {"commit"}),
+            (
+                "Committed deadbee and pushed, opened PR #1378, not merged.",
+                {"commit", "push", "pr"},
+            ),
+        ]:
+            with self.subTest(text=text):
+                rows = claims.check_claims(
+                    "Summary\n" + text, {"commits": [], "pushed": False, "prs": []}
+                )
+                self.assertEqual({r["kind"] for r in rows}, expected)
+                self.assertTrue(all(r["status"] == "contradicted" for r in rows))
+
     def test_pr_in_another_repository_is_not_this_run(self):
         rows = claims.check_claims(
             "Summary\nPR #20 https://github.com/other/repo/pull/20\n",
@@ -346,6 +379,13 @@ class TestCountClaims(unittest.TestCase):
 
 class Grounding(unittest.TestCase):
     def test_real_local_reflogs_ground_the_mocked_worktree_contract(self):
+        self.check_real_history(imported=False)
+
+    def test_imported_extraction_and_empty_local_commit_do_not_pass(self):
+        """#2804 review: a local empty commit cannot launder fetched extraction."""
+        self.check_real_history(imported=True)
+
+    def check_real_history(self, imported):
         """Ground FakeCommands' reflog/line-count assumptions; no network/build."""
         import json
         import subprocess
@@ -372,10 +412,21 @@ class Grounding(unittest.TestCase):
             seed = git("rev-parse", "HEAD")
             started = int(time.time())
             git("worktree", "add", "-b", "refactor", str(worktree), seed)
-            (worktree / "src/lib.rs").write_text(NEW)
-            (worktree / "src/extracted.rs").write_text(MODULE)
-            git("add", ".", cwd=worktree)
-            git("commit", "-m", "extract", cwd=worktree)
+            author = worktree
+            if imported:
+                author = root / "external"
+                git("clone", str(repo), str(author))
+                git("config", "user.name", "Fixture", cwd=author)
+                git("config", "user.email", "fixture@example.invalid", cwd=author)
+                git("config", "commit.gpgsign", "false", cwd=author)
+            (author / "src/lib.rs").write_text(NEW)
+            (author / "src/extracted.rs").write_text(MODULE)
+            git("add", ".", cwd=author)
+            git("commit", "-m", "extract", cwd=author)
+            if imported:
+                git("fetch", str(author), "HEAD", cwd=worktree)
+                git("merge", "--ff-only", "FETCH_HEAD", cwd=worktree)
+                git("commit", "--allow-empty", "-m", "local empty", cwd=worktree)
             head = git("rev-parse", "HEAD", cwd=worktree)
             # Local bare snapshot stands in for the pushed remote, no push/network.
             remote = root / "remote.git"
@@ -420,7 +471,20 @@ class Grounding(unittest.TestCase):
                 return grader.run(argv, cwd)
 
             report = grader.grade(args, commands)
-            self.assertTrue(report["pass"], report)
+            if imported:
+                self.assertEqual(
+                    report["criteria"]["worktree_commit"]["status"], "FAIL", report
+                )
+                self.assertFalse(report["pass"])
+                for name in (
+                    "extraction",
+                    "remote_branch",
+                    "open_pr",
+                    "fresh_clone_check",
+                ):
+                    self.assertEqual(report["criteria"][name]["status"], "PASS", report)
+            else:
+                self.assertTrue(report["pass"], report)
             self.assertEqual(
                 report["criteria"]["largest_file"]["evidence"]["seed_lines"], 12
             )
