@@ -29,6 +29,27 @@ async fn dispatch(
     args: serde_json::Value,
     permission_gate: Option<&mut dyn PermissionGate>,
 ) -> String {
+    dispatch_with_worktree_session(
+        harness,
+        workspace,
+        caveats,
+        name,
+        args,
+        permission_gate,
+        None,
+    )
+    .await
+}
+
+async fn dispatch_with_worktree_session(
+    harness: &SmartHarness,
+    workspace: &Path,
+    caveats: &Caveats,
+    name: &str,
+    args: serde_json::Value,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
+) -> String {
     let batch = harness.fixture_tool_batch(name, args.clone());
     let invocation = batch.start(0, None).unwrap();
     let mut display = super::super::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
@@ -44,6 +65,7 @@ async fn dispatch(
         ToolCollaborators {
             invocation: Some(&invocation),
             permission_gate,
+            worktree_session,
             ..Default::default()
         },
         false,
@@ -857,6 +879,7 @@ async fn private_frame_cannot_leak_through_write_shrink_or_edit_preview() {
 #[tokio::test]
 #[serial_test::serial]
 async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
+    use std::os::unix::fs::PermissionsExt as _;
     let _env = super::disable_ocap_tests::env_lock().await;
     let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
     let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
@@ -872,6 +895,7 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
     let external_parent = tempfile::tempdir().unwrap();
     let external = external_parent.path().join("task-worktree");
     std::fs::create_dir(&external).unwrap();
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o700)).unwrap();
     let sibling = external_parent.path().join("ungranted");
     std::fs::write(&sibling, "outside authority").unwrap();
     let (harness, _) = harness(private.path());
@@ -901,6 +925,7 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
     ]);
     let mut caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
     caveats.net = crate::caveats::Scope::All;
+    let session = crate::worktree_adoption::WorktreeSession::default();
     for (index, destination) in [workspace.path().join(".worktrees/task"), external.clone()]
         .into_iter()
         .enumerate()
@@ -913,18 +938,29 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
             ]);
             caveats.fs_write = caveats.fs_read.clone();
         }
-        let create = dispatch(&harness, workspace.path(), &caveats, "run_command",
-            serde_json::json!({"command":format!("git worktree add -b fixture-{index} '{}'", destination.display())}), None).await;
+        let create = dispatch_with_worktree_session(&harness, workspace.path(), &caveats, "run_command",
+            serde_json::json!({"command":format!("git worktree add -b fixture-{index} '{}'", destination.display())}), None, Some(&session)).await;
+        if index == 0 {
+            // #2813/#2759: nested creation must use the same admission as a
+            // live session; the old fixture silently bypassed that boundary.
+            assert!(create.contains("choose a sibling destination"), "{create}");
+            assert!(!destination.join("task.txt").exists());
+            continue;
+        }
+        assert!(
+            session.snapshot().is_some(),
+            "creation was not adopted: {create}"
+        );
         assert!(destination.join("task.txt").exists(), "{create}");
-        let edited = dispatch(&harness, workspace.path(), &caveats, "edit_file",
-            serde_json::json!({"path":destination.join("task.txt"), "old_string":"baseline", "new_string":"worktree change"}), None).await;
+        let edited = dispatch_with_worktree_session(&harness, &destination, &caveats, "edit_file",
+            serde_json::json!({"path":destination.join("task.txt"), "old_string":"baseline", "new_string":"worktree change"}), None, Some(&session)).await;
         assert_eq!(
             std::fs::read_to_string(destination.join("task.txt")).unwrap(),
             "worktree change\n",
             "{edited}"
         );
-        let staged = dispatch(&harness, workspace.path(), &caveats, "run_command",
-            serde_json::json!({"command":"git add task.txt && git status --short", "cwd":destination}), None).await;
+        let staged = dispatch_with_worktree_session(&harness, &destination, &caveats, "run_command",
+            serde_json::json!({"command":"git add task.txt && git status --short", "cwd":destination}), None, Some(&session)).await;
         assert!(staged.contains("M  task.txt"), "{staged}");
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("task.txt")).unwrap(),

@@ -113,27 +113,30 @@ fn helper_rejects_bad_role_arguments_before_transport_or_success_marker() {
 
 #[test]
 fn reference_helper_forwards_original_phase_and_update_bytes() {
-    let updates = "0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/task\n";
-    helper::run(
-        HelperRole::ReferenceTransaction,
-        &["prepared".into()],
-        &mut Cursor::new(updates),
-        &mut Vec::new(),
-        &mut Vec::new(),
-        &mut |bytes| {
-            assert_eq!(
-                helper::decode_request(bytes)?,
-                HookRequest::References {
-                    phase: "prepared".into(),
-                    updates: updates.into()
-                }
-            );
-            HookResponse::Success(Vec::new())
-                .canonical_form()
-                .map_err(|error| error.to_string())
-        },
-    )
-    .unwrap();
+    // #2813: Git 2.54+ adds preparing before the locked prepared boundary.
+    for phase in ["preparing", "prepared", "committed", "aborted"] {
+        let updates = "0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/task\n";
+        helper::run(
+            HelperRole::ReferenceTransaction,
+            &[phase.into()],
+            &mut Cursor::new(updates),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut |bytes| {
+                assert_eq!(
+                    helper::decode_request(bytes)?,
+                    HookRequest::References {
+                        phase: phase.into(),
+                        updates: updates.into()
+                    }
+                );
+                HookResponse::Success(Vec::new())
+                    .canonical_form()
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+    }
 }
 
 #[test]

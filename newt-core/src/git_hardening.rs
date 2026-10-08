@@ -690,7 +690,38 @@ fn write_lockfile_natively(
     rel: &Path,
     content: &str,
 ) -> Result<(), String> {
-    use std::io::Write as _;
+    write_lockfile_checked(workspace, rel, content, None, None)
+}
+
+/// Publish an already policy-verified private commit into the real detached
+/// HEAD, using its held admin directory and Git's lock/CAS protocol (#2813).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn publish_detached_head(
+    admin: &agent_bridle_fdguard::GrantedRoot,
+    old: &str,
+    new: &str,
+    verified_reflog_entry: &str,
+) -> Result<(), String> {
+    let workspace = crate::fs_cap::WorkspaceDir::from_granted_root(admin)
+        .map_err(|e| format!("refused: cannot bind HEAD publication ({e})"))?;
+    write_lockfile_checked(
+        &workspace,
+        Path::new("HEAD"),
+        &format!("{new}\n"),
+        Some(old),
+        Some(verified_reflog_entry),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_lockfile_checked(
+    workspace: &crate::fs_cap::WorkspaceDir,
+    rel: &Path,
+    content: &str,
+    expected: Option<&str>,
+    head_reflog: Option<&str>,
+) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
     let lock_rel = lock_path(rel);
     let mut lock = workspace.create_new(&lock_rel).map_err(|e| {
         format!(
@@ -698,6 +729,17 @@ fn write_lockfile_natively(
             rel.display()
         )
     })?;
+    if let Some(expected) = expected {
+        let mut actual = String::new();
+        let read = workspace
+            .open_regular(rel, true)
+            .and_then(|mut file| file.read_to_string(&mut actual));
+        if read.is_err() || actual.trim() != expected {
+            drop(lock);
+            let _ = workspace.unlink(&lock_rel);
+            return Err("refused: detached HEAD changed during native commit".into());
+        }
+    }
     let wrote = lock
         .write_all(content.as_bytes())
         .and_then(|()| lock.sync_all());
@@ -706,9 +748,30 @@ fn write_lockfile_natively(
         let _ = workspace.unlink(&lock_rel);
         return Err(format!("refused: cannot write '{}' ({e})", rel.display()));
     }
+    // Keep HEAD.lock through both writes. A failed CAS appends nothing; a
+    // failed log append leaves HEAD unchanged. The admin handle is the SAME
+    // object as workspace (dup above), with no shared-log authority added.
+    if let Some(entry) = head_reflog {
+        let appended = workspace
+            .create_dir_all(Path::new("logs"))
+            .and_then(|()| workspace.append_regular(Path::new("logs/HEAD")))
+            .and_then(|mut log| {
+                log.write_all(entry.as_bytes())
+                    .and_then(|()| log.sync_all())
+            });
+        if let Err(e) = appended {
+            let _ = workspace.unlink(&lock_rel);
+            return Err(format!("refused: cannot append worktree HEAD reflog ({e}); HEAD unchanged; a partial log entry may remain"));
+        }
+    }
     workspace.rename(&lock_rel, rel).map_err(|e| {
         let _ = workspace.unlink(&lock_rel);
-        format!("refused: cannot commit '{}' ({e})", rel.display())
+        let log_note = if head_reflog.is_some() {
+            "; the verified worktree HEAD reflog entry was already appended"
+        } else {
+            ""
+        };
+        format!("refused: cannot commit '{}' ({e}){log_note}", rel.display())
     })
 }
 
@@ -3487,3 +3550,7 @@ mod governed_push_process_tests {
         assert!(resolve_remote_url(repo.path(), "origin").is_err());
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "git_hardening/commit_view_tests.rs"]
+mod commit_view_tests;

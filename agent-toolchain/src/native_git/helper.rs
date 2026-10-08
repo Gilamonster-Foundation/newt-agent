@@ -152,7 +152,7 @@ pub fn run(
                 .first()
                 .and_then(|arg| arg.to_str())
                 .ok_or("Git reference hook omitted its phase")?;
-            if !matches!(phase, "prepared" | "committed" | "aborted") {
+            if !matches!(phase, "preparing" | "prepared" | "committed" | "aborted") {
                 return Err("unknown Git reference transaction phase".into());
             }
             let updates = String::from_utf8(bounded_read(input)?)

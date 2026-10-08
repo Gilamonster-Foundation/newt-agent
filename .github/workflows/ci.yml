@@ -208,6 +208,9 @@ jobs:
         # of the inward layer's runtime closure (#1828); enabling it here is
         # what keeps the published JSON Schemas from going stale unnoticed.
         run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
+      - name: private native commit dispatch proof (#2813)
+        # HOOK PARITY: real Git/kernel-fence tier, CI-only in .githooks/pre-push.
+        run: cargo test -p newt-core --test native_git_broker_pipeline -- --regression-2813
       - name: ambient worktree dispatch proof (#2750)
         # HOOK PARITY: CI-only real Git/host-shell proof, named in
         # .githooks/pre-push. Unix fixture; selected explicitly on Linux.
