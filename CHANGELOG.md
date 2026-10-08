@@ -9,6 +9,16 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — a repeated plain `read_file` delivers the next unread page
+
+- The second plain read of a long file still serves the whole-file outline
+  once; a third identical read now advances to the first unread page instead
+  of serving the same outline again. Measured on 2026-10-07, a model that
+  never passed the offset the outline named re-read one file seven times
+  after a failed edit and spent its last round-cap grace window on seven
+  identical outlines. No refusal and nothing new for the model to learn: the
+  read it already makes delivers the page.
+
 ### Fixed — the tool-round-cap handoff shows one plan step per line
 
 - "Captured working state: Plan:" rendered its ✓/→/☐ steps as one wrapped
