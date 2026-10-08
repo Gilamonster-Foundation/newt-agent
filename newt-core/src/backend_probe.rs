@@ -1631,9 +1631,10 @@ pub fn parse_ollama_show_window(json: &serde_json::Value) -> Option<u32> {
     }
 }
 
-/// Extract a model's `max_model_len` from an OpenAI `/v1/models` response
-/// (#1195): the entry whose `id` matches, else the first that declares a
-/// window (a single-model vLLM instance). Pure.
+/// Extract the selected model's window from `/v1/models` (#1195/#2248).
+/// A loaded llama.cpp router may expose explicit ctx-size/parallel launch
+/// arguments instead. Automatic sizes and unified KV layouts stay unknown.
+/// An unmatched name falls back only on a single-model instance. Pure.
 pub fn parse_openai_models_window(json: &serde_json::Value, model: &str) -> Option<u32> {
     let data = json["data"].as_array()?;
     let window_of = |e: &serde_json::Value| {
@@ -1647,14 +1648,48 @@ pub fn parse_openai_models_window(json: &serde_json::Value, model: &str) -> Opti
         .find_map(|field| e[field].as_u64())
         .and_then(|value| u32::try_from(value).ok())
     };
-    if let Some(w) = data
-        .iter()
-        .find(|e| e["id"].as_str() == Some(model))
-        .and_then(window_of)
-    {
-        return Some(w);
+    if let Some(entry) = data.iter().find(|e| e["id"].as_str() == Some(model)) {
+        return window_of(entry).filter(|n| *n > 0).or_else(|| {
+            if entry["status"]["value"].as_str() != Some("loaded") {
+                return None;
+            }
+            let launch = parse_llamacpp_launch(json, model)?;
+            // Unified/automatic KV layouts cannot be inferred by division.
+            if launch
+                .args
+                .iter()
+                .any(|arg| arg == "-kvu" || arg.starts_with("--kv-unified"))
+            {
+                return None;
+            }
+            let flag = |names: &[&str]| -> Option<u32> {
+                launch
+                    .args
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(i, arg)| {
+                        names.iter().find_map(|name| {
+                            if arg == name {
+                                Some(launch.args.get(i + 1)?.as_str())
+                            } else {
+                                arg.strip_prefix(&format!("{name}="))
+                            }
+                        })
+                    })
+                    .and_then(|value| value.parse().ok())
+                    .filter(|n| *n > 0)
+            };
+            let total = flag(&["-c", "--ctx-size"])?;
+            let slots = flag(&["-np", "--parallel"])?;
+            (total / slots > 0).then_some(total / slots)
+        });
     }
-    data.iter().find_map(window_of)
+    // Preserve the fixed-model compatibility fallback only when the endpoint
+    // actually lists one model, never borrow a sibling router model's limit.
+    (data.len() == 1)
+        .then(|| window_of(&data[0]).filter(|n| *n > 0))
+        .flatten()
 }
 
 /// What an endpoint reported it serves. Produced by the fetchers below (or a
