@@ -94,14 +94,18 @@ def extraction(before: dict[str, str], after: dict[str, str], target: str) -> li
     old, new = before[target], after.get(target, "")
     if not new or line_count(new) >= line_count(old):
         return []
+
     # Comments/strings may contain convincing declarations. Mask those before
     # matching real, line-oriented out-of-line mod declarations.
-    masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"', "", new, flags=re.S)
+    def source_code(text: str) -> str:
+        return re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"', "", text, flags=re.S)
+
+    masked = source_code(new)
     directory = PurePosixPath(target).parent
     if PurePosixPath(target).name not in ("mod.rs", "lib.rs", "main.rs"):
         directory /= PurePosixPath(target).stem
-    removed = {line.strip() for line in old.splitlines()} - {
-        line.strip() for line in new.splitlines()
+    removed = {line.strip() for line in source_code(old).splitlines()} - {
+        line.strip() for line in masked.splitlines()
     }
     moved = []
     for declaration in re.finditer(
@@ -113,7 +117,7 @@ def extraction(before: dict[str, str], after: dict[str, str], target: str) -> li
         for path in (str(directory / (name + ".rs")), str(directory / name / "mod.rs")):
             if path in before or path not in after:
                 continue
-            code = {line.strip() for line in after[path].splitlines()}
+            code = {line.strip() for line in source_code(after[path]).splitlines()}
             # A moved function/type declaration avoids accepting braces/comments
             # as the only shared text. This deliberately fails closed on formats
             # it cannot prove (include!, generated modules, #[path], inline-only).

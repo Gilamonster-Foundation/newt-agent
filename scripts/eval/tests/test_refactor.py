@@ -225,6 +225,15 @@ class Grade(unittest.TestCase):
                     self.grade()["criteria"]["extraction"]["status"], "FAIL"
                 )
 
+    def test_commented_or_disabled_extractions_do_not_pass(self):
+        for source, module in [
+            (NEW, "/*\nfn moved() {}\n*/\n"),
+            ("#[cfg(any())]\n" + NEW, MODULE),
+        ]:
+            self.fake.trees[HEAD][TARGET] = source
+            self.fake.trees[HEAD]["crate/src/extracted.rs"] = module
+            self.assertEqual(self.grade()["criteria"]["extraction"]["status"], "FAIL")
+
     def test_report_tampering_is_rejected_by_production_verifier(self):
         envelope = grader.seal(self.grade())
         self.assertTrue(grader.verify(envelope)["pass"])
