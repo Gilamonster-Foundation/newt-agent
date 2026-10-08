@@ -18,6 +18,9 @@ use agent_toolchain::native_git::helper::{decode_request, HookRequest, HookRespo
 use agent_toolchain::native_git::{CommitBroker, CommitPolicy, MAX_COMMIT_BYTES};
 use content_addressable::ContentAddressable;
 
+#[path = "native_git_broker_common_view.rs"]
+mod common_view;
+
 const BROKER_FD: i32 = 198;
 const FD_ENV: &str = "NEWT_NATIVE_GIT_BROKER_FD";
 const HOOKS_ENV: &str = "NEWT_NATIVE_GIT_ORIGINAL_HOOKS";
@@ -364,7 +367,7 @@ impl CommandBroker for NativeGitBroker {
                 ))
             })
             .collect::<ToolResult<Vec<_>>>()?;
-        let probe = RepositoryProbe {
+        let mut probe = RepositoryProbe {
             program: self.native_image.to_string_lossy().into_owned(),
             prefix,
             cwd: command.cwd.clone(),
@@ -402,8 +405,54 @@ impl CommandBroker for NativeGitBroker {
         // The ordinary shell hardening may deliberately disable hooks; preserve
         // that choice, as well as an explicit caller-provided hooksPath.
         let original_hooks = original_hooks(command, position, &git_dir, &probe, control)?;
+        let common_view = if reference == "HEAD" && git_dir != common {
+            Some(common_view::create(
+                &git_dir,
+                &common,
+                head.as_deref()
+                    .ok_or_else(|| denied("detached commit has no HEAD"))?,
+                context,
+                &probe,
+                control,
+            )?)
+        } else {
+            None
+        };
+        let mut env = vec![
+            (FD_ENV.into(), BROKER_FD.to_string().into()),
+            (HOOKS_ENV.into(), original_hooks.into_os_string()),
+        ];
+        if let Some(view) = &common_view {
+            env.push((
+                "GIT_COMMON_DIR".into(),
+                view.directory.path().as_os_str().to_owned(),
+            ));
+        }
         let mut args = command.args[..position].to_vec();
+        if let Some(view) = &common_view {
+            let worktree = probe.text(&["rev-parse", "--show-toplevel"], control)?;
+            let selectors = [
+                format!("--git-dir={}", view.directory.path().display()),
+                format!("--work-tree={worktree}"),
+            ];
+            args.extend(selectors.iter().map(OsString::from));
+            probe.prefix.extend(selectors);
+            probe.env.retain(|(key, _)| key != "GIT_COMMON_DIR");
+            probe.env.push((
+                "GIT_COMMON_DIR".into(),
+                view.directory.path().to_string_lossy().into_owned(),
+            ));
+            if !command.env.iter().any(|(key, _)| key == "GIT_INDEX_FILE") {
+                env.push((
+                    "GIT_INDEX_FILE".into(),
+                    git_dir.join("index").into_os_string(),
+                ));
+            }
+        }
         for (key, value) in [
+            // Commit-scoped views must not initiate repository-wide maintenance.
+            ("gc.auto", "0".into()),
+            ("maintenance.auto", "false".into()),
             (
                 "core.hooksPath",
                 self.helper_dir.path().as_os_str().to_owned(),
@@ -437,14 +486,12 @@ impl CommandBroker for NativeGitBroker {
         // retains native parsing and is refused at the protected ref boundary.
         Ok(Some(PreparedBrokerCommand {
             args: Some(args),
-            env: vec![
-                (FD_ENV.into(), BROKER_FD.to_string().into()),
-                (HOOKS_ENV.into(), original_hooks.into_os_string()),
-            ],
+            env,
             target_fd: BROKER_FD,
             expected_process_image: (program != self.native_image)
                 .then(|| self.native_image.clone()),
             session: Arc::new(NativeCommitSession {
+                common_view,
                 state: Mutex::new(SessionState {
                     process: None,
                     broker: CommitBroker::new(policy, reference.clone()),
@@ -521,6 +568,7 @@ struct SessionState {
 }
 
 struct NativeCommitSession {
+    common_view: Option<common_view::CommitView>,
     state: Mutex<SessionState>,
     probe: RepositoryProbe,
     reference: String,
@@ -627,6 +675,15 @@ impl NativeCommitSession {
         updates: &str,
         control: &BrokerControl,
     ) -> Result<(), String> {
+        // Git 2.54+ reports preparing before locking or resolving symbolic refs.
+        // It is only a notification: do not retain a candidate, approve bytes,
+        // or consume attribution here. The locked prepared event still performs
+        // every destination, ancestry, message and signing check below; committed
+        // cannot succeed without that verified candidate. This also covers the
+        // pre-lock AUTO_MERGE cleanup notification after publication (#2813).
+        if phase == "preparing" {
+            return Ok(());
+        }
         // Git removes its temporary AUTO_MERGE tree reference after publishing
         // a commit, even when it is absent (zero -> zero). This is native
         // cleanup under the admitted gitdir write grant, never another commit.
@@ -705,6 +762,15 @@ impl NativeCommitSession {
                     return Err("published Git object differs from the prepared bytes".into());
                 }
                 state.broker.committed(&self.reference, &actual)?;
+                if let Some(view) = &self.common_view {
+                    view.publish(
+                        self.head
+                            .as_deref()
+                            .ok_or("private commit lacks original HEAD")?,
+                        &oid,
+                        &actual,
+                    )?;
+                }
                 state.published = true;
                 state.candidate = None;
             }

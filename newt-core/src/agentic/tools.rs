@@ -4675,7 +4675,7 @@ async fn execute_authorized_tool(
                                 .map(|oid| format!(" The commit exists, unpublished, as {oid}."))
                                 .unwrap_or_default();
                             exec_text = format!(
-                                "error: the commit was created but refused publication to \
+                                "{exec_text}\nerror: the commit was created but refused publication to \
                                  branch '{branch}': {refusal}.{candidate} No branch ref moved; \
                                  retry the commit."
                             );
@@ -6142,3 +6142,11 @@ mod git_fixture;
 #[cfg(test)]
 #[path = "tools_tests/command_shape_contract.rs"]
 mod command_shape_contract;
+
+/// Resolve the environment through the same seam as confined dispatch.
+pub(crate) fn dispatch_exec_path() -> Option<std::ffi::OsString> {
+    shell::venv_env_map()
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+}

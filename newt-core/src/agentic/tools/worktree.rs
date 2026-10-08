@@ -522,17 +522,30 @@ pub(super) async fn execute(
             )
         })
     });
-    let admission = session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
-        creation_admission(
-            bypass,
-            name,
-            &normalized,
-            workspace,
-            caveats,
-            shell::shell_engine(),
-            git_identity::resolve,
-        )
-    });
+    // #2813: no adoption slot is not permission to run creation ungoverned.
+    // A second worktree cannot replace the session's already-bound task either.
+    let unavailable_creation = !bypass
+        && name == "run_command"
+        && (session.is_none() || policy.is_some())
+        && normalized
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(possible_creation);
+    let admission = if unavailable_creation {
+        Err(())
+    } else {
+        session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
+            creation_admission(
+                bypass,
+                name,
+                &normalized,
+                workspace,
+                caveats,
+                shell::shell_engine(),
+                git_identity::resolve,
+            )
+        })
+    };
     let Ok(candidate) = admission else {
         if let Some(invocation) = collab.invocation {
             invocation.host();

@@ -237,8 +237,14 @@ fn adoption_fences_common_metadata_outside_the_original_checkout() {
         "index",
         "config",
         "packed-refs",
+        // #2813: task refs and lock files stay broker-owned on every OS.
+        "packed-refs.lock",
         "refs/heads/main",
+        "refs/heads/task",
+        "refs/heads/task.lock",
+        "refs/remotes/origin/task",
         "logs/refs/heads/main",
+        "logs/refs/heads/task",
     ] {
         let path = policy.common.join(relative);
         assert!(policy.blocked(&path), "{relative}");

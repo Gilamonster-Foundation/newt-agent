@@ -112,6 +112,8 @@ embedded = ["newt-inference/embedded"]
 tests-pty.workspace = true
 
 [dev-dependencies]
+# Paused-time metadata retry tests; no wall-clock sleeps.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 # The #1785/#1792 tamper-and-restore regression's raw-SQLite hatch: the test
 # must alter a stored turn OUTSIDE the store's append path (the store itself

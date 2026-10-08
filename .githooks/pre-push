@@ -45,11 +45,23 @@
 #     (explicitly dependent on PR #2818),
 #     and plan approval (PR #2814). Portable tests remain scoped here; native
 #     macOS confinement is CI-only because it needs the macOS kernel.
+#   - pinned carried artifact caches + bounded retry downloads (#2817),
+#     .github/workflows/ci.yml Windows job (actions/cache requires CI), and
+#     scripts/test_carried_cache.py in its lint job (workflow contract).
+#     Cache hits still pass through Install-CarriedTools.ps1 SHA256 verification.
+#   - macOS executable basename pins (PR #2816), newt-tui-pty.yml macOS job:
+#     installs gh when absent, stages a root-owned copy outside Homebrew,
+#     runs macos_exec_basenames explicitly with --ignored,
+#     and runs session_capability:: constructor tests. Requires native Seatbelt;
+#     portable trust regressions remain in the scoped Rust tests below.
 #   - packaged carried commands (#2776), .github/workflows/ci.yml Windows job:
 #     builds newt-carried-tools and the Brush runner, verifies pinned rg/BusyBox,
 #     stages only approved per-name executables, and runs scripts/windows/Test-CarriedTools.ps1 natively.
 #     Native Brush checks cover sed/awk/xargs/which (#2795).
 #     Portable argv translation and PATH/PATHEXT tests remain in the scoped Rust gate.
+#   - private native commit dispatch proof (#2813), .github/workflows/ci.yml test job:
+#     native_git_broker_pipeline --regression-2813 uses real Git/Brush/kernel
+#     confinement with net:none; also run manually on macOS.
 #   - ambient worktree dispatch proof (#2750), .github/workflows/ci.yml test job:
 #     explicitly runs the exact ignored fullaccess_tests::adoption_2750_full_access_creation_then_task_command
 #     in newt-core's worktree module. Real Git/host shell, Linux CI only.

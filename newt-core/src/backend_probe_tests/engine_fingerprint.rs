@@ -308,3 +308,61 @@ async fn no_props_route_yields_no_window_not_an_error() {
         None
     );
 }
+
+/// #2248/#2815: launch capacity is requested, not effective; training caps
+/// may lower it. Neither raw args nor a sibling model can establish the window.
+#[test]
+fn router_launch_window_stays_provisional_until_props() {
+    for args in [
+        serde_json::json!(["llama-server", "-c", "262144", "-np", "2"]),
+        serde_json::json!(["llama-server", "--ctx-size=262144", "--parallel=2"]),
+    ] {
+        let body = serde_json::json!({"data": [
+            {"id":"other", "max_model_len":4096},
+            {"id":"selected", "status":{"value":"loaded", "args":args}}
+        ]});
+        assert_eq!(parse_openai_models_window(&body, "selected"), None);
+    }
+}
+
+/// #2248: unknown/automatic launch sizes must fall through to /props.
+#[test]
+fn router_automatic_or_ambiguous_launch_window_stays_unknown() {
+    for args in [
+        serde_json::json!(["llama-server", "-c", "0", "-np", "1"]),
+        serde_json::json!(["llama-server", "-c", "131072"]),
+        serde_json::json!(["llama-server", "-c", "131072", "-np", "0"]),
+        serde_json::json!(["llama-server", "-c", "131072", "-np", "2", "-kvu"]),
+        serde_json::json!(["llama-server", "-c", "131072", "-np", "2", "--kv-unified"]),
+    ] {
+        let body = serde_json::json!({"data": [{"id":"selected", "status":{"value":"loaded", "args":args}}]});
+        assert_eq!(parse_openai_models_window(&body, "selected"), None);
+    }
+}
+
+/// #2248/#2815: unavailable effective metadata must not promote requested args.
+#[tokio::test]
+async fn router_launch_window_stays_unknown_when_props_is_unavailable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id":"selected", "status":{"value":"loaded",
+                "args":["llama-server", "-c", "262144", "-np", "2"]}}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        api_for(BackendKind::Openai)
+            .context_window(&reqwest::Client::new(), &server.uri(), "selected", None)
+            .await,
+        None
+    );
+}
