@@ -33,6 +33,11 @@ name = "native_git_broker_pipeline"
 path = "tests/native_git_broker_pipeline.rs"
 harness = false
 
+[[test]]
+name = "macos_exec_basenames"
+path = "tests/macos_exec_basenames.rs"
+harness = false
+
 [dependencies]
 agent-toolchain = { workspace = true, features = ["embedded-git"] }
 agent-harness.workspace = true
