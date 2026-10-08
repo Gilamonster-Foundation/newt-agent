@@ -3999,6 +3999,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
+            let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
             let governed_pr = std::sync::OnceLock::new();
             let command_directory = std::sync::OnceLock::new();
@@ -4099,6 +4100,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
@@ -4150,6 +4152,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 ReadScope { workspace, caveats },
             );
+            repeat_calls.permit_authorized_retry(name, &args, &retry_authorized);
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -4432,6 +4435,17 @@ struct RepeatCallGuard {
 }
 
 impl RepeatCallGuard {
+    fn permit_authorized_retry(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        ready: &std::sync::OnceLock<()>,
+    ) {
+        if ready.get().is_some() {
+            self.repeat_memos.remove(&Self::key(name, args));
+        }
+    }
+
     fn key(name: &str, args: &serde_json::Value) -> String {
         // The model emits byte-identical args when it loops (confirmed by the
         // identical forensic args digests), so the compact JSON is a stable key.
@@ -9028,6 +9042,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
+            let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
             let governed_pr = std::sync::OnceLock::new();
             let command_directory = std::sync::OnceLock::new();
@@ -9116,6 +9131,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
@@ -9175,6 +9191,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 ReadScope { workspace, caveats },
             );
+            repeat_calls.permit_authorized_retry(name, &args, &retry_authorized);
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -11585,6 +11602,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
+            let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
             let governed_pr = std::sync::OnceLock::new();
             let command_directory = std::sync::OnceLock::new();
@@ -11667,6 +11685,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
@@ -11723,6 +11742,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 ReadScope { workspace, caveats },
             );
+            repeat_calls.permit_authorized_retry(name, &args, &retry_authorized);
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -13320,6 +13340,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
+            let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
             let governed_pr = std::sync::OnceLock::new();
             let command_directory = std::sync::OnceLock::new();
@@ -13422,6 +13443,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
@@ -13479,6 +13501,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 ReadScope { workspace, caveats },
             );
+            repeat_calls.permit_authorized_retry(name, &args, &retry_authorized);
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
