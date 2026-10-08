@@ -109,6 +109,11 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if std::env::args().any(|arg| arg == "--confined-contract") {
+        contract::run();
+        return;
+    }
     #[cfg(target_os = "linux")]
     native::required_kernel_gate_regression();
     if !std::env::args().any(|arg| arg == "--ignored") {
@@ -128,7 +133,11 @@ fn main() {
 #[path = "native_git_broker_pipeline/cancellation.rs"]
 mod cancellation;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "native_git_broker_pipeline/contract.rs"]
+mod contract;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod native {
     use std::path::Path;
     use std::sync::Arc;
@@ -136,12 +145,15 @@ mod native {
     use agent_toolchain::git_caveats::GitCaveats;
     use agent_toolchain::native_git::CommitPolicy;
     use newt_core::agentic::GitTool;
+    #[cfg(target_os = "linux")]
     use newt_core::{Caveats, NoMcp, Scope};
 
+    #[cfg(target_os = "linux")]
     const MARKER: &str = "NATIVE_GIT_BROKER_PIPELINE_CONFIRMED";
     const TRAILER: &str =
         "Co-Authored-By: native-git-broker-pipeline-fixture <fixture@example.invalid>";
 
+    #[cfg(target_os = "linux")]
     pub fn run() {
         // Cancellation may leave an orphan candidate; never journal fixtures
         // into the operator's event stream. Set this before starting any runtime.
@@ -188,6 +200,7 @@ mod native {
     /// this binary needs the identical real-kernel-fence + fixture-git
     /// preconditions, and a silent `return` here would make a quietly-green
     /// local run indistinguishable from one that measured nothing.
+    #[cfg(target_os = "linux")]
     fn kernel_gate(available: bool, required: bool) -> Result<bool, &'static str> {
         if required && !available {
             return Err("required native Git broker proof needs Landlock + /usr/bin/git");
@@ -196,6 +209,7 @@ mod native {
     }
 
     /// #2697: a required proof must reject missing prerequisites, not pass a skip.
+    #[cfg(target_os = "linux")]
     pub fn required_kernel_gate_regression() {
         assert_eq!(kernel_gate(true, false), Ok(true));
         assert_eq!(kernel_gate(true, true), Ok(true));
@@ -206,6 +220,7 @@ mod native {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn skip_without_real_kernel_fence() -> bool {
         let available = newt_core::confined_exec::kernel_fs_fence_available()
             && Path::new(FIXTURE_GIT).exists();
@@ -242,7 +257,7 @@ mod native {
         cmd
     }
 
-    fn real_git(dir: &Path, args: &[&str]) {
+    pub(super) fn real_git(dir: &Path, args: &[&str]) {
         let home = tempfile::tempdir().unwrap();
         let status = hermetic_git(dir, home.path()).args(args).status().unwrap();
         assert!(status.success(), "git {args:?} failed");
@@ -255,6 +270,7 @@ mod native {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) fn init_worktree(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let main = root.join("main");
         std::fs::create_dir(&main).unwrap();
@@ -270,6 +286,7 @@ mod native {
         (main, wt)
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) fn session_caveats(wt: &Path) -> Caveats {
         let own_git = newt_core::git_hardening::own_gitdir_grants(wt);
         let mut read_roots = vec![wt.to_string_lossy().into_owned()];
@@ -300,7 +317,7 @@ mod native {
     /// (or signature)" as the round-trip proof, and the trailer alone
     /// already proves the policy's `finalize_message` reached the real
     /// commit through the real hook handshake.
-    struct TrailerGitTool(bool);
+    pub(super) struct TrailerGitTool(pub(super) bool);
     impl GitTool for TrailerGitTool {
         fn native_commit_policy(&self) -> Option<Arc<dyn CommitPolicy>> {
             Some(Arc::new(TrailerPolicy(self.0)))
@@ -343,7 +360,9 @@ mod native {
     /// negative control: no policy means no broker, which `tools.rs`'s `run_command`
     /// arm refuses outright rather than falling back to an unmanaged commit
     /// (`run_command_creates_shell_git_commit(cmd) && commit_broker.is_none()`).
+    #[cfg(target_os = "linux")]
     struct NoBrokerGitTool;
+    #[cfg(target_os = "linux")]
     impl GitTool for NoBrokerGitTool {
         fn dispatch(
             &self,
@@ -362,6 +381,7 @@ mod native {
     /// engages. Asserted ABSENT below — a regression in
     /// `ExecOrigin::BrokerMediated`, or a revert to `AgentInfluenced`, must
     /// fail this test loudly rather than return a quiet "pass".
+    #[cfg(target_os = "linux")]
     const KNOWN_KERNEL_INTERCEPTOR_MISMATCH: &str = "Exec axis requires Kernel";
 
     /// The primary proof: a REAL confined `git commit`, through
@@ -378,6 +398,7 @@ mod native {
     /// pre-#2693 `ExecOrigin::AgentInfluenced` origin (this assertion fails
     /// with the refusal text quoted); green with `ExecOrigin::BrokerMediated`.
     // #2720: ambient authority must still run the real attribution broker.
+    #[cfg(target_os = "linux")]
     async fn governed_commit_carries_the_attribution_trailer(
         full_access: bool,
         signing_required: bool,
@@ -453,6 +474,7 @@ mod native {
     /// must be refused outright rather than landing unmanaged, so the
     /// missing-policy admission is tested separately from broker mediation
     /// on the admitted positive path.
+    #[cfg(target_os = "linux")]
     async fn disabling_the_broker_refuses_the_commit_entirely() {
         let root = tempfile::tempdir().unwrap();
         let (main, wt) = init_worktree(root.path());
