@@ -92,6 +92,9 @@ jobs:
       - name: push-hook changed-scope classification regression
         if: always()
         run: python3 scripts/test_changed_scope.py
+      # HOOK PARITY: CI-only workflow contract; named in .githooks/pre-push.
+      - name: Carried artifact cache contract (#2817)
+        run: python3 scripts/test_carried_cache.py
       - name: push-hook reverse-dependent expansion regression
         if: always()
         run: python3 scripts/test_reverse_deps.py
@@ -542,6 +545,36 @@ jobs:
         run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+      # HOOK PARITY: CI-only artifact caches and bounded downloads (#2817);
+      # scripts/test_carried_cache.py checks this contract in lint. Both are
+      # named in .githooks/pre-push. No fallback keys: version AND hash must match.
+      - name: Cache pinned BusyBox
+        id: busybox-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/carried-downloads/busybox.exe
+          key: carried-busybox-FRP-6075-g169694ebd-6e263d154d8548d1eb936f65d1d8312c80df31c45974e48d6335e4dcc0f4f34c
+      - name: Cache pinned ripgrep
+        id: ripgrep-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/carried-downloads/ripgrep.zip
+          key: carried-ripgrep-14.1.1-d0f534024c42afd6cb4d38907c25cd2b249b79bbe6cc1dbee8e3e37c2b6e25a1
+      - name: Download busybox on cache miss
+        if: steps.busybox-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/carried-downloads" | Out-Null
+          # curl's default retry delay doubles (1, 2, 4, 8 seconds).
+          curl.exe --fail --location --retry 4 --retry-all-errors --retry-max-time 180 --connect-timeout 20 --max-time 60 --output "$env:RUNNER_TEMP/carried-downloads/busybox.exe" "https://frippery.org/files/busybox/busybox-w64u-FRP-6075-g169694ebd.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned BusyBox download failed after bounded retries' }
+      - name: Download ripgrep on cache miss
+        if: steps.ripgrep-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/carried-downloads" | Out-Null
+          curl.exe --fail --location --retry 4 --retry-all-errors --retry-max-time 180 --connect-timeout 20 --max-time 60 --output "$env:RUNNER_TEMP/carried-downloads/ripgrep.zip" "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned ripgrep download failed after bounded retries' }
       # HOOK PARITY: CI-only native packaging proof; named in .githooks/pre-push.
       - name: Packaged carried commands (#2776)
         shell: pwsh
@@ -554,7 +587,7 @@ jobs:
           # target/ is cached; every invocation needs a fresh, uncached stage.
           $packageDirectory = Join-Path $env:RUNNER_TEMP ('carried-package-' + [guid]::NewGuid().ToString('N'))
           New-Item -ItemType Directory -Path $packageDirectory | Out-Null
-          ./scripts/windows/Install-CarriedTools.ps1 -BinaryPath target/debug/newt-carried-tools.exe -NewtDirectory $packageDirectory
+          ./scripts/windows/Install-CarriedTools.ps1 -BinaryPath target/debug/newt-carried-tools.exe -NewtDirectory $packageDirectory -BusyboxArchive "$env:RUNNER_TEMP/carried-downloads/busybox.exe" -RipgrepArchive "$env:RUNNER_TEMP/carried-downloads/ripgrep.zip"
           Copy-Item target/debug/newt-ambient-brush.exe (Join-Path $packageDirectory 'tools')
           ./scripts/windows/Test-CarriedTools.ps1 -ToolsDirectory (Join-Path $packageDirectory 'tools') -RequireRunnerTemp
       - name: Stage trusted AppContainer launcher for ordinary tests
