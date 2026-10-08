@@ -42,7 +42,7 @@
 #     .github/workflows/macos-confined-contract.yml: command-shape rows,
 #     production harness=false Brush creation/adoption, raw shared-ref refusal,
 #     local transport and broker-refusal controls, governed task-ref publication
-#     (explicitly dependent on PR #2818),
+#     (required after integration of PR #2818),
 #     and plan approval (PR #2814). Portable tests remain scoped here; native
 #     macOS confinement is CI-only because it needs the macOS kernel.
 #   - pinned carried artifact caches + bounded retry downloads (#2817),
