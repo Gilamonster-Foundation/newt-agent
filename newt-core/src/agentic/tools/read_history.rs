@@ -11,6 +11,13 @@ type Cursor = (usize, usize);
 struct FileRead {
     content_id: RawContentId,
     plain_read: bool,
+    /// The whole-file map was served once for this content. A later plain
+    /// repeat advances to the first unread page instead of serving the map
+    /// again: measured on 2026-10-07, a model that never passed the offset the
+    /// map named re-read the same file seven times after a failed edit, got
+    /// seven identical maps, and spent its last round-cap grace window on
+    /// them. The page it was pointed at is what the repeat delivers now.
+    map_served: bool,
     served: Vec<Range<Cursor>>,
 }
 
@@ -60,12 +67,14 @@ impl ReadHistory {
         let state = self.0.entry(path.to_owned()).or_insert_with(|| FileRead {
             content_id,
             plain_read: false,
+            map_served: false,
             served: Vec::new(),
         });
         if state.content_id != content_id {
             *state = FileRead {
                 content_id,
                 plain_read: false,
+                map_served: false,
                 served: Vec::new(),
             };
         }
@@ -78,8 +87,11 @@ impl ReadHistory {
         let mut page = read_file_page(path, contents, offset, limit, char_offset, tool_offload);
         let mut next = crate::prune::read_page_continuation(&page, path, start.0, start.1);
         if plain && state.plain_read && next.is_some() {
-            if let Some(map) = file_map::render(path, contents, &state.served, tool_offload) {
-                return map;
+            if !state.map_served {
+                if let Some(map) = file_map::render(path, contents, &state.served, tool_offload) {
+                    state.map_served = true;
+                    return map;
+                }
             }
             start = state.next_unread();
             if start >= eof {
