@@ -224,3 +224,35 @@ fn bounds_2782_cap_math_and_first_party_field() {
         16_384
     );
 }
+
+/// #2824/#2825: strict input recovery releases capacity, not a fixed output
+/// allowance. Admission and wire caps must agree after the one-token reduction.
+#[test]
+fn bounds_2824_recovery_and_generation_share_the_window() {
+    use super::super::send_budget::{context_window_split, recovered_input_budget};
+
+    for (window, refused, allowance, expected_input, expected_output) in [
+        (40_000, 999_999, None, 31_999, 8_001),
+        (40_000, 999_999, Some(8_000), 31_999, 8_000),
+        (40_000, 999_999, Some(12_000), 27_999, 12_000),
+        (40_000, 20_000, None, 19_999, 16_384),
+    ] {
+        let proposed = recovered_input_budget(window, 80, allowance, None);
+        let input = cw_overflow::recovery_target(proposed, refused, None).unwrap();
+        let output = generation_bounds::output_cap(allowance, Some(window), input).unwrap();
+        assert_eq!((input, output), (expected_input, expected_output));
+        assert!(input < refused);
+        assert!(input + output as usize <= window as usize);
+        let (admitted, remaining) = context_window_split(window, input, 0);
+        assert_eq!(admitted, input);
+        assert_eq!(admitted + remaining as usize, window as usize);
+    }
+    // Saturation must not wrap or erase an impossible known-window budget.
+    assert_eq!(context_window_split(0, usize::MAX, 0), (0, 0));
+    assert_eq!(context_window_split(100, usize::MAX, 200), (0, 100));
+    assert_eq!(
+        context_window_split(u32::MAX, usize::MAX, 0),
+        (u32::MAX as usize, 0)
+    );
+    assert!(generation_bounds::output_cap(None, Some(100), usize::MAX).is_err());
+}
