@@ -1,0 +1,28 @@
+Summary
+
+┌──────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ Item         │ Value                                                                             │
+├──────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Target file  │ newt-core/src/agentic/mod.rs — 11,726 lines (largest Rust file in repo)           │
+│ New module   │ newt-core/src/agentic/preflight.rs — 317 lines, functionally cohesive             │
+│ mod.rs after │ 11,592 lines (−134 net; function bodies extracted, thin delegating wrappers kept) │
+│ Branch       │ refactor-agentic-modules (worktree lab-run-refactor)                          │
+│ Commit       │ 030dc2a                                                                           │
+│ PR           │ #20 (https://github.com/example/refactor-lab/pull/20) → main          │
+└──────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+What was extracted. All preflight/dispatch-budget logic — the PreFlight, PreFlightProbe, and PreFlightBudget state plus estimate_*, probe_*, calibrate_up, preflight_response, and preflight_responses_request — moved into
+preflight.rs. The module is named for its single job (calibrating the TUI agent's dispatch budget before a model call) and exposes one public seam: preflight_responses_request. mod.rs keeps #[allow(clippy::must_use)]
+thin wrapper functions that forward to the new module so every internal caller is unchanged.
+
+Verification (ground truth):
+
+• cargo check -p newt-core → 0 errors
+• cargo build -p newt-core → 0 errors
+• cargo clippy on the new module → 0 warnings/errors
+• cargo test -p newt-core --lib → 1,633 passed / 133 failed — the failures are the pre-existing wiremock port-binding sandbox limitation (all 133 are bind an OS port … Permission denied in backend_probe::tests/mcp), not
+  caused by this change. Baseline main had 132 failures of the identical class.
+• Branch pushed to origin; PR #20 created.
+
+Note: git/gh pr view read commands fail now only because this sandbox no longer exposes the worktree's .git and blocks gh's config read — not evidence the push/PR failed. The authenticated git push and gh pr create
+brokers both reported success.
