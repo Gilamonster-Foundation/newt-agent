@@ -65,6 +65,7 @@ fn web_decisions_publish_and_consume_a_web_verdict_without_the_tty() {
         ..Default::default()
     };
     let mut gate = PromptPermissionGate {
+        pending_command_retries: Default::default(),
         state: &mut state,
         base: Caveats::default(),
         key_path: None,
@@ -108,6 +109,7 @@ fn web_decision_timeout_resolves_and_denies_without_hanging() {
         ..Default::default()
     };
     let mut gate = PromptPermissionGate {
+        pending_command_retries: Default::default(),
         state: &mut state,
         base: Caveats::default(),
         key_path: None,
@@ -158,6 +160,7 @@ fn web_publish_failure_records_web_unavailable_scope() {
         ..Default::default()
     };
     let mut gate = PromptPermissionGate {
+        pending_command_retries: Default::default(),
         state: &mut state,
         base: Caveats::default(),
         key_path: None,
@@ -277,6 +280,7 @@ pub(super) fn store_and_conv() -> (
 macro_rules! web_gate {
     ($state:expr, $conv:expr, $timeout:expr, $cancel:expr, $exit:expr) => {
         PromptPermissionGate {
+            pending_command_retries: Default::default(),
             state: $state,
             base: Caveats::default(),
             key_path: None,
@@ -841,6 +845,7 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
     let mut state = PermissionPromptState::default();
     {
         let mut gate = PromptPermissionGate {
+            pending_command_retries: Default::default(),
             state: &mut state,
             base,
             key_path: Some(key_path),
@@ -887,6 +892,7 @@ pub(super) fn scripted_gate<'a>(
 ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> {
     let mut script = script.into_iter();
     PromptPermissionGate {
+        pending_command_retries: Default::default(),
         state,
         base,
         key_path,
@@ -1899,6 +1905,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
     {
         let mut script = vec![PromptChoice::DenyPermanent].into_iter();
         let mut gate = PromptPermissionGate {
+            pending_command_retries: Default::default(),
             state: &mut state,
             base: base.clone(),
             key_path: None,
@@ -1939,6 +1946,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
     let mut fresh = PermissionPromptState::with_persistent_denials(Some(&denials));
     {
         let mut gate = PromptPermissionGate {
+            pending_command_retries: Default::default(),
             state: &mut fresh,
             base,
             key_path: None,
@@ -2056,6 +2064,7 @@ fn allow_permanently_grants_now_and_persists_host_to_approve_toml() {
         {
             let mut script = vec![PromptChoice::AllowPermanent].into_iter();
             let mut gate = PromptPermissionGate {
+                pending_command_retries: Default::default(),
                 state: &mut state,
                 base,
                 key_path: Some(key_path.clone()),
