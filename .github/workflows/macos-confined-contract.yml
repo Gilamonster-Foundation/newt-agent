@@ -28,6 +28,11 @@ jobs:
         with:
           cache-on-failure: true
       - uses: taiki-e/install-action@cargo-nextest
+      # Hosted images install versioned Xcode bundles outside the production
+      # Xcode.app exception. Narrow the ancestor's permissions, not the broker's
+      # trust policy, so the controls reach destination/network admission.
+      - name: Make the system Git ancestor non-group-writable
+        run: sudo chmod g-w /Applications
       # No network/forge fixtures: fixed-argv local push exercises the adopted
       # common-dir policy, while the broker control still refuses local URLs.
       # The ignored git-clean row asserts a kernel fence exists (no soft skip).
