@@ -4675,7 +4675,7 @@ async fn execute_authorized_tool(
                                 .map(|oid| format!(" The commit exists, unpublished, as {oid}."))
                                 .unwrap_or_default();
                             exec_text = format!(
-                                "error: the commit was created but refused publication to \
+                                "{exec_text}\nerror: the commit was created but refused publication to \
                                  branch '{branch}': {refusal}.{candidate} No branch ref moved; \
                                  retry the commit."
                             );

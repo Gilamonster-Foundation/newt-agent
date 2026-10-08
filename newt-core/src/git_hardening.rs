@@ -690,7 +690,28 @@ fn write_lockfile_natively(
     rel: &Path,
     content: &str,
 ) -> Result<(), String> {
-    use std::io::Write as _;
+    write_lockfile_checked(workspace, rel, content, None)
+}
+
+/// Publish an already policy-verified private commit into the real detached
+/// HEAD, using its held admin directory and Git's lock/CAS protocol (#2813).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn publish_detached_head(
+    workspace: &crate::fs_cap::WorkspaceDir,
+    old: &str,
+    new: &str,
+) -> Result<(), String> {
+    write_lockfile_checked(workspace, Path::new("HEAD"), &format!("{new}\n"), Some(old))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_lockfile_checked(
+    workspace: &crate::fs_cap::WorkspaceDir,
+    rel: &Path,
+    content: &str,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
     let lock_rel = lock_path(rel);
     let mut lock = workspace.create_new(&lock_rel).map_err(|e| {
         format!(
@@ -698,6 +719,17 @@ fn write_lockfile_natively(
             rel.display()
         )
     })?;
+    if let Some(expected) = expected {
+        let mut actual = String::new();
+        let read = workspace
+            .open_regular(rel, true)
+            .and_then(|mut file| file.read_to_string(&mut actual));
+        if read.is_err() || actual.trim() != expected {
+            drop(lock);
+            let _ = workspace.unlink(&lock_rel);
+            return Err("refused: detached HEAD changed during native commit".into());
+        }
+    }
     let wrote = lock
         .write_all(content.as_bytes())
         .and_then(|()| lock.sync_all());
@@ -3487,3 +3519,7 @@ mod governed_push_process_tests {
         assert!(resolve_remote_url(repo.path(), "origin").is_err());
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "git_hardening/commit_view_tests.rs"]
+mod commit_view_tests;

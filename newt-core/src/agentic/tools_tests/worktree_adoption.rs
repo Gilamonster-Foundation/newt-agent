@@ -358,3 +358,48 @@ async fn worktree_adoption_unverifiable_policy_refuses_dispatch() {
         );
     }
 }
+
+/// #2813 reg2-A: absent/already-used adoption state must not send a nested
+/// worktree creation through to a child and discover the ref fence by EPERM.
+#[tokio::test]
+async fn worktree_creation_2813_requires_an_available_adoption_session() {
+    let (_temp, policy, _) = fixture(false);
+    link(&policy);
+    let root = policy.worktree.parent().unwrap().join("main");
+    let session = WorktreeSession::default();
+    session.adopt(policy.clone());
+    for active in [None, Some(&session)] {
+        let mut presentation =
+            crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
+        let outcome = std::sync::OnceLock::new();
+        let source = format!("cd '{}' && git worktree add -b agentic-refactor-wt agentic-refactor-wt main 2>&1 | tail -5", root.display());
+        let caveats = Caveats {
+            exec: Scope::none(),
+            ..Caveats::top()
+        };
+        let text = execute(
+            &mut presentation,
+            "run_command",
+            &serde_json::json!({"command":source}),
+            root.to_str().unwrap(),
+            false,
+            20,
+            &caveats,
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                worktree_session: active,
+                execution: Some(&outcome),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+        )
+        .await;
+        assert!(
+            text.contains("standalone literal command"),
+            "creation fell through admission: {text}"
+        );
+        assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Denied));
+        assert!(!root.join("agentic-refactor-wt").exists());
+    }
+}

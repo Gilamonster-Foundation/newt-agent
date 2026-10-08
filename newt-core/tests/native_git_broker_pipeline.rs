@@ -109,26 +109,35 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if std::env::args().any(|arg| arg == "--regression-2813") {
+        regression_2813::run();
+        return;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     native::required_kernel_gate_regression();
     if !std::env::args().any(|arg| arg == "--ignored") {
         eprintln!(
-            "test native_git_broker_pipeline ... ignored (real toolchain, Landlock, \
+            "test native_git_broker_pipeline ... ignored (real toolchain, kernel fence, \
              root-owned /usr/bin/git)"
         );
         return;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     native::run();
-    #[cfg(not(target_os = "linux"))]
-    panic!("the native Git broker's hook round-trip is unverified off Linux (no Landlock fence)");
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    panic!("the native Git broker's hook round-trip is unverified outside Linux/macOS");
 }
 
 #[cfg(target_os = "linux")]
 #[path = "native_git_broker_pipeline/cancellation.rs"]
 mod cancellation;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "native_git_broker_pipeline/regression_2813.rs"]
+mod regression_2813;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod native {
     use std::path::Path;
     use std::sync::Arc;
@@ -177,6 +186,7 @@ mod native {
             governed_commit_carries_the_attribution_trailer(true, false).await;
             governed_commit_carries_the_attribution_trailer(true, true).await;
             disabling_the_broker_refuses_the_commit_entirely().await;
+            #[cfg(target_os = "linux")]
             super::cancellation::run().await;
             println!("{MARKER}");
         });
@@ -242,7 +252,7 @@ mod native {
         cmd
     }
 
-    fn real_git(dir: &Path, args: &[&str]) {
+    pub(super) fn real_git(dir: &Path, args: &[&str]) {
         let home = tempfile::tempdir().unwrap();
         let status = hermetic_git(dir, home.path()).args(args).status().unwrap();
         assert!(status.success(), "git {args:?} failed");
@@ -300,7 +310,7 @@ mod native {
     /// (or signature)" as the round-trip proof, and the trailer alone
     /// already proves the policy's `finalize_message` reached the real
     /// commit through the real hook handshake.
-    struct TrailerGitTool(bool);
+    pub(super) struct TrailerGitTool(pub(super) bool);
     impl GitTool for TrailerGitTool {
         fn native_commit_policy(&self) -> Option<Arc<dyn CommitPolicy>> {
             Some(Arc::new(TrailerPolicy(self.0)))
