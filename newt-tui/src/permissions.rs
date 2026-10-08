@@ -840,6 +840,11 @@ pub(crate) struct PermissionPromptState {
     persistent_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     /// One-shot grants carried from `request_permissions` to its retry.
     pending_once_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    /// Exact command/cwd content identities, never basename aliases or standing grants.
+    pending_command_retries: std::collections::BTreeMap<
+        (newt_identity::RawContentId, newt_identity::RawContentId),
+        Vec<(newt_core::DenialKind, String)>,
+    >,
     pub(crate) decisions: Vec<newt_core::PermissionRecord>,
     /// Durable approve/deny policy, read-only during the session.
     pub(crate) ocap_policy: newt_core::ocap_store::PolicySet,
@@ -1918,6 +1923,58 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         self.state
             .pending_once_grants
             .insert((kind, target.to_string()));
+    }
+
+    fn queue_command_retry(
+        &mut self,
+        command: &str,
+        cwd: &str,
+        requests: &[newt_core::PermissionRequest],
+    ) {
+        let key = (
+            newt_identity::RawContentId::from_content(command.as_bytes()),
+            newt_identity::RawContentId::from_content(cwd.as_bytes()),
+        );
+        self.state.pending_command_retries.insert(
+            key,
+            requests
+                .iter()
+                .map(|request| (request.kind, request.target.clone()))
+                .collect(),
+        );
+    }
+
+    fn apply_command_retry(
+        &mut self,
+        command: &str,
+        cwd: &str,
+        base: &newt_core::Caveats,
+    ) -> newt_core::Caveats {
+        let key = (
+            newt_identity::RawContentId::from_content(command.as_bytes()),
+            newt_identity::RawContentId::from_content(cwd.as_bytes()),
+        );
+        let Some(grants) = self.state.pending_command_retries.get(&key) else {
+            return base.clone();
+        };
+        if grants
+            .iter()
+            .any(|(kind, target)| self.state.denied(*kind, target))
+        {
+            self.state.pending_command_retries.remove(&key);
+            return base.clone();
+        }
+        let Ok(policy) = self.mint(base, grants) else {
+            return base.clone();
+        };
+        use newt_core::CaveatsExt as _;
+        if !grants.iter().all(|(kind, target)| {
+            *kind == newt_core::DenialKind::Exec && policy.permits_exec(target)
+        }) {
+            return base.clone();
+        }
+        self.state.pending_command_retries.remove(&key);
+        policy
     }
 
     fn apply_pending_once(
