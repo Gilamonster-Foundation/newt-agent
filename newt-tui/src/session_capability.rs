@@ -29,6 +29,10 @@ pub(crate) struct SessionCapability {
     caveats: newt_core::caveats::Caveats,
     delegation: Option<newt_identity::VerifiedDelegation>,
     frozen_at_launch: bool,
+    #[cfg(target_os = "macos")]
+    exec_pins: newt_core::exec_grants::ExecPins,
+    #[cfg(target_os = "macos")]
+    exec_notice: Option<String>,
 }
 
 impl SessionCapability {
@@ -83,8 +87,24 @@ impl SessionCapability {
                 caveats,
                 delegation: Some(d),
                 frozen_at_launch: false,
+                #[cfg(target_os = "macos")]
+                exec_pins: Default::default(),
+                #[cfg(target_os = "macos")]
+                exec_notice: None,
             };
         }
+        // Resolve only at the root session boundary, after all write grants.
+        // Delegated sessions above retain their signed ceiling unchanged.
+        #[cfg(target_os = "macos")]
+        let (policy, exec_pins, exec_notice) = {
+            let mut policy = policy;
+            let path = newt_core::exec_grants::dispatch_path();
+            let (pins, unresolved) =
+                newt_core::exec_grants::resolve_basenames(&mut policy, path.as_deref());
+            let notice = (!unresolved.is_empty()).then(|| format!(
+                "Executable grants kept as basenames (not found or untrusted on PATH): {}. Confined execution may need an explicit trusted executable path.", unresolved.join(", ")));
+            (policy, pins, notice)
+        };
         let op = key_path.and_then(|p| mint_operating_key(p, &policy).ok());
         let caveats = match &op {
             Some(k) => newt_identity::enforced_caveats(k).unwrap_or(policy),
@@ -95,7 +115,17 @@ impl SessionCapability {
             caveats,
             delegation: None,
             frozen_at_launch: false,
+            #[cfg(target_os = "macos")]
+            exec_pins,
+            #[cfg(target_os = "macos")]
+            exec_notice,
         }
+    }
+
+    /// Render once through the chat surface, never directly over its terminal.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_exec_notice(&mut self) -> Option<String> {
+        self.exec_notice.take()
     }
 
     /// The inherited ceiling is distinct from a removable named posture.
@@ -145,6 +175,12 @@ impl SessionCapability {
             return false;
         }
         let requested = policy_for(tui, workspace);
+        #[cfg(target_os = "macos")]
+        let requested = {
+            let mut requested = requested;
+            self.exec_pins.apply(&mut requested);
+            requested
+        };
         let narrowed = requested.meet(&self.caveats);
         let clamped = narrowed != requested;
         if let Some(op) = self.op.take() {
@@ -166,5 +202,48 @@ impl SessionCapability {
             self.caveats = narrowed;
         }
         clamped
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    /// agent-bridle #421: the actual session constructor must pin before mint,
+    /// including an operator-reviewed frozen profile.
+    #[test]
+    fn macos_session_pins_before_mint() {
+        let _env = newt_core::process_env::lock();
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("identity.pem");
+        let policy = newt_core::Caveats {
+            exec: newt_core::Scope::only(["echo".to_owned()]),
+            fs_write: newt_core::Scope::none(),
+            net: newt_core::Scope::none(),
+            ..newt_core::Caveats::top()
+        };
+        let session = SessionCapability::establish_frozen(policy.clone(), Some(&key), None);
+        let newt_core::Scope::Only(grants) = &session.caveats().exec else {
+            panic!("session must retain restricted exec");
+        };
+        assert!(grants.contains("echo"));
+        assert!(grants
+            .iter()
+            .any(|path| std::path::Path::new(path).is_absolute()));
+        assert_eq!(session.caveats().net, policy.net);
+        assert_eq!(session.caveats().fs_write, policy.fs_write);
+        let signed = newt_identity::enforced_caveats(session.op.as_ref().unwrap()).unwrap();
+        assert_eq!(signed.exec, session.caveats().exec);
+        let missing = newt_core::Caveats {
+            exec: newt_core::Scope::only(["newt-nonexistent-exec-fixture-421".into()]),
+            ..policy
+        };
+        let mut session = SessionCapability::establish_frozen(missing.clone(), None, None);
+        assert_eq!(session.caveats().exec, missing.exec);
+        assert!(session
+            .take_exec_notice()
+            .unwrap()
+            .contains("newt-nonexistent-exec-fixture-421"));
+        assert!(session.take_exec_notice().is_none());
     }
 }
