@@ -321,5 +321,14 @@ async fn governed_publication() {
         real_git_output(&task, &["symbolic-ref", "HEAD"]),
         "refs/heads/task"
     );
+    // #2813: ref movement alone is insufficient: Git can publish the commit
+    // and still fail its AUTO_MERGE cleanup against shared packed refs.
+    assert!(
+        !out.contains("packed-refs.lock")
+            && !out.contains("Operation not permitted")
+            && !out.contains("Permission denied")
+            && !out.contains("error:"),
+        "NEEDS PR #2818: governed commit cleanup failed after publication: {out}"
+    );
     println!("PASS governed_commit_and_task_ref_publication");
 }
