@@ -3,6 +3,8 @@ use quote::ToTokens;
 use std::{env, fs, process};
 use syn::{Attribute, Item};
 
+mod forwarding;
+
 fn allowed(attrs: &[Attribute], derive: bool) -> bool {
     attrs
         .iter()
@@ -69,6 +71,7 @@ fn evidence(old: &str, new: &str, module: &str, name: &str) -> Result<bool, Stri
             .iter()
             .any(|old| attributes(old).is_some_and(|a| allowed(a, true)) && tokens(old) == text)
             && !after.items.iter().any(|new| tokens(new) == text)
+            && forwarding::removed_or_forwarded(item, &after.items, name)
         {
             return Ok(true);
         }
@@ -119,6 +122,103 @@ mod tests {
             ),
             Ok(true)
         );
+    }
+
+    #[test]
+    fn retained_implementation_with_added_semicolon_is_not_forwarding() {
+        // #2804 round 5: copying and trivially editing is not extraction.
+        let old = r#"fn moved() { println!("hello") }"#;
+        assert_eq!(
+            evidence(
+                old,
+                r#"mod extracted; fn moved() { println!("hello"); }"#,
+                old,
+                "extracted"
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn genuine_wrapper_passes_each_parameter_through_in_order() {
+        let old = "fn moved(x: i32, y: i32) -> i32 { x + y }";
+        assert_eq!(
+            evidence(
+                old,
+                "mod extracted; fn moved(x: i32, y: i32) -> i32 { extracted::moved(x, y) }",
+                old,
+                "extracted"
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn direct_return_and_unit_statement_wrappers_forward() {
+        for (old, wrapper) in [
+            (
+                "fn moved(x: i32) -> i32 { x + 1 }",
+                "fn moved(x: i32) -> i32 { return extracted::moved(x); }",
+            ),
+            (
+                "fn moved(x: i32) { println!(\"{x}\"); }",
+                "fn moved(x: i32) { extracted::moved(x); }",
+            ),
+        ] {
+            assert_eq!(
+                evidence(old, &format!("mod extracted; {wrapper}"), old, "extracted"),
+                Ok(true)
+            );
+        }
+    }
+
+    #[test]
+    fn retained_nonfunction_and_conditional_wrapper_do_not_prove_removal() {
+        assert_eq!(
+            evidence(
+                "struct Moved { x: i32 }",
+                "mod extracted; struct Moved { x: i64 }",
+                "struct Moved { x: i32 }",
+                "extracted"
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            evidence(
+                "fn moved() {}",
+                "mod extracted; #[cfg(any())] fn moved() { extracted::moved() }",
+                "fn moved() {}",
+                "extracted"
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn changed_arguments_wrong_callee_and_extra_work_are_not_forwarding() {
+        // #2804: retained functions must actually delegate the original inputs.
+        let old = "fn moved(x: i32, y: i32) -> i32 { x + y }";
+        for body in [
+            "x + y + 0",
+            "other::moved(x, y)",
+            "extracted::other(x, y)",
+            "extracted::moved(y, x)",
+            "extracted::moved(x, 0)",
+            "extracted::moved(x)",
+            "let x = 0; extracted::moved(x, y)",
+            "extracted::moved(x, y); 0",
+        ] {
+            assert_eq!(
+                evidence(
+                    old,
+                    &format!("mod extracted; fn moved(x: i32, y: i32) -> i32 {{ {body} }}"),
+                    old,
+                    "extracted"
+                ),
+                Ok(false),
+                "{body}"
+            );
+        }
     }
 
     #[test]

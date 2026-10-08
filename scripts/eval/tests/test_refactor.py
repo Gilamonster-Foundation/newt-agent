@@ -203,6 +203,20 @@ class Grade(unittest.TestCase):
             result["criteria"]["worktree_commit"]["status"], "PASS", result
         )
 
+    def test_retained_body_copy_is_not_extraction(self):
+        """#2804 round 5: a semicolon edit must not turn a copy into extraction."""
+        old = 'fn moved() { println!("hello") }\n'
+        self.fake.trees[SEED][TARGET] = old + "\n" * 10
+        self.fake.trees[HEAD][
+            TARGET
+        ] = 'mod extracted;\nfn moved() { println!("hello"); }\n'
+        self.fake.trees[HEAD]["crate/src/extracted.rs"] = old
+        result = self.grade()
+        self.assertEqual(result["criteria"]["extraction"]["status"], "FAIL", result)
+        self.assertEqual(
+            result["criteria"]["worktree_commit"]["status"], "FAIL", result
+        )
+
     def test_seed_largest_is_computed_not_hardcoded(self):
         self.fake.trees[SEED]["unexpected.rs"] = "// big\n" * 50
         self.fake.trees[HEAD]["unexpected.rs"] = "// big\n" * 50

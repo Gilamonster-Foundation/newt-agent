@@ -108,7 +108,12 @@ Candidate modules/file roots must have only doc attributes; moved declarations
 may have doc/derive attributes. Conditional or custom attributes affecting those
 candidates explicitly fail as unsupported (cfg is not evaluated). Unrelated
 attributes are ignored. Functions are compared by parsed signature and body,
-allowing new visibility/documentation and a forwarding wrapper left behind.
+allowing new visibility/documentation. A retained function must be a parsed
+forwarding wrapper with the same signature: one call to `module::function`
+passing each parameter unchanged and in order. Tail calls, explicit returns,
+and unit-returning call statements are supported. Other retained bodies,
+conditional wrappers, and generic/async/unsafe wrappers are declined; this
+helper does not resolve arbitrary paths or prove their semantics.
 This remains structural evidence, not macro expansion or semantic equivalence.
 
 The grader builds the trusted `newt-refactor-evidence` workspace helper offline
