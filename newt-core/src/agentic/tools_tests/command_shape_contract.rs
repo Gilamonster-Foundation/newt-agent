@@ -123,13 +123,16 @@ fn discovery_matches_unique_fixture_across_windows_path_forms() {
 async fn check(row: Row) {
     let _lock = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("original");
-    let task = temp.path().join("task");
+    // macOS exposes /var through /private/var; grants must use the same
+    // canonical spelling as destination admission.
+    let temp_root = dunce::canonicalize(temp.path()).unwrap();
+    let root = temp_root.as_path().join("original");
+    let task = temp_root.as_path().join("task");
     std::fs::create_dir(&root).unwrap();
-    git(&root, temp.path(), &["init", "-q", "-b", "main"]);
+    git(&root, temp_root.as_path(), &["init", "-q", "-b", "main"]);
     git(
         &root,
-        temp.path(),
+        temp_root.as_path(),
         &[
             "-c",
             "commit.gpgsign=false",
@@ -144,7 +147,7 @@ async fn check(row: Row) {
     if matches!(row.setup, Setup::Bound | Setup::Restricted | Setup::Publish) {
         git(
             &root,
-            temp.path(),
+            temp_root.as_path(),
             &["worktree", "add", "-b", "task", "../task"],
         );
         std::fs::write(task.join("marker"), "task marker").unwrap();
@@ -156,18 +159,22 @@ async fn check(row: Row) {
         session.record_task_worktree(&task.canonicalize().unwrap(), "task");
     }
     if matches!(row.setup, Setup::Publish | Setup::AdoptedPublish) {
-        let remote = temp.path().join("remote.git");
+        let remote = temp_root.as_path().join("remote.git");
         git(
             &root,
-            temp.path(),
+            temp_root.as_path(),
             &["init", "--bare", "-q", remote.to_str().unwrap()],
         );
         git(
             &root,
-            temp.path(),
+            temp_root.as_path(),
             &["remote", "add", "origin", remote.to_str().unwrap()],
         );
-        git(&root, temp.path(), &["config", "push.default", "current"]);
+        git(
+            &root,
+            temp_root.as_path(),
+            &["config", "push.default", "current"],
+        );
     }
     let _redirects: Vec<_> = [
         "GIT_DIR",
@@ -185,7 +192,7 @@ async fn check(row: Row) {
     .into_iter()
     .map(EnvVar::unset)
     .collect();
-    let git_env = git_fixture::hermetic_git_env(temp.path());
+    let git_env = git_fixture::hermetic_git_env(temp_root.as_path());
     let _env = [
         "HOME",
         "GIT_AUTHOR_NAME",
@@ -198,7 +205,7 @@ async fn check(row: Row) {
     ]
     .map(|key| EnvVar::set(key, &git_env[key]));
     // Discovery is about lookup, not host gh installation or credentials.
-    let bin = temp.path().join("bin");
+    let bin = temp_root.as_path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     // The test executable rejects gh's --base argument locally. It can never
     // create a PR; its error proves the plain route really spawned the child.
@@ -243,7 +250,7 @@ async fn check(row: Row) {
             row.setup,
             Setup::Fresh | Setup::Adopted | Setup::AdoptedPublish
         ) {
-            temp.path()
+            temp_root.as_path()
         } else {
             &task
         }
@@ -267,7 +274,7 @@ async fn check(row: Row) {
         caveats.fs_write = Scope::only([task.to_string_lossy().into_owned()]);
         if row.setup == Setup::AdoptedPublish {
             caveats.fs_write = Scope::only(
-                [task.clone(), temp.path().join("remote.git")]
+                [task.clone(), temp_root.as_path().join("remote.git")]
                     .map(|p| p.to_string_lossy().into_owned()),
             );
         }
@@ -356,10 +363,16 @@ async fn check(row: Row) {
             },
             "local push must use the native kernel fence"
         );
+        let expected = std::fs::read_to_string(root.join(".git/refs/heads/task")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp_root.join("remote.git/refs/heads/task")).unwrap(),
+            expected,
+            "local push must publish the task commit before checking tracking metadata"
+        );
         let tracking = root.join(".git/refs/remotes/origin/task");
         assert_eq!(
-            std::fs::read_to_string(&tracking).ok(),
-            std::fs::read_to_string(root.join(".git/refs/heads/task")).ok(),
+            std::fs::read_to_string(&tracking).ok().as_deref(),
+            Some(expected.as_str()),
             "local push must update shared tracking ref: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -454,8 +467,15 @@ async fn check(row: Row) {
     if matches!(row.setup, Setup::Publish | Setup::AdoptedPublish) {
         let expected =
             crate::agentic::claim_check::git_head(task.to_str().unwrap(), &Scope::All).unwrap();
-        let remote = temp.path().join("remote.git/refs/heads/task");
+        let remote = temp_root.as_path().join("remote.git/refs/heads/task");
         assert_eq!(std::fs::read_to_string(remote).unwrap().trim(), expected);
+    }
+    if row.command == "git commit -m contract" {
+        assert_ne!(
+            std::fs::read(root.join(".git/refs/heads/task")).unwrap(),
+            std::fs::read(root.join(".git/refs/heads/main")).unwrap(),
+            "confined commit must advance the task branch"
+        );
     }
     if row.command == "git branch followup" {
         assert_eq!(
@@ -574,8 +594,12 @@ default_cwd, Plain, Bound, "git branch --show-current", Some(Passed), Task, true
 relative_read, Plain, Bound, "read_file marker", None, Neither, true, false, "task marker", None, "";
 confined_read, Confined, Bound, "read_file marker", None, Neither, true, false, "task marker", None, "";
 #[cfg(any(unix, feature = "windows-appcontainer"))]
+// #905: measured native Seatbelt refusal, not an ignored row.
+#[cfg_attr(target_os = "macos", should_panic(expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"))]
 which_git, Confined, Fresh, "which git", Some(Passed), Original, false, false, "git", None, "";
 #[cfg(any(unix, feature = "windows-appcontainer"))]
+// #905: measured native Seatbelt refusal, not an ignored row.
+#[cfg_attr(target_os = "macos", should_panic(expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"))]
 which_gh, Confined, Fresh, "which gh", Some(Passed), Original, false, false, "gh", None, "";
 plain_which_git, Plain, Fresh, "which git", Some(Passed), Original, false, false, "git", None, "";
 plain_which_gh, Plain, Fresh, "which gh", Some(Passed), Original, false, false, "gh", None, "";
