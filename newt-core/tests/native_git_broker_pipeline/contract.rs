@@ -1,6 +1,9 @@
 //! Production Brush counterpart of the libtest command-shape/adoption rows.
 //! Grounds session binding, kernel ref protection, and governed publication.
 //! `--require-2818` runs the positive commit/ref publication row pending PR #2818.
+#[path = "contract_chat.rs"]
+mod chat;
+
 use super::native::{real_git, real_git_output, TrailerGitTool};
 use newt_core::{worktree_adoption::WorktreeSession, Caveats, Scope};
 use std::path::{Path, PathBuf};
@@ -94,9 +97,14 @@ async fn dispatch(
     caveats: &Caveats,
     command: &str,
 ) -> String {
-    session
-        .execute_command(command, main, caveats, Some(&TrailerGitTool(false)))
-        .await
+    chat::dispatch(
+        session,
+        main,
+        caveats,
+        command,
+        Some(&TrailerGitTool(false)),
+    )
+    .await
 }
 
 async fn adopt(
@@ -175,14 +183,14 @@ async fn creation_and_security(wrapper: bool) {
     raw_refs_are_protected(&main, &task).await;
     // No policy: refusal must not fund an unmanaged commit.
     let before = real_git_output(&task, &["rev-parse", "HEAD"]);
-    let out = session
-        .execute_command(
-            "git commit --allow-empty -m unmanaged",
-            &main,
-            &caveats,
-            None,
-        )
-        .await;
+    let out = chat::dispatch(
+        &session,
+        &main,
+        &caveats,
+        "git commit --allow-empty -m unmanaged",
+        None,
+    )
+    .await;
     assert!(
         out.contains("error:") || out.contains("refused"),
         "no broker: {out}"
