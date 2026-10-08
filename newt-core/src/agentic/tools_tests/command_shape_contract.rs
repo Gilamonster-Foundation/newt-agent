@@ -571,16 +571,22 @@ rows! {
 // name, mode, setup, command, outcome, cwd, bound, refusal, text, gate, claim
 // #2813: actual confined creation precedes commit/ref writes. No forge or network.
 #[cfg(unix)]
+// #905: native creation is refused before the requested task operation.
+#[cfg_attr(target_os = "macos", should_panic(expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"))]
 confined_task_commit, Confined, Adopted, "git commit -m contract", Some(Passed), Task, true, false, "", None, "";
 #[cfg(unix)]
 // #2813 also reproduces under Landlock: task-scoped authority cannot lock shared refs.
 #[cfg_attr(target_os = "linux", should_panic(expected = "original/.git/refs/heads/followup.lock': Permission denied"))]
+// #905: native creation is refused before the requested task operation.
+#[cfg_attr(target_os = "macos", should_panic(expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"))]
 confined_task_ref_update, Confined, Adopted, "git branch followup", Some(Passed), Task, true, false, "", None, "";
 // Owned local remote via the kernel-confined executor; the governed broker's
 // local-URL refusal is a separate control in the macOS job (#905, #2813).
 #[cfg(unix)]
 // #2813: successful transport must not hide a failed shared tracking-ref update.
 #[cfg_attr(target_os = "linux", should_panic(expected = "error: update_ref failed for ref 'refs/remotes/origin/task': cannot lock ref 'refs/remotes/origin/task': unable to create directory for"))]
+// #905: native creation is refused before the requested task operation.
+#[cfg_attr(target_os = "macos", should_panic(expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"))]
 confined_local_push, Confined, AdoptedPublish, "confined-executor git push", Some(Passed), Task, true, false, "", None, "";
 // TODO row (c), PR #2814: blank plan approval -> Approved once it lands.
 // The macOS job also selects plan_mode::tests to inherit that regression.
@@ -589,6 +595,8 @@ standalone, Plain, Fresh, "git worktree add -b task ../task", Some(Passed), Orig
 compound, Plain, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Passed), Original, true, false, "", None, "";
 missing_b, Plain, Fresh, "git worktree add ../task absent", Some(Failed), Original, false, false, "-b", None, "";
 #[cfg(unix)]
+// #905: native creation is refused before the requested task operation.
+#[cfg_attr(target_os = "macos", should_panic(expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"))]
 confined_creation, Confined, Fresh, "git worktree add -b task ../task", Some(Passed), Original, true, false, "", None, "";
 default_cwd, Plain, Bound, "git branch --show-current", Some(Passed), Task, true, false, "task", None, "";
 relative_read, Plain, Bound, "read_file marker", None, Neither, true, false, "task marker", None, "";
@@ -622,8 +630,12 @@ true_push_claim, Plain, Publish, "git push origin task", Some(Passed), Task, tru
 true_commit_claim, Plain, Bound, "git -c commit.gpgsign=false commit --allow-empty -m contract", Some(Passed), Task, true, false, "HEAD moved", None, "I committed the change locally.";
 #[cfg(unix)]
 // #2810: verified read-only output wrappers retain confined adoption.
+// #905: native creation is refused before the requested task operation.
+#[cfg_attr(target_os = "macos", should_panic(expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"))]
 confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Passed), Original, true, false, "?? marker", None, "";
 #[cfg(unix)]
+// #905: native creation is refused before the requested task operation.
+#[cfg_attr(target_os = "macos", should_panic(expected = "refusing to spawn: backend authority on the Net axis is not decidable against the delegated grant ∪ declared runtime closure (L3 BOUND)"))]
 confined_missing_b, Confined, Fresh, "git worktree add ../task absent", Some(Failed), Original, false, false, "-b", None, "";
 nested_plain, Plain, Fresh, "git worktree add -b task .worktrees/task", Some(Passed), Original, true, false, "", None, "";
 #[cfg(windows)]
