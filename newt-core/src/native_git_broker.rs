@@ -759,6 +759,7 @@ impl NativeCommitSession {
                             .as_deref()
                             .ok_or("private commit lacks original HEAD")?,
                         &oid,
+                        &actual,
                     )?;
                 }
                 state.published = true;

@@ -6,18 +6,47 @@ use agent_bridle::{ToolContext, ToolResult};
 use std::path::Path;
 
 pub(super) struct CommitView {
+    // TempDir cleans up ordinary exits on a best-effort basis; crashes,
+    // filesystem errors, or a concurrent rename can leave the view behind.
     pub directory: tempfile::TempDir,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    admin: crate::fs_cap::WorkspaceDir,
+    admin: agent_bridle_fdguard::GrantedRoot,
 }
 
 impl CommitView {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub fn publish(&self, old: &str, new: &str) -> Result<(), String> {
-        crate::git_hardening::publish_detached_head(&self.admin, old, new)
+    pub fn publish(&self, old: &str, new: &str, verified_commit: &[u8]) -> Result<(), String> {
+        // Derive the entry only from the policy-verified object, never from
+        // logs/HEAD in the child-writable view. Preserve its committer/date.
+        let commit = std::str::from_utf8(verified_commit).map_err(|e| e.to_string())?;
+        let (headers, message) = commit.split_once("\n\n").ok_or("commit lacks message")?;
+        let mut committers = headers
+            .split('\n')
+            .filter_map(|line| line.strip_prefix("committer "));
+        let committer = committers.next().ok_or("commit lacks committer")?;
+        if committer.is_empty()
+            || committer.chars().any(char::is_control)
+            || committers.next().is_some()
+        {
+            return Err("commit has invalid reflog committer".into());
+        }
+        let summary = message
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let action = if super::commit_parents(verified_commit)? == [old] {
+            "commit"
+        } else {
+            "commit (amend)"
+        };
+        let entry = format!("{old} {new} {committer}\t{action}: {summary}\n");
+        crate::git_hardening::publish_detached_head(&self.admin, old, new, &entry)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub fn publish(&self, _old: &str, _new: &str) -> Result<(), String> {
+    pub fn publish(&self, _old: &str, _new: &str, _verified_commit: &[u8]) -> Result<(), String> {
         Err("private commit views are unavailable on this platform".into())
     }
 }
@@ -66,7 +95,6 @@ pub(super) fn create(
         return Err(denied("private commit view needs an independently confined admin directory; run standalone git commit from the task worktree"));
     }
     let admin_root = agent_bridle_fdguard::GrantedRoot::acquire(admin).map_err(denied)?;
-    let root = crate::fs_cap::WorkspaceDir::from_granted_root(&admin_root).map_err(denied)?;
     let directory = tempfile::Builder::new()
         .prefix(".newt-commit-view-")
         .tempdir_in(admin)
@@ -123,7 +151,7 @@ pub(super) fn create(
     }
     Ok(CommitView {
         directory,
-        admin: root,
+        admin: admin_root,
     })
 }
 

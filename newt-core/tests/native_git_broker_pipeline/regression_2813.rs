@@ -147,6 +147,42 @@ async fn commit_cleanup_preserves_shared_refs(heredoc: bool, packed: bool) {
         raw.contains("\nencoding ISO-8859-1\n"),
         "relative config include was lost: {raw}"
     );
+    // #2813 / PR #2818: the private Git view must preserve the real linked
+    // worktree HEAD reflog for both an ordinary commit and an amendment.
+    let first = real_git_output(&wt, &["rev-parse", "HEAD"]);
+    let amended = dispatch(
+        &wt,
+        "git commit -q --amend -m 'amended reflog fixture'",
+        &caveats,
+        false,
+    )
+    .await;
+    let second = real_git_output(&wt, &["rev-parse", "HEAD"]);
+    assert_ne!(first, second, "amend did not publish: {amended}");
+    assert_eq!(
+        real_git_output(&wt, &["reflog", "show", "-2", "--format=%H", "HEAD"]),
+        format!("{second}\n{first}"),
+        "private commit/amend lost the real worktree HEAD reflog"
+    );
+    let log = std::fs::read_to_string(main.join(".git/worktrees/wt/logs/HEAD")).unwrap();
+    for (old, new, prefix) in [
+        (original_head.as_str(), first.as_str(), "commit:"),
+        (first.as_str(), second.as_str(), "commit (amend):"),
+    ] {
+        let commit = real_git_output(&wt, &["cat-file", "commit", new]);
+        let (headers, message) = commit.split_once("\n\n").unwrap();
+        let committer = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("committer "))
+            .unwrap();
+        assert!(
+            log.contains(&format!(
+                "{old} {new} {committer}\t{prefix} {}\n",
+                message.lines().next().unwrap()
+            )),
+            "missing verified reflog transition: {log}"
+        );
+    }
     // The fixture signer deliberately refuses: private views must not turn a
     // required signature failure into an unsigned publication (#2813/#2720).
     if packed {
