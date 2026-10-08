@@ -66,6 +66,9 @@ on:
       - "newt-tui/src/clarification_modal.rs"
       - "newt-tui/src/modal.rs"
       - "newt-tui/src/completed_spill.rs"
+      - "newt-tui/src/live_spill.rs"
+      - "newt-tui/src/live_spill_tests.rs"
+      - "newt-tui/src/live_spill_pty_tests.rs"
       # chat.rs is also reached by these tests but is deliberately left out: it
       # would fire this tier on nearly every PR (see the scoped-gate note above).
       - "newt-core/src/tty/**"
@@ -143,6 +146,15 @@ jobs:
       - name: Run interaction frame real-PTY tests
         run: |
           cargo test -p newt-tui --features rich-tui,live-spill interaction_view_pty_test \
+            -- --include-ignored --test-threads=1
+
+      # The live tool-output viewport on a real terminal: the arbiter's
+      # placement under the transcript, the scroll by the deficit, and the
+      # row the next committed line lands on. The parent answers the cursor
+      # queries, so `--include-ignored` and one thread, like the frame tests.
+      - name: Run live viewport real-PTY tests
+        run: |
+          cargo test -p newt-tui --features rich-tui,live-spill live_spill::tests::terminal \
             -- --include-ignored --test-threads=1
 
       # The cockpit owns fd 0/1 and the terminal's modes for a whole session,

@@ -861,12 +861,12 @@ pub trait LiveToolOutput: Send + Sync {
 /// the next tool header). Only the Rich TUI (feature `rich-tui` + `live-spill`)
 /// implements this; the Lean TUI and headless callers pass `None`.
 ///
-/// The dismissal discipline is load-bearing: the viewport's erase rewinds
-/// relative to the cursor (`MoveUp` + clear), so any committed line landing
-/// below a still-painted frame breaks the rewind and destroys rows the frame
-/// does not own. A viewport that must SURVIVE canonical output (scroll during
-/// the next thinking round, or at the prompt) is the #1303 step 6
-/// retain-overlay, not this trait.
+/// The dismissal discipline is load-bearing: the viewport holds rows the tty
+/// arbiter placed under the transcript and erases exactly those rows, so a
+/// committed line that landed on them would go with the frame. Dismissing
+/// first is what keeps the transcript whole. A viewport that must SURVIVE
+/// canonical output (scroll during the next thinking round, or at the prompt)
+/// is the #1303 step 6 retain-overlay, not this trait.
 ///
 /// Key differences from `LiveToolOutput`:
 /// - Not incremental — renders a complete, finished tool result
