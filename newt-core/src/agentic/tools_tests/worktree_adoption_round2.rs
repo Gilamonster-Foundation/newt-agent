@@ -34,6 +34,12 @@ pub(super) async fn dispatch(
     session: &WorktreeSession,
     gate: Option<&mut dyn PermissionGate>,
 ) -> (String, Option<crate::ExecOutcome>) {
+    // All adoption dispatch fixtures, including ignored native proofs, must
+    // exclude sibling bypass overrides until execution finishes. Restore before
+    // unlocking; the shared reentrant guard stays on the test root thread.
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let _confined = EnvVar::set("NEWT_DISABLE_OCAP", "0");
     let outcome = std::sync::OnceLock::new();
     let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
     let text = execute(
@@ -191,6 +197,51 @@ async fn worktree_adoption_round2_argv_build_uses_adopted_root() {
 #[tokio::test]
 async fn worktree_adoption_round2_shell_build_uses_adopted_root() {
     adopted_build_dispatch("cargo check; echo done").await;
+}
+
+/// #2733 libtest regression: a sibling's temporary bypass must not change
+/// these confined build fixtures. Enter the fixtures while that override is
+/// active to reproduce the offending order without timing or parallelism.
+#[cfg(unix)]
+#[tokio::test]
+async fn worktree_adoption_build_fixture_isolates_and_restores_bypass() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let _foreign = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    for source in ["cargo check", "cargo check; echo done"] {
+        adopted_build_dispatch(source).await;
+        assert!(crate::launch_authority::current().ocap_disabled());
+    }
+}
+
+/// #2822: every native caller of dispatch must isolate a sibling's bypass,
+/// including the sentinel proofs. The Build gate stops before spawning, so
+/// this regression needs neither a kernel fence nor a timing-sensitive race.
+#[cfg(unix)]
+#[tokio::test]
+async fn worktree_adoption_dispatch_isolates_and_restores_bypass() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let _foreign = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let (temp, policy, _) = fixture(false);
+    link(&policy);
+    let session = WorktreeSession::default();
+    session.adopt(policy.clone());
+    let mut c = Caveats::top();
+    c.exec = Scope::none();
+    c.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
+    let mut gate = BuildGate::default();
+    let (text, outcome) = dispatch(
+        serde_json::json!({"command": "cargo check", "cwd": policy.worktree}),
+        &temp.path().join("main"),
+        &c,
+        &session,
+        Some(&mut gate),
+    )
+    .await;
+    assert_eq!(outcome, Some(crate::ExecOutcome::Denied), "{text}");
+    assert_eq!(gate.0.len(), 1, "{text}");
+    assert!(crate::launch_authority::current().ocap_disabled());
 }
 
 /// #2733 P2: ground the recording-gate tests in actual confined Cargo builds
