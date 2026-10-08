@@ -71,6 +71,12 @@ on:
       - "newt-tui/src/live_spill_pty_tests.rs"
       # chat.rs is also reached by these tests but is deliberately left out: it
       # would fire this tier on nearly every PR (see the scoped-gate note above).
+      # PR #2816: this existing macOS job also proves confined basename exec.
+      - "newt-core/src/exec_grants.rs"
+      - "newt-core/src/git_staging*.rs"
+      - "newt-core/src/git_staging/**"
+      - "newt-core/tests/macos_exec_basenames.rs"
+      - "newt-tui/src/session_capability.rs"
       - "newt-core/src/tty/**"
       - "newt-core/src/agentic/permissions.rs"
       - "tests/pty/**"
@@ -186,6 +192,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: newt-tui-pty-macos
+
+      # HOOK PARITY: CI-only native Seatbelt proof, explicitly named in
+      # .githooks/pre-push; the portable pin tests remain in its scoped gate.
+      - name: Ensure GitHub CLI for confined basename proof
+        run: command -v gh >/dev/null || brew install gh
+
+      - name: Prove confined executable pins and signed session construction
+        run: |
+          # Homebrew's shared writable prefix is not a trusted exec fixture.
+          # Copy the real binary; never weaken the production ancestry checks.
+          ambient_gh="$(command -v gh)"
+          trusted_gh_dir="$(sudo mktemp -d /private/tmp/newt-gh.XXXXXX)"
+          trap 'sudo rm -rf "$trusted_gh_dir"' EXIT
+          sudo install -m 0555 "$ambient_gh" "$trusted_gh_dir/gh"
+          sudo chmod 0755 "$trusted_gh_dir"
+          proof_path="$trusted_gh_dir:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+          env -u NEWT_VENV -u VIRTUAL_ENV \
+            NEWT_TEST_AMBIENT_GH="$ambient_gh" NEWT_EXEC_PATHS="$trusted_gh_dir" \
+            PATH="$proof_path" \
+            cargo test -p newt-core --test macos_exec_basenames -- --ignored
+          env -u NEWT_VENV -u VIRTUAL_ENV \
+            NEWT_EXEC_PATHS="$trusted_gh_dir" PATH="$proof_path" \
+            cargo test -p newt-tui --lib session_capability:: -- --test-threads=1
 
       # The termios/pty surface, in the order it is layered: the modal's raw
       # guard, then the cockpit's capture and mode restoration on top of it.

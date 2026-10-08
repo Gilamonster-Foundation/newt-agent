@@ -1,5 +1,5 @@
 //! Pin admitted Git and display words using staging's executable trust (#2733, #2810).
-use crate::{git_staging, Caveats};
+use crate::Caveats;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -8,21 +8,7 @@ pub(super) fn authenticate(path: &OsStr, caveats: &Caveats) -> Result<PathBuf, (
 }
 
 fn authenticate_program(path: &OsStr, caveats: &Caveats, name: &str) -> Result<PathBuf, ()> {
-    // The shared lookup skips relative PATH entries; a shell would not. Never
-    // infer that its absolute result is what an unresolved shell name means.
-    if std::env::split_paths(path).any(|dir| !dir.is_absolute()) {
-        return Err(());
-    }
-    // Same resolver used by staging and #2743 diagnostics, via its Git wrapper.
-    let program = crate::git_hardening::resolve_trusted_program(Path::new("."), Some(path), name)
-        .map_err(|_| ())?;
-    let resolved = program.canonicalize().map_err(|_| ())?;
-    let mut trust = git_staging::TrustContext::bind(&caveats.fs_write).map_err(|_| ())?;
-    if name == "git" {
-        trust = trust.with_git(&resolved);
-    }
-    git_staging::trust_check(&program, &trust).map_err(|_| ())?;
-    Ok(resolved)
+    crate::exec_grants::trusted_program(path, caveats, name)
 }
 
 pub(super) fn resolve(caveats: &Caveats) -> Result<PathBuf, ()> {
@@ -32,12 +18,7 @@ pub(super) fn resolve(caveats: &Caveats) -> Result<PathBuf, ()> {
 fn resolve_program(caveats: &Caveats, name: &str) -> Result<PathBuf, ()> {
     // Use the same venv/exec-path/developer-tool selection as shell dispatch.
     // In particular macOS may select the real tool instead of /usr/bin's shim.
-    let env = super::shell::venv_env_map();
-    let path = env
-        .get("PATH")
-        .map(std::ffi::OsString::from)
-        .or_else(|| std::env::var_os("PATH"))
-        .ok_or(())?;
+    let path = crate::exec_grants::dispatch_path().ok_or(())?;
     if name == "git" {
         authenticate(&path, caveats)
     } else {

@@ -6142,3 +6142,11 @@ mod git_fixture;
 #[cfg(test)]
 #[path = "tools_tests/command_shape_contract.rs"]
 mod command_shape_contract;
+
+/// Resolve the environment through the same seam as confined dispatch.
+pub(crate) fn dispatch_exec_path() -> Option<std::ffi::OsString> {
+    shell::venv_env_map()
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+}
