@@ -230,21 +230,15 @@ fn json_batch(finish: &str) -> ResponseTemplate {
         "usage":{"prompt_tokens":2000,"completion_tokens":4}}))
 }
 
-/// #2385: a complete stream whose tool call carries invalid arguments, including
-/// a call cut at the output limit (`finish_reason: length`), is the model's to
-/// retry. The loop echoes a keyed rejection per call and asks again, as the
+/// #2385: a complete stream whose tool call carries invalid arguments may be
+/// retried when the provider did not report an output limit (#2824). The loop echoes a keyed rejection per call and asks again, as the
 /// non-streamed Chat wire does; before, the strict decoder failed the turn. No
 /// call of the rejected batch runs, the retry's batch runs once, and both wires
 /// send the model the same rejection.
 #[tokio::test]
 async fn invalid_streamed_arguments_are_rejected_per_call_and_retried() {
     let mut rejections = Vec::new();
-    for (streamed, finish) in [
-        (true, "tool_calls"),
-        (true, "length"),
-        (false, "tool_calls"),
-        (false, "length"),
-    ] {
+    for (streamed, finish) in [(true, "tool_calls"), (false, "tool_calls")] {
         let label = format!("streamed={streamed} finish={finish}");
         let server = MockServer::start().await;
         let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -1250,3 +1244,6 @@ async fn a_mixed_response_on_the_retry_fails_after_exactly_two_attempts() {
 
 #[path = "generation_bound_tests.rs"]
 mod generation_bound_tests;
+
+#[path = "provider_output_limit_tests.rs"]
+mod provider_output_limit_tests;
