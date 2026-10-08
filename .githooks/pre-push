@@ -61,7 +61,8 @@
 #   - the `--no-default-features` lean build/test config (issue #416, #1409, #1828)
 #   - `just msrv` (MSRV toolchain check)
 #   - `just audit` (cargo-audit against .cargo/audit.toml)
-#   - `just eval-selftest` (bench/harbor fixture suite)
+#   - `just eval-selftest` (bench/harbor and refactor-grader offline fixture suites;
+#     .github/workflows/ci.yml lint job runs scripts/eval/tests)
 #   - `just harness-python` (uv + CPython real-resource lane)
 #   - the PTY (newt-tui-pty.yml) and mcp-import-real.yml real-resource lanes
 #   - the real-`newt`-session and real-PTY integration binaries of the
