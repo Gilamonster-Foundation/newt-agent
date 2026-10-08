@@ -145,8 +145,9 @@ mod native {
     use agent_toolchain::git_caveats::GitCaveats;
     use agent_toolchain::native_git::CommitPolicy;
     use newt_core::agentic::GitTool;
+    use newt_core::Caveats;
     #[cfg(target_os = "linux")]
-    use newt_core::{Caveats, NoMcp, Scope};
+    use newt_core::{NoMcp, Scope};
 
     #[cfg(target_os = "linux")]
     const MARKER: &str = "NATIVE_GIT_BROKER_PIPELINE_CONFIRMED";
