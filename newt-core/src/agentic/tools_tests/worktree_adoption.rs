@@ -363,6 +363,10 @@ async fn worktree_adoption_unverifiable_policy_refuses_dispatch() {
 /// worktree creation through to a child and discover the ref fence by EPERM.
 #[tokio::test]
 async fn worktree_creation_2813_requires_an_available_adoption_session() {
+    // #2813: cargo test runs alongside bypass fixtures on Windows. Pin the
+    // governed mode under their shared lock; do not inherit a sibling's yolo.
+    let _env = crate::agentic::tools::disable_ocap_tests::env_lock().await;
+    let _ocap = crate::agentic::tools::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
     let (_temp, policy, _) = fixture(false);
     link(&policy);
     let root = policy.worktree.parent().unwrap().join("main");
