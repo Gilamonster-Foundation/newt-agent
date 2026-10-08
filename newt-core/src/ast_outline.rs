@@ -196,6 +196,16 @@ fn leading_closing_delimiters(source: &str) -> usize {
     end
 }
 
+/// Line containing an arbitrary parser byte offset, including an inclusive
+/// `range.end - 1` inside a multibyte character. Floor before slicing text.
+fn line_at_byte(source: &str, byte: usize) -> usize {
+    let mut end = byte.min(source.len());
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    source[..end].bytes().filter(|&b| b == b'\n').count()
+}
+
 /// The page-cut counterpart of tags-based recovery (#2638 fix item 1): a
 /// definition whose CLOSE never arrives inside this fragment leaves an
 /// unbalanced brace count with no `is_definition` tag of its own. Recovery
@@ -213,7 +223,7 @@ fn trailing_truncated_definition(
 ) -> Option<OutlineEntry> {
     let tree = parse_rust(source).ok()?;
     let target = final_incomplete_node(tree.root_node())?;
-    let line_of = |byte: usize| source[..byte.min(source.len())].matches('\n').count();
+    let line_of = |byte: usize| line_at_byte(source, byte);
     // Recovery boundary: the cut item starts AFTER the last tagged entry
     // ENDS. Everything up to there parsed as complete items, tagged or not.
     let last_tagged_end = entries.iter().map(|e| e.end_line).max().unwrap_or(0);
@@ -260,7 +270,7 @@ pub fn outline_rust(source: &str, first_line: usize) -> Option<Vec<OutlineEntry>
     // `name_node.start_position()..end_position()`), not the definition —
     // the caller wants the definition's full line range, so it comes from
     // `Tag::range` (the tagged node's byte range) via a newline count instead.
-    let line_of = |byte: usize| source[..byte.min(source.len())].matches('\n').count();
+    let line_of = |byte: usize| line_at_byte(source, byte);
     let mut entries: Vec<OutlineEntry> = tags
         .filter_map(Result::ok)
         .filter(|t| t.is_definition)

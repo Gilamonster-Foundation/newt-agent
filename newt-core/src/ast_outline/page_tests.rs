@@ -89,3 +89,33 @@ fn closing_delimiter_variants_keep_coordinates() {
     }
     assert!(outline_rust("  ))\n}\n  ", 1).unwrap().is_empty());
 }
+
+/// A page cut after a Unicode comment/identifier must not make the inclusive
+/// end-byte calculation slice through the last character and kill the session.
+#[test]
+fn unicode_page_cuts_keep_outline_coordinates() {
+    for character in ["é", "—", "界", "🦎"] {
+        let source = format!("fn before() {{}}\nfn cut() {{\n    // comment {character}\n}}\n");
+        for end in source
+            .char_indices()
+            .map(|(end, _)| end)
+            .chain([source.len()])
+        {
+            let entries = outline_rust(&source[..end], 100).unwrap();
+            for entry in entries {
+                assert!(entry.start_line >= 100);
+                assert!(entry.end_line >= entry.start_line);
+                assert!(
+                    entry.end_line <= 100 + source[..end].bytes().filter(|b| *b == b'\n').count()
+                );
+            }
+        }
+    }
+    // A complete parser-tagged item may also end at a Unicode identifier when
+    // the read page cuts before its body or terminator.
+    let entries = outline_rust("fn before() {}\nstruct Café", 100).unwrap();
+    assert_eq!(entries[0].start_line, 100);
+    assert!(entries.iter().any(|entry| entry.header == "struct Café"
+        && entry.start_line == 101
+        && entry.end_line == 101));
+}
