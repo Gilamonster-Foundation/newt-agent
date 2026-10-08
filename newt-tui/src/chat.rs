@@ -2002,6 +2002,10 @@ fn session_body(
             SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None)
         }
     };
+    #[cfg(target_os = "macos")]
+    if let Some(notice) = cap.take_exec_notice() {
+        print_newt(&notice, color, verbose);
+    }
     workspace_settings.protect(cap.caveats())?;
     if workspace_settings.profile.is_some() {
         print_newt("Saved workspace settings active. Changes in /settings workspaces apply after a full Newt restart.", color, verbose);
