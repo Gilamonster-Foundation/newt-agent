@@ -489,24 +489,27 @@ fn filesystem_grant_is_covered(scope: &Scope<String>, target: &str) -> bool {
     let Scope::Only(roots) = scope else {
         return true;
     };
-    let target = Path::new(target);
+    // Canonical Windows paths use a verbatim prefix even when the signed name
+    // or policy root uses an ordinary drive path. Reuse the platform simplifier
+    // without resolving aliases or collapsing traversal in the named path.
+    let target = dunce::simplified(Path::new(target));
     let exact = |path: &Path| {
         path.canonicalize()
-            .is_ok_and(|resolved| resolved.as_os_str() == path.as_os_str())
+            .is_ok_and(|resolved| dunce::simplified(&resolved).as_os_str() == path.as_os_str())
     };
     if !roots.iter().any(|root| {
-        let root = Path::new(root);
+        let root = dunce::simplified(Path::new(root));
         exact(root) && target.starts_with(root)
     }) {
         return false;
     }
     match target.canonicalize() {
-        Ok(resolved) => resolved.as_os_str() == target.as_os_str(),
+        Ok(resolved) => dunce::simplified(&resolved).as_os_str() == target.as_os_str(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             crate::config::normalize_path(target)
                 .is_ok_and(|path| path.as_os_str() == target.as_os_str())
                 && crate::config::resolve_uncreated_path(target)
-                    .is_ok_and(|path| path.as_os_str() == target.as_os_str())
+                    .is_ok_and(|path| dunce::simplified(&path).as_os_str() == target.as_os_str())
         }
         Err(_) => false,
     }
@@ -611,6 +614,39 @@ mod tests {
                 base,
                 "uncovered/alias/traversal: {path:?}"
             );
+        }
+    }
+
+    /// PR #2838: canonical verbatim Windows names must not add unstable roots.
+    #[cfg(windows)]
+    #[test]
+    fn covered_windows_grants_accept_ordinary_and_verbatim_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let verbatim = temp.path().canonicalize().unwrap();
+        let ordinary = dunce::simplified(&verbatim).to_path_buf();
+        assert_ne!(ordinary.as_os_str(), verbatim.as_os_str());
+        std::fs::write(ordinary.join("existing"), "fixture").unwrap();
+        for root in [&ordinary, &verbatim] {
+            let base = Caveats {
+                fs_read: Scope::only([root.to_str().unwrap().into()]),
+                fs_write: Scope::only([root.to_str().unwrap().into()]),
+                ..Caveats::top()
+            };
+            for name in [&ordinary, &verbatim] {
+                for leaf in ["existing", "deleted\\plan.md"] {
+                    for kind in [DenialKind::FsRead, DenialKind::FsWrite] {
+                        let target = name.join(leaf).to_str().unwrap().to_owned();
+                        assert_eq!(widen_caveats(&base, &[(kind, target)]), base);
+                    }
+                }
+                // String concatenation preserves traversal in verbatim names:
+                // PathBuf::join would normalize it before the filter sees it.
+                let traversal = format!("{}\\deleted\\..\\missing", name.display());
+                assert_ne!(
+                    widen_caveats(&base, &[(DenialKind::FsWrite, traversal)]),
+                    base
+                );
+            }
         }
     }
 
