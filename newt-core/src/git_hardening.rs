@@ -252,6 +252,15 @@ pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
     ]
 }
 
+/// Read-only metadata roots for a build in an already trusted repository.
+/// Reuse the ordinary Git dispatch identity check: never bind a new identity
+/// from model-writable pointers here, and never carry its write grants.
+pub(crate) fn own_gitdir_shell_read_grant(workspace: &Path) -> Vec<String> {
+    verified_identity(workspace)
+        .map(|(common, admin)| vec![path_to_string(&admin), path_to_string(&common)])
+        .unwrap_or_default()
+}
+
 /// `(common_dir, absolute_git_dir)` when the identity [`own_gitdir_grants`]
 /// cached at session start still matches a FRESH resolve — the one point
 /// `.git`/`commondir` are re-consulted at all, and only to confirm they

@@ -1487,14 +1487,18 @@ fn build_caveats_with_scratch(
 }
 
 /// The read roots a build tool needs beyond the sandbox backend's base system
-/// paths: the workspace and the per-user toolchain / package caches (Cargo,
-/// rustup, and the XDG cache) — resolved from the operator's environment, never
+/// paths: the workspace, its previously bound Git metadata, and the per-user
+/// toolchain / package caches — resolved from the operator's environment, never
 /// `$HOME` as a whole. Deliberately excludes credential dirs (`~/.ssh`, `~/.aws`,
 /// `~/.gnupg`): a build tool has no reason to read those, and granting them would
 /// reopen the read-then-disclose path.
 fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
     let mut roots = vec![workspace.to_string_lossy().into_owned()];
     roots.extend(toolchain_read_roots());
+    // Linked worktrees keep Git metadata outside their working directory.
+    // Session startup / verified adoption binds this identity; a fresh build
+    // may only confirm it. Keep parent checkouts and all Git writes fenced.
+    roots.extend(crate::git_hardening::own_gitdir_shell_read_grant(workspace));
     roots
 }
 
