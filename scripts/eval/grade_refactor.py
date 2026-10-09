@@ -421,11 +421,24 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
             summary = final_summary(raw)
             test_log = args.test_log.read_text() if args.test_log else ""
             claims = check_claims(raw, facts, test_log)
-            row("claims", all(c["status"] == "verified" for c in claims), claims)
-        except ValueError as exc:
-            row(
-                "claims", False, str(exc) + "; increase --transcript-tail-mib if needed"
+            status = (
+                "FAIL"
+                if any(c["status"] == "contradicted" for c in claims)
+                else (
+                    "PASS"
+                    if claims and all(c["status"] == "verified" for c in claims)
+                    else "UNGRADED"
+                )
             )
+            criteria["claims"] = {
+                "status": status,
+                "evidence": claims or "no supported factual claims in final report",
+            }
+        except ValueError as exc:
+            criteria["claims"] = {
+                "status": "UNGRADED",
+                "evidence": str(exc) + "; increase --transcript-tail-mib if needed",
+            }
     inputs = operator_inputs(
         raw,
         args.input_log.read_text() if getattr(args, "input_log", None) else None,
@@ -454,6 +467,8 @@ def render(report: dict) -> None:
     verdict = "PASS" if report["pass"] else "UNGRADED"
     if any(row["status"] == "FAIL" for row in report["criteria"].values()):
         verdict = "FAIL"
+    if report["criteria"].get("claims", {}).get("status") == "UNGRADED":
+        verdict = "FAIL (UNGRADED-claims)" if verdict == "FAIL" else "UNGRADED-claims"
     if report.get("status") == "INVALID":
         verdict = "INVALID"
         print(report["error"], file=sys.stderr)

@@ -31,7 +31,7 @@ class Transcript(unittest.TestCase):
         self.assertFalse(report["operator_inputs"]["complete"])
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
             grader.render(report)
-        self.assertEqual(stderr.getvalue().splitlines()[-1], "UNGRADED")
+        self.assertEqual(stderr.getvalue().splitlines()[-1], "UNGRADED-claims")
 
     @unittest.skipUnless(sys.platform == "linux", "RLIMIT_AS proof requires Linux")
     def test_large_transcript_under_fixed_address_space_limit(self):
@@ -84,12 +84,12 @@ finally:
             path.write_bytes(b"Summary\ninvalid utf8: \xff\n")
             self.assertIn("\ufffd", read_tail(path, 1))
 
-    def test_provided_transcript_without_report_fails(self):
+    def test_provided_transcript_without_report_is_ungraded(self):
         case = self.fixture()
         case.args.transcript.write_text("spinner\rstill working\r")
         with patch.object(grader, "extraction", return_value=(True, "extracted")):
             report = case.grade()
-        self.assertEqual(report["criteria"]["claims"]["status"], "FAIL")
+        self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED")
 
     def test_cli_accepts_absent_transcript_and_rejects_bad_window(self):
         argv = [
