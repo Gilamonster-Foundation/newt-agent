@@ -3878,6 +3878,15 @@ async fn execute_authorized_tool(
         None => (name, args),
     };
 
+    // Adoption requires a live checkout/admin pair. Refuse destructive Git
+    // administration before execution or permission approval, across routes.
+    if adopted.is_some() && worktree::administration::refuses(name, args, workspace) {
+        return host_return(executed((
+            worktree::administration::NOTICE.into(),
+            crate::ExecOutcome::Denied,
+        )));
+    }
+
     match name {
         // Exact prompt recovery is always available. Durable TUI sessions pass
         // a conversation-fenced source; headless callers pass an ephemeral
