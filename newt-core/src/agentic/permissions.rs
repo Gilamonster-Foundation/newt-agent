@@ -448,6 +448,14 @@ pub trait PermissionGate {
 pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats {
     let mut out = base.clone();
     for (kind, target) in grants {
+        let covered = match kind {
+            DenialKind::FsRead => filesystem_grant_is_covered(&base.fs_read, target),
+            DenialKind::FsWrite => filesystem_grant_is_covered(&base.fs_write, target),
+            _ => false,
+        };
+        if covered {
+            continue;
+        }
         let scope = match kind {
             DenialKind::Exec => &mut out.exec,
             DenialKind::FsRead => &mut out.fs_read,
@@ -472,6 +480,36 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
         }
     }
     out
+}
+
+/// Do not emit redundant roots: their mutable parent would fail anchor checks.
+/// Missing names count only when their existing ancestors resolve exactly as
+/// named. Aliases, traversal and other I/O failures still require validation.
+fn filesystem_grant_is_covered(scope: &Scope<String>, target: &str) -> bool {
+    let Scope::Only(roots) = scope else {
+        return true;
+    };
+    let target = Path::new(target);
+    let exact = |path: &Path| {
+        path.canonicalize()
+            .is_ok_and(|resolved| resolved.as_os_str() == path.as_os_str())
+    };
+    if !roots.iter().any(|root| {
+        let root = Path::new(root);
+        exact(root) && target.starts_with(root)
+    }) {
+        return false;
+    }
+    match target.canonicalize() {
+        Ok(resolved) => resolved.as_os_str() == target.as_os_str(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::config::normalize_path(target)
+                .is_ok_and(|path| path.as_os_str() == target.as_os_str())
+                && crate::config::resolve_uncreated_path(target)
+                    .is_ok_and(|path| path.as_os_str() == target.as_os_str())
+        }
+        Err(_) => false,
+    }
 }
 
 /// One prompted permission decision, recorded with the session for later
@@ -526,6 +564,55 @@ impl PermissionRecord {
 
 #[cfg(test)]
 mod tests {
+
+    /// Stale signed filesystem children must not become redundant unstable roots.
+    #[test]
+    fn missing_grant_filter_is_shared_and_keeps_axis_and_alias_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let covered = root.join("covered");
+        std::fs::create_dir(&covered).unwrap();
+        let base = Caveats {
+            fs_read: Scope::none(),
+            fs_write: Scope::only([covered.to_str().unwrap().into()]),
+            ..Caveats::top()
+        };
+        let dead = covered.join("missing/plan.md").to_str().unwrap().to_owned();
+        assert_eq!(
+            widen_caveats(&base, &[(DenialKind::FsWrite, dead.clone())]),
+            base
+        );
+        assert_ne!(
+            widen_caveats(&base, &[(DenialKind::FsRead, dead)]),
+            base,
+            "read is not covered by write"
+        );
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let names = vec![
+            outside.join("dead"),
+            Path::new(&format!("{}/../outside/dead", covered.display())).to_path_buf(),
+        ];
+        #[cfg(unix)]
+        let names = {
+            let mut names = names;
+            let alias = covered.join("alias");
+            std::os::unix::fs::symlink(&outside, &alias).unwrap();
+            names.push(alias.join("missing"));
+            names.push(alias);
+            names
+        };
+        for path in names {
+            assert_ne!(
+                widen_caveats(
+                    &base,
+                    &[(DenialKind::FsWrite, path.to_str().unwrap().into())]
+                ),
+                base,
+                "uncovered/alias/traversal: {path:?}"
+            );
+        }
+    }
 
     /// #2823: invocation-bound approval must never fall back to a target-only queue.
     #[test]

@@ -835,6 +835,8 @@ pub(crate) struct PermissionPromptState {
     pub(crate) workspace_key: String,
     session_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     pub(crate) durable_grants: newt_core::durable_grants::GrantSet,
+    /// Invalid recalled approvals stay quarantined until the next session.
+    rejected_durable_grants: std::cell::RefCell<newt_core::durable_grants::GrantSet>,
     session_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     /// Durable deny-only entries loaded at session start.
     persistent_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
@@ -959,7 +961,8 @@ impl PermissionPromptState {
     fn denied(&self, kind: newt_core::DenialKind, target: &str) -> bool {
         let denied = |target: &str| {
             let key = (kind, target.to_string());
-            self.session_denials.contains(&key)
+            self.rejected_durable_grants.borrow().contains(&key)
+                || self.session_denials.contains(&key)
                 || self.persistent_denials.contains(&key)
                 || newt_core::ocap_store::evaluate_request(&self.ocap_policy, kind, target)
                     == Some(newt_core::ocap_store::Verdict::Deny)
@@ -1014,10 +1017,15 @@ impl PermissionPromptState {
             .filter(|(kind, target)| {
                 !self.recall_conflicts_with_denial(*kind, target)
                     && danger.classify(*kind, target) != danger::DangerTier::High
-                    && self
-                        .protection
-                        .as_ref()
-                        .is_none_or(|guard| guard.validate_request(*kind, target).is_ok())
+                    && self.protection.as_ref().is_none_or(|guard| {
+                        match guard.validate_request(*kind, target) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                self.reject_durable_grant(*kind, target, &error);
+                                false
+                            }
+                        }
+                    })
             })
     }
 
@@ -1068,52 +1076,52 @@ impl PermissionPromptState {
         base: &newt_core::Caveats,
         ceiling: Option<&newt_core::Caveats>,
     ) -> anyhow::Result<newt_core::Caveats> {
-        let grants = self
-            .recalled_grants(&production_danger_table())
-            .cloned()
-            .collect::<Vec<_>>();
-        let policy = self.widen_caveats(base, &grants);
-        let policy = ceiling.map_or_else(|| policy.clone(), |ceiling| policy.meet(ceiling));
+        // Invalid configured authority is still fatal. Only recalled durable
+        // approvals can be discarded, and only before committing their widening.
+        let clamp = |policy: newt_core::Caveats| {
+            ceiling.map_or_else(|| policy.clone(), |ceiling| policy.meet(ceiling))
+        };
+        let mut policy = clamp(base.clone());
         self.validate_caveats(&policy)?;
+        for (kind, target) in self.recalled_grants(&production_danger_table()) {
+            let candidate = clamp(newt_core::widen_caveats(
+                &policy,
+                &[(*kind, target.clone())],
+            ));
+            match self.validate_caveats(&candidate) {
+                Ok(()) => policy = candidate,
+                Err(error) if self.reject_durable_grant(*kind, target, &error) => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(policy)
     }
 
-    /// Avoid emitting redundant filesystem roots from old exact approvals.
-    /// Only existing, byte-exact canonical paths can be already covered here;
-    /// aliases and unresolved paths must still reach the protection guard.
+    fn reject_durable_grant(
+        &self,
+        kind: newt_core::DenialKind,
+        target: &str,
+        error: &anyhow::Error,
+    ) -> bool {
+        let grant = (kind, target.to_owned());
+        if !self.durable_grants.contains(&grant) {
+            return false;
+        }
+        let mut rejected = self.rejected_durable_grants.borrow_mut();
+        let reported = rejected.iter().any(|(_, path)| path == target);
+        rejected.insert(grant);
+        if !reported {
+            eprintln!("warning: dropped durable grant {target:?} for this session: {:?}; inspect ~/.newt/ocap/approve.toml", error.to_string());
+        }
+        true
+    }
+
     fn widen_caveats(
         &self,
         base: &newt_core::Caveats,
         grants: &[(newt_core::DenialKind, String)],
     ) -> newt_core::Caveats {
-        if self.protection.is_none() {
-            return newt_core::widen_caveats(base, grants);
-        }
-        let needed = grants
-            .iter()
-            .filter(|(kind, target)| {
-                let scope = match kind {
-                    newt_core::DenialKind::FsRead => &base.fs_read,
-                    newt_core::DenialKind::FsWrite => &base.fs_write,
-                    _ => return true,
-                };
-                let target = std::path::Path::new(target);
-                let canonical = |path: &std::path::Path| {
-                    path.canonicalize()
-                        .is_ok_and(|resolved| resolved.as_os_str() == path.as_os_str())
-                };
-                let newt_core::Scope::Only(roots) = scope else {
-                    return false;
-                };
-                !canonical(target)
-                    || !roots.iter().any(|root| {
-                        let root = std::path::Path::new(root);
-                        canonical(root) && target.starts_with(root)
-                    })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        newt_core::widen_caveats(base, &needed)
+        newt_core::widen_caveats(base, grants)
     }
 
     fn validate_caveats(&self, caveats: &newt_core::Caveats) -> anyhow::Result<()> {

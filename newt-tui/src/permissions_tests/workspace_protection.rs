@@ -280,8 +280,53 @@ fn recalled_alias_is_not_discarded_as_an_already_covered_lexical_child() {
         .durable_grants
         .insert((DenialKind::FsRead, alias.to_string_lossy().into_owned()));
     let base = fixture.caveats();
-    assert!(
-        state.recalled_caveats(&base, None).is_err(),
-        "the named child resolves outside the already-granted root and has a writable alias anchor"
+    assert_ne!(
+        state.widen_caveats(
+            &base,
+            &state.durable_grants.iter().cloned().collect::<Vec<_>>()
+        ),
+        base,
+        "an alias must reach validation, not be silently treated as covered"
+    );
+    assert_eq!(state.recalled_caveats(&base, None).unwrap(), base);
+    assert_eq!(state.rejected_durable_grants.borrow().len(), 1);
+    assert_eq!(
+        state.durable_grants.len(),
+        1,
+        "signed store remains untouched"
+    );
+    assert_eq!(state.recalled_caveats(&base, None).unwrap(), base);
+}
+
+/// A dead exact approval under an existing same-axis root is redundant too.
+#[test]
+fn dead_covered_grants_do_not_add_unstable_nested_roots() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let base = fixture.caveats();
+    let dead = fixture
+        .workspace
+        .join("deleted/plan.md")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        state.widen_caveats(
+            &base,
+            &[
+                (DenialKind::FsRead, dead.clone()),
+                (DenialKind::FsWrite, dead)
+            ]
+        ),
+        base
+    );
+    let outside = fixture
+        ._temp
+        .path()
+        .join("outside/deleted.md")
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(
+        state.widen_caveats(&base, &[(DenialKind::FsWrite, outside)]),
+        base
     );
 }
