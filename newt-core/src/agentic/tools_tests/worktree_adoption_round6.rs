@@ -200,3 +200,110 @@ fn worktree_2810_admission_refuses_tail_input_redirects() {
         .collect();
     assert!(accepted.is_empty(), "admitted tail redirects: {accepted:?}");
 }
+
+/// #2810/#2812 follow-up: admit only fixed read-only Git sibling forms.
+#[test]
+fn readonly_git_sibling_shapes() {
+    for sibling in [
+        "git status",
+        "git status --short",
+        "git status -s",
+        "git status --porcelain",
+        "git branch --show-current",
+        "git rev-parse HEAD",
+        "git rev-parse --abbrev-ref HEAD",
+        "git rev-parse --show-toplevel",
+        "git log --oneline -n 5",
+        "git log --oneline -5",
+        "git worktree list",
+    ] {
+        assert!(
+            creation_batch_is_read_only_after_add(
+                &serde_json::json!({"command":format!("git worktree add -b task ../task HEAD 2>&1 | tail -5 && {sibling}")}),
+                crate::ShellEngine::Brush
+            ),
+            "{sibling}"
+        );
+    }
+}
+
+/// #2810/#2812: no config/alias/pager/env surface or sibling redirection may
+/// run before the original-checkout fence is armed.
+#[test]
+fn readonly_git_sibling_negatives() {
+    for sibling in [
+        "git commit -m bad",
+        "git checkout -b bad",
+        "git branch bad",
+        "git st",
+        "git -c core.pager=cat status",
+        "git --exec-path=/tmp status",
+        "git --paginate log --oneline -5",
+        "GIT_PAGER=cat git status",
+        "env GIT_DIR=/tmp git status",
+        "git status > marker",
+        "git status < marker",
+        "git status 2>&1",
+        "git status <&3",
+        "git rev-parse --git-path config",
+        "git log --oneline -0",
+        "git log --oneline -n +5",
+        "git log --oneline -n $N",
+        "git log --oneline -5 --output=marker",
+        "git log --oneline -5 --format=%x00",
+        "git worktree list --porcelain",
+    ] {
+        assert!(
+            !creation_batch_is_read_only_after_add(
+                &serde_json::json!({"command":format!("git worktree add -b task ../task && {sibling}")}),
+                crate::ShellEngine::Brush
+            ),
+            "{sibling}"
+        );
+    }
+}
+
+/// #2810/#2812: dots in cwd/destination/prose are not the start operand. Every
+/// admitted sibling must use the injected trusted Git, with pagers/locks off.
+#[test]
+fn readonly_git_pins_siblings_and_only_normalizes_dot_start() {
+    for start in [
+        ".",
+        "'.'",
+        "\".\"",
+        "HEAD",
+        "main",
+        "0123456789012345678901234567890123456789abcd",
+    ] {
+        let source =
+            format!("git -C . worktree add -b task ../task {start} 2>&1 && git log --oneline -5");
+        let pinned =
+            git_identity::pin(&source, Path::new("/trusted tool/git"), &Caveats::top()).unwrap();
+        let start = if [".", "'.'", "\".\""].contains(&start) {
+            "HEAD"
+        } else {
+            start
+        };
+        assert_eq!(pinned, format!("'/trusted tool/git' -C . worktree add -b task ../task {start} 2>&1 && '/trusted tool/git' --no-pager --no-optional-locks log --oneline -5"));
+    }
+    for source in [
+        "git worktree add -b task .",
+        "git worktree add -b task ../task && echo '.'",
+    ] {
+        let pinned =
+            git_identity::pin(source, Path::new("/trusted tool/git"), &Caveats::top()).unwrap();
+        assert!(!pinned.contains("HEAD"), "{pinned}");
+    }
+}
+
+/// #2810/#2812: only creation's stderr-to-stdout duplication is admitted.
+#[test]
+fn readonly_git_redirect_boundary() {
+    for redirect in ["< marker", "<&3", "1>&2", "2>&3", "> marker", "<<< text"] {
+        let args = serde_json::json!({"command":format!("git worktree add -b task ../task {redirect} && git status")});
+        assert!(
+            !creation_batch_is_read_only_after_add(&args, crate::ShellEngine::Brush),
+            "{redirect}"
+        );
+    }
+}
