@@ -1,4 +1,4 @@
-//! #2836: lifecycle must inspect the retained source, never resolve it twice.
+//! #2836: lifecycle inspects retained source only after adoption is validated.
 use crate::agentic::{
     display::ToolDisplay,
     tools::{
@@ -85,6 +85,16 @@ async fn lifecycle_retains_source_when_configuration_changes_after_resolution() 
             PromptDisposition::Act,
         )
         .await;
+        // #2836 Windows CI: held, symlink-safe metadata reads are Unix-only.
+        // An injected adoption must fail closed before even resolving source on
+        // unsupported platforms (the same contract as #2733's adoption tests).
+        if cfg!(not(unix)) {
+            assert_eq!(reads.get(), 0, "invalid adoption resolved source: {out}");
+            assert_eq!(&*configuration.borrow(), initial);
+            assert!(out.contains(&policy.notice()), "{out}");
+            assert_eq!(outcome.get(), Some(&ExecOutcome::Denied), "{out}");
+            continue;
+        }
         assert_eq!(reads.get(), 1, "configuration was resolved again: {out}");
         assert_eq!(&*configuration.borrow(), replacement);
         if expected == ExecOutcome::Passed {
