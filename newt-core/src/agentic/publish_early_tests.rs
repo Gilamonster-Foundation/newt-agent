@@ -170,6 +170,7 @@ async fn publish_early_checked_content_controls() {
             );
         };
         git(&original, &["init", "-q", "-b", "main"]);
+        git(&original, &["config", "core.autocrlf", "false"]);
         std::fs::write(original.join("source"), "base").unwrap();
         git(&original, &["add", "."]);
         git(

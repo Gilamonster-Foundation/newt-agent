@@ -26,6 +26,11 @@ async fn publish_early_reaches_provider_after_check_and_commit() {
     git(
         &original,
         temp.path(),
+        &["config", "core.autocrlf", "false"],
+    );
+    git(
+        &original,
+        temp.path(),
         &["commit", "--allow-empty", "-qm", "base"],
     );
     let caveats = Caveats::top();

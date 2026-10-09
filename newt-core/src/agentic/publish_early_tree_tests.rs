@@ -39,6 +39,7 @@ async fn publish_early_filter_race_never_executes() {
         let root = temp.path().join("repo");
         std::fs::create_dir(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "extensions.worktreeConfig", "true"]);
         std::fs::write(root.join("source"), "checked\n").unwrap();
         // The injected attribute is ignored, so absence of a sentinel cannot
@@ -103,6 +104,7 @@ async fn publish_early_raw_content_and_conversion_controls() {
                     &format!("--object-format={format}"),
                 ],
             );
+            git(root, &["config", "core.autocrlf", "false"]);
             std::fs::create_dir(root.join("nested")).unwrap();
             std::fs::write(root.join("nested/source name"), [0, 255, 10, 65]).unwrap();
             git(root, &["add", "."]);
@@ -116,6 +118,15 @@ async fn publish_early_raw_content_and_conversion_controls() {
                 &["-c", "commit.gpgsign=false", "commit", "-qm", "checked"],
             );
             assert_eq!(index_tree(root, &crate::Scope::All), Some(checked));
+            assert!(index_is_head(root, &crate::Scope::All));
+            // #2831 Windows: HEAD reads must not depend on the Unix-only
+            // broker. Both loose and packed refs name the physical branch,
+            // regardless of ambient namespace redirection.
+            {
+                let _namespace = EnvVar::set("GIT_NAMESPACE", "unrelated");
+                assert!(index_is_head(root, &crate::Scope::All));
+            }
+            git(root, &["pack-refs", "--all", "--prune"]);
             assert!(index_is_head(root, &crate::Scope::All));
             git(root, &["repack", "-ad"]);
             git(root, &["prune-packed"]);

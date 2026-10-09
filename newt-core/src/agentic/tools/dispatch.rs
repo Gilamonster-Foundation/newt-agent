@@ -467,3 +467,32 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
         }
     }
 }
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+
+    /// #2831: inline tool futures overflowed the provider cancellation stack
+    /// under coverage. Keep dispatch state bounded independently of tool growth.
+    #[test]
+    fn publish_early_dispatch_future_has_bounded_inline_state() {
+        let args = serde_json::json!({});
+        let caveats = crate::Caveats::top();
+        let mut mcp = crate::agentic::mcp::NoMcp;
+        let future = execute_tool_with_collaborators(
+            "read_file",
+            &args,
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut mcp,
+            ToolCollaborators::default(),
+            false,
+            PromptDisposition::Act,
+            None,
+        );
+        let size = std::mem::size_of_val(&future);
+        assert!(size < 16 * 1024, "dispatch future occupies {size} bytes");
+    }
+}

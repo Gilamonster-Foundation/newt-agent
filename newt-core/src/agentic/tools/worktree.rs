@@ -624,6 +624,7 @@ pub(super) async fn execute(
     let before = (name == "run_command" && session.is_some())
         .then(|| detect::Snapshot::before(Path::new(workspace), &caveats.fs_read))
         .flatten();
+    // #2831: keep the large tool state off the provider/cancellation stack.
     let mut result = if let Some(policy) = &policy {
         let refuse_git = name == "git"
             && !matches!(
@@ -658,7 +659,7 @@ pub(super) async fn execute(
             policy,
             inner: collab.permission_gate.take(),
         };
-        execute_tool_unadopted(
+        Box::pin(execute_tool_unadopted(
             presentation,
             name,
             args,
@@ -673,14 +674,14 @@ pub(super) async fn execute(
             },
             tool_offload,
             disposition,
-        )
+        ))
         .await
     } else if let Some(candidate) = &candidate {
         let mut guard = prepare::Guard {
             candidate,
             inner: collab.permission_gate.take(),
         };
-        execute_tool_unadopted(
+        Box::pin(execute_tool_unadopted(
             presentation,
             name,
             args,
@@ -695,10 +696,10 @@ pub(super) async fn execute(
             },
             tool_offload,
             disposition,
-        )
+        ))
         .await
     } else {
-        execute_tool_unadopted(
+        Box::pin(execute_tool_unadopted(
             presentation,
             name,
             args,
@@ -710,7 +711,7 @@ pub(super) async fn execute(
             collab,
             tool_offload,
             disposition,
-        )
+        ))
         .await
     };
     if let (Some(session), Some(notice)) = (session, command_default_notice) {

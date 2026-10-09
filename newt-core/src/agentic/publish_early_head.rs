@@ -8,17 +8,7 @@ pub(super) fn index_is_head(root: &Path, read: &crate::Scope<String>) -> bool {
 fn head_matches(root: &Path, read: &crate::Scope<String>) -> Option<bool> {
     let (admin, _, index) = index(root, read)?;
     let common = grit_lib::refs::common_dir(&admin).unwrap_or_else(|| admin.clone());
-    let held =
-        crate::git_staging::HeldRoots::bind(&crate::Scope::only([common.to_str()?.to_owned()]))
-            .ok()?;
-    let branch = crate::git_staging::read_head_branch(
-        &admin,
-        &crate::git_staging::HeldRoots::bind(read).ok()?,
-    )
-    .ok()?;
-    let oid =
-        ObjectId::from_hex(&crate::git_staging::read_branch_oid(&common, &branch, &held).ok()?)
-            .ok()?;
+    let oid = head_oid(&admin, &common, read)?;
     // Odb::read reads loose/packed objects and local alternates only. Unlike
     // native Git it has no lazy-fetch child, replacement-object or filter path.
     let odb = grit_lib::odb::Odb::new(&common.join("objects"));
@@ -73,4 +63,25 @@ fn read_object(odb: &grit_lib::odb::Odb, oid: &ObjectId, kind: ObjectKind) -> Op
         return None;
     }
     Some(object.data)
+}
+
+// Use the advisory's bounded, no-exec fact reader. The broker's HeldRoots
+// deliberately refuses all reads on non-Unix platforms; it is not portable
+// metadata plumbing. Read literal paths so GIT_NAMESPACE cannot redirect HEAD.
+fn head_oid(admin: &Path, common: &Path, read: &crate::Scope<String>) -> Option<ObjectId> {
+    let head = super::super::read_fact(&admin.join("HEAD"), read)?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    crate::git_staging::validate_branch_name(branch).ok()?;
+    let name = format!("refs/heads/{branch}");
+    let loose = common.join(&name);
+    let oid = if absent(&loose) {
+        let packed = super::super::read_fact(&common.join("packed-refs"), read)?;
+        packed.lines().find_map(|line| {
+            let (oid, reference) = line.split_once(' ')?;
+            (reference == name).then(|| oid.to_owned())
+        })?
+    } else {
+        super::super::read_fact(&loose, read)?.trim().to_owned()
+    };
+    ObjectId::from_hex(&oid).ok()
 }
