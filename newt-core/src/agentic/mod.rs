@@ -2177,7 +2177,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
     let mut overflow_retries: u32 = 0;
     let mut suspicious_empty_retries: u32 = 0;
-    // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
+    // Consecutive context-window recoveries (parse limit → trim → retry).
     let mut cw_retries: u32 = 0;
     // Some models reject ANY request carrying a `tools` field (e.g.
     // deepseek-r1). Once one 400s with "does not support tools", drop tools for
@@ -2770,7 +2770,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 }
             };
             match dispatch {
-                Ok(j) => break (j, round_est_raw),
+                Ok(j) => {
+                    // Success renews recovery attempts, not the learned budget.
+                    cw_retries = 0;
+                    break (j, round_est_raw);
+                }
                 Err(e) => {
                     // No-tools recovery: a model that rejects the `tools` field
                     // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
@@ -7244,7 +7248,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
-    // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
+    // Consecutive context-window recoveries (parse limit → trim → retry).
     let mut cw_retries: u32 = 0;
     // No-tools recovery (mirrors the Ollama path): a model that rejects the
     // `tools` field 400s even on "hello"; drop tools and retry, notice once.
@@ -7832,7 +7836,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 ));
             };
             match dispatch {
-                Ok(j) => break (j, round_est_raw),
+                Ok(j) => {
+                    // Success renews recovery attempts, not the learned budget.
+                    cw_retries = 0;
+                    break (j, round_est_raw);
+                }
                 Err(e) => {
                     // No-tools recovery: a model that rejects the `tools` field
                     // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
@@ -9984,7 +9992,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut reasoning_overflow_signal_index: Option<usize> = None;
     // `pause_turn` re-dispatches the same history at most once per turn.
     let mut pause_turn_retried = false;
-    // Hard context-window 400s recovered (parse limit → trim → retry).
+    // Consecutive context-window recoveries (parse limit → trim → retry).
     let mut cw_retries: u32 = 0;
     // No-tools recovery (mirrors the OpenAI path): real Anthropic never
     // rejects `tools`, but façades might; drop tools and retry, notice once.
@@ -10412,6 +10420,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     ))
                 }
                 Ok(Some((reply, printed))) => {
+                    // A completed generation (including pause_turn) ends the
+                    // rejection streak; tightened input limits remain in force.
+                    cw_retries = 0;
                     // `pause_turn`: the server paused a long turn; re-dispatch
                     // the SAME history once — bounded so a façade that always
                     // pauses cannot spin the loop.
@@ -12433,8 +12444,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         estimate_value_tokens(&tools_for_estimate, estimation),
         cal,
     ));
-    // #1528: hard context-window 400s recovered this turn (parse limit → tighten
-    // → compact → redispatch), bounded to 2 (mirror of the Chat path). See #223.
+    // #1528: consecutive context-window recoveries (parse limit → tighten
+    // → compact → redispatch), bounded to 2 until a generation succeeds.
     let mut cw_retries: u32 = 0;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     preflight_irreducible_request(
@@ -12710,7 +12721,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             .await;
 
             match dispatch {
-                Ok(j) => break j,
+                Ok(j) => {
+                    // Success renews recovery attempts, not the learned budget.
+                    cw_retries = 0;
+                    break j;
+                }
                 Err(e) => {
                     if tools_supported && is_tools_unsupported_error(&e) {
                         tools_supported = false;
