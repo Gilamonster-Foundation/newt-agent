@@ -3878,9 +3878,9 @@ async fn execute_authorized_tool(
         None => (name, args),
     };
 
-    // Adoption requires a live checkout/admin pair. Refuse destructive Git
-    // administration before execution or permission approval, across routes.
-    if adopted.is_some() && worktree::administration::refuses(name, args, workspace) {
+    // Narrow accident guard for explicit Git administration and unverified
+    // verbs. Filesystem write authority and script execution remain unchanged.
+    if adopted.is_some() && worktree::administration::refuses(name, args) {
         return host_return(executed((
             worktree::administration::NOTICE.into(),
             crate::ExecOutcome::Denied,
@@ -4852,6 +4852,17 @@ async fn execute_authorized_tool(
                 return crate::tooling::unconfigured_phase_message(phase, &nested);
             }
             let joined = cmds.join(" && ");
+            // Inspect exactly the retained source used by both execution lanes.
+            // Never re-resolve mutable tooling configuration after this check.
+            if action != "list"
+                && adopted.is_some()
+                && worktree::administration::destructive(&joined)
+            {
+                return host_return(executed((
+                    worktree::administration::NOTICE.into(),
+                    crate::ExecOutcome::Denied,
+                )));
+            }
             // F38: a `run` whose resolved command starts with a build tool
             // (cargo/just/make) cannot execute in the run lane (the tool is not
             // in its profile), so it takes the build lane, exactly as
