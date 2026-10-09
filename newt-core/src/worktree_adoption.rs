@@ -32,6 +32,7 @@ pub struct WorktreeSession {
     // Advisory working state, independent of whether confinement is armed.
     task_worktree: std::sync::Mutex<Option<(PathBuf, String)>>,
     pub(crate) command_cwd_notice_shown: std::sync::atomic::AtomicBool,
+    pub(crate) publish_early: std::sync::Mutex<crate::agentic::publish_early::State>,
     pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
 }
 impl WorktreeSession {
