@@ -2089,19 +2089,21 @@ fn session_body(
         adoption_request.is_none() || smart_config.is_some(),
         "--adopt-frame requires [smart_harness] enabled = true"
     );
-    if let Some(config) = smart_config.as_ref() {
-        newt_core::agentic::smart_harness::validate_isolation_runtime()?;
-        // Local MCP processes inherit this capability when the pool starts.
-        // Validate it before spawning them, as well as each turn's narrower
-        // authority when its session opens and tools dispatch.
-        config.directory(&newt_core::config::HarnessLaunch {
-            workspace: std::path::Path::new(workspace),
-            caveats: cap.caveats(),
-            frame_dir: None,
-            resume_from: None,
-            hermetic: false,
-        })?;
-    }
+    // Admit before local MCP starts. A refused optional feature cannot open a
+    // frame, but must not take the primary interactive session down with it.
+    let smart_config = smart_config.and_then(|config| {
+        config.admit_startup(
+            &newt_core::config::HarnessLaunch {
+                workspace: std::path::Path::new(workspace),
+                caveats: cap.caveats(),
+                frame_dir: None,
+                resume_from: None,
+                hermetic: false,
+            },
+            |notice| print_newt(notice, color, verbose),
+        )
+    });
+    let adoption_request = adoption_request.filter(|_| smart_config.is_some());
     // Session working style. This never grants authority; plan/diagnose only
     // narrow the existing prompt-disposition and caveat boundaries.
     let mut active_operating_mode = OperatingMode::Chat;

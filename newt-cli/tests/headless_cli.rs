@@ -7,14 +7,24 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 mod common;
+#[path = "headless_cli/smart_startup.rs"]
+mod smart_startup;
 
 const NEMOTRON_MODEL: &str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
 
 /// Grounds frame-directory admission with the real headless entrypoint. The
 /// deliberately invalid auxiliary placement proves isolation is checked first,
 /// while an isolated store proceeds to the independent auxiliary validation.
-#[test]
-fn smart_solve_admits_private_storage_before_loading_the_auxiliary() {
+#[tokio::test(flavor = "multi_thread")]
+async fn smart_solve_admits_private_storage_before_loading_the_auxiliary() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        })
+        .mount(&server)
+        .await;
     for (exposed, extra_grant, unsafe_exec) in [
         (true, false, false),
         (false, true, false),
@@ -33,15 +43,18 @@ fn smart_solve_admits_private_storage_before_loading_the_auxiliary() {
         let config = home.join("config.toml");
         std::fs::write(
             &config,
-            r#"default_backend = "fixture"
+            format!(
+                r#"default_backend = "fixture"
 [[backends]]
 name = "fixture"
-endpoint = "http://127.0.0.1:1"
+endpoint = "{}"
 model = "fixture"
 kind = "openai"
 [smart_harness]
 device = "cuda"
 "#,
+                server.uri()
+            ),
         )
         .unwrap();
         let instruction = workspace.join("task.md");
@@ -75,10 +88,19 @@ device = "cuda"
             // which proves storage admission ran first without loading a model.
             "requires an external backend"
         };
-        command
-            .assert()
-            .failure()
-            .stderr(predicates::str::contains(expected));
+        let refused = unsafe_exec
+            || exposed
+            || extra_grant
+            || !cfg!(any(target_os = "linux", target_os = "macos"))
+            || !newt_core::ocap_l3_backend().1;
+        let assertion = command.assert().stderr(predicates::str::contains(expected));
+        if refused {
+            assertion.success().stderr(predicates::str::contains(
+                "smart harness disabled for this session",
+            ));
+        } else {
+            assertion.failure(); // Admitted storage reaches invalid auxiliary configuration.
+        }
         assert!(!frame.exists(), "rejected launch must not create a frame");
     }
 }
