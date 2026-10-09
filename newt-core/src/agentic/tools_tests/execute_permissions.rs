@@ -1563,6 +1563,7 @@ async fn a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_b
         &mut None,
         None,
         None,
+        None,
         Default::default(),
     )
     .await;
@@ -2148,6 +2149,7 @@ async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
         &mut None,
         None,
         None,
+        None,
         Default::default(),
     )
     .await;
@@ -2199,6 +2201,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
     struct QueueBackedGate {
         base: Caveats,
         queue: std::collections::BTreeSet<(DenialKind, String)>,
+        invocation: Option<(String, String)>,
         asks: usize,
         sufficient: bool,
     }
@@ -2219,6 +2222,32 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
         }
         fn queue_pending_once(&mut self, kind: DenialKind, target: &str) {
             self.queue.insert((kind, target.to_string()));
+        }
+        fn queue_command_retry(
+            &mut self,
+            command: &str,
+            cwd: &str,
+            requests: &[super::PermissionRequest],
+        ) {
+            self.invocation = Some((command.into(), cwd.into()));
+            for request in requests {
+                self.queue_pending_once(request.kind, &request.target);
+            }
+        }
+        fn apply_command_retry(&mut self, command: &str, cwd: &str, base: &Caveats) -> Caveats {
+            if self
+                .invocation
+                .as_ref()
+                .is_some_and(|(cmd, dir)| cmd == command && dir == cwd)
+            {
+                self.invocation = None;
+                let grants = std::mem::take(&mut self.queue)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                crate::agentic::widen_caveats(base, &grants)
+            } else {
+                base.clone()
+            }
         }
         fn consume_pending_once(&mut self, kind: DenialKind, target: &str) {
             self.queue.remove(&(kind, target.to_string()));
@@ -2251,6 +2280,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
         let mut gate = QueueBackedGate {
             base: denied.clone(),
             queue: std::collections::BTreeSet::new(),
+            invocation: None,
             asks: 0,
             sufficient,
         };
@@ -2259,6 +2289,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
         let cmd = format!("/bin/echo x >> {} && /bin/true", marker.display());
 
         // ── CALL 1: denied on /bin/true — not replay-safe, grant queued ────────
+        let retry_authorized = std::sync::OnceLock::new();
         let first = shell::exec_confined_command_with_broker(
             &cmd,
             &ws.path().to_string_lossy(),
@@ -2276,11 +2307,17 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             None,
             &mut None,
+            Some(&retry_authorized),
             None,
             None,
             Default::default(),
         )
         .await;
+        assert_eq!(
+            retry_authorized.get().is_some(),
+            sufficient,
+            "only sufficient approval releases retry suppression"
+        );
         assert_eq!(gate.asks, 1, "{}", first.0);
         assert!(
             !marker.exists(),
@@ -2317,6 +2354,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             None,
             &mut None,
+            None,
             None,
             None,
             Default::default(),
@@ -2368,6 +2406,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
             None,
             None,
             &mut None,
+            None,
             None,
             None,
             Default::default(),
@@ -2461,6 +2500,7 @@ async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() 
         Some(broker),
         None,
         &mut None,
+        None,
         None,
         None,
         Default::default(),

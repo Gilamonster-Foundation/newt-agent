@@ -84,6 +84,8 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// #2315: where a shell call records its execution class for the loop's
     /// tool-event funnel. `None` when no funnel is listening.
     pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
+    /// A host-approved deferred retry; independent of child output or exit status.
+    pub(crate) retry_authorized: Option<&'a std::sync::OnceLock<()>>,
     /// #2741/#2769: only governed brokers supply typed publication outcomes.
     pub(crate) governed_pr: Option<&'a std::sync::OnceLock<crate::git_staging::Outcome>>,
     /// Actual resolved command cwd; a locator, never new filesystem authority.
