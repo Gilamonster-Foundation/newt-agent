@@ -182,13 +182,34 @@ pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
 /// `(common_dir, absolute_git_dir)`.
 type GitDirPair = (PathBuf, PathBuf);
 
-/// The identity pair `own_gitdir_grants` resolved the ONE time it ran at
+#[derive(Clone)]
+struct CachedGitIdentity {
+    paths: GitDirPair,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    held: Arc<BoundGitIdentity>,
+}
+impl CachedGitIdentity {
+    fn acquire(paths: GitDirPair) -> Option<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let held = Arc::new(
+            BoundGitIdentity::bind(paths.0.canonicalize().ok()?, paths.1.canonicalize().ok()?)
+                .ok()?,
+        );
+        Some(Self {
+            paths,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            held,
+        })
+    }
+}
+
+/// The paths and held directory objects acquired by `own_gitdir_grants` at
 /// session bootstrap, keyed by workspace. `None` for a workspace bootstrap
 /// never resolved (or resolved to "not a repo") is a distinct cache state
 /// from "not yet looked up" — both read back as `None` from
 /// [`cached_identity`], and both correctly deny the per-dispatch grant.
-fn identity_cache() -> &'static Mutex<HashMap<PathBuf, Option<GitDirPair>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<GitDirPair>>>> = OnceLock::new();
+fn identity_cache() -> &'static Mutex<HashMap<PathBuf, Option<CachedGitIdentity>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<CachedGitIdentity>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -196,10 +217,13 @@ fn prime_identity_cache(workspace: &Path, resolved: Option<GitDirPair>) {
     identity_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(workspace.to_path_buf(), resolved);
+        .insert(
+            workspace.to_path_buf(),
+            resolved.and_then(CachedGitIdentity::acquire),
+        );
 }
 
-fn cached_identity(workspace: &Path) -> Option<GitDirPair> {
+fn cached_identity(workspace: &Path) -> Option<CachedGitIdentity> {
     identity_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -217,7 +241,7 @@ pub(crate) fn ambient_gitdir_write_grant(workspace: &Path) -> Vec<String> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(workspace.to_path_buf())
-        .or_insert(resolved);
+        .or_insert_with(|| resolved.and_then(CachedGitIdentity::acquire));
     own_gitdir_shell_write_grant(workspace)
 }
 
@@ -252,13 +276,48 @@ pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
     ]
 }
 
-/// Read-only metadata roots for a build in an already trusted repository.
-/// Reuse the ordinary Git dispatch identity check: never bind a new identity
-/// from model-writable pointers here, and never carry its write grants.
-pub(crate) fn own_gitdir_shell_read_grant(workspace: &Path) -> Vec<String> {
-    verified_identity(workspace)
-        .map(|(common, admin)| vec![path_to_string(&admin), path_to_string(&common)])
-        .unwrap_or_default()
+/// Build metadata reads retain the objects acquired at session bootstrap or
+/// verified adoption. Linux installs rules from these held descriptors.
+/// Seatbelt remains path-only: verify before preparing the request, but a
+/// replacement after that check can redirect its pathname-based profile.
+/// No descriptor-isolation claim is made for Seatbelt; Windows gets no extra
+/// metadata authority until equivalent held-object support is available.
+pub(crate) fn build_git_reads(workspace: &Path) -> (Vec<String>, Vec<agent_bridle::HeldReadRoot>) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let checked = || -> Option<_> {
+            verified_identity(workspace)?;
+            let identity = cached_identity(workspace)?;
+            identity.held.verify().ok()?;
+            let mut paths = Vec::new();
+            #[allow(unused_mut)]
+            let mut handles = Vec::new();
+            for (path, root) in [
+                (&identity.held.common_dir, &identity.held.common_root),
+                (&identity.held.git_dir, &identity.held.git_root),
+            ] {
+                let path = path_to_string(path);
+                // Constructor checks the path/fd pairing again; no second open.
+                let held = agent_bridle::HeldReadRoot::bind(
+                    path.clone(),
+                    root.as_fd().try_clone_to_owned().ok()?,
+                )
+                .ok()?;
+                paths.push(path);
+                #[cfg(target_os = "linux")]
+                handles.push(held);
+                #[cfg(target_os = "macos")]
+                let _ = held;
+            }
+            Some((paths, handles))
+        };
+        checked().unwrap_or_default()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = workspace;
+        (Vec::new(), Vec::new())
+    }
 }
 
 /// `(common_dir, absolute_git_dir)` when the identity [`own_gitdir_grants`]
@@ -271,7 +330,10 @@ pub(crate) fn own_gitdir_shell_read_grant(workspace: &Path) -> Vec<String> {
 /// caller that needs the identity PAIR (not just the write-grant strings —
 /// [`own_branch_for_commit_ref_move`] does) shares one check.
 fn verified_identity(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
-    let (cached_common, cached_git_dir) = cached_identity(workspace)?;
+    let cached = cached_identity(workspace)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    cached.held.verify().ok()?;
+    let (cached_common, cached_git_dir) = cached.paths;
     let (fresh_common, fresh_git_dir) = git_dirs(workspace)?;
     if fresh_common != cached_common || fresh_git_dir != cached_git_dir {
         return None; // re-pointed since session start — trust nothing

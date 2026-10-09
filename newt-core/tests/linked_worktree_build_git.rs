@@ -2,61 +2,15 @@
 //! widening access to sibling working files or shared Git writes.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use newt_core::caveats::{permits_path, Scope};
 use newt_core::confined_exec::{build_tool_request, ConstrainedExecutor};
 use newt_core::git_hardening::own_gitdir_grants;
 
-fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .current_dir(root)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{args:?}: {output:?}");
-    String::from_utf8(output.stdout).unwrap()
-}
-
-fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let fixture = tempfile::tempdir().unwrap();
-    // macOS /var is a symlink; grant the same canonical paths Git resolves.
-    let root = fixture.path().canonicalize().unwrap();
-    let repo = root.join("repo");
-    let linked = root.join("linked");
-    std::fs::create_dir(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    std::fs::write(repo.join("tracked"), "original\n").unwrap();
-    git(&repo, &["add", "tracked"]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "--no-gpg-sign",
-            "-qm",
-            "fixture",
-        ],
-    );
-    git(
-        &repo,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "task",
-            linked.to_str().unwrap(),
-        ],
-    );
-    (fixture, repo, linked)
-}
+#[path = "support/linked_git_fixture.rs"]
+mod fixture_support;
+use fixture_support::{fixture, git};
 
 fn confined(root: &Path, program: &str, args: &[&str]) -> newt_core::confined_exec::ConfinedOutput {
     let request = build_tool_request(root, root, program, args.iter().copied(), &Scope::All)
@@ -183,4 +137,95 @@ fn build_reads_require_the_original_validated_git_identity() {
         ));
     }
     assert!(!confined(&linked, "git", &["rev-parse", "HEAD"]).success);
+}
+
+/// #2835: inherited Git pointers/config and PATH cannot redirect fixture setup
+/// or run hooks against an outside repository. Poison only a child process.
+#[test]
+fn fixture_ignores_hostile_git_environment() {
+    let (_outside, outside_repo, _) = fixture();
+    let sentinel = outside_repo.join("tracked");
+    let before: Vec<_> = ["tracked", ".git/HEAD", ".git/config", ".git/index"]
+        .iter()
+        .map(|p| std::fs::read(outside_repo.join(p)).unwrap())
+        .collect();
+    let hostile = tempfile::tempdir().unwrap();
+    let injected = hostile.path().join("injected");
+    let script = format!(
+        "#!/bin/sh\nprintf poisoned > '{}'\nexit 1\n",
+        injected.display()
+    );
+    use std::os::unix::fs::PermissionsExt;
+    for name in ["git", "post-checkout"] {
+        let path = hostile.path().join(name);
+        std::fs::write(&path, &script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hostile_environment_fixture_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("PATH", hostile.path())
+        .env("HOME", hostile.path())
+        .env("GIT_DIR", outside_repo.join(".git"))
+        .env("GIT_WORK_TREE", &outside_repo)
+        .env("GIT_INDEX_FILE", outside_repo.join(".git/index"))
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", hostile.path())
+        .env("GIT_CONFIG_PARAMETERS", "invalid injected config")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "hermetic fixture failed: {output:?}"
+    );
+    let after: Vec<_> = ["tracked", ".git/HEAD", ".git/config", ".git/index"]
+        .iter()
+        .map(|p| std::fs::read(outside_repo.join(p)).unwrap())
+        .collect();
+    assert_eq!(before, after);
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"original\n");
+    assert!(!injected.exists(), "inherited PATH/config executed a hook");
+}
+
+#[test]
+#[ignore = "launched by fixture_ignores_hostile_git_environment with hostile child-only env"]
+fn hostile_environment_fixture_child() {
+    let (_fixture, repo, linked) = fixture();
+    assert_eq!(
+        git(&repo, &["rev-parse", "HEAD"]),
+        git(&linked, &["rev-parse", "HEAD"])
+    );
+}
+
+/// #2835: matching rev-parse path strings do not authorize replacement objects
+/// installed after the trusted session bind but before preparing a build.
+#[test]
+fn replacement_admin_is_not_rebound_at_build_time() {
+    let (_fixture, repo, linked) = fixture();
+    own_gitdir_grants(&linked);
+    let admin = repo.join(".git/worktrees/linked");
+    let saved = repo.join("saved-admin");
+    std::fs::rename(&admin, &saved).unwrap();
+    std::fs::create_dir(&admin).unwrap();
+    for file in ["HEAD", "commondir", "gitdir"] {
+        std::fs::copy(saved.join(file), admin.join(file)).unwrap();
+    }
+    assert_eq!(
+        git(&linked, &["rev-parse", "--absolute-git-dir"]).trim(),
+        admin.to_str().unwrap()
+    );
+    let request = build_tool_request(&linked, &linked, "/usr/bin/git", ["status"], &Scope::All);
+    assert!(!permits_path(
+        &request.caveats().fs_read,
+        &admin.to_string_lossy()
+    ));
+    assert!(!permits_path(
+        &request.caveats().fs_read,
+        &repo.join(".git").to_string_lossy()
+    ));
 }

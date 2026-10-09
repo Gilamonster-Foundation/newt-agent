@@ -217,6 +217,22 @@ impl ExecRequest {
         self
     }
 
+    /// Add validated build metadata reads together with their held objects.
+    /// Plain caveats alone cannot carry descriptor-bound authority.
+    #[must_use]
+    pub fn with_build_git_reads(mut self, workspace: &Path) -> Self {
+        let (paths, held) = crate::git_hardening::build_git_reads(workspace);
+        if let Scope::Only(reads) = &mut self.caveats.fs_read {
+            reads.extend(paths);
+            self.held_read_roots.extend(held);
+        }
+        self
+    }
+
+    pub(crate) fn build_held_read_roots(&self) -> Vec<agent_bridle::HeldReadRoot> {
+        self.held_read_roots.clone()
+    }
+
     /// Give the run a private scratch `dir`: created just before spawning
     /// (owner-only, refused if anything already exists there, symlink
     /// included) and removed when the run ends. See [`ScratchDir`].
@@ -1401,7 +1417,7 @@ fn toolchain_request(
     if let Ok(path) = std::env::join_paths(paths) {
         request = request.env("PATH", path.to_string_lossy());
     }
-    request
+    request.with_build_git_reads(workspace)
 }
 
 fn operator_tool_home(name: &str, default: &str) -> Option<String> {
@@ -1487,18 +1503,14 @@ fn build_caveats_with_scratch(
 }
 
 /// The read roots a build tool needs beyond the sandbox backend's base system
-/// paths: the workspace, its previously bound Git metadata, and the per-user
-/// toolchain / package caches — resolved from the operator's environment, never
+/// paths: the workspace and per-user toolchain / package caches — resolved
+/// from the operator's environment, never
 /// `$HOME` as a whole. Deliberately excludes credential dirs (`~/.ssh`, `~/.aws`,
 /// `~/.gnupg`): a build tool has no reason to read those, and granting them would
 /// reopen the read-then-disclose path.
 fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
     let mut roots = vec![workspace.to_string_lossy().into_owned()];
     roots.extend(toolchain_read_roots());
-    // Linked worktrees keep Git metadata outside their working directory.
-    // Session startup / verified adoption binds this identity; a fresh build
-    // may only confirm it. Keep parent checkouts and all Git writes fenced.
-    roots.extend(crate::git_hardening::own_gitdir_shell_read_grant(workspace));
     roots
 }
 
@@ -2284,3 +2296,7 @@ mod tests {
         assert!(r.to_string().contains("fail-closed"));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "confined_exec_git_tests.rs"]
+mod git_read_race_tests;
