@@ -544,8 +544,8 @@ async fn unavailable_receipt_preview_preserves_mutation_outcome() {
         "{display}"
     );
 
-    // The parent is a regular file, so the actual authorized write fails.
-    // Its unavailable receipt must not acquire success wording or hide failure.
+    // The parent is a regular file, so canonical admission fails before capture.
+    // A refused operation must not acquire a change receipt or success wording.
     std::fs::write(ws.path().join("blocked"), "keep these bytes").unwrap();
     let (failed, display) = model_and_display(
         "write_file",
@@ -558,11 +558,11 @@ async fn unavailable_receipt_preview_preserves_mutation_outcome() {
     assert!(!tool_result_ok(&failed), "{failed}");
     assert!(!failed.contains("File operation succeeded"), "{failed}");
     assert!(
-        failed.contains("file-change receipt unavailable"),
+        failed.starts_with("capability denied: fs_write"),
         "{failed}"
     );
     assert!(
-        display.contains("file-change receipt unavailable"),
+        !display.contains("file-change receipt unavailable"),
         "{display}"
     );
     assert_eq!(

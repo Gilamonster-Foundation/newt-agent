@@ -137,8 +137,8 @@ pub fn load_store(
 
 /// The durable verdict for a permission request, if any (the one question the
 /// gate asks the store). `None` ⇒ no durable policy ⇒ the gate prompts.
-/// Matching is exact on the target string; a gate with richer matching
-/// normalizes the target before calling.
+/// Filesystem spellings resolve through the grant canonicalizer; other axes
+/// retain exact matching. The most restrictive matching verdict wins.
 pub fn evaluate_request(set: &PolicySet, kind: DenialKind, target: &str) -> Option<Verdict> {
     let mut request_policy = std::borrow::Cow::Borrowed(set);
     if kind == DenialKind::FsWrite {
@@ -147,6 +147,24 @@ pub fn evaluate_request(set: &PolicySet, kind: DenialKind, target: &str) -> Opti
         if let Some(approve) = request_policy.to_mut().files.get_mut(&Verdict::Approve) {
             approve.fs.retain(|entry| entry.write);
         }
+    }
+    if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
+        let normalized = crate::caveats::canonical_fs_path(target).ok()?;
+        // Compare verified records without rewriting their signed payloads.
+        // Canonical matching must preserve deny/passkey/ask precedence too.
+        return request_policy
+            .files
+            .iter()
+            .filter_map(|(&verdict, file)| {
+                file.fs
+                    .iter()
+                    .any(|entry| {
+                        crate::caveats::canonical_fs_path(&entry.path)
+                            .is_ok_and(|p| p == normalized)
+                    })
+                    .then_some(verdict)
+            })
+            .min_by_key(|verdict| verdict.precedence());
     }
     request_policy.evaluate(class_for(kind)?, target)
 }
@@ -401,9 +419,9 @@ fn normalize_fs_target(entry: ApproveEntry) -> anyhow::Result<ApproveEntry> {
 }
 
 /// The string-level normalization [`normalize_fs_target`] applies to an
-/// `[[fs]]` target: require an absolute path, run it through the SAME
-/// [`crate::caveats::lexically_normalize`] the read/write fences use, and
-/// refuse any `..` that survives. Exposed `pub` (#2524 follow-up item 2) so
+/// `[[fs]]` target: require an absolute path, reject traversal above its root,
+/// and resolve aliases through the SAME canonicalizer the read/write fences use.
+/// Exposed `pub` (#2524 follow-up item 2) so
 /// the gate can classify danger and phrase a refusal against the SAME
 /// normalized target the writer would actually persist — never a second
 /// copy of this normalizer, and never a danger decision made against a raw
@@ -419,7 +437,9 @@ pub fn normalize_fs_path(path: &str) -> anyhow::Result<String> {
     {
         anyhow::bail!("permanent allow refused: fs target `{path}` escapes above its root");
     }
-    Ok(normalized.to_string_lossy().into_owned())
+    Ok(crate::caveats::canonical_fs_path(path)?
+        .to_string_lossy()
+        .into_owned())
 }
 
 #[cfg(test)]
@@ -859,7 +879,9 @@ mod tests {
         assert_eq!(file.fs.len(), 1, "{text}");
         assert_eq!(
             std::path::Path::new(&file.fs[0].path),
-            ws.join("y").as_path(),
+            dunce::simplified(&dir.path().canonicalize().unwrap())
+                .join("ws/y")
+                .as_path(),
             "{text}"
         );
     }

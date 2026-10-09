@@ -449,7 +449,15 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
             DenialKind::GitWrite | DenialKind::Build => continue,
         };
         if let Scope::Only(set) = scope {
-            set.insert(target.clone());
+            let target = if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
+                let Ok(path) = crate::caveats::canonical_fs_path(target) else {
+                    continue;
+                };
+                path.to_string_lossy().into_owned()
+            } else {
+                target.clone()
+            };
+            set.insert(target);
         }
     }
     out
@@ -561,20 +569,26 @@ mod tests {
 
     #[test]
     fn widen_adds_each_grant_to_its_axis_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let root = dunce::simplified(&root);
+        let read = root.join("read");
+        let write = root.join("out");
+        let (read, write) = (read.to_str().unwrap(), write.to_str().unwrap());
         let widened = widen_caveats(
             &base(),
             &[
                 (DenialKind::Exec, "npm".to_string()),
                 (DenialKind::Net, "docs.rs".to_string()),
-                (DenialKind::FsRead, "/etc/hosts".to_string()),
-                (DenialKind::FsWrite, "/tmp/out".to_string()),
+                (DenialKind::FsRead, read.to_string()),
+                (DenialKind::FsWrite, write.to_string()),
             ],
         );
         assert!(widened.permits_exec("npm"));
         assert!(widened.permits_exec("cargo"), "existing grants kept");
         assert!(widened.permits_net("docs.rs"));
-        assert!(widened.permits_fs_read("/etc/hosts"));
-        assert!(widened.permits_fs_write("/tmp/out"));
+        assert!(widened.permits_fs_read(read));
+        assert!(widened.permits_fs_write(write));
         // Untouched axes / non-granted targets stay denied.
         assert!(!widened.permits_exec("rm"));
         assert!(!widened.permits_net("evil.example.com"));

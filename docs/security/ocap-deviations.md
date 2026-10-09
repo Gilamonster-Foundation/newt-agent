@@ -504,34 +504,24 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Invariant (ideal):** the fs gate canonicalizes the target (resolving symlinks,
   e.g. via `openat2(RESOLVE_BENEATH)`) and contains it under the workspace root, so no
   path — symlink, `..`, or otherwise — escapes the fence.
-- **Practical caveat (now):** `tui_permits_path` (`newt-core/src/agentic/tools.rs`)
-  **lexically** normalizes the target and each root (collapsing `.`/`..`) and contains with
-  a component-aware `Path::starts_with`. This closes `..` traversal (`/ws/../etc/passwd` →
-  `/etc/passwd`, denied) and sibling-prefix escapes (`/ws-evil` denied against `/ws`) — both
-  were reproduced on the host before the #502 review. It does NOT resolve symlinks: a symlink
-  *inside* the workspace pointing out would still be read.
-- **Residual:** 🟠 high — a symlink under the workspace that targets an outside path escapes
-  the read/write fence (lexical normalization can't see through it). Planting one needs a
-  write/exec, both separately gated.
-- **Disabled while open:** seeding a shared filesystem across mutually-distrusting voices
-  where one can plant a symlink the other follows; relying on the fence alone (no OS sandbox)
-  for a genuinely-untrusted worker.
-- **Compensating controls:** lexical containment (the #502 fix) blocks the `..`/sibling
-  vectors; the crew/worker run in throwaway git worktrees; `b1`'s OS sandbox (Landlock fs) is
-  the backstop that bounds the symlink residual once present. **The object-bound resolver now
-  exists** — `newt_core::fs_cap::WorkspaceDir` (step-52.1) resolves every path *beneath* an
-  `O_DIRECTORY` root fd with `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, so the symlink /
-  `..` / absolute escape is refused by the kernel at open time. It is proven and available; the
-  residual persists only because the fs tool arms have not yet been *rewired* onto it.
-- **Closure criterion:** the read arms, write arms, and write primitives resolve through
-  `WorkspaceDir` (step-52.2/52.3) rather than `join` + a `&str→bool` predicate, so the escape is
-  structurally unreachable. Note: the register's earlier "make `tui_permits_path` canonicalize,
-  flip its assertion" plan is **superseded** — `tui_permits_path` is a lexical `&str→bool`
-  predicate, and having it canonicalize would re-introduce the TOCTOU (check decoupled from
-  open). The correct closure binds authority to the opened object; the proof is an object-level
-  test (`fs_cap_object_bound.rs`, landed here) plus each arm's own contained-open test, not a
-  predicate flip. `tui_permits_path_symlink_escape_is_the_known_residual` is retired when its
-  arm moves to `WorkspaceDir`, not flipped in place.
+- **Admission:** `tui_permits_path` delegates to the shared filesystem
+  canonicalizer, including existing ancestors of missing leaves. Grants are
+  recorded in that form too, so macOS `/tmp` and `/private/tmp` spellings agree.
+  Sibling-prefix, traversal, resolution errors, and physical escapes deny before
+  file capture. This is a prefilter, not a substitute for object binding.
+- **Enforcement:** the read/write arms resolve through `WorkspaceDir` beneath
+  an opened root (`openat2 RESOLVE_BENEATH` on Linux; an `O_NOFOLLOW` descriptor
+  walk on macOS). Alias mapping preserves components below that root so the
+  actual operation still passes through the fence; unlink never becomes unlink
+  of a resolved symlink target. A pathname check alone would retain a TOCTOU gap.
+- **Residual:** other-platform fallback operations lack that descriptor fence;
+  the existing macOS navigation/applier residuals in the status below are not
+  closed by improving admission. Mutually distrusting workers still require
+  the kernel fence, not only this path predicate.
+- **Alias regression:** `path_alias` tests cover both spellings, missing leaves,
+  immutable recorded grants, siblings, and symlink escapes. Native creation,
+  adoption and confined writes are measured in
+  [macOS evidence](platform/macos-evidence.md#filesystem-aliases-and-task-worktrees).
 - **Ratchet guard:** `newt-core/tests/fs_cap_object_bound.rs` (step-52.1, real-fs tier) drives
   real `..`, absolute, in-tree-relative-symlink-escape, and absolute-symlink-escape paths through
   `WorkspaceDir` and asserts denial, with an explicit contrast test proving the object resolver

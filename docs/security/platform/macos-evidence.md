@@ -107,3 +107,32 @@ canonicalized workspace write-root re-allow, and the **absence** of any
 > net denial, an absent `sandbox-exec` backend is honestly reported UNSUPPORTED
 > and **fail-closed**, and one named residual stays ACTIVE
 > (`mach-xpc-ambient-deputy`), so no route ever runs hostile code unconfined.
+
+## Filesystem aliases and task worktrees
+
+Filesystem grants and containment checks use one ancestor resolver, including
+missing leaves. `/tmp`, `/var`, and `/etc` therefore match their `/private/*`
+spellings. Approval records the resolved path; changing an approved symlink
+later does not move that grant. Resolution errors deny access. File operations
+still walk beneath the granted descriptor, preserving below-root components
+rather than resolving a symlink leaf into a different operation target.
+
+On macOS, Seatbelt does not replace the host's `/tmp` with a private namespace.
+A worktree explicitly approved there remains host-visible after each confined
+command and appears in `git worktree list`. The executor's disposable per-run
+`TMPDIR` is separate: it is scratch space, not a persistent task-worktree
+location. Use a directory outside temporary storage for work that must survive
+OS temporary-file cleanup. No extra `/tmp` authority or adoption exception is
+granted.
+
+Native proof (real Git, Seatbelt, and host filesystem):
+
+```sh
+cargo test -p newt-core --lib mac_tmp_alias_dispatch_and_adoption_persist -- --ignored --nocapture
+```
+
+This exercises both grant/request alias directions through creation/adoption,
+`write_file`, and confined `run_command`, then checks persisted host contents
+and Git registration. Portable `path_alias` tests additionally cover missing
+leaves, dangling links, grant pinning, durable deny precedence, and sibling and
+symlink-escape rejection.

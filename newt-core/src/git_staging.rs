@@ -216,8 +216,15 @@ impl TrustContext {
     /// scope (a symlinked root still names what the model was granted) and
     /// against the canonical roots bound at the start of the call.
     fn excludes(&self, path: &Path) -> bool {
-        permits_path(&self.write_scope, &path.to_string_lossy())
-            || self.write_roots.iter().any(|root| path.starts_with(root))
+        // Do not re-resolve raw aliases here: the exclusion was pinned at bind.
+        let lexical = crate::caveats::lexically_normalize(&path.to_string_lossy());
+        let raw = match &self.write_scope {
+            Scope::All => true,
+            Scope::Only(roots) => roots
+                .iter()
+                .any(|root| lexical.starts_with(crate::caveats::lexically_normalize(root))),
+        };
+        raw || self.write_roots.iter().any(|root| path.starts_with(root))
     }
 }
 
