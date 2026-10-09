@@ -2093,3 +2093,40 @@ fn identical_read_only_probe_is_still_refused_without_a_change() {
 // `compression_loop_tests::compaction_release_forces_fresh_read_over_long_haul`,
 // driven through the actual chat loop instead of calling
 // `RepeatCallGuard` methods directly — see that test's docstring for why.
+
+/// An approved deferred exec retry is still Denied as an execution fact, but
+/// must not be blocked as a duplicate failure. Only the host's typed signal
+/// releases the exact call; child text cannot authorize or release anything.
+#[test]
+fn deferred_exec_grant_releases_only_the_authorized_retry() {
+    let args = serde_json::json!({"command": "bash script.sh"});
+    let other = serde_json::json!({"command": "sh other.sh"});
+    let base = crate::Caveats::top();
+    let mut guard = RepeatCallGuard::default();
+    let ready = std::sync::OnceLock::new();
+    for call in [&args, &other] {
+        guard.record(
+            "run_command",
+            call,
+            false,
+            "granted: the operator allowed exec for '/bin/bash'. Retry the original operation now.",
+            Some(crate::ExecOutcome::Denied),
+            ReadScope {
+                workspace: "/ws",
+                caveats: &base,
+            },
+        );
+    }
+    guard.permit_authorized_retry("run_command", &args, &ready);
+    assert!(
+        guard.repeat_steer("run_command", &args).is_some(),
+        "text alone is not a grant"
+    );
+    ready.set(()).unwrap();
+    guard.permit_authorized_retry("run_command", &args, &ready);
+    assert!(
+        guard.repeat_steer("run_command", &args).is_none(),
+        "operator-authorized retry was suppressed"
+    );
+    assert!(guard.repeat_steer("run_command", &other).is_some());
+}

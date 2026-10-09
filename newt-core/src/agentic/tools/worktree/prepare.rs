@@ -121,6 +121,28 @@ impl PermissionGate for Guard<'_, '_> {
             g.queue_pending_once(kind, target);
         }
     }
+    fn queue_command_retry(&mut self, command: &str, cwd: &str, requests: &[PermissionRequest]) {
+        if let Some(g) = self.inner.as_deref_mut() {
+            g.queue_command_retry(command, cwd, requests);
+        }
+    }
+    fn apply_command_retry(&mut self, command: &str, cwd: &str, base: &Caveats) -> Caveats {
+        let current = self.inner.as_deref_mut().map_or_else(
+            || base.clone(),
+            |g| g.apply_command_retry(command, cwd, base),
+        );
+        if self.candidate.ready().is_ok() {
+            current
+        } else {
+            Caveats {
+                exec: Scope::none(),
+                fs_read: Scope::none(),
+                fs_write: Scope::none(),
+                net: Scope::none(),
+                ..current
+            }
+        }
+    }
     fn apply_pending_once(&mut self, kind: DenialKind, target: &str, base: &Caveats) -> Caveats {
         let current = self.inner.as_deref_mut().map_or_else(
             || base.clone(),

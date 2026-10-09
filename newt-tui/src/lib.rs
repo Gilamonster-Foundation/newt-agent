@@ -10257,3 +10257,8 @@ mod http_loop_tests;
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:23 EDT | Date: 2026-09-15
+
+/// Native-test adapter for exercising the real permission gate in a provider loop.
+#[cfg(feature = "native-permission-test")]
+#[doc(hidden)]
+pub mod native_permission_test;

@@ -1156,6 +1156,12 @@ pub(crate) struct PromptPermissionGate<
     'a,
     F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice,
 > {
+    /// Owned by this turn gate; dropping it expires every unused approval.
+    /// Exact command/cwd content identities, never basename aliases or standing grants.
+    pub(crate) pending_command_retries: std::collections::BTreeMap<
+        (newt_identity::RawContentId, newt_identity::RawContentId),
+        Vec<(newt_core::DenialKind, String)>,
+    >,
     pub(crate) state: &'a mut PermissionPromptState,
     /// Enforced caveats at turn start.
     pub(crate) base: newt_core::Caveats,
@@ -1918,6 +1924,58 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         self.state
             .pending_once_grants
             .insert((kind, target.to_string()));
+    }
+
+    fn queue_command_retry(
+        &mut self,
+        command: &str,
+        cwd: &str,
+        requests: &[newt_core::PermissionRequest],
+    ) {
+        let key = (
+            newt_identity::RawContentId::from_content(command.as_bytes()),
+            newt_identity::RawContentId::from_content(cwd.as_bytes()),
+        );
+        self.pending_command_retries.insert(
+            key,
+            requests
+                .iter()
+                .map(|request| (request.kind, request.target.clone()))
+                .collect(),
+        );
+    }
+
+    fn apply_command_retry(
+        &mut self,
+        command: &str,
+        cwd: &str,
+        base: &newt_core::Caveats,
+    ) -> newt_core::Caveats {
+        let key = (
+            newt_identity::RawContentId::from_content(command.as_bytes()),
+            newt_identity::RawContentId::from_content(cwd.as_bytes()),
+        );
+        let Some(grants) = self.pending_command_retries.get(&key) else {
+            return base.clone();
+        };
+        if grants
+            .iter()
+            .any(|(kind, target)| self.state.denied(*kind, target))
+        {
+            self.pending_command_retries.remove(&key);
+            return base.clone();
+        }
+        let Ok(policy) = self.mint(base, grants) else {
+            return base.clone();
+        };
+        use newt_core::CaveatsExt as _;
+        if !grants.iter().all(|(kind, target)| {
+            *kind == newt_core::DenialKind::Exec && policy.permits_exec(target)
+        }) {
+            return base.clone();
+        }
+        self.pending_command_retries.remove(&key);
+        policy
     }
 
     fn apply_pending_once(
