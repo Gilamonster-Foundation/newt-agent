@@ -1210,8 +1210,33 @@ pub(crate) async fn response_with_decoder(
 ) -> anyhow::Result<Value> {
     let status = response.status();
     let mut observation = ResponseObservation::new(harness);
-    let read_error = crate::retry::read_response_bytes_into(response, &mut observation.bytes).await;
+    let read = super::generation_bounds::read(response, &mut observation.bytes).await;
     let bytes = observation.finish()?;
+    let read_error = match read {
+        Ok(error) => error,
+        Err(error) => {
+            if let Some(harness) = harness {
+                harness.provider_failure(&error.to_string())?;
+            }
+            let usage = match decode(&bytes) {
+                Ok(value) => body_usage(&value),
+                Err(decoded) => super::observability::reported_usage(&decoded),
+            };
+            let message = if let Some(usage) = usage {
+                format!(
+                    "model generated {} tokens without finishing; stopped: {error}",
+                    usage.output_tokens
+                )
+            } else {
+                format!("{error}; output token count unavailable")
+            };
+            let class = super::observability::error_class(&error)
+                .unwrap_or(super::observability::ErrorClass::Harness);
+            return Err(error.context(
+                super::observability::DispatchError::new(class, message).with_usage(usage),
+            ));
+        }
+    };
     // A parsed SSE error envelope may arrive under HTTP 200 before the socket
     // closes. Inspect that evidence before preferring the body-read failure.
     // Successful content quoting the same text must remain ordinary content.

@@ -26,8 +26,8 @@ pub fn projected_cognition(
 /// per-cognition table supplies it; otherwise `None`, and a wire that REQUIRES
 /// a cap applies its own default (Anthropic: `NEWT_ANTHROPIC_MAX_TOKENS`, else
 /// 8192). The Chat Completions policy sends the result as `max_tokens` where the
-/// endpoint declared cognition projection; the Responses loop RESERVES it as
-/// local headroom (that wire sends no `max_output_tokens`). The explicit value
+/// endpoint declared cognition projection. At dispatch, the independent generation
+/// guard caps both Chat and Responses by this allowance and remaining context. The explicit value
 /// never changes cognition, thinking or sampling.
 pub(crate) fn resolve_output_allowance(
     explicit: Option<u32>,
@@ -64,10 +64,10 @@ pub fn validate_output_allowance(
     }
 }
 
-/// What a Chat Completions request will carry for generation — the public,
+/// Generation policy and output upper bound before prompt admission — the public,
 /// read-only view of [`GenerationPolicy::resolve`] for display (#2567). It is
-/// computed by the same resolver the dispatch loop uses, so a panel cannot
-/// show a value the request would not send.
+/// computed by the same policy resolver the dispatch loop uses. The final wire
+/// cap also depends on the prompt size and configured generation maximum.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ChatGenerationPreview {
     /// The `enable_thinking` value sent in `chat_template_kwargs`; `None` when
@@ -75,10 +75,23 @@ pub struct ChatGenerationPreview {
     pub enable_thinking: Option<bool>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
-    /// `max_tokens` as sent; `None` when the field is omitted.
+    /// Output upper bound; prompt admission can lower it further.
     pub max_output_tokens: Option<u32>,
     /// The output allowance reserved locally, sent or not.
     pub output_allowance: Option<u32>,
+}
+
+impl ChatGenerationPreview {
+    /// Apply the independent guard only on the OpenAI wires it governs.
+    /// Other backends retain their own generation policy.
+    #[must_use]
+    pub fn with_generation_bound(mut self, kind: crate::BackendKind) -> Self {
+        if kind == crate::BackendKind::Openai {
+            self.max_output_tokens =
+                super::generation_bounds::output_cap(self.output_allowance, None, 0).ok();
+        }
+        self
+    }
 }
 
 #[must_use]
@@ -284,6 +297,32 @@ mod tests {
         let sampled = preview_chat_generation(Some(Cognition::Thoughtful), None, no_kwargs, scope);
         assert_eq!(sampled.enable_thinking, None);
         assert_eq!(sampled.temperature, Some(0.6), "sampling still projects");
+    }
+
+    /// #2782: the preview cannot claim unlimited output without cognition.
+    #[test]
+    fn bounds_2782_preview_includes_the_independent_output_maximum() {
+        let preview = preview_chat_generation(None, None, Default::default(), Default::default());
+        assert_eq!(
+            preview
+                .with_generation_bound(crate::BackendKind::Ollama)
+                .max_output_tokens,
+            None
+        );
+        assert_eq!(
+            preview
+                .with_generation_bound(crate::BackendKind::Openai)
+                .max_output_tokens,
+            Some(16_384)
+        );
+        let limited =
+            preview_chat_generation(None, Some(3000), Default::default(), Default::default());
+        assert_eq!(
+            limited
+                .with_generation_bound(crate::BackendKind::Openai)
+                .max_output_tokens,
+            Some(3000)
+        );
     }
 
     #[test]

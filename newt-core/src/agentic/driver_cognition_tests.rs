@@ -140,7 +140,7 @@ async fn captured_responses_wire_survives_sibling_api_switch() {
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["store"], false);
-        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["max_output_tokens"], 3_000);
     }
 }
 

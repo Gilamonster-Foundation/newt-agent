@@ -39,7 +39,9 @@ mod crew_attest;
 mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
+mod generation_bounds;
 mod generation_policy;
+mod generation_repetition;
 pub use generation_policy::{
     preview_chat_generation, projected_cognition, validate_output_allowance, ChatGenerationPreview,
 };
@@ -1051,8 +1053,8 @@ pub struct ChatCtx<'a> {
     /// cognition, thinking or sampling; every loop reserves it locally, and it is
     /// sent only where the wire declares a cap. `None` keeps today's defaults.
     pub output_allowance: Option<u32>,
-    /// `[[model_tuning]] overflow_retry`: the one-shot retry after a
-    /// reasoning overflow (Chat Completions loop only).
+    /// Legacy model-tuning preference. Provider output limits now stop the turn;
+    /// this preference cannot purchase an automatic continuation (#2824).
     pub overflow_retry: crate::config::OverflowRetry,
     /// The run's attempt ledger (#2313). Every primary inference request is
     /// recorded as one attempt at the send, from its exact wire bytes. `None`
@@ -1861,23 +1863,6 @@ macro_rules! no_progress_gate {
             }
         }
     };
-}
-
-/// F34: the concise nudge appended for the one thinking-off re-dispatch.
-const REASONING_OVERFLOW_NUDGE: &str = "Your reasoning used the whole output budget before you \
-answered. Be concise and act now: give the answer or make the tool call.";
-
-/// F34: the one visible line when a reasoning overflow ends a turn empty.
-fn reasoning_overflow_reason(retried: bool) -> String {
-    let tail = if retried {
-        "; a retry without thinking was also empty"
-    } else {
-        " once"
-    };
-    format!(
-        "(model returned an empty response — reasoning exhausted the output budget{tail}; \
-lower `/settings cognition`, raise the output allowance, or rephrase)"
-    )
 }
 
 pub async fn chat_complete(
@@ -6639,10 +6624,29 @@ impl CapExit {
             }
             other => other,
         };
+        if let Err(error) = &result {
+            if error.downcast_ref::<generation_bounds::Stopped>().is_some() {
+                let (mut text, streamed, usage) = self.fallback();
+                generation_bounds::append_notice(&mut text, error);
+                return Ok((
+                    text,
+                    streamed,
+                    merge_round_usage(usage, observability::reported_usage(error)),
+                ));
+            }
+        }
         if let Ok((json, attempt)) = result {
+            let limited = generation_bounds::output_limited(&json);
             let (content, usage) = extract(json);
             attempt_capture::complete(attempt.as_ref(), usage);
             let total = merge_round_usage(self.accumulated, usage);
+            if limited {
+                return Ok((
+                    generation_bounds::output_limit_notice(content, usage),
+                    false,
+                    total,
+                ));
+            }
             if !content.is_empty() {
                 return Ok((
                     cap_exit_model_reply(
@@ -6792,8 +6796,7 @@ fn prepare_openai_assistant_replay(
 /// #2558/F39: every replayed assistant turn routes through
 /// [`prepare_openai_assistant_replay`] before entering `messages` — the one
 /// place to make an unparseable `arguments` string harmless everywhere
-/// (chat, the reasoning-continuation replay, and the token-count preflight,
-/// which all resend `messages` verbatim). A call whose `arguments` string
+/// (chat and the token-count preflight, which resend `messages` verbatim). A call whose `arguments` string
 /// fails to parse as JSON is replayed as `"{}"`: the model already sees a
 /// rejection naming the parse error (`validate_tool_call_batch` /
 /// `ContentInvalid`), and never sees this call dispatched, so a small valid
@@ -6870,6 +6873,7 @@ async fn final_summary_openai(
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
+    context_window: Option<u32>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
@@ -6887,6 +6891,15 @@ async fn final_summary_openai(
         "stream_options": {"include_usage": true},
     });
     generation_policy.apply_to_chat_completions_body(&mut body);
+    generation_bounds::apply_chat(
+        &mut body,
+        chat_url,
+        generation_policy.output_allowance,
+        context_window,
+        cap.request_budget.unwrap_or_else(|| {
+            calibrate_up(estimate_tokens(&messages, cap.estimation), cap.calibration)
+        }),
+    )?;
     cap.finish_with_decoder(
         chat_url,
         attempts,
@@ -7001,7 +7014,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // into a local generation policy.
         cognition,
         output_allowance,
-        overflow_retry,
+        overflow_retry: _,
         attempt_ledger,
         chat_completions_capability,
         responses_capability: _,
@@ -7080,19 +7093,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let smart_verify = action_nudges && prompt_disposition == PromptDisposition::Act;
     let action_nudges = action_nudges && smart_harness.is_none();
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
+    let mut generation_window = num_ctx;
     let generation_policy = generation_policy::GenerationPolicy::resolve(
         cognition,
         output_allowance,
         chat_completions_capability,
         reasoning_replay_scope,
     );
-    // One cognition drop per overflow episode. Only established tool progress
-    // re-arms recovery; repeated observations cannot buy another retry.
-    let mut cognition_drop_used = false;
-    // The lower-level policy for the single round that follows the drop.
-    let mut retry_policy: Option<(usize, generation_policy::GenerationPolicy)> = None;
-    // Every body this loop sends applies `generation_policy`, so the cap is
-    // server-enforced exactly when the policy projects `max_tokens`.
+    // Initial policy observation; each assembled request below records the
+    // independent generation guard's actual server-enforced cap.
     observability::observe_output_allowance(
         &mut solve_obs,
         generation_policy.output_allowance,
@@ -7219,11 +7228,6 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
-    // At most one reasoning-only length-stop continuation per user turn. The
-    // signal index lets the next response record whether that bounded recovery
-    // produced visible content or an executable call.
-    let mut reasoning_continuation_attempted = false;
-    let mut reasoning_overflow_signal_index: Option<usize> = None;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
     // No-tools recovery (mirrors the Ollama path): a model that rejects the
@@ -7348,13 +7352,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut turn_heartbeat = TurnHeartbeat::default();
     let mut uncorrelatable_batches: u32 = 0;
     'round_loop: for round in 0..usize::MAX {
-        // F34: the drop lasts one request; every other round runs the
-        // operator's original policy.
-        let round_policy = match retry_policy {
-            Some((at, lowered)) if at == round => lowered,
-            _ => generation_policy,
-        };
-        let is_cognition_retry = retry_policy.is_some_and(|(at, _)| at == round);
+        let round_policy = generation_policy;
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
         if hidden_tools.append_promoted(&mut tools) {
@@ -7693,6 +7691,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 send_budget_authoritative,
                 mid_loop_trim_tokens,
             );
+            let output_cap = generation_bounds::apply_chat(
+                &mut body,
+                &chat_url,
+                round_policy.output_allowance,
+                generation_window,
+                request_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
+            )?;
+            observability::observe_output_allowance(&mut solve_obs, Some(output_cap), true);
             let measured_prompt_tokens = std::sync::atomic::AtomicUsize::new(0);
             let admission_commit_failure = std::sync::OnceLock::new();
             let max_attempts = retry.max_retries.saturating_add(1);
@@ -7886,6 +7892,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             })
                         {
                             if let Some(context_window) = recovered_window {
+                                generation_window = Some(
+                                    generation_window
+                                        .map_or(context_window, |old| old.min(context_window)),
+                                );
                                 emit_context_window_400(&mut on_round_usage, context_window);
                             }
                             // The callback returns the endpoint's full hard window,
@@ -8173,6 +8183,55 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             completed_spill_renderer.as_deref(),
             color,
         );
+        // #2824: stop before content recovery, validation, nudges or dispatch.
+        // A provider capability or old thinking-off setting cannot buy a retry.
+        if generation_bounds::output_limited(&json) {
+            if let Some(obs) = solve_obs.as_deref_mut() {
+                obs.behavior_signals
+                    .push(observability::BehaviorSignal::ChatCompletionFinish {
+                        round,
+                        finish_reason: Some("length".into()),
+                    });
+                let reasoning = separate_reasoning.or(inline_reasoning.as_deref());
+                if observability::reasoning_overflow_signature(
+                    Some("length"),
+                    oa_content.is_empty(),
+                    reasoning.is_some(),
+                    message["tool_calls"]
+                        .as_array()
+                        .is_some_and(|calls| !calls.is_empty()),
+                ) {
+                    obs.behavior_signals
+                        .push(observability::BehaviorSignal::ReasoningOverflow {
+                            round,
+                            reasoning_overflow_detected: true,
+                            continuation_attempted: false,
+                            continuation_succeeded: false,
+                            finish_reason: "length".into(),
+                            reasoning_tokens_estimate: estimation.tokens_for_chars(
+                                reasoning.map(|text| text.chars().count()).unwrap_or(0),
+                            ),
+                        });
+                }
+            }
+            let text = finalize_final_text(
+                oa_content,
+                workspace,
+                &caveats.fs_read,
+                &capability_evidence,
+                disclosure,
+                &turn_claims,
+                &verification,
+            );
+            let text = generation_bounds::output_limit_notice(text, round_usage);
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::Failed);
+            }
+            if let Some(harness) = smart_harness {
+                harness.outcome(crate::TurnEndReason::Failed, &text)?;
+            }
+            return Ok((text, false, accumulated_usage, hallucination_count));
+        }
         let native_calls = message["tool_calls"].as_array();
         // Recover tool calls emitted as content instead of the native field —
         // the #1 weak-model failure (see `tool_recovery`). Mirror of the Ollama
@@ -8203,134 +8262,6 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     round,
                     finish_reason: finish_reason.map(str::to_string),
                 });
-        }
-        let reasoning_text = separate_reasoning.or(inline_reasoning.as_deref());
-        let reasoning_overflow = observability::reasoning_overflow_signature(
-            finish_reason,
-            oa_content.is_empty(),
-            reasoning_text.is_some(),
-            has_tools,
-        );
-
-        // Resolve the pending telemetry record on the first response after a
-        // continuation. A tool call or visible answer is a successful recovery;
-        // another reasoning-only/empty response remains an honest failure.
-        if reasoning_continuation_attempted && !reasoning_overflow {
-            if has_tools || !oa_content.is_empty() {
-                if let (Some(obs), Some(index)) =
-                    (solve_obs.as_deref_mut(), reasoning_overflow_signal_index)
-                {
-                    if let Some(signal) = obs.behavior_signals.get_mut(index) {
-                        signal.mark_continuation_succeeded();
-                    }
-                }
-            }
-            reasoning_overflow_signal_index = None;
-        }
-
-        if reasoning_overflow {
-            let has_round_budget = workflow_runtime.has_next_round(
-                round,
-                current_tool_round_limit,
-                workflow_grace_rounds,
-            );
-            // Re-dispatch once with thinking off at the same budget, only when
-            // the endpoint supports the actual off switch. Another retry needs
-            // intervening progress recorded by the normal tool-batch accounting.
-            let lower = cognition
-                .filter(|_| chat_completions_capability.cognition == Some(true))
-                .filter(|_| chat_completions_capability.chat_template_kwargs == Some(true))
-                .filter(|level| *level != crate::role_profile::Cognition::Zen)
-                .filter(|_| overflow_retry == crate::config::OverflowRetry::ThinkingOff)
-                .filter(|_| !cognition_drop_used && has_round_budget);
-            if let Some(from) = lower {
-                cognition_drop_used = true;
-                // Thinking off (Zen's projection) at the ORIGINAL budget.
-                retry_policy = Some((
-                    round + 1,
-                    generation_policy::GenerationPolicy {
-                        thinking: Some(false),
-                        ..generation_policy
-                    },
-                ));
-                tracing::info!(
-                    round,
-                    from = from.label(),
-                    to = "thinking-off",
-                    "reasoning overflow: re-dispatching once with thinking off"
-                );
-                if let Some(obs) = solve_obs.as_deref_mut() {
-                    obs.behavior_signals
-                        .push(observability::BehaviorSignal::CognitionDropRetry {
-                            round,
-                            from: from.label().into(),
-                            to: "thinking-off".into(),
-                        });
-                }
-                // Keep user/assistant alternation; the partial reasoning is not replayed.
-                messages.push(serde_json::json!({"role":"assistant","content":""}));
-                messages
-                    .push(serde_json::json!({"role":"user","content":REASONING_OVERFLOW_NUDGE}));
-                continue 'round_loop;
-            }
-            let can_continue = generation_policy
-                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget)
-                && !cognition_drop_used;
-
-            let resolving_existing_continuation =
-                reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
-            if !resolving_existing_continuation {
-                if let Some(obs) = solve_obs.as_deref_mut() {
-                    let index = obs.behavior_signals.len();
-                    obs.behavior_signals
-                        .push(observability::BehaviorSignal::ReasoningOverflow {
-                            round,
-                            reasoning_overflow_detected: true,
-                            continuation_attempted: can_continue,
-                            continuation_succeeded: false,
-                            finish_reason: "length".into(),
-                            reasoning_tokens_estimate: estimation.tokens_for_chars(
-                                reasoning_text
-                                    .map(|reasoning| reasoning.chars().count())
-                                    .unwrap_or(0),
-                            ),
-                        });
-                    reasoning_overflow_signal_index = Some(index);
-                }
-            }
-
-            if can_continue {
-                print_newt(
-                    "reasoning reached the output limit before an answer — continuing once",
-                    color,
-                    false,
-                );
-                messages.push(prepare_openai_assistant_replay(
-                    message,
-                    &oa_content,
-                    reasoning_replay_scope,
-                    true,
-                ));
-                reasoning_continuation_attempted = true;
-                continue 'round_loop;
-            }
-
-            let reason = if resolving_existing_continuation {
-                "the bounded continuation also reached the output limit"
-            } else if reasoning_continuation_attempted {
-                "the turn already used its bounded continuation"
-            } else if !generation_policy.one_bounded_reasoning_continuation {
-                "the endpoint does not advertise bounded continuation"
-            } else if reasoning_replay_scope == crate::model_card::ReasoningReplayScope::Never {
-                "the endpoint does not allow current-turn reasoning replay"
-            } else {
-                "the turn has no remaining round budget"
-            };
-            print_newt(
-                &format!("reasoning overflow detected — {reason}"),
-                color,
-                false,
-            );
         }
         // W0 (#1511): served-model + parse-status observation for the solve
         // contract — mirror of the Ollama loop above.
@@ -8771,11 +8702,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 **slot = Some(accepted_reason);
             }
             if content.is_empty() {
-                let out = if reasoning_overflow {
-                    reasoning_overflow_reason(is_cognition_retry)
-                } else {
-                    "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
-                };
+                let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
                 observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
@@ -9265,9 +9192,6 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             harness.record_messages(&messages)?;
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
-        if round_modified_workspace || round_progress {
-            cognition_drop_used = false;
-        }
         if let Some(text) = pending_plan_approval_handoff(
             plan_mode_control,
             PlanRoundFacts {
@@ -9360,6 +9284,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         api_key,
         trimmed,
         generation_policy,
+        generation_window,
         &cap,
         attempts,
     );
@@ -12311,6 +12236,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // about what it means for this wire instead of silently defaulting.
         emits_leading_reasoning: _,
     } = ctx;
+    let mut generation_window = num_ctx;
     let generation_policy = generation_policy::GenerationPolicy::resolve_responses(
         cognition,
         output_allowance,
@@ -12345,7 +12271,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
-        .timeout(std::time::Duration::from_secs(inference_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let responses_url = format!("{}/v1/responses", url.trim_end_matches('/'));
     let retry = tui_retry_policy(url);
@@ -12720,7 +12646,19 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             if let Some(harness) = smart_harness {
                 harness.record_responses_messages(instructions.as_deref(), &input)?;
             }
-            let body = build_body(&input, if tools_supported { &tools } else { &[] });
+            let mut body = build_body(&input, if tools_supported { &tools } else { &[] });
+            let output_cap = generation_bounds::apply_responses(
+                &mut body,
+                generation_policy.output_allowance,
+                generation_window,
+                estimate_responses_request_real_tokens(
+                    instructions.as_deref(),
+                    &input,
+                    tools_supported.then_some(tools.as_slice()),
+                    estimation,
+                    cal,
+                ),
+            );
             let policy = responses_wire_validation::ResponsesWirePolicy {
                 store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
                 tools_permitted: true,
@@ -12736,6 +12674,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 Some(reason) => anyhow::Error::new(e).context(reason.to_string()),
                 None => anyhow::Error::new(e),
             })?;
+            observability::observe_output_allowance(&mut solve_obs, Some(output_cap?), true);
             let dispatch = dispatch_responses_json(
                 &client,
                 &responses_url,
@@ -12820,6 +12759,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             })
                         {
                             if let Some(context_window) = recovered_window {
+                                generation_window = Some(
+                                    generation_window
+                                        .map_or(context_window, |old| old.min(context_window)),
+                                );
                                 emit_context_window_400(&mut on_round_usage, context_window);
                             }
                             // Tighten the shared state MONOTONICALLY (a recovery may
@@ -12954,6 +12897,27 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // surfaced — never mistaken for a benign empty reply.
         let decoded = crate::responses_wire::decode_response(&json);
         complete_responses_attempt(attempt.as_ref(), &json, &decoded);
+        if generation_bounds::output_limited(&json) {
+            let usage = crate::responses_wire::decode_usage(&json["usage"]);
+            accumulated_usage = merge_round_usage(accumulated_usage, usage);
+            let text = finalize_final_text(
+                generation_bounds::partial_responses_text(&json),
+                workspace,
+                &caveats.fs_read,
+                &capability_evidence,
+                disclosure,
+                &turn_claims,
+                &verification,
+            );
+            let text = generation_bounds::output_limit_notice(text, usage);
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::Failed);
+            }
+            if let Some(harness) = smart_harness {
+                harness.outcome(crate::TurnEndReason::Failed, &text)?;
+            }
+            return Ok((text, false, accumulated_usage, hallucination_count));
+        }
         let refused = matches!(
             decoded,
             Err(crate::responses_wire::ResponseDecodeError::Refused { .. })
@@ -13714,7 +13678,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // typed strict-wire gate the rounds use, with `tools_permitted = false` so the
     // final summary can carry NO tools; a proactive-compaction reason (if any) rides
     // its error chain. Only a `ValidatedResponsesRequest` reaches the dispatcher.
-    let body = build_body(&input, &[]);
+    let mut body = build_body(&input, &[]);
+    let output_cap = generation_bounds::apply_responses(
+        &mut body,
+        generation_policy.output_allowance,
+        generation_window,
+        estimate_responses_request_real_tokens(
+            instructions.as_deref(),
+            &input,
+            None,
+            estimation,
+            cal,
+        ),
+    )?;
+    observability::observe_output_allowance(&mut solve_obs, Some(output_cap), true);
     let policy = responses_wire_validation::ResponsesWirePolicy {
         store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
         tools_permitted: false,
@@ -13790,7 +13767,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 error = %error,
                 "Responses cap-exit summary dispatch failed; returning captured progress"
             );
-            let text = finalize_final_text(
+            let mut text = finalize_final_text(
                 cap_exit_fallback(
                     current_tool_round_limit,
                     cap_accumulated,
@@ -13804,6 +13781,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &turn_claims,
                 &verification,
             );
+            generation_bounds::append_notice(&mut text, &error);
             if let Some(slot) = &mut end_reason {
                 **slot = Some(cap_reason);
             }
@@ -13816,6 +13794,24 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // persist it and retain the continuation link.
     let decoded = crate::responses_wire::decode_response(&json);
     complete_responses_attempt(attempt.as_ref(), &json, &decoded);
+    if generation_bounds::output_limited(&json) {
+        let usage = crate::responses_wire::decode_usage(&json["usage"]);
+        accumulated_usage = merge_round_usage(accumulated_usage, usage);
+        let text = finalize_final_text(
+            generation_bounds::partial_responses_text(&json),
+            workspace,
+            &caveats.fs_read,
+            &capability_evidence,
+            disclosure,
+            &turn_claims,
+            &verification,
+        );
+        let text = generation_bounds::output_limit_notice(text, usage);
+        if let Some(slot) = &mut end_reason {
+            **slot = Some(crate::TurnEndReason::Failed);
+        }
+        return Ok((text, false, accumulated_usage, hallucination_count));
+    }
     let decoded = match decoded {
         Ok(d) => d,
         Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {

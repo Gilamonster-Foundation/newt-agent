@@ -252,6 +252,21 @@ pub(super) fn preflight_responses_request(
     Ok(())
 }
 
+/// Split a served window into admitted input and remaining output capacity.
+/// An explicit output reservation can lower the input ceiling. A stricter input
+/// limit (including overflow recovery's one-token reduction) leaves more output
+/// capacity; that capacity is still subject to the generation cap at dispatch.
+/// Both admission and generation use this split so a safety margin is counted
+/// once, and input + output capacity never exceeds the served window.
+pub(super) fn context_window_split(
+    window: u32,
+    input_limit: usize,
+    output_reserve: u32,
+) -> (usize, u32) {
+    let input = input_limit.min(window.saturating_sub(output_reserve) as usize);
+    (input, window - input as u32)
+}
+
 /// Authoritative input-token ceiling implied by a declared context window.
 ///
 /// A backend's context window contains both input and generated output. The
@@ -268,8 +283,12 @@ pub(super) fn num_ctx_input_ceiling(
     num_ctx.map(|context_window| {
         let percentage_ceiling =
             crate::config::input_percentage_ceiling(context_window, input_ceiling_pct) as usize;
-        let output_reserved = context_window.saturating_sub(max_output_tokens.unwrap_or(0));
-        percentage_ceiling.min(output_reserved as usize)
+        context_window_split(
+            context_window,
+            percentage_ceiling,
+            max_output_tokens.unwrap_or(0),
+        )
+        .0
     })
 }
 
@@ -308,16 +327,15 @@ pub(super) fn resolve_responses_budget(
 /// The **Responses** branch PROJECTS from the shared [`ResponsesBudgetState`]
 /// (via [`resolve_responses_budget`]) so the reported budget cannot diverge from
 /// what the Responses loop enforces: that state RESERVES local output via the
-/// cognition dial even though this wire sends no `max_output_tokens`, because a
+/// cognition dial before the dispatch guard selects `max_output_tokens`, because a
 /// declared window (#1526, invariant #4) must still leave room to generate. The
 /// projected value is the state's soft send budget — cached caps composed with
 /// the reserved hard ceiling — exactly what this seam has always returned.
 /// Explicitly capable **Chat Completions** endpoints receive Newt's local
 /// generation policy (its output reserve). **Anthropic** reserves the
 /// `max_tokens` it always sends (#2341). **Ollama and embedded** backends keep
-/// the percentage-only local ceiling. Ceiling-from-an-unsent-value is deliberate
-/// for Responses — the alternative is an over-window request that only a reactive
-/// 400 (or a silent truncation) can catch.
+/// the percentage-only local ceiling. Responses reserves its policy allowance
+/// here; the generation guard additionally limits the wire cap at dispatch.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn initial_context_input_budget(
@@ -560,8 +578,8 @@ pub(super) struct ResponsesBudgetState {
     num_ctx: Option<u32>,
     /// Configured percentage bound (`[context] input_ceiling_pct`).
     input_ceiling_pct: u32,
-    /// Resolved output allowance (this wire sends no `max_output_tokens`, but the
-    /// declared window must still leave room to generate). Reused when a cw-400
+    /// Resolved output allowance reserved before the wire generation guard
+    /// selects the final cap. Reused when a cw-400
     /// recovers the full window into the next input cap.
     output_reserve: Option<u32>,
     /// Declared/believed-safe window; the tool-exposure fallback clip budget.

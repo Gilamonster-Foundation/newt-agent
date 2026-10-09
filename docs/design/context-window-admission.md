@@ -173,9 +173,63 @@ remote service releases its scheduler slot or KV allocation on the same schedule
 
 An accepted answer is returned as generated; no mode sends a second,
 display-only request for it (#2372). A streamed primary request keeps its idle
-read deadline, so a progressing stream continues. Quoting a context-exceeded
+read deadline, so a progressing stream continues within its generation bounds. Quoting a context-exceeded
 message in answer text is ordinary content.
 
 The [decoder tests](../../newt-core/src/agentic/openai_sse_strict_tests.rs)
 and [primary-loop tests](../../newt-core/src/agentic/mod_tests/openai_primary_stream.rs)
 cover these protocol and recovery boundaries without live models.
+
+### Generation bounds (#2782)
+
+Primary and tools-disabled summary requests on Chat Completions and Responses
+also have independent output and total-duration limits:
+
+- `NEWT_GENERATION_MAX_TOKENS` (positive integer, default **16384**) caps the
+  resolved output allowance. The wire cap is further limited to the resolved
+  context window minus the admitted input ceiling on Chat (or its calibrated
+  prompt estimate when no ceiling exists), and minus the calibrated prompt
+  estimate on Responses. Chat counts and sends the same capped body; changing
+  its cap after counting would invalidate exact request admission. A measured
+  prompt at or below the input ceiling therefore fits beside the cap. Without a resolved window,
+  the allowance/maximum still bounds output. An estimate is not an exact server
+  token count; existing context-overflow recovery remains necessary.
+- `NEWT_GENERATION_TIMEOUT_SECS` (positive integer, default **900**) bounds each
+  attempt from sending the request through reading its final body byte, including
+  header latency. Receiving bytes resets the idle timer, never this timer.
+- `NEWT_GENERATION_REPEAT_LIMIT` is **off by default**. Set an integer of at
+  least 2 (for example, 8) to opt in to stopping a Chat SSE stream whose text
+  suffix repeats a 64–256-byte block that many times. Unset, invalid, 0 and 1
+  settings leave detection disabled.
+  Content and reasoning deltas count; SSE scaffolding and tool arguments do not.
+  This heuristic can stop intentionally repetitive output; enable it only when
+  that tradeoff is acceptable. The output cap and total deadline remain the hard
+  bounds. It does not inspect non-streamed JSON Responses output.
+
+Invalid or zero maximum/timeout settings use the defaults. Chat-compatible
+servers receive `max_tokens`; first-party OpenAI receives
+`max_completion_tokens`. Set `NEWT_CHAT_TOKEN_FIELD=max_completion_tokens` for
+proxies requiring the modern field. Responses receives `max_output_tokens`.
+These limits include generated reasoning according to the provider's accounting.
+See the [OpenAI token-counting guide](https://developers.openai.com/api/docs/guides/token-counting)
+and [llama.cpp server schema](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-schema.cpp),
+where both Chat field names alias `n_predict`.
+
+A duration/repetition stop drops the response and fails that attempt without
+an automatic transport retry. Received bytes remain in the existing observation;
+reported usage is retained. The notice gives the reported output-token count
+when present, otherwise says the count is unavailable rather than treating bytes
+as tokens. Summary fallbacks retain the notice with captured progress. Closing
+the client response does not guarantee immediate server-side slot reclamation.
+
+Provider-reported output exhaustion (`finish_reason: length` on Chat, or Responses
+`status: incomplete` with `incomplete_details.reason: max_output_tokens`) stops
+the turn before tool recovery, argument validation, completion classification or
+dispatch. Newt retains reported usage and visible partial prose with an explicit
+truncation notice. No tool from that response runs, even if another call in the
+same batch has complete arguments. The same notice and usage retention apply to
+tools-disabled summaries. The primary turn is marked failed, not completed.
+There is no automatic repair, continuation or thinking-off re-ask after this
+hard stop: endpoint continuation declarations and the legacy `overflow_retry`
+preference do not override it. The operator may issue a new request to continue,
+reduce the requested output, or explicitly change the configured cap.
