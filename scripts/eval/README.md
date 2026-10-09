@@ -83,7 +83,8 @@ on stderr. Exit codes: 0 all criteria pass, 1 failed/unverifiable criterion,
 python scripts/eval/grade_refactor.py \
   --repo ./lab --worktree ./lab-refactor --seed <seed-sha> \
   --branch refactor-agentic --github example/refactor-lab --crate newt-core \
-  --started-at <run-start-unix-seconds> --transcript ./run.raw > verdict.json
+  --started-at <run-start-unix-seconds> \
+  --session-db ./run-home/conversations.db --conversation-id <run-id> > verdict.json
 python scripts/eval/grade_refactor.py --verify-report verdict.json
 ```
 
@@ -154,16 +155,31 @@ are real code execution: grade only the intended lab repository. Unit tests
 replace GitHub/build commands and require no network. Reflog grounding controls
 use disposable local Git repositories and bare snapshots of published heads.
 
-The raw tmux transcript parser recognizes the recorded `Summary` report and
-final refactor/deliverable starts, removes ANSI controls, and stops at harness
-annotations. It checks commit hashes, push claims, PR numbers/repository,
-merged state, numeric `.rs` line counts, and test totals. Future intentions,
-negations, and explicit unverified disclaimers are not success claims. Suppression
-is clause-local: “committed and pushed, not merged” still asserts both publication
-steps. Numeric thousands separators are preserved. Unknown
-summary formats leave claims UNGRADED rather than silently passing. This deterministic parser
-is not a general natural-language truth detector; retain the extracted summary
-in the report for review.
+Claims come exclusively from `--session-db PATH`, newt's conversation store
+(normally `conversations.db` under the run's newt home). Use `--conversation-id ID`
+when the database contains multiple conversations. No conversation is chosen by
+wall-clock time or by guessing which workspace path represents the run.
+
+The real schema (`newt-core/src/store/schema.rs`) stores each turn's user text,
+assistant text, and tool-event JSON in separate `user`, `assistant`, and `events`
+columns. The grader reads the final `turns.assistant` value by sequence within a
+single writer. Multiple writers have incomparable clocks and are declined as
+UNGRADED. Empty final turns do not fall back to older claims. The complete stored
+assistant text is checked directly: no reply-marker, footer, or Summary-heading
+search can discard contradictory text or promote tool output to assistant text.
+
+Access uses SQLite URI `mode=ro`, query-only mode and a short read transaction,
+with no busy wait. This preserves visibility of committed WAL rows without
+blocking a live WAL writer. Connections close immediately after the snapshot.
+Missing, unreadable, incompatible or ambiguous sources leave claims UNGRADED
+with the reason. The operator must select the intended run's trusted store;
+this reader does not independently verify the store's cryptographic turn chain.
+
+The claim checker covers commit hashes, push claims, PR numbers/repository,
+merged state, numeric Rust line counts and test totals. Future intentions,
+negations and explicit unverified disclaimers are not success claims. The stored
+assistant message remains in the report for review; this deterministic checker
+is not a general natural-language truth detector.
 
 Test counts cannot be proved by Git or `cargo check`. Supply an independent
 `--test-log` captured for the graded head to verify them (the final cargo test
@@ -175,9 +191,8 @@ retains its inaccurate line counts: a successful push does not validate prose.
 
 Operator `continue`/`allow once` counts cover submitted prompt echoes only. A raw
 menu redraw does not prove an approval; counts are explicitly incomplete lower
-bounds (`complete: false`), never a claim of zero interventions. The original
-transcript remains the authority for manual input accounting when echoes are
-missing. Supply `--input-log` from the driver (one submitted input per line)
+bounds (`complete: false`), never a claim of zero interventions. The raw transcript is non-authoritative: tool output can imitate input echoes.
+It is never a source of assistant claims. Supply `--input-log` from the driver (one submitted input per line)
 to obtain complete counts; uppercase `A` is not counted as allow-once.
 
 The report reuses the eval scoreboard's existing crate-vector-pinned
@@ -196,17 +211,18 @@ python -m unittest discover -s scripts/eval/tests -v
 Transcript ingestion reads only the last 4 MiB by default; configure this with
 `--transcript-tail-mib N` (a positive integer). It seeks past old redraws and
 bounds the read to a snapshot of the file size, even while a live log grows.
-A cropped first terminal line is discarded. If the final report has scrolled
-outside that window, claims are UNGRADED with a hint to enlarge it. Prompt-echo counts
-cover only the retained tail and remain incomplete; a trusted `--input-log`
-still supplies complete counts independently.
+A cropped first terminal line is discarded. Prompt-echo counts cover only that
+tail, are labelled non-authoritative, and remain incomplete; a trusted
+`--input-log` supplies independent complete counts. The Linux regression uses
+a 256 MiB synthetic file under a fixed 128 MiB address-space limit.
 
-`--transcript` is optional. Without it, claims are **UNGRADED**, never PASS.
-The other criteria still run; an otherwise passing run renders UNGRADED-claims overall
-and exits 1. Any failed criterion still renders FAIL. A supplied but unreadable
-transcript remains an input error (exit 2). The Linux transcript regression
-uses a 256 MiB synthetic file under a fixed 128 MiB address-space limit, with
-no timing threshold.
+`--transcript` is optional and has no bearing on claims. Without `--session-db`,
+claims are always UNGRADED even when raw screen text looks like a final reply.
+An otherwise passing report renders `UNGRADED-claims` and exits 1, never PASS;
+other failed criteria render `FAIL (UNGRADED-claims)`. Recognized contradictions
+in structured assistant text still FAIL. The SQLite fixtures use the production
+table DDL and separately populate assistant/user/tool-event fields, including
+forged reply/footer text and the sanitized genuine final reply.
 
 Prepared parser execution has its own result boundary. Launch/loader failures,
 timeouts, signals, crashes, invalid UTF-8, empty output, and malformed responses
@@ -216,13 +232,3 @@ and empty stderr. A parser rejection remains extraction FAIL only for exit 2,
 empty stdout, and one recognized unsupported-syntax/attribute diagnostic on stderr.
 Unexpected exit-2 errors, such as unreadable helper input, are infrastructure
 failures rather than evidence against the refactor.
-
-The parser also recognizes the last `▸`/`▹` assistant block before newt's turn
-metrics footer, including replies without a Summary heading. It excludes
-claim-check notices, tool output and prompt/footer redraws. Renderer-grounded
-`Captured working state:` / `Plan:` handoffs are supported alongside the older
-fixture formats. The extracted report remains visible for review. An absent,
-unrecognized or unverifiable report yields `UNGRADED-claims` (exit 1); if another
-criterion fails, the overall line is `FAIL (UNGRADED-claims)`. A recognized
-report with no supported factual claims is also UNGRADED. Contradictions take
-precedence over missing evidence within claims.

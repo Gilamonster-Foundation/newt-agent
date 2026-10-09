@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import refactor_claims as claims
 import grade_refactor as grader
+from session_fixture import session_db
 
 FIXTURES = Path(__file__).parent / "fixtures" / "refactor"
 
@@ -46,10 +47,6 @@ class Claims(unittest.TestCase):
             "Will have committed and pushed.",
         ):
             self.assertEqual(claims.check_claims("Summary\n" + text, {}), [])
-
-    def test_missing_final_summary_is_not_silently_empty(self):
-        with self.assertRaises(ValueError):
-            claims.final_summary("⚙ run_command: echo pushed\n▒ pushed\n")
 
 
 SEED = "a" * 40
@@ -161,6 +158,10 @@ class Grade(unittest.TestCase):
             crate="crate",
             started_at=100,
             transcript=transcript,
+            session_db=session_db(
+                root / "conversation.db",
+                "Summary\nCommitted and pushed. Opened PR #20.",
+            ),
             test_log=None,
         )
         self.fake = FakeCommands(self.args.repo, self.args.worktree)
@@ -503,6 +504,10 @@ class Grounding(unittest.TestCase):
                 crate="crate",
                 started_at=started,
                 transcript=transcript,
+                session_db=session_db(
+                    root / "conversation.db",
+                    "Summary\nCommitted and pushed. Opened PR #20.",
+                ),
                 test_log=None,
             )
 

@@ -21,9 +21,10 @@ class Transcript(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         return case
 
-    def test_absent_transcript_is_ungraded(self):
+    def test_absent_session_source_is_ungraded(self):
         case = self.fixture()
         case.args.transcript = None
+        case.args.session_db = None
         with patch.object(grader, "extraction", return_value=(True, "extracted")):
             report = case.grade()
         self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED")
@@ -84,8 +85,9 @@ finally:
             path.write_bytes(b"Summary\ninvalid utf8: \xff\n")
             self.assertIn("\ufffd", read_tail(path, 1))
 
-    def test_provided_transcript_without_report_is_ungraded(self):
+    def test_raw_screen_without_session_source_is_ungraded(self):
         case = self.fixture()
+        case.args.session_db = None
         case.args.transcript.write_text("spinner\rstill working\r")
         with patch.object(grader, "extraction", return_value=(True, "extracted")):
             report = case.grade()

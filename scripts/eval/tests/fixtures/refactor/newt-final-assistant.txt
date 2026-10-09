@@ -1,0 +1,1 @@
+Steps 5 and 6were both actually finished (clippy/fmt green, commit pushed, PR #25 open) — the earlier handoff was premature. All six plan steps are now complete.

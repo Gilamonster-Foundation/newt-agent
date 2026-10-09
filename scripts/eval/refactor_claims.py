@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 
-from refactor_summary import extract_summary
-
 ANSI = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
 NUMBER = r"[\d,]+"
 FILE = r"[\w./-]+\.rs"
@@ -17,11 +15,6 @@ def clean_terminal(raw: str) -> str:
     # Preserve that boundary before removing controls, or spinner + reply merge.
     raw = re.sub(r"\x1b\[[0-9;]*[Hf]", "\n", raw)
     return ANSI.sub("", raw).replace("\r", "\n")
-
-
-def final_summary(raw: str) -> str:
-    """Recognize renderer-framed replies and legacy final-report headings."""
-    return extract_summary(clean_terminal(raw))
 
 
 def operator_inputs(raw: str, submitted: str | None = None) -> dict:
@@ -47,9 +40,8 @@ def operator_inputs(raw: str, submitted: str | None = None) -> dict:
     }
 
 
-def check_claims(raw: str, facts: dict, test_log: str = "") -> list[dict]:
-    """Return each supported factual claim with verified/contradicted/unverifiable."""
-    summary = final_summary(raw)
+def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
+    """Check explicit assistant text; caller must establish its structured role."""
     rows: list[dict] = []
 
     def add(kind: str, claim: str, actual: object, matches: bool | None) -> None:
