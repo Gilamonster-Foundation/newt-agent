@@ -1,4 +1,5 @@
 //! Grounds optional smart-harness startup in the real CLI, without an auxiliary.
+#[cfg(unix)]
 use super::*;
 
 /// Parent-directory TUI launch: bare command grants must degrade with notice.
