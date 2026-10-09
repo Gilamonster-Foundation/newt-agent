@@ -47,7 +47,9 @@ pub use generation_policy::{
 };
 mod git_tool;
 pub mod openai_sse;
+pub(crate) mod publish_early;
 pub(crate) mod self_verify;
+pub use publish_early::GUIDANCE as REFACTOR_PUBLISH_GUIDANCE;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
 pub(crate) mod scratchpad;
 // Step 26.5 (#582): semantic repo-evidence retrieval (embedding RAG-for-code).
@@ -5142,7 +5144,7 @@ fn active_step_description(step_ledger: Option<&dyn scheduled::StepLedger>) -> O
 
 fn workflow_guidance(direction: impl std::fmt::Display) -> String {
     format!(
-        "{direction} Guidance is advisory: follow the latest operator instruction, including \
+        "{direction} {REFACTOR_PUBLISH_GUIDANCE} Guidance is advisory: follow the latest operator instruction, including \
          newer steering. Honor stop or report-only requests. Reconcile changed plans with \
          update_plan; preserve completed work."
     )
