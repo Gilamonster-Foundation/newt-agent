@@ -269,7 +269,7 @@ fn recalled_redundant_canonical_children_do_not_disable_a_workspace_profile() {
 
 #[cfg(unix)]
 #[test]
-fn recalled_alias_is_not_discarded_as_an_already_covered_lexical_child() {
+fn recalled_alias_is_pinned_outside_the_already_covered_root() {
     let fixture = Fixture::new();
     let outside = fixture._temp.path().canonicalize().unwrap().join("outside");
     std::fs::create_dir(&outside).unwrap();
@@ -280,8 +280,31 @@ fn recalled_alias_is_not_discarded_as_an_already_covered_lexical_child() {
         .durable_grants
         .insert((DenialKind::FsRead, alias.to_string_lossy().into_owned()));
     let base = fixture.caveats();
+    let recalled = state.recalled_caveats(&base, None).unwrap();
     assert!(
-        state.recalled_caveats(&base, None).is_err(),
-        "the named child resolves outside the already-granted root and has a writable alias anchor"
+        recalled
+            .fs_read
+            .permits(&outside.to_string_lossy().into_owned()),
+        "the outside target must be retained as an explicit canonical grant"
     );
+    assert!(
+        !recalled
+            .fs_read
+            .permits(&alias.to_string_lossy().into_owned()),
+        "a writable alias must not remain an authority anchor"
+    );
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&fixture.operator, &alias).unwrap();
+    assert!(!newt_core::caveats::permits_path(
+        &recalled.fs_read,
+        &alias.join("identity.pem").to_string_lossy()
+    ));
+    fixture.guard.validate_caveats(&recalled).unwrap();
+    // Recalling the saved spelling again cannot approve a protected target.
+    if let Ok(refreshed) = state.recalled_caveats(&base, None) {
+        assert!(!newt_core::caveats::permits_path(
+            &refreshed.fs_read,
+            &fixture.key.to_string_lossy()
+        ));
+    }
 }
