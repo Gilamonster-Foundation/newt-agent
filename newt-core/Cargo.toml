@@ -78,7 +78,8 @@ parking_lot.workspace = true
 # table (notes_scan.rs). Already a workspace dep used by newt-eval/newt-tools.
 regex.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# Artifact metadata is verified byte-for-byte after JSON reload; preserve f64 bits.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 # Content-addressed spill identity (#1528 B3 follow-up): a spill handle is the
 # BLAKE3 CIDv1 of a versioned, session-scoped record — self-verifying, so the
 # allocator/reservation bug class is unrepresentable. Frozen 0.1.x core only.
