@@ -13,6 +13,9 @@ impl PermissionGate for BroadGate {
     fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
         PermissionDecision::Allow(Caveats::top())
     }
+    fn apply_command_retry(&mut self, _: &str, _: &str, _: &Caveats) -> Caveats {
+        Caveats::top()
+    }
     fn apply_pending_once(&mut self, _: DenialKind, _: &str, _: &Caveats) -> Caveats {
         Caveats::top()
     }
@@ -97,6 +100,11 @@ fn worktree_adoption_clamps_refresh_retry_and_build_requests() {
         ));
     }
     let c = gate.apply_pending_once(DenialKind::Exec, "python3", &Caveats::top());
+    assert!(!crate::caveats::permits_path(
+        &c.fs_write,
+        original.to_str().unwrap()
+    ));
+    let c = gate.apply_command_retry("bash script.sh", "/ws", &Caveats::top());
     assert!(!crate::caveats::permits_path(
         &c.fs_write,
         original.to_str().unwrap()

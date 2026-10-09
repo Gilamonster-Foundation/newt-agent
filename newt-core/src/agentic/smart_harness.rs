@@ -238,6 +238,27 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
         self.inner.queue_pending_once(kind, target);
     }
 
+    fn queue_command_retry(
+        &mut self,
+        command: &str,
+        cwd: &str,
+        requests: &[super::permissions::PermissionRequest],
+    ) {
+        self.inner.queue_command_retry(command, cwd, requests);
+    }
+    fn apply_command_retry(
+        &mut self,
+        command: &str,
+        cwd: &str,
+        baseline: &crate::caveats::Caveats,
+    ) -> crate::caveats::Caveats {
+        use super::permissions::PermissionDecision;
+        let widened = self.inner.apply_command_retry(command, cwd, baseline);
+        match self.validate_decision(PermissionDecision::Allow(widened)) {
+            PermissionDecision::Allow(validated) => validated,
+            PermissionDecision::Deny => baseline.clone(),
+        }
+    }
     fn apply_pending_once(
         &mut self,
         kind: super::permissions::DenialKind,

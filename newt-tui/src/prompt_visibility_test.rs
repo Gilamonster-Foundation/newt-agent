@@ -117,6 +117,7 @@ fn prompt_scenario_child() {
         state.web_store = Some(store);
         {
             let mut gate = PromptPermissionGate {
+                pending_command_retries: Default::default(),
                 state: &mut state,
                 base: no_net_caveats(),
                 key_path: None,
@@ -175,6 +176,7 @@ fn prompt_scenario_child() {
     }
     let allowed = {
         let mut gate = PromptPermissionGate {
+            pending_command_retries: Default::default(),
             state: &mut state,
             base: no_net_caveats(),
             key_path: None,

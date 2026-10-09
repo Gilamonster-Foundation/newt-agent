@@ -55,6 +55,9 @@ on:
       - "newt-tui/src/transcript_pager.rs"
       - "newt-tui/src/transcript_pager_pty_test.rs"
       - "newt-tui/src/permissions.rs"
+      - "newt-tui/src/native_permission_test.rs"
+      - "newt-tui/tests/exec_grant_retry_loop*"
+      - "newt-tui/tests/exec_grant_retry_loop/**"
       - "newt-tui/src/panel.rs"
       - "newt-tui/src/panel_raw_mode_pty_test.rs"
       - "newt-tui/src/modal_size.rs"
@@ -113,6 +116,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: newt-tui-pty
+
+      # HOOK PARITY: CI-only native Brush/provider proof; see .githooks/pre-push.
+      - name: Prove one-shot interpreter retry and turn expiry with Brush
+        run: cargo test -p newt-tui --features native-permission-test --test exec_grant_retry_loop -- --ignored
 
       # Single-threaded: the real-PTY child must not contend with sibling tests
       # for CPU, or a nudged control byte is swallowed in cooked mode and the
@@ -215,6 +222,10 @@ jobs:
           env -u NEWT_VENV -u VIRTUAL_ENV \
             NEWT_EXEC_PATHS="$trusted_gh_dir" PATH="$proof_path" \
             cargo test -p newt-tui --lib session_capability:: -- --test-threads=1
+
+      # HOOK PARITY: CI-only native Brush/provider proof; see .githooks/pre-push.
+      - name: Prove one-shot interpreter retry and turn expiry with Brush
+        run: cargo test -p newt-tui --features native-permission-test --test exec_grant_retry_loop -- --ignored
 
       # The termios/pty surface, in the order it is layered: the modal's raw
       # guard, then the cockpit's capture and mode restoration on top of it.

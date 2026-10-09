@@ -75,6 +75,7 @@ fn gate_with_danger<'a>(
 ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> {
     let mut script = vec![choice].into_iter();
     PromptPermissionGate {
+        pending_command_retries: Default::default(),
         state,
         base: open_caveats(),
         key_path,
@@ -400,6 +401,7 @@ fn permanent_allow_with_no_config_path_gets_its_own_distinct_fallback() {
     let request = req(DenialKind::Exec, "cargo");
     let mut script = vec![PromptChoice::AllowPermanent].into_iter();
     match (PromptPermissionGate {
+        pending_command_retries: Default::default(),
         state: &mut state,
         base: open_caveats(),
         key_path: Some(key_path),
