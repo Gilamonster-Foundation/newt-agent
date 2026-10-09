@@ -5,6 +5,7 @@ use crate::Caveats;
 use std::path::{Path, PathBuf};
 
 use super::native_git::{invocation, is_git as resembles_git, literal};
+pub(super) mod administration;
 pub(super) mod branch;
 mod detect;
 #[path = "worktree_git.rs"]
