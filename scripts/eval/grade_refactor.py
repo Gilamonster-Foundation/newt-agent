@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -85,6 +86,14 @@ def reflog_entries(text: str) -> list[tuple[str, int, str]]:
     return entries
 
 
+def cargo_prefix() -> list[str]:
+    """Keep builds low priority, with I/O scheduling where available."""
+    prefix = ["env", "RUSTC_WRAPPER=", "CARGO_BUILD_JOBS=4", "nice", "-n", "10"]
+    if shutil.which("ionice"):
+        prefix.extend(["ionice", "-c3"])
+    return prefix
+
+
 @cache
 def syntax_helper(prebuilt: Path | None = None, *, prepare: bool = False) -> Path:
     """Prepare trusted code with downloads, or grade offline using a prepared binary."""
@@ -96,16 +105,7 @@ def syntax_helper(prebuilt: Path | None = None, *, prepare: bool = False) -> Pat
             )
         return binary
     root = Path(__file__).resolve().parents[2]
-    prefix = [
-        "env",
-        "RUSTC_WRAPPER=",
-        "CARGO_BUILD_JOBS=4",
-        "nice",
-        "-n",
-        "10",
-        "ionice",
-        "-c3",
-    ]
+    prefix = cargo_prefix()
     try:
         run(
             [
@@ -390,16 +390,7 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
             cloned = git("rev-parse", "HEAD", where=clone)
             if cloned != head:
                 raise EvidenceError("remote branch moved during clone; retry grading")
-            prefix = [
-                "env",
-                "RUSTC_WRAPPER=",
-                "CARGO_BUILD_JOBS=4",
-                "nice",
-                "-n",
-                "10",
-                "ionice",
-                "-c3",
-            ]
+            prefix = cargo_prefix()
             output = command([*prefix, "cargo", "check", "-p", args.crate], clone)
             row(
                 "fresh_clone_check",

@@ -355,6 +355,10 @@ fn merged_packs() -> Vec<ToolingPack> {
 /// Configuration over Convention; empty = nothing declared for this phase.
 #[must_use]
 pub fn resolved_phase_commands(repo_dir: &Path, phase: Phase) -> Vec<String> {
+    #[cfg(test)]
+    if let Some(commands) = resolution_fixture::resolve() {
+        return commands;
+    }
     if let Some(cmd) = LIFECYCLE_OVERRIDE.get().and_then(|c| c.get(phase)) {
         return vec![cmd.to_string()];
     }
@@ -696,3 +700,7 @@ mod tests {
         assert!(msg.contains("agent-voice, agent-tools"), "got: {msg}");
     }
 }
+
+#[cfg(test)]
+#[path = "tooling_resolution_fixture.rs"]
+pub(crate) mod resolution_fixture;
