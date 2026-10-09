@@ -1,0 +1,77 @@
+# HOOK PARITY: .githooks/pre-push scopes portable Rust checks; this native
+# Seatbelt contract is explicitly CI-only there. Keep both lists in sync.
+name: confined command contract (macOS)
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "ci/macos-confined-contract"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 4
+  RUSTC_WRAPPER: ""
+  CARGO_TERM_COLOR: never
+
+jobs:
+  confined-contract-macos:
+    name: command and adoption contract (native Seatbelt)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@cargo-nextest
+      # Hosted images install versioned Xcode bundles outside the production
+      # Xcode.app exception. Narrow the ancestor's permissions, not the broker's
+      # trust policy, so the controls reach destination/network admission.
+      - name: Make the system Git ancestor non-group-writable
+        run: sudo chmod g-w /Applications
+      # Libtest substitutes SafeSubset for Brush. Keep portable routing and
+      # refusal controls here; native positives run the production binary below.
+      # Row (c): plan_mode includes PR #2814's blank => approve regression.
+      - name: Run portable routing and broker refusal controls
+        env:
+          NEWT_EXEC_PATHS: /usr/bin:/bin
+        shell: bash
+        run: |
+          set -o pipefail
+          nice -n 10 cargo nextest run --locked -p newt-core --lib \
+            --no-fail-fast --status-level pass --final-status-level fail \
+            -E 'test(command_shape_contract::) or test(worktree_adoption::tests::) or test(scope_all_push_to_a_local_path_is_refused_through_real_dispatch) or test(wrapped_worktree_push_dispatch_reaches_gate_and_honors_denial) or test(plan_mode::tests::)' \
+            2>&1 | tee macos-confined-contract.log
+      - name: Run production Brush creation, adoption and raw-ref security contract
+        shell: bash
+        run: |
+          set -o pipefail
+          nice -n 10 cargo test --locked -p newt-core --test native_git_broker_pipeline \
+            -- --confined-contract 2>&1 | tee macos-native-contract.log
+      # Required production publication proof after integrating PR #2818.
+      - name: Governed commit and task-ref publication
+        id: publication
+        shell: bash
+        run: |
+          set -o pipefail
+          nice -n 10 cargo test --locked -p newt-core --test native_git_broker_pipeline \
+            -- --confined-contract --publication 2>&1 | tee macos-publication-contract.log
+      - name: Report required publication outcome
+        if: always()
+        env:
+          PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
+        run: |
+          echo "Governed commit/task-ref publication (required): $PUBLICATION_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve per-row evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-confined-contract
+          path: |
+            macos-confined-contract.log
+            macos-native-contract.log
+            macos-publication-contract.log

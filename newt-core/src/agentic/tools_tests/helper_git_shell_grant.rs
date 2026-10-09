@@ -944,11 +944,10 @@ fn git_shell_widening_grants_read_on_etc_gitconfig() {
 /// binary (`newt`/`brush_build_pipeline`'s `harness = false` tests) — never
 /// from the ordinary `cargo test` harness this file runs under.
 ///
-/// Linux-only with its two users: the orphan-commit dispatch test below and
-/// `worktree_adoption_refs`, both real-kernel-fence tests.
-#[cfg(target_os = "linux")]
+/// Shared by native confined commit fixtures on Unix, including the macOS contract.
+#[cfg(unix)]
 struct QuietCommitPolicy;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl agent_toolchain::native_git::CommitPolicy for QuietCommitPolicy {
     fn finalize_message(&self, message: &str) -> Result<String, String> {
         Ok(message.to_string())
@@ -962,9 +961,9 @@ impl agent_toolchain::native_git::CommitPolicy for QuietCommitPolicy {
     fn committed(&self) {}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(in crate::agentic::tools) struct FixtureGitTool;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl crate::agentic::git_tool::GitTool for FixtureGitTool {
     fn native_commit_policy(
         &self,

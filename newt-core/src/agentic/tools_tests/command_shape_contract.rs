@@ -5,9 +5,9 @@
 //! deny before Cargo executes; the requested kind/root proves routing. Publication
 //! uses a local bare remote or an inert child, never credentials or a forge.
 //! Existing detailed regressions retain responsibility for broker internals.
-//! Linux/Windows ordinary CI runs these; there is no ordinary macOS core test
-//! job yet. Confined
-//! discovery on Windows needs the AppContainer feature.
+//! Linux/Windows CI and the native macOS confinement job run these. Confined
+//! discovery on Windows needs the AppContainer feature. Libtest substitutes
+//! SafeSubset; tests/native_git_broker_pipeline/contract.rs proves production Brush.
 use super::*;
 use crate::caveats::Caveats;
 use crate::{worktree_adoption::WorktreeSession, ExecOutcome, Scope};
@@ -28,6 +28,12 @@ enum Setup {
     Bound,
     Restricted,
     Publish,
+    // Linux unit rows retain these setups; macOS native counterparts run
+    // in the production binary. Shared matching still names the variants.
+    #[cfg_attr(any(not(unix), target_os = "macos"), allow(dead_code))]
+    Adopted,
+    #[cfg_attr(any(not(unix), target_os = "macos"), allow(dead_code))]
+    AdoptedPublish,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Root {
@@ -118,13 +124,16 @@ fn discovery_matches_unique_fixture_across_windows_path_forms() {
 async fn check(row: Row) {
     let _lock = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("original");
-    let task = temp.path().join("task");
+    // macOS exposes /var through /private/var; grants must use the same
+    // canonical spelling as destination admission.
+    let temp_root = dunce::canonicalize(temp.path()).unwrap();
+    let root = temp_root.as_path().join("original");
+    let task = temp_root.as_path().join("task");
     std::fs::create_dir(&root).unwrap();
-    git(&root, temp.path(), &["init", "-q", "-b", "main"]);
+    git(&root, temp_root.as_path(), &["init", "-q", "-b", "main"]);
     git(
         &root,
-        temp.path(),
+        temp_root.as_path(),
         &[
             "-c",
             "commit.gpgsign=false",
@@ -136,10 +145,10 @@ async fn check(row: Row) {
     );
     std::fs::write(root.join("marker"), "original marker").unwrap();
     let session = WorktreeSession::default();
-    if row.setup != Setup::Fresh {
+    if matches!(row.setup, Setup::Bound | Setup::Restricted | Setup::Publish) {
         git(
             &root,
-            temp.path(),
+            temp_root.as_path(),
             &["worktree", "add", "-b", "task", "../task"],
         );
         std::fs::write(task.join("marker"), "task marker").unwrap();
@@ -150,19 +159,23 @@ async fn check(row: Row) {
         .unwrap();
         session.record_task_worktree(&task.canonicalize().unwrap(), "task");
     }
-    if row.setup == Setup::Publish {
-        let remote = temp.path().join("remote.git");
+    if matches!(row.setup, Setup::Publish | Setup::AdoptedPublish) {
+        let remote = temp_root.as_path().join("remote.git");
         git(
             &root,
-            temp.path(),
+            temp_root.as_path(),
             &["init", "--bare", "-q", remote.to_str().unwrap()],
         );
         git(
-            &task,
-            temp.path(),
+            &root,
+            temp_root.as_path(),
             &["remote", "add", "origin", remote.to_str().unwrap()],
         );
-        git(&task, temp.path(), &["config", "push.default", "current"]);
+        git(
+            &root,
+            temp_root.as_path(),
+            &["config", "push.default", "current"],
+        );
     }
     let _redirects: Vec<_> = [
         "GIT_DIR",
@@ -180,7 +193,7 @@ async fn check(row: Row) {
     .into_iter()
     .map(EnvVar::unset)
     .collect();
-    let git_env = git_fixture::hermetic_git_env(temp.path());
+    let git_env = git_fixture::hermetic_git_env(temp_root.as_path());
     let _env = [
         "HOME",
         "GIT_AUTHOR_NAME",
@@ -193,7 +206,7 @@ async fn check(row: Row) {
     ]
     .map(|key| EnvVar::set(key, &git_env[key]));
     // Discovery is about lookup, not host gh installation or credentials.
-    let bin = temp.path().join("bin");
+    let bin = temp_root.as_path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     // The test executable rejects gh's --base argument locally. It can never
     // create a PR; its error proves the plain route really spawned the child.
@@ -203,6 +216,10 @@ async fn check(row: Row) {
         std::fs::copy(&executable, &gh).unwrap();
     }
     let mut paths = vec![bin.clone()];
+    // Keep dispatch on the same system Git used by hermetic setup, not a
+    // runner's group-writable Homebrew prefix. The inert gh fixture stays first.
+    #[cfg(unix)]
+    paths.push(PathBuf::from("/usr/bin"));
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
@@ -230,8 +247,11 @@ async fn check(row: Row) {
     let _routing = EnvVar::set("NEWT_NO_ROUTE", "0");
     let mut caveats = Caveats {
         net: Scope::none(),
-        fs_write: Scope::only([if row.setup == Setup::Fresh {
-            temp.path()
+        fs_write: Scope::only([if matches!(
+            row.setup,
+            Setup::Fresh | Setup::Adopted | Setup::AdoptedPublish
+        ) {
+            temp_root.as_path()
         } else {
             &task
         }
@@ -241,6 +261,26 @@ async fn check(row: Row) {
     };
     if row.setup == Setup::Restricted {
         caveats.exec = Scope::none();
+    }
+    #[cfg(unix)]
+    if matches!(row.setup, Setup::Adopted | Setup::AdoptedPublish) {
+        confined_setup(
+            "git worktree add -b task ../task",
+            &root,
+            &caveats,
+            &session,
+        )
+        .await;
+        assert!(session.snapshot().is_some(), "creation must arm adoption");
+        caveats.fs_write = Scope::only([task.to_string_lossy().into_owned()]);
+        if row.setup == Setup::AdoptedPublish {
+            caveats.fs_write = Scope::only(
+                [task.clone(), temp_root.as_path().join("remote.git")]
+                    .map(|p| p.to_string_lossy().into_owned()),
+            );
+        }
+        std::fs::write(task.join("marker"), "task commit\n").unwrap();
+        confined_setup("git add marker", &root, &caveats, &session).await;
     }
     let baseline = crate::agentic::claim_check::TurnClaims::capture(
         root.to_str().unwrap(),
@@ -290,31 +330,93 @@ async fn check(row: Row) {
     let directory = OnceLock::new();
     let receipt = OnceLock::new();
     let mut gate = Gate::default();
-    let out = execute_tool_with_display_cancellable(
-        &mut ToolDisplay::new(Vec::new(), false, 100, 40, false),
-        name,
-        &args,
-        root.to_str().unwrap(),
-        false,
-        40,
-        &caveats,
-        &mut crate::agentic::NoMcp,
-        ToolCollaborators {
-            worktree_session: Some(&session),
-            execution: Some(&execution),
-            command_directory: Some(&directory),
-            governed_pr: Some(&receipt),
-            permission_gate: Some(&mut gate),
-            exec_floor: (row.setup == Setup::Restricted).then_some(&caveats.exec),
-            ..Default::default()
-        },
-        false,
-        PromptDisposition::Act,
-        None,
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    #[cfg(unix)]
+    let fixture_git = crate::agentic::tools::tests::git_shell_grant::FixtureGitTool;
+    let out = if row.command == "confined-executor git push" {
+        use crate::confined_exec::{ConstrainedExecutor, ExecOrigin, ExecRequest};
+        let policy = session.snapshot().expect("adopted task");
+        let authority = policy.attenuate(&policy.task_authority(&caveats));
+        let program = crate::git_hardening::trusted_git_program(Some(paths.as_os_str())).unwrap();
+        let request = ExecRequest::new(
+            ExecOrigin::AgentInfluenced,
+            program.to_string_lossy(),
+            ["push", "origin", "task:task"],
+            &task,
+            authority,
+        )
+        .envs(git_env.clone())
+        .env("PATH", paths.to_string_lossy())
+        .timeout(std::time::Duration::from_secs(30));
+        let output = ConstrainedExecutor::run_async(request)
+            .await
+            .expect("confined local push admission");
+        assert!(
+            output.success,
+            "confined local push: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.sandbox_kind,
+            if cfg!(target_os = "macos") {
+                agent_bridle::SandboxKind::Seatbelt
+            } else {
+                agent_bridle::SandboxKind::Landlock
+            },
+            "local push must use the native kernel fence"
+        );
+        let expected = std::fs::read_to_string(root.join(".git/refs/heads/task")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp_root.join("remote.git/refs/heads/task")).unwrap(),
+            expected,
+            "local push must publish the task commit before checking tracking metadata"
+        );
+        let tracking = root.join(".git/refs/remotes/origin/task");
+        assert!(
+            !tracking.exists(),
+            "raw push must not write a shared tracking ref"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("update_ref failed"),
+            "tracking write was not refused: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git/refs/heads/task")).unwrap(),
+            expected
+        );
+        execution.set(ExecOutcome::Passed).unwrap();
+        directory.set(task.clone()).unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    } else {
+        execute_tool_with_display_cancellable(
+            &mut ToolDisplay::new(Vec::new(), false, 100, 40, false),
+            name,
+            &args,
+            root.to_str().unwrap(),
+            false,
+            40,
+            &caveats,
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                worktree_session: Some(&session),
+                #[cfg(unix)]
+                git_tool: matches!(row.setup, Setup::Adopted | Setup::AdoptedPublish)
+                    .then_some(&fixture_git as &dyn crate::agentic::git_tool::GitTool),
+                execution: Some(&execution),
+                command_directory: Some(&directory),
+                governed_pr: Some(&receipt),
+                permission_gate: Some(&mut gate),
+                exec_floor: (row.setup == Setup::Restricted).then_some(&caveats.exec),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    };
     #[cfg(windows)]
     if let Some(cwd) = directory.get() {
         assert!(
@@ -392,11 +494,28 @@ async fn check(row: Row) {
             );
         }
     }
-    if row.setup == Setup::Publish {
+    if matches!(row.setup, Setup::Publish | Setup::AdoptedPublish) {
         let expected =
             crate::agentic::claim_check::git_head(task.to_str().unwrap(), &Scope::All).unwrap();
-        let remote = temp.path().join("remote.git/refs/heads/task");
+        let remote = temp_root.as_path().join("remote.git/refs/heads/task");
         assert_eq!(std::fs::read_to_string(remote).unwrap().trim(), expected);
+    }
+    if row.command == "git commit -m contract" {
+        assert_ne!(
+            std::fs::read(root.join(".git/refs/heads/task")).unwrap(),
+            std::fs::read(root.join(".git/refs/heads/main")).unwrap(),
+            "confined commit must advance the task branch"
+        );
+    }
+    if row.command == "git branch followup" {
+        assert!(
+            !root.join(".git/refs/heads/followup").exists(),
+            "raw branch creation must be refused"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".git/refs/heads/task")).unwrap(),
+            std::fs::read(root.join(".git/refs/heads/main")).unwrap()
+        );
     }
     if row.command == "which gh" {
         // Both plain and confined discovery must name this fixture, not host gh.
@@ -441,6 +560,36 @@ async fn check(row: Row) {
     assert_eq!(refused, row.refused, "{}: {out}", row.command);
 }
 
+/// Unit-dispatch setup. The native binary grounds this in production Brush.
+#[cfg(unix)]
+async fn confined_setup(command: &str, root: &Path, caveats: &Caveats, session: &WorktreeSession) {
+    let execution = OnceLock::new();
+    let text = worktree::execute(
+        &mut ToolDisplay::new(Vec::new(), false, 100, 40, false),
+        "run_command",
+        &serde_json::json!({"command":command}),
+        root.to_str().unwrap(),
+        false,
+        40,
+        caveats,
+        &mut crate::agentic::NoMcp,
+        ToolCollaborators {
+            worktree_session: Some(session),
+            git_tool: Some(&crate::agentic::tools::tests::git_shell_grant::FixtureGitTool),
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+    )
+    .await;
+    assert_eq!(
+        execution.get(),
+        Some(&ExecOutcome::Passed),
+        "{command}: {text}"
+    );
+}
+
 macro_rules! rows {
     ($( $(#[$attr:meta])* $id:ident, $mode:ident, $setup:ident, $command:literal, $outcome:expr, $root:ident, $bound:literal, $refused:literal, $contains:literal, $gate:expr, $claim:literal; )*) => {$(
         $(#[$attr])*
@@ -454,18 +603,41 @@ use ExecOutcome::{Denied, Failed, Passed, Unavailable};
 #[rustfmt::skip]
 rows! {
 // name, mode, setup, command, outcome, cwd, bound, refusal, text, gate, claim
+// Actual confined creation precedes the operation. Raw common refs stay broker-only.
+#[cfg(unix)]
+// Native macOS counterpart runs with production Brush in the harness=false binary.
+#[cfg(not(target_os = "macos"))]
+confined_task_commit, Confined, Adopted, "git commit -m contract", Some(Passed), Task, true, false, "", None, "";
+#[cfg(unix)]
+// Native macOS counterpart runs with production Brush in the harness=false binary.
+#[cfg(not(target_os = "macos"))]
+confined_task_ref_update, Confined, Adopted, "git branch followup", Some(Failed), Task, true, false, "", None, "";
+// Owned local remote via the kernel-confined executor; the governed broker's
+// local-URL refusal is a separate control in the macOS job.
+#[cfg(unix)]
+// Native macOS counterpart runs with production Brush in the harness=false binary.
+#[cfg(not(target_os = "macos"))]
+confined_local_push, Confined, AdoptedPublish, "confined-executor git push", Some(Passed), Task, true, false, "", None, "";
+// Row (c), PR #2814: the macOS job selects plan_mode::tests, including
+// the regression proving blank plan approval -> Approved.
 // Worktree creation exercises automatic binding, not a pre-seeded session (#2791).
 standalone, Plain, Fresh, "git worktree add -b task ../task", Some(Passed), Original, true, false, "", None, "";
 compound, Plain, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Passed), Original, true, false, "", None, "";
 missing_b, Plain, Fresh, "git worktree add ../task absent", Some(Failed), Original, false, false, "-b", None, "";
 #[cfg(unix)]
+// Native macOS counterpart runs with production Brush in the harness=false binary.
+#[cfg(not(target_os = "macos"))]
 confined_creation, Confined, Fresh, "git worktree add -b task ../task", Some(Passed), Original, true, false, "", None, "";
 default_cwd, Plain, Bound, "git branch --show-current", Some(Passed), Task, true, false, "task", None, "";
 relative_read, Plain, Bound, "read_file marker", None, Neither, true, false, "task marker", None, "";
 confined_read, Confined, Bound, "read_file marker", None, Neither, true, false, "task marker", None, "";
 #[cfg(any(unix, feature = "windows-appcontainer"))]
+// Native macOS counterpart runs with production Brush in the harness=false binary.
+#[cfg(not(target_os = "macos"))]
 which_git, Confined, Fresh, "which git", Some(Passed), Original, false, false, "git", None, "";
 #[cfg(any(unix, feature = "windows-appcontainer"))]
+// Native macOS counterpart runs with production Brush in the harness=false binary.
+#[cfg(not(target_os = "macos"))]
 which_gh, Confined, Fresh, "which gh", Some(Passed), Original, false, false, "gh", None, "";
 plain_which_git, Plain, Fresh, "which git", Some(Passed), Original, false, false, "git", None, "";
 plain_which_gh, Plain, Fresh, "which gh", Some(Passed), Original, false, false, "gh", None, "";
@@ -492,23 +664,29 @@ confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tai
 // #2810/#2812 follow-up: the observed compound shape must adopt, not fall
 // back to creating a branch in the original checkout. Fixture operands replace
 // the live branch/path; the argv and shell structure are otherwise exact.
-#[cfg(unix)]
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
 readonly_git_r5, Confined, Fresh, "git worktree add -b task ../task . 2>&1 | tail -5 && git branch --show-current", Some(Passed), Original, true, false, "main", None, "";
 #[cfg(unix)]
 readonly_git_status, Confined, Fresh, "git worktree add -b task ../task HEAD && git status -s", Some(Denied), Neither, false, true, "standalone literal", None, "";
-#[cfg(unix)]
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
 readonly_git_revparse, Confined, Fresh, "git worktree add -b task ../task main && git rev-parse --abbrev-ref HEAD", Some(Passed), Original, true, false, "main", None, "";
-#[cfg(unix)]
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
 readonly_git_sha, Confined, Fresh, "git worktree add -b task ../task FIXTURE_COMMIT && git branch --show-current", Some(Passed), Original, true, false, "main", None, "";
 #[cfg(unix)]
 readonly_git_log_compact, Confined, Fresh, "git worktree add -b task ../task HEAD && git log --oneline -5", Some(Denied), Neither, false, true, "standalone literal", None, "";
-#[cfg(unix)]
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
 readonly_git_worktree_list, Confined, Fresh, "git worktree add -b task ../task HEAD && git worktree list", Some(Passed), Original, true, false, "[task]", None, "";
 #[cfg(unix)]
 readonly_git_porcelain, Confined, Fresh, "git worktree add -b task ../task HEAD && git status --porcelain", Some(Denied), Neither, false, true, "standalone literal", None, "";
-#[cfg(unix)]
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
 readonly_git_head, Confined, Fresh, "git worktree add -b task ../task HEAD && git rev-parse HEAD", Some(Passed), Original, true, false, "Adopted task worktree", None, "";
-#[cfg(unix)]
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
 readonly_git_toplevel, Confined, Fresh, "git worktree add -b task ../task HEAD && git rev-parse --show-toplevel", Some(Passed), Original, true, false, "original", None, "";
 #[cfg(unix)]
 readonly_git_commit_refused, Confined, Fresh, "git worktree add -b task ../task && git commit -m bad", Some(Denied), Neither, false, true, "Do not create the branch in the original checkout", None, "";
@@ -521,6 +699,8 @@ readonly_git_redirect_refused, Confined, Fresh, "git worktree add -b task ../tas
 #[cfg(unix)]
 readonly_git_alias_refused, Confined, Fresh, "git worktree add -b task ../task && git st", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
+// Native macOS counterpart runs with production Brush in the harness=false binary.
+#[cfg(not(target_os = "macos"))]
 confined_missing_b, Confined, Fresh, "git worktree add ../task absent", Some(Failed), Original, false, false, "-b", None, "";
 nested_plain, Plain, Fresh, "git worktree add -b task .worktrees/task", Some(Passed), Original, true, false, "", None, "";
 #[cfg(windows)]

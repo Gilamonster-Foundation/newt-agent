@@ -79,12 +79,16 @@ fn worktree_adoption_round2_git_clean_operands_are_not_creation() {
 /// counterexample must preserve an untracked sentinel before any adoption;
 /// the legitimate display wrapper must still create and adopt the worktree.
 #[cfg(unix)]
+// macOS production counterpart lives in the harness=false native contract.
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 #[ignore = "requires native kernel confinement and git"]
 async fn worktree_adoption_round2_git_clean_preserves_sentinel() {
     assert!(crate::confined_exec::kernel_fs_fence_available());
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("main");
+    // Match the canonical destination spelling used by admission on macOS.
+    let temp_root = dunce::canonicalize(temp.path()).unwrap();
+    let root = temp_root.as_path().join("main");
     std::fs::create_dir(&root).unwrap();
     for args in [
         vec!["init", "-q", "-b", "main"],
@@ -97,10 +101,11 @@ async fn worktree_adoption_round2_git_clean_preserves_sentinel() {
             "fixture",
         ],
     ] {
-        let out = crate::agentic::tools::tests::git_shell_grant::hermetic_git(&root, temp.path())
-            .args(args)
-            .output()
-            .unwrap();
+        let out =
+            crate::agentic::tools::tests::git_shell_grant::hermetic_git(&root, temp_root.as_path())
+                .args(args)
+                .output()
+                .unwrap();
         assert!(
             out.status.success(),
             "{}",
@@ -111,7 +116,7 @@ async fn worktree_adoption_round2_git_clean_preserves_sentinel() {
     let session = WorktreeSession::default();
     let mut c = Caveats::top();
     c.net = Scope::none();
-    c.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
+    c.fs_write = Scope::only([temp_root.as_path().to_string_lossy().into_owned()]);
     let (text, outcome) = dispatch(serde_json::json!({"command":"git worktree add ../task -b task; git clean -fd -- victim worktree add"}), &root, &c, &session, None).await;
     assert_eq!(
         std::fs::read_to_string(root.join("victim")).ok().as_deref(),
@@ -120,12 +125,12 @@ async fn worktree_adoption_round2_git_clean_preserves_sentinel() {
     );
     assert_eq!(outcome, Some(crate::ExecOutcome::Denied), "{text}");
     assert!(session.snapshot().is_none());
-    assert!(!temp.path().join("task").exists());
+    assert!(!temp_root.as_path().join("task").exists());
     let (text, outcome) = dispatch(serde_json::json!({"command":"git worktree add ../task -b task 2>&1; echo ready; pwd; git branch --show-current"}), &root, &c, &session, None).await;
     assert_eq!(outcome, Some(crate::ExecOutcome::Passed), "{text}");
     assert_eq!(
         session.snapshot().expect(&text).worktree,
-        temp.path().join("task").canonicalize().unwrap()
+        temp_root.as_path().join("task").canonicalize().unwrap()
     );
 }
 

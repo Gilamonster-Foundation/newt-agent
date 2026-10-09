@@ -110,6 +110,11 @@ fn main() {
         std::process::exit(code);
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if std::env::args().any(|arg| arg == "--confined-contract") {
+        contract::run();
+        return;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if std::env::args().any(|arg| arg == "--regression-2813") {
         regression_2813::run();
         return;
@@ -132,6 +137,10 @@ fn main() {
 #[cfg(target_os = "linux")]
 #[path = "native_git_broker_pipeline/cancellation.rs"]
 mod cancellation;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "native_git_broker_pipeline/contract.rs"]
+mod contract;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "native_git_broker_pipeline/regression_2813.rs"]
