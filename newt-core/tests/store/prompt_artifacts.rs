@@ -413,3 +413,91 @@ fn concurrent_artifact_appends_serialize_one_conversation_chain() {
         .unwrap();
     assert_eq!(reopened.count_prompt_artifacts(conversation_id).unwrap(), 2);
 }
+
+/// Fractional compaction telemetry must survive JSON reload exactly; otherwise
+/// verifying that checkpoint blocks every later artifact, including turn outcomes.
+#[test]
+fn fractional_compaction_metadata_survives_reopen_and_outcome_append() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let conversation_id = "fractional-checkpoint";
+    let prompt_id = store
+        .begin_prompt(
+            conversation_id,
+            "fractional checkpoint",
+            None,
+            NewPrompt::operator("refactor", "refactor"),
+        )
+        .unwrap()
+        .submitted()
+        .receipt()
+        .id();
+    // Non-dyadic decimal spellings from real f32 compaction ratios, promoted
+    // into JSON f64 numbers. Powers of two hid the lossy parser in older tests.
+    let metadata = serde_json::json!({
+        "floor_trend": {
+            "latest": 0.9717830419540405,
+            "previous": 0.7690688371658325,
+            "rising": true
+        }
+    });
+    let checkpoint = store
+        .append_prompt_artifact(
+            conversation_id,
+            prompt_id,
+            NewPromptArtifact::new(
+                ArtifactKind::CompactionCheckpoint,
+                ArtifactRelation::DerivedFrom,
+            )
+            .with_metadata(metadata.clone()),
+        )
+        .unwrap();
+    checkpoint.verify_integrity().unwrap();
+    drop(store);
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let loaded = store
+        .load_prompt_artifact(conversation_id, checkpoint.id())
+        .expect("untampered fractional checkpoint must verify after reload")
+        .unwrap();
+    assert_eq!(loaded.metadata(), &metadata);
+    assert_eq!(loaded.artifact_hash(), checkpoint.artifact_hash());
+    let outcome = store
+        .append_prompt_artifact(
+            conversation_id,
+            prompt_id,
+            NewPromptArtifact::new(ArtifactKind::TurnOutcome, ArtifactRelation::DerivedFrom),
+        )
+        .expect("fractional checkpoint must not poison subsequent artifact appends");
+    assert_eq!(outcome.prev_hash(), checkpoint.artifact_hash());
+    assert_eq!(
+        store
+            .list_prompt_artifacts(conversation_id, 0, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A real metadata mutation still fails closed; do not fix precision loss
+    // by weakening the byte-for-byte encoding or immutable hash checks.
+    raw(root.path())
+        .execute(
+            "UPDATE prompt_artifacts SET metadata = ?1 WHERE id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&serde_json::json!({"floor_trend": {"latest": 0.5}}))
+                    .unwrap(),
+                checkpoint.id().to_string()
+            ],
+        )
+        .unwrap();
+    assert!(store
+        .load_prompt_artifact(conversation_id, checkpoint.id())
+        .is_err());
+    assert!(store
+        .append_prompt_artifact(
+            conversation_id,
+            prompt_id,
+            NewPromptArtifact::new(ArtifactKind::TurnOutcome, ArtifactRelation::DerivedFrom),
+        )
+        .is_err());
+}
