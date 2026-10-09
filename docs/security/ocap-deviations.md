@@ -501,37 +501,33 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   a worker-proposal flow is designed.
 
 ### fs-canonical-containment
-- **Invariant (ideal):** the fs gate canonicalizes the target (resolving symlinks,
-  e.g. via `openat2(RESOLVE_BENEATH)`) and contains it under the workspace root, so no
-  path — symlink, `..`, or otherwise — escapes the fence.
-- **Practical caveat (now):** `tui_permits_path` (`newt-core/src/agentic/tools.rs`)
-  **lexically** normalizes the target and each root (collapsing `.`/`..`) and contains with
-  a component-aware `Path::starts_with`. This closes `..` traversal (`/ws/../etc/passwd` →
-  `/etc/passwd`, denied) and sibling-prefix escapes (`/ws-evil` denied against `/ws`) — both
-  were reproduced on the host before the #502 review. It does NOT resolve symlinks: a symlink
-  *inside* the workspace pointing out would still be read.
-- **Residual:** 🟠 high — a symlink under the workspace that targets an outside path escapes
-  the read/write fence (lexical normalization can't see through it). Planting one needs a
-  write/exec, both separately gated.
+- **Invariant (ideal):** file dispatch opens only objects beneath the granted authority,
+  including during root acquisition; a pathname check alone is not a filesystem boundary.
+- **Practical caveat (now):** `tui_permits_path` checks lexical containment. On macOS,
+  a fixed table authenticates root-owned `/tmp`, `/var`, `/etc` links to their expected
+  `/private` targets once at process startup (or first use by library embedders). An
+  unexpected link disables that mapping. Grant recording and request matching only
+  substitute those fixed prefixes; stored roots are never dynamically canonicalized.
+  Linux and Windows retain their prior lexical matching and relative-scope behavior.
+- **Residual:** pathname grants and signatures do not pin an inode. Replacing a root
+  with a different real directory is not detected. Linux root acquisition still follows
+  ambient symlinks; Windows retains its existing fallback. Subprocess launchers have
+  separate root-acquisition rules; the file-tool tests below do not prove Brush execution.
 - **Disabled while open:** seeding a shared filesystem across mutually-distrusting voices
-  where one can plant a symlink the other follows; relying on the fence alone (no OS sandbox)
-  for a genuinely-untrusted worker.
-- **Compensating controls:** lexical containment (the #502 fix) blocks the `..`/sibling
-  vectors; the crew/worker run in throwaway git worktrees; `b1`'s OS sandbox (Landlock fs) is
-  the backstop that bounds the symlink residual once present. **The object-bound resolver now
-  exists** — `newt_core::fs_cap::WorkspaceDir` (step-52.1) resolves every path *beneath* an
-  `O_DIRECTORY` root fd with `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, so the symlink /
-  `..` / absolute escape is refused by the kernel at open time. It is proven and available; the
-  residual persists only because the fs tool arms have not yet been *rewired* onto it.
-- **Closure criterion:** the read arms, write arms, and write primitives resolve through
-  `WorkspaceDir` (step-52.2/52.3) rather than `join` + a `&str→bool` predicate, so the escape is
-  structurally unreachable. Note: the register's earlier "make `tui_permits_path` canonicalize,
-  flip its assertion" plan is **superseded** — `tui_permits_path` is a lexical `&str→bool`
-  predicate, and having it canonicalize would re-introduce the TOCTOU (check decoupled from
-  open). The correct closure binds authority to the opened object; the proof is an object-level
-  test (`fs_cap_object_bound.rs`, landed here) plus each arm's own contained-open test, not a
-  predicate flip. `tui_permits_path_symlink_escape_is_the_known_residual` is retired when its
-  arm moves to `WorkspaceDir`, not flipped in place.
+  where one can replace the other's roots; relying on pathname grants alone for a
+  genuinely-untrusted worker.
+- **Compensating controls:** Linux file tools use `WorkspaceDir` with beneath-fd
+  `openat2` resolution after acquiring a root. On macOS, root acquisition and subsequent
+  file operations walk components through held descriptors with `O_NOFOLLOW`, rejecting
+  both mutable root and ancestor symlinks, including swaps after lexical admission.
+  Durable legacy entries gain only the authenticated system-alias equivalence, preserving
+  deny/passkey/ask precedence and read-only approvals. Mutable legacy alias strings cannot
+  authorize their current targets; macOS file dispatch refuses those aliases. Reapprove
+  the intended non-symlink path; signatures alone cannot recover the prior intended object.
+- **Closure criterion:** every platform and caller must acquire authority from an already
+  held root/parent and perform operations beneath that object, with adversarial tests for
+  root replacement and missing components. The macOS alias compatibility and no-follow
+  acquisition close the symlink witnesses for file dispatch, not every caller's residual.
 - **Ratchet guard:** `newt-core/tests/fs_cap_object_bound.rs` (step-52.1, real-fs tier) drives
   real `..`, absolute, in-tree-relative-symlink-escape, and absolute-symlink-escape paths through
   `WorkspaceDir` and asserts denial, with an explicit contrast test proving the object resolver
@@ -563,10 +559,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `WorkspaceDir::rename`), proven by `apply_whole_files_denies_symlink_escape_object_bound`
   (step-52.7). `tui_permits_path` is now documented as a lexical *pre-filter* (renamed
   `tui_permits_path_is_a_lexical_prefilter_not_the_fence`) — the object-bound arms are the fence.
-- **Status:** CLOSED on Linux (step-52.7) — every read arm, write arm, and write primitive resolves
-  through `WorkspaceDir` (`openat2 RESOLVE_BENEATH`), so a symlink / `..` / absolute escape is
-  refused by the kernel at the open, not adjudicated by a normalized pathname; the lexical residual
-  (#502→#522) is structurally unreachable. **macOS (#2294):** `fs_cap` is
+- **Status:** CLOSED for below-held-root resolution on Linux (step-52.7): file arms and
+  write primitives use `WorkspaceDir` (`openat2 RESOLVE_BENEATH`). This classification covers
+  escapes below an already acquired descriptor, NOT ambient acquisition of that descriptor;
+  Linux root replacement remains a residual as described above. macOS now refuses root and
+  ancestor symlink replacement during acquisition as well. **macOS (#2294):** `fs_cap` is
   `#[cfg(any(target_os = "linux", target_os = "macos"))]`; its macOS arm is "a descriptor-relative
   `openat` walk with `O_NOFOLLOW` for every component", and `newt-core`'s read, write, list,
   delete, and directory-traversal arms resolve through it. **Residual (macOS):** two consumers are

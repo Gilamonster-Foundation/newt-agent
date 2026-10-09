@@ -6152,3 +6152,11 @@ pub(crate) fn dispatch_exec_path() -> Option<std::ffi::OsString> {
         .map(std::ffi::OsString::from)
         .or_else(|| std::env::var_os("PATH"))
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "tools_tests/path_aliases.rs"]
+mod path_aliases;
+
+#[cfg(all(test, unix))]
+#[path = "tools_tests/path_alias_attacks.rs"]
+mod path_alias_attacks;

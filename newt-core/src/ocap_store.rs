@@ -148,6 +148,22 @@ pub fn evaluate_request(set: &PolicySet, kind: DenialKind, target: &str) -> Opti
             approve.fs.retain(|entry| entry.write);
         }
     }
+    // Only authenticated OS spellings are equivalent. In particular, never
+    // resolve a signed pathname against the mutable filesystem at match time.
+    #[cfg(target_os = "macos")]
+    if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
+        let target = crate::fs_aliases::rewrite(target);
+        return request_policy
+            .files
+            .iter()
+            .filter(|(_, file)| {
+                file.fs
+                    .iter()
+                    .any(|entry| crate::fs_aliases::rewrite(&entry.path) == target)
+            })
+            .map(|(verdict, _)| *verdict)
+            .min_by_key(|verdict| verdict.precedence());
+    }
     request_policy.evaluate(class_for(kind)?, target)
 }
 

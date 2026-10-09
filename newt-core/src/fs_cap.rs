@@ -77,6 +77,7 @@ impl WorkspaceDir {
     /// `path` is resolved with the caller's ambient authority — it is the
     /// operator-supplied root, not a model-supplied path. Every *subsequent*
     /// access goes through the returned handle and is contained beneath it.
+    #[cfg(target_os = "linux")]
     pub fn open_root(path: &Path) -> io::Result<Self> {
         let root = open(
             path,
@@ -85,6 +86,25 @@ impl WorkspaceDir {
         )
         .map_err(io::Error::from)?;
         Ok(Self { root })
+    }
+
+    /// Authenticate fixed system aliases, then acquire every component with
+    /// O_NOFOLLOW. A mutable root or ancestor symlink never becomes authority,
+    /// including a replacement between the lexical gate and this open.
+    #[cfg(target_os = "macos")]
+    pub fn open_root(path: &Path) -> io::Result<Self> {
+        let path = path.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 authority root")
+        })?;
+        let path = crate::caveats::lexically_normalize(path);
+        let anchor = if path.is_absolute() { "/" } else { "." };
+        let root = open(
+            anchor,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        Self { root }.open_dir(path.strip_prefix("/").unwrap_or(&path))
     }
 
     /// Build a capability over an **already-held** directory descriptor —
