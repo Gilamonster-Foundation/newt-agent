@@ -5150,7 +5150,7 @@ async fn execute_authorized_tool(
                         Ok(moved) => moved,
                         Err(error) => return format!("error: move_from: {error}"),
                     };
-                    let mut artifacts = String::new();
+                    let mut artifacts = super::publish_early::bounded_move_hint(moved.child.lines().count()).to_owned();
                     for (label, before, after) in [
                         (moved.source.as_str(), super::artifact_hooks::ArtifactFileState::from_bytes(moved.before.as_bytes()), moved.parent.as_str()),
                         (path, super::artifact_hooks::ArtifactFileState::absent(), moved.child.as_str()),
@@ -5367,7 +5367,7 @@ async fn execute_authorized_tool(
                         let check = build_check_cmd
                             .map(|cmd| run_build_check(cmd, build_workspace, &caveats.net))
                             .unwrap_or_default();
-                        receipt.present_success(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
+                        receipt.present_success(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}{}", super::publish_early::bounded_move_hint(line_count)), presentation)
                     }
                     Err(tool_output) => receipt.present(file_capture::failure(tool_output.render(workspace, &caveats.fs_read), ""), "", presentation),
                 }
@@ -5705,7 +5705,7 @@ async fn execute_authorized_tool(
                     let escape_warning = literal_newline_escape_warning(old_string, new_string)
                         .map(|w| format!("\n{w}"))
                         .unwrap_or_default();
-                    receipt.present_success(format!("edited {path} ({delta_str} lines, now {new_lines} total){escape_warning}"), &format!("{artifact}{check}"), presentation)
+                    receipt.present_success(format!("edited {path} ({delta_str} lines, now {new_lines} total){escape_warning}"), &format!("{artifact}{check}{}", super::publish_early::bounded_move_hint(old_string.lines().count().max(new_string.lines().count()))), presentation)
                 }
                 Err(tool_output) => receipt.present(file_capture::failure(tool_output.render(workspace, &caveats.fs_read), ""), "", presentation),
             }
