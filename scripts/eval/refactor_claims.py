@@ -11,27 +11,10 @@ FILE = r"[\w./-]+\.rs"
 
 def clean_terminal(raw: str) -> str:
     """Remove terminal controls; don't treat prompt redraws as operator actions."""
+    # Absolute cursor positioning can begin a new renderer row without a LF.
+    # Preserve that boundary before removing controls, or spinner + reply merge.
+    raw = re.sub(r"\x1b\[[0-9;]*[Hf]", "\n", raw)
     return ANSI.sub("", raw).replace("\r", "\n")
-
-
-def final_summary(raw: str) -> str:
-    """Recognize the recorded report/final-answer starts, fail closed otherwise."""
-    text = clean_terminal(raw)
-    starts = list(re.finditer(r"(?m)^(?:#{1,3} )?Summary\s*$", text))
-    if not starts:
-        starts = list(
-            re.finditer(
-                r"(?m)^(?:The refactor is (?:finished|complete)|• Refactored the longest|Deliverable:)",
-                text,
-            )
-        )
-    if not starts:
-        raise ValueError("no recognizable final summary in transcript")
-    text = text[starts[-1].start() :]
-    # Harness annotations and subsequent tools/prompts are not assistant claims.
-    return re.split(r"(?m)^(?:⚠ claim check|▒ |⚙ |\[session |\[Find the )", text)[
-        0
-    ].strip()
 
 
 def operator_inputs(raw: str, submitted: str | None = None) -> dict:
@@ -57,9 +40,8 @@ def operator_inputs(raw: str, submitted: str | None = None) -> dict:
     }
 
 
-def check_claims(raw: str, facts: dict, test_log: str = "") -> list[dict]:
-    """Return each supported factual claim with verified/contradicted/unverifiable."""
-    summary = final_summary(raw)
+def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
+    """Check explicit assistant text; caller must establish its structured role."""
     rows: list[dict] = []
 
     def add(kind: str, claim: str, actual: object, matches: bool | None) -> None:
@@ -116,7 +98,7 @@ def check_claims(raw: str, facts: dict, test_log: str = "") -> list[dict]:
             re.I,
         ):
             continue
-        if re.search(r"\bcommitted\b|│\s*Commit\s*│", line, re.I):
+        if re.search(r"\bcommitted\b|\bcommit\s+pushed\b|│\s*Commit\s*│", line, re.I):
             shas = re.findall(r"\b[0-9a-f]{7,40}\b", line)
             commits = facts.get("commits")
             ok = (
@@ -138,6 +120,10 @@ def check_claims(raw: str, facts: dict, test_log: str = "") -> list[dict]:
             prs = facts.get("prs")
             pr = next((p for p in prs or [] if p["number"] == int(number)), None)
             ok = None if prs is None else pr is not None
+            if pr is not None and re.search(
+                r"\bPR\s*#?" + number + r"\s+(?:is\s+)?open\b", line, re.I
+            ):
+                ok = pr.get("state") == "OPEN"
             urls = re.findall(r"github\.com/([^/]+/[^/]+)/pull/" + number + r"\b", line)
             if facts.get("github") and any(repo != facts["github"] for repo in urls):
                 ok = False

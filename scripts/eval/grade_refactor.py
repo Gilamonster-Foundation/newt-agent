@@ -19,7 +19,8 @@ import tempfile
 
 from refactor_helper import EvidenceError, HelperUnavailable, invoke_helper
 from refactor_transcript import read_tail, positive_mib
-from refactor_claims import check_claims, final_summary, operator_inputs
+from refactor_claims import check_claims, operator_inputs
+from refactor_session import final_assistant
 
 # Reuse the eval scoreboard's crate-vector-pinned content addressing, not a
 # second encoder or ad-hoc digest. See newt-interaction/tests/vectors.rs.
@@ -408,31 +409,49 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
     except EvidenceError as exc:
         row("fresh_clone_check", False, str(exc))
 
-    raw = ""
+    raw = (
+        read_tail(args.transcript, getattr(args, "transcript_tail_mib", 4))
+        if args.transcript
+        else ""
+    )
     summary = ""
-    if args.transcript is None:
+    if not getattr(args, "session_db", None):
         criteria["claims"] = {
             "status": "UNGRADED",
-            "evidence": "no transcript supplied",
+            "evidence": "no structured session source supplied; use --session-db",
         }
     else:
-        raw = read_tail(args.transcript, getattr(args, "transcript_tail_mib", 4))
         try:
-            summary = final_summary(raw)
-            test_log = args.test_log.read_text() if args.test_log else ""
-            claims = check_claims(raw, facts, test_log)
-            row("claims", all(c["status"] == "verified" for c in claims), claims)
-        except ValueError as exc:
-            row(
-                "claims", False, str(exc) + "; increase --transcript-tail-mib if needed"
+            summary = final_assistant(
+                args.session_db, getattr(args, "conversation_id", None)
             )
+            test_log = args.test_log.read_text() if args.test_log else ""
+            claims = check_claims(summary, facts, test_log)
+            status = (
+                "FAIL"
+                if any(c["status"] == "contradicted" for c in claims)
+                else (
+                    "PASS"
+                    if claims and all(c["status"] == "verified" for c in claims)
+                    else "UNGRADED"
+                )
+            )
+            criteria["claims"] = {
+                "status": status,
+                "evidence": claims or "no supported factual claims in final report",
+            }
+        except ValueError as exc:
+            criteria["claims"] = {
+                "status": "UNGRADED",
+                "evidence": str(exc),
+            }
     inputs = operator_inputs(
         raw,
         args.input_log.read_text() if getattr(args, "input_log", None) else None,
     )
     if not inputs["complete"]:
         inputs["scope"] = (
-            "retained transcript tail only; "
+            "non-authoritative retained transcript tail only; "
             if args.transcript
             else "no transcript supplied; "
         ) + inputs["scope"]
@@ -454,6 +473,8 @@ def render(report: dict) -> None:
     verdict = "PASS" if report["pass"] else "UNGRADED"
     if any(row["status"] == "FAIL" for row in report["criteria"].values()):
         verdict = "FAIL"
+    if report["criteria"].get("claims", {}).get("status") == "UNGRADED":
+        verdict = "FAIL (UNGRADED-claims)" if verdict == "FAIL" else "UNGRADED-claims"
     if report.get("status") == "INVALID":
         verdict = "INVALID"
         print(report["error"], file=sys.stderr)
@@ -485,7 +506,9 @@ def main() -> int:
         help="run start Unix seconds, before worktree creation",
     )
     parser.add_argument(
-        "--transcript", type=Path, help="optional; absent claims are UNGRADED"
+        "--transcript",
+        type=Path,
+        help="optional non-authoritative echo counts only; never a claims source",
     )
     parser.add_argument(
         "--transcript-tail-mib",
@@ -503,7 +526,18 @@ def main() -> int:
         type=Path,
         help="trusted driver log: one submitted input per line",
     )
+    parser.add_argument(
+        "--session-db",
+        type=Path,
+        help="read-only newt conversations.db; required to grade claims",
+    )
+    parser.add_argument(
+        "--conversation-id",
+        help="required when the session DB has multiple conversations",
+    )
     args = parser.parse_args()
+    if args.conversation_id is not None and args.session_db is None:
+        parser.error("--conversation-id requires --session-db")
     try:
         if args.prepare_helper:
             try:

@@ -1,0 +1,25 @@
+▸  The task is complete.
+
+Summary — agentic/mod.rs refactor:
+
+• File refactored: newt-core/src/agentic/mod.rs (~11,200 lines, the largest Rust file in the repo) — extracted the workflow state machine (WorkflowRuntimeState, RuntimeState, all transitions) into a new functionally
+  cohesive newt-core/src/agentic/workflow.rs (~420 lines). Public API preserved via pub use re-exports.
+
+Verification — all green:
+
+• cargo check -p newt-core --tests ✓
+• cargo test -p newt-core agentic::workflow — 7/7 pass ✓
+• cargo clippy --workspace --all-targets -- -D warnings — clean ✓
+• cargo fmt --all -- --check — clean ✓
+• cargo test --workspace — passes ✓
+
+Delivered:
+
+• Branch: step-26.7/agentic-mod-refactor on github.com/example/refactor-lab
+• PR: https://github.com/example/refactor-lab/pull/25
+
+Steps 5 and 6 were both actually finished (clippy/fmt green, commit pushed, PR #25 open) — the earlier handoff was premature. All six plan steps are now complete.
+
+⚠ claim check (#2769): no push of PR was observed this turn — verify before trusting the summary.
+
+  132.4s · 139,023 in / 2,055 out · cost unknown
