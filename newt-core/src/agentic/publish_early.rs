@@ -1,6 +1,6 @@
 //! #2831: advisory publication steering, never authority or completion evidence.
 use crate::ExecOutcome;
-use content_addressable::RawContentId;
+use content_addressable::{ContentId, RawContentId};
 use std::collections::BTreeMap;
 
 pub const GUIDANCE: &str = "For a refactor that asks for a worktree and PR, plan one cohesive extraction per publish cycle: extract and wire it in, cargo check, commit, push, open the PR. Make further extractions follow-up commits to the same PR.";
@@ -13,7 +13,7 @@ pub(crate) struct State {
 }
 #[derive(Debug)]
 struct Checked {
-    tree: RawContentId,
+    tree: ContentId,
     reflog: RawContentId,
     log_len: usize,
 }

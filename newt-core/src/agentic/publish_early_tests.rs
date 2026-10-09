@@ -125,8 +125,15 @@ async fn publish_early_large_write_advice_never_refuses() {
 }
 
 /// #2831 round 2: real Git grounds content freshness in the shared observer.
-#[test]
-fn publish_early_checked_content_controls() {
+#[tokio::test]
+async fn publish_early_checked_content_controls() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let empty = tempfile::NamedTempFile::new().unwrap();
+    let _global = EnvVar::set("GIT_CONFIG_GLOBAL", empty.path().to_str().unwrap());
+    let _system = EnvVar::set("GIT_CONFIG_NOSYSTEM", "1");
+    let _count = EnvVar::set("GIT_CONFIG_COUNT", "0");
+    let _parameters = EnvVar::set("GIT_CONFIG_PARAMETERS", "");
     for scenario in [
         "staged",
         "original-checkout",

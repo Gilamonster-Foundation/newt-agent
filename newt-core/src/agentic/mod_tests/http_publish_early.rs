@@ -12,6 +12,13 @@ async fn publish_early_reaches_provider_after_check_and_commit() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("templates")).unwrap();
     std::fs::write(temp.path().join("empty-config"), "").unwrap();
+    let _global = EnvVar::set(
+        "GIT_CONFIG_GLOBAL",
+        temp.path().join("empty-config").to_str().unwrap(),
+    );
+    let _system = EnvVar::set("GIT_CONFIG_NOSYSTEM", "1");
+    let _count = EnvVar::set("GIT_CONFIG_COUNT", "0");
+    let _parameters = EnvVar::set("GIT_CONFIG_PARAMETERS", "");
     let original = temp.path().join("original");
     let task = temp.path().join("task");
     std::fs::create_dir(&original).unwrap();

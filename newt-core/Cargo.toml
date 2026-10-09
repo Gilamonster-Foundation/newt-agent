@@ -52,6 +52,8 @@ newtui.workspace = true
 # re-encodings (base64), not just raw — filter by value, not by shape.
 base64.workspace = true
 sha2.workspace = true
+# Pure index/object readers and Git blob hashing for optional publication evidence.
+grit-lib.workspace = true
 # Encrypted token store (`newt_core::secrets`) — see the workspace-level
 # justification comment on this dependency.
 age.workspace = true
