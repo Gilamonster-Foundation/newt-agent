@@ -1,0 +1,12 @@
+The refactor is finished and committed in the worktree refactor-lab on branch step-01-refactor-agentic-mod:
+
+• mod.rs: ~11,726 lines → 856 lines (92% reduction)
+• 8 new submodules (agent_loop, tool_recovery, nudge, hallucination, compress, metrics, util, budget), each under ~1,000 lines, wired back via mod + pub use
+
+
+
+• Public API surface unchanged — external callers unaffected
+• Gates green in-worktree: cargo check, cargo fmt --check, cargo clippy -D warnings, full test suite (1101 tests)
+
+Unverified step: the network push + PR (#1407) — gh execute and outbound DNS are both denied in this sandbox, so I can't confirm live from here. The commit is ready regardless. If you want me to finish that last leg,
+relaunch in a networked environment (or grant exec for gh and net access), and I'll push and open/verify the PR against origin.

@@ -1,0 +1,16 @@
+[package]
+name = "newt-refactor-evidence"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+readme = "README.md"
+description = "Offline Rust syntax evidence for the refactor-run grader"
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+
+[lints]
+workspace = true
