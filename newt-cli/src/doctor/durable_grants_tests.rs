@@ -68,6 +68,10 @@ fn windows_verbatim_prefix_is_not_signed_name_drift() {
     std::fs::write(&ordinary, "exists").unwrap();
     let canonical = ordinary.canonicalize().unwrap();
     for name in [&ordinary, &canonical] {
-        assert!(stale_target(CapabilityClass::Fs, name.to_str().unwrap()).is_none());
+        let finding = stale_target(CapabilityClass::Fs, name.to_str().unwrap());
+        assert!(
+            finding.is_none(),
+            "named={name:?}, canonical={canonical:?}, finding={finding:?}"
+        );
     }
 }
