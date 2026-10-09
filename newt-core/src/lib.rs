@@ -48,6 +48,8 @@ pub mod worktree_adoption;
 // Object-bound workspace filesystem capability (step-52.1). `openat2` is
 // Linux-only; macOS uses descriptor-relative no-follow opens. Consumers apply the
 // cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod fs_aliases;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fs_cap;
 pub mod git_caveats;
@@ -177,6 +179,8 @@ pub mod pyo3_module;
 /// the top of `main` to become dispatch-capable, so the brush engine's carried
 /// `ls`/`cat` shims re-exec against the newt binary itself.
 pub fn maybe_dispatch() -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    fs_aliases::initialize();
     native_git_broker::maybe_dispatch().or_else(agent_bridle::maybe_dispatch)
 }
 pub use agent_identity::{

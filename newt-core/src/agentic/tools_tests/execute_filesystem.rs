@@ -348,10 +348,22 @@ async fn delete_file_symlink_under_workspace_escaping_is_denied() {
     // same way the production delete_file arm does, rather than pinning the
     // receipt's internal formatting as a second, driftable literal.
     let full = ws.path().join("link/victim.txt");
+    let read_caveats = caveats_rw(ws.path());
+    let before = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
+    let after = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
+    let receipt = crate::agentic::tools::file_capture::receipt("link/victim.txt", &before, &after);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 0, false);
+    let expected = receipt.present(
+        crate::agentic::tools::file_capture::failure(
+            denied_fs_result("fs_write", &full.to_string_lossy()),
+            "",
+        ),
+        "",
+        &mut display,
+    );
     assert_eq!(
-        out,
-        denied_fs_result("fs_write", &full.to_string_lossy()),
-        "the symlink-escape delete must be denied before capture: {out}"
+        out, expected,
+        "the symlink-escape delete must be denied: {out}"
     );
     assert!(
         outside.path().join("victim.txt").exists(),

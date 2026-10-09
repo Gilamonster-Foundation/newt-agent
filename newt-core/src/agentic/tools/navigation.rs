@@ -106,13 +106,11 @@ mod bounded {
         else {
             return Ok(SearchRoot::Directory(directory, relative.to_path_buf()));
         };
-        let grant_relative = contained_relative(grant, workspace)
-            .ok_or_else(|| denied_fs_result("fs_read", &full_str))?;
+        let grant_relative = contained_relative(grant, workspace);
         match directory.open_dir(&grant_relative) {
             Ok(root) => Ok(SearchRoot::Directory(
                 root,
-                contained_relative(&full_str, grant)
-                    .ok_or_else(|| denied_fs_result("fs_read", &full_str))?,
+                contained_relative(&full_str, grant),
             )),
             Err(error) if lexically_normalize(grant) == lexically_normalize(&full_str) => {
                 // An exact-file grant exposes this file, never its parent or a

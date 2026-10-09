@@ -108,31 +108,25 @@ canonicalized workspace write-root re-allow, and the **absence** of any
 > and **fail-closed**, and one named residual stays ACTIVE
 > (`mach-xpc-ambient-deputy`), so no route ever runs hostile code unconfined.
 
-## Filesystem aliases and task worktrees
+## 5. System aliases and file-root acquisition (PR #2828)
 
-Filesystem grants and containment checks use one ancestor resolver, including
-missing leaves. `/tmp`, `/var`, and `/etc` therefore match their `/private/*`
-spellings. Approval records the resolved path; changing an approved symlink
-later does not move that grant. Resolution errors deny access. File operations
-still walk beneath the granted descriptor, preserving below-root components
-rather than resolving a symlink leaf into a different operation target.
+Only authenticated, root-owned system aliases `/tmp`, `/var`, and `/etc` are
+rewritten to their fixed `/private` spellings. Authentication is snapshotted
+before CLI dispatch (first use for library embedders); missing or unexpected
+aliases remain disabled. Neither stored grants nor request paths are probed
+for permission matching. Linux/Windows retain their existing lexical behavior.
 
-On macOS, Seatbelt does not replace the host's `/tmp` with a private namespace.
-A worktree explicitly approved there remains host-visible after each confined
-command and appears in `git worktree list`. The executor's disposable per-run
-`TMPDIR` is separate: it is scratch space, not a persistent task-worktree
-location. Use a directory outside temporary storage for work that must survive
-OS temporary-file cleanup. No extra `/tmp` authority or adoption exception is
-granted.
+`path_alias_attacks` grounds lexical matching and the actual `write_file` open
+seam: missing roots, replaced roots, replaced ancestors, and a swap after
+admission must preserve outside sentinels. macOS root acquisition uses the same
+no-follow descriptor walk as below-root operations. Durable signed strings
+never rebind through mutable aliases; a mutable legacy alias requires reapproval
+of the intended non-symlink path. This does not pin replacement real directories.
 
-Native proof (real Git, Seatbelt, and host filesystem):
-
-```sh
-cargo test -p newt-core --lib mac_tmp_alias_dispatch_and_adoption_persist -- --ignored --nocapture
-```
-
-This exercises both grant/request alias directions through creation/adoption,
-`write_file`, and confined `run_command`, then checks persisted host contents
-and Git registration. Portable `path_alias` tests additionally cover missing
-leaves, dangling links, grant pinning, durable deny precedence, and sibling and
-symlink-escape rejection.
+`mac_tmp_alias_dispatch_and_adoption_persist` exercises both `/tmp` ↔
+`/private/tmp` directions through Git worktree creation, adoption, `write_file`,
+and a confined shell write; the original checkout stays denied and the worktree
+and its files remain host-visible after the child exits. This is native
+**SafeSubset/Seatbelt** evidence, not production Brush proof. Task worktrees use
+host-visible absolute paths; the disposable per-child `TMPDIR` is not their
+storage or authority root. The lexical table also covers `/var` and `/etc`.

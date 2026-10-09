@@ -468,13 +468,13 @@ pub fn routing_disabled() -> bool {
     std::env::var("NEWT_NO_ROUTE").is_ok_and(|v| v == "1")
 }
 
-// The canonicalisation + prefix-containment helpers live in one shared
+// The lexical-normalisation + prefix-containment helpers now live in one shared
 // place — `crate::caveats` — so the interactive tool gate here and the headless
 // `newt-coder` apply path decide containment identically (no drift surface).
-// The Linux/macOS object-bound helpers use that same canonicalizer; the
+// Only the Linux object-bound helpers below normalise paths directly; the
 // prefix gate itself goes through `crate::caveats::permits_path`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::caveats::canonical_fs_path;
+use crate::caveats::lexically_normalize;
 
 /// Returns true if `full_path` is permitted by `scope`, under prefix
 /// (containment) semantics. Thin alias for [`crate::caveats::permits_path`],
@@ -508,7 +508,7 @@ fn justfile_findable_from(dir: &std::path::Path) -> bool {
         .any(|d| d.join("justfile").exists() || d.join("Justfile").exists())
 }
 
-/// The root in `scope` that canonically authorises `full_path`, if any.
+/// The root in `scope` that lexically authorises `full_path`, if any.
 ///
 /// `Some(Some(root))` — permitted, and `root` is the granted file or directory
 /// that anchors the object-bound access. `Some(None)` — permitted
@@ -525,39 +525,29 @@ fn authorizing_root<'a>(
         crate::caveats::Scope::All => Some(None),
         crate::caveats::Scope::Only(set) if set.is_empty() => None,
         crate::caveats::Scope::Only(set) => {
-            let candidate = canonical_fs_path(full_path).ok()?;
+            let candidate = lexically_normalize(full_path);
             set.iter()
-                .find(|root| canonical_fs_path(root).is_ok_and(|root| candidate.starts_with(root)))
+                .find(|root| candidate.starts_with(lexically_normalize(root)))
                 .map(|r| Some(r.as_str()))
         }
     }
 }
 
-/// Map the request's alias prefix into its authorizing root, retaining the
-/// below-root components for [`crate::fs_cap::WorkspaceDir`]'s descriptor walk.
-/// Failure to map after admission (including a changed alias) denies access.
+/// The `..`-free path of `full_path` relative to its authorising `root`. The
+/// gate matched `starts_with` on the normalised forms, so this strip succeeds;
+/// the result is what [`crate::fs_cap::WorkspaceDir`] resolves beneath the root fd.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn contained_relative(full_path: &str, root: &str) -> Option<std::path::PathBuf> {
-    let candidate = std::path::absolute(full_path).ok()?;
-    let nroot = canonical_fs_path(root).ok()?;
-    // Resolve only the alias prefix that enters the grant. Preserve every
-    // component below it for the no-follow/beneath descriptor walk: resolving
-    // the leaf here would make delete_file unlink a symlink's target instead.
-    let ancestors: Vec<_> = candidate.ancestors().collect();
-    for ancestor in ancestors.into_iter().rev() {
-        let Ok(resolved) = canonical_fs_path(ancestor.to_str()?) else {
-            continue;
-        };
-        if let Ok(prefix) = resolved.strip_prefix(&nroot) {
-            let rel = prefix.join(candidate.strip_prefix(ancestor).ok()?);
-            return Some(if rel.as_os_str().is_empty() {
-                std::path::PathBuf::from(".")
-            } else {
-                rel
-            });
-        }
+fn contained_relative(full_path: &str, root: &str) -> std::path::PathBuf {
+    let cand = lexically_normalize(full_path);
+    let nroot = lexically_normalize(root);
+    let rel = cand.strip_prefix(&nroot).unwrap_or(&cand);
+    // An empty relative path means the target *is* the root (e.g. `list_dir "."`);
+    // resolve `.` so `openat2` opens the root dir itself, not an empty path.
+    if rel.as_os_str().is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        rel.to_path_buf()
     }
-    None
 }
 
 /// A `WorkspaceDir` open error that means "the object escaped the fence" (the
@@ -581,10 +571,8 @@ fn object_bound_target<'a>(
     scope: &'a crate::caveats::Scope<String>,
     full_str: &str,
 ) -> Option<Option<(&'a str, std::path::PathBuf)>> {
-    match authorizing_root(scope, full_str)? {
-        None => Some(None),
-        Some(root) => Some(Some((root, contained_relative(full_str, root)?))),
-    }
+    authorizing_root(scope, full_str)
+        .map(|opt| opt.map(|root| (root, contained_relative(full_str, root))))
 }
 
 /// Unconfined directory listing via `std::fs` — the `Scope::All` / non-Linux /
@@ -6163,6 +6151,10 @@ pub(crate) fn dispatch_exec_path() -> Option<std::ffi::OsString> {
         .or_else(|| std::env::var_os("PATH"))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "macos"))]
 #[path = "tools_tests/path_aliases.rs"]
 mod path_aliases;
+
+#[cfg(all(test, unix))]
+#[path = "tools_tests/path_alias_attacks.rs"]
+mod path_alias_attacks;

@@ -112,30 +112,28 @@ pub fn lock_fs_to_workspace(
     read_grants: &[String],
     write_grants: &[String],
 ) {
-    let workspace = canonical_fs_path(workspace)
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-    let mut read_roots: Vec<String> = workspace.iter().cloned().collect();
-    read_roots.extend(
-        read_grants
-            .iter()
-            .filter_map(|p| canonical_fs_path(p).ok())
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
-    let write_roots: Vec<_> = write_grants
-        .iter()
-        .filter_map(|p| canonical_fs_path(p).ok())
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    read_roots.extend(write_roots.iter().cloned());
+    let mut read_roots: Vec<String> = vec![workspace.to_string()];
+    read_roots.extend(read_grants.iter().cloned());
+    read_roots.extend(write_grants.iter().cloned());
     caveats.fs_read = match &caveats.fs_read {
         Scope::All => Scope::only(read_roots),
         Scope::Only(set) => Scope::only(set.iter().cloned().chain(read_roots)),
     };
     caveats.fs_write = match &caveats.fs_write {
-        Scope::All => Scope::only(workspace.into_iter().chain(write_roots.iter().cloned())),
-        Scope::Only(set) => Scope::only(set.iter().cloned().chain(write_roots.iter().cloned())),
+        Scope::All => {
+            Scope::only(std::iter::once(workspace.to_string()).chain(write_grants.iter().cloned()))
+        }
+        Scope::Only(set) => Scope::only(set.iter().cloned().chain(write_grants.iter().cloned())),
     };
+    #[cfg(target_os = "macos")]
+    for scope in [&mut caveats.fs_read, &mut caveats.fs_write] {
+        if let Scope::Only(roots) = scope {
+            *roots = roots
+                .iter()
+                .map(|root| crate::fs_aliases::rewrite(root).into_owned())
+                .collect();
+        }
+    }
 }
 
 /// Apply [`lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
@@ -182,10 +180,19 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
 // Path containment (the shared prefix-semantics enforcement helper)
 // ---------------------------------------------------------------------------
 
-/// Collapse `.` and `..` without consulting the filesystem. This is a
-/// syntactic helper, not a symlink-containment check; filesystem permission
-/// matching uses [`canonical_fs_path`] and object-bound access.
+/// Lexically normalise a path *string* — collapse `.` and `..` components
+/// without touching the filesystem — so containment is decided on the location
+/// the caller actually named, not on a raw byte prefix. Does NOT resolve
+/// symlinks (that needs `canonicalize`, which requires the path to exist and is
+/// the still-open `fs-canonical-containment` deviation): a symlink *inside* a
+/// granted root can still point out — the object-bound `WorkspaceDir` resolver
+/// (`openat2 RESOLVE_BENEATH`) is what closes that. What this DOES close are the
+/// string-only escapes — `..` traversal and sibling-prefix collisions.
 pub(crate) fn lexically_normalize(path: &str) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    let path = crate::fs_aliases::rewrite(path);
+    #[cfg(target_os = "macos")]
+    let path = path.as_ref();
     use std::path::{Component, PathBuf};
     let mut out = PathBuf::new();
     for comp in std::path::Path::new(path).components() {
@@ -203,29 +210,32 @@ pub(crate) fn lexically_normalize(path: &str) -> std::path::PathBuf {
     out
 }
 
-/// Resolve a filesystem permission spelling without creating missing leaves.
-/// Uses the authority-frame resolver so grants and requests agree on aliases.
-/// Resolution errors fail closed; kernel object binding still enforces access.
-pub(crate) fn canonical_fs_path(path: &str) -> anyhow::Result<std::path::PathBuf> {
-    let absolute = std::path::absolute(path)?;
-    let resolved = crate::config::resolve_uncreated_path(&absolute)?;
-    Ok(dunce::simplified(&resolved).to_path_buf())
-}
-
-/// Does `scope` authorise `full_path` under component containment semantics?
-/// Resolve both spellings, including missing leaves, using the same resolver
-/// used when recording grants. Errors deny access. The descriptor-relative
-/// filesystem operation remains the enforcement boundary against races.
+/// Does `scope` authorise `full_path` under **prefix (containment)** semantics?
+///
+/// The [`Caveats`] lattice stores workspace-root strings (not individual file
+/// paths) with exact-set membership; this layer adds containment so that "the
+/// workspace root is permitted" means "any path *under* it is permitted". Both
+/// the candidate and each root are [`lexically_normalize`]d (collapsing `..`)
+/// and then compared by whole path components via [`std::path::Path::starts_with`],
+/// so `..` traversal (`/ws/../etc/passwd`) and sibling-prefix collisions
+/// (`/ws-secret` vs root `/ws`) cannot escape the fence.
+///
+/// Fail-closed: an empty `Only(∅)` set permits nothing. `All` permits
+/// everything. Symlink containment is not decided here — that is the
+/// object-bound resolver's job (`fs-canonical-containment`); creating a symlink
+/// needs `exec`, which is gated on its own axis.
+///
+/// This is the single site both the interactive tool gate (`tui_permits_path`,
+/// which delegates here) and the headless coder apply path consult, so the two
+/// enforcement points can never drift on what "inside the fence" means.
 pub fn permits_path(scope: &Scope<String>, full_path: &str) -> bool {
     match scope {
         Scope::All => true,
         Scope::Only(set) if set.is_empty() => false,
         Scope::Only(set) => {
-            let Ok(candidate) = canonical_fs_path(full_path) else {
-                return false;
-            };
+            let candidate = lexically_normalize(full_path);
             set.iter()
-                .any(|root| canonical_fs_path(root).is_ok_and(|root| candidate.starts_with(root)))
+                .any(|root| candidate.starts_with(lexically_normalize(root)))
         }
     }
 }
@@ -305,31 +315,21 @@ mod tests {
 
     #[test]
     fn lock_fs_to_workspace_locks_open_reads_and_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let root = dunce::simplified(&root);
-        let paths = [root.join("ws"), root.join("ro"), root.join("rw")];
-        let [ws, ro, rw] = paths.each_ref().map(|p| p.to_str().unwrap());
         // Headless default (fs open both ways) → fenced to ws + grants.
         let mut c = Caveats {
             fs_read: Scope::All,
             fs_write: Scope::All,
             ..Caveats::top()
         };
-        lock_fs_to_workspace(&mut c, ws, &[ro.into()], &[rw.into()]);
+        lock_fs_to_workspace(&mut c, "/ws", &["/ext/ro".into()], &["/ext/rw".into()]);
         // reads = ws + read grant + write grant (write implies read)
-        assert_eq!(c.fs_read, Scope::Only(s(&[ws, ro, rw])));
+        assert_eq!(c.fs_read, Scope::Only(s(&["/ws", "/ext/ro", "/ext/rw"])));
         // writes = ws + write grant only (the read grant is NOT writable)
-        assert_eq!(c.fs_write, Scope::Only(s(&[ws, rw])));
+        assert_eq!(c.fs_write, Scope::Only(s(&["/ws", "/ext/rw"])));
     }
 
     #[test]
     fn lock_fs_to_workspace_preserves_a_readonly_write_fence() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let root = dunce::simplified(&root);
-        let paths = [root.join("ws"), root.join("ro"), root.join("rw")];
-        let [ws, _ro, rw] = paths.each_ref().map(|p| p.to_str().unwrap());
         // read-only base: fs_write = none. A --write grant opens ONLY that path;
         // the workspace stays unwritable (the read-only contract holds).
         let mut c = Caveats {
@@ -337,27 +337,26 @@ mod tests {
             fs_write: Scope::none(),
             ..Caveats::top()
         };
-        lock_fs_to_workspace(&mut c, ws, &[], &[rw.into()]);
-        assert_eq!(c.fs_read, Scope::Only(s(&[ws, rw])));
-        assert_eq!(c.fs_write, Scope::Only(s(&[rw])), "ws stays unwritable");
+        lock_fs_to_workspace(&mut c, "/ws", &[], &["/ext/rw".into()]);
+        assert_eq!(c.fs_read, Scope::Only(s(&["/ws", "/ext/rw"])));
+        assert_eq!(
+            c.fs_write,
+            Scope::Only(s(&["/ext/rw"])),
+            "ws stays unwritable"
+        );
     }
 
     #[test]
     fn lock_fs_to_workspace_widens_an_existing_fence() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let root = dunce::simplified(&root);
-        let paths = [root.join("ws"), root.join("ro"), root.join("rw")];
-        let [ws, ro, rw] = paths.each_ref().map(|p| p.to_str().unwrap());
         // workspace_dev-like base: both fenced to the workspace already.
         let mut c = Caveats {
-            fs_read: Scope::only([ws.to_string()]),
-            fs_write: Scope::only([ws.to_string()]),
+            fs_read: Scope::only(["/ws".to_string()]),
+            fs_write: Scope::only(["/ws".to_string()]),
             ..Caveats::top()
         };
-        lock_fs_to_workspace(&mut c, ws, &[ro.into()], &[rw.into()]);
-        assert_eq!(c.fs_read, Scope::Only(s(&[ws, ro, rw])));
-        assert_eq!(c.fs_write, Scope::Only(s(&[ws, rw])));
+        lock_fs_to_workspace(&mut c, "/ws", &["/ext/ro".into()], &["/ext/rw".into()]);
+        assert_eq!(c.fs_read, Scope::Only(s(&["/ws", "/ext/ro", "/ext/rw"])));
+        assert_eq!(c.fs_write, Scope::Only(s(&["/ws", "/ext/rw"])));
     }
 
     #[test]
