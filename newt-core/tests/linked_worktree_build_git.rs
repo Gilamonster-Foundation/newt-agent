@@ -229,3 +229,40 @@ fn replacement_admin_is_not_rebound_at_build_time() {
         &repo.join(".git").to_string_lossy()
     ));
 }
+
+/// Grounds the toolchain HOME builder invariant against a real confined shell:
+/// macOS developer caches and Linux dot directories must never dirty a checkout.
+/// Git reads and Cargo toolchain discovery must survive the private HOME.
+#[test]
+fn confined_toolchain_home_writes_stay_outside_worktrees() {
+    let (_fixture, repo, linked) = fixture();
+    own_gitdir_grants(&linked);
+    for root in [&repo, &linked] {
+        let script = r#"set -eu
+printf home-probe > "$HOME/x"
+mkdir -p "$HOME/Library/Caches/com.apple.DeveloperTools" "$HOME/.cache" "$HOME/.config"
+printf cache > "$HOME/Library/Caches/com.apple.DeveloperTools/probe"
+printf cache > "$HOME/.cache/probe"
+printf config > "$HOME/.config/probe"
+printf '%s\n' "$HOME"
+git rev-parse --is-inside-work-tree
+cargo --version
+"#;
+        let output = confined(root, "sh", &["-c", script]);
+        assert!(output.success, "confined Git/Cargo failed: {output:?}");
+        for entry in ["x", "Library", ".cache", ".config"] {
+            assert!(!root.join(entry).exists(), "HOME write polluted {entry}");
+        }
+        assert!(git(root, &["status", "--porcelain", "--untracked-files=all"]).is_empty());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut lines = stdout.lines();
+        let home = Path::new(lines.next().unwrap());
+        assert!(!home.starts_with(root));
+        assert!(
+            !home.exists(),
+            "private HOME must be cleaned after the child exits"
+        );
+        assert_eq!(lines.next(), Some("true"));
+        assert!(lines.next().unwrap().starts_with("cargo "));
+    }
+}

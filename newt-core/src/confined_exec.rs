@@ -1368,9 +1368,11 @@ fn cargo_home_fetch_write_roots(cargo_home: &str) -> Vec<String> {
     .collect()
 }
 
-/// The environment every toolchain child shares: an env-empty start, scratch
-/// and target inside the workspace, operator tool homes, and a PATH that finds
-/// the real compiler. Network policy is the caller's.
+/// The environment every toolchain child shares: an env-empty start, a private
+/// scratch HOME, a workspace target, operator tool homes, and a PATH that finds
+/// the real compiler. HOME and temporary files share the admitted run lease;
+/// developer-tool caches and Linux dot directories cannot dirty the checkout.
+/// Network policy is the caller's.
 fn toolchain_request(
     origin: ExecOrigin,
     workspace: &Path,
@@ -1379,10 +1381,9 @@ fn toolchain_request(
     args: impl IntoIterator<Item = impl Into<String>>,
     caveats: Caveats,
 ) -> ExecRequest {
-    let root = workspace.to_string_lossy();
     let scratch = build_scratch_dir(workspace);
     let mut request = ExecRequest::new(origin, program, args, cwd, caveats)
-        .env("HOME", root.as_ref())
+        .env("HOME", scratch.to_string_lossy())
         .env("TMPDIR", scratch.to_string_lossy())
         .env("TMP", scratch.to_string_lossy())
         .env("TEMP", scratch.to_string_lossy())
@@ -1849,7 +1850,10 @@ mod tests {
             &Scope::none(),
         );
         let env: std::collections::BTreeMap<_, _> = request.env_grants().iter().cloned().collect();
-        assert_eq!(env.get("HOME").map(String::as_str), Some("/ws"));
+        assert_eq!(
+            env.get("HOME").map(Path::new),
+            Some(request.scratch_dirs[0].as_path())
+        );
         assert_eq!(
             env.get("CARGO_TARGET_DIR").map(std::path::Path::new),
             Some(Path::new("/ws").join("target").as_path())
@@ -1923,6 +1927,38 @@ mod tests {
             &request.caveats.fs_read,
             &scratch.to_string_lossy()
         ));
+    }
+
+    /// Build and fetch must isolate HOME writes without losing toolchain homes.
+    #[test]
+    fn toolchain_requests_keep_home_outside_the_workspace() {
+        let _env = crate::process_env::lock();
+        let workspace = Path::new("/ws");
+        for request in [
+            build_tool_request(workspace, workspace, "cargo", ["check"], &Scope::none()),
+            dependency_fetch_request(workspace, workspace, &Scope::none()),
+        ] {
+            let env: std::collections::BTreeMap<_, _> =
+                request.env_grants().iter().cloned().collect();
+            let home = Path::new(&env["HOME"]);
+            assert!(
+                !home.starts_with(workspace),
+                "HOME must not pollute the repo"
+            );
+            assert_eq!(home, request.scratch_dirs[0]);
+            assert_eq!(env["HOME"], env["TMPDIR"]);
+            for (name, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+                assert_eq!(env.get(name).cloned(), operator_tool_home(name, default));
+            }
+            assert!(crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &home.to_string_lossy()
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &home.parent().unwrap().parent().unwrap().to_string_lossy()
+            ));
+        }
     }
 
     #[test]
