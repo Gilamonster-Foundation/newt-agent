@@ -26,11 +26,68 @@ fn resolve_program(caveats: &Caveats, name: &str) -> Result<PathBuf, ()> {
     }
 }
 
-/// For an already-admitted batch, replace only inspected executable words.
+/// A dot is an operand here, not the shell's source builtin. Bridle refuses
+/// inspecting it as a standalone program; admit only these literal spellings.
+pub(super) fn argument(word: &str) -> Option<String> {
+    if matches!(word, "." | "'.'" | "\".\"") {
+        Some(".".into())
+    } else {
+        super::literal(word)
+    }
+}
+
+/// Fixed read-only forms; no global options, aliases, paths, or output gadgets.
+/// Confined dispatch supplies sandbox_git_env's repository-config hardening;
+/// pin() also disables pagers and optional index writes for these siblings.
+pub(super) fn read_only(args: &[&str]) -> bool {
+    let count = |n: &str| {
+        !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && n.parse::<u32>().is_ok_and(|n| n > 0)
+    };
+    match args {
+        ["status"]
+        | ["status", "--short" | "-s" | "--porcelain"]
+        | ["branch", "--show-current"]
+        | ["worktree", "list"]
+        | ["rev-parse", "HEAD" | "--show-toplevel"]
+        | ["rev-parse", "--abbrev-ref", "HEAD"] => true,
+        ["log", "--oneline", "-n", n] => count(n),
+        ["log", "--oneline", n] => n.strip_prefix('-').is_some_and(count),
+        _ => false,
+    }
+}
+
+/// Only the explicit start operand of the ordinary -b form treats `.` as HEAD.
+/// Never rewrite a cwd, branch name, destination, sibling, or quoted prose.
+fn creation_source(
+    command: &agent_bridle::InspectedCommand,
+    words: &[String],
+) -> Result<String, ()> {
+    let Some(args) = super::worktree_add_args(words) else {
+        return Ok(command.source.clone());
+    };
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    if !matches!(args.as_slice(), ["-b", _, _, "."] | [_, "-b", _, "."]) {
+        return Ok(command.source.clone());
+    }
+    // Prove the argv projection is contiguous before using its exact offsets.
+    let mut rest = command.source.as_str();
+    for word in &command.argv[..command.argv.len() - 1] {
+        rest = rest.trim_start().strip_prefix(word).ok_or(())?;
+    }
+    rest = rest.trim_start();
+    let offset = command.source.len() - rest.len();
+    let dot = command.argv.last().ok_or(())?;
+    let suffix = rest.strip_prefix(dot).ok_or(())?;
+    Ok(format!("{}HEAD{suffix}", &command.source[..offset]))
+}
+
+/// Pin an admitted batch, harden read-only siblings and normalize a dot start.
 /// Restrict gaps to exact shell
 /// connectors/fd duplication: comments, assignments, loops, background jobs,
 /// or ambiguous source projection refuse rather than guessing token offsets.
-/// Keep arguments, cwd selectors, redirects and short-circuit operators intact.
+/// Otherwise keep arguments, cwd selectors, redirects and shell operators intact.
 pub(super) fn pin(source: &str, git: &Path, caveats: &Caveats) -> Result<String, ()> {
     static GAP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\A(?:\s|;|&&|\|\||\||[0-9]*[<>]&[0-9]+)*\z")
@@ -52,8 +109,18 @@ pub(super) fn pin(source: &str, git: &Path, caveats: &Caveats) -> Result<String,
         }
         pinned.push_str(gap);
         if command.program.as_deref() == Some("git") {
+            let words = command
+                .argv
+                .iter()
+                .map(|s| argument(s))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(())?;
+            let source = creation_source(&command, &words)?;
             pinned.push_str(&quoted);
-            pinned.push_str(&command.source[word.len()..]);
+            if read_only(&words.iter().skip(1).map(String::as_str).collect::<Vec<_>>()) {
+                pinned.push_str(" --no-pager --no-optional-locks");
+            }
+            pinned.push_str(&source[word.len()..]);
         } else if command.program.as_deref() == Some("tail") {
             let tail = resolve_program(caveats, "tail")?;
             pinned.push_str(&crate::mcp::shell_quote_arg(tail.to_str().ok_or(())?));
