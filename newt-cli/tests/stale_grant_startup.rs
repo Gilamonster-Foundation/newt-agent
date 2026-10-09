@@ -115,4 +115,8 @@ async fn unsafe_recalled_grant_is_dropped_with_notice() {
     assert!(text.contains("dropped durable grant"), "{text}");
     assert!(text.contains(&format!("{path:?}")), "{text}");
     assert!(text.contains("~/.newt/ocap/approve.toml"), "{text}");
+    assert!(
+        text.contains("run `newt doctor` to inspect and repair"),
+        "{text}"
+    );
 }

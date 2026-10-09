@@ -1111,7 +1111,10 @@ impl PermissionPromptState {
         let reported = rejected.iter().any(|(_, path)| path == target);
         rejected.insert(grant);
         if !reported {
-            eprintln!("warning: dropped durable grant {target:?} for this session: {:?}; inspect ~/.newt/ocap/approve.toml", error.to_string());
+            let reason = error.to_string();
+            let suffix = format!("; {}", newt_core::ocap_store::REPAIR_HINT);
+            let reason = reason.strip_suffix(&suffix).unwrap_or(&reason);
+            eprintln!("warning: dropped durable grant {target:?} for this session: {reason:?}; inspect ~/.newt/ocap/approve.toml; {}", newt_core::ocap_store::REPAIR_HINT);
         }
         true
     }

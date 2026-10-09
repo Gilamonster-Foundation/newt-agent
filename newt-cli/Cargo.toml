@@ -27,6 +27,8 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait.workspace = true
+# Reuse the shell's existing portable PATH/PATHEXT lookup for doctor.
+brush-core = { package = "brush-ocap-core", version = "=0.6.0-rc.1" }
 newt-core.workspace = true
 newt-git.workspace = true
 newt-inference.workspace = true
@@ -43,6 +45,7 @@ agent-frame = { path = "../agent-frame" }
 agent-harness = { workspace = true }
 anyhow.workspace = true
 clap.workspace = true
+dunce.workspace = true
 content-addressable = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true
@@ -128,5 +131,4 @@ newt-core = { workspace = true, features = ["test-util"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(windows)'.dependencies]
-brush-core = { package = "brush-ocap-core", version = "=0.6.0-rc.1" }
 brush-builtins = { package = "brush-ocap-builtins", version = "=0.3.0-rc.1" }

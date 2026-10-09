@@ -104,6 +104,29 @@ fn bound_workspace<'a>(
     Ok((canonical, profile))
 }
 
+/// Read-only doctor projection of the same selected profile, fallback policy,
+/// and protected operator resources used by interactive startup. No key minting.
+pub fn workspace_protection_for_diagnostics(
+    config: &Config,
+    workspace: &Path,
+) -> anyhow::Result<(Caveats, WorkspaceProtection)> {
+    let workspace = workspace.canonicalize()?;
+    let session = WorkspaceSession::load(&workspace)?;
+    let permissions = config
+        .tui
+        .as_ref()
+        .map(|tui| tui.permissions.clone())
+        .unwrap_or_default();
+    let policy = session
+        .policy(&workspace, &permissions)?
+        .unwrap_or_else(|| {
+            crate::policy_for(crate::resolve_tui(config), &workspace.to_string_lossy())
+        });
+    let guard = session.make_protection()?;
+    guard.validate_caveats(&policy)?;
+    Ok((policy, guard))
+}
+
 pub(crate) struct WorkspaceSession {
     pub config_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,

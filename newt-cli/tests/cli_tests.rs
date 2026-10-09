@@ -192,13 +192,31 @@ fn doctor_reports_unattributable_dropin_instead_of_dying() {
 /// `doctor` run prints regardless of input.
 #[test]
 fn doctor_reports_no_finding_for_a_clean_dropin_directory() {
-    common::newt()
+    let mut cmd = common::newt();
+    // The fake home contains protected operator resources; a clean launch
+    // needs its own workspace, just like interactive startup.
+    let workspace = cmd.home().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    cmd.current_dir(workspace)
         .arg("doctor")
         .assert()
         .success()
         .stdout(predicate::str::contains("Backend drop-ins:"))
         .stdout(predicate::str::contains("(none)"))
         .stdout(predicate::str::contains("FINDING").not());
+}
+
+/// Doctor must reproduce startup's protection refusal even without stale entries.
+#[test]
+fn doctor_reports_protected_operator_resources_in_the_launch_root() {
+    common::newt()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "FINDING: workspace protection: filesystem authority overlaps protected workspace resources",
+        ))
+        .stdout(predicate::str::contains(newt_core::ocap_store::REPAIR_HINT));
 }
 
 /// #1951 C0b regression: `--fix` on a piped/headless run (every `assert_cmd`

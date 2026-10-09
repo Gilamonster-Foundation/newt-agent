@@ -22,7 +22,9 @@ mod navigator_cmds;
 mod session_capability;
 mod workspace_launch;
 mod workspace_settings;
-pub use workspace_launch::{resolve_code_workspace, CodeWorkspace};
+pub use workspace_launch::{
+    resolve_code_workspace, workspace_protection_for_diagnostics, CodeWorkspace,
+};
 // `chat.rs` establishes and reapplies the session capability, and
 // lib_tests/caveat_policy_tests.rs covers it beside `policy_for`, which stays
 // here — so this is a named re-export rather than a moved test module.

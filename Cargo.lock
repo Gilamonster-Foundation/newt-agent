@@ -4421,6 +4421,7 @@ dependencies = [
  "brush-ocap-core",
  "clap",
  "content-addressable",
+ "dunce",
  "libc",
  "newt-acp-worker",
  "newt-core",
