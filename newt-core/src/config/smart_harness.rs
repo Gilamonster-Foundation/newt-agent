@@ -113,6 +113,30 @@ impl HarnessLaunch<'_> {
 }
 
 impl SmartHarnessConfig {
+    /// Admit an optional session feature before any auxiliary or frame is opened.
+    /// Isolation failure disables this feature, never the host's primary session.
+    /// Keep `directory` strict for all later dispatch and authority checks.
+    pub fn admit_startup(
+        self,
+        launch: &HarnessLaunch<'_>,
+        notice: impl FnOnce(&str),
+    ) -> Option<Self> {
+        let admission = crate::agentic::smart_harness::validate_isolation_runtime()
+            .and_then(|()| self.directory(launch));
+        match admission {
+            Ok(_) => Some(self),
+            Err(error) => {
+                notice(&format!(
+                    "smart harness disabled for this session: {error:#}. Workspace: {}. \
+                     Move private frame storage outside model grants, or remove the offending \
+                     filesystem grant or PATH entry, then restart. No frame was opened or resumed.",
+                    launch.workspace.display()
+                ));
+                None
+            }
+        }
+    }
+
     /// Resolve the manifest before creating or restoring any session capability.
     pub fn session_config(
         &self,
@@ -380,8 +404,13 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
                 .map(PathBuf::from),
         );
         if commands.iter().any(|name| !path_bearing(name)) {
-            // ponytail: exclude whole PATH directories; narrow to executable
-            // files when bridle exposes its currently private resolver.
+            // Conservative private-store exclusion, not a claim that the
+            // executor grants entire PATH directories. Linux resolves individual
+            // executable files again at spawn; a writable PATH entry can acquire
+            // a new file or symlink after startup. Seatbelt uses fixed system
+            // search dirs. Do not simply omit mutable entries here: no shared
+            // redundant directory rule exists to remove from either executor.
+            // Startup degrades to feature-off when this exclusion is unstable.
             if let Some(path) = std::env::var_os("PATH") {
                 roots.extend(std::env::split_paths(&path).filter(|p| !p.as_os_str().is_empty()));
             }
@@ -400,14 +429,17 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
             !root
                 .components()
                 .any(|part| part == std::path::Component::ParentDir),
-            "smart-harness filesystem grants must not contain parent traversal"
+            "smart-harness filesystem grant {} must not contain parent traversal",
+            root.display()
         );
         let root = std::path::absolute(root)?;
         let resolved = resolve_uncreated_path(&root)?;
         let named = normalize_path(&root)?;
         anyhow::ensure!(
             !overlaps(&canonical, &resolved) && !overlaps(&lexical, &named),
-            "smart-harness frame storage overlaps model filesystem authority"
+            "smart-harness frame storage overlaps model filesystem authority (frame {}, grant {})",
+            dir.display(),
+            root.display()
         );
         validate_stable_anchor(&root, &writable, "smart-harness")?;
     }
@@ -432,7 +464,9 @@ pub(crate) fn validate_stable_anchor(
                     !writable.iter().any(|(write_name, write_target)| {
                         named.starts_with(write_name) || resolved.starts_with(write_target)
                     }),
-                    "{context} filesystem grant anchor has a model-writable ancestor"
+                    "{context} filesystem grant anchor {} has a model-writable ancestor {}",
+                    path.display(),
+                    parent.display()
                 );
             }
             match std::fs::symlink_metadata(ancestor) {
@@ -975,3 +1009,7 @@ fn selected_developer_runtime_cannot_contain_a_private_frame() {
         .is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "smart_harness_startup_tests.rs"]
+mod startup_tests;

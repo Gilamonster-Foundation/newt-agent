@@ -808,6 +808,7 @@ fn bridle_registry(
     engine: crate::ShellEngine,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     wall: std::time::Duration,
+    held_read_roots: Vec<agent_bridle::HeldReadRoot>,
     execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
 ) -> agent_bridle::Registry {
@@ -818,7 +819,8 @@ fn bridle_registry(
         crate::ShellEngine::SafeSubset => {
             // F20: the wall rides on the limits — see `shell_limits`.
             let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
-                .with_sandbox_policy(b1_run_command_sandbox_policy());
+                .with_sandbox_policy(b1_run_command_sandbox_policy())
+                .with_held_read_roots(held_read_roots.clone());
             if let Some(lease) = execution_lease {
                 tool = tool.with_execution_lease(lease);
             }
@@ -830,7 +832,8 @@ fn bridle_registry(
         crate::ShellEngine::Host => {
             let mut tool = agent_bridle::HostShellTool::new()
                 .with_timeout(wall)
-                .sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
+                .sandbox_policy(Arc::new(b1_run_command_sandbox_policy()))
+                .with_held_read_roots(held_read_roots.clone());
             if let Some(lease) = execution_lease {
                 tool = tool.with_execution_lease(lease);
             }
@@ -848,7 +851,8 @@ fn bridle_registry(
             #[cfg(test)]
             let shell = {
                 let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
-                    .with_sandbox_policy(b1_run_command_sandbox_policy());
+                    .with_sandbox_policy(b1_run_command_sandbox_policy())
+                    .with_held_read_roots(held_read_roots.clone());
                 if let Some(lease) = execution_lease {
                     tool = tool.with_execution_lease(lease);
                 }
@@ -866,7 +870,8 @@ fn bridle_registry(
                     .with_max_output_bytes(shell_limits(wall).max_output_bytes)
                     .expect("shared shell output limit fits Brush protocol bounds")
                     .with_timeout(wall)
-                    .with_sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
+                    .with_sandbox_policy(Arc::new(b1_run_command_sandbox_policy()))
+                    .with_held_read_roots(held_read_roots.clone());
                 if let Some(lease) = execution_lease {
                     tool = tool.with_execution_lease(lease);
                 }
@@ -967,18 +972,29 @@ pub(super) async fn dispatch_bridled_shell(
     caveats: &crate::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
-    dispatch_bridled_shell_with_floor(args, caveats, sink, None, None, None, Default::default())
-        .await
+    dispatch_bridled_shell_with_floor(
+        args,
+        caveats,
+        sink,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Default::default(),
+    )
+    .await
 }
 
 /// A prepared build keeps the native build executor's strength floor while
 /// the same shell engine evaluates the original source and pipelines once.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch_bridled_build_shell(
     args: serde_json::Value,
     caveats: &crate::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     execution_lease: std::sync::Arc<dyn Send + Sync>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    held_read_roots: Vec<agent_bridle::HeldReadRoot>,
     command_budget: crate::RunCommandBudget,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     dispatch_bridled_shell_with_floor(
@@ -988,11 +1004,13 @@ pub(super) async fn dispatch_bridled_build_shell(
         Some(agent_bridle::AxisEnforcement::Kernel),
         Some(execution_lease),
         command_broker,
+        held_read_roots,
         command_budget,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_bridled_shell_with_floor(
     mut args: serde_json::Value,
     caveats: &crate::caveats::Caveats,
@@ -1000,6 +1018,7 @@ async fn dispatch_bridled_shell_with_floor(
     strength_floor: Option<agent_bridle::AxisEnforcement>,
     execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    held_read_roots: Vec<agent_bridle::HeldReadRoot>,
     command_budget: crate::RunCommandBudget,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     let mut live = LiveOutputSession::start(sink);
@@ -1053,6 +1072,7 @@ async fn dispatch_bridled_shell_with_floor(
         engine,
         live.as_ref().map(LiveOutputSession::relay),
         wall,
+        held_read_roots,
         execution_lease.clone(),
         command_broker,
     );
@@ -1447,6 +1467,7 @@ pub(super) async fn exec_confined_command_with_broker(
         None,
         execution_lease.clone(),
         command_broker.clone(),
+        Vec::new(),
         command_budget,
     )
     .await
@@ -1599,6 +1620,7 @@ pub(super) async fn exec_confined_command_with_broker(
                                 None,
                                 execution_lease.clone(),
                                 command_broker,
+                                Vec::new(),
                                 command_budget,
                             )
                             .await

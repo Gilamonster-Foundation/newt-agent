@@ -114,6 +114,10 @@ fn main() {
 mod cleanup_authority;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "support/linked_build_shell.rs"]
+mod linked_build_shell;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "support/native_git_diff.rs"]
 mod native_git_diff;
 
@@ -194,6 +198,9 @@ mod native {
         isolate(&root);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
+            if selected("linked_worktree_build_reads") {
+                super::linked_build_shell::run().await;
+            }
             if selected("saved_workspace_profile_confines_native_commands") {
                 super::workspace_policy::run(&root).await;
             }

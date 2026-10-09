@@ -113,6 +113,7 @@ fn run_confined_build(worktree: &Path, base: &Path, cmd: &str) -> Result<(bool, 
     // a hostile repo's `build.rs`/test cannot exfiltrate. Pure hardening — the
     // crew build already ran with no network (deps are pre-fetched under the
     // shared CARGO_TARGET_DIR / cargo cache), so nothing legitimate regresses.
+    .with_build_git_reads(worktree)
     .net_grant(NetGrant::DenyAll)
     .env("CARGO_TARGET_DIR", &target_str)
     .env("TMPDIR", worktree.to_string_lossy());

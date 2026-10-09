@@ -38,6 +38,12 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - linked-worktree build metadata reads and hostile-env fixture (#2835),
+#     .github/workflows/macos-confined-contract.yml: linked_worktree_build_git
+#     runs natively under Seatbelt; Linux covers the same binary in scope.
+#     The native lane also runs brush_build_pipeline linked_worktree_build_reads
+#     through the production worker (CI-only; needs native kernel/toolchain).
+#     Seatbelt remains path-only; descriptor race proof is Linux-only.
 #   - native Seatbelt command/adoption contract (#2813),
 #     .github/workflows/macos-confined-contract.yml: command-shape rows,
 #     production harness=false Brush creation/adoption, raw shared-ref refusal,

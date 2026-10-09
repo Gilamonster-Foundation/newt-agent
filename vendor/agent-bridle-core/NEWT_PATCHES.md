@@ -266,3 +266,8 @@ separately refuses any held root whose `provenance` is not a member of the
 admitted `fs_read` scope, before the spawn thread starts, so a genuinely
 bound but un-admitted `HeldReadRoot(B, fd(B))` cannot reach the sandbox
 either.
+
+Newt #2835 extends the same descriptor mechanism through
+`SandboxedWorker::held_read_roots`. The worker delegates the handles to its
+existing `ConfinedCommand`; admission and wrapper-backend refusal remain there.
+No handles or new fields are serialized into the worker protocol.

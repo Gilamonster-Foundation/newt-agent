@@ -1156,6 +1156,7 @@ pub struct SandboxedWorker {
     kind: TrustedWorkerKind,
     sandbox_policy: Arc<SandboxPolicy>,
     read_only_resources: Vec<PathBuf>,
+    held_read_roots: Vec<crate::HeldReadRoot>,
 }
 
 impl SandboxedWorker {
@@ -1171,6 +1172,7 @@ impl SandboxedWorker {
             kind: TrustedWorkerKind::Brush,
             sandbox_policy: Arc::new(SandboxPolicy::default()),
             read_only_resources: Vec::new(),
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -1193,6 +1195,14 @@ impl SandboxedWorker {
     #[must_use]
     pub fn read_only_resources(mut self, roots: Vec<PathBuf>) -> Self {
         self.read_only_resources = roots;
+        self
+    }
+
+    /// Retain descriptor-bound reads when installing the worker's fence.
+    /// The shared ConfinedCommand seam checks admission and backend support.
+    #[must_use]
+    pub fn held_read_roots(mut self, roots: Vec<crate::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
         self
     }
 
@@ -1256,6 +1266,7 @@ impl SandboxedWorker {
         })?;
 
         let mut command = ConfinedCommand::new(executable)
+            .held_read_roots(self.held_read_roots)
             .args([flag, kind])
             .env("AGENT_BRIDLE_WORKER_NONCE", nonce)
             .current_dir(cwd)

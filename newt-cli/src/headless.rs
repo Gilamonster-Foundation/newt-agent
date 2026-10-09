@@ -581,29 +581,18 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         smart_enabled || (args.frame_dir.is_none() && launch.continuity.parent_frame().is_none()),
         "frame storage and --resume-from require --smart-harness or [smart_harness] enabled = true"
     );
+    let harness_launch = newt_core::config::HarnessLaunch {
+        workspace: std::path::Path::new(&workspace),
+        caveats: &dc.caveats,
+        frame_dir: args.frame_dir.as_deref(),
+        resume_from: launch.continuity.parent_frame(),
+        hermetic: !launch.continuity.is_resumable(),
+    };
+    let smart_config = smart_enabled.then_some(smart_config).and_then(|config| {
+        config.admit_startup(&harness_launch, |notice| eprintln!("newt: {notice}"))
+    });
     let mut smart_manifest = None;
-    let smart_harness = if smart_enabled {
-        newt_core::agentic::smart_harness::validate_isolation_runtime()
-            .context("smart-harness: isolation runtime check")?;
-        let harness_launch = newt_core::config::HarnessLaunch {
-            workspace: std::path::Path::new(&workspace),
-            caveats: &dc.caveats,
-            frame_dir: args.frame_dir.as_deref(),
-            resume_from: launch.continuity.parent_frame(),
-            hermetic: !launch.continuity.is_resumable(),
-        };
-        // Admit storage before loading or contacting the auxiliary. Explicit
-        // broad CLI grants stay visible and are rejected if they expose it.
-        smart_config.directory(&harness_launch).with_context(|| {
-            format!(
-                "smart-harness: resolving the frame directory (workspace {}, frame dir {})",
-                harness_launch.workspace.display(),
-                harness_launch
-                    .frame_dir
-                    .map(|d| d.display().to_string())
-                    .unwrap_or_else(|| "<default>".into())
-            )
-        })?;
+    let smart_harness = if let Some(smart_config) = smart_config {
         let auxiliary = newt_inference::smart_harness::build(&smart_config, &url, kind)
             .with_context(|| format!("smart-harness: building the auxiliary against {url}"))?;
         let mut manifest = auxiliary.manifest;

@@ -97,6 +97,7 @@ pub struct BrushShellTool {
     schema: Arc<serde_json::Value>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
     execution_lease: Option<crate::ExecutionLease>,
+    held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
     command_broker: Option<Arc<dyn crate::CommandBroker>>,
     /// Wall-clock ceiling for one run (FIX 3). A run that exceeds it is stopped
     /// and reported `timed_out:true` with exit 124.
@@ -126,6 +127,7 @@ impl BrushShellTool {
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
             command_broker: None,
             timeout: default_timeout(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
@@ -161,6 +163,14 @@ impl BrushShellTool {
     #[must_use]
     pub fn with_execution_lease(mut self, lease: crate::ExecutionLease) -> Self {
         self.execution_lease = Some(lease);
+        self
+    }
+
+    /// Carry already admitted read roots to the kernel fence by descriptor.
+    /// This changes the mechanism, never the tool's filesystem authority.
+    #[must_use]
+    pub fn with_held_read_roots(mut self, roots: Vec<agent_bridle_core::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
         self
     }
 
@@ -338,6 +348,7 @@ impl Tool for BrushShellTool {
         let confined = SandboxedWorker::brush()
             .sandbox_policy(Arc::clone(&self.sandbox_policy))
             .read_only_resources(resources)
+            .held_read_roots(self.held_read_roots.clone())
             .spawn(cx, &nonce, &cwd)?;
         let sandbox_kind = confined.sandbox_kind;
         let caveats = cx.caveats().clone();

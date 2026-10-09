@@ -96,6 +96,7 @@ pub(crate) struct SpawnCfg {
     pub audit_sink: Option<String>,
     /// Sandbox read/exec allow-lists + ABI floors ([`SandboxPolicy`]).
     pub sandbox: Arc<SandboxPolicy>,
+    pub held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
     /// Explicit private-host approvals (#385/#386, forward-ported from the 0.7
     /// line), independently intersected with the invocation's ordinary network
     /// scope by the shared egress proxy.
@@ -256,11 +257,12 @@ fn run_with_egress_proxy(
     let max_output = cfg.max_output;
     let output = cfg.output.clone();
     let sandbox = cfg.sandbox.clone();
+    let held = cfg.held_read_roots.clone();
     let deadline = cfg.deadline.clone();
     let captured = std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
-            best_available_sandbox(&sandbox).apply(&fenced)?;
+            best_available_sandbox(&sandbox).apply_with_held_roots(&fenced, &held)?;
             run_pipeline(
                 &stages,
                 cwd.as_deref(),
@@ -360,11 +362,12 @@ fn run_confined(
     let max_output = cfg.max_output;
     let output = cfg.output.clone();
     let sandbox = cfg.sandbox.clone();
+    let held = cfg.held_read_roots.clone();
     let deadline = cfg.deadline.clone();
     std::thread::Builder::new()
         .name("agent-bridle-confined".to_string())
         .spawn(move || {
-            best_available_sandbox(&sandbox).apply(&caveats)?;
+            best_available_sandbox(&sandbox).apply_with_held_roots(&caveats, &held)?;
             run_pipeline(
                 &stages,
                 cwd.as_deref(),
@@ -411,6 +414,7 @@ pub struct ShellTool {
     private_hosts: HashSet<String>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
     execution_lease: Option<crate::ExecutionLease>,
+    held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -440,6 +444,7 @@ impl ShellTool {
             private_hosts: HashSet::new(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -461,6 +466,14 @@ impl ShellTool {
     #[must_use]
     pub fn with_execution_lease(mut self, lease: crate::ExecutionLease) -> Self {
         self.execution_lease = Some(lease);
+        self
+    }
+
+    /// Carry already admitted read roots to the kernel fence by descriptor.
+    /// This changes the mechanism, never the tool's filesystem authority.
+    #[must_use]
+    pub fn with_held_read_roots(mut self, roots: Vec<agent_bridle_core::HeldReadRoot>) -> Self {
+        self.held_read_roots = roots;
         self
     }
 
@@ -500,6 +513,7 @@ impl ShellTool {
             private_hosts: HashSet::new(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -517,6 +531,7 @@ impl ShellTool {
             private_hosts: HashSet::new(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 
@@ -538,6 +553,7 @@ impl ShellTool {
             private_hosts: HashSet::new(),
             output_observer: None,
             execution_lease: None,
+            held_read_roots: Vec::new(),
         }
     }
 }
@@ -943,6 +959,7 @@ impl Tool for ShellTool {
             max_output: self.limits.max_output_bytes,
             audit_sink: self.limits.audit_sink.clone(),
             sandbox: Arc::clone(&self.sandbox),
+            held_read_roots: self.held_read_roots.clone(),
             private_hosts: self.private_hosts.clone(),
             unbridled,
             output,
@@ -963,6 +980,20 @@ impl Tool for ShellTool {
         let (env, _dropped_env) =
             agent_bridle_core::fence_env(&parsed.env, &self.limits.env_denylist);
         let caveats = cx.caveats().clone();
+        for root in &self.held_read_roots {
+            if !matches!(&caveats.fs_read, Scope::All)
+                && !matches!(&caveats.fs_read, Scope::Only(paths) if paths.contains(root.provenance()))
+            {
+                return Err(ToolError::denied("held read root is not admitted"));
+            }
+        }
+        if !self.held_read_roots.is_empty()
+            && best_available_sandbox(&self.sandbox).kind() != SandboxKind::Landlock
+        {
+            return Err(ToolError::denied(
+                "this sandbox cannot anchor held read roots",
+            ));
+        }
         let execution_lease = self.execution_lease.clone();
         let mut run = tokio::task::spawn_blocking(move || {
             let _execution_lease = execution_lease;
@@ -2216,6 +2247,7 @@ mod tests {
         };
         let cfg = SpawnCfg {
             max_output: 100,
+            held_read_roots: Vec::new(),
             audit_sink: None,
             sandbox: Arc::new(SandboxPolicy::default()),
             private_hosts: HashSet::new(),

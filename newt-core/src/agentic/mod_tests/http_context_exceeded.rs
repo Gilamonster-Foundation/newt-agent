@@ -276,3 +276,6 @@ async fn cap_summary_context_exceeded_keeps_round_cap_and_records_the_rejection(
     ));
     assert!(state.calibration.ratio(None) >= 1.5);
 }
+
+#[path = "http_context_exceeded_rounds.rs"]
+mod rounds;

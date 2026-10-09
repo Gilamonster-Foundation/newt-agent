@@ -209,6 +209,7 @@ pub(super) async fn execute(
         live_output,
         scratch,
         command_broker,
+        request.build_held_read_roots(),
         command_budget,
     )
     .await
