@@ -1,32 +1,33 @@
 //! #2831: advisory publication steering, never authority or completion evidence.
 use crate::ExecOutcome;
+use content_addressable::RawContentId;
 use std::collections::BTreeMap;
 
 pub const GUIDANCE: &str = "For a refactor that asks for a worktree and PR, plan one cohesive extraction per publish cycle: extract and wire it in, cargo check, commit, push, open the PR. Make further extractions follow-up commits to the same PR.";
-const HINT: &str = "Publish early: a task-worktree commit and a passing cargo check were observed; no governed PR creation has been observed for this branch. Push and open the PR before the next extraction (update the same PR if one already exists).";
+const HINT: &str = "Publish early: a task-worktree commit matches the staged content of a passing cargo check; no governed PR creation has been observed for this branch. Push and open the PR before the next extraction (update the same PR if one already exists).";
 #[derive(Debug, Default)]
-pub(crate) struct State(BTreeMap<String, Branch>);
+pub(crate) struct State {
+    branches: BTreeMap<String, Branch>,
+    // One current content witness, never a branch-indexed cache of old passes.
+    checked: Option<Checked>,
+}
+#[derive(Debug)]
+struct Checked {
+    tree: RawContentId,
+    reflog: RawContentId,
+    log_len: usize,
+}
 #[derive(Debug, Default)]
 struct Branch {
-    check: Option<ExecOutcome>,
     pr: bool,
     shown: bool,
     requested: bool,
 }
 impl State {
-    fn observe(
-        &mut self,
-        branch: &str,
-        check: Option<ExecOutcome>,
-        pr: bool,
-        commit: bool,
-    ) -> Option<&'static str> {
-        let state = self.0.entry(branch.to_owned()).or_default();
-        if let Some(check) = check {
-            state.check = Some(check);
-        }
+    fn observe(&mut self, branch: &str, pr: bool, checked_commit: bool) -> Option<&'static str> {
+        let state = self.branches.entry(branch.to_owned()).or_default();
         state.pr |= pr;
-        if !state.shown && !state.pr && commit && state.check == Some(ExecOutcome::Passed) {
+        if !state.shown && !state.pr && checked_commit {
             state.shown = true;
             Some(HINT)
         } else {
@@ -107,25 +108,67 @@ pub(crate) fn after_tool(
             .and_then(|path| path.canonicalize().ok())
             .is_some_and(|path| path.starts_with(&root));
     let mut state = session.publish_early.lock().expect("publication hint lock");
-    let observed = state.0.entry(branch.to_owned()).or_default();
-    // Keep the requested workflow through continuation/compaction turns. Facts
-    // (including PR creation) are retained even before this steering is requested.
+    let observed = state.branches.entry(branch.to_owned()).or_default();
     observed.requested |= refactor_publication(objective);
-    if matches!(name, "write_file" | "edit_file" | "delete_file") {
-        observed.check = None;
+    observed.pr |= pr;
+    if observed.pr || observed.shown {
+        state.checked = None;
+        return None;
     }
-    // Read the reflog only when a pass could make this branch eligible. This
-    // is an advisory observation, not an inode/signature or publication proof.
-    let previous = state.0.get(branch);
-    let eligible_check =
-        check.or_else(|| previous.and_then(|s| s.check)) == Some(ExecOutcome::Passed);
-    let commit = previous.is_some_and(|s| s.requested)
-        && eligible_check
-        && !pr
-        && !previous.is_some_and(|s| s.pr || s.shown)
-        && read_fact(&admin.join("logs/HEAD"), read).is_some_and(|log| commit_in_reflog(&log));
-    state.observe(branch, check, pr, commit)
+    let requested = observed.requested;
+    // Unknown/failed execution cannot retain a pass. For an unsupported Cargo
+    // spelling, even exit 0 may mask a failed check (e.g. `cargo check || true`).
+    // This deliberately over-invalidates mentions, without interpreting effects.
+    if execution != Some(ExecOutcome::Passed)
+        || matches!(name, "write_file" | "edit_file" | "delete_file")
+        || (command.contains("cargo") && check != Some(ExecOutcome::Passed))
+    {
+        state.checked = None;
+        return None;
+    }
+    if check.is_none() && state.checked.is_none() {
+        return None;
+    }
+    let Some(log) = read_fact(&admin.join("logs/HEAD"), read) else {
+        state.checked = None;
+        return None;
+    };
+    let Some(tree) = checked_tree::index_tree(&root, read) else {
+        state.checked = None;
+        return None;
+    };
+    if check == Some(ExecOutcome::Passed) {
+        state.checked = Some(Checked {
+            tree,
+            reflog: RawContentId::from_content(log.as_bytes()),
+            log_len: log.len(),
+        });
+        return None;
+    }
+    let checked = state.checked.as_ref()?;
+    let prefix_matches = log
+        .as_bytes()
+        .get(..checked.log_len)
+        .is_some_and(|prefix| RawContentId::from_content(prefix) == checked.reflog);
+    let added = log.get(checked.log_len..).unwrap_or_default();
+    // Inspect actual reflog transitions, including away-and-back in ONE shell
+    // command. Only appended commit records preserve this content witness.
+    if tree != checked.tree
+        || !prefix_matches
+        || added.is_empty()
+        || !added.lines().all(commit_in_reflog)
+    {
+        state.checked = None;
+        return None;
+    }
+    // Without an attributable check or a newly observed commit, an intervening
+    // command has unknown check semantics; never infer non-mutation from shell.
+    let commit = requested && checked_tree::index_is_head(&root, read);
+    state.observe(branch, pr, commit)
 }
+
+#[path = "publish_early_tree.rs"]
+mod checked_tree;
 
 fn read_fact(path: &std::path::Path, read: &crate::Scope<String>) -> Option<String> {
     use std::io::Read;

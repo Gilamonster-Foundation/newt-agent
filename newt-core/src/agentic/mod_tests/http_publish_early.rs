@@ -44,7 +44,9 @@ async fn publish_early_reaches_provider_after_check_and_commit() {
         "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
     )
     .unwrap();
-    let commands = ["cargo check --offline", "git -c core.hooksPath= -c commit.gpgsign=false -c user.name=Fixture -c user.email=fixture@example.invalid commit --allow-empty -qm extraction", "git status --short"];
+    std::fs::write(task.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    git(&task, temp.path(), &["add", "."]);
+    let commands = ["cargo check --offline", "git -c core.hooksPath= -c commit.gpgsign=false -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm extraction", "git status --short"];
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let task_path = task.clone();

@@ -1,45 +1,15 @@
 use super::*;
 
-/// #2831: the first eligible extraction nudges once per branch, not per turn.
+/// #2831: once-per-branch and governed PR facts are independent of content evidence.
 #[test]
 fn publish_early_once_per_branch_requires_observed_facts() {
     let mut state = State::default();
-    assert!(state.observe("task", None, false, true).is_none());
-    assert!(state
-        .observe("task", Some(ExecOutcome::Failed), false, true)
-        .is_none());
-    assert!(state
-        .observe("task", Some(ExecOutcome::Passed), false, false)
-        .is_none());
-    assert_eq!(state.observe("task", None, false, true), Some(HINT));
-    assert!(state
-        .observe("task", Some(ExecOutcome::Passed), false, true)
-        .is_none());
-    assert_eq!(
-        state.observe("other", Some(ExecOutcome::Passed), false, true),
-        Some(HINT)
-    );
-}
-
-#[test]
-fn publication_and_latest_check_suppress_the_hint() {
-    let mut state = State::default();
-    assert!(state
-        .observe("task", Some(ExecOutcome::Passed), true, true)
-        .is_none());
-    assert!(state
-        .observe("task", Some(ExecOutcome::Passed), false, true)
-        .is_none());
-    assert!(state
-        .observe("failed", Some(ExecOutcome::Passed), false, false)
-        .is_none());
-    assert!(state
-        .observe("failed", Some(ExecOutcome::Failed), false, true)
-        .is_none());
-    assert!(state.observe("failed", None, false, true).is_none());
-    assert!(state
-        .observe("failed", Some(ExecOutcome::Denied), false, true)
-        .is_none());
+    assert!(state.observe("task", false, false).is_none());
+    assert_eq!(state.observe("task", false, true), Some(HINT));
+    assert!(state.observe("task", false, true).is_none());
+    assert_eq!(state.observe("other", false, true), Some(HINT));
+    assert!(state.observe("published", true, true).is_none());
+    assert!(state.observe("published", false, true).is_none());
 }
 
 /// The measured 6096-line copy gets advice, not refusal; ordinary extractions do not.
@@ -154,92 +124,180 @@ async fn publish_early_large_write_advice_never_refuses() {
     }
 }
 
-/// Ground the wiring in reciprocal task metadata. The provider regression
-/// separately grounds this fixture's HEAD/reflog spelling in actual Git.
+/// #2831 round 2: real Git grounds content freshness in the shared observer.
 #[test]
-fn publish_early_observer_keeps_branch_facts_across_continuations() {
-    use std::path::Path;
-    let temp = tempfile::tempdir().unwrap();
-    let original = temp.path().join("original");
-    let task = temp.path().join("task");
-    let admin = original.join(".git/worktrees/task");
-    std::fs::create_dir_all(admin.join("logs")).unwrap();
-    std::fs::create_dir_all(task.join("package")).unwrap();
-    std::fs::write(task.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
-    std::fs::write(admin.join("gitdir"), task.join(".git").to_str().unwrap()).unwrap();
-    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
-    std::fs::write(admin.join("HEAD"), "ref: refs/heads/task\n").unwrap();
-    let commit = format!(
-        "{} {} Fixture <fixture@example.invalid> 1 +0000\tcommit: extraction\n",
-        "0".repeat(40),
-        "a".repeat(40)
-    );
-    std::fs::write(admin.join("logs/HEAD"), &commit).unwrap();
-    let read = crate::Scope::All;
-    let session = crate::worktree_adoption::WorktreeSession::default();
-    session.record_task_worktree(&task, "task");
-    let check = serde_json::json!({"command":"cargo check", "cwd":task.join("package")});
-    let objective = "Refactor in a worktree and open a PR";
-    let observe = |session: &crate::worktree_adoption::WorktreeSession,
-                   objective,
-                   args: &serde_json::Value,
-                   outcome,
-                   pr| {
-        after_tool(
-            session,
-            objective,
-            "run_command",
-            args,
-            original.to_str().unwrap(),
-            outcome,
-            pr,
-            &read,
-            Some(task.as_path()),
-        )
-    };
-    // A pass in the original checkout is not a pass in the task worktree.
-    assert!(observe(
-        &session,
-        objective,
-        &serde_json::json!({"command":"cargo check","cwd":original}),
-        Some(ExecOutcome::Passed),
-        None
-    )
-    .is_none());
-    std::fs::write(admin.join("logs/HEAD"), "creation only").unwrap();
-    assert!(observe(&session, objective, &check, Some(ExecOutcome::Passed), None).is_none());
-    std::fs::write(admin.join("logs/HEAD"), &commit).unwrap();
-    assert_eq!(
-        observe(
-            &session,
-            "continue",
-            &serde_json::json!({"command":"git status"}),
-            Some(ExecOutcome::Passed),
-            None
-        ),
-        Some(HINT)
-    );
-    assert!(observe(&session, objective, &check, Some(ExecOutcome::Passed), None).is_none());
-    let published = crate::worktree_adoption::WorktreeSession::default();
-    published.record_task_worktree(&task, "task");
-    let receipt = crate::git_staging::Outcome::PrCreated {
-        url: "https://github.com/example/project/pull/1".into(),
-    };
-    assert!(observe(
-        &published,
-        "Publish this branch",
-        &serde_json::json!({"command":"gh pr create"}),
-        Some(ExecOutcome::Passed),
-        Some(&receipt)
-    )
-    .is_none());
-    assert!(observe(
-        &published,
-        objective,
-        &check,
-        Some(ExecOutcome::Passed),
-        None
-    )
-    .is_none());
-    assert!(read_fact(Path::new("does-not-exist"), &crate::Scope::none()).is_none());
+fn publish_early_checked_content_controls() {
+    for scenario in [
+        "staged",
+        "original-checkout",
+        "shell-edit",
+        "ambiguous",
+        "opaque-check",
+        "switch-return",
+        "failed-check",
+        "unknown-check",
+        "pr-created",
+        "unstaged",
+        "untracked",
+        "assume-unchanged",
+        "filters",
+        "different-commit",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let task = temp.path().join("task");
+        std::fs::create_dir(&original).unwrap();
+        let git = |root: &std::path::Path, args: &[&str]| {
+            let out = crate::git_hardening::metadata_git(root, args, &crate::Scope::All)
+                .unwrap()
+                .env("GIT_AUTHOR_NAME", "Fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&original, &["init", "-q", "-b", "main"]);
+        std::fs::write(original.join("source"), "base").unwrap();
+        git(&original, &["add", "."]);
+        git(
+            &original,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        git(
+            &original,
+            &["worktree", "add", "-qb", "task", task.to_str().unwrap()],
+        );
+        std::fs::write(task.join("source"), "checked extraction").unwrap();
+        git(&task, &["add", "."]);
+        let session = crate::worktree_adoption::WorktreeSession::default();
+        session.record_task_worktree(&task, "task");
+        let observe = |command: &str, outcome| {
+            after_tool(
+                &session,
+                "Refactor in a worktree and open a PR",
+                "run_command",
+                &serde_json::json!({"command":command,"cwd":task}),
+                original.to_str().unwrap(),
+                outcome,
+                None,
+                &crate::Scope::All,
+                Some(&task),
+            )
+        };
+        match scenario {
+            "unstaged" => std::fs::write(task.join("source"), "unstaged extraction").unwrap(),
+            "untracked" => std::fs::write(task.join("extra"), "untracked input").unwrap(),
+            "assume-unchanged" => git(&task, &["update-index", "--assume-unchanged", "source"]),
+            "filters" => git(&task, &["config", "filter.fixture.clean", "false"]),
+            _ => {}
+        }
+        if scenario == "original-checkout" {
+            assert!(after_tool(
+                &session,
+                "Refactor in a worktree and open a PR",
+                "run_command",
+                &serde_json::json!({"command":"cargo check","cwd":original}),
+                original.to_str().unwrap(),
+                Some(ExecOutcome::Passed),
+                None,
+                &crate::Scope::All,
+                Some(&original)
+            )
+            .is_none());
+        } else {
+            assert!(observe("cargo check", Some(ExecOutcome::Passed)).is_none());
+        }
+        match scenario {
+            "shell-edit" => {
+                std::fs::write(task.join("source"), "unchecked broken code").unwrap();
+                assert!(observe("printf broken > source", Some(ExecOutcome::Passed)).is_none());
+                git(&task, &["add", "."]);
+            }
+            "failed-check" => {
+                assert!(observe("cargo check", Some(ExecOutcome::Failed)).is_none());
+            }
+            "unknown-check" => {
+                assert!(observe("cargo check", None).is_none());
+            }
+            "opaque-check" => {
+                assert!(observe("./check-wrapper", Some(ExecOutcome::Passed)).is_none());
+            }
+            "pr-created" => {
+                let receipt = crate::git_staging::Outcome::PrCreated {
+                    url: "https://github.com/example/project/pull/1".into(),
+                };
+                assert!(after_tool(
+                    &session,
+                    "continue",
+                    "run_command",
+                    &serde_json::json!({"command":"gh pr create","cwd":task}),
+                    original.to_str().unwrap(),
+                    Some(ExecOutcome::Passed),
+                    Some(&receipt),
+                    &crate::Scope::All,
+                    Some(&task)
+                )
+                .is_none());
+            }
+            "different-commit" => {
+                std::fs::write(task.join("other"), "different tree").unwrap();
+                git(&task, &["add", "other"]);
+                git(
+                    &task,
+                    &[
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "--only",
+                        "-qm",
+                        "other",
+                        "other",
+                    ],
+                );
+                assert!(!checked_tree::index_is_head(&task, &crate::Scope::All));
+                assert!(observe("git commit --only other", Some(ExecOutcome::Passed)).is_none());
+            }
+            "ambiguous" => {
+                assert!(observe("cargo check || true", Some(ExecOutcome::Passed)).is_none());
+            }
+            "switch-return" => {
+                git(&task, &["switch", "-qc", "other"]);
+                git(&task, &["switch", "-q", "task"]);
+                assert!(observe(
+                    "git switch -c other && git switch task",
+                    Some(ExecOutcome::Passed)
+                )
+                .is_none());
+            }
+            _ => {}
+        }
+        git(&task, &["add", "."]);
+        git(
+            &task,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "extraction"],
+        );
+        assert_eq!(
+            after_tool(
+                &session,
+                "continue",
+                "run_command",
+                &serde_json::json!({"command":"git commit -qm extraction","cwd":task}),
+                original.to_str().unwrap(),
+                Some(ExecOutcome::Passed),
+                None,
+                &crate::Scope::All,
+                Some(&task)
+            ),
+            (scenario == "staged").then_some(HINT),
+            "{scenario}"
+        );
+        assert!(observe("git status", Some(ExecOutcome::Passed)).is_none());
+        assert!(checked_tree::index_tree(&task, &crate::Scope::none()).is_none());
+    }
 }

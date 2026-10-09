@@ -239,12 +239,26 @@ extractions are follow-up commits on that PR. This is advice, not a new gate.
 
 The shared worktree result annotation observes typed execution outcomes and
 uses the existing conservative Cargo command/cwd parser. A passing `cargo check`
-in the task worktree, a commit entry in that worktree's HEAD reflog, and no
-observed governed PR creation make a one-shot publication hint eligible. The
-session remembers each branch, including failed checks and PR creation; model
-prose is never evidence. Absence from the governed ledger is not a remote GitHub
-query: the hint says no creation was observed and tells the model to update an
-existing PR if there is one. No network access or publication is triggered.
+records a content address of Git's canonical staged listing (paths, modes and
+blob IDs), only when the working files match the index and no non-ignored
+untracked files remain. The hint requires a subsequent task-worktree commit
+whose tree equals that exact staged content. Git's read-only cached diff proves
+index/HEAD equality; no `write-tree` or repository mutation is needed. This
+conservatively requires staging before checking. Sparse/assume-unchanged entries,
+submodules, configured clean filters, unavailable Git metadata and bounded read
+grants decline the hint.
+
+There is one current checked-content witness, not a cache of passes per branch.
+Failed/unknown outcomes, unsupported Cargo spellings (even masked exit-zero
+commands), changed content and intervening non-commit reflog transitions discard
+it. An intervening command without an attributable check or new commit also
+discards it; unknown wrappers cannot silently retain a pass. The reflog prefix
+is content-addressed too, so switching away and back within
+one tool call cannot revive a pass. The branch-local flags retain only the
+requested workflow, prior governed PR creation and whether advice was shown.
+Model prose is never evidence. Absence from the governed ledger is not a remote
+GitHub query: the hint says no creation was observed and tells the model to update
+an existing PR if there is one. No network access or publication is triggered.
 
 Writes exceeding 1,500 lines receive a short split hint, never a refusal. The
 threshold leaves headroom over the measured successful 171–1,168-line extractions
@@ -255,6 +269,8 @@ count the replaced/inserted span rather than the whole existing file.
 Unit tests cover the predicate, one-shot state, latest-check outcome, PR
 suppression, strict command attribution, reflog interpretation and threshold.
 A scripted ChatCtx loop with a real linked Git worktree and local Cargo check
-asserts the next provider request receives the hint after the commit. It uses
+stages the extraction before checking and asserts the next provider request
+receives the hint after committing that content. Real Git observer controls
+cover shell edits, ambiguous checks and switching away and back. It uses
 no sleeps or model endpoint. Refactor-lab before/after runs remain the operator's
 separate behavioral measurement; these tests do not claim model success.
