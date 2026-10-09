@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 
+from refactor_helper import EvidenceError, HelperUnavailable, invoke_helper
 from refactor_transcript import read_tail, positive_mib
 from refactor_claims import check_claims, final_summary, operator_inputs
 
@@ -26,14 +27,6 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "newt-interaction/conformance")
 )
 from newt_conformance import content_id, encode  # noqa: E402
-
-
-class HelperUnavailable(RuntimeError):
-    """The grader cannot establish a verdict without its trusted parser."""
-
-
-class EvidenceError(RuntimeError):
-    """Unavailable evidence is a failing grade, not proof of fabrication."""
 
 
 def run(argv: list[str], cwd: Path) -> str:
@@ -173,13 +166,9 @@ def extraction(
             else:
                 continue
             paths[2].write_text(after[path])
-            output = run(
-                [str(syntax_helper(helper)), *map(str, paths), name], root
-            ).strip()
+            output = invoke_helper(syntax_helper(helper), paths, name, root)
             if output == "MATCH":
                 moved.append(path)
-            elif output != "NONE":
-                raise EvidenceError("invalid Rust syntax helper response")
     return moved
 
 

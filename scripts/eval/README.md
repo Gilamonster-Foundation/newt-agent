@@ -206,3 +206,12 @@ and exits 1. Any failed criterion still renders FAIL. A supplied but unreadable
 transcript remains an input error (exit 2). The Linux transcript regression
 uses a 256 MiB synthetic file under a fixed 128 MiB address-space limit, with
 no timing threshold.
+
+Prepared parser execution has its own result boundary. Launch/loader failures,
+timeouts, signals, crashes, invalid UTF-8, empty output, and malformed responses
+invalidate grading (INVALID, extraction UNGRADED, exit 2), including report replay.
+Success requires exit 0, exactly `MATCH` or `NONE` (with an optional final newline),
+and empty stderr. A parser rejection remains extraction FAIL only for exit 2,
+empty stdout, and one recognized unsupported-syntax/attribute diagnostic on stderr.
+Unexpected exit-2 errors, such as unreadable helper input, are infrastructure
+failures rather than evidence against the refactor.
