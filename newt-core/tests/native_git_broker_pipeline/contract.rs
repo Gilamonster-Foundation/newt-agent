@@ -5,6 +5,8 @@
 mod chat;
 #[path = "contract_diagnostics.rs"]
 mod diagnostics;
+#[path = "contract_removal.rs"]
+mod removal;
 #[path = "contract_siblings.rs"]
 mod siblings;
 
@@ -71,6 +73,7 @@ pub fn run() {
             if std::env::args().any(|arg| arg == "--publication") {
                 governed_publication().await;
             } else {
+                removal::run().await;
                 siblings::run().await;
                 for wrapper in [false, true] {
                     creation_and_security(wrapper).await;
