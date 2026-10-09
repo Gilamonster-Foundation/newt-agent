@@ -40,22 +40,16 @@ pub(super) fn argument(word: &str) -> Option<String> {
 /// Confined dispatch supplies sandbox_git_env's repository-config hardening;
 /// pin() also disables pagers and optional index writes for these siblings.
 pub(super) fn read_only(args: &[&str]) -> bool {
-    let count = |n: &str| {
-        !n.is_empty()
-            && n.bytes().all(|b| b.is_ascii_digit())
-            && n.parse::<u32>().is_ok_and(|n| n > 0)
-    };
-    match args {
-        ["status"]
-        | ["status", "--short" | "-s" | "--porcelain"]
-        | ["branch", "--show-current"]
-        | ["worktree", "list"]
-        | ["rev-parse", "HEAD" | "--show-toplevel"]
-        | ["rev-parse", "--abbrev-ref", "HEAD"] => true,
-        ["log", "--oneline", "-n", n] => count(n),
-        ["log", "--oneline", n] => n.strip_prefix('-').is_some_and(count),
-        _ => false,
-    }
+    // PR #2827: log can invoke signature verifiers; status can invoke clean
+    // filters and submodule summaries (which run log). Neither is read-only
+    // under repository config, even with pagers and optional locks disabled.
+    matches!(
+        args,
+        ["branch", "--show-current"]
+            | ["worktree", "list"]
+            | ["rev-parse", "HEAD" | "--show-toplevel"]
+            | ["rev-parse", "--abbrev-ref", "HEAD"]
+    )
 }
 
 /// Only the explicit start operand of the ordinary -b form treats `.` as HEAD.
