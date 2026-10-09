@@ -531,3 +531,6 @@ mod ollama_initiative;
 
 #[path = "claimcheck_task_root.rs"]
 mod claimcheck_task_root_tests;
+
+#[path = "http_publish_early.rs"]
+mod publish_early_tests;

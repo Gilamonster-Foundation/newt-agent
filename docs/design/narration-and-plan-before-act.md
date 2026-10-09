@@ -229,3 +229,58 @@ The `edit` approval option and the RichTUI plan pane (parent design); a
 `/goal` verb or the `resolute` tenacity level (a declared check the harness
 runs before accepting "done"); rendering each dial's `describe()` in the psyche
 panel; reading or editing the composed system prompt from the TUI.
+
+## Publish one extraction before expanding the refactor (#2831)
+
+The plan guidance and existing workflow/narration nudges ask refactor objectives
+that include a worktree and PR to use one cohesive extraction per publication
+cycle: extract **and wire it in**, check, commit, push, open the PR. Later
+extractions are follow-up commits on that PR. This is advice, not a new gate.
+
+The shared worktree result annotation observes typed execution outcomes and
+uses the existing conservative Cargo command/cwd parser. A passing `cargo check`
+records a canonical content address of the staged paths, modes and blob IDs,
+only when each working file's raw bytes hash to its indexed Git blob ID and no
+non-ignored untracked files remain. `grit-lib` supplies the in-process index
+parser and Git SHA-1/SHA-256 blob hashing; `content-addressable` supplies the
+canonical witness identity. A subsequent commit must contain that same tree:
+local loose/packed HEAD objects are read in-process and compared to the index.
+There are **no production Git subprocesses on this advisory path**: no filters,
+fsmonitor, hooks, external diff or lazy-fetch helpers can run, even if a writer
+changes config after screening. No objects or index entries are written.
+
+This conservatively requires staging before checking. Attribute files on tracked
+paths (including info/attributes), configured attributes/filters, autocrlf or EOL
+conversion, sparse/split/assume-unchanged indexes, symlinks, submodules, unavailable
+metadata and bounded read grants decline the hint. Conversion is never modeled
+or applied. Config/attribute rechecks can suppress stale advice; execution safety
+does not depend on the timing of those rechecks.
+
+There is one current checked-content witness, not a cache of passes per branch.
+Failed/unknown outcomes, unsupported Cargo spellings (even masked exit-zero
+commands), changed content and intervening non-commit reflog transitions discard
+it. An intervening command without an attributable check or new commit also
+discards it; unknown wrappers cannot silently retain a pass. The reflog prefix
+is content-addressed too, so switching away and back within
+one tool call cannot revive a pass. The branch-local flags retain only the
+requested workflow, prior governed PR creation and whether advice was shown.
+Model prose is never evidence. Absence from the governed ledger is not a remote
+GitHub query: the hint says no creation was observed and tells the model to update
+an existing PR if there is one. No network access or publication is triggered.
+
+Writes exceeding 1,500 lines receive a short split hint, never a refusal. The
+threshold leaves headroom over the measured successful 171–1,168-line extractions
+and flags the failed 6,096-line copy that was never wired into its parent. File
+writes include copied lines; checked moves count the extracted child; edits
+count the replaced/inserted span rather than the whole existing file.
+
+Unit tests cover the predicate, one-shot state, latest-check outcome, PR
+suppression, strict command attribution, reflog interpretation and threshold.
+A scripted ChatCtx loop with a real linked Git worktree and local Cargo check
+stages the extraction before checking and asserts the next provider request
+receives the hint after committing that content. Real Git observer controls
+cover shell edits, ambiguous checks and switching away and back. A deterministic
+post-screen config/attribute mutation test asserts that clean/process filters
+cannot write an outside sentinel, alongside ordinary-content controls. The tests use
+no sleeps or model endpoint. Refactor-lab before/after runs remain the operator's
+separate behavioral measurement; these tests do not claim model success.

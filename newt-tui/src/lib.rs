@@ -5883,6 +5883,9 @@ fn build_system_prompt_with_persona(
          re-reading the whole codebase.\n"
     ));
 
+    ctx.push_str(newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE);
+    ctx.push('\n');
+
     // `[tui] narration_intent_line` (opt-in): appended here like the plan
     // sentence, so every identity gets it and no soul text carries it.
     let intent = cfg

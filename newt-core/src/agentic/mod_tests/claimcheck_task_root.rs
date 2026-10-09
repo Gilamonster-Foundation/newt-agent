@@ -2,7 +2,7 @@
 use super::*;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn git(root: &std::path::Path, home: &std::path::Path, args: &[&str]) {
+pub(super) fn git(root: &std::path::Path, home: &std::path::Path, args: &[&str]) {
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(root).env_clear();
     for key in ["PATH", "SystemRoot", "TEMP", "TMP"] {

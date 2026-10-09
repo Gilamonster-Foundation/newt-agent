@@ -4535,6 +4535,7 @@ dependencies = [
  "globset",
  "grep-regex",
  "grep-searcher",
+ "grit-lib",
  "ignore",
  "libc",
  "markdown-table-formatter",
