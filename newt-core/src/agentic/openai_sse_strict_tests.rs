@@ -519,8 +519,8 @@ fn strict_rejections_classify_by_cause() {
 /// (`validate_tool_call_batch`), as on every other wire. A complete stream
 /// whose call has cut or non-object arguments, or no name, decodes with that
 /// call's raw fields, and so does a batch cut at the output limit
-/// (`finish_reason: length`); the loop then rejects the batch per call and
-/// retries. A valid call is still normalized here exactly as the loop would.
+/// (`finish_reason: length`). The loop stops a length-terminated response
+/// before validation (#2824); otherwise it may reject the batch and retry. A valid call is still normalized here exactly as the loop would.
 #[test]
 fn stream_leaves_invalid_tool_calls_to_the_batch_validator() {
     let call = |function: Value, finish: &str| {

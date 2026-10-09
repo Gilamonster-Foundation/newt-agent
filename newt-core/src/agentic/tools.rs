@@ -3680,6 +3680,7 @@ async fn execute_authorized_tool(
         command_directory,
         routed_to: routed_to_slot,
         pending_rerun,
+        retry_authorized,
     } = collab;
     // #2636 (round1 finding 1): a queued #2628 rerun binds to the denial that
     // set it. ANY tool call other than the `request_permissions` that
@@ -4644,6 +4645,7 @@ async fn execute_authorized_tool(
                     .as_ref()
                     .map(|guard| guard.clone() as agent_bridle_tool_shell::ExecutionLease),
                 &mut fs_pre_exec_missing,
+                retry_authorized,
                 args.get("timeout_secs").and_then(serde_json::Value::as_u64),
                 adopted.as_ref(),
                 command_budget,
@@ -6150,3 +6152,11 @@ pub(crate) fn dispatch_exec_path() -> Option<std::ffi::OsString> {
         .map(std::ffi::OsString::from)
         .or_else(|| std::env::var_os("PATH"))
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "tools_tests/path_aliases.rs"]
+mod path_aliases;
+
+#[cfg(all(test, unix))]
+#[path = "tools_tests/path_alias_attacks.rs"]
+mod path_alias_attacks;

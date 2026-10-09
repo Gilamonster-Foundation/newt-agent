@@ -498,6 +498,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
         None,
         Vec::new(),
         generation_policy::GenerationPolicy::default(),
+        None,
         &CapExit {
             max_tool_rounds: 40,
             accumulated: Some(crate::TokenUsage {
@@ -544,6 +545,8 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
         body["messages"].to_string().contains("progress update"),
         "the model is explicitly asked for a resumable progress update"
     );
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["max_tokens"], 16_384, "#2782: cap summary is bounded");
 }
 
 #[tokio::test]
@@ -641,6 +644,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
         None,
         messages,
         generation_policy::GenerationPolicy::default(),
+        None,
         &CapExit {
             max_tool_rounds: 1,
             accumulated: None,

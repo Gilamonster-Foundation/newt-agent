@@ -2293,6 +2293,7 @@ fn session_body(
         .map(|tui| tui.permissions.mcp_net_prompt_default);
     let mut mcp = tokio::task::block_in_place(|| -> anyhow::Result<_> {
         let mut permission_gate = interactive.then(|| PromptPermissionGate {
+            pending_command_retries: Default::default(),
             ask_surface: Some(&ask_surface),
             #[cfg(feature = "rich-tui")]
             open_panel: terminal_owns_turn.then_some(&open_permission_panel),
@@ -3638,6 +3639,7 @@ fn session_body(
                             let exit = std::sync::atomic::AtomicBool::new(false);
                             let posture = newt_core::posture::active_posture();
                             let mut gate = PromptPermissionGate {
+                                pending_command_retries: Default::default(),
                                 ask_surface: Some(&ask_surface),
                                 open_panel: terminal_owns_turn.then_some(&open_permission_panel),
                                 state: &mut permission_state,
@@ -8442,6 +8444,7 @@ fn session_body(
                         .as_ref()
                         .and_then(|tui| tui.permissions.prompt_default);
                     let mut permission_gate = interactive.then(|| PromptPermissionGate {
+                        pending_command_retries: Default::default(),
                         // C1: ask the UI thread, never this one.
                         ask_surface: Some(&ask_surface),
                         #[cfg(feature = "rich-tui")]

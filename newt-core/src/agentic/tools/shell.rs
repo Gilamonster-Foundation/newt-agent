@@ -1200,6 +1200,7 @@ pub(super) async fn exec_confined_command(
         &mut None,
         None,
         None,
+        None,
         command_budget,
     )
     .await
@@ -1248,6 +1249,7 @@ pub(super) async fn exec_confined_command_with_broker(
     // rerun-eligible slot; child stdout that happens to contain the denial
     // string does not.
     pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
+    retry_authorized: Option<&std::sync::OnceLock<()>>,
     timeout_secs: Option<u64>,
     adopted: Option<&crate::worktree_adoption::AdoptedWorktree>,
     command_budget: crate::RunCommandBudget,
@@ -1380,24 +1382,20 @@ pub(super) async fn exec_confined_command_with_broker(
     };
     let caveats = refreshed.as_ref().unwrap_or(caveats);
 
-    // #2689/#2691 round 3 (P2): bind any pending-once grant already queued
-    // for a program THIS command statically needs, before dispatch — so a
-    // model's reissue of a held command (see this function's doc comment)
-    // succeeds on its first attempt instead of being denied all over again
-    // and looping through "granted…Retry the original operation now"
-    // forever. `apply_pending_once` is scoped per exact target (a no-op
-    // unless that exact target is queued), so an unrelated command cannot
-    // inherit a grant queued for a different retry. Skipped when inspection
-    // fails (dynamic/unsupported syntax): the reactive ask_with_caveats/
-    // take_pending_once path below still covers that case, just without
-    // this optimization.
-    let bound = permission_gate.as_deref_mut().and_then(|gate| {
-        let commands = agent_bridle::inspect_shell(cmd).ok()?.commands;
-        let mut current = caveats.clone();
+    // Bind an operator-approved invocation before inspection: interpreters are
+    // deliberately opaque to inspect_shell, but an exact command/cwd retry can
+    // still use its exact granted executable paths. Proactive target-only grants
+    // retain their existing statically inspected matching behavior below.
+    let bound = permission_gate.as_deref_mut().map(|gate| {
+        let mut current = gate.apply_command_retry(cmd, cwd, caveats);
+        let Ok(inspection) = agent_bridle::inspect_shell(cmd) else {
+            return current;
+        };
+        let commands = inspection.commands;
         for program in commands.iter().filter_map(|c| c.program.as_deref()) {
             current = gate.apply_pending_once(DenialKind::Exec, program, &current);
         }
-        Some(current)
+        current
     });
     let caveats = bound.as_ref().unwrap_or(caveats);
 
@@ -1544,8 +1542,18 @@ pub(super) async fn exec_confined_command_with_broker(
                             // spending it on a replay that could duplicate an
                             // effect.
                             if !requests_are_replay_safe(&requests, cmd) {
-                                for request in &requests {
-                                    gate.queue_pending_once(request.kind, &request.target);
+                                if requests
+                                    .iter()
+                                    .all(|request| request.kind == DenialKind::Exec)
+                                {
+                                    gate.queue_command_retry(cmd, cwd, &requests);
+                                    if let Some(ready) = retry_authorized {
+                                        let _ = ready.set(());
+                                    }
+                                } else {
+                                    for request in &requests {
+                                        gate.queue_pending_once(request.kind, &request.target);
+                                    }
                                 }
                                 let granted = requests
                                     .iter()

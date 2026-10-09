@@ -104,16 +104,19 @@ pub(crate) async fn send<'a>(
             failure, error,
         ))
     };
+    let (client, request) = request.build_split();
+    let request = request.map_err(dispatch_error)?;
     let Some(scope) = scope else {
-        return Ok((request.send().await.map_err(dispatch_error)?, None));
+        return Ok((
+            super::generation_bounds::execute(&client, request, failure).await?,
+            None,
+        ));
     };
     // #2313: refused before any wire bytes are built or sent — an exhausted
     // run allowance stops dispatch, it does not fail a request that went out.
     if let Some(allowance) = scope.run_allowance {
         allowance.try_reserve()?;
     }
-    let (client, request) = request.build_split();
-    let request = request.map_err(dispatch_error)?;
     let Some(bytes) = request.body().and_then(reqwest::Body::as_bytes) else {
         anyhow::bail!(
             "an inference request without an in-memory body cannot be recorded as an attempt"
@@ -127,12 +130,12 @@ pub(crate) async fn send<'a>(
         settled: AtomicBool::new(false),
     };
     // Held across the request, so an interrupt that drops the send cancels it.
-    let response = client.execute(request).await;
+    let response = super::generation_bounds::execute(&client, request, failure).await;
     let response = match response {
         Ok(response) => response,
         Err(error) => {
             attempt.settled.store(true, Ordering::Relaxed);
-            return Err(dispatch_error(error));
+            return Err(error);
         }
     };
     Ok((response, Some(attempt)))

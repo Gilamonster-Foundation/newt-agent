@@ -102,6 +102,12 @@ async fn openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
     let body = |i: usize| -> serde_json::Value {
         serde_json::from_slice(&reqs[i].body).unwrap_or_default()
     };
+    // #2782 + #2825: recovery admits at most 31,999 input tokens (strictly
+    // below the 32k ceiling), leaving 8,001 for output in the learned 40k
+    // window. No explicit output allowance pins that capacity to 8,000.
+    // Both the recovered primary and final summary use the same split.
+    assert_eq!(body(1)["max_tokens"], 8_001);
+    assert_eq!(body(2)["max_tokens"], 8_001);
     assert!(
         body(1)["messages"].to_string().len() < body(0)["messages"].to_string().len(),
         "recovery must shrink the request before retrying the same logical round"

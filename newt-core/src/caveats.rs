@@ -125,6 +125,15 @@ pub fn lock_fs_to_workspace(
         }
         Scope::Only(set) => Scope::only(set.iter().cloned().chain(write_grants.iter().cloned())),
     };
+    #[cfg(target_os = "macos")]
+    for scope in [&mut caveats.fs_read, &mut caveats.fs_write] {
+        if let Scope::Only(roots) = scope {
+            *roots = roots
+                .iter()
+                .map(|root| crate::fs_aliases::rewrite(root).into_owned())
+                .collect();
+        }
+    }
 }
 
 /// Apply [`lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
@@ -180,6 +189,10 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
 /// (`openat2 RESOLVE_BENEATH`) is what closes that. What this DOES close are the
 /// string-only escapes — `..` traversal and sibling-prefix collisions.
 pub(crate) fn lexically_normalize(path: &str) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    let path = crate::fs_aliases::rewrite(path);
+    #[cfg(target_os = "macos")]
+    let path = path.as_ref();
     use std::path::{Component, PathBuf};
     let mut out = PathBuf::new();
     for comp in std::path::Path::new(path).components() {

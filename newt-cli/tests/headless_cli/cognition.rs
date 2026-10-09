@@ -50,7 +50,7 @@ async fn assert_semantic_chat(allowance: Option<u32>, capable: bool) {
         assert_eq!(requests[0]["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(contract["effective_config"]["cognition"], "meticulous");
     } else {
-        for key in ["max_tokens", "chat_template_kwargs", "temperature", "top_p"] {
+        for key in ["chat_template_kwargs", "temperature", "top_p"] {
             assert!(
                 requests[0].get(key).is_none(),
                 "strict request acquired {key}: {}",
@@ -59,18 +59,15 @@ async fn assert_semantic_chat(allowance: Option<u32>, capable: bool) {
         }
         assert_eq!(contract["effective_config"]["cognition"], "default");
     }
-    let expected_allowance = allowance.or(capable.then_some(16_000));
-    match expected_allowance {
-        None => assert!(contract["effective_config"]
-            .get("output_allowance")
-            .is_none()),
-        Some(tokens) => assert_eq!(
-            contract["effective_config"]["output_allowance"],
-            serde_json::json!({
-                "tokens": tokens, "enforced": if capable { "server" } else { "local" }
-            })
-        ),
-    }
+    // #2782: cognition remains capability-gated; an independent output cap
+    // always applies. The unknown endpoint keeps the 80% input ceiling of
+    // 26,214, leaving 6,554 output tokens inside the declared 32,768 window.
+    let expected_allowance = allowance.unwrap_or(if capable { 16_000 } else { 6_554 });
+    assert_eq!(requests[0]["max_tokens"], expected_allowance);
+    assert_eq!(
+        contract["effective_config"]["output_allowance"],
+        serde_json::json!({"tokens": expected_allowance, "enforced": "server"})
+    );
     assert_eq!(
         contract["effective_config"]["semantic_cognition"], "meticulous",
         "captured intent stays separate from accepted wire projection"
@@ -78,7 +75,8 @@ async fn assert_semantic_chat(allowance: Option<u32>, capable: bool) {
 }
 
 /// Suite #2449: the actual process and HTTP request ground the projection
-/// tests. Unknown Chat retains no cognition-derived fields or reservation.
+/// tests. Unknown Chat retains no cognition-derived fields or reservation;
+/// #2782 still bounds generation inside the remaining declared window.
 #[tokio::test(flavor = "multi_thread")]
 async fn semantic_cognition_survives_unknown_chat_without_changing_admission() {
     assert_semantic_chat(None, false).await;

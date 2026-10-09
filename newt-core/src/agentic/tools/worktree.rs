@@ -193,7 +193,7 @@ fn creation(
         let words = command
             .argv
             .iter()
-            .map(|s| literal(s))
+            .map(|s| git_identity::argument(s))
             .collect::<Option<Vec<_>>>()?;
         let Some(add_args) = worktree_add_args(&words) else {
             continue;
@@ -264,13 +264,18 @@ fn creation_batch_is_read_only_after_add(
     }
     let mut additions = 0;
     let safe = inspection.commands.iter().all(|c| {
-        if c.redirects.iter().any(redirect_has_effect) {
+        if !c.descendant_execs.is_empty()
+            || !c
+                .argv
+                .first()
+                .is_some_and(|word| c.source.starts_with(word))
+        {
             return false;
         }
         let Some(words) = c
             .argv
             .iter()
-            .map(|s| literal(s))
+            .map(|s| git_identity::argument(s))
             .collect::<Option<Vec<_>>>()
         else {
             return false;
@@ -280,15 +285,13 @@ fn creation_batch_is_read_only_after_add(
             Some("git") => {
                 if worktree_add_args(&words).is_some() {
                     additions += 1;
-                    true
+                    c.redirects.iter().all(|r| {
+                        r.fd == Some(2)
+                            && r.operation == agent_bridle::RedirectOperation::DuplicateOutput
+                            && r.target == "1"
+                    })
                 } else {
-                    matches!(
-                        args.as_slice(),
-                        ["branch", "--show-current"]
-                            | ["worktree", "list"]
-                            | ["status"]
-                            | ["status", "--short"]
-                    )
+                    c.redirects.is_empty() && git_identity::read_only(&args)
                 }
             }
             // #2810: bounded stdin-only tail is read-only, but its basename
@@ -301,7 +304,7 @@ fn creation_batch_is_read_only_after_add(
                     && super::super::routing::parse_trim_spec(&words.join(" ")).is_some()
             }
             // Only actual shell builtins have an intrinsic implementation.
-            Some(program) => display_builtin(program, engine),
+            Some(program) => c.redirects.is_empty() && display_builtin(program, engine),
             None => false,
         }
     });
@@ -375,6 +378,18 @@ impl PermissionGate for Guard<'_, '_> {
         if let Some(g) = self.inner.as_deref_mut() {
             g.queue_pending_once(kind, target);
         }
+    }
+    fn queue_command_retry(&mut self, command: &str, cwd: &str, requests: &[PermissionRequest]) {
+        if let Some(g) = self.inner.as_deref_mut() {
+            g.queue_command_retry(command, cwd, requests);
+        }
+    }
+    fn apply_command_retry(&mut self, command: &str, cwd: &str, base: &Caveats) -> Caveats {
+        let c = self.inner.as_deref_mut().map_or_else(
+            || base.clone(),
+            |g| g.apply_command_retry(command, cwd, base),
+        );
+        self.policy.attenuate(&c)
     }
     fn apply_pending_once(&mut self, kind: DenialKind, target: &str, base: &Caveats) -> Caveats {
         let c = self.inner.as_deref_mut().map_or_else(

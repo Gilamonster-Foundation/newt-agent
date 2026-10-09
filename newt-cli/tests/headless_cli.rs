@@ -589,12 +589,11 @@ async fn headless_refuses_an_invalid_output_allowance_before_inference() {
     assert!(!events_path.exists(), "a refused run records no trace");
 }
 
-/// #2312: a headless run can set its output allowance, and the contract says
-/// whether the server was told (`max_tokens` on the wire) or newt only reserved
-/// it locally. Every contract read is paired with the captured bodies, so an
-/// `enforced` predicted from configuration rather than the request cannot pass.
+/// #2312/#2782: CLI and tuning allowances are bounded on the Chat wire even
+/// without cognition projection. Pair each contract read with captured bodies
+/// so an enforcement claim unsupported by the actual request cannot pass.
 #[tokio::test(flavor = "multi_thread")]
-async fn headless_output_allowance_reports_server_or_local_enforcement_from_the_wire() {
+async fn headless_output_allowance_reports_server_enforcement_from_the_wire() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -642,9 +641,9 @@ output_allowance = 12000
 "#,
         server.uri()
     );
-    for (name, config, flag, enforced) in [
-        ("projecting", projecting, true, "server"),
-        ("unknown", unknown, false, "local"),
+    for (name, config, flag) in [
+        ("projecting", projecting, true),
+        ("unknown", unknown, false),
     ] {
         let config_path = fixture.path().join(format!("{name}.toml"));
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
@@ -669,16 +668,11 @@ output_allowance = 12000
         let bodies = std::mem::take(&mut *requests.lock().expect("request capture lock"));
         assert!(!bodies.is_empty(), "{name}: the run reached the model");
         for body in &bodies {
-            let sent = body.get("max_tokens");
-            if enforced == "server" {
-                assert_eq!(sent, Some(&serde_json::json!(12000)), "{name}: {body}");
-            } else {
-                assert_eq!(sent, None, "{name}: no cap may be sent: {body}");
-            }
+            assert_eq!(body["max_tokens"], 12000, "{name}: cap is sent");
         }
         assert_eq!(
             contract_from(&events_path)["effective_config"]["output_allowance"],
-            serde_json::json!({"tokens": 12000, "enforced": enforced}),
+            serde_json::json!({"tokens": 12000, "enforced": "server"}),
             "{name}"
         );
     }
@@ -1245,7 +1239,12 @@ api = "chat_completions"
     // intent, not evidence the endpoint supports the wire fields.
     assert_eq!(requests.len(), 1);
     for request in requests.iter() {
-        assert!(request.get("max_tokens").is_none());
+        assert!(
+            request["max_tokens"]
+                .as_u64()
+                .is_some_and(|cap| cap > 0 && cap <= 16_384),
+            "#2782: generation is bounded independently of cognition"
+        );
         assert!(request.get("chat_template_kwargs").is_none());
     }
     drop(requests);

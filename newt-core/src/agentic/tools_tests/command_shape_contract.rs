@@ -318,10 +318,13 @@ async fn check(row: Row) {
             "plain gh must resolve to the inert libtest child before PR execution"
         );
     }
+    // The SHA-start row uses an actual fixture commit, never shell expansion.
+    let seed = crate::agentic::claim_check::git_head(root.to_str().unwrap(), &Scope::All).unwrap();
+    let command = row.command.replace("FIXTURE_COMMIT", &seed);
     let (name, args) = if row.command == "read_file marker" {
         ("read_file", serde_json::json!({"path":"marker"}))
     } else {
-        ("run_command", serde_json::json!({"command":row.command}))
+        ("run_command", serde_json::json!({"command":command}))
     };
     let execution = OnceLock::new();
     let directory = OnceLock::new();
@@ -454,6 +457,28 @@ async fn check(row: Row) {
     // #2810: recording a task path alone is not confined adoption.
     if row.mode == Mode::Confined && row.setup == Setup::Fresh && row.bound {
         assert!(session.snapshot().is_some(), "{}: {out}", row.command);
+        assert_eq!(
+            crate::agentic::claim_check::git_head(task.to_str().unwrap(), &Scope::All),
+            Some(seed.clone()),
+            "start point: {out}"
+        );
+    }
+    if row.mode == Mode::Confined && row.setup == Setup::Fresh {
+        assert_eq!(
+            std::fs::read_to_string(root.join("marker")).unwrap(),
+            "original marker"
+        );
+        assert_eq!(
+            crate::agentic::claim_check::git_head(root.to_str().unwrap(), &Scope::All),
+            Some(seed),
+            "original tip: {out}"
+        );
+        if row.refused {
+            assert!(
+                !task.exists(),
+                "refusal must precede destination creation: {out}"
+            );
+        }
     }
     if let Some(kind) = row.gate {
         assert!(
@@ -593,8 +618,8 @@ confined_task_ref_update, Confined, Adopted, "git branch followup", Some(Failed)
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
 confined_local_push, Confined, AdoptedPublish, "confined-executor git push", Some(Passed), Task, true, false, "", None, "";
-// TODO row (c), PR #2814: blank plan approval -> Approved once it lands.
-// The macOS job also selects plan_mode::tests to inherit that regression.
+// Row (c), PR #2814: the macOS job selects plan_mode::tests, including
+// the regression proving blank plan approval -> Approved.
 // Worktree creation exercises automatic binding, not a pre-seeded session (#2791).
 standalone, Plain, Fresh, "git worktree add -b task ../task", Some(Passed), Original, true, false, "", None, "";
 compound, Plain, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Passed), Original, true, false, "", None, "";
@@ -634,10 +659,45 @@ commit_claim, Plain, Bound, "git status --short", Some(Passed), Task, true, fals
 true_push_claim, Plain, Publish, "git push origin task", Some(Passed), Task, true, false, "Pushed: origin/task is live.", None, "Pushed: origin/task is live.";
 true_commit_claim, Plain, Bound, "git -c commit.gpgsign=false commit --allow-empty -m contract", Some(Passed), Task, true, false, "HEAD moved", None, "I committed the change locally.";
 #[cfg(unix)]
-// #2810: verified read-only output wrappers retain confined adoption.
-// Native macOS counterpart runs with production Brush in the harness=false binary.
-#[cfg(not(target_os = "macos"))]
-confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Passed), Original, true, false, "?? marker", None, "";
+// PR #2827: status can launch repository helpers before the adoption fence.
+confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Denied), Neither, false, true, "standalone literal", None, "";
+// #2810/#2812 follow-up: the observed compound shape must adopt, not fall
+// back to creating a branch in the original checkout. Fixture operands replace
+// the live branch/path; the argv and shell structure are otherwise exact.
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
+readonly_git_r5, Confined, Fresh, "git worktree add -b task ../task . 2>&1 | tail -5 && git branch --show-current", Some(Passed), Original, true, false, "main", None, "";
+#[cfg(unix)]
+readonly_git_status, Confined, Fresh, "git worktree add -b task ../task HEAD && git status -s", Some(Denied), Neither, false, true, "standalone literal", None, "";
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
+readonly_git_revparse, Confined, Fresh, "git worktree add -b task ../task main && git rev-parse --abbrev-ref HEAD", Some(Passed), Original, true, false, "main", None, "";
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
+readonly_git_sha, Confined, Fresh, "git worktree add -b task ../task FIXTURE_COMMIT && git branch --show-current", Some(Passed), Original, true, false, "main", None, "";
+#[cfg(unix)]
+readonly_git_log_compact, Confined, Fresh, "git worktree add -b task ../task HEAD && git log --oneline -5", Some(Denied), Neither, false, true, "standalone literal", None, "";
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
+readonly_git_worktree_list, Confined, Fresh, "git worktree add -b task ../task HEAD && git worktree list", Some(Passed), Original, true, false, "[task]", None, "";
+#[cfg(unix)]
+readonly_git_porcelain, Confined, Fresh, "git worktree add -b task ../task HEAD && git status --porcelain", Some(Denied), Neither, false, true, "standalone literal", None, "";
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
+readonly_git_head, Confined, Fresh, "git worktree add -b task ../task HEAD && git rev-parse HEAD", Some(Passed), Original, true, false, "Adopted task worktree", None, "";
+// Native macOS positive runs with production Brush in contract_siblings.rs.
+#[cfg(all(unix, not(target_os = "macos")))]
+readonly_git_toplevel, Confined, Fresh, "git worktree add -b task ../task HEAD && git rev-parse --show-toplevel", Some(Passed), Original, true, false, "original", None, "";
+#[cfg(unix)]
+readonly_git_commit_refused, Confined, Fresh, "git worktree add -b task ../task && git commit -m bad", Some(Denied), Neither, false, true, "Do not create the branch in the original checkout", None, "";
+#[cfg(unix)]
+readonly_git_checkout_refused, Confined, Fresh, "git worktree add -b task ../task && git checkout -b bad", Some(Denied), Neither, false, true, "standalone literal", None, "";
+#[cfg(unix)]
+readonly_git_config_refused, Confined, Fresh, "git worktree add -b task ../task && git -c core.pager=cat branch --show-current", Some(Denied), Neither, false, true, "standalone literal", None, "";
+#[cfg(unix)]
+readonly_git_redirect_refused, Confined, Fresh, "git worktree add -b task ../task && git branch --show-current > marker", Some(Denied), Neither, false, true, "standalone literal", None, "";
+#[cfg(unix)]
+readonly_git_alias_refused, Confined, Fresh, "git worktree add -b task ../task && git st", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]

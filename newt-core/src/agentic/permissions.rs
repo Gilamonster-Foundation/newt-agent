@@ -346,6 +346,19 @@ pub trait PermissionGate {
     /// no-op: gates with no such queue have nothing to hold.
     fn queue_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
 
+    /// Hold an approved exec denial for this exact command and working directory.
+    /// Interpreters cannot be projected by shell inspection. Binding the invocation
+    /// lets its explicit retry use exact granted paths without replaying effects.
+    /// Gates without invocation-bound storage fail closed; never degrade this
+    /// approval into the older target-only pending queue.
+    fn queue_command_retry(&mut self, _command: &str, _cwd: &str, _requests: &[PermissionRequest]) {
+    }
+
+    /// Consume a matching invocation-bound grant without creating standing authority.
+    fn apply_command_retry(&mut self, _command: &str, _cwd: &str, base: &Caveats) -> Caveats {
+        base.clone()
+    }
+
     /// #2691 round 3 (P2): called BEFORE a dispatch runs (`shell.rs`,
     /// `exec_confined_command_with_broker`'s top), once per exec target the
     /// about-to-run command statically needs. When `(kind, target)` is
@@ -449,6 +462,12 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
             DenialKind::GitWrite | DenialKind::Build => continue,
         };
         if let Scope::Only(set) = scope {
+            #[cfg(target_os = "macos")]
+            let target = if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
+                crate::fs_aliases::rewrite(target).into_owned()
+            } else {
+                target.clone()
+            };
             set.insert(target.clone());
         }
     }
@@ -507,6 +526,37 @@ impl PermissionRecord {
 
 #[cfg(test)]
 mod tests {
+
+    /// #2823: invocation-bound approval must never fall back to a target-only queue.
+    #[test]
+    fn command_retry_default_does_not_queue_legacy_authority() {
+        #[derive(Default)]
+        struct LegacyGate(Vec<(DenialKind, String)>);
+        impl PermissionGate for LegacyGate {
+            fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+                PermissionDecision::Deny
+            }
+            fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+                HumanQuestionOutcome::Unavailable
+            }
+            fn queue_pending_once(&mut self, kind: DenialKind, target: &str) {
+                self.0.push((kind, target.into()));
+            }
+        }
+        let mut gate = LegacyGate::default();
+        let request = PermissionRequest {
+            tool: "run_command".into(),
+            kind: DenialKind::Exec,
+            target: "/bin/bash".into(),
+            reason: "denied".into(),
+            harness_bound: true,
+        };
+        gate.queue_command_retry("bash script.sh", "/workspace", &[request]);
+        assert!(
+            gate.0.is_empty(),
+            "invocation grant degraded into transferable target authority"
+        );
+    }
     use super::*;
     use crate::caveats::{CaveatsExt as _, CountBound};
 

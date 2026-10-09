@@ -5,6 +5,8 @@
 mod chat;
 #[path = "contract_diagnostics.rs"]
 mod diagnostics;
+#[path = "contract_siblings.rs"]
+mod siblings;
 
 use super::native::{real_git, real_git_output, TrailerGitTool};
 use newt_core::{worktree_adoption::WorktreeSession, Caveats, Scope};
@@ -69,6 +71,7 @@ pub fn run() {
             if std::env::args().any(|arg| arg == "--publication") {
                 governed_publication().await;
             } else {
+                siblings::run().await;
                 for wrapper in [false, true] {
                     creation_and_security(wrapper).await;
                 }
@@ -118,7 +121,7 @@ async fn adopt(
     wrapper: bool,
 ) {
     let command = if wrapper {
-        "git worktree add -b task ../task 2>&1 | tail -5 && git status --short"
+        "git worktree add -b task ../task 2>&1 | tail -5 && git branch --show-current"
     } else {
         "git worktree add -b task ../task"
     };
