@@ -1,5 +1,7 @@
 """Distinguish parser evidence from failures to execute the trusted parser."""
 
+from __future__ import annotations
+
 from pathlib import Path
 import re
 import subprocess

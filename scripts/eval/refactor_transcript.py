@@ -1,5 +1,7 @@
 """Bounded transcript ingestion, independent of the size of a tmux capture."""
 
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
 
