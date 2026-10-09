@@ -28,6 +28,10 @@ sys.path.insert(
 from newt_conformance import content_id, encode  # noqa: E402
 
 
+class HelperUnavailable(RuntimeError):
+    """The grader cannot establish a verdict without its trusted parser."""
+
+
 class EvidenceError(RuntimeError):
     """Unavailable evidence is a failing grade, not proof of fabrication."""
 
@@ -88,8 +92,15 @@ def reflog_entries(text: str) -> list[tuple[str, int, str]]:
 
 
 @cache
-def syntax_helper() -> Path:
-    """Build only trusted grader code, offline, once per grading process."""
+def syntax_helper(prebuilt: Path | None = None, *, prepare: bool = False) -> Path:
+    """Prepare trusted code with downloads, or grade offline using a prepared binary."""
+    if prebuilt is not None:
+        binary = prebuilt.resolve()
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise HelperUnavailable(
+                "prebuilt syntax helper is missing or not executable"
+            )
+        return binary
     root = Path(__file__).resolve().parents[2]
     prefix = [
         "env",
@@ -101,18 +112,25 @@ def syntax_helper() -> Path:
         "ionice",
         "-c3",
     ]
-    run(
-        [
-            *prefix,
-            "cargo",
-            "build",
-            "--offline",
-            "--locked",
-            "-p",
-            "newt-refactor-evidence",
-        ],
-        root,
-    )
+    try:
+        run(
+            [
+                *prefix,
+                "cargo",
+                "build",
+                *([] if prepare else ["--offline"]),
+                "--locked",
+                "-p",
+                "newt-refactor-evidence",
+            ],
+            root,
+        )
+    except EvidenceError as exc:
+        raise HelperUnavailable(
+            "syntax helper build unavailable; run --prepare-helper with registry access, "
+            "then grade with --syntax-helper PATH using the printed binary path. "
+            f"No extraction verdict was established: {exc}"
+        ) from exc
     return (
         root
         / "target"
@@ -125,7 +143,12 @@ def syntax_helper() -> Path:
     )
 
 
-def extraction(before: dict[str, str], after: dict[str, str], target: str) -> list[str]:
+def extraction(
+    before: dict[str, str],
+    after: dict[str, str],
+    target: str,
+    helper: Path | None = None,
+) -> list[str]:
     """Require a parsed unconditional item moved into a directly wired module."""
     old, new = before[target], after.get(target, "")
     if not new or line_count(new) >= line_count(old):
@@ -150,7 +173,9 @@ def extraction(before: dict[str, str], after: dict[str, str], target: str) -> li
             else:
                 continue
             paths[2].write_text(after[path])
-            output = run([str(syntax_helper()), *map(str, paths), name], root).strip()
+            output = run(
+                [str(syntax_helper(helper)), *map(str, paths), name], root
+            ).strip()
             if output == "MATCH":
                 moved.append(path)
             elif output != "NONE":
@@ -158,7 +183,24 @@ def extraction(before: dict[str, str], after: dict[str, str], target: str) -> li
     return moved
 
 
+def invalid_helper_report(exc: Exception) -> dict:
+    return {
+        "pass": False,
+        "status": "INVALID",
+        "error": str(exc),
+        "criteria": {"extraction": {"status": "UNGRADED", "evidence": str(exc)}},
+    }
+
+
 def grade(args: argparse.Namespace, command=run) -> dict:
+    """Infrastructure failures invalidate the run instead of grading the agent."""
+    try:
+        return collect_grade(args, command)
+    except HelperUnavailable as exc:
+        return invalid_helper_report(exc)
+
+
+def collect_grade(args: argparse.Namespace, command=run) -> dict:
     """Collect independent evidence; each failed collection leaves a FAIL row."""
     repo, worktree = args.repo.resolve(), args.worktree.resolve()
     criteria: dict[str, dict] = {}
@@ -200,7 +242,10 @@ def grade(args: argparse.Namespace, command=run) -> dict:
             bool(touched),
             {"seed_lines": size, "largest": largest, "touched": touched},
         )
-        modules = {p: extraction(before, after, p) for p in touched}
+        modules = {
+            p: extraction(before, after, p, getattr(args, "syntax_helper", None))
+            for p in touched
+        }
         row("extraction", any(modules.values()), modules)
         git("merge-base", "--is-ancestor", seed, head)
         facts["commits"] = git("rev-list", f"{seed}..{head}").splitlines()
@@ -292,7 +337,9 @@ def grade(args: argparse.Namespace, command=run) -> dict:
                 continue
             parent_tree, commit_tree = tree(parents[1]), tree(sha)
             moved = {
-                p: extraction(parent_tree, commit_tree, p)
+                p: extraction(
+                    parent_tree, commit_tree, p, getattr(args, "syntax_helper", None)
+                )
                 for p in touched
                 if p in parent_tree
             }
@@ -418,12 +465,25 @@ def render(report: dict) -> None:
     verdict = "PASS" if report["pass"] else "UNGRADED"
     if any(row["status"] == "FAIL" for row in report["criteria"].values()):
         verdict = "FAIL"
+    if report.get("status") == "INVALID":
+        verdict = "INVALID"
+        print(report["error"], file=sys.stderr)
     print(verdict, file=sys.stderr)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify-report", type=Path)
+    parser.add_argument(
+        "--prepare-helper",
+        action="store_true",
+        help="build trusted parser with locked dependencies; allow downloads and print its path",
+    )
+    parser.add_argument(
+        "--syntax-helper",
+        type=Path,
+        help="trusted prebuilt parser; bypass Cargo and its dependency cache",
+    )
     parser.add_argument("--repo", type=Path)
     parser.add_argument("--worktree", type=Path)
     parser.add_argument("--seed")
@@ -456,7 +516,13 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
-        if args.verify_report:
+        if args.prepare_helper:
+            try:
+                print(syntax_helper(prepare=True))
+                return 0
+            except HelperUnavailable as exc:
+                report = invalid_helper_report(exc)
+        elif args.verify_report:
             report = verify(json.loads(args.verify_report.read_text()))
         else:
             for name in (
@@ -477,7 +543,7 @@ def main() -> int:
             report = grade(args)
         print(json.dumps(seal(report), ensure_ascii=False))
         render(report)
-        return 0 if report["pass"] else 1
+        return 2 if report.get("status") == "INVALID" else (0 if report["pass"] else 1)
     except (OSError, ValueError, KeyError) as exc:
         print(json.dumps({"pass": False, "error": str(exc)}))
         return 2

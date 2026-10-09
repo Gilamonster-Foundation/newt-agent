@@ -77,7 +77,7 @@ The endpoint template (host stays local) is `loop-template.example`.
 `grade_refactor.py` grades the seed-to-branch diff and the run's final claims.
 It prints a content-addressed JSON envelope on stdout and PASS/FAIL per criterion
 on stderr. Exit codes: 0 all criteria pass, 1 failed/unverifiable criterion,
-2 invalid invocation or report. No model is called; GitHub commands only read.
+2 invalid invocation, report, or grader infrastructure. No model is called; GitHub commands only read.
 
 ```bash
 python scripts/eval/grade_refactor.py \
@@ -116,12 +116,33 @@ conditional wrappers, and generic/async/unsafe wrappers are declined; this
 helper does not resolve arbitrary paths or prove their semantics.
 This remains structural evidence, not macro expansion or semantic equivalence.
 
-The grader builds the trusted `newt-refactor-evidence` workspace helper offline
-once per process in its own checkout's target directory. Cargo dependencies
-must already be cached (normal workspace setup); an unavailable helper fails
-grading. syn and quote were already locked workspace dependencies. Offline
-Python tests exercise this real parser, including a sanitized positive shaped
-like the passing extraction and inactive-text negative controls.
+Prepare the trusted `newt-refactor-evidence` parser once with registry access:
+
+```bash
+python scripts/eval/grade_refactor.py --prepare-helper
+# Pass the printed absolute binary path to subsequent grading invocations:
+python scripts/eval/grade_refactor.py --syntax-helper <prepared-binary> <grading-arguments>
+```
+
+Preparation runs `cargo build --locked -p newt-refactor-evidence` in the trusted
+grader checkout, allowing missing dependencies to download. Grading with
+`--syntax-helper` executes that binary directly without invoking Cargo: clearing
+the registry cache does not affect it. Keep the binary outside any target-directory
+cleanup, or prepare it again after cleaning build outputs. Use only a trusted
+binary built from the grader revision being used; rebuild after updating that
+revision. No binary or dependency cache is committed.
+
+Without `--syntax-helper`, the grader retains its offline, locked build fallback.
+If that build fails (including missing cached dependencies), the report is
+**INVALID**, extraction is **UNGRADED**, and the exit code is **2**. This aborts
+grading rather than reporting an extraction FAIL or deriving secondary failures
+from missing parser evidence. The error includes the build diagnostic and the
+preparation command. A missing/non-executable prebuilt helper also invalidates
+grading. Preparation failures and replayed INVALID reports return 2 too.
+Unsupported candidate Rust syntax still fails extraction; it is not a build
+infrastructure error. syn and quote remain existing locked dependencies. Offline
+Python tests exercise the real parser and prove that a prepared binary grades
+successfully with an empty Cargo cache.
 
 Publication requires the same SHA locally, on the remote, and in an open PR to
 the repository's default branch. A fresh `--no-local` clone of the remote branch
