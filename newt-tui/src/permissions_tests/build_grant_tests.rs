@@ -88,9 +88,10 @@ fn a_session_build_grant_covers_exec_of_the_same_build_tool() {
 
 /// Build-covered execution keeps the calibrated filesystem fence and the
 /// invocation's existing network authority. Recalled grants cannot restore
-/// attenuated networking, and an explicit Plan ceiling still wins.
+/// attenuated networking. Plan temporarily clamps the retained Build grant;
+/// releasing Plan restores exactly the previous build authority without a prompt.
 #[test]
-fn a_build_covered_exec_keeps_network_authority_and_the_build_fence() {
+fn plan_release_preserves_build_grant_and_network_bounds() {
     let ws = "/ws";
     let cargo_test = PermissionRequest {
         tool: "run_command".into(),
@@ -122,7 +123,8 @@ fn a_build_covered_exec_keeps_network_authority_and_the_build_fence() {
             vec![],
             prompts.clone(),
         );
-        for plan_active in [false, true] {
+        let mut before_plan = None;
+        for plan_active in [false, true, false] {
             gate.preset_clamp = plan_active.then(newt_core::agentic::plan_phase_clamp);
             let decision = gate.ask_with_caveats(&baseline, std::slice::from_ref(&cargo_test));
             let newt_core::PermissionDecision::Allow(caveats) = decision else {
@@ -142,6 +144,16 @@ fn a_build_covered_exec_keeps_network_authority_and_the_build_fence() {
             assert!(!caveats.permits_fs_write("/outside"));
             assert!(!caveats.permits_fs_read("/outside"));
             assert_eq!(caveats.max_calls, baseline.max_calls);
+            if !plan_active {
+                if let Some(before) = &before_plan {
+                    assert_eq!(
+                        &caveats, before,
+                        "release restores exactly the prior authority"
+                    );
+                } else {
+                    before_plan = Some(caveats);
+                }
+            }
         }
         assert_eq!(prompts.get(), 0, "the existing Build grant is reused");
     }
