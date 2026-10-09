@@ -45,7 +45,7 @@ fn worktree_adoption_round5_git_identity_sweep() {
         );
     }
     assert!(creation_batch_is_read_only_after_add(
-        &serde_json::json!({"command": "git worktree add ../task -b task; git status"}),
+        &serde_json::json!({"command": "git worktree add ../task -b task; git branch --show-current"}),
         crate::ShellEngine::Brush
     ));
 }
@@ -103,7 +103,7 @@ async fn worktree_adoption_round5_replacement_preserves_sentinel() {
     assert!(!temp.path().join("task").exists());
     assert!(session.snapshot().is_none());
     let (text, outcome) = dispatch(
-        serde_json::json!({"command": "pwd; git worktree add ../task -b task; git status; echo ready"}),
+        serde_json::json!({"command": "pwd; git worktree add ../task -b task; git branch --show-current; echo ready"}),
         &root,
         &c,
         &session,
@@ -118,10 +118,10 @@ async fn worktree_adoption_round5_replacement_preserves_sentinel() {
 #[test]
 fn worktree_adoption_round5_pins_every_git_word_without_changing_operands() {
     let source =
-        "pwd; git worktree add ../task -b task 2>&1 && echo 'git status; café' ; 'git' status";
+        "pwd; git worktree add ../task -b task 2>&1 && echo 'git status; café' ; 'git' branch --show-current";
     let pinned =
         git_identity::pin(source, Path::new("/trusted tool/bin/git"), &Caveats::top()).unwrap();
-    assert_eq!(pinned, "pwd; '/trusted tool/bin/git' worktree add ../task -b task 2>&1 && echo 'git status; café' ; '/trusted tool/bin/git' --no-pager --no-optional-locks status");
+    assert_eq!(pinned, "pwd; '/trusted tool/bin/git' worktree add ../task -b task 2>&1 && echo 'git status; café' ; '/trusted tool/bin/git' --no-pager --no-optional-locks branch --show-current");
     for source in [
         "# git status\ngit status",
         "PATH=/authorized/bin git status",
