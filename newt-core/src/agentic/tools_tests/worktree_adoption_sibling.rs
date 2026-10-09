@@ -308,7 +308,8 @@ async fn plan_release_preserves_worktree_adoption() {
                     plan.take_exit_requested(),
                     "approval follows an exit request"
                 );
-                // Same operation performed by the TUI's approved verdict.
+                // Component-level release using this fixture's phase controller;
+                // the CLI approval guard exercises the production transition.
                 plan.set_plan_mode(false).unwrap();
             }
             let current = if phase == Phase::Plan {
