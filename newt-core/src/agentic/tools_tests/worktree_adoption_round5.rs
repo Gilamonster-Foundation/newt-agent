@@ -121,7 +121,7 @@ fn worktree_adoption_round5_pins_every_git_word_without_changing_operands() {
         "pwd; git worktree add ../task -b task 2>&1 && echo 'git status; café' ; 'git' status";
     let pinned =
         git_identity::pin(source, Path::new("/trusted tool/bin/git"), &Caveats::top()).unwrap();
-    assert_eq!(pinned, "pwd; '/trusted tool/bin/git' worktree add ../task -b task 2>&1 && echo 'git status; café' ; '/trusted tool/bin/git' status");
+    assert_eq!(pinned, "pwd; '/trusted tool/bin/git' worktree add ../task -b task 2>&1 && echo 'git status; café' ; '/trusted tool/bin/git' --no-pager --no-optional-locks status");
     for source in [
         "# git status\ngit status",
         "PATH=/authorized/bin git status",
