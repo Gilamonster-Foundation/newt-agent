@@ -229,3 +229,32 @@ The `edit` approval option and the RichTUI plan pane (parent design); a
 `/goal` verb or the `resolute` tenacity level (a declared check the harness
 runs before accepting "done"); rendering each dial's `describe()` in the psyche
 panel; reading or editing the composed system prompt from the TUI.
+
+## Publish one extraction before expanding the refactor (#2831)
+
+The plan guidance and existing workflow/narration nudges ask refactor objectives
+that include a worktree and PR to use one cohesive extraction per publication
+cycle: extract **and wire it in**, check, commit, push, open the PR. Later
+extractions are follow-up commits on that PR. This is advice, not a new gate.
+
+The shared worktree result annotation observes typed execution outcomes and
+uses the existing conservative Cargo command/cwd parser. A passing `cargo check`
+in the task worktree, a commit entry in that worktree's HEAD reflog, and no
+observed governed PR creation make a one-shot publication hint eligible. The
+session remembers each branch, including failed checks and PR creation; model
+prose is never evidence. Absence from the governed ledger is not a remote GitHub
+query: the hint says no creation was observed and tells the model to update an
+existing PR if there is one. No network access or publication is triggered.
+
+Writes exceeding 1,500 lines receive a short split hint, never a refusal. The
+threshold leaves headroom over the measured successful 171–1,168-line extractions
+and flags the failed 6,096-line copy that was never wired into its parent. File
+writes include copied lines; checked moves count the extracted child; edits
+count the replaced/inserted span rather than the whole existing file.
+
+Unit tests cover the predicate, one-shot state, latest-check outcome, PR
+suppression, strict command attribution, reflog interpretation and threshold.
+A scripted ChatCtx loop with a real linked Git worktree and local Cargo check
+asserts the next provider request receives the hint after the commit. It uses
+no sleeps or model endpoint. Refactor-lab before/after runs remain the operator's
+separate behavioral measurement; these tests do not claim model success.
