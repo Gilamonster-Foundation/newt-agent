@@ -9,7 +9,7 @@ fn mutable_anchor_refusal_names_the_offending_path() {
     let workspace = root.path().canonicalize().unwrap();
     let bin = workspace.join("bin");
     std::fs::create_dir(&bin).unwrap();
-    let error = validate_stable_anchor(&bin, &[(workspace.clone(), workspace)])
+    let error = validate_stable_anchor(&bin, &[(workspace.clone(), workspace)], "smart-harness")
         .unwrap_err()
         .to_string();
     assert!(error.contains(bin.to_str().unwrap()), "{error}");
@@ -31,10 +31,10 @@ fn swapped_path_directory_cannot_read_private_frame() {
     let bin = workspace.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let writable = [(workspace.clone(), workspace.clone())];
-    assert!(validate_stable_anchor(&bin, &writable).is_err());
+    assert!(validate_stable_anchor(&bin, &writable, "smart-harness").is_err());
     std::fs::remove_dir(&bin).unwrap();
     std::os::unix::fs::symlink(&frame, &bin).unwrap();
-    assert!(validate_stable_anchor(&bin, &writable).is_err());
+    assert!(validate_stable_anchor(&bin, &writable, "smart-harness").is_err());
     let caveats = crate::confined_exec::workspace_confined_caveats(&workspace);
     let request = |path: &Path| {
         ExecRequest::new(

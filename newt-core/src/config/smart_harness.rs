@@ -441,7 +441,7 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
             dir.display(),
             root.display()
         );
-        validate_stable_anchor(&root, &writable)?;
+        validate_stable_anchor(&root, &writable, "smart-harness")?;
     }
     Ok(canonical)
 }
@@ -451,6 +451,7 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
 pub(crate) fn validate_stable_anchor(
     path: &Path,
     writable: &[(PathBuf, PathBuf)],
+    context: &str,
 ) -> anyhow::Result<()> {
     let mut pending = vec![path.to_path_buf()];
     let mut expanded = std::collections::BTreeSet::new();
@@ -463,7 +464,7 @@ pub(crate) fn validate_stable_anchor(
                     !writable.iter().any(|(write_name, write_target)| {
                         named.starts_with(write_name) || resolved.starts_with(write_target)
                     }),
-                    "smart-harness filesystem grant anchor {} has a model-writable ancestor {}",
+                    "{context} filesystem grant anchor {} has a model-writable ancestor {}",
                     path.display(),
                     parent.display()
                 );

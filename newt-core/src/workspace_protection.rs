@@ -130,10 +130,10 @@ impl WorkspaceProtection {
         // before the existing kernel backend opens it. Reuse the same bounded
         // symlink/ancestor inspection that protects private Smart frames.
         for resource in &self.write_protected {
-            validate_stable_anchor(&resource.named, &writes)?;
+            validate_stable_anchor(&resource.named, &writes, "workspace-protection")?;
         }
         for (named, _) in reads.iter().chain(&writes) {
-            validate_stable_anchor(named, &writes)?;
+            validate_stable_anchor(named, &writes, "workspace-protection")?;
         }
         Ok(())
     }
@@ -434,9 +434,15 @@ mod tests {
         let alias = workspace.join("allowed");
         symlink(&public, &alias).unwrap();
         let protection = WorkspaceProtection::new(&[], &[operator.join("identity.pem")]).unwrap();
-        assert!(protection
+        let error = protection
             .validate_caveats(&authority(&[&alias], &[&workspace]))
-            .is_err());
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("workspace-protection filesystem grant anchor"),
+            "{error}"
+        );
+        assert!(!error.contains("smart-harness"), "{error}");
         assert_eq!(std::fs::read_link(&alias).unwrap(), public);
     }
 

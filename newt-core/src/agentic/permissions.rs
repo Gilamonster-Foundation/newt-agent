@@ -448,6 +448,14 @@ pub trait PermissionGate {
 pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats {
     let mut out = base.clone();
     for (kind, target) in grants {
+        let covered = match kind {
+            DenialKind::FsRead => filesystem_grant_is_covered(&base.fs_read, target),
+            DenialKind::FsWrite => filesystem_grant_is_covered(&base.fs_write, target),
+            _ => false,
+        };
+        if covered {
+            continue;
+        }
         let scope = match kind {
             DenialKind::Exec => &mut out.exec,
             DenialKind::FsRead => &mut out.fs_read,
@@ -472,6 +480,39 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
         }
     }
     out
+}
+
+/// Do not emit redundant roots: their mutable parent would fail anchor checks.
+/// Missing names count only when their existing ancestors resolve exactly as
+/// named. Aliases, traversal and other I/O failures still require validation.
+fn filesystem_grant_is_covered(scope: &Scope<String>, target: &str) -> bool {
+    let Scope::Only(roots) = scope else {
+        return true;
+    };
+    // Canonical Windows paths use a verbatim prefix even when the signed name
+    // or policy root uses an ordinary drive path. Reuse the platform simplifier
+    // without resolving aliases or collapsing traversal in the named path.
+    let target = dunce::simplified(Path::new(target));
+    let exact = |path: &Path| {
+        path.canonicalize()
+            .is_ok_and(|resolved| dunce::simplified(&resolved).as_os_str() == path.as_os_str())
+    };
+    if !roots.iter().any(|root| {
+        let root = dunce::simplified(Path::new(root));
+        exact(root) && target.starts_with(root)
+    }) {
+        return false;
+    }
+    match target.canonicalize() {
+        Ok(resolved) => dunce::simplified(&resolved).as_os_str() == target.as_os_str(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::config::normalize_path(target)
+                .is_ok_and(|path| path.as_os_str() == target.as_os_str())
+                && crate::config::resolve_uncreated_path(target)
+                    .is_ok_and(|path| dunce::simplified(&path).as_os_str() == target.as_os_str())
+        }
+        Err(_) => false,
+    }
 }
 
 /// One prompted permission decision, recorded with the session for later
@@ -526,6 +567,88 @@ impl PermissionRecord {
 
 #[cfg(test)]
 mod tests {
+
+    /// Stale signed filesystem children must not become redundant unstable roots.
+    #[test]
+    fn missing_grant_filter_is_shared_and_keeps_axis_and_alias_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let covered = root.join("covered");
+        std::fs::create_dir(&covered).unwrap();
+        let base = Caveats {
+            fs_read: Scope::none(),
+            fs_write: Scope::only([covered.to_str().unwrap().into()]),
+            ..Caveats::top()
+        };
+        let dead = covered.join("missing/plan.md").to_str().unwrap().to_owned();
+        assert_eq!(
+            widen_caveats(&base, &[(DenialKind::FsWrite, dead.clone())]),
+            base
+        );
+        assert_ne!(
+            widen_caveats(&base, &[(DenialKind::FsRead, dead)]),
+            base,
+            "read is not covered by write"
+        );
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let names = vec![
+            outside.join("dead"),
+            Path::new(&format!("{}/../outside/dead", covered.display())).to_path_buf(),
+        ];
+        #[cfg(unix)]
+        let names = {
+            let mut names = names;
+            let alias = covered.join("alias");
+            std::os::unix::fs::symlink(&outside, &alias).unwrap();
+            names.push(alias.join("missing"));
+            names.push(alias);
+            names
+        };
+        for path in names {
+            assert_ne!(
+                widen_caveats(
+                    &base,
+                    &[(DenialKind::FsWrite, path.to_str().unwrap().into())]
+                ),
+                base,
+                "uncovered/alias/traversal: {path:?}"
+            );
+        }
+    }
+
+    /// PR #2838: canonical verbatim Windows names must not add unstable roots.
+    #[cfg(windows)]
+    #[test]
+    fn covered_windows_grants_accept_ordinary_and_verbatim_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let verbatim = temp.path().canonicalize().unwrap();
+        let ordinary = dunce::simplified(&verbatim).to_path_buf();
+        assert_ne!(ordinary.as_os_str(), verbatim.as_os_str());
+        std::fs::write(ordinary.join("existing"), "fixture").unwrap();
+        for root in [&ordinary, &verbatim] {
+            let base = Caveats {
+                fs_read: Scope::only([root.to_str().unwrap().into()]),
+                fs_write: Scope::only([root.to_str().unwrap().into()]),
+                ..Caveats::top()
+            };
+            for name in [&ordinary, &verbatim] {
+                for leaf in ["existing", "deleted\\plan.md"] {
+                    for kind in [DenialKind::FsRead, DenialKind::FsWrite] {
+                        let target = name.join(leaf).to_str().unwrap().to_owned();
+                        assert_eq!(widen_caveats(&base, &[(kind, target)]), base);
+                    }
+                }
+                // String concatenation preserves traversal in verbatim names:
+                // PathBuf::join would normalize it before the filter sees it.
+                let traversal = format!("{}\\deleted\\..\\missing", name.display());
+                assert_ne!(
+                    widen_caveats(&base, &[(DenialKind::FsWrite, traversal)]),
+                    base
+                );
+            }
+        }
+    }
 
     /// #2823: invocation-bound approval must never fall back to a target-only queue.
     #[test]
