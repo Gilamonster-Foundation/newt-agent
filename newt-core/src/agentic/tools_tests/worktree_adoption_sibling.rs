@@ -73,9 +73,10 @@ impl PermissionGate for ReadOnly {
 
 /// #2757: the old parent write-only prompt lets Git mkdir but denies opening
 /// the new .git file. An approved task destination must also remain usable
-/// after the one creation call, without opening any neighboring checkout.
+/// after the one creation call and a Plan/approval cycle, without opening any
+/// neighboring checkout or restoring writes to the original checkout.
 #[tokio::test]
-async fn sibling_grant_once_creates_and_keeps_task_readable_writable() {
+async fn plan_release_preserves_worktree_adoption() {
     let _env = crate::process_env::lock();
     let _engine =
         crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "brush");
@@ -248,6 +249,127 @@ async fn sibling_grant_once_creates_and_keeps_task_readable_writable() {
             original_index
         );
         assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), config);
+
+        // A new planning phase after adoption must not lose
+        // the task root or its projected authority on operator approval.
+        use crate::agentic::PlanModeControl as _;
+        #[derive(Default)]
+        struct Plan(std::sync::atomic::AtomicBool, std::sync::atomic::AtomicBool);
+        impl crate::agentic::PlanModeControl for Plan {
+            fn is_plan_mode(&self) -> bool {
+                self.0.load(std::sync::atomic::Ordering::SeqCst)
+            }
+            fn set_plan_mode(&self, active: bool) -> Result<(), String> {
+                self.0.store(active, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn request_exit(&self) -> Result<(), String> {
+                self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn take_exit_requested(&self) -> bool {
+                self.1.swap(false, std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+        let plan = Plan::default();
+        let ledger = crate::agentic::scheduled::SessionStepLedger::default();
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Phase {
+            Act,
+            Plan,
+            Approved,
+        }
+        for (name, args, phase) in [
+            ("enter_plan_mode", serde_json::json!({}), Phase::Act),
+            (
+                "write_file",
+                serde_json::json!({"path":"plan-guard", "content":"forbidden"}),
+                Phase::Plan,
+            ),
+            ("exit_plan_mode", serde_json::json!({}), Phase::Plan),
+            (
+                "write_file",
+                serde_json::json!({"path":"plan-guard", "content":"approved"}),
+                Phase::Approved,
+            ),
+            (
+                "run_command",
+                serde_json::json!({"command":"pwd"}),
+                Phase::Approved,
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path":root.join("seed"), "content":"forbidden"}),
+                Phase::Approved,
+            ),
+        ] {
+            if phase == Phase::Approved && plan.is_plan_mode() {
+                assert!(
+                    plan.take_exit_requested(),
+                    "approval follows an exit request"
+                );
+                // Same operation performed by the TUI's approved verdict.
+                plan.set_plan_mode(false).unwrap();
+            }
+            let current = if phase == Phase::Plan {
+                base.meet(&crate::agentic::plan_phase_clamp())
+            } else {
+                base.clone()
+            };
+            let mut display = ToolDisplay::new(Vec::new(), false, 80, 20, false);
+            let outcome = std::sync::OnceLock::new();
+            let text = execute(
+                &mut display,
+                name,
+                &args,
+                root.to_str().unwrap(),
+                false,
+                20,
+                &current,
+                &mut crate::agentic::NoMcp,
+                ToolCollaborators {
+                    worktree_session: Some(&session),
+                    plan_mode_control: Some(&plan),
+                    step_ledger: Some(&ledger),
+                    execution: Some(&outcome),
+                    ..Default::default()
+                },
+                false,
+                PromptDisposition::Act,
+            )
+            .await;
+            assert_eq!(session.task_root(&root).as_deref(), Some(target.as_path()));
+            assert_eq!(
+                plan.is_plan_mode(),
+                phase != Phase::Approved,
+                "{name}: {text}"
+            );
+            if name == "enter_plan_mode" {
+                assert!(text.contains("entered PLAN MODE"), "{text}");
+            }
+            if name == "exit_plan_mode" {
+                assert!(text.contains("exit requested"), "{text}");
+            }
+            if phase == Phase::Plan {
+                assert!(!target.join("plan-guard").exists(), "{text}");
+            }
+            if phase == Phase::Approved && name == "write_file" && args["path"] == "plan-guard" {
+                assert_eq!(
+                    std::fs::read_to_string(target.join("plan-guard")).unwrap(),
+                    "approved",
+                    "{text}"
+                );
+            }
+            if phase == Phase::Approved && name == "run_command" {
+                assert!(text.contains(target.to_str().unwrap()), "{text}");
+                assert_eq!(outcome.get(), Some(&ExecOutcome::Passed), "{text}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("seed")).unwrap(),
+                "original contents",
+                "{text}"
+            );
+        }
 
         // A current gate ceiling must also apply to native file tools, which
         // do not enter the shell's own permission refresh.
