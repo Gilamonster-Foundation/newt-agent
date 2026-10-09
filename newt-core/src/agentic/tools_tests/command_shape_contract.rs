@@ -487,25 +487,25 @@ commit_claim, Plain, Bound, "git status --short", Some(Passed), Task, true, fals
 true_push_claim, Plain, Publish, "git push origin task", Some(Passed), Task, true, false, "Pushed: origin/task is live.", None, "Pushed: origin/task is live.";
 true_commit_claim, Plain, Bound, "git -c commit.gpgsign=false commit --allow-empty -m contract", Some(Passed), Task, true, false, "HEAD moved", None, "I committed the change locally.";
 #[cfg(unix)]
-// #2810: verified read-only output wrappers retain confined adoption.
-confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Passed), Original, true, false, "?? marker", None, "";
+// PR #2827: status can launch repository helpers before the adoption fence.
+confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tail -5 && git status --short", Some(Denied), Neither, false, true, "standalone literal", None, "";
 // #2810/#2812 follow-up: the observed compound shape must adopt, not fall
 // back to creating a branch in the original checkout. Fixture operands replace
 // the live branch/path; the argv and shell structure are otherwise exact.
 #[cfg(unix)]
 readonly_git_r5, Confined, Fresh, "git worktree add -b task ../task . 2>&1 | tail -5 && git branch --show-current", Some(Passed), Original, true, false, "main", None, "";
 #[cfg(unix)]
-readonly_git_status, Confined, Fresh, "git worktree add -b task ../task HEAD && git status -s", Some(Passed), Original, true, false, "?? marker", None, "";
+readonly_git_status, Confined, Fresh, "git worktree add -b task ../task HEAD && git status -s", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
 readonly_git_revparse, Confined, Fresh, "git worktree add -b task ../task main && git rev-parse --abbrev-ref HEAD", Some(Passed), Original, true, false, "main", None, "";
 #[cfg(unix)]
-readonly_git_sha, Confined, Fresh, "git worktree add -b task ../task FIXTURE_COMMIT && git log --oneline -n 5", Some(Passed), Original, true, false, "seed", None, "";
+readonly_git_sha, Confined, Fresh, "git worktree add -b task ../task FIXTURE_COMMIT && git branch --show-current", Some(Passed), Original, true, false, "main", None, "";
 #[cfg(unix)]
-readonly_git_log_compact, Confined, Fresh, "git worktree add -b task ../task HEAD && git log --oneline -5", Some(Passed), Original, true, false, "seed", None, "";
+readonly_git_log_compact, Confined, Fresh, "git worktree add -b task ../task HEAD && git log --oneline -5", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
 readonly_git_worktree_list, Confined, Fresh, "git worktree add -b task ../task HEAD && git worktree list", Some(Passed), Original, true, false, "[task]", None, "";
 #[cfg(unix)]
-readonly_git_porcelain, Confined, Fresh, "git worktree add -b task ../task HEAD && git status --porcelain", Some(Passed), Original, true, false, "?? marker", None, "";
+readonly_git_porcelain, Confined, Fresh, "git worktree add -b task ../task HEAD && git status --porcelain", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
 readonly_git_head, Confined, Fresh, "git worktree add -b task ../task HEAD && git rev-parse HEAD", Some(Passed), Original, true, false, "Adopted task worktree", None, "";
 #[cfg(unix)]
@@ -515,9 +515,9 @@ readonly_git_commit_refused, Confined, Fresh, "git worktree add -b task ../task 
 #[cfg(unix)]
 readonly_git_checkout_refused, Confined, Fresh, "git worktree add -b task ../task && git checkout -b bad", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
-readonly_git_config_refused, Confined, Fresh, "git worktree add -b task ../task && git -c core.pager=cat log --oneline -1", Some(Denied), Neither, false, true, "standalone literal", None, "";
+readonly_git_config_refused, Confined, Fresh, "git worktree add -b task ../task && git -c core.pager=cat branch --show-current", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
-readonly_git_redirect_refused, Confined, Fresh, "git worktree add -b task ../task && git status > marker", Some(Denied), Neither, false, true, "standalone literal", None, "";
+readonly_git_redirect_refused, Confined, Fresh, "git worktree add -b task ../task && git branch --show-current > marker", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
 readonly_git_alias_refused, Confined, Fresh, "git worktree add -b task ../task && git st", Some(Denied), Neither, false, true, "standalone literal", None, "";
 #[cfg(unix)]
