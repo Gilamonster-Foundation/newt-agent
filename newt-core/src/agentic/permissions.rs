@@ -462,6 +462,12 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
             DenialKind::GitWrite | DenialKind::Build => continue,
         };
         if let Scope::Only(set) = scope {
+            #[cfg(target_os = "macos")]
+            let target = if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
+                crate::fs_aliases::rewrite(target).into_owned()
+            } else {
+                target.clone()
+            };
             set.insert(target.clone());
         }
     }
