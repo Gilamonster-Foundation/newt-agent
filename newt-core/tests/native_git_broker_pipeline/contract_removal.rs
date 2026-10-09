@@ -1,8 +1,9 @@
-//! A model must not dismantle its adopted checkout and strand the session.
+//! Explicit Git worktree administration is caught by the narrow accident guard.
 //! Runs with production Brush on both Linux and macOS (not SafeSubset).
 use super::{adopt, dispatch, fixture, real_git, real_git_output, WorktreeSession};
 
 pub async fn run() {
+    aliases().await;
     let (_temp, main, task, caveats) = fixture();
     let session = WorktreeSession::default();
     // A session without adoption retains ordinary worktree administration.
@@ -54,4 +55,62 @@ pub async fn run() {
         "{out}"
     );
     println!("PASS adopted_worktree_removal_refused_session_usable");
+}
+
+/// #2836: aliases carry the same destructive operation without a literal verb.
+async fn aliases() {
+    for source in ["command-line", "repository", "worktree"] {
+        let (_temp, main, task, caveats) = fixture();
+        let session = WorktreeSession::default();
+        adopt(&session, &main, &task, &caveats, false).await;
+        std::fs::write(task.join("uncommitted"), "alias sentinel").unwrap();
+        match source {
+            "repository" => real_git(&main, &["config", "alias.wipe", "worktree remove --force"]),
+            "worktree" => {
+                real_git(&main, &["config", "extensions.worktreeConfig", "true"]);
+                real_git(
+                    &task,
+                    &[
+                        "config",
+                        "--worktree",
+                        "alias.wipe",
+                        "worktree remove --force",
+                    ],
+                );
+            }
+            _ => {}
+        }
+        let command = if source == "command-line" {
+            format!(
+                "git -c 'alias.wipe=worktree remove --force' wipe '{}'",
+                task.display()
+            )
+        } else {
+            format!("git wipe '{}'", task.display())
+        };
+        let out = dispatch(&session, &main, &caveats, &command).await;
+        assert_eq!(
+            std::fs::read_to_string(task.join("uncommitted"))
+                .ok()
+                .as_deref(),
+            Some("alias sentinel"),
+            "{source}: {out}"
+        );
+        assert!(
+            out.contains("adopted worktree administration"),
+            "{source}: {out}"
+        );
+        assert!(task.join(".git").is_file());
+        assert!(main.join(".git/worktrees/task/HEAD").is_file());
+        // Git built-ins take precedence over aliases; preserve ordinary reads.
+        let out = dispatch(
+            &session,
+            &main,
+            &caveats,
+            "git -c 'alias.status=worktree prune' status --short",
+        )
+        .await;
+        assert!(out.contains("uncommitted"), "built-in status: {out}");
+        println!("PASS adopted_alias_refused source={source}");
+    }
 }
