@@ -605,6 +605,7 @@ pub(super) async fn execute(
     let caveats = creation_authority.as_ref().unwrap_or(caveats);
     let args = normalized.as_ref();
     let execution = collab.execution;
+    let publication = collab.governed_pr;
     if let Some(candidate) = &candidate {
         if let Err(reason) = candidate.ready() {
             if let Some(invocation) = collab.invocation {
@@ -811,6 +812,25 @@ pub(super) async fn execute(
                 "\nTask worktree: {}. The original checkout remains read-only.",
                 task_path_literal(&policy.worktree)
             ));
+        }
+    }
+    if disposition == PromptDisposition::Act {
+        if let (Some(session), Some(objective)) = (session, objective) {
+            if let Some(hint) = crate::agentic::publish_early::after_tool(
+                session,
+                objective,
+                name,
+                args,
+                workspace,
+                execution.and_then(|slot| slot.get()).copied(),
+                publication.and_then(|slot| slot.get()),
+                &caveats.fs_read,
+                command_directory
+                    .and_then(|slot| slot.get())
+                    .map(PathBuf::as_path),
+            ) {
+                result.push_str(&format!("\n{hint}"));
+            }
         }
     }
     result
