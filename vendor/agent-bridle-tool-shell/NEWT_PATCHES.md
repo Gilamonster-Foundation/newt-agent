@@ -79,3 +79,13 @@ have completed.
 Upstream these changes into agent-bridle, then remove this override and use
 the released dependency. Native Linux and Windows behavior require their own
 real-process evidence; macOS results do not establish platform parity.
+
+## Prepared build read handles (#2835)
+
+Brush, Host and SafeSubset accept held read roots from their host caller.
+Brush passes them to `SandboxedWorker`, Host to `ConfinedCommand`, and
+SafeSubset to `Sandbox::apply_with_held_roots` after checking the admitted
+read scope. This retains the existing Landlock descriptor rule through shell
+execution without extending tool authority or changing the wire protocol.
+Unsupported backends refuse nonempty handle sets. Newt's Seatbelt build route
+supplies no handles and explicitly documents its remaining pathname race.

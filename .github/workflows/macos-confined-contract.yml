@@ -46,6 +46,16 @@ jobs:
             --no-fail-fast --status-level pass --final-status-level fail \
             -E 'test(command_shape_contract::) or test(worktree_adoption::tests::) or test(scope_all_push_to_a_local_path_is_refused_through_real_dispatch) or test(wrapped_worktree_push_dispatch_reaches_gate_and_honors_denial) or test(plan_mode::tests::)' \
             2>&1 | tee macos-confined-contract.log
+      # HOOK PARITY: native Seatbelt row is CI-only in .githooks/pre-push;
+      # Linux runs the same binary in the portable scoped test gate.
+      - name: Linked-worktree build reads and fixture isolation (Seatbelt)
+        shell: bash
+        run: |
+          set -o pipefail
+          nice -n 10 cargo test --locked -p newt-core --test linked_worktree_build_git \
+            -- --nocapture 2>&1 | tee macos-linked-build-reads.log
+          nice -n 10 cargo test --locked -p newt-core --test brush_build_pipeline \
+            -- --ignored linked_worktree_build_reads 2>&1 | tee macos-linked-build-brush.log
       - name: Run production Brush creation, adoption and raw-ref security contract
         shell: bash
         run: |
@@ -75,3 +85,5 @@ jobs:
             macos-confined-contract.log
             macos-native-contract.log
             macos-publication-contract.log
+            macos-linked-build-reads.log
+            macos-linked-build-brush.log
