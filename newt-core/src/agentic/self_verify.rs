@@ -1461,6 +1461,20 @@ pub fn workspace_tree_state(root: &std::path::Path) -> Option<ContentId> {
     complete.get().then_some(state).flatten()
 }
 
+/// Shared conservative Cargo grammar for publication hints and claim checks.
+pub(crate) fn cargo_check_directory(
+    command: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+) -> Option<std::path::PathBuf> {
+    let parts = split_command(command);
+    let words: Vec<_> = parts.last()?.0.split_whitespace().take(2).collect();
+    if words != ["cargo", "check"] {
+        return None;
+    }
+    claim_facts::command_directory(command, args, workspace)
+}
+
 #[cfg(test)]
 #[path = "self_verify_outcomes_tests.rs"]
 mod outcomes_tests;
