@@ -14,8 +14,10 @@ use std::{
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENTRIES: usize = 50_000;
 
+type Entries = BTreeMap<Vec<u8>, (u32, Vec<u8>)>;
+
 #[derive(serde::Serialize)]
-struct Tree(BTreeMap<Vec<u8>, (u32, Vec<u8>)>);
+struct Tree(Entries);
 impl ContentAddressable for Tree {
     fn canonical_form(&self) -> Result<Vec<u8>, content_addressable::ContentError> {
         content_addressable::canonical::to_canonical_dagcbor(self)
@@ -170,6 +172,17 @@ fn index_tree_with(
     read: &crate::Scope<String>,
     after_screen: impl FnOnce(),
 ) -> Option<ContentId> {
+    working_tree(root, read, after_screen, true)?
+        .content_id()
+        .ok()
+}
+
+fn working_tree(
+    root: &Path,
+    read: &crate::Scope<String>,
+    after_screen: impl FnOnce(),
+    require_index_match: bool,
+) -> Option<Tree> {
     let (admin, before, index) = index(root, read)?;
     no_attributes(root, &admin, &index)?;
     after_screen();
@@ -177,29 +190,19 @@ fn index_tree_with(
     let mut total = 0usize;
     for entry in &index.entries {
         let path = plain_path(root, &entry.path)?;
-        let (bytes, meta) = read_file(&path)?;
-        total = total.checked_add(bytes.len())?;
-        if total > 4 * MAX_BYTES {
-            return None;
+        if !require_index_match && absent(&path) {
+            continue;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if (meta.permissions().mode() & 0o111 != 0) != (entry.mode == 0o100755) {
-                return None;
-            }
-        }
+        let (mode, oid) = raw_entry(&path, index.hash_algo.len(), &mut total)?;
         #[cfg(not(unix))]
-        let _ = meta;
-        // Grit implements Git's `blob <len>\0` framing and SHA-1/SHA-256.
-        // Never use a Git worktree hash/diff API here: those apply conversions.
-        let oid =
-            grit_lib::pack::hash_object_bytes(ObjectKind::Blob, &bytes, index.hash_algo.len())
-                .ok()?;
-        if oid != entry.oid.as_bytes() {
+        let mode = {
+            let _ = mode;
+            entry.mode
+        };
+        if require_index_match && (oid != entry.oid.as_bytes() || mode != entry.mode) {
             return None;
         }
-        if tree.insert(entry.path.clone(), (entry.mode, oid)).is_some() {
+        if tree.insert(entry.path.clone(), (mode, oid)).is_some() {
             return None;
         }
     }
@@ -228,7 +231,14 @@ fn index_tree_with(
             .to_str()?
             .replace(std::path::MAIN_SEPARATOR, "/");
         if !tree.contains_key(name.as_bytes()) {
-            return None;
+            if require_index_match || entry.path().file_name()? == ".gitattributes" {
+                return None;
+            }
+            let path = plain_path(root, name.as_bytes())?;
+            tree.insert(
+                name.into_bytes(),
+                raw_entry(&path, index.hash_algo.len(), &mut total)?,
+            );
         }
     }
     // Rechecks protect witness freshness; no-exec safety does NOT depend on
@@ -238,7 +248,7 @@ fn index_tree_with(
     if read_file(&admin.join("index"))?.0 != before {
         return None;
     }
-    Tree(tree).content_id().ok()
+    Some(Tree(tree))
 }
 
 pub(super) fn index_is_head(root: &Path, read: &crate::Scope<String>) -> bool {
@@ -247,6 +257,62 @@ pub(super) fn index_is_head(root: &Path, read: &crate::Scope<String>) -> bool {
 
 #[path = "publish_early_head.rs"]
 mod head;
+
+/// Shared raw-byte hashing. No Git worktree API or conversion program is used.
+fn raw_entry(path: &Path, oid_len: usize, total: &mut usize) -> Option<(u32, Vec<u8>)> {
+    let (bytes, meta) = read_file(path)?;
+    *total = total.checked_add(bytes.len())?;
+    if *total > 4 * MAX_BYTES {
+        return None;
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 != 0 {
+            0o100755
+        } else {
+            0o100644
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = {
+        let _ = meta;
+        0o100644
+    };
+    Some((
+        mode,
+        grit_lib::pack::hash_object_bytes(ObjectKind::Blob, &bytes, oid_len).ok()?,
+    ))
+}
+
+/// Optional advisory comparison against a recorded commit. Reuses the checked
+/// tree reader, relaxing only equality with the index to report changed paths.
+pub(in crate::agentic) fn changed_paths(
+    root: &Path,
+    read: &crate::Scope<String>,
+    base: &str,
+) -> Option<Vec<String>> {
+    let (admin, _, index) = index(root, read)?;
+    let oid = ObjectId::from_hex(base).ok()?;
+    if oid.as_bytes().len() != index.hash_algo.len() {
+        return None;
+    }
+    let old = head::commit_tree(&admin, &oid, index.hash_algo.len())?;
+    let current = working_tree(root, read, || {}, false)?.0;
+    let names: std::collections::BTreeSet<_> = old.keys().chain(current.keys()).collect();
+    names
+        .into_iter()
+        .filter(|name| old.get(*name) != current.get(*name))
+        .map(|name| String::from_utf8(name.clone()).ok())
+        .collect()
+}
+
+pub(in crate::agentic) fn baseline(root: &Path, read: &crate::Scope<String>) -> Option<String> {
+    crate::agentic::check_git_read_scope("metadata", read).ok()?;
+    let admin = crate::workspace_key::discover_git_dir(root)?;
+    let common = grit_lib::refs::common_dir(&admin).unwrap_or_else(|| admin.clone());
+    Some(head::head_oid(&admin, &common, read)?.to_hex())
+}
 
 #[cfg(test)]
 #[path = "publish_early_tree_tests.rs"]

@@ -175,8 +175,16 @@ fn selected_target_projection_survives_compaction_continue_and_done_plan() {
 }
 
 /// Grounds the pure path reconciliation in real local Git, with no network.
-#[test]
-fn selected_target_git_diff_includes_commits_dirty_untracked_and_source_rename() {
+#[tokio::test]
+async fn selected_target_git_diff_includes_commits_dirty_untracked_and_source_rename() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let empty = tempfile::NamedTempFile::new().unwrap();
+    let _global = EnvVar::set("GIT_CONFIG_GLOBAL", empty.path().to_str().unwrap());
+    let _system = EnvVar::set("GIT_CONFIG_NOSYSTEM", "1");
+    let _count = EnvVar::set("GIT_CONFIG_COUNT", "0");
+    let _parameters = EnvVar::set("GIT_CONFIG_PARAMETERS", "");
+
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let run = |args: &[&str]| {
@@ -202,8 +210,17 @@ fn selected_target_git_diff_includes_commits_dirty_untracked_and_source_rename()
     target
         .bind_baseline(baseline(root, &crate::Scope::All))
         .unwrap();
+    assert_eq!(diff_paths(&target, root, &crate::Scope::All), Some(vec![]));
     std::fs::write(root.join("other.txt"), "changed").unwrap();
+    assert_eq!(
+        diff_paths(&target, root, &crate::Scope::All),
+        Some(vec!["other.txt".into()])
+    );
     run(&["add", "."]);
+    assert_eq!(
+        diff_paths(&target, root, &crate::Scope::All),
+        Some(vec!["other.txt".into()])
+    );
     run(&["-c", "commit.gpgsign=false", "commit", "-qm", "outside"]);
     let paths = diff_paths(&target, root, &crate::Scope::All).unwrap();
     assert!(card(&target, Some(&paths)).contains("work landed outside"));
@@ -216,4 +233,66 @@ fn selected_target_git_diff_includes_commits_dirty_untracked_and_source_rename()
     assert!(paths.contains(&"nested/source.txt".into()));
     assert!(!card(&target, Some(&paths)).contains("work landed outside"));
     assert!(diff_paths(&target, root, &crate::Scope::none()).is_none());
+}
+
+/// PR #2844: read-only projection must never execute repository conversion
+/// programs, even when Git would need to rehash a dirty tracked file.
+#[test]
+fn selected_target_projection_never_executes_clean_or_process_filters() {
+    for kind in ["clean", "process"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = crate::agentic::tools::git_fixture::hermetic_git(&root, &root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "Fixture"]);
+        run(&["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(root.join("source.txt"), "original\n").unwrap();
+        run(&["add", "."]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-qm", "base"]);
+        let ledger = SessionStepLedger::default();
+        pin(&ledger, "source.txt");
+        let mut snapshot = ledger.snapshot();
+        snapshot
+            .target
+            .as_mut()
+            .unwrap()
+            .bind_baseline(baseline(&root, &crate::Scope::All))
+            .unwrap();
+        ledger.restore(&snapshot);
+        run(&[
+            "config",
+            &format!("filter.hostile.{kind}"),
+            "echo ran > ../sentinel; exit 1",
+        ]);
+        std::fs::write(root.join(".gitattributes"), "source.txt filter=hostile\n").unwrap();
+        std::fs::write(root.join("source.txt"), "changed contents require rehash\n").unwrap();
+        let mut messages = Vec::new();
+        Projection::default().refresh(
+            &mut messages,
+            Some(&ledger),
+            root.to_str().unwrap(),
+            &crate::Scope::All,
+            None,
+            false,
+        );
+        assert!(
+            !temp.path().join("sentinel").exists(),
+            "{kind} executed on host"
+        );
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("unverified, not a pass"));
+    }
 }

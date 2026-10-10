@@ -38,7 +38,10 @@ finalizing. Rename origins count as changes to the source.
 
 This is advisory reconciliation, not a write restriction or proof of completion.
 It introduces no filesystem grants. If the existing read authority cannot inspect
-Git metadata, the comparison is unverified rather than successful. The HEAD
+Git metadata, the comparison is unverified rather than successful. Comparison
+uses in-process index parsing, verified object reads and raw-byte hashing, never
+Git conversion programs. Filters, attributes, EOL conversion and unsupported
+repository states likewise produce an unverified result. The HEAD
 comparison can include pre-existing uncommitted changes; it does not attribute
 authorship. The harness retains the model's selection and evidence, but does not
 independently prove that the selection satisfies a natural-language superlative.

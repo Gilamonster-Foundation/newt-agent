@@ -111,57 +111,21 @@ pub(crate) fn root(
         .unwrap_or_else(|| workspace.into())
 }
 
-fn git(root: &Path, scope: &crate::Scope<String>, args: &[&str]) -> Option<String> {
-    let out = crate::git_hardening::metadata_git(root, args, scope)
-        .ok()?
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 pub(crate) fn baseline(root: &Path, scope: &crate::Scope<String>) -> Option<String> {
-    git(root, scope, &["rev-parse", "--verify", "HEAD"]).map(|s| s.trim().to_owned())
+    super::publish_early::checked_tree::baseline(root, scope)
 }
 
-/// Compare the whole task, including committed, staged, unstaged and untracked
-/// paths. Rename detection is disabled so a moved source remains visible.
+/// In-process comparison: repository conversion settings can only decline
+/// evidence, never execute programs. Includes committed and working changes.
 fn diff_paths(
     target: &PinnedTarget,
     root: &Path,
     scope: &crate::Scope<String>,
 ) -> Option<Vec<String>> {
-    let base = target.selection.baseline.as_deref()?;
-    if !matches!(base.len(), 40 | 64) || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let tracked = git(
+    super::publish_early::checked_tree::changed_paths(
         root,
         scope,
-        &[
-            "diff",
-            "--name-only",
-            "--no-ext-diff",
-            "--no-textconv",
-            "-z",
-            "--no-renames",
-            base,
-            "--",
-        ],
-    )?;
-    let untracked = git(
-        root,
-        scope,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )?;
-    Some(
-        tracked
-            .split('\0')
-            .chain(untracked.split('\0'))
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned)
-            .collect(),
+        target.selection.baseline.as_deref()?,
     )
 }
 
@@ -178,7 +142,7 @@ pub(crate) fn card(target: &PinnedTarget, paths: Option<&[String]>) -> String {
         Some(paths) if !paths.is_empty() =>
             "work landed outside the selected source: the task diff contains changes but not the pinned source. Reconcile before finalizing; do not claim the selected-source task complete.",
         Some(_) => "No task diff observed for the selected source yet.",
-        None => "Task diff unavailable under current read authority or without a baseline; reconciliation is unverified, not a pass.",
+        None => "Task diff unavailable under current read authority, without a baseline, or for an unsupported repository state; reconciliation is unverified, not a pass.",
     };
     format!(
         "{PREFIX}\n{POLICY}\nSelection (agent data): {}\nDiff reconciliation: {status}",

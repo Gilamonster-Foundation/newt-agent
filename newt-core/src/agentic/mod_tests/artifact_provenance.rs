@@ -676,6 +676,14 @@ async fn invalid_plan_and_declined_write_record_no_artifacts() {
 /// ENOENT must retain the selected full path rather than redirecting the task.
 #[tokio::test]
 async fn selected_target_diff_warning_reaches_model_before_finalization() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let empty = tempfile::NamedTempFile::new().unwrap();
+    let _global = EnvVar::set("GIT_CONFIG_GLOBAL", empty.path().to_str().unwrap());
+    let _system = EnvVar::set("GIT_CONFIG_NOSYSTEM", "1");
+    let _count = EnvVar::set("GIT_CONFIG_COUNT", "0");
+    let _parameters = EnvVar::set("GIT_CONFIG_PARAMETERS", "");
+
     let workspace = tempfile::tempdir().unwrap();
     for args in [
         vec!["init", "-q"],
