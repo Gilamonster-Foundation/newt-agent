@@ -300,7 +300,10 @@ fn observed_report_model_note_without_smart_harness() {
     let dir = fixture();
     let workspace = dir.path().to_str().unwrap();
     let claims = TurnClaims::capture(workspace, &Scope::All, None);
-    let mut messages = vec![serde_json::json!({"role":"user","content":"continue"})];
+    let mut messages = vec![
+        serde_json::json!({"role":"system", "content":crate::agentic::prompt_read::ACTIVE_PROMPT_PREFIX}),
+        serde_json::json!({"role":"user","content":"continue"}),
+    ];
     let prompt = PromptReadContext::new(None, "continue", None);
     let capture = Capture {
         command: Some(("cargo check".into(), workspace.into())),
@@ -339,6 +342,14 @@ fn observed_report_model_note_without_smart_harness() {
         .as_str()
         .unwrap()
         .contains("not assistant-authored"));
+    assert_eq!(
+        crate::agentic::trim::protected_prompt_head_len(
+            &messages,
+            crate::agentic::prompt_read::ACTIVE_PROMPT_PREFIX
+        ),
+        messages.len(),
+        "facts must not displace the exact task from the protected prompt head"
+    );
     let original_len = messages.len();
     claims.observe_report(
         workspace,

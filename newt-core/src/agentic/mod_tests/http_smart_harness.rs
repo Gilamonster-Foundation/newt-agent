@@ -89,8 +89,9 @@ async fn run(
     // before the request is recorded and sent, including post-tool rounds.
     for request in &requests {
         assert!(
-            String::from_utf8_lossy(&request.body)
-                .contains("Current observed facts; historical checks retain their stated scope"),
+            String::from_utf8_lossy(&request.body).contains(
+                "Harness observed facts; not assistant-authored; not an operator request"
+            ),
             "{wire}: host report omitted from actual request"
         );
     }

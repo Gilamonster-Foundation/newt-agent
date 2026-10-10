@@ -60,7 +60,9 @@ async fn context_overflow_trims_and_retries_then_recovers() {
     // two rounds on EVERY long turn, firing spurious overflow retries.)
     let safe_context = (builtin_catalog_tokens(PromptDisposition::Act)
         + prompt_read::response_repository_policy_tokens()
-        + 311) as u32;
+        + 311
+        + crate::agentic::compression_loop_tests::observed_note_tokens(NO_CHECKS_WORKSPACE))
+        as u32;
     let overflow_prompt = safe_context * 88 / 100; // ≥85% of the window
     let probes = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))

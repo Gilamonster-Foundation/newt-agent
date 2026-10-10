@@ -664,11 +664,10 @@ async fn compact_responses_input(
         Ok(m) => m,
         Err(_) => return ResponsesCompaction::BridgeError,
     };
-    let mut chat: Vec<serde_json::Value> = Vec::new();
+    let mut chat = host_notes.clone();
     if let Some(ins) = instructions {
         chat.push(serde_json::json!({ "role": "system", "content": ins }));
     }
-    chat.extend(host_notes.iter().cloned());
     chat.extend(responses_compaction::compaction_to_chat(&messages));
     // Run the compressor against a CANDIDATE state AND a candidate-local staging
     // buffer — the live anti-thrash counters / disabled latch and the session
@@ -6806,7 +6805,11 @@ async fn final_summary_ollama(
 fn openai_chat_wire_messages(
     messages: &[serde_json::Value],
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    Ok(agent_harness::render::openai_chat_wire_messages(messages)?)
+    agent_harness::render::openai_chat_wire_messages(messages).map_err(|error| match error {
+        // Preserve the existing public diagnostic at this adapter boundary.
+        agent_harness::Error::Proposal(message) => anyhow::anyhow!(message),
+        other => anyhow::Error::new(other),
+    })
 }
 
 fn prepare_openai_assistant_replay(
