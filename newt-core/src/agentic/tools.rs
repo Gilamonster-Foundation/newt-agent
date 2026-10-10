@@ -3945,6 +3945,16 @@ async fn execute_authorized_tool(
         // verbatim body of one ADDRESSED item (`note:<id>` / `turn:<conv>#<seq>`)
         // via the caller's MemorySource — workspace-fenced by the underlying
         // NoteStore / ConversationStore. Same presence-gating as `recall`.
+        "propose_context" => match smart_harness {
+            Some(harness) => {
+                invocation.expect("smart dispatch has a witness").host();
+                match harness.propose_context(args) {
+                    Ok(text) => text,
+                    Err(error) => executed((format!("Error: propose_context refused: {error}"), crate::ExecOutcome::Denied)),
+                }
+            },
+            None => executed(("Error: propose_context is unavailable outside an enabled composition session".into(), crate::ExecOutcome::Unavailable)),
+        },
         "re_read" => match smart_harness {
             Some(harness) => match harness.read(args) {
                 Ok(text) => { invocation.expect("smart dispatch has a witness").retrieval(); text }

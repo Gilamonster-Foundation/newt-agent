@@ -7,6 +7,13 @@ use crate::composition::{
 
 #[path = "candidate.rs"]
 mod candidate;
+#[path = "model_carry.rs"]
+mod model_carry;
+#[path = "model_preflight.rs"]
+mod model_preflight;
+#[path = "model_session.rs"]
+mod model_session;
+use crate::composition::Queued;
 #[cfg(test)]
 #[path = "transaction_tests.rs"]
 mod transaction_tests;
@@ -56,6 +63,7 @@ impl Session {
             .map(|p| self.store.put(p))
             .transpose()?;
         let catalog = Catalog {
+            offered: None,
             run: self.run,
             root: self.root,
             request,
@@ -81,6 +89,16 @@ impl Session {
         actor: Actor,
         proposal: Proposal,
     ) -> Result<ContentId> {
+        self.submit_composition(catalog, actor, proposal, None)
+    }
+
+    pub(super) fn submit_composition(
+        &mut self,
+        catalog: ContentId,
+        actor: Actor,
+        proposal: Proposal,
+        queued: Option<ContentId>,
+    ) -> Result<ContentId> {
         self.ensure_writer()?;
         self.ensure_tools_closed()?;
         if !self.composition.catalogs.contains(&catalog) {
@@ -96,6 +114,7 @@ impl Session {
         self.check_navigation()?;
         let actor = self.store.put(&actor)?;
         let submission = Submission {
+            queued,
             catalog,
             actor,
             proposal,
@@ -185,6 +204,7 @@ impl Session {
             ),
         };
         let decision = Decision {
+            queued: submission.queued,
             version: 1,
             run: self.run,
             root: self.root,

@@ -534,3 +534,6 @@ mod claimcheck_task_root_tests;
 
 #[path = "http_publish_early.rs"]
 mod publish_early_tests;
+
+#[path = "http_context_composition.rs"]
+mod context_composition;

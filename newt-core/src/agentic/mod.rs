@@ -6806,9 +6806,9 @@ fn openai_chat_wire_messages(
     messages: &[serde_json::Value],
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     agent_harness::render::openai_chat_wire_messages(messages).map_err(|error| match error {
-        // Preserve the existing public diagnostic at this adapter boundary.
+        // Preserve the public wire diagnostic when adapting the shared renderer.
         agent_harness::Error::Proposal(message) => anyhow::anyhow!(message),
-        other => anyhow::Error::new(other),
+        error => error.into(),
     })
 }
 
@@ -7795,13 +7795,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         ));
                     }
                     async {
-                        let mut req = match smart_harness {
-                            Some(harness) => stream_client
-                                .post(&chat_url)
-                                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                                .body(harness.prepare_with_messages(&body, "openai", &messages)?),
-                            None => stream_client.post(&chat_url).json(&body),
-                        };
+                        let mut req = smart_harness::request_with_messages(
+                            stream_client.post(&chat_url),
+                            &body,
+                            smart_harness,
+                            "openai",
+                            &messages,
+                        )?;
                         if let Some(key) = api_key {
                             req = req.bearer_auth(key);
                         }
@@ -12488,7 +12488,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         run_allowance,
     });
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
-    let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
+    let (mut instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
+    // Smart preflight, pin registration and composition must all see the same
+    // canonical sources. Split system instructions only in the wire renderer.
+    if smart_harness.is_some() {
+        if let Some(text) = instructions.take() {
+            input.insert(0, serde_json::json!({"role":"system", "content":text}));
+        }
+    }
     let tools_chat = merged_tool_definitions(
         mcp,
         advertise_save_note,

@@ -30,6 +30,9 @@ pub(super) fn refresh(
     workspace: &str,
     read: &crate::Scope<String>,
 ) -> anyhow::Result<()> {
+    if let Some(smart) = smart {
+        smart.normalize_composition(messages)?;
+    }
     if let Some(previous) = projection.previous.take() {
         if let Some(index) = messages
             .iter()

@@ -230,3 +230,14 @@ alone do not disable protection when execution remains confined.
 To lift an armed guard, the operator uses `/permissions worktree-lift`.
 `request_permissions` rejects that reserved target; an executable grant cannot
 perform the operator command.
+
+Context composition is experimental and disabled by default, even when smart
+harness is enabled. Opt in with `[smart_harness.adjudication]`
+`composition_enabled = true`; `composition_max_bytes` (default 262144) bounds the
+complete rendered request. The `propose_context` tool reads bounded catalog pages
+when `changes` is absent, or queues include/park changes with catalog, expected
+head and reasons. Primary and auxiliary proposals use the same host validator.
+Queued is not accepted: current pins, complete tool exchanges and final request
+bytes are rechecked before dispatch. `summarise` is refused. Cancellation,
+unavailable sources or invalid selection never trigger a legacy-summary fallback.
+`re_read` is unchanged. This mode makes no claim of measured model improvement.
