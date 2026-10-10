@@ -1927,6 +1927,7 @@ async fn raw_anthropic_round(
         jitter: false,
     };
     let dispatch = AnthropicDispatch {
+        defer_answer: false,
         smart_harness: None,
         client: &client,
         stream_client: &client,

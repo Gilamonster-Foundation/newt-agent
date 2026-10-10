@@ -2,6 +2,8 @@
 
 Final task reports begin with an **Observed** section assembled by the harness.
 The model's explanation follows it. This includes tool-round-cap handoffs.
+Anthropic answer deltas are buffered until finalization so the report and
+explanation print once; SSE consumption and idle-timeout handling continue.
 
 The report shows changed files relative to the first objective/adoption snapshot,
 with before and after LF counts (`wc -l` semantics), the last observed Cargo check

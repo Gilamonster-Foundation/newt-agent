@@ -77,7 +77,15 @@ async fn consumer_drives_a_turn_and_renders_the_transcript_with_only_public_api(
         TurnStatus::Completed(outcome) => outcome,
         other => panic!("expected Completed, got {other:?}"),
     };
-    assert_eq!(outcome.reply, "I see your shell — the build is green.");
+    assert!(outcome.reply.starts_with("## Observed\n"));
+    assert_eq!(
+        outcome
+            .reply
+            .split_once("\n## Model explanation\n\n")
+            .unwrap()
+            .1,
+        "I see your shell — the build is green."
+    );
 
     // 4. It renders the transcript into its own pane width using only the
     //    public render-data fn (renderer-agnostic; the consumer maps these to

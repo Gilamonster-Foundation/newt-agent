@@ -975,9 +975,9 @@ async fn headless_scratchpad_state_reaches_wire_and_receipt() {
 }
 
 /// #2372: `newt headless` shows the model's final claim on stdout exactly once on
-/// every wire. Chat Completions returns its answer unprinted, so headless prints
-/// it; Anthropic streams it itself, so headless must not print it again. The
-/// claim is what a transcript tail and false-completion forensics read.
+/// every wire. The harness report and model explanation must each appear once,
+/// including Anthropic SSE: printing deltas live would duplicate the explanation
+/// when the observed report is finalized. Transcript forensics read this output.
 #[tokio::test(flavor = "multi_thread")]
 async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
     const CLAIM: &str = "FINAL-CLAIM-2372 every check passed";
@@ -1039,6 +1039,7 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(stdout.matches(CLAIM).count(), 1, "{kind}: {stdout}");
+        assert_eq!(stdout.matches("## Observed").count(), 1, "{kind}: {stdout}");
     }
 
     // The answer is shown before anything that can fail: an unwritable
@@ -1062,11 +1063,8 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
         !output.status.success(),
         "a directory is not an events file"
     );
-    assert_eq!(
-        stdout.matches(&format!("▸  {CLAIM}")).count(),
-        1,
-        "{stdout}"
-    );
+    assert_eq!(stdout.matches("▸  ## Observed").count(), 1, "{stdout}");
+    assert_eq!(stdout.matches(CLAIM).count(), 1, "{stdout}");
 }
 
 /// #2372: `▸` marks the model's claim. A reply the harness wrote itself — here

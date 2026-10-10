@@ -9422,6 +9422,8 @@ struct AnthropicDispatch<'a> {
     retry: &'a RetryPolicy,
     color: bool,
     markdown: bool,
+    /// Buffer answer deltas until the harness can prepend its observed report.
+    defer_answer: bool,
     /// Where a folded reasoning body is retained, so the closing line's
     /// `/spill open <id>` names something real rather than gesturing at it.
     retain: Option<&'a std::sync::Arc<dyn CompletedSpillRenderer>>,
@@ -9435,7 +9437,7 @@ struct AnthropicDispatch<'a> {
 ///
 /// `stream:true`: only send()+status-check sit in the retry envelope; the SSE
 /// body is consumed OUTSIDE it (a re-sent body after visible output would
-/// re-print). Text deltas print live (spinner teardown before the first
+/// re-print). Unless `defer_answer` is set, text deltas print live (spinner teardown before the first
 /// visible char, the `▸  ` prefix, the markdown block writer when markdown is
 /// on); thinking deltas go to the spinner detail. A mid-stream failure follows the #640 policy: with no
 /// visible output the round is re-issued under the retry budget; with partial
@@ -9541,7 +9543,7 @@ async fn anthropic_dispatch_round(
             d.color,
         );
         let cols = display::term_cols();
-        let mut md = d.markdown.then(|| {
+        let mut md = (d.markdown && !d.defer_answer).then(|| {
             MarkdownStreamWriter::new(
                 io::stdout(),
                 RenderOpts {
@@ -9582,6 +9584,16 @@ async fn anthropic_dispatch_round(
                     for action in acc.feed(&decode_chunk(&mut carry, &chunk)) {
                         match action {
                             anthropic_wire::StreamAction::TextDelta(t) => {
+                                if d.defer_answer {
+                                    if let Some(sp) = spinner.take() {
+                                        anth_reason.close(
+                                            sp.elapsed(),
+                                            d.retain.map(std::sync::Arc::as_ref),
+                                            d.color,
+                                        );
+                                    }
+                                    continue;
+                                }
                                 if !started {
                                     // The answer is starting — close the
                                     // reasoning block while the spinner's clock
@@ -9668,7 +9680,7 @@ async fn anthropic_dispatch_round(
             if crate::retry::classify(&shaped) != crate::retry::Retryability::Retry {
                 return Err(shaped);
             }
-            if !started {
+            if round.text.is_empty() {
                 if stream_retries >= d.retry.max_retries {
                     return Err(shaped);
                 }
@@ -9682,7 +9694,7 @@ async fn anthropic_dispatch_round(
                 &format!("stream broke mid-response ({err}) — keeping the partial answer"),
                 d.color,
             );
-            return Ok(Some((round, true)));
+            return Ok(Some((round, started)));
         }
         return Ok(Some((round, started)));
     }
@@ -9922,6 +9934,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let messages_url = anthropic_wire::messages_url(url);
     let retry = tui_retry_policy(url);
     let dispatcher = AnthropicDispatch {
+        defer_answer: true,
         smart_harness,
         client: &client,
         stream_client: &stream_client,

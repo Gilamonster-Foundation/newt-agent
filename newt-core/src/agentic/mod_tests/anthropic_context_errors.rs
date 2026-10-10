@@ -8,6 +8,7 @@ async fn dispatch(url: &str) -> anyhow::Result<Option<(anthropic_wire::Anthropic
     let client = reqwest::Client::new();
     let retry = RetryPolicy::immediate(2);
     let dispatcher = AnthropicDispatch {
+        defer_answer: false,
         smart_harness: None,
         client: &client,
         stream_client: &client,
