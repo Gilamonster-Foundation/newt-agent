@@ -64,6 +64,12 @@ fn inspect(config: Option<&newt_core::Config>, fix: bool) -> Result<()> {
                 .map(|(index, entry)| (CapabilityClass::Exec, index, entry.target.as_str())),
         );
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let unavailable = repair_unavailable_reason();
+    if fix {
+        if let Some(reason) = unavailable {
+            println!("  {reason}");
+        }
+    }
     let mut selected = Vec::new();
     let mut findings = 0;
     for (kind, index, target) in entries {
@@ -72,7 +78,7 @@ fn inspect(config: Option<&newt_core::Config>, fix: bool) -> Result<()> {
         };
         findings += 1;
         println!("  FINDING: {target:?}: {reason}");
-        if fix && repairable && interactive && confirm(target) {
+        if fix && repairable && interactive && unavailable.is_none() && confirm(target) {
             selected.push((kind, index));
         }
     }
@@ -114,6 +120,12 @@ fn stale_target(kind: CapabilityClass, target: &str) -> Option<(String, bool)> {
     }
 }
 
+fn repair_unavailable_reason() -> Option<&'static str> {
+    cfg!(windows).then_some(
+        "durable-grant --fix is report-only on Windows: owner-only backup access is not supported; nothing changed",
+    )
+}
+
 fn confirm(target: &str) -> bool {
     let form = newt_core::interaction_form::confirm(
         format!("Prune stale durable grant {target:?}?"),
@@ -128,6 +140,23 @@ fn confirm(target: &str) -> bool {
 }
 
 fn prune(config: &Path, expected: &str, selected: &[(CapabilityClass, usize)]) -> Result<PathBuf> {
+    prune_with_backup_sync(
+        config,
+        expected,
+        selected,
+        newt_core::atomic_fs::sync_parent,
+    )
+}
+
+fn prune_with_backup_sync(
+    config: &Path,
+    expected: &str,
+    selected: &[(CapabilityClass, usize)],
+    sync_backup: impl FnOnce(&Path) -> Result<()>,
+) -> Result<PathBuf> {
+    if let Some(reason) = repair_unavailable_reason() {
+        anyhow::bail!(reason);
+    }
     let (destination, _lock) = ocap_store::lock_approve_file(config)?;
     let current = std::fs::read_to_string(destination.as_path())?;
     anyhow::ensure!(
@@ -181,6 +210,9 @@ fn prune(config: &Path, expected: &str, selected: &[(CapabilityClass, usize)]) -
     let mut saved = options.open(&backup)?;
     saved.write_all(current.as_bytes())?;
     saved.sync_all()?;
+    // Persist the backup's name before replacement can commit the pruned store.
+    // The injected operation is the same parent-sync primitive used by atomic_fs.
+    sync_backup(&backup).context("backup could not be durably published; nothing pruned")?;
     destination.atomic_write(repaired.as_bytes())?;
     Ok(backup)
 }

@@ -804,6 +804,8 @@ pub enum Command {
         /// Offer per-entry repair for stale durable grants and ambiguous backend
         /// drop-ins. Requires a terminal and explicit confirmation; piped runs
         /// report only. Grant pruning saves a dated backup and keeps signatures.
+        /// Durable-grant repair is report-only on Windows until private backups
+        /// are supported.
         #[arg(long)]
         fix: bool,
     },

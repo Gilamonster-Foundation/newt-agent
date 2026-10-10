@@ -96,6 +96,8 @@ async fn doctor_reports_dead_grants_and_never_fixes_without_a_terminal() {
     );
     assert!(text.contains("target does not exist"), "{text}");
     assert!(text.contains("--fix needs a terminal"), "{text}");
+    #[cfg(windows)]
+    assert!(text.contains("report-only on Windows"), "{text}");
     assert_eq!(std::fs::read(&f.store).unwrap(), f.before);
     let (verified, warnings) =
         newt_core::ocap_store::load_store(&f.config, Some(f.key.public().as_bytes()));
@@ -173,6 +175,16 @@ async fn doctor_confirmed_prune_backs_up_and_preserves_signatures() {
         .collect();
     assert_eq!(backups.len(), 1, "{text}");
     assert_eq!(std::fs::read(backups[0].path()).unwrap(), f.before);
+    use std::os::unix::fs::PermissionsExt as _;
+    assert_eq!(
+        std::fs::metadata(backups[0].path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "backup must remain private even in a broadly readable directory"
+    );
     let (verified, warnings) =
         newt_core::ocap_store::load_store(&f.config, Some(f.key.public().as_bytes()));
     assert!(warnings.is_empty(), "{warnings:?}");
