@@ -103,3 +103,14 @@ never count as a committed checkpoint. These history guarantees do not install
 an execution sandbox or promise exactly-once external effects.
 
 License: Apache-2.0.
+
+Host semantic pins use `Session::register_semantic_pins` with typed `HostPin`
+indices for the current objective, selected target, and observed facts. The
+host supplies these registrations; message text cannot register itself. The
+existing candidate validator also protects the latest operator instruction,
+system constraints, and live tool exchanges. Selection refuses a context that
+cannot fit these requirements instead of dropping them. A host refresh replaces
+obsolete target/fact cards while retaining their source events for historical
+inspection; historical checks are not current-tree certification. Registrations
+use the existing canonical journal and verified restore, with no separate store
+or new model-facing operation.

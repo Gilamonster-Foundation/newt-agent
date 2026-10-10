@@ -233,3 +233,57 @@ pub(crate) fn model_explanation(text: &str) -> &str {
 
 #[path = "files_tests.rs"]
 mod enumeration;
+
+/// Slice 1: an actual edit replaces the pinned report; a pre-edit context
+/// cannot be dispatched as if its facts were still the current observation.
+#[test]
+fn semantic_pins_refresh_actual_report_after_edit_and_refuse_stale_request() {
+    use crate::agentic::{
+        prompt_read::PromptReadContext, semantic_pins, smart_harness::SmartHarness,
+    };
+    let dir = fixture();
+    let workspace = dir.path().to_str().unwrap();
+    let claims = TurnClaims::capture(workspace, &Scope::All, None);
+    let h = SmartHarness::new(
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
+        std::sync::Arc::new(|_| Box::pin(async { anyhow::bail!("no inference in this test") })),
+        Default::default(),
+    )
+    .unwrap();
+    let mut messages = vec![serde_json::json!({"role":"user","content":"change source"})];
+    let prompt = PromptReadContext::new(None, "change source", None);
+    semantic_pins::refresh(
+        Some(&h),
+        &mut messages,
+        prompt,
+        None,
+        &claims,
+        workspace,
+        &Scope::All,
+    )
+    .unwrap();
+    let stale = messages.clone();
+    std::fs::write(dir.path().join("src/mod.rs"), "new\nsource\nthree\n").unwrap();
+    semantic_pins::refresh(
+        Some(&h),
+        &mut messages,
+        prompt,
+        None,
+        &claims,
+        workspace,
+        &Scope::All,
+    )
+    .unwrap();
+    assert_eq!(messages.len(), stale.len(), "old report must retire");
+    assert_ne!(messages, stale);
+    assert!(messages.iter().any(|m| m["content"]
+        .as_str()
+        .is_some_and(|s| s.contains("`src/mod.rs`: 2 → 3"))));
+    let sent = h
+        .request(&serde_json::json!({"messages":messages}), "openai")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&sent).contains("historical checks retain their stated scope"));
+    assert!(h
+        .request(&serde_json::json!({"messages":stale}), "openai")
+        .is_err());
+}

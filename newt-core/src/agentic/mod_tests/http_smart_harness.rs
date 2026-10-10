@@ -85,6 +85,15 @@ async fn run(
     }
     .expect("smart provider round");
     let requests = server.received_requests().await.unwrap();
+    // Slice 1: each production provider loop registers its observed-facts pin
+    // before the request is recorded and sent, including post-tool rounds.
+    for request in &requests {
+        assert!(
+            String::from_utf8_lossy(&request.body)
+                .contains("Current observed facts; historical checks retain their stated scope"),
+            "{wire}: host report omitted from actual request"
+        );
+    }
     assert_eq!(
         harness.replay_last_request().unwrap(),
         requests.last().unwrap().body,

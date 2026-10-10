@@ -320,6 +320,18 @@ impl SmartHarness {
         })
     }
 
+    pub(crate) fn register_semantic_pins(
+        &self,
+        objective: &str,
+        messages: &mut Vec<Value>,
+        pins: &[agent_harness::composition::HostPin],
+    ) -> anyhow::Result<()> {
+        self.state()?
+            .session
+            .register_semantic_pins(objective, messages, pins)?;
+        Ok(())
+    }
+
     fn state(&self) -> anyhow::Result<MutexGuard<'_, State>> {
         let state = self
             .state
@@ -1447,6 +1459,80 @@ mod tests {
             settings,
         )
         .unwrap()
+    }
+
+    /// Slice 1: real target/report producers remain required through navigation;
+    /// refreshing facts never turns unavailable evidence into a passing check.
+    #[test]
+    fn semantic_pins_adapt_host_producers_and_preserve_operator_anchor() {
+        use crate::agentic::{
+            claim_check::TurnClaims,
+            prompt_read::PromptReadContext,
+            selected_target::{self, PinnedTarget},
+            semantic_pins,
+        };
+        let h = harness(&[], Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_str().unwrap();
+        let read = crate::Scope::Only(Default::default());
+        let claims = TurnClaims::capture(workspace, &read, None);
+        let target = PinnedTarget::revise(
+            &serde_json::json!({
+                "path":"engine/source.rs", "scope":"extract parser", "evidence":"inventory",
+                "revision":"initial selection"
+            }),
+            None,
+        )
+        .unwrap();
+        let card = selected_target::card(&target, None);
+        // The prompt adapter must recover the objective ahead of this newer
+        // instruction, not let the recovered copy become the latest operator.
+        let mut messages = vec![serde_json::json!({"role":"user","content":"continue"})];
+        semantic_pins::refresh(
+            Some(&h),
+            &mut messages,
+            PromptReadContext::new(None, "extract parser", None),
+            Some(&card),
+            &claims,
+            workspace,
+            &read,
+        )
+        .unwrap();
+        assert_eq!(messages[0]["content"], "extract parser");
+        assert_eq!(messages[1]["content"], "continue");
+        let first = messages.clone();
+        semantic_pins::refresh(
+            Some(&h),
+            &mut messages,
+            PromptReadContext::new(None, "extract parser", None),
+            Some(&card),
+            &claims,
+            workspace,
+            &read,
+        )
+        .unwrap();
+        assert_eq!(messages, first, "refresh must not accumulate host cards");
+        let mut s = h.state().unwrap();
+        let catalog = s.session.catalog(&messages, 64_000).unwrap();
+        let selected: Vec<_> = catalog["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["cid"].as_str().unwrap().to_owned())
+            .collect();
+        let projected = s
+            .session
+            .project_selection(&messages, &selected, 64_000)
+            .unwrap();
+        assert_eq!(projected, messages);
+        assert!(projected.iter().any(|m| m["content"] == card));
+        assert!(projected.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("historical checks retain their stated scope"))));
+        assert!(
+            s.session.project_selection(&messages, &[], 64_000).is_err(),
+            "host cards must not replace the latest operator anchor"
+        );
     }
 
     fn observation(h: &SmartHarness, text: &str) {

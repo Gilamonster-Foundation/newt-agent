@@ -11,6 +11,8 @@ use content_addressable::{ContentAddressable, ContentError, ContentId, MerkleNod
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[path = "composition/session.rs"]
+mod semantic;
 mod tools;
 pub(crate) use tools::ToolChange;
 pub use tools::{ExecOutcome, ToolCallState, ToolCallStatus, ToolReturn};
@@ -98,6 +100,9 @@ impl SessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum JournalEntry {
+    SemanticPins {
+        pins: crate::composition::Pins,
+    },
     Run {
         schema: u32,
         config: SessionConfig,
@@ -241,6 +246,7 @@ fn real_navigation_clock() -> NavigationClock {
 }
 
 pub struct Session {
+    semantic_pins: Option<crate::composition::Pins>,
     store: FrameStore,
     writer: RunWriter,
     config: SessionConfig,
@@ -330,6 +336,7 @@ impl Session {
         root: ContentId,
     ) -> Self {
         Self {
+            semantic_pins: None,
             store,
             writer,
             config,
@@ -509,6 +516,7 @@ impl Session {
 
     fn apply(&mut self, entry: &JournalEntry) -> Result<()> {
         match entry {
+            JournalEntry::SemanticPins { pins } => self.apply_semantic_pins(pins)?,
             JournalEntry::Run { .. } => return Err(integrity("nested run record")),
             JournalEntry::ToolBatch {
                 reply,
@@ -1029,6 +1037,14 @@ impl Session {
     }
 
     fn ingest(&mut self, messages: &[Value]) -> Result<Vec<Entry>> {
+        self.ingest_registered(messages, &[])
+    }
+
+    fn ingest_registered(
+        &mut self,
+        messages: &[Value],
+        pins: &[crate::composition::HostPin],
+    ) -> Result<Vec<Entry>> {
         self.ensure_tools_closed()?;
         let mut entries = Vec::with_capacity(messages.len());
         let mut available: BTreeMap<RawContentId, std::collections::VecDeque<ContentId>> =
@@ -1044,10 +1060,16 @@ impl Session {
                 }
             }
         }
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
+            let host_pin = pins
+                .iter()
+                .any(|p| p.index == index && p.class.host_material());
             let bytes = serde_json::to_vec(message).map_err(integrity)?;
             let source = RawContentId::from_content(&bytes);
-            let old = available.get_mut(&source).and_then(|ids| ids.pop_front());
+            let old = available
+                .get_mut(&source)
+                .and_then(|ids| ids.pop_front())
+                .filter(|id| !host_pin || self.events[id].body().origin == EventOrigin::Harness);
             let event = if let Some(id) = old {
                 id
             } else {
@@ -1059,7 +1081,7 @@ impl Session {
                     .flatten()
                     .copied()
                     .collect::<BTreeSet<_>>();
-                let origin = if !retrieved.is_empty() {
+                let origin = if host_pin || !retrieved.is_empty() {
                     EventOrigin::Harness
                 } else if !tool_contents.is_empty() {
                     EventOrigin::Tool
@@ -1154,7 +1176,8 @@ impl Session {
         &self,
         messages: &[Value],
         entries: &[Entry],
-    ) -> Vec<crate::navigation::Candidate> {
+    ) -> Result<Vec<crate::navigation::Candidate>> {
+        self.require_semantic_pins(entries)?;
         let last_operator = messages.iter().zip(entries).rposition(|(message, entry)| {
             self.events[&entry.event].body().origin == EventOrigin::Operator
                 && tool_pairs(message).is_empty()
@@ -1169,7 +1192,7 @@ impl Session {
         // An observed server rejection does not make the newest result
         // disposable. Pair validation also retains its complete call group.
         let last_result = messages.iter().rposition(is_tool_result);
-        messages
+        Ok(messages
             .iter()
             .zip(entries)
             .enumerate()
@@ -1179,14 +1202,18 @@ impl Session {
                 crate::navigation::Candidate {
                     id: entry.event,
                     bytes: entry.span.len() as usize,
-                    required: Some(index) == last_operator
-                        || Some(index) == last_result
-                        || matches!(entry.role.as_str(), "system" | "developer")
-                        || (result && !self.seen.contains(&entry.event)),
+                    required: self.semantic_pin(entry.event)
+                        || crate::composition::PinClass::protocol(
+                            Some(index) == last_operator,
+                            matches!(entry.role.as_str(), "system" | "developer"),
+                            Some(index) == last_result
+                                || (result && !self.seen.contains(&entry.event)),
+                        )
+                        .is_some(),
                     pairs,
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Bounded catalog cards contain source facts only. Harness interventions
@@ -1205,7 +1232,7 @@ impl Session {
     fn catalog_inner(&mut self, messages: &[Value], max_bytes: usize) -> Result<Value> {
         self.check_navigation()?;
         let entries = self.ingest(messages)?;
-        let candidates = self.candidates(messages, &entries);
+        let candidates = self.candidates(messages, &entries)?;
         let start = entries
             .len()
             .saturating_sub(self.config.max_catalog_entries);
@@ -1309,7 +1336,7 @@ impl Session {
     fn project_inner(&mut self, messages: &[Value], max_bytes: usize) -> Result<Vec<Value>> {
         self.check_navigation()?;
         let entries = self.ingest(messages)?;
-        let candidates = self.candidates(messages, &entries);
+        let candidates = self.candidates(messages, &entries)?;
         let all: Vec<_> = candidates.iter().map(|c| c.id).collect();
         if crate::navigation::validate_selection(&candidates, &all, max_bytes).is_ok() {
             return Ok(messages.to_vec());
@@ -1367,7 +1394,7 @@ impl Session {
         max_bytes: usize,
     ) -> Result<Vec<Value>> {
         let entries = self.ingest(messages)?;
-        let candidates = self.candidates(messages, &entries);
+        let candidates = self.candidates(messages, &entries)?;
         let mut selected = selected_cids
             .iter()
             .map(|id| id.parse().map_err(integrity))
@@ -1854,6 +1881,7 @@ impl Session {
             .ok_or_else(|| integrity("request must be an object"))?;
         object.insert(field.into(), Value::Array(Vec::new()));
         let entries = self.ingest(messages)?;
+        self.require_semantic_pins(&entries)?;
         let template = self
             .store
             .put_source(&serde_json::to_vec(&body).map_err(integrity)?)?;

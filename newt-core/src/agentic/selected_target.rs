@@ -157,6 +157,10 @@ pub(crate) struct Projection {
     previous: Option<String>,
 }
 impl Projection {
+    pub(crate) fn current(&self) -> Option<&str> {
+        self.previous.as_deref()
+    }
+
     pub(crate) fn refresh(
         &mut self,
         messages: &mut Vec<Value>,
