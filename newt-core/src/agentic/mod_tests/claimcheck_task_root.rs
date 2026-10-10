@@ -292,3 +292,135 @@ async fn claimcheck_2787_anthropic_fixture_preserves_streaming_mode() {
         "fixture must preserve streaming requests"
     );
 }
+
+/// Ground report voice separation on all four actual provider request shapes.
+/// Restored pre-fix replies must not speak as the assistant; current facts come
+/// only from report state in a labelled harness note, including plain mode.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn observed_report_four_wire_replay_has_separate_harness_voice() {
+    let _lock = crate::agentic::tools::disable_ocap_tests::env_lock().await;
+    for smart in [false, true] {
+        for wire in ["ollama", "openai", "responses", "anthropic"] {
+            let (_temp, original, _) = fixture();
+            let workspace = original.to_str().unwrap();
+            let session = crate::worktree_adoption::WorktreeSession::default();
+            let claims =
+                claim_check::TurnClaims::capture(workspace, &crate::Scope::All, Some(&session));
+            claims.observe_report(
+                workspace,
+                &crate::Scope::All,
+                &observed_report::Capture::default(),
+                None,
+                Some(&crate::git_staging::Outcome::PrCreated {
+                    url: "https://github.com/example/project/pull/7".into(),
+                }),
+            );
+            let first_reply = finalize_final_text(
+                "I extracted the helper.".into(),
+                workspace,
+                &crate::Scope::All,
+                &capability_check::Evidence::default(),
+                None,
+                &claims,
+                &self_verify::VerificationLedger::default(),
+            );
+            assert!(first_reply.starts_with("## Observed\n"));
+            let messages = vec![
+                crate::MemMessage::system("You are a test assistant."),
+                crate::MemMessage::user("refactor"),
+                crate::MemMessage::assistant(first_reply),
+                crate::MemMessage::user("continue"),
+            ];
+            let server = MockServer::start().await;
+            let reply = match wire {
+                "anthropic" => {
+                    serde_json::json!({"id":"msg_1","type":"message","role":"assistant", "model":"test-model","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":10,"output_tokens":5}})
+                }
+                "responses" => {
+                    serde_json::json!({"id":"resp_1","status":"completed","model":"test-model","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Done.","annotations":[]}]}]})
+                }
+                "openai" => {
+                    serde_json::json!({"choices":[{"message":{"role":"assistant","content":"Done."},"finish_reason":"stop"}]})
+                }
+                _ => {
+                    serde_json::json!({"message":{"role":"assistant","content":"Done."},"done":true})
+                }
+            };
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    if wire == "anthropic" && body["stream"] == true {
+                        crate::agentic::anthropic_loop_tests::sse_text_reply(&["Done."], 10, 5)
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(reply.clone())
+                    }
+                })
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let caveats = crate::Caveats::top();
+            let harness = crate::agentic::smart_harness::SmartHarness::new(
+                agent_harness::Session::new(crate::test_guard::unbudgeted_session_config())
+                    .unwrap(),
+                std::sync::Arc::new(|_| Box::pin(async { Ok(("\"answer\"".to_string(), None)) })),
+                crate::agentic::smart_harness::AdjudicationSettings::default(),
+            )
+            .unwrap();
+            let mut context = ctx(&uri, &messages, &caveats);
+            context.smart_harness = smart.then_some(&harness);
+            context.workspace = workspace;
+            context.worktree_session = Some(&session);
+            context.action_nudges = false;
+            context.kind = match wire {
+                "ollama" => crate::BackendKind::Ollama,
+                "anthropic" => crate::BackendKind::Anthropic,
+                _ => crate::BackendKind::Openai,
+            };
+            let (output, ..) = if wire == "responses" {
+                openai_responses_complete(context, &mut NoMcp).await
+            } else {
+                chat_complete(context, &mut NoMcp).await
+            }
+            .unwrap();
+            assert!(output.starts_with("## Observed\n"), "{wire}: {output}");
+            let requests = server.received_requests().await.unwrap();
+            assert!(!requests.is_empty());
+            for request in requests {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let messages = body[if wire == "responses" {
+                    "input"
+                } else {
+                    "messages"
+                }]
+                .as_array()
+                .unwrap();
+                let mut found = ["system", "instructions"].iter().any(|field| {
+                    let text = body[field].to_string();
+                    text.contains("[Harness observed facts")
+                        && text.contains("https://github.com/example/project/pull/7")
+                });
+                for message in messages {
+                    let text = message.to_string();
+                    if message["role"] == "assistant" {
+                        assert!(
+                            !text.contains("## Observed")
+                                && !text.contains("https://github.com/example/project/pull/7"),
+                            "{wire}: {text}"
+                        );
+                    }
+                    if text.contains("https://github.com/example/project/pull/7") {
+                        assert_eq!(message["role"], "system", "{wire}: {text}");
+                        assert!(
+                            text.contains("[Harness observed facts")
+                                && text.contains("not assistant-authored"),
+                            "{wire}: {text}"
+                        );
+                        found = true;
+                    }
+                }
+                assert!(found, "{wire}: missing harness facts: {body}");
+            }
+        }
+    }
+}

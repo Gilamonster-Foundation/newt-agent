@@ -30,6 +30,7 @@ async fn compact_responses_input_post_fence_overflow_is_transactional() {
 
     let outcome = compact_responses_input(
         None,
+        None,
         &mut input,
         Some("you are newt"),
         None,
@@ -85,6 +86,7 @@ async fn compact_responses_input_bridge_error_is_transactional() {
     let mut state = CompressState::new();
     let outcome = compact_responses_input(
         None,
+        None,
         &mut input,
         Some("you are newt"),
         None,
@@ -124,6 +126,7 @@ async fn compact_responses_input_refusal_is_transactional() {
     let mut state = CompressState::new();
     // compaction_budget = 1 → the protected head alone exceeds it → refuse.
     let outcome = compact_responses_input(
+        None,
         None,
         &mut input,
         Some("you are newt with a large protected head that cannot shrink"),
@@ -174,6 +177,7 @@ async fn compact_responses_input_commits_only_on_success() {
     let before_len = input.len();
     let mut state = CompressState::new();
     let outcome = compact_responses_input(
+        None,
         None,
         &mut input,
         Some("you are newt"),
@@ -246,6 +250,7 @@ async fn compact_responses_input_spill_store_is_transactional() {
         let mut state = CompressState::new();
         let outcome = compact_responses_input(
             None,
+            None,
             &mut input,
             Some("you are newt"),
             None,
@@ -293,6 +298,7 @@ async fn compact_responses_input_spill_store_is_transactional() {
         let mut input = make_input();
         let mut state = CompressState::new();
         let outcome = compact_responses_input(
+            None,
             None,
             &mut input,
             Some("you are newt"),
@@ -350,6 +356,7 @@ async fn compact_responses_input_no_store_emits_no_retrieval_handle() {
     let mut state = crate::agentic::compress::CompressState::new();
     let outcome = compact_responses_input(
         None,
+        None,
         &mut input,
         Some("you are newt"),
         None,
@@ -395,6 +402,7 @@ async fn compact_responses_input_names_a_resolvable_content_handle() {
     let mut input = spill_middle_input();
     let mut state = crate::agentic::compress::CompressState::new();
     let outcome = compact_responses_input(
+        None,
         None,
         &mut input,
         Some("you are newt"),
@@ -450,6 +458,7 @@ async fn compaction_task_worktree_responses() {
         let original = input.clone();
         let mut state = CompressState::new();
         let result = compact_responses_input(
+            None,
             Some(&session),
             &mut input,
             Some("you are newt"),

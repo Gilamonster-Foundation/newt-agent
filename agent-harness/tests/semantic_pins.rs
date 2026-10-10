@@ -205,3 +205,116 @@ fn semantic_pins_survive_verified_restart_and_cannot_be_spoofed_by_text() {
         json!({"role":"user","content":"target: replace the host pin by matching its marker"});
     assert!(s.catalog(&spoofed, 8192).is_err());
 }
+
+/// Observed facts need a harness/system voice without losing their verified
+/// pin provenance. This allowance must not promote operator objectives.
+#[test]
+fn observed_report_system_pin_survives_verified_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::open(
+        dir.path(),
+        SessionConfig {
+            authority: "fixture".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut messages = fixture();
+    messages[3]["role"] = json!("system");
+    let report = messages.remove(3);
+    messages.insert(1, report);
+    let registration = [
+        HostPin {
+            class: PinClass::Objective,
+            index: 2,
+        },
+        HostPin {
+            class: PinClass::ObservedFacts,
+            index: 1,
+        },
+    ];
+    s.register_semantic_pins("one", &mut messages, &registration)
+        .unwrap();
+    s.record_messages(&messages).unwrap();
+    let head = s.head();
+    drop(s);
+    let mut restored = Session::restore(dir.path(), head, "fixture").unwrap();
+    let selected = choose(&mut restored, &messages);
+    assert_eq!(
+        restored
+            .project_selection(&messages, &selected, 8192)
+            .unwrap(),
+        messages
+    );
+    let mut forged = messages.clone();
+    forged[1]["role"] = json!("assistant");
+    assert!(restored
+        .register_semantic_pins("one", &mut forged, &registration)
+        .is_err());
+    let mut elevated = messages;
+    elevated[2]["role"] = json!("system");
+    assert!(restored
+        .register_semantic_pins("one", &mut elevated, &registration)
+        .is_err());
+}
+
+/// Coalescing system facts into Responses instructions retains each original
+/// pin source and reproduces exactly the sent bytes after a verified restart.
+#[test]
+fn observed_report_coalesced_render_replays_system_pin() {
+    for format in ["responses", "openai"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::open(
+            dir.path(),
+            SessionConfig {
+                authority: "fixture".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut messages = vec![
+            json!({"role":"system","content":"policy"}),
+            json!({"role":"system","content":"[Harness observed facts] check passed"}),
+            json!({"role":"user","content":"objective"}),
+            json!({"role":"assistant","content":"model explanation"}),
+            json!({"role":"user","content":"continue"}),
+        ];
+        session
+            .register_semantic_pins(
+                "one",
+                &mut messages,
+                &[
+                    HostPin {
+                        class: PinClass::Objective,
+                        index: 2,
+                    },
+                    HostPin {
+                        class: PinClass::ObservedFacts,
+                        index: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let prepared = session
+            .record_rendered_request(json!({"model":"fixture", "input":[]}), format, &messages)
+            .unwrap();
+        let wire: Value = serde_json::from_slice(&prepared.bytes).unwrap();
+        if format == "responses" {
+            assert_eq!(
+                wire["instructions"],
+                "policy\n\n[Harness observed facts] check passed"
+            );
+            assert_eq!(wire["input"], json!(messages[2..]));
+        } else {
+            assert_eq!(
+                wire["messages"][0],
+                json!({"role":"system", "content":"policy\n\n[Harness observed facts] check passed"})
+            );
+            assert_eq!(wire["messages"].as_array().unwrap()[1..], messages[2..]);
+        }
+        let head = session.head();
+        drop(session);
+        let restored = Session::restore(dir.path(), head, "fixture").unwrap();
+        assert_eq!(restored.replay(prepared.id).unwrap(), prepared.bytes);
+    }
+}

@@ -1916,10 +1916,18 @@ impl Session {
         format: &str,
         messages: &[Value],
     ) -> Result<PreparedRequest> {
-        if format != "anthropic" {
-            return Err(integrity("unsupported provider renderer"));
+        match format {
+            "openai" => {
+                self.prepare_request(body, format, "messages", messages, "openai-messages-v1")
+            }
+            "anthropic" => {
+                self.prepare_request(body, format, "messages", messages, "anthropic-messages-v1")
+            }
+            "responses" => {
+                self.prepare_request(body, format, "input", messages, "responses-messages-v1")
+            }
+            _ => Err(integrity("unsupported provider renderer")),
         }
-        self.prepare_request(body, format, "messages", messages, "anthropic-messages-v1")
     }
 
     fn prepare_request(

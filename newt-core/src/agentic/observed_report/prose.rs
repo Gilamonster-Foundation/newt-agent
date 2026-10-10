@@ -41,6 +41,37 @@ pub(in crate::agentic) fn model_prose(text: &str) -> String {
     out
 }
 
+/// The durable reply is the operator's view. Its leading harness report is not
+/// assistant speech. Dropping it here grants no authority to text or a CID;
+/// current model facts are supplied separately from the trusted report state.
+pub fn assistant_prose(text: &str) -> String {
+    let prose = split_report(text).map_or(text, |(_, prose)| prose);
+    model_prose(prose)
+}
+
+/// Also covers callers supplying history directly, outside MemoryManager.
+pub(crate) fn replay_messages(messages: &[crate::MemMessage]) -> Vec<crate::MemMessage> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if message.role == crate::Role::Assistant {
+                message.content = assistant_prose(&message.content);
+            }
+            message
+        })
+        .collect()
+}
+
+/// Split only our presentation shape. This is not a provenance verifier and
+/// never imports displayed facts into the trusted report state.
+pub(crate) fn split_report(text: &str) -> Option<(&str, &str)> {
+    (text.starts_with("## Observed\n\nReport `")
+        || text.starts_with("## Observed\n\nFacts unavailable:"))
+    .then(|| text.split_once("\n## Model explanation\n\n"))
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -166,3 +166,70 @@ pub fn tool_use_block(tc: &serde_json::Value) -> serde_json::Value {
         "input": input,
     })
 }
+
+/// Split canonical messages into Responses instructions and verbatim input items.
+/// Shared by live dispatch and content-addressed cold replay.
+pub fn responses_wire_messages(
+    messages: &[serde_json::Value],
+) -> (Option<String>, Vec<serde_json::Value>) {
+    let mut instructions: Vec<String> = Vec::new();
+    let mut input: Vec<serde_json::Value> = Vec::new();
+    for m in messages {
+        if m.get("type").is_some() {
+            input.push(m.clone());
+            continue;
+        }
+        let role = m["role"].as_str().unwrap_or("user");
+        let content = m["content"].as_str().unwrap_or("");
+        match role {
+            "system" | "developer" => instructions.push(content.to_string()),
+            _ => input.push(serde_json::json!({ "role": role, "content": content })),
+        }
+    }
+    let ins = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
+    (ins, input)
+}
+
+/// Coalesce only the leading system run for OpenAI chat, preserving source roles
+/// in the recorded projection while live transport and cold replay share bytes.
+pub fn openai_chat_wire_messages(
+    messages: &[serde_json::Value],
+) -> crate::Result<Vec<serde_json::Value>> {
+    let leading_systems = messages
+        .iter()
+        .take_while(|message| message["role"].as_str() == Some("system"))
+        .count();
+
+    if messages[leading_systems..]
+        .iter()
+        .any(|message| message["role"].as_str() == Some("system"))
+    {
+        return Err(crate::Error::Proposal(
+            "invalid OpenAI chat message order: system messages must precede conversation history"
+                .into(),
+        ));
+    }
+    if leading_systems <= 1 {
+        return Ok(messages.to_vec());
+    }
+
+    let content = messages[..leading_systems]
+        .iter()
+        .map(|message| {
+            message["content"].as_str().ok_or_else(|| {
+                crate::Error::Proposal(
+                    "invalid OpenAI chat system message: content must be text before coalescing"
+                        .into(),
+                )
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?
+        .join("\n\n");
+    let mut system = messages[0].clone();
+    system["content"] = serde_json::Value::String(content);
+
+    let mut wire = Vec::with_capacity(messages.len() - leading_systems + 1);
+    wire.push(system);
+    wire.extend(messages[leading_systems..].iter().cloned());
+    Ok(wire)
+}

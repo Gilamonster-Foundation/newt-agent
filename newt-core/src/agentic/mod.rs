@@ -29,6 +29,7 @@ pub mod anthropic_wire;
 mod capability_check;
 mod claim_check;
 pub(crate) mod observed_report;
+pub use observed_report::assistant_prose as model_reply_for_history;
 mod selected_target;
 mod semantic_pins;
 pub use claim_check::{
@@ -583,6 +584,7 @@ pub(crate) type CompactionStageBuffer =
 /// [`CompactionRejection`]).
 #[allow(clippy::too_many_arguments)]
 async fn compact_responses_input(
+    observed_facts: Option<&semantic_pins::Projection>,
     worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
     input: &mut Vec<serde_json::Value>,
     instructions: Option<&str>,
@@ -652,7 +654,13 @@ async fn compact_responses_input(
     // Classify the Responses `input` into TYPED provenance (fail-closed) and render
     // it to chat with `instructions` as a protected system head. A forbidden
     // `system` item in `input` fails closed here (BHV-PROVENANCE-002).
-    let messages = match responses_compaction::responses_input_to_compaction(input) {
+    // Only the exact note owned by this turn bypasses the untrusted-input
+    // bridge. Unknown system items still fail closed; no marker classification.
+    let (host_notes, conversation): (Vec<_>, Vec<_>) = input
+        .iter()
+        .cloned()
+        .partition(|item| observed_facts.is_some_and(|facts| facts.owns_note(item)));
+    let messages = match responses_compaction::responses_input_to_compaction(&conversation) {
         Ok(m) => m,
         Err(_) => return ResponsesCompaction::BridgeError,
     };
@@ -660,6 +668,7 @@ async fn compact_responses_input(
     if let Some(ins) = instructions {
         chat.push(serde_json::json!({ "role": "system", "content": ins }));
     }
+    chat.extend(host_notes.iter().cloned());
     chat.extend(responses_compaction::compaction_to_chat(&messages));
     // Run the compressor against a CANDIDATE state AND a candidate-local staging
     // buffer — the live anti-thrash counters / disabled latch and the session
@@ -711,20 +720,21 @@ async fn compact_responses_input(
         return ResponsesCompaction::NotFired;
     }
     // Drop the instructions system head we prepended for head protection:
-    // `instructions` is re-sent ONCE via its own field (BHV-PROVENANCE-005), never
-    // duplicated into `input`. The compressor keeps the head verbatim at index 0.
+    // Both the base instructions and owned facts stay in the protected head.
     let compacted = &outcome.messages;
-    let rebuilt_chat: &[serde_json::Value] = if instructions.is_some()
-        && compacted.first().and_then(|m| m["role"].as_str()) == Some("system")
-    {
-        &compacted[1..]
-    } else {
-        compacted
-    };
+    let protected = usize::from(instructions.is_some()) + host_notes.len();
+    let rebuilt_chat = &compacted[protected..];
     // Reclassify to typed provenance, then rebuild exhaustively (untrusted-derived
     // → fenced `user`).
     let rebuilt_msgs = responses_compaction::chat_to_compaction(rebuilt_chat);
-    let rebuilt_input = with_task(responses_compaction::compaction_to_responses(&rebuilt_msgs));
+    let with_notes = |mut items: Vec<serde_json::Value>| {
+        let mut result = host_notes.clone();
+        result.append(&mut items);
+        result
+    };
+    let rebuilt_input = with_task(with_notes(responses_compaction::compaction_to_responses(
+        &rebuilt_msgs,
+    )));
     // #1528 B2 (BHV-BUDGET-004): the provenance fences are added AFTER the
     // compressor fit its budget, so validate the REBUILT request against the
     // authoritative budget (the SHARED B1 estimator, same real-token currency
@@ -735,8 +745,8 @@ async fn compact_responses_input(
             estimate_responses_request_real_tokens(instructions, items, tools, estimation, cal)
         };
         let post_bridge = est_tokens(&rebuilt_input);
-        let pre_bridge = est_tokens(&responses_compaction::rebuild_unfenced_for_estimate(
-            &rebuilt_msgs,
+        let pre_bridge = est_tokens(&with_notes(
+            responses_compaction::rebuild_unfenced_for_estimate(&rebuilt_msgs),
         ));
         if let Err(exceeded) =
             responses_compaction::check_post_bridge_budget(budget, pre_bridge, post_bridge)
@@ -2112,6 +2122,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
 
     // Convert MemMessage list to Ollama JSON format.
     // The memory manager already included the current task as the last user message.
+    let mem_messages = observed_report::replay_messages(mem_messages);
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
@@ -2353,6 +2364,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     let mut selected_source = selected_target::Projection::default();
+    let mut observed_facts = semantic_pins::Projection::default();
     'round_loop: for round in 0..usize::MAX {
         selected_source.refresh(
             &mut messages,
@@ -2363,6 +2375,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             false,
         );
         semantic_pins::refresh(
+            &mut observed_facts,
             smart_harness,
             &mut messages,
             prompt_context,
@@ -6793,41 +6806,7 @@ async fn final_summary_ollama(
 fn openai_chat_wire_messages(
     messages: &[serde_json::Value],
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let leading_systems = messages
-        .iter()
-        .take_while(|message| message["role"].as_str() == Some("system"))
-        .count();
-
-    if messages[leading_systems..]
-        .iter()
-        .any(|message| message["role"].as_str() == Some("system"))
-    {
-        anyhow::bail!(
-            "invalid OpenAI chat message order: system messages must precede conversation history"
-        );
-    }
-    if leading_systems <= 1 {
-        return Ok(messages.to_vec());
-    }
-
-    let content = messages[..leading_systems]
-        .iter()
-        .map(|message| {
-            message["content"].as_str().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "invalid OpenAI chat system message: content must be text before coalescing"
-                )
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .join("\n\n");
-    let mut system = messages[0].clone();
-    system["content"] = serde_json::Value::String(content);
-
-    let mut wire = Vec::with_capacity(messages.len() - leading_systems + 1);
-    wire.push(system);
-    wire.extend(messages[leading_systems..].iter().cloned());
-    Ok(wire)
+    Ok(agent_harness::render::openai_chat_wire_messages(messages)?)
 }
 
 fn prepare_openai_assistant_replay(
@@ -7215,6 +7194,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let advertise_plan_mode_active =
         plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
+    let mem_messages = observed_report::replay_messages(mem_messages);
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
         .map(|m| {
@@ -7420,6 +7400,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut turn_heartbeat = TurnHeartbeat::default();
     let mut uncorrelatable_batches: u32 = 0;
     let mut selected_source = selected_target::Projection::default();
+    let mut observed_facts = semantic_pins::Projection::default();
     'round_loop: for round in 0..usize::MAX {
         selected_source.refresh(
             &mut messages,
@@ -7430,6 +7411,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             false,
         );
         semantic_pins::refresh(
+            &mut observed_facts,
             smart_harness,
             &mut messages,
             prompt_context,
@@ -7810,12 +7792,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         ));
                     }
                     async {
-                        let mut req = smart_harness::request(
-                            stream_client.post(&chat_url),
-                            &body,
-                            smart_harness,
-                            "openai",
-                        )?;
+                        let mut req = match smart_harness {
+                            Some(harness) => stream_client
+                                .post(&chat_url)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .body(harness.prepare_with_messages(&body, "openai", &messages)?),
+                            None => stream_client.post(&chat_url).json(&body),
+                        };
                         if let Some(key) = api_key {
                             req = req.bearer_auth(key);
                         }
@@ -10000,6 +9983,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let advertise_plan_mode_active =
         plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
+    let mem_messages = observed_report::replay_messages(mem_messages);
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
         .map(|m| {
@@ -10198,6 +10182,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut turn_heartbeat = TurnHeartbeat::default();
     let mut uncorrelatable_batches: u32 = 0;
     let mut selected_source = selected_target::Projection::default();
+    let mut observed_facts = semantic_pins::Projection::default();
     'round_loop: for round in 0..usize::MAX {
         selected_source.refresh(
             &mut messages,
@@ -10208,6 +10193,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             false,
         );
         semantic_pins::refresh(
+            &mut observed_facts,
             smart_harness,
             &mut messages,
             prompt_context,
@@ -12165,6 +12151,18 @@ pub async fn openai_responses_complete_with_prompt(
 /// constructor other than a successful [`validate_responses_request`] — so an
 /// unvalidated `serde_json::Value` body cannot compile its way to `POST /v1/responses`.
 #[allow(clippy::too_many_arguments)]
+fn responses_source_messages(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut messages = Vec::with_capacity(input.len() + 1);
+    if let Some(text) = instructions {
+        messages.push(serde_json::json!({"role":"system", "content":text}));
+    }
+    messages.extend_from_slice(input);
+    messages
+}
+
 async fn dispatch_responses_json<'a>(
     client: &reqwest::Client,
     url: &str,
@@ -12172,12 +12170,12 @@ async fn dispatch_responses_json<'a>(
     validated: &responses_wire_validation::ValidatedResponsesRequest,
     retry: &RetryPolicy,
     color: bool,
-    smart_harness: Option<&smart_harness::SmartHarness>,
+    smart_harness: Option<(&smart_harness::SmartHarness, &[serde_json::Value])>,
     attempts: Option<attempt_capture::AttemptScope<'a>>,
 ) -> anyhow::Result<(serde_json::Value, Option<attempt_capture::Attempt<'a>>)> {
     let body = validated.body();
     let body_bytes = smart_harness
-        .map(|h| h.request(body, "responses"))
+        .map(|(h, messages)| h.prepare_with_messages(body, "responses", messages))
         .transpose()?;
     dispatch_with_decoder(
         retry,
@@ -12200,7 +12198,7 @@ async fn dispatch_responses_json<'a>(
         |attempt, delay, error| {
             print_retry_indicator(attempt, retry.max_retries, delay, error, color);
         },
-        smart_harness,
+        smart_harness.map(|(h, _)| h),
         |bytes| Ok(serde_json::from_slice(bytes)?),
     )
     .await
@@ -12449,6 +12447,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let advertise_plan_mode_active =
         plan_mode_control.is_some_and(|control| control.is_plan_mode());
 
+    let mem_messages = observed_report::replay_messages(mem_messages);
     let mut msgs_json: Vec<serde_json::Value> = mem_messages
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
@@ -12632,13 +12631,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // so retention buys nothing and would leave an unaudited copy of the
         // operator's prompts/source/reasoning on the provider. Policy lives in
         // one place (`responses_wire::STORE_RESPONSE_SERVER_SIDE`).
+        let source = responses_source_messages(instructions.as_deref(), input);
+        let (wire_instructions, input) = crate::responses_wire::build_responses_input(&source);
         let mut body = serde_json::json!({
             "model": model,
             "input": input,
             "stream": false,
             "store": crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
         });
-        if let Some(ins) = &instructions {
+        if let Some(ins) = &wire_instructions {
             body["instructions"] = serde_json::json!(ins);
         }
         // Psyche cognition → `reasoning.effort` (omitted entirely when unset).
@@ -12665,6 +12666,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut uncorrelatable_batches: u32 = 0;
     let mut current_tool_round_limit = max_tool_rounds;
     let mut selected_source = selected_target::Projection::default();
+    let mut observed_facts = semantic_pins::Projection::default();
     for round in 0..usize::MAX {
         selected_source.refresh(
             &mut input,
@@ -12675,6 +12677,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             true,
         );
         semantic_pins::refresh(
+            &mut observed_facts,
             smart_harness,
             &mut input,
             prompt_context,
@@ -12778,6 +12781,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 );
                 if before > budget {
                     let compression = compact_responses_input(
+                        Some(&observed_facts),
                         worktree_session,
                         &mut input,
                         instructions.as_deref(),
@@ -12855,6 +12859,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 None => anyhow::Error::new(e),
             })?;
             observability::observe_output_allowance(&mut solve_obs, Some(output_cap?), true);
+            let source = responses_source_messages(instructions.as_deref(), &input);
             let dispatch = dispatch_responses_json(
                 &client,
                 &responses_url,
@@ -12862,7 +12867,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &validated,
                 &retry,
                 color,
-                smart_harness,
+                smart_harness.map(|h| (h, source.as_slice())),
                 attempts,
             )
             .await;
@@ -12973,6 +12978,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 estimation,
                             );
                             let compression = compact_responses_input(
+                                Some(&observed_facts),
                                 worktree_session,
                                 &mut input,
                                 instructions.as_deref(),
@@ -13832,6 +13838,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         );
         if before > budget {
             let compression = compact_responses_input(
+                Some(&observed_facts),
                 worktree_session,
                 &mut input,
                 instructions.as_deref(),
@@ -13935,6 +13942,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // were spent.
     let summary_estimate =
         estimate_responses_request_tokens(instructions.as_deref(), &input, None, estimation);
+    let source = responses_source_messages(instructions.as_deref(), &input);
     let (json, attempt) = match dispatch_responses_json(
         &client,
         &responses_url,
@@ -13942,7 +13950,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &validated,
         &retry,
         color,
-        smart_harness,
+        smart_harness.map(|h| (h, source.as_slice())),
         attempts,
     )
     .await

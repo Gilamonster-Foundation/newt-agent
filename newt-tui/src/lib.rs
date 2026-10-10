@@ -6689,10 +6689,13 @@ where
     // single prompt of the turn, output = sum across rounds (Step 18.1
     // semantics); `None` (backend reported nothing) is stored as NULL.
     // #717: phantom reaches persist alongside the events column.
+    // The displayed harness report belongs to the outcome artifact, not the
+    // assistant's authored turn. Keep new rows clean; replay also handles old rows.
+    let model_reply = newt_core::agentic::model_reply_for_history(reply);
     store.append_turn_full(
         conversation_id,
         task,
-        reply,
+        &model_reply,
         events,
         phantom_reaches,
         // A model turn is witnessed, never derived: empty sources always.

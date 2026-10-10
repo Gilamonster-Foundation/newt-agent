@@ -179,3 +179,31 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
     // The lone-sided summary record never dispatches an empty message.
     assert!(!messages.iter().any(|m| m.content.is_empty()));
 }
+
+/// Operator-only reports must not become assistant-authored SQLite history.
+#[test]
+fn observed_report_persistence_stores_model_explanation_only() {
+    let (_state, _workspace, store, _persona_store) = resume_fixture();
+    let id = newt_core::new_conversation_id();
+    let reply = "## Observed\n\nReport `sample` — root `project`.\n\nFiles since objective/adoption snapshot (LF counts; absence is 0):\n- changed\n\n## Model explanation\n\nI extracted the helper.";
+    save_turn_if_persistent(
+        Some(&store),
+        &id,
+        None,
+        "refactor",
+        reply,
+        &[],
+        &[],
+        None,
+        None,
+        &std::collections::BTreeMap::new(),
+        &newt_core::PlanSnapshot::default(),
+    )
+    .unwrap();
+    let saved = store.load(&id).unwrap();
+    assert_eq!(saved.turns[0].assistant, "I extracted the helper.");
+    assert!(
+        reply.starts_with("## Observed"),
+        "operator output stays complete"
+    );
+}

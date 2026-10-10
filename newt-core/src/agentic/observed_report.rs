@@ -2,7 +2,9 @@
 mod capture;
 mod files;
 mod prose;
+pub use prose::assistant_prose;
 pub(super) use prose::model_prose;
+pub(crate) use prose::{replay_messages, split_report};
 #[cfg(test)]
 pub(crate) mod tests;
 

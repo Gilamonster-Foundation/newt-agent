@@ -595,3 +595,25 @@ fn observed_report_continue_after_normal_finish_keeps_objective() {
         ModelInputOrigin::Operator
     ));
 }
+
+/// Restored agent-maintained plans are context, not system instructions or
+/// assistant speech. Their source and advisory status must survive replay.
+#[test]
+fn observed_report_restored_plan_has_harness_voice() {
+    let original = vec![
+        newt_core::MemMessage::system("system policy"),
+        newt_core::MemMessage::user("continue"),
+    ];
+    assert_eq!(messages_with_plan(original.clone(), None), original);
+    let plan = "<plan>\n✓ 1. Extract helper\n→ 2. Verify\n</plan>";
+    let messages = messages_with_plan(original, Some(plan));
+    assert_eq!(messages[0].content, "system policy");
+    let note = messages
+        .iter()
+        .find(|m| m.content.contains("<plan>"))
+        .unwrap();
+    assert_eq!(note.role, newt_core::Role::User);
+    assert!(note.content.contains("Harness-restored plan"));
+    assert!(note.content.contains("agent-maintained, advisory"));
+    assert_eq!(messages.last().unwrap().content, "continue");
+}

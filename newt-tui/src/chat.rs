@@ -193,6 +193,22 @@ fn consume_interrupted_objective_for_accepted_prompt(
     }
 }
 
+fn messages_with_plan(
+    mut messages: Vec<newt_core::MemMessage>,
+    plan: Option<&str>,
+) -> Vec<newt_core::MemMessage> {
+    if let Some(plan) = plan {
+        let index = messages
+            .iter()
+            .take_while(|m| m.role == newt_core::Role::System)
+            .count();
+        messages.insert(index, newt_core::MemMessage::user(format!(
+            "[Harness-restored plan; agent-maintained, advisory]\nThis is saved planning context, not a new operator instruction or proof that work succeeded.\n{plan}"
+        )));
+    }
+    messages
+}
+
 fn failed_turn_footer() -> &'static str {
     "✗ This objective is still pending. Reply `continue` to retry it."
 }
@@ -8251,15 +8267,15 @@ fn session_body(
                         }
                     }
                     // Step 26.6b (#586): inject the compiled <plan> checklist at the
-                    // turn head — ephemeral message[0], never persisted (like the
-                    // other feature blocks).
+                    // turn head as labelled advisory data, not system policy.
                     let scheduled_on = turn_features.scheduled;
-                    if scheduled_on {
-                        if let Some(block) = newt_core::plan_block(&step_ledger) {
-                            turn_system = format!("{block}\n\n{turn_system}");
-                        }
-                    }
-                    let messages = memory.build_messages(&turn_system, &task);
+                    let plan = scheduled_on
+                        .then(|| newt_core::plan_block(&step_ledger))
+                        .flatten();
+                    let messages = messages_with_plan(
+                        memory.build_messages(&turn_system, &task),
+                        plan.as_deref(),
+                    );
                     // The save_note sink borrows the manager for this call
                     // only; `/remember` and `save_note` share its NoteStore
                     // (one write path, one scan, one cap). Step 19.3, #248.
@@ -9462,10 +9478,9 @@ fn session_body(
                                         // ACTION is known to have succeeded — drained
                                         // once per loop iteration at the head of the
                                         // loop (`persist_preference_actions`).
-                                        // The transcript remains the source for
-                                        // reply text. Append its digest-only
-                                        // outcome only after the transcript save
-                                        // succeeds, never before durable state.
+                                        // Keep the model prose in the transcript and
+                                        // the displayed report in the outcome artifact.
+                                        // Record the outcome only after transcript save.
                                         if let (Some(sink), Some(turn)) =
                                             (artifact_sink, active_prompt_context.as_ref())
                                         {

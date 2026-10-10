@@ -238,6 +238,7 @@ mod enumeration;
 /// cannot be dispatched as if its facts were still the current observation.
 #[test]
 fn semantic_pins_refresh_actual_report_after_edit_and_refuse_stale_request() {
+    let mut projection = crate::agentic::semantic_pins::Projection::default();
     use crate::agentic::{
         prompt_read::PromptReadContext, semantic_pins, smart_harness::SmartHarness,
     };
@@ -253,6 +254,7 @@ fn semantic_pins_refresh_actual_report_after_edit_and_refuse_stale_request() {
     let mut messages = vec![serde_json::json!({"role":"user","content":"change source"})];
     let prompt = PromptReadContext::new(None, "change source", None);
     semantic_pins::refresh(
+        &mut projection,
         Some(&h),
         &mut messages,
         prompt,
@@ -265,6 +267,7 @@ fn semantic_pins_refresh_actual_report_after_edit_and_refuse_stale_request() {
     let stale = messages.clone();
     std::fs::write(dir.path().join("src/mod.rs"), "new\nsource\nthree\n").unwrap();
     semantic_pins::refresh(
+        &mut projection,
         Some(&h),
         &mut messages,
         prompt,
@@ -282,8 +285,85 @@ fn semantic_pins_refresh_actual_report_after_edit_and_refuse_stale_request() {
     let sent = h
         .request(&serde_json::json!({"messages":messages}), "openai")
         .unwrap();
-    assert!(String::from_utf8_lossy(&sent).contains("historical checks retain their stated scope"));
+    assert!(String::from_utf8_lossy(&sent).contains("Historical checks retain their stated scope"));
     assert!(h
         .request(&serde_json::json!({"messages":stale}), "openai")
         .is_err());
+}
+
+/// Harness observations need their own labelled model message even without
+/// smart navigation. A new check replaces the prior note, not the user task.
+#[test]
+fn observed_report_model_note_without_smart_harness() {
+    let mut projection = crate::agentic::semantic_pins::Projection::default();
+    use crate::agentic::{prompt_read::PromptReadContext, semantic_pins};
+    let dir = fixture();
+    let workspace = dir.path().to_str().unwrap();
+    let claims = TurnClaims::capture(workspace, &Scope::All, None);
+    let mut messages = vec![serde_json::json!({"role":"user","content":"continue"})];
+    let prompt = PromptReadContext::new(None, "continue", None);
+    let capture = Capture {
+        command: Some(("cargo check".into(), workspace.into())),
+        exit: Some(0),
+        ..Capture::default()
+    };
+    claims.observe_report(
+        workspace,
+        &Scope::All,
+        &capture,
+        Some(ExecOutcome::Passed),
+        None,
+    );
+    semantic_pins::refresh(
+        &mut projection,
+        None,
+        &mut messages,
+        prompt,
+        None,
+        &claims,
+        workspace,
+        &Scope::All,
+    )
+    .unwrap();
+    let note = messages
+        .iter()
+        .find(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("[Harness observed facts"))
+        })
+        .expect("labelled harness note");
+    assert_eq!(note["role"], "system");
+    assert!(note["content"].as_str().unwrap().contains("cargo check"));
+    assert!(note["content"]
+        .as_str()
+        .unwrap()
+        .contains("not assistant-authored"));
+    let original_len = messages.len();
+    claims.observe_report(
+        workspace,
+        &Scope::All,
+        &Capture {
+            exit: Some(101),
+            ..capture
+        },
+        Some(ExecOutcome::Failed),
+        None,
+    );
+    semantic_pins::refresh(
+        &mut projection,
+        None,
+        &mut messages,
+        prompt,
+        None,
+        &claims,
+        workspace,
+        &Scope::All,
+    )
+    .unwrap();
+    assert_eq!(messages.len(), original_len);
+    assert_eq!(messages.last().unwrap()["content"], "continue");
+    assert!(messages.iter().any(|m| m["content"]
+        .as_str()
+        .is_some_and(|s| s.contains("Failed; exit 101"))));
 }

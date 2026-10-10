@@ -347,7 +347,7 @@ impl MemoryManager {
         for p in &self.providers {
             let msgs = p.build_messages(system_prompt, new_task);
             if !msgs.is_empty() {
-                return msgs;
+                return crate::agentic::observed_report::replay_messages(&msgs);
             }
         }
         // Minimal fallback (should not happen with at least one provider).
@@ -366,9 +366,10 @@ impl MemoryManager {
         metrics: &TurnMetrics,
         active_task: &str,
     ) {
+        let prose = crate::agentic::observed_report::assistant_prose(assistant);
         for provider in &mut self.providers {
             provider
-                .sync_turn_with_active_task(user, assistant, metrics, active_task)
+                .sync_turn_with_active_task(user, &prose, metrics, active_task)
                 .await;
         }
     }
@@ -382,8 +383,17 @@ impl MemoryManager {
 
     /// Replace conversation-local history in every provider from durable turns.
     pub fn restore_turns(&mut self, turns: &[crate::ConversationTurn]) {
+        // Project display records into model memory; never rewrite durable turns.
+        let turns: Vec<_> = turns
+            .iter()
+            .cloned()
+            .map(|mut turn| {
+                turn.assistant = crate::agentic::observed_report::assistant_prose(&turn.assistant);
+                turn
+            })
+            .collect();
         for p in &mut self.providers {
-            p.restore_turns(turns);
+            p.restore_turns(&turns);
         }
     }
 
