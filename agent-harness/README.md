@@ -114,3 +114,23 @@ obsolete target/fact cards while retaining their source events for historical
 inspection; historical checks are not current-tree certification. Registrations
 use the existing canonical journal and verified restore, with no separate store
 or new model-facing operation.
+
+Composition journaling is a host-only API; it adds no model-facing operation.
+Start from a recorded request with `composition_catalog(request, Policy)`, retain
+an attributed typed proposal with `record_composition_proposal`, then call
+`decide_composition`. The policy bounds the complete rendered request. Reasons
+are retained model claims, never execution evidence. Selection uses admitted
+occurrence IDs (including repeated text), existing pins, and complete tool groups.
+
+A decision stages its projection and existing elision proofs, verifies the source
+closure, and publishes one journal checkpoint before installing the new view.
+Refusals are durable without changing that view. Interrupted publication aborts
+the live writer: restore from the actual current head to obtain either the old
+view or the complete accepted one. Staged but unpublished objects grant no rights.
+
+`record_composed_request` retains the original provider renderer and binds its
+request record to the accepted decision. This records bytes ready for dispatch;
+it does not prove network delivery. An inverse proposal restores a prior
+projection byte-for-byte without rewinding history or re-executing tools. Changed
+host context, objective, pins or policy reject stale inverses. Historical request
+replay remains available only while the verified source closure is retained.

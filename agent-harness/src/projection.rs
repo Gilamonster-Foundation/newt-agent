@@ -3,7 +3,7 @@ use agent_frame::Span;
 use content_addressable::{ContentAddressable, ContentError, ContentId, RawContentId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
     pub event: ContentId,
@@ -12,7 +12,7 @@ pub struct Entry {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Projection {
     pub schema: u32,

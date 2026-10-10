@@ -62,3 +62,9 @@ impl PinClass {
         matches!(self, Self::SelectedTarget | Self::ObservedFacts)
     }
 }
+
+mod journal;
+pub(crate) use journal::{pin_identity, State, Submission};
+pub use journal::{
+    Action, Actor, Catalog, Change, Decision, Elision, Outcome, Policy, Proposal, Receipt, Refusal,
+};
