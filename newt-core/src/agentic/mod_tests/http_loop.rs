@@ -394,7 +394,7 @@ async fn an_ollama_probe_500_is_retried_and_the_second_attempt_answers() {
     let (reply, ..) = chat_complete(ctx(&uri, &messages, &caveats), &mut NoMcp)
         .await
         .expect("a transient 500 is retried, not fatal");
-    assert_eq!(reply, "hi");
+    assert_eq!(crate::agentic::model_explanation(&reply), "hi");
     assert_eq!(probes.load(Ordering::SeqCst), 2, "exactly one retry");
 }
 
@@ -430,7 +430,7 @@ async fn scripted_openai_identical_next_turn_consumes_the_next_answer() {
         let (reply, streamed, _, _) = chat_complete_with_prompt(c, Some(&turn), None, &mut NoMcp)
             .await
             .expect("scripted streamed primary must produce a complete answer");
-        assert_eq!(reply, expected);
+        assert_eq!(crate::agentic::model_explanation(&reply), expected);
         assert!(!streamed, "the host renders the accepted answer (#2372)");
     }
     assert_eq!(round.load(Ordering::SeqCst), 2, "two logical rounds");

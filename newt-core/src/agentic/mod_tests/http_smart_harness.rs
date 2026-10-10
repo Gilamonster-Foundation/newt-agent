@@ -126,7 +126,11 @@ async fn all_four_wires_deliver_a_real_answer_after_a_nudge_without_regeneration
             4,
         )
         .await;
-        assert_eq!(text, "The answer is three.", "{wire}");
+        assert_eq!(
+            crate::agentic::model_explanation(&text),
+            "The answer is three.",
+            "{wire}"
+        );
         assert_eq!(reason, crate::TurnEndReason::Completed, "{wire}");
         assert_eq!(requests.len(), 2, "{wire}");
         assert!(
@@ -157,7 +161,11 @@ async fn all_four_wires_preserve_questions_and_honestly_stop_exhausted_narration
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let (text, reason, requests) =
             run(wire, &["Which repository?"], &["\"question\""], 4).await;
-        assert_eq!(text, "Which repository?", "{wire}");
+        assert_eq!(
+            crate::agentic::model_explanation(&text),
+            "Which repository?",
+            "{wire}"
+        );
         assert_eq!(reason, crate::TurnEndReason::AwaitingOperator, "{wire}");
         assert_eq!(requests.len(), 1, "{wire}");
         let (text, reason, requests) = run(
@@ -198,7 +206,11 @@ async fn all_four_wires_record_validated_tools_and_stop_tool_only_caps_incomplet
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let (text, reason, requests) =
             run(wire, &["<tool>", "The file is absent."], &["\"answer\""], 3).await;
-        assert_eq!(text, "The file is absent.", "{wire}");
+        assert_eq!(
+            crate::agentic::model_explanation(&text),
+            "The file is absent.",
+            "{wire}"
+        );
         assert_eq!(reason, crate::TurnEndReason::Completed, "{wire}");
         assert_eq!(requests.len(), 2, "{wire}");
         let (_, reason, requests) = run(wire, &["<tool>"], &[], 1).await;

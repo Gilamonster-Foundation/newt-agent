@@ -137,6 +137,7 @@ pub(super) async fn execute(
     timeout_secs: Option<u64>,
     command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
+    presentation.execution_command(source, cwd);
     if let Some(refusal) = shell::same_file_redirect_refusal(source, cwd) {
         return (refusal, ExecOutcome::Denied);
     }

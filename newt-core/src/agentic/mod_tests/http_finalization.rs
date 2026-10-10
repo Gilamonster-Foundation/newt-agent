@@ -91,6 +91,7 @@ async fn cap_exit_hallucinated_path_gets_claim_check_refutation() {
         reply.contains("newt-tui/src/commands.rs (lines 38-40)"),
         "the model's prose is preserved verbatim: {reply}"
     );
+    assert!(reply.starts_with("## Observed"), "{reply}");
     assert!(reply.contains("⚠ claim check (#867)"), "got: {reply}");
     assert!(
         reply.contains("`newt-tui/src/commands.rs`"),
@@ -196,7 +197,8 @@ async fn clean_normal_finish_gets_no_annotation() {
         .expect("chat_complete should succeed");
 
     assert_eq!(
-        reply, "The task is already complete; nothing further to do.",
+        crate::agentic::model_explanation(&reply),
+        "The task is already complete; nothing further to do.",
         "a clean normal finish must pass through byte-for-byte: {reply}"
     );
     assert!(!reply.contains("⚠ claim check"), "got: {reply}");

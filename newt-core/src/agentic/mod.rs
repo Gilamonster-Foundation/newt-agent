@@ -28,12 +28,15 @@ pub mod anthropic_wire;
 /// turn's `ToolEvent` ledger. Same append-never-rewrite shape.
 mod capability_check;
 mod claim_check;
+pub(crate) mod observed_report;
 mod selected_target;
 pub use claim_check::{
     files_changed_between, is_workspace_repo_root, locate_workspace_repo, nested_current_paths,
     nested_files_changed_between, snapshot_nested_repos, snapshot_workspace,
     snapshot_workspace_subtree, NestedRepoSnapshot, StatusSnapshot, WorkspaceRepoLocation,
 };
+#[cfg(test)]
+pub(crate) use observed_report::tests::model_explanation;
 pub(crate) mod compress;
 mod context_recovery;
 mod crew_attest;
@@ -2115,6 +2118,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     if let Some(harness) = smart_harness {
         messages = harness.initial_messages(messages)?;
     }
+    if let (Some(session), Some(context)) = (worktree_session, turn_prompt_context) {
+        session
+            .report
+            .lock()
+            .expect("report state")
+            .begin(context.active().root_prompt_id());
+    }
     let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
@@ -4013,6 +4023,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
             let governed_pr = std::sync::OnceLock::new();
+            let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
             let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
             // #727: intercept the read-only budget self-read here. Its answer is
@@ -4113,6 +4124,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         execution: Some(&execution),
                         retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
+                        report_capture: Some(&report_capture),
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
@@ -4181,6 +4193,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 ok,
                 execution.get().copied(),
                 tool_t0,
+            );
+            turn_claims.observe_report(
+                workspace,
+                &caveats.fs_read,
+                &report_capture.lock().expect("report capture"),
+                execution.get().copied(),
+                governed_pr.get(),
             );
             if let Some(outcome) = governed_pr.get() {
                 verification.record_publication_outcome(outcome);
@@ -6464,6 +6483,7 @@ fn finalize_final_text(
     turn_claims: &claim_check::TurnClaims<'_>,
     verification: &self_verify::VerificationLedger,
 ) -> String {
+    let observed = turn_claims.observed_report(workspace, read_scope, &text);
     let text = capability_check::annotate_unobserved_probe(text, capability_evidence);
     let text = turn_claims.annotate(
         text,
@@ -6474,7 +6494,7 @@ fn finalize_final_text(
     let text = verification.annotate_cargo_claim(text);
     let text = verification.annotate_pr_claim(text);
     let text = verification.annotate_push_claim(text);
-    redact_model_facing(disclosure, text)
+    redact_model_facing(disclosure, format!("{observed}{text}"))
 }
 
 /// The cap-exit context threaded into a final tools-disabled summary (Step
@@ -7199,6 +7219,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         .collect();
     if let Some(harness) = smart_harness {
         messages = harness.initial_messages(messages)?;
+    }
+    if let (Some(session), Some(context)) = (worktree_session, turn_prompt_context) {
+        session
+            .report
+            .lock()
+            .expect("report state")
+            .begin(context.active().root_prompt_id());
     }
     let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
@@ -9021,6 +9048,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
             let governed_pr = std::sync::OnceLock::new();
+            let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
             let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
             // #727: intercept the read-only budget self-read (see the Ollama path).
@@ -9109,6 +9137,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         execution: Some(&execution),
                         retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
+                        report_capture: Some(&report_capture),
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
@@ -9185,6 +9214,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 ok,
                 execution.get().copied(),
                 tool_t0,
+            );
+            turn_claims.observe_report(
+                workspace,
+                &caveats.fs_read,
+                &report_capture.lock().expect("report capture"),
+                execution.get().copied(),
+                governed_pr.get(),
             );
             if let Some(outcome) = governed_pr.get() {
                 verification.record_publication_outcome(outcome);
@@ -9405,6 +9441,8 @@ struct AnthropicDispatch<'a> {
     retry: &'a RetryPolicy,
     color: bool,
     markdown: bool,
+    /// Buffer answer deltas until the harness can prepend its observed report.
+    defer_answer: bool,
     /// Where a folded reasoning body is retained, so the closing line's
     /// `/spill open <id>` names something real rather than gesturing at it.
     retain: Option<&'a std::sync::Arc<dyn CompletedSpillRenderer>>,
@@ -9418,7 +9456,7 @@ struct AnthropicDispatch<'a> {
 ///
 /// `stream:true`: only send()+status-check sit in the retry envelope; the SSE
 /// body is consumed OUTSIDE it (a re-sent body after visible output would
-/// re-print). Text deltas print live (spinner teardown before the first
+/// re-print). Unless `defer_answer` is set, text deltas print live (spinner teardown before the first
 /// visible char, the `▸  ` prefix, the markdown block writer when markdown is
 /// on); thinking deltas go to the spinner detail. A mid-stream failure follows the #640 policy: with no
 /// visible output the round is re-issued under the retry budget; with partial
@@ -9524,7 +9562,7 @@ async fn anthropic_dispatch_round(
             d.color,
         );
         let cols = display::term_cols();
-        let mut md = d.markdown.then(|| {
+        let mut md = (d.markdown && !d.defer_answer).then(|| {
             MarkdownStreamWriter::new(
                 io::stdout(),
                 RenderOpts {
@@ -9565,6 +9603,16 @@ async fn anthropic_dispatch_round(
                     for action in acc.feed(&decode_chunk(&mut carry, &chunk)) {
                         match action {
                             anthropic_wire::StreamAction::TextDelta(t) => {
+                                if d.defer_answer {
+                                    if let Some(sp) = spinner.take() {
+                                        anth_reason.close(
+                                            sp.elapsed(),
+                                            d.retain.map(std::sync::Arc::as_ref),
+                                            d.color,
+                                        );
+                                    }
+                                    continue;
+                                }
                                 if !started {
                                     // The answer is starting — close the
                                     // reasoning block while the spinner's clock
@@ -9651,7 +9699,7 @@ async fn anthropic_dispatch_round(
             if crate::retry::classify(&shaped) != crate::retry::Retryability::Retry {
                 return Err(shaped);
             }
-            if !started {
+            if round.text.is_empty() {
                 if stream_retries >= d.retry.max_retries {
                     return Err(shaped);
                 }
@@ -9665,7 +9713,7 @@ async fn anthropic_dispatch_round(
                 &format!("stream broke mid-response ({err}) — keeping the partial answer"),
                 d.color,
             );
-            return Ok(Some((round, true)));
+            return Ok(Some((round, started)));
         }
         return Ok(Some((round, started)));
     }
@@ -9905,6 +9953,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let messages_url = anthropic_wire::messages_url(url);
     let retry = tui_retry_policy(url);
     let dispatcher = AnthropicDispatch {
+        defer_answer: true,
         smart_harness,
         client: &client,
         stream_client: &stream_client,
@@ -9946,6 +9995,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         .collect();
     if let Some(harness) = smart_harness {
         messages = harness.initial_messages(messages)?;
+    }
+    if let (Some(session), Some(context)) = (worktree_session, turn_prompt_context) {
+        session
+            .report
+            .lock()
+            .expect("report state")
+            .begin(context.active().root_prompt_id());
     }
     let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
@@ -11601,6 +11657,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
             let governed_pr = std::sync::OnceLock::new();
+            let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
             let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
             // #727: intercept the read-only budget self-read (mirrors the
@@ -11683,6 +11740,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         execution: Some(&execution),
                         retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
+                        report_capture: Some(&report_capture),
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
@@ -11756,6 +11814,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 ok,
                 execution.get().copied(),
                 tool_t0,
+            );
+            turn_claims.observe_report(
+                workspace,
+                &caveats.fs_read,
+                &report_capture.lock().expect("report capture"),
+                execution.get().copied(),
+                governed_pr.get(),
             );
             if let Some(outcome) = governed_pr.get() {
                 verification.record_publication_outcome(outcome);
@@ -12361,6 +12426,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         .collect();
     if let Some(harness) = smart_harness {
         msgs_json = harness.initial_messages(msgs_json)?;
+    }
+    if let (Some(session), Some(context)) = (worktree_session, turn_prompt_context) {
+        session
+            .report
+            .lock()
+            .expect("report state")
+            .begin(context.active().root_prompt_id());
     }
     let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
@@ -13402,6 +13474,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
             let governed_pr = std::sync::OnceLock::new();
+            let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
             let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
             // #727: intercept the read-only budget self-read (see the Ollama path).
@@ -13504,6 +13577,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         execution: Some(&execution),
                         retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
+                        report_capture: Some(&report_capture),
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
@@ -13578,6 +13652,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 ok,
                 execution.get().copied(),
                 tool_t0,
+            );
+            turn_claims.observe_report(
+                workspace,
+                &caveats.fs_read,
+                &report_capture.lock().expect("report capture"),
+                execution.get().copied(),
+                governed_pr.get(),
             );
             if let Some(outcome) = governed_pr.get() {
                 verification.record_publication_outcome(outcome);

@@ -44,6 +44,7 @@
 #   test                Spawns confined to `#[cfg(test)]` / a `_test.rs` file.
 
 [files]
+"newt-core/src/agentic/observed_report/tests.rs" = { count = 1, class = "test", note = "Observed-report real-Git fixtures: fixed init/add/commit/worktree argv in owned temporary directories, cleared environment, private config and disabled hooks/signing. Compiled only under cfg(test); no model input or production spawn." }
 "newt-core/src/agentic/tools_tests/worktree_detect.rs" = { count = 1, class = "test", note = "#2791 portable real-Git worktree discovery regression: fixed init/empty-commit argv in an owned temporary repository with private config/template fixtures. Test-only; production discovery reads admin metadata without spawning." }
 "crates/newt-carried-tools/src/main.rs" = { count = 1, class = "operator-yolo-optout", note = "#2776 standalone ambient grep helper; absolute adjacent rg only, no shell/PATH lookup; PR 2 owns sanitized environment and route authorization. Not wired into Newt or private confined dispatch here." }
 "newt-core/src/agentic/tools_tests/execute_git.rs" = { count = 1, class = "test", note = "Native Git status regression fixture: fixed git init/add argv in an owned temporary repository prepares the positive control before exercising run_command. Inside the cfg(test) tree; no shell, model-controlled input, or production spawn." }

@@ -24,7 +24,7 @@ pub(in crate::agentic) enum TextSnapshot {
 /// unavailable so a failed mutation cannot acquire an invented empty state.
 /// A dangling final symlink is likewise unavailable, because
 /// `symlink_metadata` observes the link rather than an absent leaf.
-fn is_absent_leaf(path: &Path) -> bool {
+pub(in crate::agentic) fn is_absent_leaf(path: &Path) -> bool {
     if !matches!(
         std::fs::symlink_metadata(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound
@@ -48,7 +48,11 @@ fn exact_scope_root(scope: &Scope<String>, path: &Path) -> bool {
     }))
 }
 
-fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Result<File> {
+pub(in crate::agentic) fn open_for_scope(
+    scope: &Scope<String>,
+    path: &Path,
+    nofollow: bool,
+) -> io::Result<File> {
     if !super::tui_permits_path(scope, &path.to_string_lossy()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

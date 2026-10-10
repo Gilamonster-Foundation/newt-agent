@@ -27,7 +27,11 @@ async fn openai_strips_inline_think_and_never_returns_reasoning_content() {
         .await
         .expect("openai dispatch should succeed");
 
-    assert_eq!(reply, "The final answer.", "answer is the stripped content");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "The final answer.",
+        "answer is the stripped content"
+    );
     assert!(!reply.contains("<think>"), "no think markers: {reply}");
     assert!(
         !reply.contains("secret chain of thought"),
@@ -98,7 +102,10 @@ async fn openai_replays_reasoning_content_within_the_current_user_turn() {
         .await
         .expect("two-round OpenAI dispatch succeeds");
 
-    assert_eq!(reply, "finished after the tool result");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "finished after the tool result"
+    );
     let request = second_request
         .lock()
         .expect("capture lock")

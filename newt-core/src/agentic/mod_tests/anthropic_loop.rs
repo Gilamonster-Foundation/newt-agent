@@ -309,7 +309,10 @@ async fn stream_off_dispatches_kind_anthropic_end_to_end() {
             .await
             .expect("anthropic dispatch should succeed");
 
-    assert_eq!(reply, "anthropic says hi");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "anthropic says hi"
+    );
     assert!(!streamed, "stream-off mode never prints live");
     let u = usage.expect("usage decoded from the reply");
     assert_eq!((u.input_tokens, u.output_tokens), (11, 5));
@@ -338,7 +341,7 @@ async fn stream_off_valve_sends_stream_false_in_the_body() {
     let (reply, _, _, _) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
         .await
         .expect("dispatch");
-    assert_eq!(reply, "valve honored");
+    assert_eq!(crate::agentic::model_explanation(&reply), "valve honored");
 
     let requests = server.received_requests().await.expect("recorded");
     assert_eq!(requests.len(), 1);
@@ -422,8 +425,15 @@ async fn sse_streamed_text_concatenates_and_reports_usage() {
             .await
             .expect("streamed dispatch should succeed");
 
-    assert_eq!(reply, "Hello world", "deltas accumulated across frames");
-    assert!(streamed, "the final answer was printed live via SSE");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "Hello world",
+        "deltas accumulated across frames"
+    );
+    assert!(
+        !streamed,
+        "the caller must render the harness Observed report"
+    );
     let u = usage.expect("message_start + message_delta usage merged");
     assert_eq!((u.input_tokens, u.output_tokens), (7, 3));
     assert_eq!(hallu, 0);
@@ -529,7 +539,7 @@ async fn tool_use_round_trip_replays_blocks_verbatim() {
         .await
         .expect("tool round trip should succeed");
 
-    assert_eq!(reply, "done after tool");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done after tool");
     assert_eq!(hallu, 0, "a routed MCP call is not a hallucination");
     assert_eq!(calls.load(Ordering::SeqCst), 2, "tool round + final answer");
     assert_eq!(
@@ -604,7 +614,10 @@ async fn missing_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
         .await
         .expect("the loop must still complete after the refusal");
 
-    assert_eq!(reply, "acknowledged the refusal");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "acknowledged the refusal"
+    );
     assert_eq!(
         mcp.seen.lock().unwrap().len(),
         0,
@@ -656,7 +669,10 @@ async fn denied_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
         .await
         .expect("the loop must still complete after the refusal");
 
-    assert_eq!(reply, "acknowledged the refusal");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "acknowledged the refusal"
+    );
     assert_eq!(
         mcp.seen.lock().unwrap().len(),
         0,
@@ -764,7 +780,10 @@ async fn parallel_tool_results_land_in_one_user_message_in_call_order() {
         .await
         .expect("parallel round should succeed");
 
-    assert_eq!(reply, "both results landed");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "both results landed"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         mcp.seen.lock().unwrap().len(),
@@ -842,7 +861,7 @@ async fn input_json_delta_split_mid_token_executes_with_the_full_object() {
         .await
         .expect("streamed tool round should succeed");
 
-    assert_eq!(reply, "assembled");
+    assert_eq!(crate::agentic::model_explanation(&reply), "assembled");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         mcp.seen.lock().unwrap().as_slice(),
@@ -893,7 +912,7 @@ async fn zero_argument_tool_use_executes_with_an_empty_object() {
         .await
         .expect("zero-arg tool round should succeed");
 
-    assert_eq!(reply, "assembled");
+    assert_eq!(crate::agentic::model_explanation(&reply), "assembled");
     assert_eq!(
         mcp.seen.lock().unwrap().as_slice(),
         &[serde_json::json!({})],
@@ -974,7 +993,10 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
         .await
         .expect("cap exit should produce the summary");
 
-    assert!(reply.starts_with("capped summary"), "{reply}");
+    assert!(
+        crate::agentic::model_explanation(&reply).starts_with("capped summary"),
+        "{reply}"
+    );
     assert!(!streamed, "the cap-exit summary is stream:false");
     assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
     assert_eq!(
@@ -1191,7 +1213,7 @@ async fn multiple_system_messages_coalesce_into_top_level_system() {
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("coalesced request should be accepted");
-    assert_eq!(reply, "coalesced ok");
+    assert_eq!(crate::agentic::model_explanation(&reply), "coalesced ok");
 }
 
 // -----------------------------------------------------------------------
@@ -1318,7 +1340,10 @@ async fn overloaded_529_is_retried_then_succeeds() {
         .await
         .expect("529 must be retried, not surfaced");
 
-    assert_eq!(reply, "recovered after overload");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered after overload"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one retry");
 }
 
@@ -1412,7 +1437,10 @@ async fn max_tokens_stop_returns_the_truncated_text() {
     let (reply, _, _, _) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
         .await
         .expect("a length stop with text is accepted");
-    assert_eq!(reply, "The list has 3 entries.");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "The list has 3 entries."
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -1473,7 +1501,7 @@ async fn usage_across_rounds_takes_max_input_and_sums_output() {
     context.permission_gate = Some(&mut permission);
     let (reply, _, usage, _) = chat_complete(context, &mut mcp).await.expect("dispatch");
 
-    assert_eq!(reply, "usage merged");
+    assert_eq!(crate::agentic::model_explanation(&reply), "usage merged");
     let u = usage.expect("accumulated usage");
     // Step 18.1 semantics via `merge_round_usage`: input = the LARGEST single
     // prompt (each round re-includes all prior history — summing would
@@ -1662,7 +1690,10 @@ async fn an_anthropic_cap_exit_summary_is_one_ledger_attempt() {
     let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
     c.permission_gate = Some(&mut permission);
     let (reply, _, _, _) = chat_complete(c, &mut mcp).await.expect("cap exit");
-    assert!(reply.starts_with("capped summary"), "{reply}");
+    assert!(
+        crate::agentic::model_explanation(&reply).starts_with("capped summary"),
+        "{reply}"
+    );
 
     let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
     assert_eq!(
@@ -1721,7 +1752,7 @@ async fn a_paused_turn_keeps_the_paused_replys_usage() {
     let mut c = ctx(&uri, &messages, &caveats);
     c.attempt_ledger = Some(&ledger);
     let (reply, _, usage, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
-    assert_eq!(reply, "resumed answer");
+    assert_eq!(crate::agentic::model_explanation(&reply), "resumed answer");
     assert_eq!(
         usage,
         Some(crate::TokenUsage {
@@ -1896,6 +1927,7 @@ async fn raw_anthropic_round(
         jitter: false,
     };
     let dispatch = AnthropicDispatch {
+        defer_answer: false,
         smart_harness: None,
         client: &client,
         stream_client: &client,
@@ -2080,8 +2112,14 @@ async fn mid_stream_error_after_partial_text_keeps_the_partial_answer() {
             .await
             .expect("the partial answer is accepted, not errored");
 
-    assert_eq!(reply, "partial answer before the break");
-    assert!(streamed, "the partial text was already printed live");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "partial answer before the break"
+    );
+    assert!(
+        !streamed,
+        "the caller must render facts alongside the partial answer"
+    );
     let requests = server.received_requests().await.expect("recorded");
     assert_eq!(
         requests.len(),
@@ -2146,7 +2184,10 @@ async fn context_window_400_compacts_and_retries() {
         .await
         .expect("the cw-400 must recover, not surface");
 
-    assert_eq!(reply, "recovered after compaction");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered after compaction"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
@@ -2212,7 +2253,7 @@ async fn advertised_tools_carry_input_schema_and_object_tool_choice() {
     let (reply, _, _, _) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
         .await
         .expect("well-shaped tools should be accepted");
-    assert_eq!(reply, "tools shape ok");
+    assert_eq!(crate::agentic::model_explanation(&reply), "tools shape ok");
 }
 
 /// #2315: the Anthropic funnel records the structured execution class of a
@@ -2465,7 +2506,7 @@ async fn idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block() {
     let (reply, ..) = chat_complete(context, &mut NoMcp)
         .await
         .expect("the turn completes after the re-ask");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
 
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
@@ -2554,7 +2595,7 @@ async fn a_recovered_call_replays_as_tool_use_with_a_derived_id() {
     let (reply, ..) = chat_complete(context, &mut NoMcp)
         .await
         .expect("a recovered call completes");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
     assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
 
     let bodies = bodies.lock().unwrap();

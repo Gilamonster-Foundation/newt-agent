@@ -29,6 +29,7 @@ pub(crate) fn task_path_literal(path: &Path) -> String {
 #[derive(Debug, Default)]
 pub struct WorktreeSession {
     adopted: std::sync::Mutex<Option<AdoptedWorktree>>,
+    pub(crate) report: std::sync::Arc<std::sync::Mutex<crate::agentic::observed_report::State>>,
     // Advisory working state, independent of whether confinement is armed.
     task_worktree: std::sync::Mutex<Option<(PathBuf, String)>>,
     pub(crate) command_cwd_notice_shown: std::sync::atomic::AtomicBool,
@@ -38,6 +39,7 @@ pub struct WorktreeSession {
 impl WorktreeSession {
     /// Explicit operator lift, also used at the existing new-task boundary.
     pub fn lift(&self) {
+        *self.report.lock().expect("report state") = Default::default();
         *self.adopted.lock().expect("worktree session lock") = None;
         *self.task_worktree.lock().expect("worktree hint lock") = None;
         self.command_cwd_notice_shown

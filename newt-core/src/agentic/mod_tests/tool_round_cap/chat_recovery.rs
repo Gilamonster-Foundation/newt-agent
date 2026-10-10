@@ -89,7 +89,7 @@ async fn openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
     let (reply, _, _, _) = openai_chat_complete(ctx, &mut NoMcp)
         .await
         .expect("recovery retries the round in place and the turn completes");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
 
     let reqs = server.received_requests().await.expect("requests recorded");
     let reqs = openai_generation_requests(reqs);
@@ -225,7 +225,7 @@ async fn ollama_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
     let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
         .await
         .expect("recovery retries the round in place and the turn completes");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
 
     let reqs = server.received_requests().await.expect("requests recorded");
     assert_eq!(
@@ -309,7 +309,7 @@ async fn ollama_chat_malformed_xml_retries_the_same_logical_round_with_tools() {
     let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
         .await
         .expect("malformed-XML recovery retries the round and the turn completes");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
 
     let reqs = server.received_requests().await.expect("requests recorded");
     assert_eq!(
@@ -426,7 +426,10 @@ async fn ollama_chat_tools_unsupported_recovers_in_the_same_round() {
     let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
         .await
         .expect("unsupported-tools recovery retries the same round");
-    assert_eq!(reply, "recovered directly");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered directly"
+    );
 
     let reqs = server.received_requests().await.expect("requests recorded");
     assert_eq!(
@@ -501,7 +504,10 @@ async fn openai_chat_tools_unsupported_recovers_in_the_same_round() {
     let (reply, _, _, _) = openai_chat_complete(ctx, &mut NoMcp)
         .await
         .expect("unsupported-tools recovery retries the same round");
-    assert_eq!(reply, "recovered directly");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered directly"
+    );
 
     let reqs = server.received_requests().await.expect("requests recorded");
     assert_eq!(

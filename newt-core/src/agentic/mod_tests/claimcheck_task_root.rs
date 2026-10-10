@@ -126,6 +126,7 @@ async fn check(bound: bool, citation: bool, wire: &str) -> Vec<serde_json::Value
         chat_complete(context, &mut NoMcp).await
     }
     .unwrap();
+    assert!(text.starts_with("## Observed"), "{wire}: {text}");
     if !citation || !bound {
         let root = if bound {
             task.canonicalize().unwrap()

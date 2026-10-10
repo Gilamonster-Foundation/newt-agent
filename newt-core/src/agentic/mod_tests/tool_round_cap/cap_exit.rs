@@ -187,7 +187,10 @@ async fn ollama_cap_trim_keeps_headless_active_pair_after_more_than_six_trailing
     let (reply, _, _, _) = chat_complete(context, &mut NoMcp)
         .await
         .expect("cap exit succeeds");
-    assert!(reply.starts_with("cap summary"), "{reply}");
+    assert!(
+        crate::agentic::model_explanation(&reply).starts_with("cap summary"),
+        "{reply}"
+    );
     assert!(pair_seen.load(Ordering::SeqCst));
     assert!(
         omission_seen.load(Ordering::SeqCst),
@@ -226,7 +229,10 @@ async fn openai_cap_trim_keeps_headless_active_pair_after_more_than_six_trailing
     let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
         .await
         .expect("cap exit succeeds");
-    assert!(reply.starts_with("cap summary"), "{reply}");
+    assert!(
+        crate::agentic::model_explanation(&reply).starts_with("cap summary"),
+        "{reply}"
+    );
     assert!(pair_seen.load(Ordering::SeqCst));
     assert!(
         omission_seen.load(Ordering::SeqCst),
@@ -268,7 +274,10 @@ async fn openai_cap_exit_preserves_the_full_current_turn_reasoning_tail() {
     let (reply, _, _, _) = openai_chat_complete(context, &mut NoMcp)
         .await
         .expect("cap exit succeeds");
-    assert!(reply.starts_with("cap summary"), "{reply}");
+    assert!(
+        crate::agentic::model_explanation(&reply).starts_with("cap summary"),
+        "{reply}"
+    );
     assert!(
         first_plan_seen.load(Ordering::SeqCst),
         "the tools-disabled cap-exit request must retain the first current-turn plan"
@@ -398,7 +407,10 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
     assert_eq!(served.load(Ordering::SeqCst), cap);
     // The cap-exit issued a final tools-disabled completion and returned
     // its text — NOT the dead placeholder.
-    assert!(reply.starts_with("here is my partial summary"), "{reply}");
+    assert!(
+        crate::agentic::model_explanation(&reply).starts_with("here is my partial summary"),
+        "{reply}"
+    );
     assert_ne!(reply, "(reached tool-round limit)");
     assert!(!streamed);
     // The cap exit reports itself (acceptance forensics, commit 4).
@@ -984,7 +996,10 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
     .expect("openai_chat_complete should succeed");
 
     assert_eq!(served.load(Ordering::SeqCst), cap);
-    assert!(reply.starts_with("openai partial answer"), "{reply}");
+    assert!(
+        crate::agentic::model_explanation(&reply).starts_with("openai partial answer"),
+        "{reply}"
+    );
     assert_ne!(reply, "(reached tool-round limit)");
     assert!(!streamed);
     assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));

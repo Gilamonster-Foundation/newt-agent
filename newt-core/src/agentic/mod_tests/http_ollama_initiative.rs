@@ -85,7 +85,7 @@ async fn nudge_rounds(
     let turn = crate::psyche::capture_turn_psyche();
     let (reply, ..) = chat_complete(c, &mut NoMcp).await.expect("scripted turn");
     drop(turn);
-    assert_eq!(reply, "Finished.");
+    assert_eq!(crate::agentic::model_explanation(&reply), "Finished.");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         8,

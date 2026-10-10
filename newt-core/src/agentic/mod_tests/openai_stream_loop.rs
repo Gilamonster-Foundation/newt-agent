@@ -592,7 +592,11 @@ async fn a_markdown_turn_returns_the_raw_answer_for_the_host_to_render() {
         .await
         .expect("a markdown turn completes");
 
-    assert_eq!(reply, "**bold**", "the transcript keeps the raw source");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "**bold**",
+        "the transcript keeps the raw source"
+    );
     assert!(!streamed, "the host renders it");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
@@ -616,7 +620,10 @@ async fn a_tool_round_and_its_answer_are_two_generations() {
             .await
             .expect("tool round then answer");
 
-    assert_eq!(reply, "answered after the tool");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "answered after the tool"
+    );
     assert!(!streamed);
     assert_eq!(seen.lock().unwrap().len(), 2, "one tool batch, one answer");
 }
@@ -684,7 +691,10 @@ async fn every_openai_chat_request_is_one_ledger_attempt_keyed_by_its_wire_bytes
     let (reply, streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
         .await
         .expect("tool round then answer");
-    assert_eq!(reply, "answered after the tool");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "answered after the tool"
+    );
     assert!(!streamed, "the host renders the accepted answer (#2372)");
 
     assert_eq!(
@@ -811,7 +821,11 @@ async fn the_chat_answer_follows_the_declared_reasoning_policy() {
         let (reply, _streamed, _usage, _hallu) =
             chat_complete(c, &mut NoMcp).await.expect("dispatch");
 
-        assert_eq!(reply, expected, "{content:?} declared={leading}");
+        assert_eq!(
+            crate::agentic::model_explanation(&reply),
+            expected,
+            "{content:?} declared={leading}"
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
@@ -1044,7 +1058,10 @@ async fn streamed_idless_tool_call_is_re_asked_and_the_turn_completes() {
         sse_answer(),
     ])
     .await;
-    assert_eq!(result.expect("the turn completes"), "all done");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.expect("the turn completes"))),
+        "all done"
+    );
     assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
     let second = bodies[1]["messages"].as_array().expect("messages");
     let last = second.last().unwrap();
@@ -1078,7 +1095,10 @@ async fn streamed_duplicate_ids_reach_the_shared_validator() {
         "[DONE]",
     ]);
     let (result, bodies, _) = run_streamed(vec![dup, sse_answer()]).await;
-    assert_eq!(result.expect("re-asked then answered"), "all done");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.expect("re-asked then answered"))),
+        "all done"
+    );
     let last = bodies[1]["messages"]
         .as_array()
         .unwrap()
@@ -1099,7 +1119,10 @@ async fn streamed_duplicate_ids_reach_the_shared_validator() {
 #[tokio::test]
 async fn a_decoded_idless_streamed_call_is_never_dispatched() {
     let (result, _, events) = run_streamed(vec![sse_tool_call(""), sse_answer()]).await;
-    assert_eq!(result.expect("re-asked, then answered"), "all done");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.expect("re-asked, then answered"))),
+        "all done"
+    );
     assert!(
         events
             .iter()

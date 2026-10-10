@@ -82,7 +82,11 @@ async fn no_tools_model_recovers_by_dropping_tools() {
             .await
             .expect("a no-tools model still answers a bare prompt");
 
-    assert_eq!(reply, "hello there", "the tools-absent retry answered");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "hello there",
+        "the tools-absent retry answered"
+    );
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert!(
         served_without_tools.load(Ordering::SeqCst),
@@ -188,7 +192,10 @@ async fn ollama_tool_xml_error_recovers_with_tools_still_available() {
             .await
             .expect("malformed XML tool-call parser errors should retry with tools");
 
-    assert_eq!(reply, "recovered with tools still available");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered with tools still available"
+    );
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert!(
         served_with_tools_after_error.load(Ordering::SeqCst),

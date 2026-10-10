@@ -100,7 +100,7 @@ async fn consecutive_requests(usage: ReportedUsage) -> Vec<Value> {
         .await
         .unwrap();
         assert!(result.error.is_none(), "{:?}", result.error);
-        assert_eq!(result.reply, "4.");
+        assert_eq!(crate::agentic::model_explanation(&result.reply), "4.");
     }
     let requests = requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
@@ -223,7 +223,7 @@ async fn inferred_overflows_cannot_permanently_refuse_the_next_small_driver_prom
         "unmeasured overflow guesses must not permanently block a small prompt: {:?}",
         result.error
     );
-    assert_eq!(result.reply, "Hello.");
+    assert_eq!(crate::agentic::model_explanation(&result.reply), "Hello.");
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1, "one primary; no display reissue (#2372)");
     for request in requests.iter() {

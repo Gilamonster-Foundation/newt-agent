@@ -83,6 +83,7 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
         Option<std::sync::Arc<dyn crate::agentic::CompletedSpillRenderer>>,
     /// #2315: where a shell call records its execution class for the loop's
     /// tool-event funnel. `None` when no funnel is listening.
+    pub(crate) report_capture: Option<&'a std::sync::Mutex<super::super::observed_report::Capture>>,
     pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
     /// A host-approved deferred retry; independent of child output or exit status.
     pub(crate) retry_authorized: Option<&'a std::sync::OnceLock<()>>,

@@ -551,7 +551,7 @@ async fn check(row: Row) {
         );
         assert!(final_text.contains(row.contains), "{final_text}");
         if row.setup == Setup::Publish {
-            assert_eq!(final_text, row.claim);
+            assert_eq!(crate::agentic::model_explanation(&final_text), row.claim);
         }
     }
     let refused = out.contains("capability denied")

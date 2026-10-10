@@ -70,7 +70,7 @@ async fn only_a_new_operator_turn_continues_after_output_exhaustion() {
         if turn == 0 {
             assert!(reply.contains("truncated"));
         } else {
-            assert_eq!(reply, "finished");
+            assert_eq!(crate::agentic::model_explanation(&reply), "finished");
         }
     }
     let requests = server.received_requests().await.unwrap();

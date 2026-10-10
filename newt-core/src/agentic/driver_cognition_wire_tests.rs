@@ -82,7 +82,7 @@ async fn cognition_capture_and_projection_agree_on_all_wires_with_smart_on_or_of
             };
             assert_eq!(outcome.error, None, "{wire}, smart={smart}");
             assert_eq!(outcome.semantic_cognition, Some(Cognition::Meticulous));
-            assert_eq!(outcome.reply, "done");
+            assert_eq!(crate::agentic::model_explanation(&outcome.reply), "done");
             if smart {
                 assert_eq!(*observed.lock().unwrap(), vec![Some(Cognition::Meticulous)]);
             }

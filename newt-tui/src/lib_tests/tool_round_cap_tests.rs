@@ -243,7 +243,11 @@ fn openai_loop_recovers_from_context_window_400() {
 
     let (reply, _streamed, _usage, _hallu) =
         result.expect("loop must recover from the 400, not propagate it");
-    assert_eq!(reply, "recovered answer");
+    assert!(reply.starts_with("## Observed\n"));
+    assert_eq!(
+        reply.split_once("\n## Model explanation\n\n").unwrap().1,
+        "recovered answer"
+    );
     assert!(
         calls_made >= 2,
         "expected at least one retry after the 400, got {calls_made} call(s)"

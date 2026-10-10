@@ -148,7 +148,10 @@ async fn responses_proactively_compacts_before_the_first_dispatch() {
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("proactive compaction fits the request and it dispatches once");
-    assert_eq!(reply, "proactively compacted");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "proactively compacted"
+    );
 
     let reqs = server.received_requests().await.expect("requests recorded");
     assert_eq!(
@@ -203,7 +206,7 @@ async fn responses_final_summary_is_proactively_compacted() {
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("the tools-disabled summary is proactively compacted and dispatches");
-    assert_eq!(reply, "summarized");
+    assert_eq!(crate::agentic::model_explanation(&reply), "summarized");
     assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
 
     let reqs = server.received_requests().await.expect("requests recorded");
@@ -456,7 +459,10 @@ async fn responses_unsupported_tools_retry_is_proactively_compacted_without_sche
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("tools-disabled retry is proactively compacted and completes in the same round");
-    assert_eq!(reply, "done tools-disabled");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "done tools-disabled"
+    );
     let reqs = server.received_requests().await.expect("request journal");
     assert_eq!(
         reqs.len(),

@@ -136,7 +136,8 @@ async fn fresh_evidence_renews_rounds_without_nudges_on_every_provider() {
             let (answer, calls) = complete_read_assignment(wire, 1, smart, None).await;
             let answer = answer.unwrap_or_else(|error| panic!("{wire}: {error:#}"));
             assert_eq!(
-                answer, "All three files read.",
+                crate::agentic::model_explanation(&answer),
+                "All three files read.",
                 "{wire}, smart={smart}: {answer}"
             );
             assert_eq!(
@@ -227,7 +228,11 @@ async fn read_only_nudge_requests(wire: &'static str, grace: usize) -> (usize, V
     }
     .unwrap_or_else(|error| panic!("{wire}, grace={grace}: {error:#}"));
     if grace > 0 {
-        assert_eq!(result.0, "All seven files read.", "{wire}");
+        assert_eq!(
+            crate::agentic::model_explanation(&result.0),
+            "All seven files read.",
+            "{wire}"
+        );
     }
     let requests = server.received_requests().await.unwrap();
     (
@@ -365,7 +370,11 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
         } else {
             chat_complete(ctx, &mut NoMcp).await
         };
-        assert_eq!(result.unwrap().0, answer, "{wire}");
+        assert_eq!(
+            crate::agentic::model_explanation(&(result.unwrap().0)),
+            answer,
+            "{wire}"
+        );
         assert_eq!(events.len(), 2, "{wire}: {events:?}");
         assert!(!events[0].ok, "{wire}: the invalid cwd must really fail");
         assert!(

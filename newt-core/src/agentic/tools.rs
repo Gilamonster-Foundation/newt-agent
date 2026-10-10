@@ -1389,6 +1389,7 @@ async fn run_confined_build_lane(
     wall: std::time::Duration,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
+    presentation.execution_command(display, &cwd.to_string_lossy());
     use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
     let (root, cwd) = match build_shell::build_directory(workspace, cwd, caveats) {
         Ok(directory) => directory,
@@ -3676,12 +3677,19 @@ async fn execute_authorized_tool(
         live_tool_output,
         completed_spill_renderer: _,
         execution,
+        report_capture,
         governed_pr,
         command_directory,
         routed_to: routed_to_slot,
         pending_rerun,
         retry_authorized,
     } = collab;
+    let mut report_presentation = super::observed_report::Presentation {
+        inner: presentation,
+        capture: report_capture,
+    };
+    let presentation: &mut dyn ToolPresentation = &mut report_presentation;
+
     // #2636 (round1 finding 1): a queued #2628 rerun binds to the denial that
     // set it. ANY tool call other than the `request_permissions` that
     // consumes it invalidates a stale slot immediately — including a

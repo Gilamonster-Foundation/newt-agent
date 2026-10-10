@@ -251,7 +251,10 @@ async fn check_accepted_observation_raises_budget() {
         .await
         .expect("the turn must complete — no Refused bail after the raise");
 
-    assert_eq!(reply, "budget raised, here is the answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "budget raised, here is the answer"
+    );
     assert!(
         observations.iter().any(|o| matches!(
             o,
@@ -409,7 +412,10 @@ async fn thinking_only_response_emits_one_thinking_only_observation() {
         .await
         .expect("the corrective retry recovers the turn");
 
-    assert_eq!(reply, "recovered after thinking-only");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered after thinking-only"
+    );
     let thinking = observations
         .iter()
         .filter(|o| matches!(o, RoundObservation::ThinkingOnly))
@@ -507,7 +513,7 @@ async fn truncation_suspect_rounds_emit_nothing() {
         .await
         .expect("suspect rounds still complete the turn");
 
-    assert_eq!(reply, "suspect answer");
+    assert_eq!(crate::agentic::model_explanation(&reply), "suspect answer");
     assert!(
         observations.is_empty(),
         "a possibly head-truncated prompt is evidence of nothing: \
@@ -573,7 +579,7 @@ async fn openai_loop_reports_accepted_rounds() {
         .await
         .expect("openai loop should succeed");
 
-    assert_eq!(reply, "openai accepted");
+    assert_eq!(crate::agentic::model_explanation(&reply), "openai accepted");
     let accepted: Vec<u32> = observations
         .iter()
         .filter_map(|o| match o {
@@ -745,7 +751,10 @@ async fn accepted_text_emits_exactly_one_accepted() {
         .await
         .expect("a usable-text turn completes");
 
-    assert_eq!(reply, "final answer ready");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "final answer ready"
+    );
     assert_eq!(
         accepted_prompts(&observations),
         vec![5_000],
@@ -817,7 +826,7 @@ async fn validated_tool_calls_emit_one_accepted_and_survive_execution_failure() 
         .await
         .expect("the tool round then the final answer complete the turn");
 
-    assert_eq!(reply, "all done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "all done");
     // One Accepted for the validated tool round (6_000) and one for the
     // final text (5_200) — at most one per response, and the tool round's
     // Accepted survives the unknown-tool execution failure.
@@ -859,7 +868,7 @@ async fn every_ollama_request_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("the tool round then the final answer complete the turn");
-    assert_eq!(reply, "all done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "all done");
 
     let received = server.received_requests().await.expect("journal");
     let generation: Vec<_> = received
@@ -1026,7 +1035,7 @@ async fn a_grounding_nudge_keeps_the_rejected_answers_usage() {
     let (reply, _, usage, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("the nudged turn completes");
-    assert_eq!(reply, "all done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "all done");
     let received = server.received_requests().await.expect("journal");
     assert_eq!(received.len(), 2, "one generation per round (#2372)");
     let totals = ledger.lock().unwrap().totals();
@@ -1099,7 +1108,10 @@ async fn content_invalid_tool_batch_emits_no_accepted() {
         .await
         .expect("the rejected batch re-dispatches to a valid answer");
 
-    assert_eq!(reply, "recovered answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered answer"
+    );
     let accepted = accepted_prompts(&observations);
     assert!(
         !accepted.contains(&6_000),
@@ -1169,7 +1181,10 @@ async fn openai_content_invalid_tool_batch_emits_no_accepted() {
         .await
         .expect("the rejected batch re-dispatches to a valid answer");
 
-    assert_eq!(reply, "recovered answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered answer"
+    );
     let accepted = accepted_prompts(&observations);
     assert!(
         !accepted.contains(&6_000),
@@ -1240,7 +1255,10 @@ async fn openai_truncated_tool_args_never_reach_a_later_request_body() {
         .await
         .expect("the rejected batch re-dispatches to a valid answer");
 
-    assert_eq!(reply, "recovered answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered answer"
+    );
     let received = server.received_requests().await.expect("journal");
     assert_eq!(received.len(), 2, "one generation per round");
     let second_body = body_json(&received[1]);
@@ -1405,7 +1423,7 @@ async fn none_usage_round_emits_no_accepted() {
         .await
         .expect("a usable-text turn with no usage still completes");
 
-    assert_eq!(reply, "answer");
+    assert_eq!(crate::agentic::model_explanation(&reply), "answer");
     assert!(
         accepted_prompts(&observations).is_empty(),
         "no usage → no invented measurement, hence no Accepted: {observations:?}"
@@ -1533,7 +1551,10 @@ async fn run_scripted(
 async fn idless_tool_call_is_re_asked_and_the_turn_completes() {
     let (result, bodies, ran, rejected) =
         run_scripted(vec![idless_call(), call_with_id(), final_answer()]).await;
-    assert_eq!(result.expect("the turn completes"), "all done");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.expect("the turn completes"))),
+        "all done"
+    );
     assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
     assert_eq!(ran, 1, "only the well-formed batch ran a tool");
     assert_eq!(
@@ -1569,7 +1590,10 @@ async fn a_well_formed_batch_resets_the_idless_budget() {
         final_answer(),
     ])
     .await;
-    assert_eq!(result.expect("completes"), "all done");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.expect("completes"))),
+        "all done"
+    );
     assert_eq!(ran, 1);
 }
 
@@ -1619,7 +1643,10 @@ async fn the_re_ask_reaches_the_next_request_body() {
 async fn a_recovered_content_call_is_not_re_asked() {
     let (result, bodies, _, rejected) =
         run_scripted(vec![bare_reply(BARE), call_with_id(), final_answer()]).await;
-    assert_eq!(result.expect("completes"), "all done");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.expect("completes"))),
+        "all done"
+    );
     assert_eq!(rejected, 0, "no re-ask round: the id was derived");
     assert_eq!(bodies.len(), 3);
     assert!(
@@ -1697,7 +1724,10 @@ fn replayed_ids(request: &serde_json::Value) -> Vec<String> {
 #[tokio::test]
 async fn a_recovered_call_completes_with_a_derived_id_and_a_reshaped_turn() {
     let (result, bodies, events, _) = run_recovery(vec![bare_reply(BARE), final_answer()]).await;
-    assert_eq!(result.expect("the turn completes"), "all done");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.expect("the turn completes"))),
+        "all done"
+    );
     assert_eq!(bodies.len(), 2, "recovered call, then the final answer");
     assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
     let messages = bodies[1]["messages"].as_array().unwrap();
@@ -1856,7 +1886,7 @@ async fn missing_permission_gate_mcp_refusal_records_not_ok_on_the_chat_wire() {
         .await
         .expect("the loop must still complete after the refusal");
 
-    assert_eq!(reply, "all done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "all done");
     assert_eq!(
         mcp.seen.lock().unwrap().len(),
         0,

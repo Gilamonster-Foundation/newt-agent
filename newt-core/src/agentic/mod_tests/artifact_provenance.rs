@@ -257,7 +257,10 @@ async fn ollama_advertises_artifact_read_and_records_plan_provenance() {
     .await
     .expect("Ollama plan loop succeeds");
 
-    assert_eq!(reply, "plan provenance captured");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "plan provenance captured"
+    );
     // #2372: the accepted answer is not generated again for display.
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert!(
@@ -362,7 +365,10 @@ async fn openai_chat_records_harness_retry_against_submitted_not_active_prompt()
     .await
     .expect("OpenAI Chat plan loop succeeds");
 
-    assert_eq!(reply, "retry plan provenance captured");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "retry plan provenance captured"
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert!(
         artifact_read_seen.load(Ordering::SeqCst),
@@ -459,7 +465,10 @@ async fn responses_advertises_artifact_read_and_records_plan_provenance() {
     .await
     .expect("Responses plan loop succeeds");
 
-    assert_eq!(reply, "Responses provenance captured");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "Responses provenance captured"
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert!(
         artifact_read_seen.load(Ordering::SeqCst),
@@ -754,7 +763,7 @@ async fn selected_target_diff_warning_reaches_model_before_finalization() {
     c.kind = BackendKind::Openai;
     c.step_ledger = Some(&ledger);
     c.tool_events = Some(&mut events);
-    chat_complete_with_prompt_and_artifacts(
+    let (reply, _, _, _) = chat_complete_with_prompt_and_artifacts(
         c,
         Some(&turn),
         None,
@@ -764,6 +773,7 @@ async fn selected_target_diff_warning_reaches_model_before_finalization() {
     )
     .await
     .unwrap();
+    assert!(reply.starts_with("## Observed\n"), "{reply}");
     assert!(events
         .iter()
         .any(|event| event.tool == "read_file" && !event.ok));
@@ -891,7 +901,7 @@ async fn selected_target_anthropic_pin_is_on_the_final_request() {
     let mut c = ctx(&uri, &messages, TASK, ".", &caveats);
     c.kind = BackendKind::Anthropic;
     c.step_ledger = Some(&ledger);
-    chat_complete_with_prompt_and_artifacts(
+    let (reply, _, _, _) = chat_complete_with_prompt_and_artifacts(
         c,
         Some(&turn),
         None,
@@ -901,6 +911,7 @@ async fn selected_target_anthropic_pin_is_on_the_final_request() {
     )
     .await
     .unwrap();
+    assert!(reply.starts_with("## Observed\n"), "{reply}");
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert_one_plan_artifact(&artifacts, &turn);
 }

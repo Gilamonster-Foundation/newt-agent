@@ -517,3 +517,41 @@ fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
         "offload off keeps the full budget"
     );
 }
+
+/// Stage 1: capture raw check evidence before trimming the model-facing view.
+#[test]
+fn observed_report_envelope_tap_precedes_output_trimming() {
+    use crate::agentic::observed_report::{Capture, Presentation, State};
+    let dir = tempfile::tempdir().unwrap();
+    let capture = std::sync::Mutex::new(Capture::default());
+    let mut display = ToolDisplay::new(Vec::new(), false, 80, 20, false);
+    let mut view = Presentation {
+        inner: &mut display,
+        capture: Some(&capture),
+    };
+    view.execution_command("cargo test", dir.path().to_str().unwrap());
+    let stdout = "test result: ok. 1 passed; 0 failed\n".repeat(12);
+    let envelope =
+        serde_json::json!({"exit_code":101,"stdout":stdout,"stderr":"error: one target failed"});
+    shell::shell_envelope_output_with_view(
+        &envelope,
+        Some("short display"),
+        1,
+        false,
+        false,
+        None,
+        Some(&mut view),
+    );
+    let mut state = State::default();
+    state.bind(dir.path(), &crate::Scope::All);
+    state.observe(
+        dir.path(),
+        &capture.lock().unwrap(),
+        Some(crate::ExecOutcome::Failed),
+        None,
+    );
+    let text = state.render(dir.path(), &crate::Scope::All, "done");
+    assert!(text.contains("Failed; exit 101"), "{text}");
+    assert!(text.contains("Result excerpt incomplete"), "{text}");
+    assert!(text.contains("error: one target failed"), "{text}");
+}

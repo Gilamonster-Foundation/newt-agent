@@ -333,7 +333,10 @@ async fn headroom_aware_policy_defers_count_only_compaction_for_known_roomy_wind
     .await
     .expect("roomy count-only loop succeeds");
 
-    assert_eq!(reply, "headroom retained the active prompt");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "headroom retained the active prompt"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no summarizer invocation");
     assert!(active_prompt_seen.load(Ordering::SeqCst));
     assert!(
@@ -391,7 +394,10 @@ async fn legacy_message_count_policy_still_compacts_under_the_same_roomy_window(
     .await
     .expect("legacy count-only loop succeeds");
 
-    assert_eq!(reply, "automatic checkpoint complete");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "automatic checkpoint complete"
+    );
     assert!(calls.load(Ordering::SeqCst) >= 1);
     assert!(marker_seen.load(Ordering::SeqCst));
     assert!(requests.load(Ordering::SeqCst) >= 1);
@@ -455,7 +461,10 @@ async fn automatic_compaction_records_one_checkpoint_after_installing_summary() 
     .await
     .expect("automatic compaction loop succeeds");
 
-    assert_eq!(reply, "automatic checkpoint complete");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "automatic checkpoint complete"
+    );
     assert!(
         calls.load(Ordering::SeqCst) >= 1,
         "the automatic transformation must invoke its configured summarizer"
@@ -589,7 +598,10 @@ async fn assert_silent_overflow_checkpoint(num_ctx: Option<u32>, reason: &str) {
     .await
     .expect("silent-overflow fallback loop succeeds");
 
-    assert_eq!(reply, "fallback checkpoint complete");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "fallback checkpoint complete"
+    );
     assert_eq!(
         probes.load(Ordering::SeqCst),
         2,

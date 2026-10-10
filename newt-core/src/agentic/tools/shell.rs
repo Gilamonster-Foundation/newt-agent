@@ -1274,6 +1274,7 @@ pub(super) async fn exec_confined_command_with_broker(
     adopted: Option<&crate::worktree_adoption::AdoptedWorktree>,
     command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
+    presentation.execution_command(cmd, cwd);
     // #2759: adoption is not liftable by an exec or filesystem approval.
     // Keep structural refusals out of both prompts and the pending-rerun slot.
     if let Some(policy) = adopted {
@@ -3048,6 +3049,10 @@ pub(super) fn shell_envelope_output_with_view(
     spill_store: Option<&dyn SpillStore>,
     presentation: Option<&mut dyn ToolPresentation>,
 ) -> String {
+    let mut presentation = presentation;
+    if let Some(presentation) = presentation.as_deref_mut() {
+        presentation.execution_result(envelope);
+    }
     let stdout = envelope
         .get("stdout")
         .and_then(serde_json::Value::as_str)

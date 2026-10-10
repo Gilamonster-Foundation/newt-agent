@@ -466,7 +466,8 @@ async fn general_repository_explanation_is_markdown_and_source_first() {
     .await;
 
     assert!(
-        reply.starts_with("## Authentication implementation\n\n- "),
+        crate::agentic::model_explanation(&reply)
+            .starts_with("## Authentication implementation\n\n- "),
         "general repository findings must remain renderable GFM: {reply}"
     );
     assert!(
@@ -512,7 +513,7 @@ async fn rust_followup_answers_with_source_filtered_markdown_table() {
     .await;
 
     assert!(
-        reply.starts_with("| Rust file | Lines |\n|---|---:|"),
+        crate::agentic::model_explanation(&reply).starts_with("| Rust file | Lines |\n|---|---:|"),
         "final answer must be a complete GFM table: {reply}"
     );
     assert!(

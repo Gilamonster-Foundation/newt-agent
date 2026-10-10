@@ -1730,6 +1730,9 @@ impl<W: Write> ToolDisplay<W> {
 /// completed-result rendering are intentionally absent: the outer dispatcher
 /// owns those exactly once for every return path.
 pub(crate) trait ToolPresentation: Send {
+    /// Trusted execution observations, before result rendering/capping.
+    fn execution_command(&mut self, _command: &str, _cwd: &str) {}
+    fn execution_result(&mut self, _envelope: &serde_json::Value) {}
     fn preview(&mut self, output: &str, max_lines: usize);
     fn document(&mut self, output: &str);
     fn override_result(&mut self, output: String);
