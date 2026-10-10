@@ -1,5 +1,8 @@
 //! `newt doctor` — health-check local backends and provider plugins.
 
+#[path = "doctor/durable_grants.rs"]
+mod durable_grants;
+
 use newt_core::dgx::{DgxConfig, EndpointKind};
 use newt_core::ocap::SecurityReport;
 use newt_core::Config;
@@ -49,6 +52,7 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
     // `Config::resolve`'s merge (which stops at its first unattributable
     // file) would hide it.
     diagnose_backend_dropins(fix, config.is_some()).await;
+    durable_grants::diagnose(config.as_ref(), fix);
 
     let Some(config) = config else {
         println!(

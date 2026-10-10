@@ -65,6 +65,15 @@ impl WorkspaceProtection {
         caveats: &Caveats,
         policy: &agent_bridle::SandboxPolicy,
     ) -> anyhow::Result<()> {
+        self.validate_policy(caveats, policy)
+            .map_err(|error| anyhow::anyhow!("{error:#}; {}", crate::ocap_store::REPAIR_HINT))
+    }
+
+    fn validate_policy(
+        &self,
+        caveats: &Caveats,
+        policy: &agent_bridle::SandboxPolicy,
+    ) -> anyhow::Result<()> {
         for resource in &self.write_protected {
             anyhow::ensure!(
                 resolve_uncreated_path(&resource.named)? == resource.resolved,
@@ -443,6 +452,7 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("smart-harness"), "{error}");
+        assert!(error.ends_with(crate::ocap_store::REPAIR_HINT), "{error}");
         assert_eq!(std::fs::read_link(&alias).unwrap(), public);
     }
 

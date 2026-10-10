@@ -801,11 +801,11 @@ pub enum Command {
         /// refused and reported (exit 2).
         #[arg(long = "sign-ocap")]
         sign_ocap: bool,
-        /// #1951: offer to repair a backend drop-in doctor cannot attribute on
-        /// its own (an old newt-adopt probe cache carrying operator-looking
-        /// fields). Prompts interactively per ambiguous file; on a piped or
-        /// headless run there is no one to ask, so it reports the finding and
-        /// changes nothing, same as without the flag.
+        /// Offer per-entry repair for stale durable grants and ambiguous backend
+        /// drop-ins. Requires a terminal and explicit confirmation; piped runs
+        /// report only. Grant pruning saves a dated backup and keeps signatures.
+        /// Durable-grant repair is report-only on Windows until private backups
+        /// are supported.
         #[arg(long)]
         fix: bool,
     },

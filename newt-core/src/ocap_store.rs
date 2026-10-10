@@ -36,6 +36,9 @@ pub use agent_bridle::policy::{
 
 use crate::agentic::DenialKind;
 
+/// Shared recovery nudge for startup grant/protection diagnostics.
+pub const REPAIR_HINT: &str = "run `newt doctor` to inspect and repair";
+
 /// The four verdicts in load order — every store read walks exactly these.
 pub const VERDICTS: [Verdict; 4] = [
     Verdict::Deny,
@@ -132,6 +135,10 @@ pub fn load_store(
     let (set, mut sig_warnings) =
         verify_approves(set, verifier.as_ref().map(|v| v as &dyn ApproveVerifier));
     warnings.append(&mut sig_warnings);
+    for warning in &mut warnings {
+        warning.push_str("; ");
+        warning.push_str(REPAIR_HINT);
+    }
     (set, warnings)
 }
 

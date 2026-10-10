@@ -123,3 +123,5 @@
 
 # #2801: extracted unchanged hermetic Git test constructor; portable Windows lookup.
 "newt-core/src/agentic/tools_tests/git_fixture.rs" = { count = 2, class = "test", note = "Shared isolated Git fixture extracted from helper_git_shell_grant.rs; no production spawn" }
+
+"newt-cli/src/doctor/durable_grants_tests.rs" = { count = 1, class = "test", note = "#2842 Windows-only signed-name drift fixture: cmd.exe /d /c mklink /J creates a junction between two owned temporary paths. Fixed operation, disabled AutoRun, no model input; no production spawn. Uses a real alias without requiring symlink privilege." }
