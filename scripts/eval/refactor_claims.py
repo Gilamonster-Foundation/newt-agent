@@ -95,10 +95,19 @@ def check_claims(
         if row not in rows:
             rows.append(row)
 
+    def resolve(path: str) -> str | None:
+        paths = {
+            p
+            for stage in ("before", "after")
+            for p in facts.get(stage, {})
+            if p == path or p.endswith("/" + path)
+        }
+        if "/" not in path and "changed" in facts:
+            paths.intersection_update(facts["changed"])
+        return next(iter(paths)) if len(paths) == 1 else None
+
     def lines(path: str, count: str, stage: str) -> None:
-        candidates = facts.get(stage, {})
-        matches = [p for p in candidates if p == path or p.endswith("/" + path)]
-        actual = candidates[matches[0]] if len(matches) == 1 else None
+        actual = facts.get(stage, {}).get(resolve(path))
         expected = int(count.replace(",", ""))
         add(
             "lines",
@@ -108,20 +117,32 @@ def check_claims(
         )
 
     def unqualified(path: str, count: str) -> None:
-        trees = [facts.get(stage, {}) for stage in ("before", "after")]
-        paths = {
-            p for tree in trees for p in tree if p == path or p.endswith("/" + path)
-        }
-        values = [tree[p] for p in paths for tree in trees if p in tree]
+        resolved = resolve(path)
+        values = [
+            facts[stage][resolved]
+            for stage in ("before", "after")
+            if resolved in facts.get(stage, {})
+        ]
         expected = int(count.replace(",", ""))
-        measurable = (
-            len(paths) == 1 and values and all(isinstance(n, int) for n in values)
-        )
+        measurable = values and all(isinstance(n, int) for n in values)
         add(
             "lines",
             f"{path} absolute: {expected}",
             values if measurable else None,
             expected in values if measurable else None,
+        )
+
+    def delta(path: str, count: str) -> None:
+        resolved = resolve(path)
+        before = facts.get("before", {}).get(resolved)
+        after = facts.get("after", {}).get(resolved)
+        actual = after - before if before is not None and after is not None else None
+        expected = int(count.replace(",", "").replace("−", "-"))
+        add(
+            "line_delta",
+            f"{path} net: {expected:+d}",
+            actual,
+            None if actual is None else actual == expected,
         )
 
     # Line claims keep their entire sentence/clause. Splitting on coordination,
@@ -137,41 +158,56 @@ def check_claims(
             clause,
             re.I,
         )
-        pair = re.fullmatch(
-            path_pattern + rf"\s+(?P<before>{NUMBER})\s*(?:→|->)\s*(?P<after>{NUMBER})",
-            clause,
+        signed = rf"[+−-]{NUMBER}"
+        pairs = list(
+            re.finditer(
+                path_pattern
+                + rf"\s*:?\s+(?P<before>{NUMBER})\s*(?:→|->)\s*(?P<after>{NUMBER})"
+                + r"(?![\w,]|\.\d)(?:\s+lines\b|(?=\s*(?:$|\(net\b|net\b)))"
+                + rf"(?:\s+(?:\(net\s+(?P<net_paren>{signed})\s*\)"
+                + rf"|net\s+(?P<net_plain>{signed})(?![\w,%]|\.\d)))?",
+                clause,
+            )
         )
-        size_forms = (
-            rf"(?P<count>{NUMBER})-line\s+{path_pattern}",
-            path_pattern + rf"\s+\((?P<count>{NUMBER})\s+lines\)",
+        sizes = list(
+            re.finditer(
+                path_pattern + rf"\s+\((?P<count>{NUMBER})\s+lines\)",
+                clause,
+            )
         )
-        sizes = []
-        for form in size_forms:
-            whole = re.fullmatch(form, clause)
-            if whole:
-                sizes.append(whole)
-            else:
-                # Parentheses explicitly delimit an absolute descriptor in prose.
-                sizes.extend(re.finditer(r"\(" + form + r"\)", clause))
+        descriptor = rf"(?P<count>{NUMBER})-line\s+{path_pattern}"
+        whole = re.fullmatch(descriptor, clause)
+        if whole:
+            sizes.append(whole)
+        else:
+            sizes.extend(re.finditer(r"\(" + descriptor + r"\)", clause))
+        # Remove only the parsed spans before examining the remaining prose.
+        # A recognized pair/net must not hide an unsupported comparison nearby.
+        context = clause
+        for match in sorted(pairs + sizes, key=lambda m: m.start(), reverse=True):
+            context = context[: match.start()] + " " + context[match.end() :]
         comparison = re.search(
             r"\b(?:before|after|old|now|difference|reduction|reduc\w*|drop\w*|"
             r"shorter|smaller|fewer|less|trim\w*|cut|down|delta|changed|"
             r"remov\w*|add\w*|increas\w*|decreas\w*|grow\w*|shrink\w*|shrank|"
-            r"sav\w*|larger|longer|more|approximately|about|roughly)\b|[→~]|->",
-            re.sub(FILE, "", clause),
+            r"sav\w*|larger|longer|more|approximately|about|roughly|net)\b|[→~]|->",
+            re.sub(FILE, "", context),
             re.I,
         )
-        if sizes and not comparison:
+        if (sizes or pairs) and not comparison:
             for size in sizes:
                 unqualified(size["path"], size["count"])
+            for pair in pairs:
+                lines(pair["path"], pair["before"], "before")
+                lines(pair["path"], pair["after"], "after")
+                net = pair["net_paren"] or pair["net_plain"]
+                if net is not None:
+                    delta(pair["path"], net)
         elif absolute:
             if absolute["after"] or comparison:
                 lines(absolute["path"], absolute["size"] or absolute["after"], "after")
             else:
                 unqualified(absolute["path"], absolute["size"])
-        elif pair:
-            lines(pair["path"], pair["before"], "before")
-            lines(pair["path"], pair["after"], "after")
         elif re.search(FILE, clause) and re.search(r"\d", re.sub(FILE, "", clause)):
             add("lines", clause + ": unrecognized line-count phrasing", None, None)
 
@@ -251,9 +287,12 @@ def check_claims(
         if line in command_lines:
             argv = named_test(line)
             test_evidence = test_totals(clean_terminal((test_logs or {}).get(argv, "")))
+        elif re.search(r"\b(?:pure\s+(?:fs-free\s+)?|fs-free\s+)tests?\b", line):
+            # An inventory of new tests does not identify a test invocation.
+            test_evidence = None
         counts = []
         for count in re.finditer(
-            rf"({NUMBER})\s+tests?(?:\s+(passed|pass|failed|fail|ignored|total)\b)?|({NUMBER})\s+(passed|failed|ignored|failures)\b",
+            rf"({NUMBER})\s+(?:pure\s+)?(?:fs-free\s+)?tests?(?:\s+(passed|pass|failed|fail|ignored|total)\b)?|({NUMBER})\s+(passed|failed|ignored|failures)\b",
             line,
             re.I,
         ):

@@ -224,12 +224,26 @@ resolved path. A match to neither count is contradicted; ambiguous or missing
 measurements remain unverifiable. Parenthesized descriptors in prose, such as
 ``Extracted the cluster (11,726-line `module.rs`) into a submodule``, are accepted.
 Backticks around paths and a final period are accepted. Explicit `now`/`after`
-sizes still refer only to the after revision; `FILE N → M` (also `->`) checks
-both revisions in order.
+sizes still refer only to the after revision. Attached `FILE (N lines)` sizes
+also work in sentences, such as `The largest file was FILE (N lines)` and
+`New FILE (N lines) with 10 pure fs-free tests`. The latter test inventory stays
+unverifiable without a named test invocation; it cannot borrow a general
+`--test-log` or be verified by the file size.
+
+`FILE: A → B lines` (also `->`) checks before and after in order, including
+inside a sentence. A following `(net −C)` or `net +C` is checked separately
+against **after − before**, not against deletions. Thus `11726 → 11632 lines
+(net −106)` verifies the pair but contradicts the net claim (the actual net
+change is −94). ASCII minus is also accepted. Bare `FILE A → B` remains
+supported as a standalone pair. Bare filenames resolve only among changed
+files; full paths can identify unchanged files too. Ambiguous basenames or
+missing measurements remain unverifiable.
 
 The checker retains whole-clause context: reduction/comparison language and
 approximations remain unverifiable even if a number matches a measured size.
-It does not split line claims on commas, `and`, or `but`, or infer deltas.
+It does not split line claims on commas, `and`, or `but`. Only explicitly
+parsed signed `net` deltas are checked; unparsed comparison vocabulary in
+the surrounding clause still makes that clause unverifiable.
 Extra prose outside the supported absolute/parenthesized forms remains
 unverifiable. Unknown clauses remain evidence rows, so verified publication
 claims cannot turn them into a claims PASS.
