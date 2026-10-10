@@ -33,6 +33,9 @@ pub(in crate::agentic::tools) fn execute(
         | ["git", "switch", "-c", branch]
         | ["git", "checkout", "-b", branch, "HEAD"]
         | ["git", "switch", "-c", branch, "HEAD"] => branch,
+        // This repair governs wrappers only; unsupported standalone Git
+        // forms retain their existing confined execution and diagnostics.
+        _ if super::standalone_git_words(source).is_some() => return None,
         _ => return refuse(),
     };
     let result = if !caveats.permits_exec("git")
