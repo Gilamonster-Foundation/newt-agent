@@ -345,6 +345,7 @@ async fn openai_chat_coalesces_system_cards_for_strict_vllm_templates() {
     );
 }
 
+/// Shared composition rendering must preserve the existing wire diagnostic.
 #[test]
 fn openai_chat_rejects_system_messages_after_conversation_history() {
     let messages = vec![
@@ -359,6 +360,21 @@ fn openai_chat_rejects_system_messages_after_conversation_history() {
     assert_eq!(
         error.to_string(),
         "invalid OpenAI chat message order: system messages must precede conversation history"
+    );
+}
+
+/// The shared renderer must not expose its internal proposal-error prefix.
+#[test]
+fn openai_chat_coalescing_preserves_nontext_system_diagnostic() {
+    let messages = vec![
+        serde_json::json!({"role": "system", "content": "base policy"}),
+        serde_json::json!({"role": "system", "content": []}),
+    ];
+    assert_eq!(
+        openai_chat_wire_messages(&messages)
+            .unwrap_err()
+            .to_string(),
+        "invalid OpenAI chat system message: content must be text before coalescing"
     );
 }
 

@@ -21,15 +21,16 @@ pub struct Policy {
 pub enum Action {
     Include,
     Park,
+    Summarise,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Change {
     pub occurrence: ContentId,
     pub action: Action,
     pub reason: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
     pub expected_head: Option<ContentId>,
@@ -40,6 +41,8 @@ pub struct Proposal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Catalog {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offered: Option<ContentId>,
     pub run: ContentId,
     pub root: ContentId,
     pub request: ContentId,
@@ -56,6 +59,8 @@ pub struct Catalog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Submission {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued: Option<ContentId>,
     pub catalog: ContentId,
     pub actor: ContentId,
     pub proposal: Proposal,
@@ -67,6 +72,7 @@ pub enum Refusal {
     RequiredInput,
     Capacity,
     NoProgress,
+    Unsupported,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Outcome {
@@ -82,6 +88,8 @@ pub struct Elision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Decision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued: Option<ContentId>,
     pub version: u32,
     pub run: ContentId,
     pub root: ContentId,
@@ -108,6 +116,10 @@ pub struct Receipt {
 }
 #[derive(Default)]
 pub(crate) struct State {
+    pub pending: Vec<ContentId>,
+    pub latest_catalog: Option<ContentId>,
+    pub attempts: usize,
+    pub pages: BTreeMap<ContentId, BTreeSet<ContentId>>,
     pub head: Option<ContentId>,
     pub active: Option<ContentId>,
     pub context_revision: Option<ContentId>,

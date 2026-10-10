@@ -134,3 +134,12 @@ it does not prove network delivery. An inverse proposal restores a prior
 projection byte-for-byte without rewinding history or re-executing tools. Changed
 host context, objective, pins or policy reject stale inverses. Historical request
 replay remains available only while the verified source closure is retained.
+
+Model adapters can page an admitted catalog with `composition_page` and retain
+one pending proposal using `queue_composition`. Page reads share retrieval/call
+budgets; proposals share navigation/retry bounds. A queue receipt is not acceptance.
+Resolve at the next closed tool boundary against the complete host request. Only
+append-only continuations with unchanged objective/pins may carry the offered
+inventory forward. Unknown or unoffered occurrences cannot be queued; `summarise`
+is retained as an explicit unsupported refusal. Restart retains pending proposals;
+publication still uses the existing atomic decision checkpoint.

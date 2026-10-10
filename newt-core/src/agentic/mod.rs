@@ -6792,41 +6792,11 @@ async fn final_summary_ollama(
 fn openai_chat_wire_messages(
     messages: &[serde_json::Value],
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let leading_systems = messages
-        .iter()
-        .take_while(|message| message["role"].as_str() == Some("system"))
-        .count();
-
-    if messages[leading_systems..]
-        .iter()
-        .any(|message| message["role"].as_str() == Some("system"))
-    {
-        anyhow::bail!(
-            "invalid OpenAI chat message order: system messages must precede conversation history"
-        );
-    }
-    if leading_systems <= 1 {
-        return Ok(messages.to_vec());
-    }
-
-    let content = messages[..leading_systems]
-        .iter()
-        .map(|message| {
-            message["content"].as_str().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "invalid OpenAI chat system message: content must be text before coalescing"
-                )
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .join("\n\n");
-    let mut system = messages[0].clone();
-    system["content"] = serde_json::Value::String(content);
-
-    let mut wire = Vec::with_capacity(messages.len() - leading_systems + 1);
-    wire.push(system);
-    wire.extend(messages[leading_systems..].iter().cloned());
-    Ok(wire)
+    agent_harness::render::openai_chat_wire_messages(messages).map_err(|error| match error {
+        // Preserve the public wire diagnostic when adapting the shared renderer.
+        agent_harness::Error::Proposal(message) => anyhow::anyhow!(message),
+        error => error.into(),
+    })
 }
 
 fn prepare_openai_assistant_replay(
@@ -7809,11 +7779,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         ));
                     }
                     async {
-                        let mut req = smart_harness::request(
+                        let mut req = smart_harness::request_with_messages(
                             stream_client.post(&chat_url),
                             &body,
                             smart_harness,
                             "openai",
+                            &messages,
                         )?;
                         if let Some(key) = api_key {
                             req = req.bearer_auth(key);

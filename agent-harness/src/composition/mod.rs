@@ -68,3 +68,7 @@ pub(crate) use journal::{pin_identity, State, Submission};
 pub use journal::{
     Action, Actor, Catalog, Change, Decision, Elision, Outcome, Policy, Proposal, Receipt, Refusal,
 };
+
+mod model;
+pub(crate) use model::Queued;
+pub use model::{Card, Page};
