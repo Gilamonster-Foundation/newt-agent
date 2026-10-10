@@ -230,6 +230,7 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
         size = max(map(line_count, before.values()))
         largest = sorted(p for p, s in before.items() if line_count(s) == size)
         changed = set(git("diff", "--name-only", "-z", seed, head).split("\0"))
+        facts["changed"] = sorted(changed - {""})
         touched = sorted(set(largest) & changed)
         row(
             "largest_file",
