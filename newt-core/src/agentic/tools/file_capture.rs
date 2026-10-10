@@ -24,7 +24,7 @@ pub(in crate::agentic) enum TextSnapshot {
 /// unavailable so a failed mutation cannot acquire an invented empty state.
 /// A dangling final symlink is likewise unavailable, because
 /// `symlink_metadata` observes the link rather than an absent leaf.
-fn is_absent_leaf(path: &Path) -> bool {
+pub(in crate::agentic) fn is_absent_leaf(path: &Path) -> bool {
     if !matches!(
         std::fs::symlink_metadata(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound

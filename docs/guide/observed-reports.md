@@ -9,7 +9,11 @@ The report shows changed files relative to the first objective/adoption snapshot
 with before and after LF counts (`wc -l` semantics), the last observed Cargo check
 or test per exact command and directory, bounded child-reported result lines,
 and governed push/PR creation receipts. A committed change remains visible even
-when the working tree is clean. Bare filenames such as `mod.rs` are marked
+when the working tree is clean. A path dropping out of Git's listing is reread
+through the authorized reader: an ignored but present file retains its measured
+count, and only verified absence is labelled `0 (absent)`. A newly discovered
+path has an unverified baseline unless absence was actually observed there;
+current contents cannot establish a historical count. Bare filenames such as `mod.rs` are marked
 ambiguous when they could refer to multiple observed files.
 
 These are historical observations. A previous successful check does not certify
@@ -21,7 +25,8 @@ unavailable; a dry-run push is not a publication receipt.
 The session retains facts across continuations of the same objective. A new
 objective or explicit worktree lift resets them. Retention is bounded to four
 roots, sixteen exact check scopes and sixteen publication observations per root.
-File snapshots consider at most 4,096 Git-tracked/nonignored files, two MiB per
+File snapshots consider at most 4,096 paths (Git-tracked/nonignored files plus
+formerly observed paths omitted from the current listing), two MiB per
 file and 32 MiB total. Unsafe, binary or oversized files have unavailable line
 counts. Reports show at most 64 changed/unavailable file rows and eight bounded
 result lines per check, and disclose omitted evidence. This in-memory retention

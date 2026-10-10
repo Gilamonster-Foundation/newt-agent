@@ -200,8 +200,8 @@ fn observed_report_objective_reset_and_root_isolation() {
     assert!(state.pinned.is_none());
 }
 
-/// An edit of the same LF length still appears, new/deleted files use absent
-/// counts, and a newline-free final line is not counted as an LF.
+/// Same-LF edits still appear, new paths have unverified baselines, deletion
+/// is verified, and a newline-free final line is not counted as an LF.
 #[test]
 fn observed_report_content_changes_not_just_line_deltas() {
     let dir = fixture();
@@ -210,10 +210,14 @@ fn observed_report_content_changes_not_just_line_deltas() {
     std::fs::write(dir.path().join("src/mod.rs"), "different\ncontent\n").unwrap();
     std::fs::remove_file(dir.path().join("tests/mod.rs")).unwrap();
     std::fs::write(dir.path().join("new.rs"), "no newline").unwrap();
-    let text = state.render(dir.path(), &Scope::All, "done");
+    let text = state.render(dir.path(), &Scope::All, "changed mod.rs");
     assert!(text.contains("`src/mod.rs`: 2 → 2"), "{text}");
-    assert!(text.contains("`new.rs`: 0 (absent) → 0"), "{text}");
+    assert!(
+        text.contains("`new.rs`: unverified (not enumerated at baseline) → 0"),
+        "{text}"
+    );
     assert!(text.contains("`tests/mod.rs`: 1 → 0 (absent)"), "{text}");
+    assert!(!text.contains("Unverified ambiguous bare paths"), "{text}");
 }
 
 /// Protocol assertions inspect model prose; report contracts are tested separately.
@@ -226,3 +230,6 @@ pub(crate) fn model_explanation(text: &str) -> &str {
         text
     }
 }
+
+#[path = "files_tests.rs"]
+mod enumeration;

@@ -148,7 +148,7 @@ impl State {
         let Some(state) = self.roots.get(root) else {
             return "## Observed\n\nFacts unavailable: root retention limit reached.\n\n## Model explanation\n\n".into();
         };
-        let current = files::snapshot(root, scope);
+        let current = files::snapshot_with_baseline(root, scope, state.baseline.as_ref());
         let rows = match (&state.baseline, &current) {
             (Some(before), Some(after)) => files::changes(before, after),
             _ => vec!["File counts unavailable: incomplete or unauthorized snapshot.".into()],

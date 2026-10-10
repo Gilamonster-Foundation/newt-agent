@@ -4,11 +4,20 @@ use content_addressable::RawContentId;
 use std::io::Read;
 
 #[derive(Debug, Serialize)]
-pub(super) struct Snapshot(BTreeMap<String, File>);
+pub(super) struct Snapshot(BTreeMap<String, Entry>);
 #[derive(Debug, Serialize, PartialEq)]
-struct File {
-    bytes: Option<RawContentId>,
-    lf: Option<usize>,
+struct Entry {
+    file: File,
+    enumerated: bool,
+}
+#[derive(Debug, Serialize, PartialEq)]
+enum File {
+    Absent,
+    Present {
+        bytes: RawContentId,
+        lf: Option<usize>,
+    },
+    Unverified,
 }
 impl ContentAddressable for Snapshot {
     fn canonical_form(&self) -> Result<Vec<u8>, ContentError> {
@@ -16,8 +25,18 @@ impl ContentAddressable for Snapshot {
     }
 }
 
-fn read(scope: &Scope<String>, path: &Path, remaining: &mut usize) -> Option<File> {
-    let mut file = crate::agentic::tools::file_capture::open_for_scope(scope, path, true).ok()?;
+fn read(scope: &Scope<String>, path: &Path, remaining: &mut usize) -> File {
+    use crate::agentic::tools::file_capture::{is_absent_leaf, open_for_scope};
+    match open_for_scope(scope, path, true) {
+        Ok(file) => read_contents(file, remaining).unwrap_or(File::Unverified),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && is_absent_leaf(path) => {
+            File::Absent
+        }
+        Err(_) => File::Unverified,
+    }
+}
+
+fn read_contents(mut file: std::fs::File, remaining: &mut usize) -> Option<File> {
     let before = file.metadata().ok()?;
     let limit = (*remaining).min(2 * 1024 * 1024);
     if before.len() > limit as u64 {
@@ -37,13 +56,21 @@ fn read(scope: &Scope<String>, path: &Path, remaining: &mut usize) -> Option<Fil
     {
         return None;
     }
-    Some(File {
-        bytes: Some(RawContentId::from_content(&bytes)),
+    Some(File::Present {
+        bytes: RawContentId::from_content(&bytes),
         lf: (!bytes.contains(&0)).then(|| bytes.iter().filter(|b| **b == b'\n').count()),
     })
 }
 
 pub(super) fn snapshot(root: &Path, scope: &Scope<String>) -> Option<Snapshot> {
+    snapshot_with_baseline(root, scope, None)
+}
+
+pub(super) fn snapshot_with_baseline(
+    root: &Path,
+    scope: &Scope<String>,
+    baseline: Option<&Snapshot>,
+) -> Option<Snapshot> {
     // metadata_git refuses partial metadata authority; file reads independently
     // enforce their scope. Never discover files above the selected root.
     if !crate::agentic::claim_check::is_workspace_repo_root(&root.to_string_lossy(), scope) {
@@ -80,22 +107,60 @@ pub(super) fn snapshot(root: &Path, scope: &Scope<String>) -> Option<Snapshot> {
         {
             return None;
         }
-        let full = root.join(path);
-        // Only absence of the leaf is a deletion, not denial/dangling symlink.
-        if std::fs::symlink_metadata(&full).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-            && crate::caveats::permits_path(scope, &full.to_string_lossy())
-        {
-            continue;
-        }
         files.insert(
             path.into(),
-            read(scope, &full, &mut remaining).unwrap_or(File {
-                bytes: None,
-                lf: None,
-            }),
+            Entry {
+                file: read(scope, &root.join(path), &mut remaining),
+                enumerated: true,
+            },
         );
     }
+    // A Git listing is discovery, not proof of absence. Reopen baseline paths
+    // omitted today through exactly the same scoped, no-follow reader. These
+    // postimages share the snapshot's file/byte limits and canonical identity.
+    if let Some(baseline) = baseline {
+        for path in baseline.0.keys() {
+            if files.contains_key(path) {
+                continue;
+            }
+            if files.len() >= 4096 {
+                return None;
+            }
+            files.insert(
+                path.clone(),
+                Entry {
+                    file: read(scope, &root.join(path), &mut remaining),
+                    enumerated: false,
+                },
+            );
+        }
+    }
     Some(Snapshot(files))
+}
+
+fn count(entry: Option<&Entry>, baseline: bool) -> String {
+    match entry {
+        None if baseline => "unverified (not enumerated at baseline)".into(),
+        None
+        | Some(Entry {
+            file: File::Unverified,
+            ..
+        }) => "unverified".into(),
+        Some(Entry {
+            file: File::Absent, ..
+        }) => "0 (absent)".into(),
+        Some(Entry {
+            file: File::Present { lf, .. },
+            enumerated,
+        }) => {
+            let count = lf.map_or_else(|| "unavailable".into(), |n| n.to_string());
+            if *enumerated {
+                count
+            } else {
+                format!("{count} (present, not enumerated (ignored/untracked transition))")
+            }
+        }
+    }
 }
 
 pub(super) fn changes(before: &Snapshot, after: &Snapshot) -> Vec<String> {
@@ -104,25 +169,30 @@ pub(super) fn changes(before: &Snapshot, after: &Snapshot) -> Vec<String> {
         .filter_map(|path| {
             let old = before.0.get(path);
             let new = after.0.get(path);
-            let unknown = [old, new]
-                .iter()
-                .flatten()
-                .any(|f| f.bytes.is_none() || f.lf.is_none());
-            let count = |f: Option<&File>| {
-                f.map_or_else(
-                    || "0 (absent)".into(),
-                    |f| f.lf.map_or_else(|| "unavailable".into(), |v| v.to_string()),
+            let unknown = [old, new].iter().flatten().any(|entry| {
+                matches!(
+                    entry.file,
+                    File::Unverified | File::Present { lf: None, .. }
                 )
-            };
-            (old != new || unknown)
-                .then(|| format!("{}: {} → {}", literal(path), count(old), count(new)))
+            });
+            (old != new || unknown).then(|| {
+                format!(
+                    "{}: {} → {}",
+                    literal(path),
+                    count(old, true),
+                    count(new, false)
+                )
+            })
         })
         .collect()
 }
 
 pub(super) fn ambiguous(snapshot: &Snapshot, prose: &str) -> Vec<String> {
     let mut names = BTreeMap::<&str, usize>::new();
-    for path in snapshot.0.keys() {
+    for (path, entry) in &snapshot.0 {
+        if matches!(entry.file, File::Absent) {
+            continue;
+        }
         *names
             .entry(path.rsplit('/').next().unwrap_or(path))
             .or_default() += 1;
