@@ -5,6 +5,18 @@ The model's explanation follows it. This includes tool-round-cap handoffs.
 Anthropic answer deltas are buffered until finalization so the report and
 explanation print once; SSE consumption and idle-timeout handling continue.
 
+The Observed section is operator output, not assistant-authored speech. New
+conversation rows store only the model explanation; legacy mixed rows are
+projected the same way when replayed, without rewriting their history. The
+existing turn-outcome artifact retains the displayed report separately (with an
+explicit excerpt notice if its body limit is reached). Current facts reach all
+four provider APIs in a labelled harness system note. Paths, commands and result
+excerpts are framed as data; the note never substitutes for an operator request.
+Smart navigation preserves its existing content-addressed harness pin provenance.
+Restored plans are labelled agent-maintained advisory context rather than system
+policy. Bare continuations retain the objective after normal finishes as well as
+round-cap pauses.
+
 The report shows changed files relative to the first objective/adoption snapshot,
 with before and after LF counts (`wc -l` semantics), the last observed Cargo check
 or test per exact command and directory, bounded child-reported result lines,
@@ -37,5 +49,7 @@ content ID covers the objective/root, baseline/current snapshot identities and
 observations. This is the first harness-owned pinned report record. Model text
 cannot create a governed receipt or replace a stored observation.
 
-Stage 1 leaves the model's explanatory prose intact, including any conflicting
+Only complete copies matching the rendered report structure outside code fences
+are removed from model prose. Partial or ambiguous report-like text is preserved.
+Stage 1 otherwise leaves the model's explanation intact, including any conflicting
 numbers or conclusions. Clause-level correction of those claims is a later stage.

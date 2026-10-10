@@ -3,7 +3,8 @@
 //! The hooks in this module are deliberately narrower than general tool
 //! telemetry. They retain bounded harness-authored state, or locators plus
 //! digests for external state. Raw file contents, assistant replies, and tool
-//! streams never enter an artifact.
+//! streams never enter an artifact. Bounded harness reports may retain selected
+//! result excerpts as observations, separately from model prose.
 
 use anyhow::Context as _;
 use serde_json::{json, Value};
@@ -751,7 +752,8 @@ fn compaction_trigger_metadata(
 /// receipts, in turns, or in artifacts, and runs reaching rounds 145/236/285/320
 /// were indistinguishable from runs under the announced cap.
 ///
-/// Four bounded scalars, no text: the ledger's content-free rule is untouched.
+/// The model explanation remains digest-only. The bounded operator-facing
+/// Observed section, when present, occupies the existing outcome body.
 /// `configured` is carried beside `rounds` so a reader sees the ESCALATION and
 /// not merely the result.
 pub fn record_turn_outcome(
@@ -764,9 +766,7 @@ pub fn record_turn_outcome(
     tool_round_limit: Option<crate::tenacity::ToolRoundLimit>,
 ) -> anyhow::Result<ArtifactReadRecord> {
     let reply_digest = blake3::hash(reply.as_bytes()).to_hex().to_string();
-    append(
-        sink,
-        context,
+    let mut artifact =
         NewPromptArtifact::new(ArtifactKind::TurnOutcome, ArtifactRelation::DerivedFrom)
             .with_metadata(json!({
                 "reply_digest_algorithm": "blake3",
@@ -779,8 +779,24 @@ pub fn record_turn_outcome(
                 "tool_round_limit_source": tool_round_limit.map(|l| l.source.as_str()),
                 "configured_tool_round_limit": tool_round_limit.map(|l| l.configured),
                 "tenacity": tool_round_limit.and_then(|l| l.tenacity).map(|t| t.label()),
-            })),
-    )
+            }));
+    // Persist the operator-facing report separately from assistant-authored
+    // transcript rows. This body is presentation data, never imported as a
+    // verified check; fresh model facts still come from the typed report state.
+    if let Some((report, _)) = super::observed_report::split_report(reply) {
+        let body = if report.len() <= crate::MAX_ARTIFACT_BODY_BYTES {
+            report.to_owned()
+        } else {
+            let marker = "\n[Observed report excerpt: artifact body limit reached.]";
+            let mut end = crate::MAX_ARTIFACT_BODY_BYTES - marker.len();
+            while !report.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}{marker}", &report[..end])
+        };
+        artifact = artifact.with_body(body);
+    }
+    append(sink, context, artifact)
 }
 
 /// Record conversation-memory compaction without copying its generated
@@ -1699,6 +1715,35 @@ mod tests {
         assert_eq!(metadata["tool_round_limit_source"], "tenacity");
         assert_eq!(metadata["configured_tool_round_limit"], 40);
         assert_eq!(metadata["tenacity"], "relentless");
+    }
+
+    /// The operator's report is retained as an outcome artifact, not as
+    /// assistant speech or a second copy of the model explanation.
+    #[test]
+    fn observed_report_outcome_artifact_preserves_only_harness_section() {
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().to_str().unwrap();
+        let claims =
+            crate::agentic::claim_check::TurnClaims::capture(workspace, &crate::Scope::All, None);
+        let reply = crate::agentic::finalize_final_text(
+            "private model explanation".into(),
+            workspace,
+            &crate::Scope::All,
+            &crate::agentic::capability_check::Evidence::default(),
+            None,
+            &claims,
+            &crate::agentic::self_verify::VerificationLedger::default(),
+        );
+        record_turn_outcome(&sink, context, &reply, None, None, 1, None).unwrap();
+        let artifacts = sink.artifacts();
+        let body = artifacts[0].body().expect("operator report artifact");
+        assert_eq!(
+            body,
+            reply.split_once("\n## Model explanation\n\n").unwrap().0
+        );
+        assert!(!body.contains("private model explanation"));
     }
 
     #[test]

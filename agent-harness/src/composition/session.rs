@@ -22,7 +22,7 @@ impl Session {
             if !pin.class.semantic()
                 || !classes.insert(pin.class)
                 || !indices.insert(pin.index)
-                || message["role"] != "user"
+                || !pin.class.accepts_role(message["role"].as_str())
                 || !message["content"].is_string()
                 || message.as_object().is_none_or(|m| m.len() != 2)
             {
@@ -90,7 +90,7 @@ impl Session {
             if !class.semantic()
                 || !distinct.insert(id)
                 || event.body().origin != expected
-                || message["role"] != "user"
+                || !class.accepts_role(message["role"].as_str())
                 || !message["content"].is_string()
                 || message.as_object().is_none_or(|m| m.len() != 2)
             {

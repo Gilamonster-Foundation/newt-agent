@@ -308,7 +308,7 @@ async fn active_task_survives_compression() {
             + 5_600,
     );
     assert!(
-        initial_request_budget(&messages, TASK).saturating_sub(1)
+        initial_request_budget(&messages, TASK, &workspace).saturating_sub(1)
             <= c.mid_loop_trim_tokens.unwrap(),
         "completed history must fit initially; fresh reads trigger the compression"
     );
@@ -436,7 +436,8 @@ async fn first_turn_over_num_ctx_ceiling_compresses_before_dispatch() {
     // 4,915-token ceiling.)
     let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act)
         + prompt_read::response_repository_policy_tokens()
-        + 1_130;
+        + 1_130
+        + observed_note_tokens(&workspace);
     let num_ctx = (input_ceiling * 100).div_ceil(c.input_ceiling_pct as usize) as u32;
     // The actual ceiling the loop derives (`num_ctx_input_ceiling`), reused
     // by the fit assertion below so budget and check stay in lockstep.
@@ -561,10 +562,11 @@ async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
     c.mid_loop_trim_tokens = Some(
         builtin_catalog_tokens(PromptDisposition::Act)
             + prompt_read::response_repository_policy_tokens()
-            + 1_815,
+            + 1_815
+            + observed_note_tokens(&workspace),
     );
     assert!(
-        initial_request_budget(&messages, TASK).saturating_sub(1)
+        initial_request_budget(&messages, TASK, &workspace).saturating_sub(1)
             <= c.mid_loop_trim_tokens.unwrap(),
         "completed history must fit initially; a fresh read triggers outage recovery"
     );
@@ -661,7 +663,8 @@ async fn optional_continuation_cannot_abort_a_fitting_static_fallback() {
     // Preserve the observed tight ceiling, derived from the current catalog.
     let ceiling = builtin_catalog_tokens(PromptDisposition::Act)
         + prompt_read::response_repository_policy_tokens()
-        + 1_815;
+        + 1_815
+        + observed_note_tokens(&workspace);
     c.mid_loop_trim_tokens = Some(ceiling);
     c.summarizer = Some(&*summarizer);
     c.compress_state = Some(&mut state);
@@ -876,7 +879,34 @@ fn multi_turn_msgs() -> Vec<MemMessage> {
 /// Leave exactly one estimated token of room for the initial request. This
 /// keeps the hard-budget regressions coupled to the live advertised tool
 /// catalog rather than a stale numeric snapshot of its schema overhead.
-fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
+// Price the real host note so tight-budget tests still exercise their named
+// boundary rather than failing on unaccounted mandatory request overhead.
+pub(super) fn add_observed_note(
+    messages: &mut Vec<serde_json::Value>,
+    task: &str,
+    workspace: &str,
+) {
+    let claims = claim_check::TurnClaims::capture(workspace, &crate::Scope::All, None);
+    semantic_pins::refresh(
+        &mut semantic_pins::Projection::default(),
+        None,
+        messages,
+        prompt_read::PromptReadContext::new(None, task, None),
+        None,
+        &claims,
+        workspace,
+        &crate::Scope::All,
+    )
+    .unwrap();
+}
+
+pub(super) fn observed_note_tokens(workspace: &str) -> usize {
+    let mut messages = Vec::new();
+    add_observed_note(&mut messages, TASK, workspace);
+    estimate_tokens(&messages, crate::tokens::TokenEstimation::default())
+}
+
+fn initial_request_budget(messages: &[MemMessage], task: &str, workspace: &str) -> usize {
     let tools = merged_tool_definitions(
         &NoMcp,
         false,
@@ -910,6 +940,7 @@ fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         prompt_read::PromptReadContext::new(Some(&receipt), task, None),
         None,
     );
+    add_observed_note(&mut wire_messages, task, workspace);
     estimate_request_tokens(
         &wire_messages,
         Some(&tools),
@@ -1617,7 +1648,7 @@ async fn exact_request_pressure_self_compacts_after_tracker_underreport() {
         MemMessage::assistant("old reclaimable evidence\n".repeat(600)),
         MemMessage::user(TASK),
     ];
-    let budget = initial_request_budget(&messages, TASK);
+    let budget = initial_request_budget(&messages, TASK, &workspace);
     let caveats = Caveats::top();
     let uri = server.uri();
     let prompts = Arc::new(Mutex::new(Vec::new()));
@@ -1684,7 +1715,7 @@ async fn hard_budget_thrash_latches_then_bails_with_named_error() {
     let uri = server.uri();
     let mut compress_state = CompressState::new();
     let mut c = ctx(&uri, &messages, &caveats, &workspace);
-    c.mid_loop_trim_tokens = Some(initial_request_budget(&messages, TASK));
+    c.mid_loop_trim_tokens = Some(initial_request_budget(&messages, TASK, &workspace));
     c.compress_state = Some(&mut compress_state);
     let err = chat_complete(c, &mut NoMcp)
         .await

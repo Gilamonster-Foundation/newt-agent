@@ -1201,10 +1201,10 @@ pub(crate) fn request_with_messages(
     messages: &[Value],
 ) -> anyhow::Result<reqwest::RequestBuilder> {
     match harness {
-        Some(h) if h.settings.composition_enabled => Ok(builder
+        Some(h) => Ok(builder
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(h.prepare_with_messages(body, format, messages)?)),
-        _ => request(builder, body, harness, format),
+        None => Ok(builder.json(body)),
     }
 }
 
@@ -1511,6 +1511,7 @@ mod tests {
     /// refreshing facts never turns unavailable evidence into a passing check.
     #[test]
     fn semantic_pins_adapt_host_producers_and_preserve_operator_anchor() {
+        let mut projection = crate::agentic::semantic_pins::Projection::default();
         use crate::agentic::{
             claim_check::TurnClaims,
             prompt_read::PromptReadContext,
@@ -1535,6 +1536,7 @@ mod tests {
         // instruction, not let the recovered copy become the latest operator.
         let mut messages = vec![serde_json::json!({"role":"user","content":"continue"})];
         semantic_pins::refresh(
+            &mut projection,
             Some(&h),
             &mut messages,
             PromptReadContext::new(None, "extract parser", None),
@@ -1544,10 +1546,12 @@ mod tests {
             &read,
         )
         .unwrap();
-        assert_eq!(messages[0]["content"], "extract parser");
-        assert_eq!(messages[1]["content"], "continue");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"], "extract parser");
+        assert_eq!(messages[2]["content"], "continue");
         let first = messages.clone();
         semantic_pins::refresh(
+            &mut projection,
             Some(&h),
             &mut messages,
             PromptReadContext::new(None, "extract parser", None),
@@ -1574,7 +1578,7 @@ mod tests {
         assert!(projected.iter().any(|m| m["content"] == card));
         assert!(projected.iter().any(|m| m["content"]
             .as_str()
-            .is_some_and(|s| s.contains("historical checks retain their stated scope"))));
+            .is_some_and(|s| s.contains("Historical checks retain their stated scope"))));
         assert!(
             s.session.project_selection(&messages, &[], 64_000).is_err(),
             "host cards must not replace the latest operator anchor"

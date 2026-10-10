@@ -167,7 +167,31 @@ pub fn tool_use_block(tc: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// Coalesce leading OpenAI system messages without changing conversation order.
+/// Split canonical messages into Responses instructions and verbatim input items.
+/// Shared by live dispatch and content-addressed cold replay.
+pub fn responses_wire_messages(
+    messages: &[serde_json::Value],
+) -> (Option<String>, Vec<serde_json::Value>) {
+    let mut instructions: Vec<String> = Vec::new();
+    let mut input: Vec<serde_json::Value> = Vec::new();
+    for m in messages {
+        if m.get("type").is_some() {
+            input.push(m.clone());
+            continue;
+        }
+        let role = m["role"].as_str().unwrap_or("user");
+        let content = m["content"].as_str().unwrap_or("");
+        match role {
+            "system" | "developer" => instructions.push(content.to_string()),
+            _ => input.push(serde_json::json!({ "role": role, "content": content })),
+        }
+    }
+    let ins = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
+    (ins, input)
+}
+
+/// Coalesce only the leading system run for OpenAI chat, preserving source roles
+/// in the recorded projection while live transport and cold replay share bytes.
 pub fn openai_chat_wire_messages(
     messages: &[serde_json::Value],
 ) -> crate::Result<Vec<serde_json::Value>> {

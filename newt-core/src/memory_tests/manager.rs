@@ -143,3 +143,28 @@ async fn memory_manager_fallback_with_no_providers() {
     let msgs = mgr.build_messages("sys", "task");
     assert_eq!(msgs.len(), 2);
 }
+
+/// Operator reports must remain in durable display history without being
+/// replayed as assistant-authored text, including after conversation restore.
+#[tokio::test]
+async fn observed_report_replay_keeps_only_assistant_explanation() {
+    let report = "## Observed\n\nReport `sample` — root `project`.\n\nFiles since objective/adoption snapshot (LF counts; absence is 0):\n- `source`: 2 → 3\n\nLast observed checks per exact command/cwd (historical observations, not current-tree certification):\n- No check observation available.\n\nGoverned publication observations (not a live remote-state check):\n- No governed receipt available.\n\n## Model explanation\n\nI extracted the helper.";
+    let mut memory = MemoryManager::new();
+    memory.add_provider(RollingWindow::new(5));
+    memory
+        .sync_all_with_active_task("refactor", report, &metrics_with_input(10), "refactor")
+        .await;
+    for restored in [false, true] {
+        let saved = crate::ConversationTurn::new("refactor", report);
+        if restored {
+            memory.restore_turns(std::slice::from_ref(&saved));
+        }
+        let messages = memory.build_messages("system", "continue");
+        let assistant = messages.iter().find(|m| m.role == Role::Assistant).unwrap();
+        assert_eq!(assistant.content, "I extracted the helper.");
+        assert_eq!(
+            saved.assistant, report,
+            "durable operator history stays intact"
+        );
+    }
+}

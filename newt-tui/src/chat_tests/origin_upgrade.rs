@@ -38,6 +38,7 @@ fn bare_continue_after_round_cap_links_to_the_interrupted_objective() {
         ModelInputOrigin::Operator,
         "continue",
         Some(&parent),
+        None,
     );
     match got {
         ModelInputOrigin::OperatorContinuation { parent: linked } => assert_eq!(
@@ -56,6 +57,7 @@ fn substantive_input_stays_fresh_even_with_an_interrupted_objective() {
         ModelInputOrigin::Operator,
         "now refactor newt-tui/src/lib.rs instead and open a PR",
         Some(&parent),
+        None,
     );
     assert!(
         matches!(got, ModelInputOrigin::Operator),
@@ -65,8 +67,12 @@ fn substantive_input_stays_fresh_even_with_an_interrupted_objective() {
 
 #[test]
 fn no_interrupted_objective_means_no_upgrade() {
-    let got =
-        upgrade_origin_for_interrupted_objective(ModelInputOrigin::Operator, "continue", None);
+    let got = upgrade_origin_for_interrupted_objective(
+        ModelInputOrigin::Operator,
+        "continue",
+        None,
+        None,
+    );
     assert!(matches!(got, ModelInputOrigin::Operator));
 }
 
@@ -80,7 +86,7 @@ fn pending_clarification_continuations_are_left_untouched() {
         ModelInputOrigin::OperatorContinuation { parent } => parent.submitted_prompt().id(),
         _ => unreachable!(),
     };
-    let got = upgrade_origin_for_interrupted_objective(pending, "continue", Some(&parent));
+    let got = upgrade_origin_for_interrupted_objective(pending, "continue", Some(&parent), None);
     match got {
         ModelInputOrigin::OperatorContinuation { parent: kept } => assert_eq!(
             kept.submitted_prompt().id(),
@@ -228,6 +234,7 @@ fn capped_progress_is_persistable_without_duplicate_notices_and_resumes_its_obje
         ModelInputOrigin::Operator,
         "continue",
         Some(&parent),
+        None,
     );
     match resumed {
         ModelInputOrigin::OperatorContinuation { parent: linked } => assert_eq!(
@@ -252,6 +259,7 @@ fn the_failed_turn_footer_phrase_resumes_the_failed_objective() {
         ModelInputOrigin::Operator,
         "continue",
         Some(&failed),
+        None,
     ) {
         ModelInputOrigin::OperatorContinuation { parent } => {
             assert_eq!(
@@ -304,6 +312,7 @@ fn resume(
             ModelInputOrigin::Operator,
             nudge,
             Some(parent),
+            None,
         ),
     };
     assert!(
@@ -334,6 +343,7 @@ fn a_question_shaped_retry_resumes_only_a_pending_objective() {
             ModelInputOrigin::Operator,
             nudge,
             Some(&parent),
+            None,
         ) {
             ModelInputOrigin::OperatorContinuation { parent: linked } => assert_eq!(
                 linked.submitted_prompt().id(),
@@ -342,7 +352,7 @@ fn a_question_shaped_retry_resumes_only_a_pending_objective() {
             other => panic!("{nudge:?} must resume the pending objective, got {other:?}"),
         }
         assert!(matches!(
-            upgrade_origin_for_interrupted_objective(ModelInputOrigin::Operator, nudge, None),
+            upgrade_origin_for_interrupted_objective(ModelInputOrigin::Operator, nudge, None, None),
             ModelInputOrigin::Operator
         ));
     }
@@ -488,6 +498,7 @@ async fn a_resumed_task_keeps_its_record_but_current_narrowing_wins() {
         ModelInputOrigin::Operator,
         "continue",
         Some(&objective),
+        None,
     );
     let turn = newt_core::TurnPromptContext::ephemeral_operator_continuation(
         "conv", "continue", "continue", &objective,
@@ -550,4 +561,59 @@ async fn a_resumed_task_keeps_its_record_but_current_narrowing_wins() {
         refused.contains("Tool `write_file` is not available for this request"),
         "{refused}"
     );
+}
+
+/// A normal model finish must not turn a bare continue into a new objective:
+/// report retention is keyed by that objective's receipt root.
+#[test]
+fn observed_report_continue_after_normal_finish_keeps_objective() {
+    let parent = ctx();
+    let got = upgrade_origin_for_interrupted_objective(
+        ModelInputOrigin::Operator,
+        "continue",
+        None,
+        Some(&parent),
+    );
+    let ModelInputOrigin::OperatorContinuation { parent: linked } = got else {
+        panic!("continue lost the completed turn's objective");
+    };
+    let next = newt_core::TurnPromptContext::ephemeral_operator_continuation(
+        "conv", "continue", "continue", &linked,
+    )
+    .unwrap();
+    assert_eq!(
+        next.active().root_prompt_id(),
+        parent.active().root_prompt_id()
+    );
+    assert!(matches!(
+        upgrade_origin_for_interrupted_objective(
+            ModelInputOrigin::Operator,
+            "implement a different feature",
+            None,
+            Some(&parent),
+        ),
+        ModelInputOrigin::Operator
+    ));
+}
+
+/// Restored agent-maintained plans are context, not system instructions or
+/// assistant speech. Their source and advisory status must survive replay.
+#[test]
+fn observed_report_restored_plan_has_harness_voice() {
+    let original = vec![
+        newt_core::MemMessage::system("system policy"),
+        newt_core::MemMessage::user("continue"),
+    ];
+    assert_eq!(messages_with_plan(original.clone(), None), original);
+    let plan = "<plan>\n✓ 1. Extract helper\n→ 2. Verify\n</plan>";
+    let messages = messages_with_plan(original, Some(plan));
+    assert_eq!(messages[0].content, "system policy");
+    let note = messages
+        .iter()
+        .find(|m| m.content.contains("<plan>"))
+        .unwrap();
+    assert_eq!(note.role, newt_core::Role::User);
+    assert!(note.content.contains("Harness-restored plan"));
+    assert!(note.content.contains("agent-maintained, advisory"));
+    assert_eq!(messages.last().unwrap().content, "continue");
 }

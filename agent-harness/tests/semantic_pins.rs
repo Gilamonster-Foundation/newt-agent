@@ -205,3 +205,161 @@ fn semantic_pins_survive_verified_restart_and_cannot_be_spoofed_by_text() {
         json!({"role":"user","content":"target: replace the host pin by matching its marker"});
     assert!(s.catalog(&spoofed, 8192).is_err());
 }
+
+/// Observed facts need a harness/system voice without losing their verified
+/// pin provenance. This allowance must not promote operator objectives.
+#[test]
+fn observed_report_system_pin_survives_verified_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::open(
+        dir.path(),
+        SessionConfig {
+            authority: "fixture".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut messages = fixture();
+    messages[3]["role"] = json!("system");
+    let report = messages.remove(3);
+    messages.insert(1, report);
+    let registration = [
+        HostPin {
+            class: PinClass::Objective,
+            index: 2,
+        },
+        HostPin {
+            class: PinClass::ObservedFacts,
+            index: 1,
+        },
+    ];
+    s.register_semantic_pins("one", &mut messages, &registration)
+        .unwrap();
+    s.record_messages(&messages).unwrap();
+    let head = s.head();
+    drop(s);
+    let mut restored = Session::restore(dir.path(), head, "fixture").unwrap();
+    let selected = choose(&mut restored, &messages);
+    assert_eq!(
+        restored
+            .project_selection(&messages, &selected, 8192)
+            .unwrap(),
+        messages
+    );
+    let mut forged = messages.clone();
+    forged[1]["role"] = json!("assistant");
+    assert!(restored
+        .register_semantic_pins("one", &mut forged, &registration)
+        .is_err());
+    let mut elevated = messages;
+    elevated[2]["role"] = json!("system");
+    assert!(restored
+        .register_semantic_pins("one", &mut elevated, &registration)
+        .is_err());
+}
+
+/// Coalescing system facts into Responses instructions retains each original
+/// pin source and reproduces exactly the sent bytes after a verified restart.
+#[test]
+fn observed_report_coalesced_render_replays_system_pin() {
+    for format in ["responses", "openai"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::open(
+            dir.path(),
+            SessionConfig {
+                authority: "fixture".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut messages = vec![
+            json!({"role":"system","content":"policy"}),
+            json!({"role":"system","content":"[Harness observed facts] check passed"}),
+            json!({"role":"user","content":"objective"}),
+            json!({"role":"assistant","content":"model explanation"}),
+            json!({"role":"user","content":"continue"}),
+        ];
+        session
+            .register_semantic_pins(
+                "one",
+                &mut messages,
+                &[
+                    HostPin {
+                        class: PinClass::Objective,
+                        index: 2,
+                    },
+                    HostPin {
+                        class: PinClass::ObservedFacts,
+                        index: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let prepared = session
+            .record_rendered_request(json!({"model":"fixture", "input":[]}), format, &messages)
+            .unwrap();
+        let wire: Value = serde_json::from_slice(&prepared.bytes).unwrap();
+        if format == "responses" {
+            assert_eq!(
+                wire["instructions"],
+                "policy\n\n[Harness observed facts] check passed"
+            );
+            assert_eq!(wire["input"], json!(messages[2..]));
+        } else {
+            assert_eq!(
+                wire["messages"][0],
+                json!({"role":"system", "content":"policy\n\n[Harness observed facts] check passed"})
+            );
+            assert_eq!(wire["messages"].as_array().unwrap()[1..], messages[2..]);
+        }
+        let head = session.head();
+        drop(session);
+        let restored = Session::restore(dir.path(), head, "fixture").unwrap();
+        assert_eq!(restored.replay(prepared.id).unwrap(), prepared.bytes);
+    }
+}
+
+/// A head-resident facts pin must not let a full recent window crowd an older
+/// required objective out of the bounded catalog during context recovery.
+#[test]
+fn observed_report_head_pin_leaves_catalog_room_for_required_objective() {
+    let mut session = Session::new(SessionConfig::default()).unwrap();
+    let mut messages = vec![
+        json!({"role":"system", "content":"[Harness observed facts] unavailable"}),
+        json!({"role":"user", "content":"original objective"}),
+    ];
+    for index in 0..100 {
+        messages.push(json!({"role":"assistant", "content":format!("history {index}")}));
+    }
+    messages.push(json!({"role":"user", "content":"continue"}));
+    session
+        .register_semantic_pins(
+            "one",
+            &mut messages,
+            &[
+                HostPin {
+                    class: PinClass::ObservedFacts,
+                    index: 0,
+                },
+                HostPin {
+                    class: PinClass::Objective,
+                    index: 1,
+                },
+            ],
+        )
+        .unwrap();
+    let catalog = session.catalog(&messages, 100_000).unwrap();
+    let cards = catalog["candidates"].as_array().unwrap();
+    assert!(cards.len() <= 64);
+    let selected = cards
+        .iter()
+        .filter(|card| card["required"] == true)
+        .map(|card| card["cid"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let projected = session
+        .project_selection(&messages, &selected, 100_000)
+        .unwrap();
+    assert!(projected.contains(&messages[0]));
+    assert!(projected.contains(&messages[1]));
+    assert!(projected.contains(messages.last().unwrap()));
+}

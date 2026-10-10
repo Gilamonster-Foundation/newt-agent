@@ -71,22 +71,7 @@ pub fn generation_probe_body(model: &str) -> Value {
 /// transport call, so the two can never drift on the instructions/input split.
 #[must_use]
 pub fn build_responses_input(messages: &[Value]) -> (Option<String>, Vec<Value>) {
-    let mut instructions: Vec<String> = Vec::new();
-    let mut input: Vec<Value> = Vec::new();
-    for m in messages {
-        if m.get("type").is_some() {
-            input.push(m.clone());
-            continue;
-        }
-        let role = m["role"].as_str().unwrap_or("user");
-        let content = m["content"].as_str().unwrap_or("");
-        match role {
-            "system" | "developer" => instructions.push(content.to_string()),
-            _ => input.push(serde_json::json!({ "role": role, "content": content })),
-        }
-    }
-    let ins = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
-    (ins, input)
+    agent_harness::render::responses_wire_messages(messages)
 }
 
 /// A successfully decoded, **completed** Responses turn. Produced ONLY when the

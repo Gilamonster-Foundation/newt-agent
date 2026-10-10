@@ -1056,3 +1056,26 @@ fn observed_report_is_present_at_cap_finalization() {
     assert!(out.starts_with("## Observed"), "{out}");
     assert!(out.contains("unavailable"), "{out}");
 }
+
+/// Live report regression: copied report envelopes in model prose must not
+/// impersonate a second harness report, including copies after ordinary prose.
+#[test]
+fn observed_report_finalization_removes_model_report_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let claims = claim_check::TurnClaims::capture(root, &crate::Scope::All, None);
+    let copy = claims.observed_report(root, &crate::Scope::All, "");
+    let out = finalize_final_text(
+        format!("{copy}First explanation.\n\n{copy}Second explanation."),
+        root,
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        &claims,
+        &self_verify::VerificationLedger::default(),
+    );
+    assert_eq!(out.matches("## Observed").count(), 1, "{out}");
+    assert_eq!(out.matches("## Model explanation").count(), 1, "{out}");
+    assert!(out.contains("First explanation."));
+    assert!(out.contains("Second explanation."));
+}

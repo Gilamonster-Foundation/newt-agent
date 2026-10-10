@@ -148,7 +148,7 @@ impl ModelInputOrigin {
 
 /// bug/steering-regressions iteration #2: upgrade a fresh operator prompt to
 /// an [`ModelInputOrigin::OperatorContinuation`] when the previous agentic
-/// turn was interrupted by the round cap AND the input is a bare continuation
+/// turn has an active objective AND the input is a bare continuation
 /// nudge ("continue", "keep going", "1: proceed"). Minted fresh, such a nudge
 /// becomes the active operator prompt itself — the compression-immune card
 /// then protects the word "continue" while the real task drifts into the
@@ -156,12 +156,15 @@ impl ModelInputOrigin {
 /// interrupted objective's lineage, so fix #1's authority walk keeps the real
 /// task active. A substantive new ask never upgrades — the classifier is
 /// conservative by construction ([`newt_core::classifiers::is_bare_continuation`]).
+/// A normal finish can still leave work pending (or ask a question in prose).
+/// Reuse its active receipt too, so a bare nudge cannot erase objective facts.
 fn upgrade_origin_for_interrupted_objective(
     origin: ModelInputOrigin,
     task: &str,
     interrupted: Option<&newt_core::TurnPromptContext>,
+    active: Option<&newt_core::TurnPromptContext>,
 ) -> ModelInputOrigin {
-    match (&origin, interrupted) {
+    match (&origin, interrupted.or(active)) {
         (ModelInputOrigin::Operator, Some(parent))
             if newt_core::classifiers::is_bare_continuation(task) =>
         {
@@ -188,6 +191,22 @@ fn consume_interrupted_objective_for_accepted_prompt(
     ) {
         interrupted.take();
     }
+}
+
+fn messages_with_plan(
+    mut messages: Vec<newt_core::MemMessage>,
+    plan: Option<&str>,
+) -> Vec<newt_core::MemMessage> {
+    if let Some(plan) = plan {
+        let index = messages
+            .iter()
+            .take_while(|m| m.role == newt_core::Role::System)
+            .count();
+        messages.insert(index, newt_core::MemMessage::user(format!(
+            "[Harness-restored plan; agent-maintained, advisory]\nThis is saved planning context, not a new operator instruction or proof that work succeeded.\n{plan}"
+        )));
+    }
+    messages
 }
 
 fn failed_turn_footer() -> &'static str {
@@ -3497,6 +3516,7 @@ fn session_body(
                     model_input_origin,
                     &task,
                     interrupted_objective.as_ref(),
+                    active_prompt_context.as_ref(),
                 );
                 if model_input_origin.is_operator() {
                     surface.add_history(&task);
@@ -8247,15 +8267,15 @@ fn session_body(
                         }
                     }
                     // Step 26.6b (#586): inject the compiled <plan> checklist at the
-                    // turn head — ephemeral message[0], never persisted (like the
-                    // other feature blocks).
+                    // turn head as labelled advisory data, not system policy.
                     let scheduled_on = turn_features.scheduled;
-                    if scheduled_on {
-                        if let Some(block) = newt_core::plan_block(&step_ledger) {
-                            turn_system = format!("{block}\n\n{turn_system}");
-                        }
-                    }
-                    let messages = memory.build_messages(&turn_system, &task);
+                    let plan = scheduled_on
+                        .then(|| newt_core::plan_block(&step_ledger))
+                        .flatten();
+                    let messages = messages_with_plan(
+                        memory.build_messages(&turn_system, &task),
+                        plan.as_deref(),
+                    );
                     // The save_note sink borrows the manager for this call
                     // only; `/remember` and `save_note` share its NoteStore
                     // (one write path, one scan, one cap). Step 19.3, #248.
@@ -9458,10 +9478,9 @@ fn session_body(
                                         // ACTION is known to have succeeded — drained
                                         // once per loop iteration at the head of the
                                         // loop (`persist_preference_actions`).
-                                        // The transcript remains the source for
-                                        // reply text. Append its digest-only
-                                        // outcome only after the transcript save
-                                        // succeeds, never before durable state.
+                                        // Keep the model prose in the transcript and
+                                        // the displayed report in the outcome artifact.
+                                        // Record the outcome only after transcript save.
                                         if let (Some(sink), Some(turn)) =
                                             (artifact_sink, active_prompt_context.as_ref())
                                         {

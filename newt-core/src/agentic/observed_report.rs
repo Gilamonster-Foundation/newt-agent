@@ -1,6 +1,10 @@
 //! Objective-scoped, content-addressed facts. Model prose is not evidence.
 mod capture;
 mod files;
+mod prose;
+pub use prose::assistant_prose;
+pub(super) use prose::model_prose;
+pub(crate) use prose::{replay_messages, split_report};
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -63,6 +67,11 @@ impl ContentAddressable for Report<'_> {
         canonical::to_canonical_dagcbor(self)
     }
 }
+
+const FILES_HEADING: &str = "Files since objective/adoption snapshot (LF counts; absence is 0):";
+const CHECKS_HEADING: &str = "Last observed checks per exact command/cwd (historical observations, not current-tree certification):";
+const PUBLICATIONS_HEADING: &str =
+    "Governed publication observations (not a live remote-state check):";
 
 impl State {
     pub(crate) fn begin(&mut self, objective: crate::prompt::PromptId) {
@@ -182,14 +191,17 @@ impl State {
             "## Observed\n\nReport `{cid}` — root {}.\n\n",
             crate::worktree_adoption::task_path_literal(root)
         );
-        out.push_str("Files since objective/adoption snapshot (LF counts; absence is 0):\n");
+        out.push_str(FILES_HEADING);
+        out.push('\n');
         if report.files.is_empty() {
             out.push_str("- No content changes observed.\n");
         }
         for row in &report.files {
             out.push_str(&format!("- {row}\n"));
         }
-        out.push_str("\nLast observed checks per exact command/cwd (historical observations, not current-tree certification):\n");
+        out.push('\n');
+        out.push_str(CHECKS_HEADING);
+        out.push('\n');
         if state.checks.is_empty() {
             out.push_str("- No check observation available.\n");
         }
@@ -210,7 +222,9 @@ impl State {
                 out.push_str("  Result excerpt incomplete; totals unavailable.\n");
             }
         }
-        out.push_str("\nGoverned publication observations (not a live remote-state check):\n");
+        out.push('\n');
+        out.push_str(PUBLICATIONS_HEADING);
+        out.push('\n');
         if state.publications.is_empty() {
             out.push_str("- No governed receipt available.\n");
         }

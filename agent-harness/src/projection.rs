@@ -29,7 +29,10 @@ impl Projection {
         if self.schema != 1
             || !matches!(
                 self.renderer.as_str(),
-                "json-messages-v1" | "anthropic-messages-v1" | "openai-messages-v1"
+                "json-messages-v1"
+                    | "anthropic-messages-v1"
+                    | "responses-messages-v1"
+                    | "openai-messages-v1"
             )
             || !matches!(self.field.as_str(), "messages" | "input")
         {
@@ -86,9 +89,23 @@ impl Projection {
             messages
         } else if self.renderer == "openai-messages-v1" {
             if self.field != "messages" {
-                return Err(invalid("OpenAI rendering requires messages"));
+                return Err(invalid("OpenAI chat rendering requires messages"));
             }
             crate::render::openai_chat_wire_messages(&messages)?
+        } else if self.renderer == "responses-messages-v1" {
+            if self.field != "input" {
+                return Err(invalid("Responses rendering requires input"));
+            }
+            let (instructions, messages) = crate::render::responses_wire_messages(&messages);
+            match instructions {
+                Some(instructions) => {
+                    object.insert("instructions".into(), instructions.into());
+                }
+                None => {
+                    object.remove("instructions");
+                }
+            }
+            messages
         } else {
             messages
         };

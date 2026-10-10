@@ -138,6 +138,7 @@ fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         prompt_read::PromptReadContext::new(Some(&receipt), task, None),
         None,
     );
+    super::compression_loop_tests::add_observed_note(&mut wire_messages, task, ".");
     estimate_request_tokens(
         &wire_messages,
         Some(&tools),
@@ -481,7 +482,8 @@ async fn truncation_suspect_rounds_emit_nothing() {
     const INPUT_CEILING_PCT: usize = 80; // matches ctx() default below
     let input_ceiling = builtin_catalog_tokens(PromptDisposition::Act)
         + prompt_read::response_repository_policy_tokens()
-        + 311;
+        + 311
+        + super::compression_loop_tests::observed_note_tokens(".");
     let num_ctx = (input_ceiling * 100).div_ceil(INPUT_CEILING_PCT) as u32;
     let suspect_prompt = num_ctx * 98 / 100; // ≥95% of num_ctx → suspect
     let tools_rounds = Arc::new(AtomicUsize::new(0));
@@ -651,7 +653,8 @@ async fn persistent_empty_over_safe_context_emits_suspected_overflow() {
     c.safe_context = Some(
         (builtin_catalog_tokens(PromptDisposition::Act)
             + prompt_read::response_repository_policy_tokens()
-            + 215) as u32,
+            + 215
+            + super::compression_loop_tests::observed_note_tokens(".")) as u32,
     );
     c.on_round_usage = Some(&mut hook);
     let (_reply, streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)

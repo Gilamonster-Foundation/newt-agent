@@ -52,6 +52,12 @@ impl PinClass {
         }
     }
 
+    // Legacy user-envelope facts remain readable. Only the host's facts slot
+    // may additionally occupy the system channel; objectives remain operator data.
+    pub(crate) fn accepts_role(self, role: Option<&str>) -> bool {
+        role == Some("user") || (self == Self::ObservedFacts && role == Some("system"))
+    }
+
     pub(crate) fn semantic(self) -> bool {
         matches!(
             self,
