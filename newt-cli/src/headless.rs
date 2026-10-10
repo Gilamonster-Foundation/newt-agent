@@ -944,7 +944,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             ),
             o_opt.map_or(&[][..], |o| &o.tool_events[..]),
             &end_reason,
-            reply_chars > 0,
+            o_opt.is_some_and(|o| !newt_core::agentic::model_reply_for_history(&o.reply).trim().is_empty()),
             uncommitted_delta,
             commits_this_run.clone(),
         ),
