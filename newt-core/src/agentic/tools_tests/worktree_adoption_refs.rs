@@ -103,6 +103,32 @@ async fn adoption_refs_real_checkout_and_commit_preserve_original() {
     .await;
     assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
     assert!(session.snapshot().is_some(), "{text}");
+    // Detached-adoption regression: unsupported presentation wrappers must
+    // refuse before shell execution, with the exact supported broker retry.
+    // On macOS the old fallthrough reached Seatbelt and failed on the shared
+    // refs/heads lock; this portable real-Git case grounds the same dispatch seam.
+    let detached_head = git(&target, temp.path(), &["rev-parse", "HEAD"]);
+    for command in [
+        "git checkout -b blocked 2>&1 | tail -3",
+        "git checkout -b blocked 2>&1 && git branch --show-current",
+        "git checkout -b blocked 2>&1; echo \"rc=$?\"; git branch --show-current",
+        "git switch -c blocked && touch sibling-ran",
+        "git branch blocked; echo done",
+        "git branch blocked > branch-output",
+    ] {
+        let (text, outcome) = run(command, &target, &original, &c, &session).await;
+        assert_eq!(outcome, Some(ExecOutcome::Denied), "{command}: {text}");
+        assert!(text.contains("git checkout -b blocked"), "{text}");
+        assert!(text.contains("cwd"), "{text}");
+        assert!(!original.join(".git/refs/heads/blocked").exists());
+        assert!(!original.join(".git/logs/refs/heads/blocked").exists());
+        assert!(!target.join("sibling-ran").exists());
+        assert_eq!(
+            git(&target, temp.path(), &["rev-parse", "HEAD"]),
+            detached_head
+        );
+        assert_eq!(git(&target, temp.path(), &["branch", "--show-current"]), "");
+    }
     let (text, outcome) = run("git checkout -b feat/x", &target, &original, &c, &session).await;
     assert_eq!(
         outcome,

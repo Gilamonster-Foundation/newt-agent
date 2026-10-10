@@ -408,7 +408,8 @@ async fn worktree_creation_2813_requires_an_available_adoption_session() {
         )
         .await;
         assert!(
-            text.contains("standalone literal command"),
+            text.contains("standalone literal command")
+                && text.contains("git worktree add -b <new-branch> <path> [<start>]"),
             "creation fell through admission: {text}"
         );
         assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Denied));
