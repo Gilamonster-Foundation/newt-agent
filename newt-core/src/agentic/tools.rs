@@ -4557,6 +4557,9 @@ async fn execute_authorized_tool(
                     &mut permission_gate,
                     commit_broker.is_some(),
                 ) {
+                    if let Some(notice) = adopted.as_ref().and_then(|policy| worktree::branch::wrapper_refusal(policy, cmd)) {
+                        return host_return(executed((notice, crate::ExecOutcome::Denied)));
+                    }
                     return host_return(reason);
                 }
             }

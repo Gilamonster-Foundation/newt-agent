@@ -522,6 +522,25 @@ impl HeldRoots {
         self.open_read(anchor, rel).map(|_| None)
     }
 
+    /// Advisory path recognition through existing read authority. Never block
+    /// on special files or follow an escaping/final symlink.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn is_regular_file(&self, path: &Path) -> bool {
+        self.canonical.iter().enumerate().any(|(index, root)| {
+            let Ok(relative) = path.strip_prefix(root) else {
+                return false;
+            };
+            crate::fs_cap::WorkspaceDir::from_granted_root(&self.handles[index])
+                .and_then(|directory| directory.open_regular(relative, true))
+                .is_ok()
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn is_regular_file(&self, _path: &Path) -> bool {
+        false
+    }
+
     /// Immediately before the held roots are admitted by pathname (the
     /// confined copy's fs grant is paths): the object each canonical path
     /// names NOW must be the object the handle holds — `(dev, ino)` from
@@ -1730,6 +1749,27 @@ pub fn validate_pr_url(candidate: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// PR #2853: checkout recognition cannot probe through an escaping link
+    /// or turn an out-of-scope file into a positive confined-route decision.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn regular_file_recognition_stays_beneath_read_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("granted");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("seed"), "inside").unwrap();
+        std::fs::write(base.join("outside"), "outside").unwrap();
+        std::os::unix::fs::symlink(&base, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(root.join("seed"), root.join("link")).unwrap();
+        let read = HeldRoots::bind(&Scope::only([root.to_string_lossy().into_owned()])).unwrap();
+        assert!(read.is_regular_file(&root.join("seed")));
+        assert!(!read.is_regular_file(&base.join("outside")));
+        assert!(!read.is_regular_file(&root.join("escape/outside")));
+        assert!(!read.is_regular_file(&root.join("link")));
+        assert!(!read.is_regular_file(&root));
+    }
 
     fn scope(roots: &[&str]) -> Scope<String> {
         Scope::only(roots.iter().map(|s| s.to_string()).collect::<Vec<_>>())

@@ -370,8 +370,31 @@ async fn detached_branch_wrappers() {
     )
     .await;
     assert!(out.contains("Adopted task worktree:"), "{out}");
+    for command in [
+        "git branch --show-current | head",
+        "git branch --list | head",
+        "git branch -vv | head",
+        "git switch unadopted && git status --short",
+        "git checkout unadopted && git status --short",
+        "git checkout --detach HEAD && git status --short",
+    ] {
+        let command = format!(
+            "cd '{}' && {command} && echo noncreating-ok",
+            task.display()
+        );
+        let out = dispatch(&session, &main, &caveats, &command).await;
+        assert!(out.contains("noncreating-ok"), "{command}: {out}");
+        assert!(!out.contains("capability denied"), "{command}: {out}");
+        if command.contains("switch unadopted") {
+            assert_eq!(
+                real_git_output(&task, &["branch", "--show-current"]),
+                "unadopted"
+            );
+        }
+    }
     let head = real_git_output(&task, &["rev-parse", "HEAD"]);
     for command in [
+        "git branch -v detached-task | head; touch sibling-ran",
         "git switch --create detached-task | tail -3; touch sibling-ran",
         "git -C. checkout -b detached-task | tail -3; touch sibling-ran",
         "git -C./ checkout -b detached-task | tail -3; touch sibling-ran",
@@ -387,7 +410,7 @@ async fn detached_branch_wrappers() {
         let out = dispatch(&session, &main, &caveats, &command).await;
         assert!(out.contains("capability denied"), "{command}: {out}");
         let retry = if command.contains("env LANG=C") {
-            "git checkout -b <name>"
+            "run the same Git operation as a standalone command"
         } else {
             "git checkout -b detached-task"
         };
