@@ -40,7 +40,8 @@ async fn ollama_returns_the_accepted_probe_answer_without_a_reissue() {
             .expect("chat_complete should succeed");
 
     assert_eq!(
-        reply, "probe answer",
+        crate::agentic::model_explanation(&reply),
+        "probe answer",
         "the gated answer, never a second generation"
     );
     assert!(!streamed, "nothing was streamed to a display");
@@ -87,7 +88,7 @@ async fn ollama_answer(
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
     let folded = recorder.0.lock().unwrap().clone();
-    (reply, folded)
+    (crate::agentic::model_explanation(&reply).to_owned(), folded)
 }
 
 fn thinking_folded() -> crate::test_guard::GlobalSettingsGuard {
@@ -156,7 +157,7 @@ impl CompletedSpillRenderer for FoldRecorder {
 async fn ollama_native_thinking_is_folded_with_the_accepted_answer() {
     let _settings = thinking_folded();
     let (reply, folded) = ollama_answer("Done.", Some("plan the change"), false, true).await;
-    assert_eq!(reply, "Done.");
+    assert_eq!(crate::agentic::model_explanation(&reply), "Done.");
     assert!(
         folded.iter().any(|body| body.contains("plan the change")),
         "{folded:?}"
@@ -231,7 +232,7 @@ async fn empty_stream_falls_back_to_probe_content() {
             .await
             .expect("chat_complete should succeed");
 
-    assert_eq!(reply, "probe says hi");
+    assert_eq!(crate::agentic::model_explanation(&reply), "probe says hi");
     assert!(!streamed, "fallback content was never streamed");
     assert_eq!(usage.unwrap().input_tokens, 5);
 }
@@ -291,7 +292,10 @@ async fn empty_stream_probe_fallback_pending_action_nudges_and_continues() {
         2,
         "the nudge ran a second probe"
     );
-    assert_eq!(reply, "Verified after the automatic continue.");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "Verified after the automatic continue."
+    );
     assert!(!streamed, "the second answer also came from probe fallback");
     assert!(
         !reply.contains("Let me verify"),
@@ -414,7 +418,10 @@ async fn suspicious_empty_generated_output_retries_with_nudge() {
             .await
             .expect("chat_complete should succeed");
 
-    assert_eq!(reply, "recovered after empty retry");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered after empty retry"
+    );
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(probes.load(Ordering::SeqCst), 2);
     assert!(saw_nudge.load(Ordering::SeqCst));
@@ -507,7 +514,10 @@ async fn repeated_thinking_only_gets_stronger_second_nudge() {
             .await
             .expect("second hidden-only nudge should recover the turn");
 
-    assert_eq!(reply, "recovered after strong hidden-only nudge");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered after strong hidden-only nudge"
+    );
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(probes.load(Ordering::SeqCst), 3);
     assert!(saw_strong_nudge.load(Ordering::SeqCst));

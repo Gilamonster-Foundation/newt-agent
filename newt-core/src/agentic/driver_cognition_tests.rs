@@ -123,8 +123,7 @@ async fn captured_responses_wire_survives_sibling_api_switch() {
         panic!("turn did not finish");
     };
     assert_eq!(outcome.error, None);
-    assert_eq!(
-        outcome.reply, "read complete",
+    assert_eq!(crate::agentic::model_explanation(&outcome.reply), "read complete",
         "the captured API owns dispatch"
     );
     assert_eq!(outcome.semantic_cognition, Some(Cognition::Meticulous));

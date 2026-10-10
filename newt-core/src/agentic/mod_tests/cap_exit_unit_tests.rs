@@ -1034,3 +1034,22 @@ fn cap_exit_handoff_keeps_one_plan_step_per_rendered_line() {
          own rendered line, in order; got {order:?} in: {rendered}"
     );
 }
+
+/// Stage 1: even a cap fallback must include harness facts, not only model claims.
+#[test]
+fn observed_report_is_present_at_cap_finalization() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let claims = claim_check::TurnClaims::capture(root, &crate::Scope::All, None);
+    let out = finalize_final_text(
+        cap_exit_fallback(1, None, 0, None),
+        root,
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        &claims,
+        &self_verify::VerificationLedger::default(),
+    );
+    assert!(out.starts_with("## Observed"), "{out}");
+    assert!(out.contains("unavailable"), "{out}");
+}

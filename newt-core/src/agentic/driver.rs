@@ -1101,7 +1101,10 @@ mod tests {
             outcome.end_reason,
             Some(crate::TurnEndReason::AwaitingOperator)
         );
-        assert_eq!(outcome.reply, "Which repository?");
+        assert_eq!(
+            crate::agentic::model_explanation(&outcome.reply),
+            "Which repository?"
+        );
         assert_ne!(before, harness.head().unwrap());
     }
 
@@ -1134,7 +1137,10 @@ mod tests {
         let status = pump_to_done(&mut driver).await;
         match status {
             TurnStatus::Completed(outcome) => {
-                assert_eq!(outcome.reply, "the driver answered");
+                assert_eq!(
+                    crate::agentic::model_explanation(&outcome.reply),
+                    "the driver answered"
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -1146,7 +1152,10 @@ mod tests {
         assert_eq!(t[0].role, Role::User);
         assert_eq!(t[0].content, "what is 2 + 2?");
         assert_eq!(t[1].role, Role::Assistant);
-        assert_eq!(t[1].content, "the driver answered");
+        assert_eq!(
+            crate::agentic::model_explanation(&t[1].content),
+            "the driver answered"
+        );
 
         // The backend served the turn's generation; at least one request landed.
         assert!(served.load(Ordering::SeqCst) >= 1);
@@ -1658,7 +1667,10 @@ mod tests {
             panic!("crew turn did not complete")
         };
         assert_eq!(outcome.error, None);
-        assert_eq!(outcome.reply, "tool result reviewed");
+        assert_eq!(
+            crate::agentic::model_explanation(&outcome.reply),
+            "tool result reviewed"
+        );
         assert_eq!(
             dispatches.lock().unwrap().as_slice(),
             &[CrewDispatch {
@@ -1771,7 +1783,10 @@ mod tests {
             panic!("headless turn did not complete after numbered recovery")
         };
         assert_eq!(outcome.error, None, "numbered recovery must be clean");
-        assert_eq!(outcome.reply, "recovered");
+        assert_eq!(
+            crate::agentic::model_explanation(&outcome.reply),
+            "recovered"
+        );
         assert!(calls.load(Ordering::SeqCst) >= 2);
         let observed = message_chars.lock().unwrap();
         assert!(

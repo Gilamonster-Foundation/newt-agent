@@ -176,7 +176,10 @@ async fn exact_count_reprojects_and_recounts_before_any_generation() {
     let result = chat_complete(count_ctx(&server.uri(), &messages, &caveats), &mut NoMcp).await;
     let trace = trace.lock().unwrap();
     assert!(trace.violations.is_empty(), "{:?}", trace.violations);
-    assert_eq!(result.unwrap().0, "measured answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.unwrap().0)),
+        "measured answer"
+    );
     assert!(
         trace.probes[0].1.unwrap() > INPUT_BOUND,
         "fixture must expose the cold-prior under-count"
@@ -214,7 +217,10 @@ async fn exact_count_rejection_preserves_a_known_window_for_the_protected_prompt
     let trace = trace.lock().unwrap();
     assert!(trace.violations.is_empty(), "{:?}", trace.violations);
     assert!(trace.probes[0].1.unwrap() > INPUT_BOUND);
-    assert_eq!(result.unwrap().0, "measured answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.unwrap().0)),
+        "measured answer"
+    );
     let (_, Some(admitted), _) = trace.probes.last().unwrap() else {
         panic!("the successful request must have a measured count");
     };
@@ -304,7 +310,10 @@ async fn exact_count_absent_endpoint_falls_back_to_anchored_admission() {
     let caveats = Caveats::top();
     let result = chat_complete(count_ctx(&server.uri(), &messages, &caveats), &mut NoMcp).await;
     let trace = trace.lock().unwrap();
-    assert_eq!(result.unwrap().0, "measured answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.unwrap().0)),
+        "measured answer"
+    );
     assert!(
         !trace.probes.is_empty(),
         "endpoint absence must be observed"
@@ -328,7 +337,10 @@ async fn exact_count_rechecks_identical_turns() {
         context.compress_state = Some(&mut state);
         let result = chat_complete(context, &mut NoMcp).await;
         assert!(trace.lock().unwrap().violations.is_empty());
-        assert_eq!(result.unwrap().0, "measured answer");
+        assert_eq!(
+            crate::agentic::model_explanation(&(result.unwrap().0)),
+            "measured answer"
+        );
     }
     let trace = trace.lock().unwrap();
     assert_eq!(
@@ -357,7 +369,10 @@ async fn exact_count_covers_the_tools_disabled_cap_exit_summary() {
     let result = chat_complete(context, &mut NoMcp).await;
     let trace = trace.lock().unwrap();
     assert!(trace.violations.is_empty(), "{:?}", trace.violations);
-    assert_eq!(result.unwrap().0, "measured answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.unwrap().0)),
+        "measured answer"
+    );
     assert_eq!(
         trace.generations.len(),
         2,
@@ -449,7 +464,10 @@ async fn exact_count_smart_admission_keeps_raw_response_evidence_and_request_rep
     let result = chat_complete(context, &mut NoMcp).await;
     let trace = trace.lock().unwrap();
     assert!(trace.violations.is_empty(), "{:?}", trace.violations);
-    assert_eq!(result.unwrap().0, "measured answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.unwrap().0)),
+        "measured answer"
+    );
     assert_eq!(
         trace.generations.len(),
         1,
@@ -661,7 +679,7 @@ async fn exact_count_transport_retry_keeps_the_strongest_observed_count() {
     let (reply, _, _, _) = chat_complete(context, &mut NoMcp).await.unwrap();
     let trace = trace.lock().unwrap();
     assert!(trace.violations.is_empty(), "{:?}", trace.violations);
-    assert_eq!(reply, "measured answer");
+    assert_eq!(crate::agentic::model_explanation(&reply), "measured answer");
     assert_eq!(
         trace.probes.len(),
         2,

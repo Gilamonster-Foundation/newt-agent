@@ -29,7 +29,10 @@ async fn rendered_report_ack_avoids_repetition_and_allows_followup_tools() {
     c.kind = BackendKind::Openai;
     c.step_ledger = Some(&ledger);
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
-    assert_eq!(reply, "The verification plan is ready.");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "The verification plan is ready."
+    );
     assert_eq!(
         ledger.count(),
         1,
@@ -318,7 +321,7 @@ async fn completed_check_report_after_tool_reads_keeps_completed_end_reason() {
             3,
             "one rescue, actual reads, final reply"
         );
-        assert_eq!(reply, answer);
+        assert_eq!(crate::agentic::model_explanation(&reply), answer);
         let requests = server.received_requests().await.unwrap();
         let recovery = body_json(&requests[1]);
         let guidance = recovery["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -379,7 +382,10 @@ async fn explanation_completion_retries_a_promise_without_restricting_session_au
     c.action_nudges = false;
     c.end_reason = Some(&mut end_reason);
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
-    assert_eq!(reply, "Do you mean local branches or open pull requests?");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "Do you mean local branches or open pull requests?"
+    );
     assert_eq!(
         round.load(Ordering::SeqCst),
         3,
@@ -497,7 +503,7 @@ async fn readonly_completion_accepts_answers_questions_and_blockers_without_retr
         c.kind = BackendKind::Openai;
         c.prompt_disposition = PromptDisposition::Explain;
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
-        assert_eq!(reply, answer);
+        assert_eq!(crate::agentic::model_explanation(&reply), answer);
         assert_eq!(round.load(Ordering::SeqCst), 1);
     }
 }
@@ -622,7 +628,10 @@ async fn readonly_completion_ollama_and_responses_recover_with_the_same_readonly
             chat_complete(c, &mut NoMcp).await
         }
         .unwrap();
-        assert_eq!(reply, "There are three local branches.");
+        assert_eq!(
+            crate::agentic::model_explanation(&reply),
+            "There are three local branches."
+        );
         let requests = server.received_requests().await.unwrap();
         // #2372: no display reissue on either wire.
         assert_eq!(requests.len(), 2);

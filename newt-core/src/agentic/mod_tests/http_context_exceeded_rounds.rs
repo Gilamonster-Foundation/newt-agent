@@ -160,7 +160,11 @@ async fn overflow_scenario(wire: &'static str, independent: bool) {
         return;
     }
     assert_eq!(requests.len(), 6, "{wire}: {result:?}");
-    assert_eq!(result.unwrap().0, ANSWER, "{wire}");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.unwrap().0)),
+        ANSWER,
+        "{wire}"
+    );
     for pair in requests.as_chunks::<2>().0 {
         let field = if wire == "responses" {
             "input"

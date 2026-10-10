@@ -9,6 +9,7 @@ pub(crate) struct TurnClaims<'a> {
     session: Option<&'a WorktreeSession>,
     baseline_root: PathBuf,
     head_before: Option<String>,
+    report: std::sync::Arc<std::sync::Mutex<super::super::observed_report::State>>,
 }
 
 fn root(workspace: &str, session: Option<&WorktreeSession>) -> PathBuf {
@@ -25,11 +26,43 @@ impl<'a> TurnClaims<'a> {
     ) -> Self {
         let baseline_root = root(workspace, session);
         let head_before = git_head(&baseline_root.to_string_lossy(), read_scope);
+        let report = session.map(|s| s.report.clone()).unwrap_or_default();
+        report
+            .lock()
+            .expect("report state")
+            .bind(&baseline_root, read_scope);
         Self {
+            report,
             session,
             baseline_root,
             head_before,
         }
+    }
+
+    pub(crate) fn observe_report(
+        &self,
+        workspace: &str,
+        scope: &crate::Scope<String>,
+        capture: &super::super::observed_report::Capture,
+        outcome: Option<crate::ExecOutcome>,
+        publication: Option<&crate::git_staging::Outcome>,
+    ) {
+        let root = root(workspace, self.session);
+        let mut report = self.report.lock().expect("report state");
+        report.bind(&root, scope);
+        report.observe(&root, capture, outcome, publication);
+    }
+
+    pub(crate) fn observed_report(
+        &self,
+        workspace: &str,
+        scope: &crate::Scope<String>,
+        prose: &str,
+    ) -> String {
+        let root = root(workspace, self.session);
+        let mut report = self.report.lock().expect("report state");
+        report.bind(&root, scope);
+        report.render(&root, scope, prose)
     }
 
     pub(crate) fn annotate(

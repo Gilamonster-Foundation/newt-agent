@@ -292,7 +292,10 @@ async fn ollama_save_note_routes_to_sink_and_result_feeds_back() {
         vec!["add:user prefers vi keybindings"],
         "the tool call must route through the sink"
     );
-    assert_eq!(reply, "noted, moving on");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "noted, moving on"
+    );
     assert_eq!(hallu, 0, "save_note is a real tool, not a hallucination");
     assert!(
         !nudge_seen.load(Ordering::SeqCst),
@@ -349,7 +352,7 @@ async fn without_sink_no_tool_and_no_nudge_even_when_due() {
         .await
         .expect("chat_complete should succeed");
 
-    assert_eq!(reply, "plain answer");
+    assert_eq!(crate::agentic::model_explanation(&reply), "plain answer");
     assert!(
         !advertised.load(Ordering::SeqCst),
         "save_note advertised without a sink"
@@ -388,7 +391,7 @@ async fn nudge_appended_to_user_message_when_due() {
         .await
         .expect("chat_complete should succeed");
 
-    assert_eq!(reply, "plain answer");
+    assert_eq!(crate::agentic::model_explanation(&reply), "plain answer");
     assert!(
         nudge_seen.load(Ordering::SeqCst),
         "the reminder line must reach the model on the due turn"
@@ -421,7 +424,7 @@ async fn organic_save_resets_the_nudge_counter() {
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("chat_complete should succeed");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
     assert_eq!(sink.calls.len(), 1, "the model saved organically");
 
     // The turn included an organic save → the counter restarted, so the
@@ -498,7 +501,7 @@ async fn openai_save_note_routes_and_nudge_appends() {
         .await
         .expect("openai loop should succeed");
 
-    assert_eq!(reply, "openai noted");
+    assert_eq!(crate::agentic::model_explanation(&reply), "openai noted");
     assert_eq!(sink.calls, vec!["add:CI gate is just check"]);
     assert!(advertised.load(Ordering::SeqCst));
     assert!(nudge_seen.load(Ordering::SeqCst));
@@ -571,7 +574,10 @@ async fn over_budget_error_round_trips_to_the_model() {
         .await
         .expect("chat_complete should succeed");
 
-    assert_eq!(reply, "I will curate first");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "I will curate first"
+    );
     assert!(
         error_seen.load(Ordering::SeqCst),
         "the curator error (full entry list + instruction) must reach the model verbatim"

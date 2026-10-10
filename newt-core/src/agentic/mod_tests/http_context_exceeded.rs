@@ -119,7 +119,10 @@ async fn run_overflow(
 #[tokio::test]
 async fn context_exceeded_shrinks_before_second_attempt_and_records_recovery() {
     let (result, requests, events) = run_overflow(1, &history(), false).await;
-    assert_eq!(result.unwrap().0, "recovered");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.unwrap().0)),
+        "recovered"
+    );
     assert_eq!(requests.len(), 2);
     assert!(
         requests[1]["messages"].to_string().len() < requests[0]["messages"].to_string().len(),
@@ -181,7 +184,10 @@ async fn context_exceeded_never_resends_an_unchanged_request() {
 #[tokio::test]
 async fn smart_context_exceeded_reprojects_the_recorded_request_before_retry() {
     let (result, requests, events) = run_overflow(1, &history(), true).await;
-    assert_eq!(result.unwrap().0, "recovered");
+    assert_eq!(
+        crate::agentic::model_explanation(&(result.unwrap().0)),
+        "recovered"
+    );
     assert_eq!(requests.len(), 2);
     assert!(requests[1]["messages"].to_string().len() < requests[0]["messages"].to_string().len());
     assert_eq!(events.len(), 1);

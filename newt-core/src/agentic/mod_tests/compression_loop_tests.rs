@@ -319,7 +319,10 @@ async fn active_task_survives_compression() {
         .expect("chat_complete should succeed");
 
     // The turn completed with a real answer, not a cap/diagnostic exit.
-    assert_eq!(reply, "the marker is GAUNTLET-7f3d9c");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "the marker is GAUNTLET-7f3d9c"
+    );
     assert_eq!(hallu, 0);
 
     // The summarizer ran exactly once and its request carried the
@@ -447,7 +450,10 @@ async fn first_turn_over_num_ctx_ceiling_compresses_before_dispatch() {
 
     // The turn produced the real answer (visibly degraded, not silently
     // wrong: compression ran and the model answered from the summary).
-    assert_eq!(reply, "the marker is GAUNTLET-7f3d9c");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "the marker is GAUNTLET-7f3d9c"
+    );
 
     // Compression fired BEFORE the first dispatch: the summarizer ran,
     // and the VERY FIRST request the backend ever saw already carried
@@ -570,7 +576,10 @@ async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
         .await
         .expect("a summarizer failure must never abort the turn");
 
-    assert_eq!(reply, "completed despite summarizer outage");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "completed despite summarizer outage"
+    );
     // #2313 (b1a): with compaction in the turn, the primary rounds are still
     // exactly the attempts: attempts == requests on `/api/chat`, keyed by
     // their bodies. b3's red: the summarizer's own `/summarize` request is not
@@ -659,7 +668,10 @@ async fn optional_continuation_cannot_abort_a_fitting_static_fallback() {
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("optional harness guidance must not abort a fitting fallback");
-    assert_eq!(reply, "completed with action nudges enabled");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "completed with action nudges enabled"
+    );
     assert!(attempts.load(Ordering::SeqCst) > 0);
     assert!(task_in_marker.load(Ordering::SeqCst));
     assert!(static_in_marker.load(Ordering::SeqCst));
@@ -761,7 +773,10 @@ async fn openai_loop_compresses_with_the_same_pipeline() {
         .await
         .expect("openai loop should succeed");
 
-    assert_eq!(reply, "openai: marker is GAUNTLET-7f3d9c");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "openai: marker is GAUNTLET-7f3d9c"
+    );
     assert!(!prompts.lock().unwrap().is_empty(), "summarizer engaged");
     assert!(task_in_marker.load(Ordering::SeqCst));
     assert!(summary_in_marker.load(Ordering::SeqCst));
@@ -968,7 +983,7 @@ async fn forty_rounds_single_turn_stay_bounded_with_fresh_results_intact() {
     let (log, summarizer_calls, reply, latched) =
         run_long_haul(msgs(), 40, threshold, "big.txt", &line.repeat(64)).await;
 
-    assert_eq!(reply, "long haul done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "long haul done");
     assert!(!latched, "count-only pressure must never latch anti-thrash");
     assert_eq!(log.len(), 40, "all 40 tool rounds dispatched");
     // #2637: `read_file{"path":"big.txt"}` repeats byte-for-byte every
@@ -1028,7 +1043,7 @@ async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
     )
     .await;
 
-    assert_eq!(reply, "long haul done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "long haul done");
     assert!(!latched, "count-only pressure must never latch anti-thrash");
     assert_eq!(log.len(), 30, "all 30 tool rounds dispatched");
     // #2637: see the sibling forty-round test — an identical `read_file` is
@@ -1133,7 +1148,7 @@ async fn compaction_release_forces_a_real_read_not_a_cache_hit() {
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("the long haul must complete");
-    assert_eq!(reply, "long haul done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "long haul done");
 
     // Every dispatched round's `read_file` produces exactly one ToolEvent
     // (interleaved with the hallucinated `apply_patch`'s "unknown tool"
@@ -1197,7 +1212,11 @@ async fn compaction_release_forces_a_real_read_not_a_cache_hit() {
 async fn count_only_low_reclaim_never_latches_or_bails() {
     let (log, _calls, reply, latched) =
         run_long_haul(multi_turn_msgs(), 30, 15, "small.txt", &"x".repeat(600)).await;
-    assert_eq!(reply, "long haul done", "the turn must complete — no bail");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "long haul done",
+        "the turn must complete — no bail"
+    );
     assert!(
         !latched,
         "count-only passes must never latch the disable switch"
@@ -1327,7 +1346,10 @@ async fn nudged_long_haul_keeps_fresh_group_results_intact() {
         .await
         .expect("the nudged haul must complete");
 
-    assert_eq!(reply, "nudged haul done");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "nudged haul done"
+    );
     assert!(
         !compress_state.is_disabled(),
         "real reclaims every round must never latch anti-thrash"
@@ -1492,7 +1514,10 @@ async fn oversized_single_round_dispatches_within_the_window() {
         println!("oversized round request {i}: {entry:?}");
     }
     // Never a silent wrong answer: the model answered from real data.
-    assert_eq!(reply, "the three files are summarized");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "the three files are summarized"
+    );
 
     // THE #285 property: no dispatch ships over the window.
     for (i, &(tokens, ..)) in log.iter().enumerate() {
@@ -1607,7 +1632,10 @@ async fn exact_request_pressure_self_compacts_after_tracker_underreport() {
         .await
         .expect("exact-request pressure should compact and retry quietly");
 
-    assert_eq!(reply, "recovered after exact-request compaction");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered after exact-request compaction"
+    );
     assert!(
         !prompts.lock().unwrap().is_empty(),
         "self-healing must run the real compression pipeline"
@@ -1801,7 +1829,7 @@ async fn compaction_2799_releases_skill_reuse_in_real_loop() {
     c.compress_state = Some(&mut state);
     c.tool_events = Some(&mut events);
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
-    assert_eq!(reply, "skill haul done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "skill haul done");
     let events: Vec<_> = events.iter().filter(|e| e.tool == "use_skill").collect();
     assert!(
         events[0].ok,

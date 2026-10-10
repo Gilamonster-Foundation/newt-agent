@@ -98,7 +98,10 @@ async fn responses_recovers_from_a_context_window_400_by_compacting_and_redispat
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("cw-400 recovery compacts and redispatches to success");
-    assert_eq!(reply, "recovered and done");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered and done"
+    );
     assert_eq!(
         served.load(Ordering::SeqCst),
         2,
@@ -221,7 +224,7 @@ async fn responses_cw_400_recovery_retries_the_same_logical_round_with_tools() {
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("recovery retries the round in place and the turn completes");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
 
     let reqs = server.received_requests().await.expect("requests recorded");
     assert_eq!(
@@ -298,7 +301,7 @@ async fn responses_cw_400_on_the_final_round_recovers_in_place() {
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("the final round recovers in place and completes");
-    assert_eq!(reply, "finished");
+    assert_eq!(crate::agentic::model_explanation(&reply), "finished");
 
     let reqs = server.received_requests().await.expect("requests recorded");
     assert_eq!(
@@ -359,7 +362,10 @@ async fn responses_unsupported_tools_then_cw400_reactive_recovery_no_schema_over
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("tools-disabled cw-400 recovers in the same round and completes");
-    assert_eq!(reply, "recovered tools-disabled");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered tools-disabled"
+    );
     let reqs = server.received_requests().await.expect("request journal");
     assert_eq!(
         reqs.len(),

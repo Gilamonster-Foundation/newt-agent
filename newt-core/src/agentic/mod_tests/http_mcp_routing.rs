@@ -80,7 +80,10 @@ async fn openai_anthropic_native_tool_calls_route_correctly() {
     let (reply, _, _, hallu) = chat_complete(c, &mut mcp)
         .await
         .expect("should succeed with anthropic-native tool format");
-    assert_eq!(reply, "done after anthropic-native tool");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "done after anthropic-native tool"
+    );
     assert_eq!(
         mcp.calls, 1,
         "the granted MCP tool must actually execute once"
@@ -153,7 +156,10 @@ async fn openai_hyphenated_server_name_routes_through_mcp() {
     let (reply, _, _, _) = chat_complete(c, &mut mcp)
         .await
         .expect("should route hyphenated server name through mcp");
-    assert_eq!(reply, "outlook routed correctly");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "outlook routed correctly"
+    );
     assert_eq!(
         mcp.calls, 1,
         "the granted MCP tool must actually execute once"

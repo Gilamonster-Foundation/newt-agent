@@ -172,7 +172,10 @@ async fn responses_never_sends_num_ctx_on_the_wire() {
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("the request fits the configured window");
-    assert_eq!(reply, "provider accepted");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "provider accepted"
+    );
     let requests = server
         .received_requests()
         .await
@@ -330,7 +333,7 @@ async fn responses_emits_cognition_as_reasoning_effort_on_the_wire() {
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("the request should dispatch");
-    assert_eq!(reply, "considered");
+    assert_eq!(crate::agentic::model_explanation(&reply), "considered");
     let requests = server
         .received_requests()
         .await
@@ -480,7 +483,10 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
     )
     .await
     .expect("responses loop returns the message text");
-    assert_eq!(reply, "hello from responses");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "hello from responses"
+    );
     assert!(!streamed);
     assert_eq!(usage.map(|u| u.input_tokens), Some(12));
     let requests = server
@@ -909,7 +915,7 @@ async fn responses_idless_call_is_re_asked_then_recovers() {
     let (reply, ..) = openai_responses_complete(ctx, &mut NoMcp)
         .await
         .expect("the turn completes after the re-ask");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
 
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 3, "re-ask, tool result, final");

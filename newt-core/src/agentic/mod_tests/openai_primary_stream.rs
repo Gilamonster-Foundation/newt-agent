@@ -122,7 +122,8 @@ async fn an_accepted_final_answer_is_generated_once_and_returned_as_accepted() {
         .await
         .expect("a plain answer completes the turn");
     assert_eq!(
-        text, "ACCEPTED answer.",
+        crate::agentic::model_explanation(&text),
+        "ACCEPTED answer.",
         "the gated answer, never a second generation"
     );
     assert!(!streamed, "nothing was streamed to a display");
@@ -169,7 +170,10 @@ async fn primary_stream_assembles_a_tool_batch_once_and_preserves_call_ids() {
         .await
         .expect("a complete streamed tool batch must reach execution");
     assert_eq!(tools.0, ["a", "b"]);
-    assert_eq!(text, "Fixture response.");
+    assert_eq!(
+        crate::agentic::model_explanation(&text),
+        "Fixture response."
+    );
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(hallucinations, 0);
     assert_eq!(usage.unwrap().output_tokens, 6, "tool batch 4 + answer 2");
@@ -275,7 +279,11 @@ async fn invalid_streamed_arguments_are_rejected_per_call_and_retried() {
         let (text, _, _, _) = chat_complete(context, &mut tools)
             .await
             .unwrap_or_else(|error| panic!("{label}: the turn continues: {error:#}"));
-        assert_eq!(text, "Fixture response.", "{label}");
+        assert_eq!(
+            crate::agentic::model_explanation(&text),
+            "Fixture response.",
+            "{label}"
+        );
         assert_eq!(tools.0, ["a", "b"], "{label}: only the retried batch runs");
         let seen = seen.lock().unwrap();
         assert_eq!(
@@ -457,7 +465,10 @@ async fn cap_summary_stream_decodes_the_answer_and_usage_without_tools() {
     context.action_nudges = false;
     context.max_tool_rounds = 0;
     let (text, streamed, usage, _) = chat_complete(context, &mut NoMcp).await.unwrap();
-    assert_eq!(text, "Fixture response.");
+    assert_eq!(
+        crate::agentic::model_explanation(&text),
+        "Fixture response."
+    );
     assert!(
         !streamed,
         "the cap summary is returned for its existing display path"
@@ -591,7 +602,10 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
     server.await.unwrap();
     // #2372: both the primary answer and the cap summary are returned as
     // generated; nothing is sent again for display.
-    assert_eq!(text, "progressing answer");
+    assert_eq!(
+        crate::agentic::model_explanation(&text),
+        "progressing answer"
+    );
     assert!(!streamed);
 }
 
@@ -1159,7 +1173,10 @@ async fn primary_stream_retries_a_mixed_response_id_once_before_its_tool_runs() 
     let (text, _, _, _) = run_fixture_turn(&server.uri(), &mut tools, &mut reason)
         .await
         .expect("one fresh attempt recovers a mixed response");
-    assert_eq!(text, "Fixture response.");
+    assert_eq!(
+        crate::agentic::model_explanation(&text),
+        "Fixture response."
+    );
     assert_eq!(tools.0, ["a"], "the mixed batch must never dispatch");
     let seen = seen.lock().unwrap();
     assert_eq!(
@@ -1195,7 +1212,10 @@ async fn a_mixed_response_after_a_dispatched_tool_retries_the_round_without_repl
     let (text, _, _, _) = run_fixture_turn(&server.uri(), &mut tools, &mut reason)
         .await
         .expect("the answer round recovers with one fresh attempt");
-    assert_eq!(text, "Fixture response.");
+    assert_eq!(
+        crate::agentic::model_explanation(&text),
+        "Fixture response."
+    );
     assert_eq!(tools.0, ["a"], "a dispatched tool is never replayed");
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 3, "tool round, mixed answer, one retry");

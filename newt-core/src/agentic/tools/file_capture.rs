@@ -48,7 +48,11 @@ fn exact_scope_root(scope: &Scope<String>, path: &Path) -> bool {
     }))
 }
 
-fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Result<File> {
+pub(in crate::agentic) fn open_for_scope(
+    scope: &Scope<String>,
+    path: &Path,
+    nofollow: bool,
+) -> io::Result<File> {
     if !super::tui_permits_path(scope, &path.to_string_lossy()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

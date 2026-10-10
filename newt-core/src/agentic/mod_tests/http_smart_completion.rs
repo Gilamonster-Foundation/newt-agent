@@ -292,7 +292,10 @@ async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
         chat_complete(context, &mut mcp).await
     }
     .unwrap();
-    assert_eq!(resumed.0, "Recovery reviewed.");
+    assert_eq!(
+        crate::agentic::model_explanation(&resumed.0),
+        "Recovery reviewed."
+    );
     assert_eq!(
         mcp.calls,
         ["a", "b"],
@@ -513,7 +516,10 @@ async fn all_four_completed_batches_preserve_observed_errors_and_large_sources()
             chat_complete(context, &mut mcp).await
         }
         .unwrap();
-        assert_eq!(result.0, "Recovery reviewed.");
+        assert_eq!(
+            crate::agentic::model_explanation(&result.0),
+            "Recovery reviewed."
+        );
         assert_eq!(mcp.calls, ["a", "b", "c"]);
         assert_eq!(std::fs::read_to_string(&mcp.effect).unwrap(), large);
         let requests = server.received_requests().await.unwrap();
@@ -902,7 +908,10 @@ async fn bad_spill_return(wire: &str, malformed: bool, resume: bool) {
         let resumed = openai_responses_complete(context, &mut mcp)
             .await
             .expect("a source-retention error must allow a legal operator continuation");
-        assert_eq!(resumed.0, "Recovery reviewed.");
+        assert_eq!(
+            crate::agentic::model_explanation(&resumed.0),
+            "Recovery reviewed."
+        );
         assert_eq!(
             mcp.calls,
             ["a"],
@@ -1285,7 +1294,8 @@ async fn run_command_shell_writes_do_not_trip_the_no_progress_brake() {
         .map(|(text, streamed, _, _)| (text, streamed));
     let (text, _) = result.expect("run_command writes must not end the turn as an error");
     assert_eq!(
-        text, "done",
+        crate::agentic::model_explanation(&text),
+        "done",
         "the turn must run to its normal end, not be cut short by the brake"
     );
     assert_ne!(

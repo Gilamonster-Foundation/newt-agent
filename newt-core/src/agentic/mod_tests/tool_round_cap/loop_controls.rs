@@ -278,7 +278,7 @@ async fn steering_submitted_mid_turn_appears_in_the_next_rounds_request() {
     let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
         .await
         .expect("turn completes");
-    assert_eq!(reply, "acknowledged");
+    assert_eq!(crate::agentic::model_explanation(&reply), "acknowledged");
 
     let reqs = server.received_requests().await.expect("journal");
     assert!(
@@ -342,7 +342,7 @@ async fn no_inbox_means_no_extra_user_messages() {
     let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
         .await
         .expect("turn completes");
-    assert_eq!(reply, "done");
+    assert_eq!(crate::agentic::model_explanation(&reply), "done");
 
     let reqs = server.received_requests().await.expect("journal");
     for r in &reqs {
@@ -534,7 +534,8 @@ async fn read_only_nudge_injected_after_three_rounds() {
         "nudge was never injected after 3 consecutive read-only rounds; reply: {reply}"
     );
     assert_eq!(
-        reply, "nudge received, writing file now",
+        crate::agentic::model_explanation(&reply),
+        "nudge received, writing file now",
         "model should have responded to the nudge with a final answer"
     );
 }

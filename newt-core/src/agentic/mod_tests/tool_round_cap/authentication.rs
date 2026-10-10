@@ -40,7 +40,7 @@ async fn ollama_loop_sends_bearer_auth_on_every_request_when_key_configured() {
     let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
         .await
         .expect("turn completes");
-    assert_eq!(reply, "authed answer");
+    assert_eq!(crate::agentic::model_explanation(&reply), "authed answer");
     let reqs = server.received_requests().await.expect("journal");
     assert!(!reqs.is_empty());
     for r in &reqs {

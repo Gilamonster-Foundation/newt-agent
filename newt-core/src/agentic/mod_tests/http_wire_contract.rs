@@ -88,7 +88,10 @@ async fn multi_turn_wire_keeps_live_operator_task_newest_after_protected_copy() 
         .await
         .expect("ordinary multi-turn request should complete");
 
-    assert_eq!(reply, "wire order preserved");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "wire order preserved"
+    );
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(
         requests.load(Ordering::SeqCst),
@@ -202,7 +205,10 @@ async fn openai_large_mcp_catalog_stays_within_wire_contract_and_keeps_shell() {
         .await
         .expect("the provider-compatible request should reach inference");
 
-    assert_eq!(reply, "tool envelope accepted");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "tool envelope accepted"
+    );
     assert_eq!(
         max_seen.load(Ordering::SeqCst),
         crate::agentic::tools::exposure::OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS
@@ -237,7 +243,7 @@ async fn chat_complete_dispatches_openai_kind_and_returns_first_round_answer() {
         .await
         .expect("openai dispatch should succeed");
 
-    assert_eq!(reply, "openai says hi");
+    assert_eq!(crate::agentic::model_explanation(&reply), "openai says hi");
     assert!(
         !streamed,
         "a JSON fallback is not a streamed display response"
@@ -333,7 +339,10 @@ async fn openai_chat_coalesces_system_cards_for_strict_vllm_templates() {
         .await
         .expect("strict vLLM chat template should accept the next message after a backend switch");
 
-    assert_eq!(reply, "strict vllm accepted the request");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "strict vllm accepted the request"
+    );
 }
 
 #[test]

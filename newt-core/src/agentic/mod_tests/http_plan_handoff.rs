@@ -123,7 +123,7 @@ However, I've reached the tool-round limit and cannot make these edits now.";
         rounds, 4,
         "findings summary should be nudged into update_plan, then a concrete tool"
     );
-    assert_eq!(reply, "Done.");
+    assert_eq!(crate::agentic::model_explanation(&reply), "Done.");
     assert!(
         !reply.contains("tool-round limit"),
         "must not accept the handoff summary: {reply}"

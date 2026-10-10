@@ -86,7 +86,10 @@ async fn context_overflow_trims_and_retries_then_recovers() {
         2,
         "overflow must trigger exactly one trim-and-retry probe"
     );
-    assert_eq!(reply, "recovered after trim");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "recovered after trim"
+    );
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(
         usage
@@ -173,7 +176,10 @@ async fn mid_loop_compression_fires_when_message_list_grows() {
         !old_placeholder_seen.load(Ordering::SeqCst),
         "the pre-18.4 amputation placeholder must never be emitted"
     );
-    assert_eq!(reply, "final after trim");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "final after trim"
+    );
 }
 
 /// OpenAI-path transcript regression for the 2026-07-16 amnesia failure:
@@ -279,7 +285,10 @@ async fn openai_mid_loop_compaction_anchors_the_current_turn_not_historical_prom
         .await
         .expect("openai loop should continue after compaction");
 
-    assert_eq!(reply, "continued the current task");
+    assert_eq!(
+        crate::agentic::model_explanation(&reply),
+        "continued the current task"
+    );
     assert!(
         directive_seen.load(Ordering::SeqCst),
         "the post-compaction directive must reach the wire"
