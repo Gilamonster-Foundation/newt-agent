@@ -148,7 +148,7 @@ impl ModelInputOrigin {
 
 /// bug/steering-regressions iteration #2: upgrade a fresh operator prompt to
 /// an [`ModelInputOrigin::OperatorContinuation`] when the previous agentic
-/// turn was interrupted by the round cap AND the input is a bare continuation
+/// turn has an active objective AND the input is a bare continuation
 /// nudge ("continue", "keep going", "1: proceed"). Minted fresh, such a nudge
 /// becomes the active operator prompt itself — the compression-immune card
 /// then protects the word "continue" while the real task drifts into the
@@ -156,12 +156,15 @@ impl ModelInputOrigin {
 /// interrupted objective's lineage, so fix #1's authority walk keeps the real
 /// task active. A substantive new ask never upgrades — the classifier is
 /// conservative by construction ([`newt_core::classifiers::is_bare_continuation`]).
+/// A normal finish can still leave work pending (or ask a question in prose).
+/// Reuse its active receipt too, so a bare nudge cannot erase objective facts.
 fn upgrade_origin_for_interrupted_objective(
     origin: ModelInputOrigin,
     task: &str,
     interrupted: Option<&newt_core::TurnPromptContext>,
+    active: Option<&newt_core::TurnPromptContext>,
 ) -> ModelInputOrigin {
-    match (&origin, interrupted) {
+    match (&origin, interrupted.or(active)) {
         (ModelInputOrigin::Operator, Some(parent))
             if newt_core::classifiers::is_bare_continuation(task) =>
         {
@@ -3497,6 +3500,7 @@ fn session_body(
                     model_input_origin,
                     &task,
                     interrupted_objective.as_ref(),
+                    active_prompt_context.as_ref(),
                 );
                 if model_input_origin.is_operator() {
                     surface.add_history(&task);
