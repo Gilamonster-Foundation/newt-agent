@@ -4041,7 +4041,42 @@ async fn execute_authorized_tool(
                 let mut out =
                     super::scheduled::execute_update_plan(args, ledger, color, tool_output_lines);
                 if tool_result_ok(&out) {
-                    let after = ledger.snapshot();
+                    let mut after = ledger.snapshot();
+                    if after.target != before.target {
+                        if artifact_sink.is_none() || artifact_context.is_none() {
+                            ledger.restore(&before);
+                            return "error: target revision requires prompt-artifact recording; previous selection retained".into();
+                        }
+                        if let Some(target) = &mut after.target {
+                            let root = super::selected_target::root(workspace, worktree_session);
+                            if let Err(error) = target.bind_baseline(super::selected_target::baseline(&root, &caveats.fs_read)) {
+                                ledger.restore(&before);
+                                return format!("error: {error}");
+                            }
+                        }
+                        ledger.restore(&after);
+                        out = super::scheduled::plan_block(ledger).unwrap_or(out);
+                    }
+                    let mut artifact_warning = false;
+                    if let (Some(sink), Some(context)) = (artifact_sink, artifact_context) {
+                        let plan = ledger.snapshot();
+                        if !plan.is_empty() {
+                            if let Err(error) =
+                                super::artifact_hooks::record_plan_revision(sink, context, &plan)
+                            {
+                                if before.target != after.target {
+                                    ledger.restore(&before);
+                                    return format!("error: target revision was not recorded: {error}; previous selection retained");
+                                }
+                                let warning =
+                                    format!("warning: failed to record plan artifact: {error}");
+                                out.push('\n');
+                                out.push_str(&warning);
+                                artifact_warning = true;
+                            }
+                        }
+                    }
+
                     // Plan-before-act: a fresh multi-step plan in an ACTING
                     // turn, under a level that looks before it acts, is
                     // presented for approval before any mutation. Only Act:
@@ -4074,21 +4109,6 @@ async fn execute_authorized_tool(
                                         "\nwarning: plan approval unavailable: {error}"
                                     ));
                                 }
-                            }
-                        }
-                    }
-                    let mut artifact_warning = false;
-                    if let (Some(sink), Some(context)) = (artifact_sink, artifact_context) {
-                        let plan = ledger.snapshot();
-                        if !plan.is_empty() {
-                            if let Err(error) =
-                                super::artifact_hooks::record_plan_revision(sink, context, &plan)
-                            {
-                                let warning =
-                                    format!("warning: failed to record plan artifact: {error}");
-                                out.push('\n');
-                                out.push_str(&warning);
-                                artifact_warning = true;
                             }
                         }
                     }
@@ -6167,7 +6187,7 @@ pub(crate) use shell::test_windows_ambient_dispatch;
 
 #[cfg(test)]
 #[path = "tools_tests/git_fixture.rs"]
-mod git_fixture;
+pub(super) mod git_fixture;
 
 #[cfg(test)]
 #[path = "tools_tests/command_shape_contract.rs"]

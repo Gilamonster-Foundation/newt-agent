@@ -168,7 +168,7 @@ pub(crate) fn after_tool(
 }
 
 #[path = "publish_early_tree.rs"]
-mod checked_tree;
+pub(super) mod checked_tree;
 
 fn read_fact(path: &std::path::Path, read: &crate::Scope<String>) -> Option<String> {
     use std::io::Read;

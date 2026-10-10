@@ -217,6 +217,7 @@ fn escalated_narration_nudge_names_attempt_cap_and_active_step() {
 
     let ledger = SessionStepLedger::default();
     ledger.restore(&PlanSnapshot {
+        target: None,
         steps: vec![
             Step {
                 description: "inspect".to_string(),

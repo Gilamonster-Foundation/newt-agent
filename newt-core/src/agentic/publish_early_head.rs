@@ -9,10 +9,22 @@ fn head_matches(root: &Path, read: &crate::Scope<String>) -> Option<bool> {
     let (admin, _, index) = index(root, read)?;
     let common = grit_lib::refs::common_dir(&admin).unwrap_or_else(|| admin.clone());
     let oid = head_oid(&admin, &common, read)?;
+    let tree = commit_tree(&admin, &oid, index.hash_algo.len())?;
+    let staged: BTreeMap<_, _> = index
+        .entries
+        .iter()
+        .map(|e| (e.path.clone(), (e.mode, e.oid.as_bytes().to_vec())))
+        .collect();
+    Some(tree == staged)
+}
+
+/// Verified commit/tree object traversal shared by both advisory consumers.
+pub(super) fn commit_tree(admin: &Path, oid: &ObjectId, oid_len: usize) -> Option<Entries> {
+    let common = grit_lib::refs::common_dir(admin).unwrap_or_else(|| admin.to_owned());
     // Odb::read reads loose/packed objects and local alternates only. Unlike
     // native Git it has no lazy-fetch child, replacement-object or filter path.
     let odb = grit_lib::odb::Odb::new(&common.join("objects"));
-    let object = read_object(&odb, &oid, ObjectKind::Commit)?;
+    let object = read_object(&odb, oid, ObjectKind::Commit)?;
     let commit = grit_lib::objects::parse_commit(&object).ok()?;
     let mut queue = vec![(Vec::new(), commit.tree)];
     let mut tree = BTreeMap::new();
@@ -23,9 +35,7 @@ fn head_matches(root: &Path, read: &crate::Scope<String>) -> Option<bool> {
             return None;
         }
         let bytes = read_object(&odb, &oid, ObjectKind::Tree)?;
-        for entry in
-            grit_lib::objects::parse_tree_with_oid_len(&bytes, index.hash_algo.len()).ok()?
-        {
+        for entry in grit_lib::objects::parse_tree_with_oid_len(&bytes, oid_len).ok()? {
             let mut path = prefix.clone();
             path.extend_from_slice(&entry.name);
             match entry.mode {
@@ -45,12 +55,7 @@ fn head_matches(root: &Path, read: &crate::Scope<String>) -> Option<bool> {
             }
         }
     }
-    let staged: BTreeMap<_, _> = index
-        .entries
-        .iter()
-        .map(|e| (e.path.clone(), (e.mode, e.oid.as_bytes().to_vec())))
-        .collect();
-    Some(tree == staged)
+    Some(tree)
 }
 
 fn read_object(odb: &grit_lib::odb::Odb, oid: &ObjectId, kind: ObjectKind) -> Option<Vec<u8>> {
@@ -68,7 +73,11 @@ fn read_object(odb: &grit_lib::odb::Odb, oid: &ObjectId, kind: ObjectKind) -> Op
 // Use the advisory's bounded, no-exec fact reader. The broker's HeldRoots
 // deliberately refuses all reads on non-Unix platforms; it is not portable
 // metadata plumbing. Read literal paths so GIT_NAMESPACE cannot redirect HEAD.
-fn head_oid(admin: &Path, common: &Path, read: &crate::Scope<String>) -> Option<ObjectId> {
+pub(super) fn head_oid(
+    admin: &Path,
+    common: &Path,
+    read: &crate::Scope<String>,
+) -> Option<ObjectId> {
     let head = super::super::read_fact(&admin.join("HEAD"), read)?;
     let branch = head.trim().strip_prefix("ref: refs/heads/")?;
     crate::git_staging::validate_branch_name(branch).ok()?;

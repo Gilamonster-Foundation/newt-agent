@@ -436,6 +436,7 @@ pub(crate) fn record_plan_revision(
 
 fn bounded_plan(plan: &PlanSnapshot) -> PlanSnapshot {
     PlanSnapshot {
+        target: plan.target.clone(),
         steps: plan
             .steps
             .iter()
@@ -1293,6 +1294,7 @@ mod tests {
         let sink = RecordingSink::default();
         let (_, _, context) = context();
         let plan = PlanSnapshot {
+            target: None,
             steps: (0..(MAX_STEPS + 5))
                 .map(|index| Step {
                     description: if index == 0 {
