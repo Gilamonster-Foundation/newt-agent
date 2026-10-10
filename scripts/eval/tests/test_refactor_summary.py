@@ -159,4 +159,9 @@ class Summary(unittest.TestCase):
                 session_db(self.db, body, seq=index)
                 for tree in self.case.fake.trees.values():
                     tree["mod.rs"] = "fn actual() {}\n"
-                self.assertEqual(self.grade()["criteria"]["claims"]["status"], "FAIL")
+                report = self.grade()
+                # Round 3: decorated reduction prose is unverifiable, while
+                # unsupported publication claims still contradict Git evidence.
+                expected = "UNGRADED" if name == "reg2.raw" else "FAIL"
+                self.assertEqual(report["criteria"]["claims"]["status"], expected)
+                self.assertFalse(report["pass"])

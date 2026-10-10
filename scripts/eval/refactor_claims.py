@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from refactor_test_log import test_totals
+
 ANSI = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
 NUMBER = r"[\d,]+"
 FILE = r"[\w./-]+\.rs"
@@ -43,6 +45,7 @@ def operator_inputs(raw: str, submitted: str | None = None) -> dict:
 def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
     """Check explicit assistant text; caller must establish its structured role."""
     rows: list[dict] = []
+    test_evidence = test_totals(clean_terminal(test_log))
 
     def add(kind: str, claim: str, actual: object, matches: bool | None) -> None:
         row = {
@@ -69,6 +72,31 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
             actual,
             None if actual is None else actual == expected,
         )
+
+    # Line claims keep their entire sentence/clause. Splitting on coordination,
+    # contrast, or commas can erase the subject ("difference between old and
+    # new FILE is N lines") and falsely verify the remaining suffix.
+    path_pattern = rf"(?P<quote>`?)(?P<path>{FILE})(?P=quote)"
+    for clause in re.split(r"\n|;|(?<=[.!?])\s+", summary):
+        clause = clause.strip().removesuffix(".")
+        absolute = re.fullmatch(
+            path_pattern
+            + rf"(?:(?:\s+(?:is(?: now)?|now)\s+|:\s*)(?P<size>{NUMBER})\s+lines"
+            + rf"|\s+after\s*[:│]\s*(?P<after>{NUMBER})(?:\s+lines)?(?:\s*│)?)",
+            clause,
+            re.I,
+        )
+        pair = re.fullmatch(
+            path_pattern + rf"\s+(?P<before>{NUMBER})\s*(?:→|->)\s*(?P<after>{NUMBER})",
+            clause,
+        )
+        if absolute:
+            lines(absolute["path"], absolute["size"] or absolute["after"], "after")
+        elif pair:
+            lines(pair["path"], pair["before"], "before")
+            lines(pair["path"], pair["after"], "after")
+        elif re.search(FILE, clause) and re.search(r"\d", re.sub(FILE, "", clause)):
+            add("lines", clause + ": unrecognized line-count phrasing", None, None)
 
     # Sentence/contrast boundaries reset context. Within coordination, an
     # explicit future/negative assertion must not hide a completed assertion.
@@ -136,38 +164,22 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
                 prs,
                 None if prs is None else any(p.get("state") == "MERGED" for p in prs),
             )
-        pair = re.search(
-            rf"({FILE}).*?(~?{NUMBER})\s*(?:lines)?\s*(?:→|->|to)\s*~?({NUMBER})", line
-        )
-        if pair:
-            lines(pair[1], pair[2].lstrip("~"), "before")
-            lines(pair[1], pair[3], "after")
-            continue
-        for m in re.finditer(
-            rf"({FILE})(?:(?!\.rs)[^\n│])*?~?({NUMBER})\s+lines", line
+        # The supplied log must represent this claimed invocation. Never use a
+        # final doctest result as a whole-run count or turn partial logs green.
+        counts = []
+        for count in re.finditer(
+            rf"({NUMBER})\s+tests?(?:\s+(passed|pass|failed|fail|ignored|total)\b)?|({NUMBER})\s+(passed|failed|ignored|failures)\b",
+            line,
+            re.I,
         ):
-            stage = (
-                "before"
-                if re.search(r"longest|Target file|largest", line[: m.end()], re.I)
-                and "is now" not in m[0]
-                else "after"
+            number = count[1] or count[3]
+            kind = (count[2] or count[4] or "total").lower()
+            kind = {"pass": "passed", "fail": "failed", "failures": "failed"}.get(
+                kind, kind
             )
-            lines(m[1], m[2], stage)
-        table = re.search(rf"({FILE})\s+after\s*│\s*({NUMBER})", line)
-        if table:
-            lines(table[1], table[2], "after")
-        # Cargo totals require an independent captured test log. Git cannot prove
-        # how many tests were executed, and cargo check is not a test run.
-        counts = re.findall(rf"({NUMBER})\s+(?:tests?\s+)?(passed|failed)", line)
-        counts += [(n, "total") for n in re.findall(rf"\b({NUMBER})\s+tests\b", line)]
-        evidence = re.findall(r"test result: .*?(\d+) passed; (\d+) failed", test_log)
+            counts.append((number, kind))
         for count, kind in counts:
-            actual = None
-            if evidence:
-                passed, failed = map(int, evidence[-1])
-                actual = {"passed": passed, "failed": failed, "total": passed + failed}[
-                    kind
-                ]
+            actual = test_evidence[kind] if test_evidence is not None else None
             expected = int(count.replace(",", ""))
             add(
                 "tests",
@@ -175,4 +187,6 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
                 actual,
                 None if actual is None else actual == expected,
             )
+        if counts and test_evidence is not None and not test_evidence["success"]:
+            add("tests", "supplied test invocation succeeded", False, False)
     return rows

@@ -31,7 +31,11 @@ class Claims(unittest.TestCase):
             },
         )
         kinds = {r["kind"] for r in result if r["status"] == "contradicted"}
-        self.assertTrue({"commit", "push", "pr", "lines"} <= kinds, result)
+        self.assertTrue({"commit", "push", "pr"} <= kinds, result)
+        # Approximate sizes with extra change prose are no longer guessed.
+        self.assertTrue(
+            all(r["status"] == "unverifiable" for r in result if r["kind"] == "lines")
+        )
 
     def test_negation_and_plan_are_not_success_claims(self):
         text = "Summary\nNot committed or pushed. I will open PR #20.\n"
@@ -325,7 +329,7 @@ class Grade(unittest.TestCase):
         )
         self.assertFalse(any(r["kind"] == "push" for r in rows), rows)
 
-    def test_successful_run_still_has_contradicted_line_claims(self):
+    def test_successful_run_does_not_verify_decorated_line_claims(self):
         """#2804: PR #20 success does not validate its inaccurate line counts."""
         facts = {
             "commits": ["030dc2a" + "0" * 33],
@@ -343,10 +347,12 @@ class Grade(unittest.TestCase):
             "test result: FAILED. 1633 passed; 133 failed;",
         )
         contradictions = [r for r in rows if r["status"] == "contradicted"]
-        self.assertEqual(len(contradictions), 2, rows)
-        self.assertTrue(all(r["kind"] == "lines" for r in contradictions))
+        self.assertEqual(contradictions, [])
+        line_claims = [r for r in rows if r["kind"] == "lines"]
+        self.assertTrue(line_claims)
+        self.assertTrue(all(r["status"] == "unverifiable" for r in line_claims))
         self.assertTrue(
-            any(r["kind"] == "tests" and r["status"] == "verified" for r in rows)
+            any(r["kind"] == "tests" and r["status"] == "unverifiable" for r in rows)
         )
 
     def test_operator_echoes_are_counted_not_prompt_redraws(self):
@@ -424,7 +430,9 @@ class AdditionalRegressions(unittest.TestCase):
 
     def test_claim_counts_contradicted_by_independent_test_receipt(self):
         rows = claims.check_claims(
-            "Summary\n1101 tests passed.\n", {}, "test result: ok. 10 passed; 0 failed;"
+            "Summary\n1101 tests passed.\n",
+            {},
+            (FIXTURES / "cargo-multiple-binaries.txt").read_text(),
         )
         self.assertEqual(rows[0]["status"], "contradicted")
 
@@ -434,7 +442,7 @@ class TestCountClaims(unittest.TestCase):
         rows = claims.check_claims(
             "Summary\n1101 tests passed.\n",
             {},
-            "test result: FAILED. 10 passed; 1091 failed;",
+            (FIXTURES / "cargo-multiple-binaries.txt").read_text(),
         )
         self.assertTrue(any(row["status"] == "contradicted" for row in rows), rows)
 
