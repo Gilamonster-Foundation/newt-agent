@@ -12140,17 +12140,6 @@ pub async fn openai_responses_complete_with_prompt(
     .await
 }
 
-/// One retrying Responses dispatch: POST the VALIDATED body, classify + retry
-/// transient transport failures via [`with_backoff_notify_error`], surface a typed
-/// HTTP-status error, and parse the JSON body. BOTH the per-round loop and the final
-/// tools-disabled summary go through this, so a transient 500 / timeout /
-/// connection reset on the LAST request no longer discards the turn after every
-/// tool round was already spent — the summary retries like any other round.
-///
-/// #1528 B5: this takes a [`ValidatedResponsesRequest`] — a newtype with no public
-/// constructor other than a successful [`validate_responses_request`] — so an
-/// unvalidated `serde_json::Value` body cannot compile its way to `POST /v1/responses`.
-#[allow(clippy::too_many_arguments)]
 fn responses_source_messages(
     instructions: Option<&str>,
     input: &[serde_json::Value],
@@ -12163,6 +12152,17 @@ fn responses_source_messages(
     messages
 }
 
+/// One retrying Responses dispatch: POST the VALIDATED body, classify + retry
+/// transient transport failures via [`with_backoff_notify_error`], surface a typed
+/// HTTP-status error, and parse the JSON body. BOTH the per-round loop and the final
+/// tools-disabled summary go through this, so a transient 500 / timeout /
+/// connection reset on the LAST request no longer discards the turn after every
+/// tool round was already spent — the summary retries like any other round.
+///
+/// #1528 B5: this takes a [`ValidatedResponsesRequest`] — a newtype with no public
+/// constructor other than a successful [`validate_responses_request`] — so an
+/// unvalidated `serde_json::Value` body cannot compile its way to `POST /v1/responses`.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_responses_json<'a>(
     client: &reqwest::Client,
     url: &str,
