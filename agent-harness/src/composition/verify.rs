@@ -3,6 +3,7 @@ use super::*;
 
 pub(in crate::session) struct Checked {
     decision: Decision,
+    queued: Option<ContentId>,
     view: Option<Projection>,
     units: Vec<(ContentId, Unit)>,
 }
@@ -67,9 +68,15 @@ impl Session {
         let policy: Policy = self.store.get(&c.policy)?;
         let before = self.checked_composition_projection(c.before)?;
         let universe = self.checked_composition_projection(c.universe)?;
-        let expected_universe = match self.active_composition() {
-            Some(d) => self.store.get::<Catalog>(&d.catalog)?.universe,
-            None => c.before,
+        let expected_universe = if let Some(offered) = c.offered {
+            self.carried_universe(offered, &before)?
+                .content_id()
+                .map_err(integrity)?
+        } else {
+            match self.active_composition() {
+                Some(d) => self.store.get::<Catalog>(&d.catalog)?.universe,
+                None => c.before,
+            }
         };
         if c.run != self.run
             || c.root != self.root
@@ -99,6 +106,7 @@ impl Session {
         }
         self.require_semantic_pins(&before.entries)?;
         self.composition.catalogs.insert(id);
+        self.composition.latest_catalog = Some(id);
         Ok(())
     }
     pub(in crate::session) fn apply_composition_proposal(&mut self, id: ContentId) -> Result<()> {
@@ -152,7 +160,8 @@ impl Session {
         let d: Decision = self.store.get(&id)?;
         let s = self.composition_submission(d.proposal)?;
         let c: Catalog = self.store.get(&s.catalog)?;
-        if d.version != 1
+        if d.queued != s.queued
+            || d.version != 1
             || d.run != self.run
             || d.root != self.root
             || d.expected_head != self.composition.head
@@ -172,6 +181,7 @@ impl Session {
         {
             return Err(integrity("composition decision context mismatch"));
         }
+        self.verify_queued_submission(&s, &c)?;
         let candidate = self.composition_candidate(&c, &s.proposal)?;
         let before = self.checked_composition_projection(d.before)?;
         let mut units = Vec::new();
@@ -229,6 +239,7 @@ impl Session {
             }
         };
         Ok(Checked {
+            queued: s.queued,
             decision: d,
             view,
             units,
@@ -237,6 +248,7 @@ impl Session {
     pub(in crate::session) fn install_composition(&mut self, id: ContentId, checked: Checked) {
         let Checked {
             decision,
+            queued,
             view,
             units,
         } = checked;
@@ -246,6 +258,9 @@ impl Session {
             self.projections.extend(decision.after);
             self.units.extend(units);
             self.composition.active = Some(id);
+        }
+        if let Some(queued) = queued {
+            self.composition.pending.retain(|id| *id != queued);
         }
         self.composition.head = Some(id);
         self.composition.decisions.insert(id, decision);
@@ -278,7 +293,15 @@ impl Session {
         projection: ContentId,
     ) -> Result<Option<ContentId>> {
         let Some(d) = self.active_composition() else {
-            return Ok(None);
+            // Retry attribution is about identical bytes, not permission to undo
+            // later observations. Inverse admission still checks the full epoch.
+            return Ok(self.composition.active.filter(|id| {
+                self.composition.decisions.get(id).is_some_and(|d| {
+                    d.after == Some(projection)
+                        && d.root == self.root
+                        && d.pin_revision == self.composition.pin_revision
+                })
+            }));
         };
         if d.after != Some(projection) {
             return Err(Error::Proposal(

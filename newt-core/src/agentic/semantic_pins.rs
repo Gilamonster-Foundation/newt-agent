@@ -16,6 +16,7 @@ pub(super) fn refresh(
     let Some(smart) = smart else {
         return Ok(());
     };
+    smart.normalize_composition(messages)?;
     // These bytes come from the trusted producers, never a prefix classifier.
     let objective = prompt
         .active_receipt()

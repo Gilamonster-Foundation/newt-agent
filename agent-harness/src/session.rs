@@ -102,6 +102,12 @@ impl SessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum JournalEntry {
+    CompositionQueued {
+        queued: ContentId,
+    },
+    CompositionPage {
+        page: ContentId,
+    },
     CompositionCatalog {
         catalog: ContentId,
     },
@@ -420,6 +426,7 @@ impl Session {
         self.dereferences = 0;
         self.navigation_calls = 0;
         self.attempted_selections.clear();
+        self.composition.attempts = 0;
     }
 
     /// Ordered host-accounted tool occurrences since the last explicit `start_turn`.
@@ -533,6 +540,8 @@ impl Session {
 
     fn apply(&mut self, entry: &JournalEntry) -> Result<()> {
         match entry {
+            JournalEntry::CompositionQueued { queued } => self.apply_composition_queue(*queued)?,
+            JournalEntry::CompositionPage { page } => self.apply_composition_page(*page)?,
             JournalEntry::CompositionCatalog { catalog } => {
                 self.apply_composition_catalog(*catalog)?;
             }
@@ -733,11 +742,9 @@ impl Session {
             JournalEntry::Request { request } => {
                 self.ensure_tools_closed()?;
                 let record: RequestRecord = self.store.get(request)?;
-                if self
-                    .format
-                    .as_ref()
-                    .is_some_and(|format| format != &record.format)
-                {
+                if self.format.as_ref().is_some_and(|format| {
+                    record.format != "composition-context-v1" && format != &record.format
+                }) {
                     return Err(Error::Access(
                         "provider format changed within the session".into(),
                     ));
@@ -752,7 +759,9 @@ impl Session {
                     self.composition.active = None;
                 }
                 self.requests.insert(*request);
-                self.format = Some(record.format);
+                if record.format != "composition-context-v1" {
+                    self.format = Some(record.format);
+                }
             }
             JournalEntry::Resume {
                 starting,
@@ -909,7 +918,9 @@ impl Session {
             }
         }
         let changes_context = match entry {
-            JournalEntry::CompositionCatalog { .. }
+            JournalEntry::CompositionQueued { .. }
+            | JournalEntry::CompositionPage { .. }
+            | JournalEntry::CompositionCatalog { .. }
             | JournalEntry::CompositionProposed { .. }
             | JournalEntry::Composition { .. }
             | JournalEntry::Resume { .. } => false,
@@ -1916,10 +1927,12 @@ impl Session {
         format: &str,
         messages: &[Value],
     ) -> Result<PreparedRequest> {
-        if format != "anthropic" {
-            return Err(integrity("unsupported provider renderer"));
-        }
-        self.prepare_request(body, format, "messages", messages, "anthropic-messages-v1")
+        let renderer = match format {
+            "anthropic" => "anthropic-messages-v1",
+            "openai" => "openai-messages-v1",
+            _ => return Err(integrity("unsupported provider renderer")),
+        };
+        self.prepare_request(body, format, "messages", messages, renderer)
     }
 
     fn prepare_request(
@@ -1933,7 +1946,7 @@ impl Session {
         if self
             .format
             .as_ref()
-            .is_some_and(|current| current != format)
+            .is_some_and(|current| format != "composition-context-v1" && current != format)
         {
             return Err(Error::Access(
                 "provider format changed within the session".into(),

@@ -14,6 +14,8 @@ use serde_json::Value;
 
 use super::compress::SummarizeFn;
 
+#[path = "context_composition.rs"]
+mod context_composition;
 #[path = "smart_tool_completion.rs"]
 mod tool_completion;
 pub(crate) use tool_completion::{
@@ -24,6 +26,10 @@ pub(crate) use tool_completion::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdjudicationSettings {
+    /// Opt-in model proposals; never enabled by merely enabling smart harness.
+    pub composition_enabled: bool,
+    /// Complete request byte ceiling for model composition.
+    pub composition_max_bytes: usize,
     pub timeout_ms: u64,
     pub max_calls: usize,
     pub total_timeout_ms: u64,
@@ -54,7 +60,7 @@ impl AdjudicationSettings {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.timeout_ms > 0 && self.max_calls > 0,
+            self.timeout_ms > 0 && self.max_calls > 0 && self.composition_max_bytes > 0,
             "adjudication bounds must be positive"
         );
         anyhow::ensure!(
@@ -95,6 +101,8 @@ impl Default for AdjudicationSettings {
         let d: Defaults = toml::from_str(include_str!("smart_harness.toml"))
             .expect("bundled adjudication protocol is valid TOML");
         Self {
+            composition_enabled: false,
+            composition_max_bytes: 262_144,
             timeout_ms: d.timeout_ms,
             max_calls: d.max_calls,
             total_timeout_ms: d.total_timeout_ms,
@@ -113,6 +121,7 @@ impl Default for AdjudicationSettings {
 struct State {
     session: Session,
     request: Option<ContentId>,
+    primary_model: String,
     reply: Option<ContentId>,
     admission_rejection: Option<ContentId>,
     antecedent: Option<String>,
@@ -302,6 +311,7 @@ impl SmartHarness {
             state: Mutex::new(State {
                 session,
                 request: None,
+                primary_model: "unknown primary".into(),
                 reply: None,
                 admission_rejection: None,
                 antecedent: None,
@@ -326,9 +336,14 @@ impl SmartHarness {
         messages: &mut Vec<Value>,
         pins: &[agent_harness::composition::HostPin],
     ) -> anyhow::Result<()> {
-        self.state()?
-            .session
+        let mut s = self.state()?;
+        s.session
             .register_semantic_pins(objective, messages, pins)?;
+        if self.settings.composition_enabled && s.session.has_pending_composition() {
+            s.session
+                .composition_context(messages, self.settings.composition_max_bytes)?;
+            *messages = self.preview_composition(&mut s)?;
+        }
         Ok(())
     }
 
@@ -448,7 +463,7 @@ impl SmartHarness {
     /// Record the complete final request before a byte can be sent.
     pub(crate) fn request(&self, body: &Value, format: &str) -> anyhow::Result<Vec<u8>> {
         let mut s = self.state()?;
-        let request = s.session.record_request(body.clone(), format)?;
+        let request = self.composition_request(&mut s, body, format, None)?;
         s.request = Some(request.id);
         s.reply = None;
         s.admission_rejection = None;
@@ -462,9 +477,7 @@ impl SmartHarness {
         messages: &[Value],
     ) -> anyhow::Result<Vec<u8>> {
         let mut s = self.state()?;
-        let request = s
-            .session
-            .record_rendered_request(body.clone(), format, messages)?;
+        let request = self.composition_request(&mut s, body, format, Some(messages))?;
         s.request = Some(request.id);
         s.reply = None;
         s.admission_rejection = None;
@@ -565,6 +578,9 @@ impl SmartHarness {
         if serde_json::to_vec(messages)?.len() <= max_bytes {
             return Ok(messages.to_vec());
         }
+        if self.settings.composition_enabled {
+            return self.project_composition(messages, max_bytes).await;
+        }
         let (request, prompt) = {
             let mut s = self.state()?;
             let catalog = s.session.catalog(messages, max_bytes)?;
@@ -617,7 +633,13 @@ impl SmartHarness {
     }
 
     pub(crate) fn record_messages(&self, messages: &[Value]) -> anyhow::Result<()> {
-        Ok(self.state()?.session.record_messages(messages)?)
+        let mut state = self.state()?;
+        let messages = if self.settings.composition_enabled {
+            state.session.expand_composition_preflight(messages)?
+        } else {
+            messages.to_vec()
+        };
+        Ok(state.session.record_messages(&messages)?)
     }
 
     pub(crate) fn tool_batch(
@@ -662,6 +684,9 @@ impl SmartHarness {
         instructions: Option<&str>,
         input: &[Value],
     ) -> anyhow::Result<()> {
+        if self.settings.composition_enabled {
+            return self.record_messages(input);
+        }
         let mut messages = Vec::with_capacity(input.len() + 1);
         if let Some(text) = instructions {
             messages.push(serde_json::json!({"role":"system","content":text}));
@@ -1130,8 +1155,14 @@ pub(super) fn cancelled(
 }
 
 pub(crate) fn advertise(mut tools: Value, harness: Option<&SmartHarness>) -> Value {
-    if harness.is_some() {
+    if let Some(harness) = harness {
         if let Some(tools) = tools.as_array_mut() {
+            if harness.settings.composition_enabled {
+                tools.push(
+                    serde_json::from_str(include_str!("propose_context.json"))
+                        .expect("bundled composition tool"),
+                );
+            }
             tools.retain(|tool| {
                 !matches!(
                     tool["function"]["name"].as_str(),
@@ -1159,6 +1190,21 @@ pub(crate) fn request(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(h.request(body, format)?)),
         None => Ok(builder.json(body)),
+    }
+}
+
+pub(crate) fn request_with_messages(
+    builder: reqwest::RequestBuilder,
+    body: &Value,
+    harness: Option<&SmartHarness>,
+    format: &str,
+    messages: &[Value],
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    match harness {
+        Some(h) if h.settings.composition_enabled => Ok(builder
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(h.prepare_with_messages(body, format, messages)?)),
+        _ => request(builder, body, harness, format),
     }
 }
 

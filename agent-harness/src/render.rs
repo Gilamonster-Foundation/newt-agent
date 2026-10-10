@@ -166,3 +166,46 @@ pub fn tool_use_block(tc: &serde_json::Value) -> serde_json::Value {
         "input": input,
     })
 }
+
+/// Coalesce leading OpenAI system messages without changing conversation order.
+pub fn openai_chat_wire_messages(
+    messages: &[serde_json::Value],
+) -> crate::Result<Vec<serde_json::Value>> {
+    let leading_systems = messages
+        .iter()
+        .take_while(|message| message["role"].as_str() == Some("system"))
+        .count();
+
+    if messages[leading_systems..]
+        .iter()
+        .any(|message| message["role"].as_str() == Some("system"))
+    {
+        return Err(crate::Error::Proposal(
+            "invalid OpenAI chat message order: system messages must precede conversation history"
+                .into(),
+        ));
+    }
+    if leading_systems <= 1 {
+        return Ok(messages.to_vec());
+    }
+
+    let content = messages[..leading_systems]
+        .iter()
+        .map(|message| {
+            message["content"].as_str().ok_or_else(|| {
+                crate::Error::Proposal(
+                    "invalid OpenAI chat system message: content must be text before coalescing"
+                        .into(),
+                )
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?
+        .join("\n\n");
+    let mut system = messages[0].clone();
+    system["content"] = serde_json::Value::String(content);
+
+    let mut wire = Vec::with_capacity(messages.len() - leading_systems + 1);
+    wire.push(system);
+    wire.extend(messages[leading_systems..].iter().cloned());
+    Ok(wire)
+}

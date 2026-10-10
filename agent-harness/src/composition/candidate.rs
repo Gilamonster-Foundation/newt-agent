@@ -26,6 +26,13 @@ impl Session {
         {
             return Ok(Err(Refusal::Stale));
         }
+        if proposal
+            .changes
+            .iter()
+            .any(|c| c.action == Action::Summarise)
+        {
+            return Ok(Err(Refusal::Unsupported));
+        }
         let mut view = before.clone();
         if let Some(inverse) = proposal.inverse {
             let Some(original) = self.composition.decisions.get(&inverse) else {
@@ -63,6 +70,7 @@ impl Session {
                 let progress = match change.action {
                     Action::Include => selected.insert(change.occurrence),
                     Action::Park => selected.remove(&change.occurrence),
+                    Action::Summarise => return Ok(Err(Refusal::Unsupported)),
                 };
                 if !progress {
                     return Ok(Err(Refusal::NoProgress));

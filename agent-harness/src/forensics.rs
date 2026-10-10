@@ -70,6 +70,8 @@ pub fn inspect_from_store(
     {
         use JournalEntry::*;
         match node.payload() {
+            CompositionQueued { queued } => references.push(("queued", Address::Node(*queued))),
+            CompositionPage { page } => references.push(("page", Address::Node(*page))),
             CompositionCatalog { catalog } => references.push(("catalog", Address::Node(*catalog))),
             CompositionProposed { event } => references.push(("proposal", Address::Node(*event))),
             Composition { decision } => references.push(("composition", Address::Node(*decision))),
@@ -201,6 +203,7 @@ pub fn inspect_from_store(
             ("policy", Address::Node(d.policy)),
             ("before", Address::Node(d.before)),
         ]);
+        references.extend(d.queued.map(|id| ("queued", Address::Node(id))));
         references.extend(d.after.map(|id| ("after", Address::Node(id))));
         references.extend(
             d.expected_head
@@ -226,6 +229,7 @@ pub fn inspect_from_store(
             ("universe", Address::Node(c.universe)),
             ("policy", Address::Node(c.policy)),
         ]);
+        references.extend(c.offered.map(|id| ("offered_catalog", Address::Node(id))));
         references.extend(c.pins.map(|id| ("pins", Address::Node(id))));
         references.extend(
             c.entries
@@ -236,6 +240,35 @@ pub fn inspect_from_store(
             "composition_catalog",
             Vec::new(),
             serde_json::to_value(c).map_err(invalid)?,
+        )
+    } else if let Ok(q) =
+        canonical::from_canonical_dagcbor_checked::<crate::composition::Queued>(&bytes)
+    {
+        references.push(("catalog", Address::Node(q.catalog)));
+        references.extend(
+            q.proposal
+                .expected_head
+                .map(|id| ("expected_composition", Address::Node(id))),
+        );
+        references.extend(
+            q.proposal
+                .changes
+                .iter()
+                .map(|c| ("occurrence", Address::Node(c.occurrence))),
+        );
+        (
+            "composition_queued",
+            Vec::new(),
+            serde_json::to_value(q).map_err(invalid)?,
+        )
+    } else if let Ok(p) =
+        canonical::from_canonical_dagcbor_checked::<crate::composition::Page>(&bytes)
+    {
+        references.push(("catalog", Address::Node(p.catalog)));
+        (
+            "composition_page",
+            Vec::new(),
+            serde_json::to_value(p).map_err(invalid)?,
         )
     } else if let Ok(record) = canonical::from_canonical_dagcbor_checked::<RootEvent>(&bytes) {
         references.push(("source", Address::Raw(record.content)));
@@ -355,8 +388,27 @@ pub(crate) fn verify_request(store: &FrameStore, record: &RequestRecord) -> Resu
         let s: Submission =
             canonical::from_canonical_dagcbor_checked(&store.source(&raw.payload().payload)?)
                 .map_err(invalid)?;
-        if s.catalog != d.catalog || s.actor != d.actor || c.policy != d.policy {
+        if s.queued != d.queued
+            || s.catalog != d.catalog
+            || s.actor != d.actor
+            || c.policy != d.policy
+        {
             return Err(invalid("request composition attribution differs"));
+        }
+        if let Some(queued) = s.queued {
+            let q: crate::composition::Queued = store.get(&queued)?;
+            let offered: Catalog = store.get(&q.catalog)?;
+            store.get::<Projection>(&offered.before)?.render(store)?;
+            store.get::<Projection>(&offered.universe)?.render(store)?;
+            if q.proposal.changes != s.proposal.changes
+                || q.actor != store.get::<Actor>(&s.actor)?
+            {
+                return Err(invalid("queued proposal differs from dispatched decision"));
+            }
+        }
+        if let Some(offered) = c.offered {
+            let old: Catalog = store.get(&offered)?;
+            store.get::<Projection>(&old.universe)?.render(store)?;
         }
         store.get::<Actor>(&d.actor)?;
         store.get::<Policy>(&d.policy)?;
