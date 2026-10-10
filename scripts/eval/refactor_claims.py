@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from refactor_test_log import test_totals
+
 ANSI = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
 NUMBER = r"[\d,]+"
 FILE = r"[\w./-]+\.rs"
@@ -43,6 +45,7 @@ def operator_inputs(raw: str, submitted: str | None = None) -> dict:
 def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
     """Check explicit assistant text; caller must establish its structured role."""
     rows: list[dict] = []
+    test_evidence = test_totals(clean_terminal(test_log))
 
     def add(kind: str, claim: str, actual: object, matches: bool | None) -> None:
         row = {
@@ -66,6 +69,26 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
         add(
             "lines",
             f"{path} {stage}: {expected}",
+            actual,
+            None if actual is None else actual == expected,
+        )
+
+    def delta(path: str, count: str) -> None:
+        before, after = facts.get("before", {}), facts.get("after", {})
+        candidates = {
+            p
+            for p in before.keys() | after.keys()
+            if p == path or p.endswith("/" + path)
+        }
+        actual = None
+        if len(candidates) == 1:
+            candidate = candidates.pop()
+            if candidate in before and candidate in after:
+                actual = before[candidate] - after[candidate]
+        expected = int(count.replace(",", ""))
+        add(
+            "line_delta",
+            f"{path} reduction: {expected}",
             actual,
             None if actual is None else actual == expected,
         )
@@ -136,38 +159,58 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
                 prs,
                 None if prs is None else any(p.get("state") == "MERGED" for p in prs),
             )
-        pair = re.search(
-            rf"({FILE}).*?(~?{NUMBER})\s*(?:lines)?\s*(?:→|->|to)\s*~?({NUMBER})", line
-        )
-        if pair:
-            lines(pair[1], pair[2].lstrip("~"), "before")
-            lines(pair[1], pair[3], "after")
-            continue
-        for m in re.finditer(
-            rf"({FILE})(?:(?!\.rs)[^\n│])*?~?({NUMBER})\s+lines", line
-        ):
-            stage = (
-                "before"
-                if re.search(r"longest|Target file|largest", line[: m.end()], re.I)
-                and "is now" not in m[0]
-                else "after"
+        # Scope every numeric statement to its own filename, never across the
+        # next file mentioned in the same sentence.
+        for mention in re.finditer(rf"({FILE})(.*?)(?={FILE}|$)", line):
+            path, detail = mention.groups()
+            pair = re.search(
+                rf"(~?{NUMBER})\s*(?:lines)?\s*(?:→|->|to)\s*~?({NUMBER})", detail
             )
-            lines(m[1], m[2], stage)
-        table = re.search(rf"({FILE})\s+after\s*│\s*({NUMBER})", line)
-        if table:
-            lines(table[1], table[2], "after")
-        # Cargo totals require an independent captured test log. Git cannot prove
-        # how many tests were executed, and cargo check is not a test run.
-        counts = re.findall(rf"({NUMBER})\s+(?:tests?\s+)?(passed|failed)", line)
-        counts += [(n, "total") for n in re.findall(rf"\b({NUMBER})\s+tests\b", line)]
-        evidence = re.findall(r"test result: .*?(\d+) passed; (\d+) failed", test_log)
+            reduction = re.search(
+                rf"(?:\b(?:drops?|reduced|reducing|removed?|removing)(?:\s+by)?\s*|(?<![\w>])-\s*)~?({NUMBER})\b(?:\s+lines)?",
+                detail,
+                re.I,
+            )
+            if pair:
+                lines(path, pair[1].lstrip("~"), "before")
+                lines(path, pair[2], "after")
+            if reduction:
+                delta(path, reduction[1])
+            if not pair and not reduction:
+                absolute = re.search(rf"~?({NUMBER})\s+lines", detail)
+                if absolute:
+                    stage = (
+                        "before"
+                        if re.search(
+                            r"longest|Target file|largest", line[: mention.end()], re.I
+                        )
+                        and "is now" not in detail
+                        else "after"
+                    )
+                    lines(path, absolute[1], stage)
+            table = re.search(rf"\s+after\s*│\s*({NUMBER})", detail)
+            if table:
+                lines(path, table[1], "after")
+        for reduction in re.finditer(
+            rf"\bremoved\s+~?({NUMBER})\s+lines\s+from\s+`?({FILE})", line, re.I
+        ):
+            delta(reduction[2], reduction[1])
+        # The supplied log must represent this claimed invocation. Never use a
+        # final doctest result as a whole-run count or turn partial logs green.
+        counts = []
+        for count in re.finditer(
+            rf"({NUMBER})\s+tests?(?:\s+(passed|pass|failed|fail|ignored|total)\b)?|({NUMBER})\s+(passed|failed|ignored|failures)\b",
+            line,
+            re.I,
+        ):
+            number = count[1] or count[3]
+            kind = (count[2] or count[4] or "total").lower()
+            kind = {"pass": "passed", "fail": "failed", "failures": "failed"}.get(
+                kind, kind
+            )
+            counts.append((number, kind))
         for count, kind in counts:
-            actual = None
-            if evidence:
-                passed, failed = map(int, evidence[-1])
-                actual = {"passed": passed, "failed": failed, "total": passed + failed}[
-                    kind
-                ]
+            actual = test_evidence[kind] if test_evidence is not None else None
             expected = int(count.replace(",", ""))
             add(
                 "tests",
@@ -175,4 +218,6 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
                 actual,
                 None if actual is None else actual == expected,
             )
+        if counts and test_evidence is not None and not test_evidence["success"]:
+            add("tests", "supplied test invocation succeeded", False, False)
     return rows

@@ -346,7 +346,7 @@ class Grade(unittest.TestCase):
         self.assertEqual(len(contradictions), 2, rows)
         self.assertTrue(all(r["kind"] == "lines" for r in contradictions))
         self.assertTrue(
-            any(r["kind"] == "tests" and r["status"] == "verified" for r in rows)
+            any(r["kind"] == "tests" and r["status"] == "unverifiable" for r in rows)
         )
 
     def test_operator_echoes_are_counted_not_prompt_redraws(self):
@@ -424,7 +424,9 @@ class AdditionalRegressions(unittest.TestCase):
 
     def test_claim_counts_contradicted_by_independent_test_receipt(self):
         rows = claims.check_claims(
-            "Summary\n1101 tests passed.\n", {}, "test result: ok. 10 passed; 0 failed;"
+            "Summary\n1101 tests passed.\n",
+            {},
+            (FIXTURES / "cargo-multiple-binaries.txt").read_text(),
         )
         self.assertEqual(rows[0]["status"], "contradicted")
 
@@ -434,7 +436,7 @@ class TestCountClaims(unittest.TestCase):
         rows = claims.check_claims(
             "Summary\n1101 tests passed.\n",
             {},
-            "test result: FAILED. 10 passed; 1091 failed;",
+            (FIXTURES / "cargo-multiple-binaries.txt").read_text(),
         )
         self.assertTrue(any(row["status"] == "contradicted" for row in rows), rows)
 

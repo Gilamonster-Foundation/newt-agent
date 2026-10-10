@@ -1,0 +1,2 @@
+Extracted the workflow/nudge-injection cluster into `workflow.rs` (1,064 lines), reducing `mod.rs` by ~1,041 lines (11,726 → 10,746)
+`mod.rs` drops ~1,041 lines.
