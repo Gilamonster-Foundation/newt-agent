@@ -1,6 +1,7 @@
 //! Accounted context projection and bounded host policy, independent of inference.
 #![forbid(unsafe_code)]
 
+pub mod composition;
 pub mod forensics;
 pub mod navigation;
 pub mod projection;

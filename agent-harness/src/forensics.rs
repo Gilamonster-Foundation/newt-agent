@@ -70,6 +70,11 @@ pub fn inspect_from_store(
     {
         use JournalEntry::*;
         match node.payload() {
+            SemanticPins { pins } => references.extend(
+                pins.entries
+                    .values()
+                    .map(|id| ("semantic_pin", Address::Node(*id))),
+            ),
             Run { root, .. } => references.push(("root", Address::Node(*root))),
             Observation { event } | Intervention { event } | ToolOutput { event, .. } => {
                 references.push(("event", Address::Node(*event)));

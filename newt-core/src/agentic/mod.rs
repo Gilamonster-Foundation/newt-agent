@@ -30,6 +30,7 @@ mod capability_check;
 mod claim_check;
 pub(crate) mod observed_report;
 mod selected_target;
+mod semantic_pins;
 pub use claim_check::{
     files_changed_between, is_workspace_repo_root, locate_workspace_repo, nested_current_paths,
     nested_files_changed_between, snapshot_nested_repos, snapshot_workspace,
@@ -2361,6 +2362,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        semantic_pins::refresh(
+            smart_harness,
+            &mut messages,
+            prompt_context,
+            selected_source.current(),
+            &turn_claims,
+            workspace,
+            &caveats.fs_read,
+        )?;
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
         if hidden_tools.append_promoted(&mut tools) {
@@ -7418,6 +7428,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        semantic_pins::refresh(
+            smart_harness,
+            &mut messages,
+            prompt_context,
+            selected_source.current(),
+            &turn_claims,
+            workspace,
+            &caveats.fs_read,
+        )?;
         let round_policy = generation_policy;
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
@@ -10187,6 +10206,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        semantic_pins::refresh(
+            smart_harness,
+            &mut messages,
+            prompt_context,
+            selected_source.current(),
+            &turn_claims,
+            workspace,
+            &caveats.fs_read,
+        )?;
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
         if hidden_tools.append_promoted(&mut tools) {
@@ -12645,6 +12673,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             worktree_session,
             true,
         );
+        semantic_pins::refresh(
+            smart_harness,
+            &mut input,
+            prompt_context,
+            selected_source.current(),
+            &turn_claims,
+            workspace,
+            &caveats.fs_read,
+        )?;
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
         if hidden_tools.append_promoted(&mut tools_chat) {
