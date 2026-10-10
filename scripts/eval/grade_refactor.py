@@ -20,7 +20,7 @@ import tempfile
 
 from refactor_helper import EvidenceError, HelperUnavailable, invoke_helper
 from refactor_transcript import read_tail, positive_mib
-from refactor_claims import check_claims, operator_inputs
+from refactor_claims import check_claims, operator_inputs, named_test, named_test_lines
 from refactor_session import final_assistant
 
 # Reuse the eval scoreboard's crate-vector-pinned content addressing, not a
@@ -39,18 +39,22 @@ def run(argv: list[str], cwd: Path) -> str:
     env.update(RUSTC_WRAPPER="", CARGO_BUILD_JOBS="4", GIT_TERMINAL_PROMPT="0")
     if "cargo" in argv:
         env["CARGO_TARGET_DIR"] = str(cwd / "target")
+    test = any(argv[i : i + 2] == ["cargo", "test"] for i in range(len(argv) - 1))
     try:
         result = subprocess.run(
             argv,
             cwd=cwd,
             env=env,
             text=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if test else subprocess.PIPE,
             timeout=1800 if "cargo" in argv else 120,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise EvidenceError(f"{argv[0]} unavailable: {exc}") from exc
+    if test:
+        return result.stdout.rstrip("\n") + f"\ncargo-test-exit: {result.returncode}\n"
     if result.returncode:
         raise EvidenceError(
             f"{argv[0]} exited {result.returncode}: {result.stderr[-2000:]}"
@@ -368,6 +372,18 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
     except (EvidenceError, ValueError) as exc:
         row("worktree_commit", False, str(exc))
 
+    summary = ""
+    summary_error = "no structured session source supplied; use --session-db"
+    if getattr(args, "session_db", None):
+        try:
+            summary = final_assistant(
+                args.session_db, getattr(args, "conversation_id", None)
+            )
+            summary_error = None
+        except ValueError as exc:
+            summary_error = str(exc)
+    test_logs = {}
+
     try:
         if not remote or not head or remote_head != head:
             raise EvidenceError("no matching pushed head to clone")
@@ -397,6 +413,14 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
                 True,
                 {"head": cloned, "crate": args.crate, "stdout": output[-2000:]},
             )
+            for line in named_test_lines(summary):
+                argv = named_test(line)
+                if argv is not None and argv not in test_logs:
+                    try:
+                        test_logs[argv] = command([*prefix, *argv], clone)
+                    except EvidenceError:
+                        test_logs[argv] = ""
+
     except EvidenceError as exc:
         row("fresh_clone_check", False, str(exc))
 
@@ -405,19 +429,15 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
         if args.transcript
         else ""
     )
-    summary = ""
-    if not getattr(args, "session_db", None):
+    if summary_error is not None:
         criteria["claims"] = {
             "status": "UNGRADED",
-            "evidence": "no structured session source supplied; use --session-db",
+            "evidence": summary_error,
         }
     else:
         try:
-            summary = final_assistant(
-                args.session_db, getattr(args, "conversation_id", None)
-            )
             test_log = args.test_log.read_text() if args.test_log else ""
-            claims = check_claims(summary, facts, test_log)
+            claims = check_claims(summary, facts, test_log, test_logs)
             status = (
                 "FAIL"
                 if any(c["status"] == "contradicted" for c in claims)

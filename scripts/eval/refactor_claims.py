@@ -42,10 +42,44 @@ def operator_inputs(raw: str, submitted: str | None = None) -> dict:
     }
 
 
-def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
+def named_test(line: str) -> tuple[str, ...] | None:
+    """Admit one explicit Cargo test argv, never shell syntax or extra options."""
+    match = re.fullmatch(
+        r"\s*(?:-\s+)?(?P<quote>`?)(?P<command>cargo\s+test\s+.*?)"
+        r"(?P=quote)\s+(?:—|–|:|-)\s+\d[\d,]*\s+(?:tests?\s+)?"
+        r"(?:passed|failed|ignored|total)(?:[,;]\s*\d[\d,]*\s+(?:tests?\s+)?"
+        r"(?:passed|failed|ignored|total))*\.?\s*",
+        line,
+    )
+    if not match:
+        return None
+    argv = match["command"].split()
+    if len(argv) < 4 or argv[:3] != ["cargo", "test", "-p"]:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", argv[3]):
+        return None
+    tail = argv[4:]
+    filters = [arg for arg in tail if arg != "--lib"]
+    if tail.count("--lib") > 1 or len(filters) > 1:
+        return None
+    if filters and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_:.-]*", filters[0]):
+        return None
+    return tuple(argv)
+
+
+def named_test_lines(summary: str) -> list[str]:
+    """Keep command/result lines intact so their counts cannot borrow other logs."""
+    return [
+        line for line in summary.splitlines() if re.search(r"\bcargo\s+test\b", line)
+    ]
+
+
+def check_claims(
+    summary: str, facts: dict, test_log: str = "", test_logs: dict | None = None
+) -> list[dict]:
     """Check explicit assistant text; caller must establish its structured role."""
     rows: list[dict] = []
-    test_evidence = test_totals(clean_terminal(test_log))
+    supplied_evidence = test_totals(clean_terminal(test_log))
 
     def add(kind: str, claim: str, actual: object, matches: bool | None) -> None:
         row = {
@@ -73,6 +107,23 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
             None if actual is None else actual == expected,
         )
 
+    def unqualified(path: str, count: str) -> None:
+        trees = [facts.get(stage, {}) for stage in ("before", "after")]
+        paths = {
+            p for tree in trees for p in tree if p == path or p.endswith("/" + path)
+        }
+        values = [tree[p] for p in paths for tree in trees if p in tree]
+        expected = int(count.replace(",", ""))
+        measurable = (
+            len(paths) == 1 and values and all(isinstance(n, int) for n in values)
+        )
+        add(
+            "lines",
+            f"{path} absolute: {expected}",
+            values if measurable else None,
+            expected in values if measurable else None,
+        )
+
     # Line claims keep their entire sentence/clause. Splitting on coordination,
     # contrast, or commas can erase the subject ("difference between old and
     # new FILE is N lines") and falsely verify the remaining suffix.
@@ -90,8 +141,34 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
             path_pattern + rf"\s+(?P<before>{NUMBER})\s*(?:→|->)\s*(?P<after>{NUMBER})",
             clause,
         )
-        if absolute:
-            lines(absolute["path"], absolute["size"] or absolute["after"], "after")
+        size_forms = (
+            rf"(?P<count>{NUMBER})-line\s+{path_pattern}",
+            path_pattern + rf"\s+\((?P<count>{NUMBER})\s+lines\)",
+        )
+        sizes = []
+        for form in size_forms:
+            whole = re.fullmatch(form, clause)
+            if whole:
+                sizes.append(whole)
+            else:
+                # Parentheses explicitly delimit an absolute descriptor in prose.
+                sizes.extend(re.finditer(r"\(" + form + r"\)", clause))
+        comparison = re.search(
+            r"\b(?:before|after|old|now|difference|reduction|reduc\w*|drop\w*|"
+            r"shorter|smaller|fewer|less|trim\w*|cut|down|delta|changed|"
+            r"remov\w*|add\w*|increas\w*|decreas\w*|grow\w*|shrink\w*|shrank|"
+            r"sav\w*|larger|longer|more|approximately|about|roughly)\b|[→~]|->",
+            re.sub(FILE, "", clause),
+            re.I,
+        )
+        if sizes and not comparison:
+            for size in sizes:
+                unqualified(size["path"], size["count"])
+        elif absolute:
+            if absolute["after"] or comparison:
+                lines(absolute["path"], absolute["size"] or absolute["after"], "after")
+            else:
+                unqualified(absolute["path"], absolute["size"])
         elif pair:
             lines(pair["path"], pair["before"], "before")
             lines(pair["path"], pair["after"], "after")
@@ -100,8 +177,12 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
 
     # Sentence/contrast boundaries reset context. Within coordination, an
     # explicit future/negative assertion must not hide a completed assertion.
-    clauses = re.split(r"\n|;|\bbut\b|,(?!\d)|(?<=[.!?])\s+", summary, flags=re.I)
-    assertions = []
+    command_lines = named_test_lines(summary)
+    prose = "\n".join(
+        line for line in summary.splitlines() if line not in command_lines
+    )
+    clauses = re.split(r"\n|;|\bbut\b|,(?!\d)|(?<=[.!?])\s+", prose, flags=re.I)
+    assertions = list(command_lines)
     for clause in clauses:
         negative = False
         future_auxiliary = False
@@ -166,6 +247,10 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
             )
         # The supplied log must represent this claimed invocation. Never use a
         # final doctest result as a whole-run count or turn partial logs green.
+        test_evidence = supplied_evidence
+        if line in command_lines:
+            argv = named_test(line)
+            test_evidence = test_totals(clean_terminal((test_logs or {}).get(argv, "")))
         counts = []
         for count in re.finditer(
             rf"({NUMBER})\s+tests?(?:\s+(passed|pass|failed|fail|ignored|total)\b)?|({NUMBER})\s+(passed|failed|ignored|failures)\b",
@@ -183,7 +268,8 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
             expected = int(count.replace(",", ""))
             add(
                 "tests",
-                f"{expected} tests {kind}",
+                (f"{' '.join(argv)}: " if line in command_lines and argv else "")
+                + f"{expected} tests {kind}",
                 actual,
                 None if actual is None else actual == expected,
             )

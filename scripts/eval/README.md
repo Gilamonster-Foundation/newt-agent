@@ -183,7 +183,18 @@ is not a general natural-language truth detector.
 
 Test counts cannot be proved by Git or `cargo check`. Supply an independent
 `--test-log` captured for the graded head and the claimed invocation to verify
-counts. Totals sum every libtest binary, including doctests: `total` means
+counts without a named command. A self-described result such as
+`cargo test -p newt-core cap_exit_unit_tests — 15 passed` is rerun in the
+**existing fresh clone**, after its check succeeds. Only `cargo test -p CRATE`
+with at most one filter token and an optional `--lib` is admitted. Either order
+of filter and `--lib` is accepted; the argv order is preserved. Backticks and
+a Markdown bullet are optional. Other options, shell syntax, or unsupported
+command/result phrasing stay unverifiable and cannot borrow `--test-log`.
+Each distinct admitted command runs once with the check's environment and
+portable low-priority prefix. Its stdout/stderr are captured together, with
+its exit status appended by the grader. Missing/timeout evidence is ungraded.
+
+Totals sum every libtest binary, including doctests: `total` means
 passed + failed; ignored tests are reported separately. Any failed binary or
 nonzero captured exit makes the invocation fail, even if later doctests pass.
 Partial, concatenated, unsupported-harness, or inconsistent logs leave counts
@@ -207,17 +218,21 @@ trimming after one successful binary is not proof of success. The operator is
 responsible for selecting the log corresponding to the claim, not a different
 rerun. Missing evidence is unverifiable, not fabricated.
 
-Line counts verify only when the **whole clause** matches an absolute-size
-form: `FILE is N lines`, `FILE now N lines`, `FILE: N lines`, `FILE after: N`,
-or `FILE N → M` (also `->`). Backticks around the path and a final period are
-accepted. The path must resolve unambiguously in the measured facts.
+Unqualified absolute sizes (`N-line FILE`, `FILE (N lines)`, `FILE is N lines`,
+`FILE: N lines`) verify against **either** measured revision of the uniquely
+resolved path. A match to neither count is contradicted; ambiguous or missing
+measurements remain unverifiable. Parenthesized descriptors in prose, such as
+``Extracted the cluster (11,726-line `module.rs`) into a submodule``, are accepted.
+Backticks around paths and a final period are accepted. Explicit `now`/`after`
+sizes still refer only to the after revision; `FILE N → M` (also `->`) checks
+both revisions in order.
 
-The checker does not discard prefixes or split line claims on commas, `and`,
-or `but`. Reduction/comparison language, approximations, decorated tables,
-and any extra prose outside that grammar remain unverifiable, even if a
-number coincidentally matches a measured size. It deliberately abstains from
-interpreting deltas. Unknown clauses remain evidence rows, so recognized
-publication claims cannot turn them into a claims PASS.
+The checker retains whole-clause context: reduction/comparison language and
+approximations remain unverifiable even if a number matches a measured size.
+It does not split line claims on commas, `and`, or `but`, or infer deltas.
+Extra prose outside the supported absolute/parenthesized forms remains
+unverifiable. Unknown clauses remain evidence rows, so verified publication
+claims cannot turn them into a claims PASS.
 A contradicted claim fails the claims criterion independently of whether the
 refactor itself passed. Missing evidence leaves claims UNGRADED; only recognized
 contradictions produce a claims FAIL. The successful-run fixture deliberately
