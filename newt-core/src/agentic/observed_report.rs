@@ -1,6 +1,8 @@
 //! Objective-scoped, content-addressed facts. Model prose is not evidence.
 mod capture;
 mod files;
+mod prose;
+pub(super) use prose::model_prose;
 #[cfg(test)]
 pub(crate) mod tests;
 

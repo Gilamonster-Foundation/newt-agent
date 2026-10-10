@@ -6493,6 +6493,7 @@ fn finalize_final_text(
     turn_claims: &claim_check::TurnClaims<'_>,
     verification: &self_verify::VerificationLedger,
 ) -> String {
+    let text = observed_report::model_prose(&text);
     let observed = turn_claims.observed_report(workspace, read_scope, &text);
     let text = capability_check::annotate_unobserved_probe(text, capability_evidence);
     let text = turn_claims.annotate(
