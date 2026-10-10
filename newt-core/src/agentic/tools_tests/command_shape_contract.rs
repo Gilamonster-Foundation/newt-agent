@@ -611,7 +611,10 @@ confined_task_commit, Confined, Adopted, "git commit -m contract", Some(Passed),
 #[cfg(unix)]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
+// Detached-wrapper repair must preserve the raw standalone command's contract.
 confined_task_ref_update, Confined, Adopted, "git branch followup", Some(Failed), Task, true, false, "", None, "";
+#[cfg(all(unix, not(target_os = "macos")))]
+confined_task_ref_wrapper, Confined, Adopted, "git branch followup; echo done", Some(Denied), Task, true, true, "git checkout -b followup", None, "";
 // Owned local remote via the kernel-confined executor; the governed broker's
 // local-URL refusal is a separate control in the macOS job.
 #[cfg(unix)]

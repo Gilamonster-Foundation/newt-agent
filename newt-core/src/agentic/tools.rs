@@ -3889,10 +3889,14 @@ async fn execute_authorized_tool(
     // Narrow accident guard for explicit Git administration and unverified
     // verbs. Filesystem write authority and script execution remain unchanged.
     if adopted.is_some() && worktree::administration::refuses(name, args) {
-        return host_return(executed((
-            worktree::administration::NOTICE.into(),
-            crate::ExecOutcome::Denied,
-        )));
+        let notice = match (name, &adopted, args["command"].as_str()) {
+            ("run_command", Some(policy), Some(source)) => {
+                worktree::branch::wrapper_refusal(policy, source)
+            }
+            _ => None,
+        }
+        .unwrap_or_else(|| worktree::administration::NOTICE.into());
+        return host_return(executed((notice, crate::ExecOutcome::Denied)));
     }
 
     match name {
@@ -4553,6 +4557,9 @@ async fn execute_authorized_tool(
                     &mut permission_gate,
                     commit_broker.is_some(),
                 ) {
+                    if let Some(notice) = adopted.as_ref().and_then(|policy| worktree::branch::wrapper_refusal(policy, cmd)) {
+                        return host_return(executed((notice, crate::ExecOutcome::Denied)));
+                    }
                     return host_return(reason);
                 }
             }

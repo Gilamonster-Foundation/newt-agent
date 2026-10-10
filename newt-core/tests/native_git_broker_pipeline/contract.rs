@@ -73,6 +73,7 @@ pub fn run() {
             if std::env::args().any(|arg| arg == "--publication") {
                 governed_publication().await;
             } else {
+                detached_branch_wrappers().await;
                 removal::run().await;
                 siblings::run().await;
                 for wrapper in [false, true] {
@@ -340,4 +341,95 @@ async fn governed_publication() {
     // Preserve every cache diagnostic next to verified completion/outcomes.
     println!("{out}");
     println!("PASS governed_commit_and_task_ref_publication");
+}
+
+/// Grounds the portable wrapper guard in production Brush on Linux/Seatbelt.
+/// A detached task must receive the standalone retry before any shared ref lock
+/// or sibling command, then successfully attach through the existing broker.
+async fn detached_branch_wrappers() {
+    let (_temp, main, task, caveats) = fixture();
+    let session = WorktreeSession::default();
+    // No adoption: ordinary compound Git retains its existing shell behavior.
+    let out = dispatch(
+        &session,
+        &main,
+        &caveats,
+        "git branch unadopted; echo complete",
+    )
+    .await;
+    assert!(!out.contains("unsupported branch-creation"), "{out}");
+    assert_eq!(
+        real_git_output(&main, &["rev-parse", "unadopted"]),
+        real_git_output(&main, &["rev-parse", "HEAD"])
+    );
+    let out = dispatch(
+        &session,
+        &main,
+        &caveats,
+        "git worktree add --detach ../task HEAD",
+    )
+    .await;
+    assert!(out.contains("Adopted task worktree:"), "{out}");
+    for command in [
+        "git branch --show-current | head",
+        "git branch --list | head",
+        "git branch -vv | head",
+        "git switch unadopted && git status --short",
+        "git checkout unadopted && git status --short",
+        "git checkout --detach HEAD && git status --short",
+    ] {
+        let command = format!(
+            "cd '{}' && {command} && echo noncreating-ok",
+            task.display()
+        );
+        let out = dispatch(&session, &main, &caveats, &command).await;
+        assert!(out.contains("noncreating-ok"), "{command}: {out}");
+        assert!(!out.contains("capability denied"), "{command}: {out}");
+        if command.contains("switch unadopted") {
+            assert_eq!(
+                real_git_output(&task, &["branch", "--show-current"]),
+                "unadopted"
+            );
+        }
+    }
+    let head = real_git_output(&task, &["rev-parse", "HEAD"]);
+    for command in [
+        "git branch -v detached-task | head; touch sibling-ran",
+        "git switch --create detached-task | tail -3; touch sibling-ran",
+        "git -C. checkout -b detached-task | tail -3; touch sibling-ran",
+        "git -C./ checkout -b detached-task | tail -3; touch sibling-ran",
+        "git branch --no-track detached-task HEAD | tail -3; touch sibling-ran",
+        "LANG=C git checkout -b detached-task; touch sibling-ran",
+        "env LANG=C git checkout -b detached-task; touch sibling-ran",
+        "git checkout -b detached-task 2>&1 | tail -3",
+        "git checkout -b detached-task 2>&1 && git branch --show-current",
+        "git switch -c detached-task && echo done",
+        "git branch detached-task > branch-output",
+    ] {
+        let command = format!("cd '{}' && {command}", task.display());
+        let out = dispatch(&session, &main, &caveats, &command).await;
+        assert!(out.contains("capability denied"), "{command}: {out}");
+        let retry = if command.contains("env LANG=C") {
+            "run the same Git operation as a standalone command"
+        } else {
+            "git checkout -b detached-task"
+        };
+        assert!(out.contains(retry), "{out}");
+        assert!(out.contains(task.to_str().unwrap()), "{out}");
+        assert_eq!(real_git_output(&task, &["branch", "--show-current"]), "");
+        assert_eq!(real_git_output(&task, &["rev-parse", "HEAD"]), head);
+        assert!(!main.join(".git/refs/heads/detached-task").exists());
+        assert!(!main.join(".git/logs/refs/heads/detached-task").exists());
+        assert!(!task.join("branch-output").exists());
+        assert!(!task.join("sibling-ran").exists());
+    }
+    let retry = format!("cd '{}' && git checkout -b detached-task", task.display());
+    let out = dispatch(&session, &main, &caveats, &retry).await;
+    assert_eq!(
+        real_git_output(&task, &["branch", "--show-current"]),
+        "detached-task",
+        "{out}"
+    );
+    assert!(main.join(".git/logs/refs/heads/detached-task").is_file());
+    println!("PASS detached_branch_wrapper_retry_and_broker");
 }

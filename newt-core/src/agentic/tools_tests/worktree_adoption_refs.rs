@@ -103,6 +103,122 @@ async fn adoption_refs_real_checkout_and_commit_preserve_original() {
     .await;
     assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
     assert!(session.snapshot().is_some(), "{text}");
+    // PR #2853 round 3: non-creating wrappers must retain confined execution.
+    for command in [
+        "git branch --show-current | head",
+        "git branch --list | head",
+        "git branch -vv | head",
+        "git branch -a | head",
+        "git branch -r | head",
+        "git rev-parse HEAD | head",
+        "git checkout -- seed && git status --short",
+        "git checkout seed && git status --short",
+        "git switch existing && git status --short",
+        "git checkout existing && git status --short",
+        "git checkout --detach HEAD && git status --short",
+    ] {
+        let (text, outcome) = run(command, &target, &original, &c, &session).await;
+        assert_eq!(outcome, Some(ExecOutcome::Passed), "{command}: {text}");
+    }
+    // Detached-adoption regression: unsupported presentation wrappers must
+    // refuse before shell execution, with the exact supported broker retry.
+    // On macOS the old fallthrough reached Seatbelt and failed on the shared
+    // refs/heads lock; this portable real-Git case grounds the same dispatch seam.
+    let detached_head = git(&target, temp.path(), &["rev-parse", "HEAD"]);
+    for command in [
+        "git branch -v blocked | head; touch sibling-ran",
+        "git branch -vv blocked | head; touch sibling-ran",
+        "git switch --create blocked | tail -3; touch sibling-ran",
+        "git -C. checkout -b blocked | tail -3; touch sibling-ran",
+        "git -C./ checkout -b blocked | tail -3; touch sibling-ran",
+        "git branch --no-track blocked HEAD | tail -3; touch sibling-ran",
+        "LANG=C git checkout -b blocked; touch sibling-ran",
+        "env LANG=C git checkout -b blocked; touch sibling-ran",
+        "git checkout -b blocked | head -3",
+        "git checkout -b blocked; echo done",
+        "git checkout -b blocked 2>&1 | tail -3",
+        "git checkout -b blocked 2>&1 && git branch --show-current",
+        "git checkout -b blocked 2>&1; echo \"rc=$?\"; git branch --show-current",
+        "git switch -c blocked && touch sibling-ran",
+        "git branch blocked; echo done",
+        "git branch blocked > branch-output",
+    ] {
+        let (text, outcome) = run(command, &target, &original, &c, &session).await;
+        assert_eq!(outcome, Some(ExecOutcome::Denied), "{command}: {text}");
+        let retry = if command.starts_with("env ") {
+            "run the same Git operation as a standalone command"
+        } else {
+            "git checkout -b blocked"
+        };
+        assert!(text.contains(retry), "{command}: {text}");
+        assert!(text.contains("cwd"), "{text}");
+        assert!(!original.join(".git/refs/heads/blocked").exists());
+        assert!(!original.join(".git/logs/refs/heads/blocked").exists());
+        assert!(!target.join("sibling-ran").exists());
+        assert_eq!(
+            git(&target, temp.path(), &["rev-parse", "HEAD"]),
+            detached_head
+        );
+        assert_eq!(git(&target, temp.path(), &["branch", "--show-current"]), "");
+    }
+    // Creation variants keep their intent; unresolved commands get neutral
+    // advice, never an instruction to create an existing or unknown branch.
+    for (command, retry, creation) in [
+        (
+            "git checkout -B blocked | head; touch sibling-ran",
+            "git checkout -B blocked",
+            true,
+        ),
+        (
+            "git switch -C blocked | head; touch sibling-ran",
+            "git switch -C blocked",
+            true,
+        ),
+        (
+            "git switch --force-create blocked | head; touch sibling-ran",
+            "git switch --force-create blocked",
+            true,
+        ),
+        (
+            "git checkout --orphan blocked | head; touch sibling-ran",
+            "git checkout --orphan blocked",
+            true,
+        ),
+        (
+            "git switch --orphan blocked | head; touch sibling-ran",
+            "git switch --orphan blocked",
+            true,
+        ),
+        (
+            "git switch missing && touch sibling-ran",
+            "git switch missing",
+            false,
+        ),
+        (
+            "git switch --future-create-option blocked; touch sibling-ran",
+            "git switch --future-create-option blocked",
+            false,
+        ),
+    ] {
+        let (text, outcome) = run(command, &target, &original, &c, &session).await;
+        assert_eq!(outcome, Some(ExecOutcome::Denied), "{command}: {text}");
+        assert!(
+            text.contains(&format!("run `{retry}` as a standalone command")),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("unsupported branch-creation"),
+            creation,
+            "{text}"
+        );
+        assert!(!target.join("sibling-ran").exists());
+        assert!(!original.join(".git/refs/heads/blocked").exists());
+        assert!(!original.join(".git/logs/refs/heads/blocked").exists());
+        assert_eq!(
+            git(&target, temp.path(), &["rev-parse", "HEAD"]),
+            detached_head
+        );
+    }
     let (text, outcome) = run("git checkout -b feat/x", &target, &original, &c, &session).await;
     assert_eq!(
         outcome,
