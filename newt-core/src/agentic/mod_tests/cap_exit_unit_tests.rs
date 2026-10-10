@@ -677,6 +677,7 @@ fn read_only_action_nudge_mentions_active_plan_when_present() {
 
     let ledger = SessionStepLedger::default();
     ledger.restore(&PlanSnapshot {
+        target: None,
         steps: vec![
             Step {
                 description: "inspect".to_string(),
@@ -728,6 +729,7 @@ fn pending_plan_completion_nudge_is_state_driven() {
 
     let ledger = SessionStepLedger::default();
     ledger.restore(&PlanSnapshot {
+        target: None,
         steps: vec![
             Step {
                 description: "already done".to_string(),
@@ -781,6 +783,7 @@ fn pending_plan_completion_nudge_is_state_driven() {
     );
 
     ledger.restore(&PlanSnapshot {
+        target: None,
         steps: vec![Step {
             description: "complete".to_string(),
             status: StepStatus::Done,

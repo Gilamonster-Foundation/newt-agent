@@ -16,6 +16,7 @@
 //! around the compiled view. v1 injects the `<plan>` view alongside the normal
 //! window rather than replacing it — honest + non-invasive.
 
+pub use super::selected_target::PinnedTarget;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -51,6 +52,9 @@ pub struct Step {
 /// skipped on serialize so it never bloats the on-disk file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanSnapshot {
+    /// Pinned source, preserved independently of step status and plan rewrites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PinnedTarget>,
     /// The ordered steps with each one's status. `#[serde(default)]` so the
     /// historically-true empty backfill (`{}`) on an older db parses cleanly.
     #[serde(default)]
@@ -111,7 +115,7 @@ pub trait StepLedger: Send + Sync {
 /// order; deterministic (no clock/uuid) for stable tests.
 #[derive(Default)]
 pub struct SessionStepLedger {
-    steps: Mutex<Vec<Step>>,
+    state: Mutex<PlanSnapshot>,
 }
 
 impl StepLedger for SessionStepLedger {
@@ -130,12 +134,13 @@ impl StepLedger for SessionStepLedger {
             first.status = StepStatus::Active;
         }
         let n = built.len();
-        *self.steps.lock().unwrap() = built;
+        self.state.lock().unwrap().steps = built;
         n
     }
 
     fn advance(&self) -> Option<String> {
-        let mut steps = self.steps.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let steps = &mut state.steps;
         // Finish the current Active step (if any).
         if let Some(active) = steps.iter_mut().find(|s| s.status == StepStatus::Active) {
             active.status = StepStatus::Done;
@@ -150,29 +155,28 @@ impl StepLedger for SessionStepLedger {
     }
 
     fn steps(&self) -> Vec<Step> {
-        self.steps.lock().unwrap().clone()
+        self.state.lock().unwrap().steps.clone()
     }
     fn count(&self) -> u64 {
-        self.steps.lock().unwrap().len() as u64
+        self.state.lock().unwrap().steps.len() as u64
     }
     fn done_count(&self) -> u64 {
-        self.steps
+        self.state
             .lock()
             .unwrap()
+            .steps
             .iter()
             .filter(|s| s.status == StepStatus::Done)
             .count() as u64
     }
     fn clear(&self) {
-        self.steps.lock().unwrap().clear();
+        *self.state.lock().unwrap() = PlanSnapshot::default();
     }
     fn snapshot(&self) -> PlanSnapshot {
-        PlanSnapshot {
-            steps: self.steps.lock().unwrap().clone(),
-        }
+        self.state.lock().unwrap().clone()
     }
     fn restore(&self, snap: &PlanSnapshot) {
-        *self.steps.lock().unwrap() = snap.steps.clone();
+        *self.state.lock().unwrap() = snap.clone();
     }
 }
 
@@ -194,6 +198,12 @@ pub(crate) fn build_plan_block(ledger: &dyn StepLedger, total_cap: usize) -> Opt
         return None;
     }
     let mut body = String::from("<plan>\n");
+    if let Some(target) = ledger.snapshot().target {
+        body.push_str(&format!(
+            "Selected source (agent data): {}\n",
+            target.label()
+        ));
+    }
     for (i, step) in steps.iter().enumerate() {
         let mark = match step.status {
             StepStatus::Done => "✓",
@@ -239,6 +249,11 @@ pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
     if steps.len() < 2 {
         return None; // no plan, or a single-step plan that needs no re-seat
     }
+    let target = ledger
+        .snapshot()
+        .target
+        .map(|t| format!(" Selected source (agent data): {}.", t.label()))
+        .unwrap_or_default();
     let active = steps.iter().position(|s| s.status == StepStatus::Active)?;
     let done = steps
         .iter()
@@ -246,7 +261,7 @@ pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
         .count();
     Some(super::workflow_guidance(format!(
         "[Plan progress: {done}/{} done (agent-maintained, advisory). ACTIVE \u{2192} step {}. \
-         Continue this step when it still matches the operator's request.]",
+         Continue this step when it still matches the operator's request.{target}]",
         steps.len(),
         active + 1
     )))
@@ -288,7 +303,8 @@ pub fn step_change_line(before: &PlanSnapshot, after: &PlanSnapshot) -> Option<S
 }
 
 fn same_plan(a: &PlanSnapshot, b: &PlanSnapshot) -> bool {
-    a.len() == b.len()
+    a.target == b.target
+        && a.len() == b.len()
         && a.steps
             .iter()
             .zip(&b.steps)
@@ -334,10 +350,21 @@ pub fn update_plan_tool_definition() -> serde_json::Value {
                             every turn; mark the step you are on \"in_progress\" and finished \
                             steps \"completed\". Prefer this before more investigation for \
                             multi-step, ambiguous, resumed, or context-compacted work. Replaces \
-                            plan_set/plan_advance.",
+                            plan_set/plan_advance. When selecting a source to change, pin its full repository-relative path with target, scope and evidence. Keep that full path in steps; revise explicitly if the selection changes.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "target": {
+                        "type": "object",
+                        "description": "Pin the selected source. Omit to preserve it. A change requires an explicit revision reason and fresh selection evidence; this records agent intent, not operator authority.",
+                        "properties": {
+                            "path": {"type": "string", "description": "Full repository-relative source path, not an extraction destination."},
+                            "scope": {"type": "string", "description": "Search/selection scope."},
+                            "evidence": {"type": "string", "description": "Observed evidence supporting selection."},
+                            "revision": {"type": "string", "description": "Why this initial selection or explicit revision satisfies the operator's objective."}
+                        },
+                        "required": ["path", "scope", "evidence", "revision"]
+                    },
                     "plan": {
                         "type": "array",
                         "items": {
@@ -482,7 +509,15 @@ pub(crate) fn execute_update_plan(
                 "error: update_plan requires a non-empty `plan` array".to_string()
             } else {
                 normalize_active(&mut steps);
-                ledger.restore(&PlanSnapshot { steps });
+                let previous = ledger.snapshot().target;
+                let target = match args.get("target") {
+                    Some(value) => match PinnedTarget::revise(value, previous.as_ref()) {
+                        Ok(target) => Some(target),
+                        Err(error) => return format!("error: {error}"),
+                    },
+                    None => previous,
+                };
+                ledger.restore(&PlanSnapshot { steps, target });
                 plan_block(ledger).unwrap_or_else(|| "plan updated".to_string())
             }
         }
@@ -686,6 +721,7 @@ mod tests {
 
     fn snapshot(steps: &[(&str, StepStatus)]) -> PlanSnapshot {
         PlanSnapshot {
+            target: None,
             steps: steps
                 .iter()
                 .map(|(d, status)| Step {
@@ -916,5 +952,43 @@ mod tests {
         assert!(block.contains("→ 1. scope it"), "{block}");
         assert!(block.contains("☐ 2. build it"), "{block}");
         assert_eq!(l.count(), 2, "plan_get is read-only");
+    }
+}
+
+#[cfg(test)]
+mod selected_target_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A plan approval must not lose the selected nested source's identity.
+    #[test]
+    fn selected_target_survives_plan_replacement_and_approval_snapshot() {
+        let ledger = SessionStepLedger::default();
+        let result = execute_update_plan(
+            &json!({
+                "plan": [{"step": "Extract a component"}],
+                "target": {
+                    "path": "packages/engine/nested/root.code",
+                    "scope": "all tracked implementation files",
+                    "evidence": "line inventory: 4301; next candidate 2900",
+                    "revision": "Initial selection"
+                }
+            }),
+            &ledger,
+            false,
+            0,
+        );
+        assert!(
+            result.contains("packages/engine/nested/root.code"),
+            "{result}"
+        );
+        execute_update_plan(&json!({"plan":[{"step":"Verify"}]}), &ledger, false, 0);
+        let restored = SessionStepLedger::default();
+        restored.restore(
+            &serde_json::from_str(&serde_json::to_string(&ledger.snapshot()).unwrap()).unwrap(),
+        );
+        assert!(plan_block(&restored)
+            .unwrap()
+            .contains("packages/engine/nested/root.code"));
     }
 }

@@ -192,12 +192,12 @@ fn a_plan_turn_that_set_a_ledger_plan_is_asked_without_a_draft() {
 /// With no presented draft, approval seeds implementation from the ledger's
 /// own `<plan>` block — the plan the operator just read.
 #[test]
-fn approval_seeds_the_ledger_plan_when_no_draft_was_presented() {
+fn selected_target_approval_seeds_the_ledger_plan_when_no_draft_was_presented() {
     let states = ConversationModeStates::default();
     let a = objective("refactor the parser");
     states.plan.set_plan_mode(true).unwrap();
     let mut gate = ScriptedGate::new([answer("y")]);
-    let block = "<plan>\n✓ 1. inspect\n→ 2. repair\n</plan>";
+    let block = "<plan>\nSelected source (agent data): \"packages/parser/nested/root.py\"\n✓ 1. inspect packages/parser/nested/root.py\n→ 2. repair packages/parser/nested/root.py\n</plan>";
     let effects = run_plan_approval(
         Some(&mut gate),
         PlanEntry::ModelDuringAct,
