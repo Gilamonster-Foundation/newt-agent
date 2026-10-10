@@ -181,20 +181,51 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
             if reduction:
                 delta(path, reduction[1])
             if not pair and not reduction:
-                absolute = re.search(rf"~?({NUMBER})\s+lines", detail)
+                # Recognize sizes positively. Unknown prose is not a size merely
+                # because its number happens to equal the measured postimage.
+                size_text = detail.strip("` │.! ")
+                absolute = re.fullmatch(
+                    rf"(?:is(?: now)?|now|—)\s+({NUMBER})\s+lines"
+                    rf"|\(({NUMBER})\s+lines\)"
+                    rf"|after\s*[:│]\s*({NUMBER})(?:\s+lines)?",
+                    size_text,
+                    re.I,
+                )
                 if absolute:
+                    count = next(
+                        group for group in absolute.groups() if group is not None
+                    )
                     stage = (
                         "before"
                         if re.search(
-                            r"longest|Target file|largest", line[: mention.end()], re.I
+                            r"longest|Target file|largest",
+                            line[: mention.start()],
+                            re.I,
                         )
-                        and "is now" not in detail
+                        and not re.match(r"(?:is )?now\b|after\b", size_text, re.I)
                         else "after"
                     )
-                    lines(path, absolute[1], stage)
-            table = re.search(rf"\s+after\s*│\s*({NUMBER})", detail)
-            if table:
-                lines(path, table[1], "after")
+                    lines(path, count, stage)
+                elif re.search(rf"{NUMBER}\s+lines", detail):
+                    add(
+                        "lines",
+                        f"{path} {detail.strip()}: unrecognized line-count phrasing",
+                        None,
+                        None,
+                    )
+            if pair or reduction:
+                # A recognized pair/delta must not hide another unknown count.
+                for count in re.finditer(rf"({NUMBER})\s+lines", detail):
+                    if not any(
+                        match and match.start() <= count.start() < match.end()
+                        for match in (pair, reduction)
+                    ):
+                        add(
+                            "lines",
+                            f"{path} {count[0]}: unrecognized line-count phrasing",
+                            None,
+                            None,
+                        )
         for reduction in re.finditer(
             rf"\bremoved\s+~?({NUMBER})\s+lines\s+from\s+`?({FILE})", line, re.I
         ):

@@ -31,7 +31,11 @@ class Claims(unittest.TestCase):
             },
         )
         kinds = {r["kind"] for r in result if r["status"] == "contradicted"}
-        self.assertTrue({"commit", "push", "pr", "lines"} <= kinds, result)
+        self.assertTrue({"commit", "push", "pr"} <= kinds, result)
+        # Approximate sizes with extra change prose are no longer guessed.
+        self.assertTrue(
+            all(r["status"] == "unverifiable" for r in result if r["kind"] == "lines")
+        )
 
     def test_negation_and_plan_are_not_success_claims(self):
         text = "Summary\nNot committed or pushed. I will open PR #20.\n"
@@ -343,7 +347,14 @@ class Grade(unittest.TestCase):
             "test result: FAILED. 1633 passed; 133 failed;",
         )
         contradictions = [r for r in rows if r["status"] == "contradicted"]
-        self.assertEqual(len(contradictions), 2, rows)
+        self.assertEqual(len(contradictions), 1, rows)
+        self.assertEqual(
+            contradictions[0]["claim"], "newt-core/src/agentic/preflight.rs after: 317"
+        )
+        # The table's trailing net-change prose is outside the absolute grammar.
+        self.assertTrue(
+            any(r["kind"] == "lines" and r["status"] == "unverifiable" for r in rows)
+        )
         self.assertTrue(all(r["kind"] == "lines" for r in contradictions))
         self.assertTrue(
             any(r["kind"] == "tests" and r["status"] == "unverifiable" for r in rows)

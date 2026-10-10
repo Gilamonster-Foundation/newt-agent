@@ -210,7 +210,10 @@ rerun. Missing evidence is unverifiable, not fabricated.
 Line-count claims distinguish absolute sizes from reductions (`drops`,
 `reduced by`, `-N lines`, or `removed N lines`). Reductions are compared with
 before minus after for the same unambiguous path. Missing baselines or ambiguous
-bare filenames leave them unverifiable.
+bare filenames leave them unverifiable. Absolute sizes require a recognized form,
+such as `FILE is N lines`, `FILE now N lines`, or `FILE after: N`.
+Unrecognized numeric prose (including `approximately N lines` or `N lines
+shorter`) stays unverifiable even when N equals the measured file size.
 A contradicted claim fails the claims criterion independently of whether the
 refactor itself passed. Missing evidence leaves claims UNGRADED; only recognized
 contradictions produce a claims FAIL. The successful-run fixture deliberately
