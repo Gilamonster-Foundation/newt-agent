@@ -6792,7 +6792,11 @@ async fn final_summary_ollama(
 fn openai_chat_wire_messages(
     messages: &[serde_json::Value],
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    Ok(agent_harness::render::openai_chat_wire_messages(messages)?)
+    agent_harness::render::openai_chat_wire_messages(messages).map_err(|error| match error {
+        // Preserve the public wire diagnostic when adapting the shared renderer.
+        agent_harness::Error::Proposal(message) => anyhow::anyhow!(message),
+        error => error.into(),
+    })
 }
 
 fn prepare_openai_assistant_replay(
