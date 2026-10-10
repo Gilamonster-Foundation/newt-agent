@@ -1118,6 +1118,7 @@ async fn final_summary_provider_contracts() {
                 }
             };
             let (reply, streamed, usage) = result.expect("summary failures become fallbacks");
+            let reply = reply.test_text();
             // Every provider retries a transient 503 once. Until #2313's
             // classifier fix this pinned Ollama's non-retry as a contract: its
             // `Ollama 503 ...` text carried no status the classifier recognised.
@@ -1404,7 +1405,12 @@ async fn refusal_with_empty_content_returns_the_honest_placeholder() {
             .await
             .expect("a refusal is NOT an error");
 
-    assert_eq!(reply, "the model declined this request (refusal)");
+    assert!(reply.contains("the model declined this request (refusal)"));
+    assert_eq!(
+        model_reply_for_history(&reply),
+        "",
+        "a host refusal placeholder is not model prose"
+    );
     assert!(!streamed);
     assert_eq!(hallu, 0);
     let requests = server.received_requests().await.expect("recorded");

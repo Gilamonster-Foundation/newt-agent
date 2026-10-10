@@ -96,7 +96,7 @@ fn push_2769_finalizer_and_updated_facts() {
     let root = tempfile::tempdir().unwrap();
     let mut ledger = VerificationLedger::default();
     let text = crate::agentic::finalize_final_text(
-        "Pushed: origin/topic is live.".into(),
+        "Pushed: origin/topic is live.".to_string(),
         root.path().to_str().unwrap(),
         &crate::Scope::All,
         &crate::agentic::capability_check::Evidence::default(),

@@ -1728,7 +1728,7 @@ mod tests {
         let claims =
             crate::agentic::claim_check::TurnClaims::capture(workspace, &crate::Scope::All, None);
         let reply = crate::agentic::finalize_final_text(
-            "private model explanation".into(),
+            "private model explanation".to_string(),
             workspace,
             &crate::Scope::All,
             &crate::agentic::capability_check::Evidence::default(),

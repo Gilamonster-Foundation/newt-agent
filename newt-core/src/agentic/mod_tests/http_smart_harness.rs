@@ -186,6 +186,7 @@ async fn all_four_wires_preserve_questions_and_honestly_stop_exhausted_narration
         )
         .await;
         assert!(text.contains("Incomplete"), "{wire}");
+        assert_eq!(model_reply_for_history(&text), "I am finished.", "{wire}");
         assert_eq!(
             reason,
             crate::TurnEndReason::NarrationCapExhausted,
@@ -202,6 +203,7 @@ async fn all_four_wires_fail_loudly_on_malformed_adjudication_and_final_round_na
         let (text, reason, requests) =
             run(wire, &["Done."], &["prose surrounding \"answer\""], 4).await;
         assert!(text.contains("AdjudicationFailure"), "{wire}");
+        assert_eq!(model_reply_for_history(&text), "", "{wire}");
         assert_eq!(reason, crate::TurnEndReason::Failed, "{wire}");
         assert_eq!(requests.len(), 1, "{wire}");
         let (_, reason, requests) = run(wire, &["I will inspect it."], &["\"narration\""], 1).await;

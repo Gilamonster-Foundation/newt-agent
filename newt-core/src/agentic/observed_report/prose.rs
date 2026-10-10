@@ -1,5 +1,5 @@
 //! Copied report envelopes are model prose, never another source of facts.
-use super::{CHECKS_HEADING, FILES_HEADING, PUBLICATIONS_HEADING};
+use super::{CHECKS_HEADING, FILES_HEADING, NOTICES_HEADING, PUBLICATIONS_HEADING};
 
 /// Remove only complete report-shaped envelopes outside quoted examples.
 /// This is presentation cleanup, never verification of a displayed CID.
@@ -39,6 +39,9 @@ pub(crate) fn replay_messages(messages: &[crate::MemMessage]) -> Vec<crate::MemM
             }
             message
         })
+        // A harness-only stop has no assistant speech. In particular, do not
+        // send an empty assistant content block to providers that reject it.
+        .filter(|message| message.role != crate::Role::Assistant || !message.content.is_empty())
         .collect()
 }
 
@@ -67,7 +70,23 @@ fn complete_report(report: &str) -> bool {
     let Some(report) = report.strip_suffix('\n') else {
         return false;
     };
-    let parts: Vec<_> = report.split("\n\n").collect();
+    let mut parts: Vec<_> = report.split("\n\n").collect();
+    if let Some(status) = parts.last().filter(|s| s.starts_with(NOTICES_HEADING)) {
+        let Some(rows) = status
+            .strip_prefix(NOTICES_HEADING)
+            .and_then(|s| s.strip_prefix('\n'))
+        else {
+            return false;
+        };
+        if rows.is_empty()
+            || !rows
+                .lines()
+                .all(|s| s.strip_prefix("- ").is_some_and(literal))
+        {
+            return false;
+        }
+        parts.pop();
+    }
     if parts.len() == 2 && parts[0] == "## Observed" {
         return matches!(
             parts[1],

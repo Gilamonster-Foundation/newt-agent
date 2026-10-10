@@ -130,7 +130,7 @@ fn issue_2741_finalizer_checks_pr_claims() {
     let root = tempfile::tempdir().unwrap();
     let text = "PR #1 is open: extracted loop";
     let got = crate::agentic::finalize_final_text(
-        text.into(),
+        text.to_string(),
         root.path().to_str().unwrap(),
         &crate::Scope::All,
         &crate::agentic::capability_check::Evidence::default(),
@@ -170,7 +170,7 @@ async fn issue_2741_plain_shell_success_cannot_certify_a_pr() {
 fn final_claim(ledger: &VerificationLedger, text: &str) -> String {
     let root = tempfile::tempdir().unwrap();
     crate::agentic::finalize_final_text(
-        text.into(),
+        text.to_string(),
         root.path().to_str().unwrap(),
         &crate::Scope::All,
         &crate::agentic::capability_check::Evidence::default(),

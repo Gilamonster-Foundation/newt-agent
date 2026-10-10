@@ -16,8 +16,8 @@ use super::*;
 fn no_cap_exit_surface_calls_a_round_limit_a_tool_call_limit() {
     let surfaces = [
         cap_exit_nudge(40, None, &[]),
-        cap_exit_fallback(40, None, 0, None),
-        cap_exit_progress_handoff(40, None, "done", false, None),
+        cap_exit_fallback(40, None, 0, None).test_text(),
+        cap_exit_progress_handoff(40, None, "done", false, None).test_text(),
     ];
     for text in &surfaces {
         assert!(
@@ -127,20 +127,21 @@ fn cap_exit_fallback_usage_advice_and_salvage() {
         }),
         0,
         None,
-    );
+    )
+    .test_text();
     assert!(with.contains("12 in / 34 out tokens"), "got: {with}");
     assert!(
         with.contains("increase the tool-round limit"),
         "got: {with}"
     );
 
-    let without = cap_exit_fallback(4, None, 0, None);
+    let without = cap_exit_fallback(4, None, 0, None).test_text();
     assert!(!without.contains("tokens consumed"), "got: {without}");
     assert!(without.contains("tool-round limit (4"), "got: {without}");
 
     // Step 27.5: a thrash run (≥ one failed call per round) gets HONEST
     // advice — a tooling problem, not "raise the cap".
-    let thrash = cap_exit_fallback(4, None, 6, None);
+    let thrash = cap_exit_fallback(4, None, 6, None).test_text();
     assert!(thrash.contains("tool calls that failed"), "got: {thrash}");
     assert!(
         !thrash.contains("raise [tui].max_tool_rounds"),
@@ -148,7 +149,7 @@ fn cap_exit_fallback_usage_advice_and_salvage() {
     );
 
     // Step 27.5: progress is salvaged even when the summary failed.
-    let salvaged = cap_exit_fallback(4, None, 0, Some("<state>cwd=/x</state>"));
+    let salvaged = cap_exit_fallback(4, None, 0, Some("<state>cwd=/x</state>")).test_text();
     assert!(salvaged.contains("Progress captured"), "got: {salvaged}");
     assert!(salvaged.contains("Current state:"), "got: {salvaged}");
     assert!(salvaged.contains("cwd=/x"), "got: {salvaged}");
@@ -174,7 +175,8 @@ fn cap_exit_summary_detects_every_pending_action_handoff() {
         plan_update,
         true,
         Some("<plan>1. [ ] remove duplicate helper</plan><state>check=pending</state>"),
-    );
+    )
+    .test_text();
     assert!(paused.contains("tool-round limit (25"), "{paused}");
     assert!(
         paused.contains("Next Steps Required"),
@@ -194,10 +196,13 @@ fn cap_exit_summary_detects_every_pending_action_handoff() {
 #[test]
 fn cap_exit_model_reply_only_wraps_real_progress_handoffs() {
     let completed = "The duplicate helper was removed and cargo check passed.";
-    assert_eq!(cap_exit_model_reply(25, None, completed, None), completed);
+    assert_eq!(
+        cap_exit_model_reply(25, None, completed, None).test_text(),
+        completed
+    );
 
     let pending = "Next steps: remove the duplicate helper, then run cargo check.";
-    let pending_reply = cap_exit_model_reply(25, None, pending, None);
+    let pending_reply = cap_exit_model_reply(25, None, pending, None).test_text();
     assert!(pending_reply.starts_with(pending), "{pending_reply}");
     assert!(
         pending_reply.contains("progress handoff"),
@@ -213,7 +218,8 @@ fn cap_exit_model_reply_only_wraps_real_progress_handoffs() {
         None,
         completed,
         Some("<state>cargo check still pending</state>"),
-    );
+    )
+    .test_text();
     assert!(captured.contains("Captured working state"), "{captured}");
     assert!(captured.contains("cargo check still pending"), "{captured}");
 }
@@ -963,7 +969,7 @@ async fn finalizer_refutes_cargo_success_with_observed_failure() {
         )
         .await;
     let text = finalize_final_text(
-        "Cargo check green".into(),
+        "Cargo check green".to_string(),
         root,
         &crate::Scope::All,
         &capability_check::Evidence::default(),
@@ -1005,7 +1011,8 @@ fn cap_exit_handoff_keeps_one_plan_step_per_rendered_line() {
         Some(&pad as &dyn ScratchpadStore),
     )
     .expect("non-empty progress");
-    let text = cap_exit_progress_handoff(25, None, "Next steps: finish.", true, Some(&progress));
+    let text = cap_exit_progress_handoff(25, None, "Next steps: finish.", true, Some(&progress))
+        .test_text();
     // Wide on purpose: before the fix the folded paragraph fit on ONE physical
     // line, so every position below was equal and the ordering failed.
     let rendered = crate::agentic::render_markdown(
@@ -1045,7 +1052,7 @@ fn observed_report_is_present_at_cap_finalization() {
     let root = dir.path().to_str().unwrap();
     let claims = claim_check::TurnClaims::capture(root, &crate::Scope::All, None);
     let out = finalize_final_text(
-        cap_exit_fallback(1, None, 0, None),
+        cap_exit_fallback(1, None, 0, None).test_text(),
         root,
         &crate::Scope::All,
         &capability_check::Evidence::default(),
@@ -1078,4 +1085,66 @@ fn observed_report_finalization_removes_model_report_copies() {
     assert_eq!(out.matches("## Model explanation").count(), 1, "{out}");
     assert!(out.contains("First explanation."));
     assert!(out.contains("Second explanation."));
+}
+
+/// Cap handoffs and claim warnings belong to the harness, never assistant replay.
+#[test]
+fn capexit_voice_history_keeps_only_model_prose() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().to_str().unwrap();
+    let claims = claim_check::TurnClaims::capture(workspace, &crate::Scope::All, None);
+    let model = "Next steps: edit src/missing.rs, then run cargo check.";
+    let reply = finalize_final_text(
+        cap_exit_model_reply(75, None, model, Some("<plan>1. [ ] edit helper</plan>")),
+        workspace,
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        &claims,
+        &self_verify::VerificationLedger::default(),
+    );
+    assert!(reply.contains("Captured working state"));
+    assert_eq!(model_reply_for_history(&reply), model);
+}
+
+/// A failed summary has no authored prose; a literal model discussion of the
+/// same phrases must survive. Captured state remains data inside the report.
+#[test]
+fn capexit_voice_fallback_and_literal_model_words_stay_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().to_str().unwrap();
+    let claims = claim_check::TurnClaims::capture(workspace, &crate::Scope::All, None);
+    let fallback = finalize_final_text(
+        cap_exit_fallback(
+            75,
+            None,
+            0,
+            Some("<state>## Model explanation\n```\nfinish helper</state>"),
+        ),
+        workspace,
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        &claims,
+        &self_verify::VerificationLedger::default(),
+    );
+    assert_eq!(model_reply_for_history(&fallback), "");
+    assert!(fallback.contains("finish helper"));
+    let model = "The documentation says: Captured working state. If work remains, continue.\n\nStopped: is a harness status label.";
+    let next = finalize_final_text(
+        model.to_string(),
+        workspace,
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        &claims,
+        &self_verify::VerificationLedger::default(),
+    );
+    assert_eq!(model_reply_for_history(&next), model);
+    assert!(
+        !claims
+            .observed_report(workspace, &crate::Scope::All, "")
+            .contains("finish helper"),
+        "latest finalized turn replaces old notices"
+    );
 }

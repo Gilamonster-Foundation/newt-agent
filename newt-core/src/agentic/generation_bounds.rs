@@ -107,17 +107,16 @@ pub(super) fn partial_responses_text(json: &Value) -> String {
     }
 }
 
-pub(super) fn output_limit_notice(text: String, usage: Option<crate::TokenUsage>) -> String {
+pub(super) fn output_limit_notice(
+    text: String,
+    usage: Option<crate::TokenUsage>,
+) -> super::FinalReply {
     let count = usage.map_or_else(
         || "token usage unavailable".to_string(),
         |usage| format!("{} generated tokens", usage.output_tokens),
     );
     let notice = format!("(model output limit reached; response truncated; {count}. No tool calls from this response were executed. Continuation requires a new operator request.)");
-    if text.is_empty() {
-        notice
-    } else {
-        format!("{notice}\n\n{text}")
-    }
+    super::FinalReply::from(text).with_notice(notice)
 }
 
 /// An ephemeral transport deadline, never persisted or used as identity.
@@ -221,10 +220,9 @@ async fn read_bounded(
     }
 }
 
-pub(super) fn append_notice(text: &mut String, error: &anyhow::Error) {
+pub(super) fn append_notice(text: &mut super::FinalReply, error: &anyhow::Error) {
     if error.downcast_ref::<Stopped>().is_some() {
-        text.push_str("\n\n");
-        text.push_str(&error.to_string());
+        text.notices.push(error.to_string());
     }
 }
 

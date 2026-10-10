@@ -1086,7 +1086,8 @@ async fn the_no_progress_stop_ends_a_smart_harness_turn_typed_and_incomplete() {
     let (result, reason, requests, outcomes) = brake_under_smart_harness(2, None).await;
     let (text, _) = result.expect("the stop is a typed end, not an error");
     assert_eq!(reason, Some(crate::TurnEndReason::NoProgress));
-    assert!(text.starts_with("Stopped:"), "harness notice: {text}");
+    assert_eq!(model_reply_for_history(&text), "");
+    assert!(text.contains("Stopped:"), "harness notice: {text}");
     assert_eq!(
         requests.len(),
         4,
@@ -1113,7 +1114,8 @@ async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
     let (result, reason, _requests, outcomes) = brake_under_smart_harness(1, Some(1)).await;
     let (text, _) = result.expect("the stop must not turn into an error after a re-ask");
     assert_eq!(reason, Some(crate::TurnEndReason::NoProgress));
-    assert!(text.starts_with("Stopped:"), "{text}");
+    assert_eq!(model_reply_for_history(&text), "");
+    assert!(text.contains("Stopped:"), "{text}");
     assert!(
         outcomes.iter().any(|c| c == "continue")
             && outcomes.last().map(String::as_str) == Some("incomplete"),

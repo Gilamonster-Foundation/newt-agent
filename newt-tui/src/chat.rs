@@ -226,9 +226,8 @@ fn paused_at_round_cap(end_reason: Option<newt_core::TurnEndReason>, at_cap: boo
 }
 
 /// The core handoff is shared by TUI, solve, and web callers, so the interactive
-/// continuation affordance belongs here. Returning the decorated value (rather
-/// than printing a second-only notice) ensures conversation persistence and
-/// memory see exactly what the operator saw.
+/// continuation affordance belongs here. This decoration is display-only;
+/// persistence and memory receive the core reply, never this UI hint.
 fn decorate_round_cap_reply(
     reply: &str,
     end_reason: Option<newt_core::TurnEndReason>,
@@ -9105,13 +9104,12 @@ fn session_body(
                         });
                         match response {
                             Ok((reply, was_streamed, usage, hallucinations)) => {
-                                // Core's cap handoff is caller-neutral. Add the
-                                // interactive TUI affordance before any display,
-                                // memory sync, artifact, or conversation save so
-                                // the visible and persisted replies are identical.
+                                // Core's report carries the cap status. The TUI
+                                // resume hint is display-only: memory, artifacts
+                                // and conversation persistence use `reply`.
                                 let paused =
                                     paused_at_round_cap(turn_end_reason, turn_round_cap_hit);
-                                let reply = decorate_round_cap_reply(
+                                let display_reply = decorate_round_cap_reply(
                                     &reply,
                                     turn_end_reason,
                                     turn_round_cap_hit,
@@ -9134,7 +9132,7 @@ fn session_body(
                                         print!(
                                             "{}",
                                             newt_core::agentic::render_markdown(
-                                                &reply,
+                                                &display_reply,
                                                 newt_core::agentic::RenderOpts {
                                                     color: true,
                                                     cols: newt_core::agentic::reply_cols(cols),
@@ -9143,7 +9141,7 @@ fn session_body(
                                         );
                                         println!();
                                     } else {
-                                        print_newt(&reply, color, verbose);
+                                        print_newt(&display_reply, color, verbose);
                                     }
                                 }
                                 // #2424: present the Plan-phase draft exactly

@@ -28,7 +28,9 @@ pub mod anthropic_wire;
 /// turn's `ToolEvent` ledger. Same append-never-rewrite shape.
 mod capability_check;
 mod claim_check;
+mod final_reply;
 pub(crate) mod observed_report;
+use final_reply::FinalReply;
 pub use observed_report::assistant_prose as model_reply_for_history;
 mod selected_target;
 mod semantic_pins;
@@ -1858,7 +1860,7 @@ fn announce_tool_activity(name: &str) {
 macro_rules! no_progress_gate {
     (
         $runtime:expr, $steer_allowed:expr, $messages:expr, $end_reason:expr,
-        $solve_obs:expr, $usage:expr, $halluc:expr, $smart:expr, |$h:ident| $record:expr
+        $solve_obs:expr, $usage:expr, $halluc:expr, $smart:expr, ($workspace:expr, $read:expr, $evidence:expr, $disclosure:expr, $claims:expr, $verification:expr), |$h:ident| $record:expr
     ) => {
         match $runtime.no_progress_verdict($steer_allowed) {
             NoProgress::Continue => {}
@@ -1866,7 +1868,7 @@ macro_rules! no_progress_gate {
                 $messages.push(serde_json::json!({ "role": "user", "content": text }));
             }
             NoProgress::Stop => {
-                let notice = $runtime.no_progress_notice();
+                let notice = finalize_final_text(FinalReply::harness($runtime.no_progress_notice()), $workspace, $read, $evidence, $disclosure, $claims, $verification);
                 if let Some($h) = $smart {
                     $record;
                     $h.outcome(crate::TurnEndReason::NoProgress, &notice)?;
@@ -2458,6 +2460,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 accumulated_usage,
                 hallucination_count,
                 smart_harness,
+                (
+                    workspace,
+                    &caveats.fs_read,
+                    &capability_evidence,
+                    disclosure,
+                    &turn_claims,
+                    &verification
+                ),
                 |harness| harness.record_messages(&messages)?
             );
         }
@@ -3297,9 +3307,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         messages.push(serde_json::json!({"role":"user", "content":nudge}));
                         continue 'round_loop;
                     }
-                    smart_harness::Control::Answer => {
-                        (probe_content.clone(), crate::TurnEndReason::Completed)
-                    }
+                    smart_harness::Control::Answer => (
+                        FinalReply::from(probe_content.clone()),
+                        crate::TurnEndReason::Completed,
+                    ),
                     smart_harness::Control::Finish { text, reason } => (text, reason),
                 };
                 if let Some(slot) = &mut end_reason {
@@ -3836,7 +3847,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     }
                     observability::observe_harness_reply(&mut solve_obs);
                     return Ok((
-                        suspicious_empty_ollama_diagnostic(&json),
+                        finalize_final_text(
+                            FinalReply::harness(suspicious_empty_ollama_diagnostic(&json)),
+                            workspace,
+                            &caveats.fs_read,
+                            &capability_evidence,
+                            disclosure,
+                            &turn_claims,
+                            &verification,
+                        ),
                         false,
                         merged,
                         hallucination_count,
@@ -3847,7 +3866,20 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     **slot = Some(crate::TurnEndReason::Empty);
                 }
                 observability::observe_harness_reply(&mut solve_obs);
-                return Ok((msg.to_string(), false, merged, hallucination_count));
+                return Ok((
+                    finalize_final_text(
+                        FinalReply::harness(msg.to_owned()),
+                        workspace,
+                        &caveats.fs_read,
+                        &capability_evidence,
+                        disclosure,
+                        &turn_claims,
+                        &verification,
+                    ),
+                    false,
+                    merged,
+                    hallucination_count,
+                ));
             }
             maybe_nudge_no_tool_content!(probe_content.as_str(), None);
             // Phase 20 §2.2: non-empty probe content is usable output.
@@ -4294,6 +4326,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             &mut end_reason,
         )? {
             dismiss_completed_spill(&completed_spill_renderer);
+            let text = finalize_final_text(
+                FinalReply::harness(text),
+                workspace,
+                &caveats.fs_read,
+                &capability_evidence,
+                disclosure,
+                &turn_claims,
+                &verification,
+            );
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
     }
@@ -5780,9 +5821,10 @@ fn readonly_completion_handoff(
         });
     }
     finalize_final_text(
-        format!(
-            "{content}\n\nThis response appears unfinished. If the request is still unresolved, \
+        FinalReply::from(content.to_owned()).with_notice(
+            "This response appears unfinished. If the request is still unresolved, \
              reply `continue` to resume the read-only check, or clarify what evidence you need."
+                .into(),
         ),
         workspace,
         read_scope,
@@ -6426,15 +6468,15 @@ fn cap_exit_fallback(
     accumulated: Option<crate::TokenUsage>,
     wasted_calls: usize,
     progress: Option<&str>,
-) -> String {
+) -> FinalReply {
     let tokens_hint = cap_exit_tokens_hint(max_tool_rounds, accumulated);
     let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
     let salvaged = cap_exit_progress_block("Progress captured before the summary failed", progress);
-    format!(
+    FinalReply::harness(format!(
         "Paused at the tool-round limit ({max_tool_rounds} rounds){tokens_hint}. \
          The final summarization request also failed while preparing a progress \
          update; {advice}.{salvaged}"
-    )
+    ))
 }
 
 /// Preserve the model-authored progress update while making the objective state
@@ -6447,7 +6489,7 @@ fn cap_exit_progress_handoff(
     content: &str,
     has_pending_actions: bool,
     progress: Option<&str>,
-) -> String {
+) -> FinalReply {
     let tokens_hint = cap_exit_tokens_hint(max_tool_rounds, accumulated);
     let pending = if has_pending_actions {
         " The proposed next actions in this update have not run yet."
@@ -6455,10 +6497,10 @@ fn cap_exit_progress_handoff(
         ""
     };
     let captured = cap_exit_progress_block("Captured working state", progress);
-    format!(
-        "{content}\n\nThe tool loop reached the tool-round limit ({max_tool_rounds} rounds){tokens_hint}. \
+    FinalReply::from(content.to_owned()).with_notice(format!(
+        "The tool loop reached the tool-round limit ({max_tool_rounds} rounds){tokens_hint}. \
          This progress handoff preserves the model's update.{pending}{captured}"
-    )
+    ))
 }
 
 fn cap_exit_summary_is_action_handoff(content: &str) -> bool {
@@ -6477,12 +6519,12 @@ fn cap_exit_model_reply(
     accumulated: Option<crate::TokenUsage>,
     content: &str,
     progress: Option<&str>,
-) -> String {
+) -> FinalReply {
     let pending = cap_exit_summary_is_action_handoff(content);
     if pending || progress.is_some() {
         cap_exit_progress_handoff(max_tool_rounds, accumulated, content, pending, progress)
     } else {
-        content.to_string()
+        FinalReply::from(content.to_string())
     }
 }
 
@@ -6495,7 +6537,7 @@ fn cap_exit_model_reply(
 /// verified; the same promise holds for any final answer, not just one
 /// forced out by the round cap.
 fn finalize_final_text(
-    text: String,
+    text: impl Into<FinalReply>,
     workspace: &str,
     read_scope: &crate::Scope<String>,
     capability_evidence: &capability_check::Evidence,
@@ -6505,19 +6547,26 @@ fn finalize_final_text(
     turn_claims: &claim_check::TurnClaims<'_>,
     verification: &self_verify::VerificationLedger,
 ) -> String {
-    let text = observed_report::model_prose(&text);
-    let observed = turn_claims.observed_report(workspace, read_scope, &text);
-    let text = capability_check::annotate_unobserved_probe(text, capability_evidence);
-    let text = turn_claims.annotate(
-        text,
+    let mut reply = text.into();
+    reply.model = observed_report::model_prose(&reply.model);
+    // Evaluate each gate against model prose only. Its appended diagnostics are
+    // harness evidence, not words to attribute to the assistant.
+    reply.annotation(capability_check::annotate_unobserved_probe(
+        reply.model.clone(),
+        capability_evidence,
+    ));
+    reply.annotation(turn_claims.annotate(
+        reply.model.clone(),
         workspace,
         verification.claim_directories(),
         read_scope,
-    );
-    let text = verification.annotate_cargo_claim(text);
-    let text = verification.annotate_pr_claim(text);
-    let text = verification.annotate_push_claim(text);
-    redact_model_facing(disclosure, format!("{observed}{text}"))
+    ));
+    reply.annotation(verification.annotate_cargo_claim(reply.model.clone()));
+    reply.annotation(verification.annotate_pr_claim(reply.model.clone()));
+    reply.annotation(verification.annotate_push_claim(reply.model.clone()));
+    turn_claims.set_notices(workspace, read_scope, &reply.notices);
+    let observed = turn_claims.observed_report(workspace, read_scope, &reply.model);
+    redact_model_facing(disclosure, format!("{observed}{}", reply.model))
 }
 
 /// The cap-exit context threaded into a final tools-disabled summary (Step
@@ -6565,7 +6614,7 @@ impl CapExit {
         .is_ok()
     }
 
-    fn fallback(&self) -> (String, bool, Option<crate::TokenUsage>) {
+    fn fallback(&self) -> (FinalReply, bool, Option<crate::TokenUsage>) {
         self.fell_back
             .store(true, std::sync::atomic::Ordering::Relaxed);
         (
@@ -6612,12 +6661,12 @@ impl CapExit {
 
     fn recover_rejection(
         &self,
-        result: anyhow::Result<(String, bool, Option<crate::TokenUsage>)>,
+        result: anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)>,
         observations: &mut Option<&mut observability::SolveObservation>,
         state: &mut CompressState,
         round: usize,
         attempt: u32,
-    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+    ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
         self.learn_measurement(state)?;
         if let Err(error) = &result {
             if let Some(rejection) = error.downcast_ref::<context_recovery::OptionalRejection>() {
@@ -6647,7 +6696,7 @@ impl CapExit {
         http_error_prefix: &str,
         estimated_tokens: usize,
         extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
-    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)>
+    ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)>
     where
         Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
     {
@@ -6673,7 +6722,7 @@ impl CapExit {
         estimated_tokens: usize,
         decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
         extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
-    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)>
+    ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)>
     where
         Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
     {
@@ -6764,7 +6813,7 @@ async fn final_summary_ollama(
     mut messages: Vec<serde_json::Value>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
-) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     if !cap.fits(&messages, model) {
         return Ok(cap.fallback());
@@ -6919,7 +6968,7 @@ async fn final_summary_openai(
     context_window: Option<u32>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
-) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     let (count_client, stream_client) = clients;
     cap.push_nudge(&mut messages);
     let messages = openai_chat_wire_messages(&messages)?;
@@ -7492,6 +7541,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 accumulated_usage,
                 hallucination_count,
                 smart_harness,
+                (
+                    workspace,
+                    &caveats.fs_read,
+                    &capability_evidence,
+                    disclosure,
+                    &turn_claims,
+                    &verification
+                ),
                 |harness| harness.record_messages(&messages)?
             );
         }
@@ -8291,7 +8348,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 }
             }
             let text = finalize_final_text(
-                oa_content,
+                generation_bounds::output_limit_notice(oa_content, round_usage),
                 workspace,
                 &caveats.fs_read,
                 &capability_evidence,
@@ -8299,7 +8356,6 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 &turn_claims,
                 &verification,
             );
-            let text = generation_bounds::output_limit_notice(text, round_usage);
             if let Some(slot) = &mut end_reason {
                 **slot = Some(crate::TurnEndReason::Failed);
             }
@@ -8433,9 +8489,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         messages.push(serde_json::json!({"role":"user", "content":nudge}));
                         continue 'round_loop;
                     }
-                    smart_harness::Control::Answer => {
-                        (oa_content.clone(), crate::TurnEndReason::Completed)
-                    }
+                    smart_harness::Control::Answer => (
+                        FinalReply::from(oa_content.clone()),
+                        crate::TurnEndReason::Completed,
+                    ),
                     smart_harness::Control::Finish { text, reason } => (text, reason),
                 };
                 if let Some(slot) = &mut end_reason {
@@ -8778,7 +8835,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 **slot = Some(accepted_reason);
             }
             if content.is_empty() {
-                let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                let out = FinalReply::harness("(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string());
+                let out = finalize_final_text(
+                    out,
+                    workspace,
+                    &caveats.fs_read,
+                    &capability_evidence,
+                    disclosure,
+                    &turn_claims,
+                    &verification,
+                );
                 observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
@@ -9293,6 +9359,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             &mut end_reason,
         )? {
             dismiss_completed_spill(&completed_spill_renderer);
+            let text = finalize_final_text(
+                FinalReply::harness(text),
+                workspace,
+                &caveats.fs_read,
+                &capability_evidence,
+                disclosure,
+                &turn_claims,
+                &verification,
+            );
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
     }
@@ -9741,7 +9816,7 @@ async fn final_summary_anthropic(
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
-) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
     if !cap.fits(&wire_messages, model) {
@@ -10271,6 +10346,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 accumulated_usage,
                 hallucination_count,
                 smart_harness,
+                (
+                    workspace,
+                    &caveats.fs_read,
+                    &capability_evidence,
+                    disclosure,
+                    &turn_claims,
+                    &verification
+                ),
                 |harness| harness.record_messages(&messages)?
             );
         }
@@ -10853,7 +10936,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             }
             let streamed = printed_live && !model_reply.text.is_empty();
             if model_reply.text.is_empty() {
-                let out = "the model declined this request (refusal)".to_string();
+                let out =
+                    FinalReply::harness("the model declined this request (refusal)".to_string());
+                let out = finalize_final_text(
+                    out,
+                    workspace,
+                    &caveats.fs_read,
+                    &capability_evidence,
+                    disclosure,
+                    &turn_claims,
+                    &verification,
+                );
                 observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, streamed, accumulated_usage, hallucination_count));
             }
@@ -11101,9 +11194,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         messages.push(serde_json::json!({"role":"user", "content":nudge}));
                         continue 'round_loop;
                     }
-                    smart_harness::Control::Answer => {
-                        (oa_content.clone(), crate::TurnEndReason::Completed)
-                    }
+                    smart_harness::Control::Answer => (
+                        FinalReply::from(oa_content.clone()),
+                        crate::TurnEndReason::Completed,
+                    ),
                     smart_harness::Control::Finish { text, reason } => (text, reason),
                 };
                 if let Some(slot) = &mut end_reason {
@@ -11431,7 +11525,16 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // the accepted text live (so the TUI doesn't re-print).
             let streamed = printed_live && !content.is_empty();
             if content.is_empty() {
-                let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                let out = FinalReply::harness("(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string());
+                let out = finalize_final_text(
+                    out,
+                    workspace,
+                    &caveats.fs_read,
+                    &capability_evidence,
+                    disclosure,
+                    &turn_claims,
+                    &verification,
+                );
                 observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, streamed, accumulated_usage, hallucination_count));
             }
@@ -11908,6 +12011,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             &mut end_reason,
         )? {
             dismiss_completed_spill(&completed_spill_renderer);
+            let text = finalize_final_text(
+                FinalReply::harness(text),
+                workspace,
+                &caveats.fs_read,
+                &capability_evidence,
+                disclosure,
+                &turn_claims,
+                &verification,
+            );
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
     }
@@ -12751,6 +12863,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 accumulated_usage,
                 hallucination_count,
                 smart_harness,
+                (
+                    workspace,
+                    &caveats.fs_read,
+                    &capability_evidence,
+                    disclosure,
+                    &turn_claims,
+                    &verification
+                ),
                 |harness| harness.record_responses_messages(instructions.as_deref(), &input)?
             );
         }
@@ -13101,7 +13221,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let usage = crate::responses_wire::decode_usage(&json["usage"]);
             accumulated_usage = merge_round_usage(accumulated_usage, usage);
             let text = finalize_final_text(
-                generation_bounds::partial_responses_text(&json),
+                generation_bounds::output_limit_notice(
+                    generation_bounds::partial_responses_text(&json),
+                    usage,
+                ),
                 workspace,
                 &caveats.fs_read,
                 &capability_evidence,
@@ -13109,7 +13232,6 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &turn_claims,
                 &verification,
             );
-            let text = generation_bounds::output_limit_notice(text, usage);
             if let Some(slot) = &mut end_reason {
                 **slot = Some(crate::TurnEndReason::Failed);
             }
@@ -13140,7 +13262,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 // #1964: this normal (non-cap) finish gets the same claim
                 // check + disclosure gate as a cap-exit summary.
                 let out = finalize_final_text(
-                    format!("(the model refused the request) {message}"),
+                    FinalReply::from(message).with_notice("The model refused the request.".into()),
                     workspace,
                     &caveats.fs_read,
                     &capability_evidence,
@@ -13239,7 +13361,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         input.push(serde_json::json!({"role":"user", "content":nudge}));
                         continue;
                     }
-                    smart_harness::Control::Answer => (text, crate::TurnEndReason::Completed),
+                    smart_harness::Control::Answer => {
+                        (FinalReply::from(text), crate::TurnEndReason::Completed)
+                    }
                     smart_harness::Control::Finish { text, reason } => (text, reason),
                 };
                 if let Some(slot) = &mut end_reason {
@@ -13778,6 +13902,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             &mut end_reason,
         )? {
             dismiss_completed_spill(&completed_spill_renderer);
+            let text = finalize_final_text(
+                FinalReply::harness(text),
+                workspace,
+                &caveats.fs_read,
+                &capability_evidence,
+                disclosure,
+                &turn_claims,
+                &verification,
+            );
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
     }
@@ -13981,13 +14114,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 error = %error,
                 "Responses cap-exit summary dispatch failed; returning captured progress"
             );
-            let mut text = finalize_final_text(
-                cap_exit_fallback(
-                    current_tool_round_limit,
-                    cap_accumulated,
-                    repeat_calls.total_failures(),
-                    progress.as_deref(),
-                ),
+            let mut reply = cap_exit_fallback(
+                current_tool_round_limit,
+                cap_accumulated,
+                repeat_calls.total_failures(),
+                progress.as_deref(),
+            );
+            generation_bounds::append_notice(&mut reply, &error);
+            let text = finalize_final_text(
+                reply,
                 workspace,
                 &caveats.fs_read,
                 &capability_evidence,
@@ -13995,7 +14130,6 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &turn_claims,
                 &verification,
             );
-            generation_bounds::append_notice(&mut text, &error);
             if let Some(slot) = &mut end_reason {
                 **slot = Some(cap_reason);
             }
@@ -14012,7 +14146,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         let usage = crate::responses_wire::decode_usage(&json["usage"]);
         accumulated_usage = merge_round_usage(accumulated_usage, usage);
         let text = finalize_final_text(
-            generation_bounds::partial_responses_text(&json),
+            generation_bounds::output_limit_notice(
+                generation_bounds::partial_responses_text(&json),
+                usage,
+            ),
             workspace,
             &caveats.fs_read,
             &capability_evidence,
@@ -14020,7 +14157,6 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             &turn_claims,
             &verification,
         );
-        let text = generation_bounds::output_limit_notice(text, usage);
         if let Some(slot) = &mut end_reason {
             **slot = Some(crate::TurnEndReason::Failed);
         }
@@ -14033,7 +14169,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let text = cap_exit_progress_handoff(
                 current_tool_round_limit,
                 cap_accumulated,
-                &format!("The model refused the progress-summary request: {message}"),
+                &message,
                 false,
                 progress.as_deref(),
             );
