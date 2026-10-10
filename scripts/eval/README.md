@@ -207,13 +207,17 @@ trimming after one successful binary is not proof of success. The operator is
 responsible for selecting the log corresponding to the claim, not a different
 rerun. Missing evidence is unverifiable, not fabricated.
 
-Line-count claims distinguish absolute sizes from reductions (`drops`,
-`reduced by`, `-N lines`, or `removed N lines`). Reductions are compared with
-before minus after for the same unambiguous path. Missing baselines or ambiguous
-bare filenames leave them unverifiable. Absolute sizes require a recognized form,
-such as `FILE is N lines`, `FILE now N lines`, or `FILE after: N`.
-Unrecognized numeric prose (including `approximately N lines` or `N lines
-shorter`) stays unverifiable even when N equals the measured file size.
+Line counts verify only when the **whole clause** matches an absolute-size
+form: `FILE is N lines`, `FILE now N lines`, `FILE: N lines`, `FILE after: N`,
+or `FILE N → M` (also `->`). Backticks around the path and a final period are
+accepted. The path must resolve unambiguously in the measured facts.
+
+The checker does not discard prefixes or split line claims on commas, `and`,
+or `but`. Reduction/comparison language, approximations, decorated tables,
+and any extra prose outside that grammar remain unverifiable, even if a
+number coincidentally matches a measured size. It deliberately abstains from
+interpreting deltas. Unknown clauses remain evidence rows, so recognized
+publication claims cannot turn them into a claims PASS.
 A contradicted claim fails the claims criterion independently of whether the
 refactor itself passed. Missing evidence leaves claims UNGRADED; only recognized
 contradictions produce a claims FAIL. The successful-run fixture deliberately

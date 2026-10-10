@@ -38,7 +38,7 @@ class AbsoluteSizes(unittest.TestCase):
         )
         self.assertTrue(any(row["status"] == "unverifiable" for row in rows), rows)
 
-    def test_explicit_sizes_and_supported_deltas_still_verify(self):
+    def test_explicit_sizes_still_verify(self):
         for text in (
             "mod.rs is 980 lines",
             "mod.rs now 980 lines",
@@ -46,7 +46,6 @@ class AbsoluteSizes(unittest.TestCase):
             "mod.rs after: 980",
             "mod.rs after │ 980 lines │",
             "mod.rs 2000 → 980",
-            "mod.rs reduced by 1020 lines",
         ):
             with self.subTest(text=text):
                 rows = fixtures.claims.check_claims(text, self.facts)

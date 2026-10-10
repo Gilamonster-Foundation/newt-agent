@@ -50,22 +50,15 @@ class LineDeltaClaims(unittest.TestCase):
     }
 
     def test_real_summary_does_not_turn_reduction_into_absolute_size(self):
-        """The reported 1041-line reduction contradicts the measured 980 delta."""
+        """Round 3: compound/approximate reduction prose is not an absolute claim."""
         rows = claims.check_claims(
             (FIXTURES / "line-delta-summary.txt").read_text(), self.facts
         )
-        deltas = [row for row in rows if row["kind"] == "line_delta"]
-        self.assertTrue(deltas, rows)
-        self.assertTrue(
-            all(
-                row["actual"] == 980 and row["status"] == "contradicted"
-                for row in deltas
-            )
-        )
+        self.assertTrue(rows)
+        self.assertTrue(all(row["status"] == "unverifiable" for row in rows), rows)
         self.assertFalse(any(row["claim"] == "mod.rs after: 1041" for row in rows))
-        self.assertIn("workflow.rs after: 1064", [row["claim"] for row in rows])
 
-    def test_delta_spellings_use_before_minus_after(self):
+    def test_delta_spellings_are_outside_the_absolute_grammar(self):
         for text in (
             "mod.rs drops ~980 lines",
             "mod.rs reduced by 980 lines",
@@ -80,18 +73,16 @@ class LineDeltaClaims(unittest.TestCase):
             with self.subTest(text=text):
                 rows = claims.check_claims(text, self.facts)
                 self.assertEqual(len(rows), 1, rows)
-                self.assertEqual(rows[0]["kind"], "line_delta")
-                self.assertEqual(rows[0]["status"], "verified")
+                self.assertEqual(rows[0]["kind"], "lines")
+                self.assertEqual(rows[0]["status"], "unverifiable")
 
     def test_reduction_before_filename_is_checked_beside_absolute_pair(self):
         """The first incident bullet reports a delta as well as two sizes."""
         rows = claims.check_claims(
             "reducing `mod.rs` by ~1,041 lines (11,726 → 10,746)", self.facts
         )
-        delta = next(row for row in rows if row["kind"] == "line_delta")
-        self.assertEqual(delta["actual"], 980)
-        self.assertEqual(delta["status"], "contradicted")
-        self.assertEqual(sum(row["status"] == "verified" for row in rows), 2)
+        self.assertTrue(rows)
+        self.assertTrue(all(row["status"] == "unverifiable" for row in rows), rows)
 
     def test_delta_needs_unambiguous_matching_before_and_after(self):
         for facts in (
@@ -104,7 +95,7 @@ class LineDeltaClaims(unittest.TestCase):
         ):
             rows = claims.check_claims("mod.rs drops 980 lines", facts)
             self.assertEqual(rows[0]["status"], "unverifiable")
-            self.assertEqual(rows[0]["kind"], "line_delta")
+            self.assertEqual(rows[0]["kind"], "lines")
 
 
 class CompleteLogControls(unittest.TestCase):

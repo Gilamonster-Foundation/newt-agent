@@ -329,7 +329,7 @@ class Grade(unittest.TestCase):
         )
         self.assertFalse(any(r["kind"] == "push" for r in rows), rows)
 
-    def test_successful_run_still_has_contradicted_line_claims(self):
+    def test_successful_run_does_not_verify_decorated_line_claims(self):
         """#2804: PR #20 success does not validate its inaccurate line counts."""
         facts = {
             "commits": ["030dc2a" + "0" * 33],
@@ -347,15 +347,10 @@ class Grade(unittest.TestCase):
             "test result: FAILED. 1633 passed; 133 failed;",
         )
         contradictions = [r for r in rows if r["status"] == "contradicted"]
-        self.assertEqual(len(contradictions), 1, rows)
-        self.assertEqual(
-            contradictions[0]["claim"], "newt-core/src/agentic/preflight.rs after: 317"
-        )
-        # The table's trailing net-change prose is outside the absolute grammar.
-        self.assertTrue(
-            any(r["kind"] == "lines" and r["status"] == "unverifiable" for r in rows)
-        )
-        self.assertTrue(all(r["kind"] == "lines" for r in contradictions))
+        self.assertEqual(contradictions, [])
+        line_claims = [r for r in rows if r["kind"] == "lines"]
+        self.assertTrue(line_claims)
+        self.assertTrue(all(r["status"] == "unverifiable" for r in line_claims))
         self.assertTrue(
             any(r["kind"] == "tests" and r["status"] == "unverifiable" for r in rows)
         )

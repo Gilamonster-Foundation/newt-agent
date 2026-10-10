@@ -73,25 +73,30 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
             None if actual is None else actual == expected,
         )
 
-    def delta(path: str, count: str) -> None:
-        before, after = facts.get("before", {}), facts.get("after", {})
-        candidates = {
-            p
-            for p in before.keys() | after.keys()
-            if p == path or p.endswith("/" + path)
-        }
-        actual = None
-        if len(candidates) == 1:
-            candidate = candidates.pop()
-            if candidate in before and candidate in after:
-                actual = before[candidate] - after[candidate]
-        expected = int(count.replace(",", ""))
-        add(
-            "line_delta",
-            f"{path} reduction: {expected}",
-            actual,
-            None if actual is None else actual == expected,
+    # Line claims keep their entire sentence/clause. Splitting on coordination,
+    # contrast, or commas can erase the subject ("difference between old and
+    # new FILE is N lines") and falsely verify the remaining suffix.
+    path_pattern = rf"(?P<quote>`?)(?P<path>{FILE})(?P=quote)"
+    for clause in re.split(r"\n|;|(?<=[.!?])\s+", summary):
+        clause = clause.strip().removesuffix(".")
+        absolute = re.fullmatch(
+            path_pattern
+            + rf"(?:(?:\s+(?:is(?: now)?|now)\s+|:\s*)(?P<size>{NUMBER})\s+lines"
+            + rf"|\s+after\s*[:│]\s*(?P<after>{NUMBER})(?:\s+lines)?(?:\s*│)?)",
+            clause,
+            re.I,
         )
+        pair = re.fullmatch(
+            path_pattern + rf"\s+(?P<before>{NUMBER})\s*(?:→|->)\s*(?P<after>{NUMBER})",
+            clause,
+        )
+        if absolute:
+            lines(absolute["path"], absolute["size"] or absolute["after"], "after")
+        elif pair:
+            lines(pair["path"], pair["before"], "before")
+            lines(pair["path"], pair["after"], "after")
+        elif re.search(FILE, clause) and re.search(r"\d", re.sub(FILE, "", clause)):
+            add("lines", clause + ": unrecognized line-count phrasing", None, None)
 
     # Sentence/contrast boundaries reset context. Within coordination, an
     # explicit future/negative assertion must not hide a completed assertion.
@@ -159,77 +164,6 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
                 prs,
                 None if prs is None else any(p.get("state") == "MERGED" for p in prs),
             )
-        # Scope every numeric statement to its own filename, never across the
-        # next file mentioned in the same sentence.
-        for mention in re.finditer(rf"({FILE})(.*?)(?={FILE}|$)", line):
-            path, detail = mention.groups()
-            pair = re.search(
-                rf"(~?{NUMBER})\s*(?:lines)?\s*(?:→|->|to)\s*~?({NUMBER})", detail
-            )
-            reduction = re.search(
-                rf"(?:\b(?:drops?|reduced|reducing|removed?|removing)(?:\s+by)?\s*|(?<![\w>])-\s*)~?({NUMBER})\b(?:\s+lines)?",
-                detail,
-                re.I,
-            )
-            if reduction is None and re.search(
-                r"\b(?:reduced|reducing)\s+`?$", line[: mention.start()], re.I
-            ):
-                reduction = re.match(rf"`?\s+by\s+~?({NUMBER})\b(?:\s+lines)?", detail)
-            if pair:
-                lines(path, pair[1].lstrip("~"), "before")
-                lines(path, pair[2], "after")
-            if reduction:
-                delta(path, reduction[1])
-            if not pair and not reduction:
-                # Recognize sizes positively. Unknown prose is not a size merely
-                # because its number happens to equal the measured postimage.
-                size_text = detail.strip("` │.! ")
-                absolute = re.fullmatch(
-                    rf"(?:is(?: now)?|now|—)\s+({NUMBER})\s+lines"
-                    rf"|\(({NUMBER})\s+lines\)"
-                    rf"|after\s*[:│]\s*({NUMBER})(?:\s+lines)?",
-                    size_text,
-                    re.I,
-                )
-                if absolute:
-                    count = next(
-                        group for group in absolute.groups() if group is not None
-                    )
-                    stage = (
-                        "before"
-                        if re.search(
-                            r"longest|Target file|largest",
-                            line[: mention.start()],
-                            re.I,
-                        )
-                        and not re.match(r"(?:is )?now\b|after\b", size_text, re.I)
-                        else "after"
-                    )
-                    lines(path, count, stage)
-                elif re.search(rf"{NUMBER}\s+lines", detail):
-                    add(
-                        "lines",
-                        f"{path} {detail.strip()}: unrecognized line-count phrasing",
-                        None,
-                        None,
-                    )
-            if pair or reduction:
-                # A recognized pair/delta must not hide another unknown count.
-                for count in re.finditer(rf"({NUMBER})\s+lines", detail):
-                    if not any(
-                        match and match.start() <= count.start() < match.end()
-                        for match in (pair, reduction)
-                    ):
-                        add(
-                            "lines",
-                            f"{path} {count[0]}: unrecognized line-count phrasing",
-                            None,
-                            None,
-                        )
-        for reduction in re.finditer(
-            rf"\bremoved\s+~?({NUMBER})\s+lines\s+from\s+`?({FILE})", line, re.I
-        ):
-            delta(reduction[2], reduction[1])
         # The supplied log must represent this claimed invocation. Never use a
         # final doctest result as a whole-run count or turn partial logs green.
         counts = []
