@@ -8,8 +8,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const TASK: &str = "record the completed plan against this exact prompt";
-const PLAN_ARGS: &str =
-    r#"{"plan":[{"step":"capture prompt-rooted provenance","status":"completed"}]}"#;
+const PLAN_ARGS: &str = r#"{"plan":[{"step":"capture prompt-rooted provenance","status":"completed"}],"target":{"path":"engine/nested/entry.code","scope":"all implementation files","evidence":"full inventory ranked this first","revision":"initial selection"}}"#;
 
 fn messages(task: &str) -> Vec<MemMessage> {
     vec![MemMessage::system("you are a test"), MemMessage::user(task)]
@@ -154,6 +153,12 @@ fn assert_one_plan_artifact(artifacts: &SessionArtifactStore, turn: &crate::Turn
         .expect("artifact root page");
     assert_eq!(page.total, 1, "one successful plan update, one artifact");
     let record = &page.records[0];
+    let snapshot: PlanSnapshot = serde_json::from_str(record.body.as_deref().unwrap()).unwrap();
+    let target = snapshot
+        .target
+        .expect("selected source retained in artifact");
+    assert_eq!(target.selection.path, "engine/nested/entry.code");
+    assert!(target.valid());
     assert_eq!(record.kind, "plan_revision");
     assert_eq!(record.prompt_id, turn.submitted_prompt().id());
     assert_eq!(
@@ -181,6 +186,13 @@ impl Respond for OllamaPlanResponder {
         self.artifact_read_seen
             .fetch_and(chat_tools_include(&body, "artifact_read"), Ordering::SeqCst);
         let round = self.requests.fetch_add(1, Ordering::SeqCst);
+        if round > 0 {
+            assert!(
+                body.to_string().contains("[NEWT SELECTED SOURCE v1]"),
+                "pin missing from request: {body}"
+            );
+            assert!(body.to_string().contains("engine/nested/entry.code"));
+        }
         match round {
             0 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "message": {
@@ -270,6 +282,13 @@ impl Respond for OpenAiPlanResponder {
         self.artifact_read_seen
             .fetch_and(chat_tools_include(&body, "artifact_read"), Ordering::SeqCst);
         let round = self.requests.fetch_add(1, Ordering::SeqCst);
+        if round > 0 {
+            assert!(
+                body.to_string().contains("[NEWT SELECTED SOURCE v1]"),
+                "pin missing from request: {body}"
+            );
+            assert!(body.to_string().contains("engine/nested/entry.code"));
+        }
         if round == 0 {
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": {
@@ -373,6 +392,13 @@ impl Respond for ResponsesPlanResponder {
             Ordering::SeqCst,
         );
         let round = self.requests.fetch_add(1, Ordering::SeqCst);
+        if round > 0 {
+            assert!(
+                body.to_string().contains("[NEWT SELECTED SOURCE v1]"),
+                "pin missing from request: {body}"
+            );
+            assert!(body.to_string().contains("engine/nested/entry.code"));
+        }
         if round == 0 {
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "output": [{
@@ -643,4 +669,269 @@ async fn invalid_plan_and_declined_write_record_no_artifacts() {
         .unwrap();
     assert_eq!(page.total, 0, "failed/declined work emits no provenance");
     assert!(page.records.is_empty());
+}
+
+/// The real dispatcher must deliver the mismatch to the model before its final
+/// response, not merely annotate an already-published answer.
+#[tokio::test]
+async fn selected_target_diff_warning_reaches_model_before_finalization() {
+    let workspace = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+    ] {
+        assert!(crate::agentic::tools::git_fixture::hermetic_git(
+            workspace.path(),
+            workspace.path()
+        )
+        .args(args)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    }
+    std::fs::create_dir_all(workspace.path().join("engine/nested")).unwrap();
+    std::fs::write(
+        workspace.path().join("engine/nested/entry.code"),
+        "selected source",
+    )
+    .unwrap();
+    for args in [
+        vec!["add", "."],
+        vec!["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+    ] {
+        assert!(crate::agentic::tools::git_fixture::hermetic_git(
+            workspace.path(),
+            workspace.path()
+        )
+        .args(args)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    }
+    let server = MockServer::start().await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .respond_with(OpenAiScriptResponder {
+            requests: requests.clone(),
+            first_message: serde_json::json!({"role":"assistant","content":null,
+                "tool_calls":[
+                    {"id":"pin", "type":"function","function":{"name":"update_plan","arguments":PLAN_ARGS}},
+                    {"id":"wrong-file","type":"function","function":{"name":"write_file",
+                        "arguments":r#"{"path":"elsewhere.txt","content":"wrong target"}"#}}
+                ]}),
+            final_text: "The selected-source task is incomplete.",
+            replay: Default::default(),
+        }).mount(&server).await;
+    let turn = crate::TurnPromptContext::ephemeral_operator("target-diff", TASK, TASK);
+    let artifacts = SessionArtifactStore::new("target-diff").unwrap();
+    let ledger = SessionStepLedger::default();
+    let messages = messages(TASK);
+    let mut caveats = Caveats::top();
+    caveats.fs_write = Scope::only([workspace.path().to_string_lossy().into_owned()]);
+    let uri = server.uri();
+    let mut c = ctx(
+        &uri,
+        &messages,
+        TASK,
+        workspace.path().to_str().unwrap(),
+        &caveats,
+    );
+    c.kind = BackendKind::Openai;
+    c.step_ledger = Some(&ledger);
+    chat_complete_with_prompt_and_artifacts(
+        c,
+        Some(&turn),
+        None,
+        Some(&artifacts),
+        Some(&artifacts),
+        &mut NoMcp,
+    )
+    .await
+    .unwrap();
+    let captured = server.received_requests().await.unwrap();
+    let body = body_json(&captured[1]);
+    let pin = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("[NEWT SELECTED SOURCE v1]"))
+        })
+        .expect("protected pin");
+    assert!(
+        pin["content"]
+            .as_str()
+            .unwrap()
+            .contains("work landed outside the selected source"),
+        "{pin}"
+    );
+    assert!(ledger.snapshot().target.unwrap().valid());
+}
+
+/// A recorded explicit revision preserves the predecessor, rather than
+/// overwriting the selection's provenance as ordinary step progress changes.
+#[tokio::test]
+async fn selected_target_explicit_revision_keeps_both_plan_artifacts() {
+    let server = MockServer::start().await;
+    let mut revised: serde_json::Value = serde_json::from_str(PLAN_ARGS).unwrap();
+    revised["target"]["path"] = serde_json::json!("other/nested/source.text");
+    revised["target"]["revision"] =
+        serde_json::json!("Operator narrowed scope; reran the inventory");
+    let requests = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .respond_with(OpenAiScriptResponder {
+            requests,
+            first_message: serde_json::json!({"role":"assistant","content":null,"tool_calls":[
+                {"id":"initial","type":"function","function":{"name":"update_plan","arguments":PLAN_ARGS}},
+                {"id":"revision","type":"function","function":{"name":"update_plan","arguments":revised.to_string()}}
+            ]}),
+            final_text:"Selection revision recorded.", replay:Default::default(),
+        }).mount(&server).await;
+    let turn = crate::TurnPromptContext::ephemeral_operator("target-revision", TASK, TASK);
+    let artifacts = SessionArtifactStore::new("target-revision").unwrap();
+    let ledger = SessionStepLedger::default();
+    let messages = messages(TASK);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, TASK, ".", &caveats);
+    c.kind = BackendKind::Openai;
+    c.step_ledger = Some(&ledger);
+    chat_complete_with_prompt_and_artifacts(
+        c,
+        Some(&turn),
+        None,
+        Some(&artifacts),
+        Some(&artifacts),
+        &mut NoMcp,
+    )
+    .await
+    .unwrap();
+    let page = artifacts
+        .list_for_root(turn.active_operator_prompt().root_prompt_id(), 0, 10)
+        .unwrap();
+    assert_eq!(page.total, 2);
+    let old: PlanSnapshot = serde_json::from_str(page.records[0].body.as_deref().unwrap()).unwrap();
+    let new: PlanSnapshot = serde_json::from_str(page.records[1].body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        new.target.as_ref().unwrap().selection.previous,
+        Some(old.target.as_ref().unwrap().id)
+    );
+    assert_eq!(ledger.snapshot().target, new.target);
+    // Restoring a prior snapshot is an actual inverse; no history is deleted.
+    ledger.restore(&old);
+    assert_eq!(ledger.snapshot(), old);
+    assert_eq!(
+        artifacts
+            .list_for_root(turn.active_operator_prompt().root_prompt_id(), 0, 10)
+            .unwrap()
+            .total,
+        2
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn selected_target_anthropic_pin_is_on_the_final_request() {
+    let _guards = super::anthropic_loop_tests::test_env(false);
+    let server = MockServer::start().await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |req: &Request| {
+            let round = counter.fetch_add(1, Ordering::SeqCst);
+            let content = if round == 0 {
+                serde_json::json!([{"type":"tool_use","id":"pin","name":"update_plan",
+                    "input":serde_json::from_str::<serde_json::Value>(PLAN_ARGS).unwrap()}])
+            } else {
+                assert!(body_json(req)
+                    .to_string()
+                    .contains("[NEWT SELECTED SOURCE v1]"));
+                serde_json::json!([{"type":"text","text":"Selection recorded."}])
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model":"fixture","stop_reason":if round == 0 {"tool_use"} else {"end_turn"},
+                "content":content,"usage":{"input_tokens":10,"output_tokens":3}
+            }))
+        })
+        .mount(&server)
+        .await;
+    let turn = crate::TurnPromptContext::ephemeral_operator("anthropic-pin", TASK, TASK);
+    let artifacts = SessionArtifactStore::new("anthropic-pin").unwrap();
+    let ledger = SessionStepLedger::default();
+    let messages = messages(TASK);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, TASK, ".", &caveats);
+    c.kind = BackendKind::Anthropic;
+    c.step_ledger = Some(&ledger);
+    chat_complete_with_prompt_and_artifacts(
+        c,
+        Some(&turn),
+        None,
+        Some(&artifacts),
+        Some(&artifacts),
+        &mut NoMcp,
+    )
+    .await
+    .unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_one_plan_artifact(&artifacts, &turn);
+}
+
+struct RejectTargetArtifact;
+impl PromptArtifactSink for RejectTargetArtifact {
+    fn append_artifact(
+        &self,
+        _: crate::PromptId,
+        _: crate::PromptId,
+        _: crate::NewPromptArtifact,
+    ) -> anyhow::Result<artifact_read::ArtifactReadRecord> {
+        anyhow::bail!("fixture artifact append failure")
+    }
+}
+
+/// A failed append cannot silently replace the selection seen by later turns.
+#[tokio::test]
+async fn selected_target_recording_failure_retains_previous_snapshot() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .respond_with(OpenAiScriptResponder {
+            requests: Arc::new(AtomicUsize::new(0)),
+            first_message: serde_json::json!({"role":"assistant","content":null,"tool_calls":[
+                {"id":"pin","type":"function","function":{"name":"update_plan","arguments":PLAN_ARGS}}
+            ]}),
+            final_text:"Target was not recorded.", replay:Default::default(),
+        }).mount(&server).await;
+    let turn = crate::TurnPromptContext::ephemeral_operator("target-rejected", TASK, TASK);
+    let ledger = SessionStepLedger::default();
+    ledger.set_plan(&["Keep the current task".into()]);
+    let before = ledger.snapshot();
+    let messages = messages(TASK);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, TASK, ".", &caveats);
+    c.kind = BackendKind::Openai;
+    c.step_ledger = Some(&ledger);
+    chat_complete_with_prompt_and_artifacts(
+        c,
+        Some(&turn),
+        None,
+        None,
+        Some(&RejectTargetArtifact),
+        &mut NoMcp,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ledger.snapshot(), before);
+    let captured = server.received_requests().await.unwrap();
+    assert!(body_json(&captured[1])
+        .to_string()
+        .contains("target revision was not recorded"));
 }

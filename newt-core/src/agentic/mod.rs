@@ -28,6 +28,7 @@ pub mod anthropic_wire;
 /// turn's `ToolEvent` ledger. Same append-never-rewrite shape.
 mod capability_check;
 mod claim_check;
+mod selected_target;
 pub use claim_check::{
     files_changed_between, is_workspace_repo_root, locate_workspace_repo, nested_current_paths,
     nested_files_changed_between, snapshot_nested_repos, snapshot_workspace,
@@ -2340,7 +2341,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // and nothing watching the turn as a whole.
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
+    let mut selected_source = selected_target::Projection::default();
     'round_loop: for round in 0..usize::MAX {
+        selected_source.refresh(
+            &mut messages,
+            step_ledger,
+            workspace,
+            &caveats.fs_read,
+            worktree_session,
+            false,
+        );
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
         if hidden_tools.append_promoted(&mut tools) {
@@ -7371,7 +7381,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     let mut uncorrelatable_batches: u32 = 0;
+    let mut selected_source = selected_target::Projection::default();
     'round_loop: for round in 0..usize::MAX {
+        selected_source.refresh(
+            &mut messages,
+            step_ledger,
+            workspace,
+            &caveats.fs_read,
+            worktree_session,
+            false,
+        );
         let round_policy = generation_policy;
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
@@ -10102,7 +10121,16 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     let mut uncorrelatable_batches: u32 = 0;
+    let mut selected_source = selected_target::Projection::default();
     'round_loop: for round in 0..usize::MAX {
+        selected_source.refresh(
+            &mut messages,
+            step_ledger,
+            workspace,
+            &caveats.fs_read,
+            worktree_session,
+            false,
+        );
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
         if hidden_tools.append_promoted(&mut tools) {
@@ -12535,7 +12563,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     };
     let mut uncorrelatable_batches: u32 = 0;
     let mut current_tool_round_limit = max_tool_rounds;
+    let mut selected_source = selected_target::Projection::default();
     for round in 0..usize::MAX {
+        selected_source.refresh(
+            &mut input,
+            step_ledger,
+            workspace,
+            &caveats.fs_read,
+            worktree_session,
+            true,
+        );
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
         if hidden_tools.append_promoted(&mut tools_chat) {

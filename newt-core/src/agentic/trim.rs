@@ -38,6 +38,14 @@ pub(crate) fn protected_prompt_head_len(
     {
         head += 1;
     }
+    if messages.get(head).is_some_and(|m| {
+        m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with(super::selected_target::PREFIX))
+    }) {
+        head += 1;
+    }
     head
 }
 

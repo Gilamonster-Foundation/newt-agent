@@ -44,7 +44,7 @@ pub(in crate::agentic::tools) fn hermetic_git_env(
 /// `execute_tool_branch_tests::permissions` git-broker fixture reuses it
 /// too, rather than a second ad hoc git fixture that inherits the ambient
 /// `GIT_DIR`/`HOME`/hooks.
-pub(in crate::agentic::tools) fn hermetic_git(
+pub(in crate::agentic) fn hermetic_git(
     dir: &std::path::Path,
     home: &std::path::Path,
 ) -> std::process::Command {

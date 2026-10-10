@@ -4,6 +4,7 @@ use super::*;
 async fn pending_plan_final_answer_nudges_before_handoff() {
     let ledger = SessionStepLedger::default();
     ledger.restore(&PlanSnapshot {
+        target: None,
         steps: vec![
             Step {
                 description: "convert help sections".to_string(),
@@ -52,6 +53,7 @@ async fn pending_plan_final_answer_nudges_before_handoff() {
 async fn findings_summary_with_stale_plan_nudges_update_plan_then_continues() {
     let ledger = SessionStepLedger::default();
     ledger.restore(&PlanSnapshot {
+        target: None,
         steps: vec![
             Step {
                 description: "convert help sections".to_string(),
@@ -140,6 +142,7 @@ However, I've reached the tool-round limit and cannot make these edits now.";
 async fn completed_plan_final_answer_is_accepted() {
     let ledger = SessionStepLedger::default();
     ledger.restore(&PlanSnapshot {
+        target: None,
         steps: vec![Step {
             description: "done".to_string(),
             status: StepStatus::Done,
@@ -160,6 +163,7 @@ async fn completed_plan_final_answer_is_accepted() {
 async fn continuing_with_active_step_after_plan_nudge_gets_action_nudge() {
     let ledger = SessionStepLedger::default();
     ledger.restore(&PlanSnapshot {
+        target: None,
         steps: vec![
             Step {
                 description: "convert help sections".to_string(),
