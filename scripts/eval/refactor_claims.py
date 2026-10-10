@@ -194,7 +194,17 @@ def check_claims(
             re.sub(FILE, "", context),
             re.I,
         )
-        if (sizes or pairs) and not comparison:
+        # Explicit helper/predicate/caller counts are not file sizes (E1).
+        size_context = re.sub(
+            rf"{NUMBER}\s+(?:pure\s+)?(?:helpers?|predicates?|callers?)\b",
+            " ",
+            context,
+            flags=re.I,
+        )
+        residue = re.search(
+            rf"{NUMBER}\s*(?:-\s*)?lines?\b|{FILE}.*?\d", size_context, re.I
+        )
+        if (sizes or pairs) and not comparison and not residue:
             for size in sizes:
                 unqualified(size["path"], size["count"])
             for pair in pairs:
@@ -287,23 +297,28 @@ def check_claims(
         if line in command_lines:
             argv = named_test(line)
             test_evidence = test_totals(clean_terminal((test_logs or {}).get(argv, "")))
-        elif re.search(r"\b(?:pure\s+(?:fs-free\s+)?|fs-free\s+)tests?\b", line):
-            # An inventory of new tests does not identify a test invocation.
-            test_evidence = None
         counts = []
         for count in re.finditer(
-            rf"({NUMBER})\s+(?:pure\s+)?(?:fs-free\s+)?tests?(?:\s+(passed|pass|failed|fail|ignored|total)\b)?|({NUMBER})\s+(passed|failed|ignored|failures)\b",
+            rf"({NUMBER})\s+(?:[A-Za-z][\w-]*\s+)*?tests?(?:\s+(passed|pass|failed|fail|ignored|total)\b)?|({NUMBER})\s+(passed|failed|ignored|failures)\b",
             line,
             re.I,
         ):
             number = count[1] or count[3]
-            kind = (count[2] or count[4] or "total").lower()
+            # A count of test definitions is not a completed invocation.
+            # Require a result qualifier, independently of inventory adjectives.
+            kind = (count[2] or count[4] or "inventory").lower()
+            if re.search(r"\bwith\s*$", line[: count.start()], re.I):
+                kind = "inventory"
             kind = {"pass": "passed", "fail": "failed", "failures": "failed"}.get(
                 kind, kind
             )
             counts.append((number, kind))
         for count, kind in counts:
-            actual = test_evidence[kind] if test_evidence is not None else None
+            actual = (
+                test_evidence[kind]
+                if test_evidence is not None and kind != "inventory"
+                else None
+            )
             expected = int(count.replace(",", ""))
             add(
                 "tests",
@@ -312,6 +327,10 @@ def check_claims(
                 actual,
                 None if actual is None else actual == expected,
             )
-        if counts and test_evidence is not None and not test_evidence["success"]:
+        if (
+            any(kind != "inventory" for _, kind in counts)
+            and test_evidence is not None
+            and not test_evidence["success"]
+        ):
             add("tests", "supplied test invocation succeeded", False, False)
     return rows

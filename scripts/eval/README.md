@@ -228,7 +228,10 @@ sizes still refer only to the after revision. Attached `FILE (N lines)` sizes
 also work in sentences, such as `The largest file was FILE (N lines)` and
 `New FILE (N lines) with 10 pure fs-free tests`. The latter test inventory stays
 unverifiable without a named test invocation; it cannot borrow a general
-`--test-log` or be verified by the file size.
+`--test-log` or be verified by the file size. Inventories are identified by
+missing invocation-result qualifiers or a `with N … tests` phrase, not by
+adjectives such as `pure` or `fs-free`. Explicit run results (`N tests passed`,
+`N tests total`) still use the supplied complete invocation log.
 
 `FILE: A → B lines` (also `->`) checks before and after in order, including
 inside a sentence. A following `(net −C)` or `net +C` is checked separately
@@ -246,7 +249,10 @@ parsed signed `net` deltas are checked; unparsed comparison vocabulary in
 the surrounding clause still makes that clause unverifiable.
 Extra prose outside the supported absolute/parenthesized forms remains
 unverifiable. Unknown clauses remain evidence rows, so verified publication
-claims cannot turn them into a claims PASS.
+claims cannot turn them into a claims PASS. After recognized spans are removed,
+remaining size-shaped numerals also make the whole clause unverifiable: a
+verified pair cannot hide `and other.rs is 999 lines` or a bare `999 lines`.
+Explicit counts of helpers, predicates, or callers are non-size quantities.
 A contradicted claim fails the claims criterion independently of whether the
 refactor itself passed. Missing evidence leaves claims UNGRADED; only recognized
 contradictions produce a claims FAIL. The successful-run fixture deliberately
