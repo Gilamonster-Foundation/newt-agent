@@ -185,7 +185,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
 fn observed_report_persistence_stores_model_explanation_only() {
     let (_state, _workspace, store, _persona_store) = resume_fixture();
     let id = newt_core::new_conversation_id();
-    let reply = "## Observed\n\nReport `sample` — root `project`.\n\nFiles since objective/adoption snapshot (LF counts; absence is 0):\n- changed\n\n## Model explanation\n\nI extracted the helper.";
+    let reply = "## Observed\n\nReport `sample` — root `project`.\n\nFiles since objective/adoption snapshot (LF counts; absence is 0):\n- No content changes observed.\n\nLast observed checks per exact command/cwd (historical observations, not current-tree certification):\n- No check observation available.\n\nGoverned publication observations (not a live remote-state check):\n- No governed receipt available.\n\n## Model explanation\n\nI extracted the helper.";
     save_turn_if_persistent(
         Some(&store),
         &id,

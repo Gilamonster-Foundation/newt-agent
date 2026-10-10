@@ -148,7 +148,7 @@ async fn memory_manager_fallback_with_no_providers() {
 /// replayed as assistant-authored text, including after conversation restore.
 #[tokio::test]
 async fn observed_report_replay_keeps_only_assistant_explanation() {
-    let report = "## Observed\n\nReport `sample` — root `project`.\n\nFiles since objective/adoption snapshot (LF counts; absence is 0):\n- source: 2 → 3\n\n## Model explanation\n\nI extracted the helper.";
+    let report = "## Observed\n\nReport `sample` — root `project`.\n\nFiles since objective/adoption snapshot (LF counts; absence is 0):\n- `source`: 2 → 3\n\nLast observed checks per exact command/cwd (historical observations, not current-tree certification):\n- No check observation available.\n\nGoverned publication observations (not a live remote-state check):\n- No governed receipt available.\n\n## Model explanation\n\nI extracted the helper.";
     let mut memory = MemoryManager::new();
     memory.add_provider(RollingWindow::new(5));
     memory

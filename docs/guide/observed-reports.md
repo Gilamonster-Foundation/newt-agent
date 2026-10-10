@@ -49,6 +49,7 @@ content ID covers the objective/root, baseline/current snapshot identities and
 observations. This is the first harness-owned pinned report record. Model text
 cannot create a governed receipt or replace a stored observation.
 
-Recognizable copies of the report envelope are removed from model prose.
+Only complete copies matching the rendered report structure outside code fences
+are removed from model prose. Partial or ambiguous report-like text is preserved.
 Stage 1 otherwise leaves the model's explanation intact, including any conflicting
 numbers or conclusions. Clause-level correction of those claims is a later stage.

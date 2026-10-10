@@ -1064,7 +1064,7 @@ fn observed_report_finalization_removes_model_report_copies() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let claims = claim_check::TurnClaims::capture(root, &crate::Scope::All, None);
-    let copy = "## Observed\n\nReport `invented-cid` — root `workspace`.\n\nFiles since objective/adoption snapshot (LF counts; absence is 0):\n- invented facts\n\n## Model explanation\n\n";
+    let copy = claims.observed_report(root, &crate::Scope::All, "");
     let out = finalize_final_text(
         format!("{copy}First explanation.\n\n{copy}Second explanation."),
         root,
@@ -1076,7 +1076,6 @@ fn observed_report_finalization_removes_model_report_copies() {
     );
     assert_eq!(out.matches("## Observed").count(), 1, "{out}");
     assert_eq!(out.matches("## Model explanation").count(), 1, "{out}");
-    assert!(!out.contains("invented-cid"), "{out}");
     assert!(out.contains("First explanation."));
     assert!(out.contains("Second explanation."));
 }
