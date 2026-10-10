@@ -171,6 +171,10 @@ def check_claims(summary: str, facts: dict, test_log: str = "") -> list[dict]:
                 detail,
                 re.I,
             )
+            if reduction is None and re.search(
+                r"\b(?:reduced|reducing)\s+`?$", line[: mention.start()], re.I
+            ):
+                reduction = re.match(rf"`?\s+by\s+~?({NUMBER})\b(?:\s+lines)?", detail)
             if pair:
                 lines(path, pair[1].lstrip("~"), "before")
                 lines(path, pair[2], "after")
