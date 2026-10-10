@@ -672,7 +672,8 @@ async fn invalid_plan_and_declined_write_record_no_artifacts() {
 }
 
 /// The real dispatcher must deliver the mismatch to the model before its final
-/// response, not merely annotate an already-published answer.
+/// response, not merely annotate an already-published answer. A wrong-crate
+/// ENOENT must retain the selected full path rather than redirecting the task.
 #[tokio::test]
 async fn selected_target_diff_warning_reaches_model_before_finalization() {
     let workspace = tempfile::tempdir().unwrap();
@@ -719,6 +720,8 @@ async fn selected_target_diff_warning_reaches_model_before_finalization() {
             first_message: serde_json::json!({"role":"assistant","content":null,
                 "tool_calls":[
                     {"id":"pin", "type":"function","function":{"name":"update_plan","arguments":PLAN_ARGS}},
+                    {"id":"wrong-crate","type":"function","function":{"name":"read_file",
+                        "arguments":r#"{"path":"cli/nested/entry.code"}"#}},
                     {"id":"wrong-file","type":"function","function":{"name":"write_file",
                         "arguments":r#"{"path":"elsewhere.txt","content":"wrong target"}"#}}
                 ]}),
@@ -731,6 +734,7 @@ async fn selected_target_diff_warning_reaches_model_before_finalization() {
     let messages = messages(TASK);
     let mut caveats = Caveats::top();
     caveats.fs_write = Scope::only([workspace.path().to_string_lossy().into_owned()]);
+    let mut events = Vec::new();
     let uri = server.uri();
     let mut c = ctx(
         &uri,
@@ -741,6 +745,7 @@ async fn selected_target_diff_warning_reaches_model_before_finalization() {
     );
     c.kind = BackendKind::Openai;
     c.step_ledger = Some(&ledger);
+    c.tool_events = Some(&mut events);
     chat_complete_with_prompt_and_artifacts(
         c,
         Some(&turn),
@@ -751,6 +756,13 @@ async fn selected_target_diff_warning_reaches_model_before_finalization() {
     )
     .await
     .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.tool == "read_file" && !event.ok));
+    assert_eq!(
+        ledger.snapshot().target.as_ref().unwrap().selection.path,
+        "engine/nested/entry.code"
+    );
     let captured = server.received_requests().await.unwrap();
     let body = body_json(&captured[1]);
     let pin = body["messages"]
