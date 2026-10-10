@@ -70,6 +70,9 @@ pub fn inspect_from_store(
     {
         use JournalEntry::*;
         match node.payload() {
+            CompositionCatalog { catalog } => references.push(("catalog", Address::Node(*catalog))),
+            CompositionProposed { event } => references.push(("proposal", Address::Node(*event))),
+            Composition { decision } => references.push(("composition", Address::Node(*decision))),
             SemanticPins { pins } => references.extend(
                 pins.entries
                     .values()
@@ -165,6 +168,11 @@ pub fn inspect_from_store(
             ("projection", Address::Node(record.projection)),
             ("commitment", Address::Raw(record.commitment)),
         ]);
+        references.extend(
+            record
+                .composition
+                .map(|id| ("composition", Address::Node(id))),
+        );
         (
             "request",
             Vec::new(),
@@ -182,6 +190,52 @@ pub fn inspect_from_store(
             "projection",
             Vec::new(),
             serde_json::to_value(record).map_err(invalid)?,
+        )
+    } else if let Ok(d) =
+        canonical::from_canonical_dagcbor_checked::<crate::composition::Decision>(&bytes)
+    {
+        references.extend([
+            ("catalog", Address::Node(d.catalog)),
+            ("proposal", Address::Node(d.proposal)),
+            ("actor", Address::Node(d.actor)),
+            ("policy", Address::Node(d.policy)),
+            ("before", Address::Node(d.before)),
+        ]);
+        references.extend(d.after.map(|id| ("after", Address::Node(id))));
+        references.extend(
+            d.expected_head
+                .map(|id| ("previous_composition", Address::Node(id))),
+        );
+        references.extend(d.pins.map(|id| ("pins", Address::Node(id))));
+        references.extend(
+            d.elisions
+                .iter()
+                .map(|e| ("elision", Address::Node(e.unit))),
+        );
+        (
+            "composition",
+            Vec::new(),
+            serde_json::to_value(d).map_err(invalid)?,
+        )
+    } else if let Ok(c) =
+        canonical::from_canonical_dagcbor_checked::<crate::composition::Catalog>(&bytes)
+    {
+        references.extend([
+            ("request", Address::Node(c.request)),
+            ("before", Address::Node(c.before)),
+            ("universe", Address::Node(c.universe)),
+            ("policy", Address::Node(c.policy)),
+        ]);
+        references.extend(c.pins.map(|id| ("pins", Address::Node(id))));
+        references.extend(
+            c.entries
+                .iter()
+                .map(|entry| ("occurrence", Address::Node(entry.event))),
+        );
+        (
+            "composition_catalog",
+            Vec::new(),
+            serde_json::to_value(c).map_err(invalid)?,
         )
     } else if let Ok(record) = canonical::from_canonical_dagcbor_checked::<RootEvent>(&bytes) {
         references.push(("source", Address::Raw(record.content)));
@@ -290,6 +344,31 @@ pub fn replay_from_store(store: &FrameStore, request: ContentId) -> Result<Vec<u
 }
 
 pub(crate) fn verify_request(store: &FrameStore, record: &RequestRecord) -> Result<Vec<u8>> {
+    if let Some(id) = record.composition {
+        use crate::composition::{Actor, Catalog, Decision, Outcome, Policy, Submission};
+        let d: Decision = store.get(&id)?;
+        if d.version != 1 || d.outcome != Outcome::Accepted || d.after != Some(record.projection) {
+            return Err(invalid("request names a refused or different composition"));
+        }
+        let c: Catalog = store.get(&d.catalog)?;
+        let raw: RawEvent = store.get(&d.proposal)?;
+        let s: Submission =
+            canonical::from_canonical_dagcbor_checked(&store.source(&raw.payload().payload)?)
+                .map_err(invalid)?;
+        if s.catalog != d.catalog || s.actor != d.actor || c.policy != d.policy {
+            return Err(invalid("request composition attribution differs"));
+        }
+        store.get::<Actor>(&d.actor)?;
+        store.get::<Policy>(&d.policy)?;
+        store.get::<Projection>(&d.before)?.render(store)?;
+        store.get::<Projection>(&c.universe)?.render(store)?;
+        if let Some(pins) = d.pins {
+            store.get::<crate::composition::Pins>(&pins)?;
+        }
+        for receipt in &d.elisions {
+            store.unit(receipt.unit)?;
+        }
+    }
     let projection: Projection = store.get(&record.projection)?;
     let bytes = projection.render(store)?;
     if RawContentId::from_content(&bytes) != record.commitment

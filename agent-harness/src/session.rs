@@ -11,6 +11,8 @@ use content_addressable::{ContentAddressable, ContentError, ContentId, MerkleNod
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[path = "composition/engine.rs"]
+mod composition_engine;
 #[path = "composition/session.rs"]
 mod semantic;
 mod tools;
@@ -100,6 +102,15 @@ impl SessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum JournalEntry {
+    CompositionCatalog {
+        catalog: ContentId,
+    },
+    CompositionProposed {
+        event: ContentId,
+    },
+    Composition {
+        decision: ContentId,
+    },
     SemanticPins {
         pins: crate::composition::Pins,
     },
@@ -218,6 +229,8 @@ struct Retrieved {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RequestRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) composition: Option<ContentId>,
     pub(crate) projection: ContentId,
     pub(crate) commitment: RawContentId,
     pub(crate) format: String,
@@ -230,6 +243,8 @@ impl ContentAddressable for RequestRecord {
 
 #[derive(Debug, Serialize)]
 pub struct PreparedRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composition: Option<ContentId>,
     pub bytes: Vec<u8>,
     pub id: ContentId,
     pub projection: ContentId,
@@ -246,6 +261,7 @@ fn real_navigation_clock() -> NavigationClock {
 }
 
 pub struct Session {
+    composition: crate::composition::State,
     semantic_pins: Option<crate::composition::Pins>,
     store: FrameStore,
     writer: RunWriter,
@@ -336,6 +352,7 @@ impl Session {
         root: ContentId,
     ) -> Self {
         Self {
+            composition: crate::composition::State::default(),
             semantic_pins: None,
             store,
             writer,
@@ -516,7 +533,25 @@ impl Session {
 
     fn apply(&mut self, entry: &JournalEntry) -> Result<()> {
         match entry {
-            JournalEntry::SemanticPins { pins } => self.apply_semantic_pins(pins)?,
+            JournalEntry::CompositionCatalog { catalog } => {
+                self.apply_composition_catalog(*catalog)?;
+            }
+            JournalEntry::CompositionProposed { event } => {
+                self.apply_composition_proposal(*event)?;
+            }
+            JournalEntry::Composition { decision } => {
+                let checked = self.verify_composition(*decision)?;
+                self.install_composition(*decision, checked);
+            }
+            JournalEntry::SemanticPins { pins } => {
+                self.apply_semantic_pins(pins)?;
+                self.composition.pin_revision = Some(
+                    MerkleNode::new(entry.clone(), [self.head])
+                        .content_id()
+                        .map_err(integrity)?,
+                );
+                self.composition.active = None;
+            }
             JournalEntry::Run { .. } => return Err(integrity("nested run record")),
             JournalEntry::ToolBatch {
                 reply,
@@ -710,7 +745,12 @@ impl Session {
                 if !self.projections.contains(&record.projection) {
                     return Err(integrity("request names an unrecorded projection"));
                 }
+                self.verify_composition_request(&record)?;
                 self.verify_request(&record)?;
+                self.composition.latest_request = Some(*request);
+                if record.composition.is_none() {
+                    self.composition.active = None;
+                }
                 self.requests.insert(*request);
                 self.format = Some(record.format);
             }
@@ -748,6 +788,7 @@ impl Session {
                         ));
                     }
                 }
+                self.transcript = entries.clone();
                 self.restored_transcript = entries.clone();
             }
             JournalEntry::Outcome {
@@ -866,6 +907,28 @@ impl Session {
                     body.parts.iter().map(|part| part.event).collect(),
                 );
             }
+        }
+        let changes_context = match entry {
+            JournalEntry::CompositionCatalog { .. }
+            | JournalEntry::CompositionProposed { .. }
+            | JournalEntry::Composition { .. }
+            | JournalEntry::Resume { .. } => false,
+            JournalEntry::Projection { projection } => self
+                .active_composition()
+                .is_none_or(|d| d.after != Some(*projection)),
+            JournalEntry::Request { request } => self
+                .store
+                .get::<RequestRecord>(request)?
+                .composition
+                .is_none(),
+            _ => true,
+        };
+        if changes_context {
+            self.composition.context_revision = Some(
+                MerkleNode::new(entry.clone(), [self.head])
+                    .content_id()
+                    .map_err(integrity)?,
+            );
         }
         Ok(())
     }
@@ -1880,7 +1943,10 @@ impl Session {
             .as_object_mut()
             .ok_or_else(|| integrity("request must be an object"))?;
         object.insert(field.into(), Value::Array(Vec::new()));
-        let entries = self.ingest(messages)?;
+        let entries = match self.composition_entries(messages)? {
+            Some(entries) => entries,
+            None => self.ingest(messages)?,
+        };
         self.require_semantic_pins(&entries)?;
         let template = self
             .store
@@ -1893,18 +1959,21 @@ impl Session {
             entries,
         };
         let projection_id = self.store.put(&projection)?;
+        let composition = self.composition_binding(projection_id)?;
         self.append(JournalEntry::Projection {
             projection: projection_id,
         })?;
         let bytes = projection.render(&self.store)?;
         let commitment = self.store.put_source(&bytes)?;
         let id = self.store.put(&RequestRecord {
+            composition,
             projection: projection_id,
             commitment,
             format: format.into(),
         })?;
         self.append(JournalEntry::Request { request: id })?;
         Ok(PreparedRequest {
+            composition,
             bytes,
             id,
             projection: projection_id,
