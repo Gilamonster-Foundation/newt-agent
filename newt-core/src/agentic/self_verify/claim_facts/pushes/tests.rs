@@ -95,30 +95,36 @@ fn push_2769_non_evidence_and_nonclaims() {
 fn push_2769_finalizer_and_updated_facts() {
     let root = tempfile::tempdir().unwrap();
     let mut ledger = VerificationLedger::default();
-    let text = crate::agentic::finalize_final_text(
-        "Pushed: origin/topic is live.".into(),
+    let claims = crate::agentic::claim_check::TurnClaims::capture(
         root.path().to_str().unwrap(),
         &crate::Scope::All,
-        &crate::agentic::capability_check::Evidence::default(),
         None,
-        &crate::agentic::claim_check::TurnClaims::capture(
+    );
+    let finalize = |text: String, ledger: &VerificationLedger| {
+        crate::agentic::finalize_final_text(
+            text,
             root.path().to_str().unwrap(),
             &crate::Scope::All,
+            &crate::agentic::capability_check::Evidence::default(),
             None,
-        ),
-        &ledger,
-    );
+            &claims,
+            ledger,
+        )
+    };
+    let model = "Pushed: origin/topic is live.";
+    let text = finalize(model.to_owned(), &ledger);
     assert!(text.contains("#2769"), "{text}");
-    assert_eq!(ledger.annotate_push_claim(text.clone()), text);
+    assert_eq!(crate::agentic::model_reply_for_history(&text), model);
+    // Rechecking a rendered report goes through finalization, which projects
+    // model prose first; annotation helpers only consume that prose.
+    assert_eq!(finalize(text.clone(), &ledger), text);
     ledger.record_publication_outcome(&crate::git_staging::Outcome::Pushed {
         oid: "abc".into(),
         owner: "org".into(),
         name: "repo".into(),
         branch: "topic".into(),
     });
-    assert!(!ledger
-        .annotate_push_claim(text.replace("origin/topic", "org/repo/topic"))
-        .contains("#2769"));
+    assert!(!finalize(text.replace("origin/topic", "org/repo/topic"), &ledger).contains("#2769"));
 }
 
 /// #2769: the actual tool-result funnel, not an ok-looking tool string, owns

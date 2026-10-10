@@ -1,7 +1,10 @@
 # Observed facts in final reports
 
 Final task reports begin with an **Observed** section assembled by the harness.
-The model's explanation follows it. This includes tool-round-cap handoffs.
+The model's explanation follows it. Tool-round-cap handoffs, captured working
+state, no-progress stops, and claim-check warnings belong to the harness section,
+not the explanation. A failed cap summary can therefore have no model prose.
+The TUI's `continue` hint is display-only and is not saved as assistant speech.
 Anthropic answer deltas are buffered until finalization so the report and
 explanation print once; SSE consumption and idle-timeout handling continue.
 
@@ -41,8 +44,10 @@ File snapshots consider at most 4,096 paths (Git-tracked/nonignored files plus
 formerly observed paths omitted from the current listing), two MiB per
 file and 32 MiB total. Unsafe, binary or oversized files have unavailable line
 counts. Reports show at most 64 changed/unavailable file rows and eight bounded
-result lines per check, and disclose omitted evidence. This in-memory retention
-does not survive a process restart.
+result lines per check, and disclose omitted evidence. Last-turn harness notices are also bounded (eight notices, 8,192 characters
+per notice); the latest finalized turn replaces them for that root. They reach
+the next request as historical harness data. This in-memory retention does not
+survive a process restart.
 
 The report record uses the existing content-addressable canonical codec; its
 content ID covers the objective/root, baseline/current snapshot identities and

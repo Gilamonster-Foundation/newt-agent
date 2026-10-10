@@ -35,6 +35,7 @@ struct Root {
     checks: Vec<Check>,
     publications: Vec<String>,
     limited: bool,
+    notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,12 +62,15 @@ struct Report<'a> {
     checks: &'a [Check],
     publications: &'a [String],
     limited: bool,
+    notices: &'a [String],
 }
 impl ContentAddressable for Report<'_> {
     fn canonical_form(&self) -> Result<Vec<u8>, ContentError> {
         canonical::to_canonical_dagcbor(self)
     }
 }
+
+const NOTICES_HEADING: &str = "Last turn harness notices (historical, not assistant-authored):";
 
 const FILES_HEADING: &str = "Files since objective/adoption snapshot (LF counts; absence is 0):";
 const CHECKS_HEADING: &str = "Last observed checks per exact command/cwd (historical observations, not current-tree certification):";
@@ -94,8 +98,30 @@ impl State {
                 checks: Vec::new(),
                 publications: Vec::new(),
                 limited: false,
+                notices: Vec::new(),
             },
         );
+    }
+
+    pub(crate) fn set_notices(&mut self, root: &Path, notices: &[String]) {
+        if let Some(state) = self.roots.get_mut(root) {
+            const MARKER: &str = "\n[Harness notice excerpt: retention limit reached.]";
+            state.notices = notices
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .take(8)
+                .map(|s| {
+                    if s.chars().count() > 8192 {
+                        format!("{}{MARKER}", capture::bounded(s, 8192 - MARKER.len()))
+                    } else {
+                        capture::bounded(s, 8192)
+                    }
+                })
+                .collect();
+            if notices.iter().filter(|s| !s.trim().is_empty()).count() > 8 {
+                state.notices[7] = "Additional harness notices omitted by retention limits.".into();
+            }
+        }
     }
 
     pub(crate) fn observe(
@@ -169,7 +195,7 @@ impl State {
             rows.push(format!("{omitted} additional file rows omitted."));
         }
         let report = Report {
-            schema: "newt.observed-report/v1",
+            schema: "newt.observed-report/v2",
             objective: self.objective,
             root: root.to_string_lossy().into_owned(),
             baseline: state.baseline.as_ref().and_then(|s| s.content_id().ok()),
@@ -181,6 +207,7 @@ impl State {
             checks: &state.checks,
             publications: &state.publications,
             limited: state.limited,
+            notices: &state.notices,
         };
         let Ok(bytes) = report.canonical_form() else {
             return "## Observed\n\nFacts unavailable: content encoding failed.\n\n## Model explanation\n\n".into();
@@ -239,6 +266,22 @@ impl State {
                 "\nUnverified ambiguous bare paths in model explanation: {}.\n",
                 report.ambiguous.join(", ")
             ));
+        }
+        if !report.notices.is_empty() {
+            out.push('\n');
+            out.push_str(NOTICES_HEADING);
+            out.push('\n');
+            for line in report
+                .notices
+                .iter()
+                .flat_map(|s| s.lines())
+                .filter(|s| !s.trim().is_empty())
+            {
+                out.push_str(&format!(
+                    "- {}\n",
+                    crate::worktree_adoption::task_path_literal(Path::new(line))
+                ));
+            }
         }
         out.push_str("\n## Model explanation\n\n");
         out

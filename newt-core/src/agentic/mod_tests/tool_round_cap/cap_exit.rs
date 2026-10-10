@@ -455,6 +455,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
     )
     .await
     .expect("final summary helper should return a fallback");
+    let reply = reply.test_text();
 
     assert!(!streamed);
     assert!(reply.contains("tool-round limit (25"), "{reply}");
@@ -531,6 +532,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
     )
     .await
     .expect("OpenAI cap summary should become a paused handoff");
+    let reply = reply.test_text();
 
     assert!(!streamed);
     assert!(reply.contains("Summary of Findings"), "{reply}");
@@ -611,6 +613,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
     )
     .await
     .expect("oversized cap exit returns deterministic fallback");
+    let reply = reply.test_text();
     assert!(!streamed);
     assert!(usage.is_none());
     assert!(reply.contains("tool-round limit (1"), "{reply}");
@@ -674,6 +677,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
     )
     .await
     .expect("oversized cap exit returns deterministic fallback");
+    let reply = reply.test_text();
     assert!(!streamed);
     assert!(usage.is_none());
     assert!(reply.contains("tool-round limit (1"), "{reply}");

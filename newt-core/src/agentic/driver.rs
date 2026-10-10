@@ -294,7 +294,8 @@ impl InstantiatedFeatures {
 /// The outcome of one completed turn.
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
-    /// The model's reply text.
+    /// Operator-facing reply, including the harness report. Use
+    /// `model_reply_for_history` when projecting assistant-authored history.
     pub reply: String,
     /// Token usage for the turn, when the backend reported it.
     pub usage: Option<TokenUsage>,

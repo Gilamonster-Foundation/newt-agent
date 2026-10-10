@@ -541,7 +541,7 @@ async fn check(row: Row) {
             ledger.record_push_outcome(outcome);
         }
         let final_text = crate::agentic::finalize_final_text(
-            row.claim.into(),
+            row.claim.to_string(),
             root.to_str().unwrap(),
             &Scope::All,
             &crate::agentic::capability_check::Evidence::default(),

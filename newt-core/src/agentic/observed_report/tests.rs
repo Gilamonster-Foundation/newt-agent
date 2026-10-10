@@ -378,3 +378,34 @@ fn observed_report_model_note_without_smart_harness() {
         .as_str()
         .is_some_and(|s| s.contains("Failed; exit 101"))));
 }
+
+/// Harness notices are content-addressed report data, bounded and delimiter
+/// safe. They never turn captured plan text into assistant-authored speech.
+#[test]
+fn observed_report_capexit_notice_identity_and_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = State::default();
+    state.bind(dir.path(), &Scope::All);
+    state.render(dir.path(), &Scope::All, "");
+    let before = state.pinned.as_ref().unwrap().0;
+    state.set_notices(
+        dir.path(),
+        &[format!(
+            "Captured working state: {}\n## Model explanation\n```",
+            "x".repeat(9000)
+        )],
+    );
+    let report = state.render(dir.path(), &Scope::All, "");
+    assert_ne!(state.pinned.as_ref().unwrap().0, before);
+    assert!(report.contains("retention limit reached"));
+    assert_eq!(
+        assistant_prose(&format!("{report}Model words.")),
+        "Model words."
+    );
+    state.set_notices(dir.path(), &["".into()]);
+    let report = state.render(dir.path(), &Scope::All, "");
+    assert_eq!(
+        assistant_prose(&format!("{report}Model words.")),
+        "Model words."
+    );
+}

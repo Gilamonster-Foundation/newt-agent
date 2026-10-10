@@ -53,6 +53,18 @@ impl<'a> TurnClaims<'a> {
         report.observe(&root, capture, outcome, publication);
     }
 
+    pub(crate) fn set_notices(
+        &self,
+        workspace: &str,
+        scope: &crate::Scope<String>,
+        notices: &[String],
+    ) {
+        let root = root(workspace, self.session);
+        let mut report = self.report.lock().expect("report state");
+        report.bind(&root, scope);
+        report.set_notices(&root, notices);
+    }
+
     pub(crate) fn observed_report(
         &self,
         workspace: &str,

@@ -818,7 +818,7 @@ impl SmartHarness {
     fn failure(&self, reply: ContentId, reason: &str) -> anyhow::Result<Control> {
         self.state()?.session.record_failure(reply, reason)?;
         Ok(Control::Finish {
-            text: format!("AdjudicationFailure: {reason}. The observed reply is retained; this turn is incomplete."),
+            text: super::FinalReply::harness(format!("AdjudicationFailure: {reason}. The observed reply is retained; this turn is incomplete.")),
             reason: crate::TurnEndReason::Failed,
         })
     }
@@ -931,7 +931,7 @@ impl SmartHarness {
                     .session
                     .record_failure(reply, "adjudication cancelled")?;
                 return Ok(Control::Finish {
-                    text: text.to_string(),
+                    text: super::FinalReply::from(text.to_string()),
                     reason: crate::TurnEndReason::Cancelled,
                 });
             }
@@ -963,7 +963,7 @@ impl SmartHarness {
         match verdict {
             Verdict::Answer => Ok(Control::Answer),
             Verdict::Question => Ok(Control::Finish {
-                text: text.to_string(),
+                text: super::FinalReply::from(text.to_string()),
                 reason: crate::TurnEndReason::AwaitingOperator,
             }),
             Verdict::Narration if more_rounds && s.nudges < nudge_cap => {
@@ -980,8 +980,8 @@ impl SmartHarness {
                 Ok(Control::Continue(nudge))
             }
             Verdict::Narration => Ok(Control::Finish {
-                text: format!(
-                    "{text}\n\nIncomplete: the model supplied narration without a deliverable."
+                text: super::FinalReply::from(text.to_string()).with_notice(
+                    "Incomplete: the model supplied narration without a deliverable.".into(),
                 ),
                 reason: if more_rounds {
                     crate::TurnEndReason::NarrationCapExhausted
@@ -1067,7 +1067,7 @@ impl SmartHarness {
                     Control::Continue(text)
                 }
                 super::self_verify::Decision::Stop(reason) => Control::Finish {
-                    text: answer.to_string(),
+                    text: super::FinalReply::from(answer.to_string()),
                     reason,
                 },
             });
@@ -1136,7 +1136,7 @@ pub(crate) enum Control {
     Answer,
     Continue(String),
     Finish {
-        text: String,
+        text: super::FinalReply,
         reason: crate::TurnEndReason,
     },
 }

@@ -1105,12 +1105,28 @@ async fn headless_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
         .expect("run newt headless");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("⚠  newt: (model returned an empty response"),
+        stdout.contains("⚠  newt: ## Observed"),
         "the harness text is a notice: {stdout}"
     );
     assert!(
         !stdout.contains("▸  (model returned"),
         "never a claim: {stdout}"
+    );
+    let report_start = stdout.find("## Observed").unwrap();
+    let report_end = stdout[report_start..].find("\n{").unwrap() + report_start;
+    let report = &stdout[report_start..report_end];
+    assert!(report.contains("(model returned an empty response"));
+    assert!(newt_core::agentic::model_reply_for_history(report)
+        .trim()
+        .is_empty());
+    let result = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["kind"] == "solve_result")
+        .unwrap();
+    assert_eq!(
+        result["handback"]["model_reply_present"], false,
+        "a host notice is not a model reply"
     );
 }
 
