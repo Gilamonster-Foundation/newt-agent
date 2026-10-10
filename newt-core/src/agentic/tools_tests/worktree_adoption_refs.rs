@@ -103,6 +103,40 @@ async fn adoption_refs_real_checkout_and_commit_preserve_original() {
     .await;
     assert_eq!(outcome, Some(ExecOutcome::Passed), "{text}");
     assert!(session.snapshot().is_some(), "{text}");
+    // Regression: the exploration pipeline was misclassified as destructive
+    // Git solely because xargs is opaque to static shell inspection. This real
+    // dispatch grounds the administration predicate's non-Git runner controls.
+    // This fixture does not grant /dev/null: the exact command must reach
+    // that independent filesystem check rather than the Git accident guard.
+    let (text, outcome) = run(
+        "find crates -name '*.rs' | xargs wc -l 2>/dev/null | sort -n | tail -5",
+        &target,
+        &original,
+        &c,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Denied), "{text}");
+    assert!(text.contains("/dev/null"), "{text}");
+    assert!(!text.contains("administration accident guard"), "{text}");
+    for command in [
+        "printf 'seed\\n' | xargs wc -l",
+        "printf 'seed\\n' | xargs grep original",
+    ] {
+        let (text, outcome) = run(command, &target, &original, &c, &session).await;
+        assert_eq!(outcome, Some(ExecOutcome::Passed), "{command}: {text}");
+    }
+    let (text, outcome) = run(
+        "find crates -name '*.rs' | xargs git worktree remove ../task",
+        &target,
+        &original,
+        &c,
+        &session,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Denied), "{text}");
+    assert!(text.contains("administration accident guard"), "{text}");
+    assert!(target.join(".git").exists());
     // PR #2853 round 3: non-creating wrappers must retain confined execution.
     for command in [
         "git branch --show-current | head",

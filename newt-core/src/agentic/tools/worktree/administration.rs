@@ -72,8 +72,27 @@ pub(in crate::agentic::tools) fn destructive(source: &str) -> bool {
             .iter()
             .any(|construct| construct.inspection.as_deref().is_some_and(contains))
     }
-    // Uninspectable source is outside this narrow admission vocabulary.
-    agent_bridle::inspect_shell(source).map_or(true, |inspection| contains(&inspection))
+    agent_bridle::inspect_shell(source).map_or_else(
+        |_| {
+            // Opaque runners (including xargs) are not evidence of Git use.
+            // This is an accident guard, not a shell admission policy: retain
+            // refusal only when visible source names Git or worktree admin.
+            // Normalize quoted/escaped spellings as the branch classifier does.
+            static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                regex::Regex::new(
+                    r"(?i)\bgit(?:\.exe)?\b|\bworktree\s+(?:remove|prune|move|repair|unlock)\b",
+                )
+                .expect("fixed administration marker")
+            });
+            let text: String = source
+                .replace("\\\n", "")
+                .chars()
+                .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+                .collect();
+            MARKER.is_match(source) || MARKER.is_match(&text)
+        },
+        |inspection| contains(&inspection),
+    )
 }
 
 // Deliberately limited to established built-ins used in ordinary repository
@@ -149,6 +168,31 @@ const BUILTIN_VERBS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the adopted-worktree guard refused a non-Git exploration pipeline.
+    #[test]
+    fn adopted_administration_allows_non_git_runners() {
+        for source in [
+            "find crates -name '*.rs' | xargs wc -l 2>/dev/null | sort -n | tail -5",
+            "xargs wc -l",
+            "xargs grep needle",
+            "xargs rustfmt --check",
+            "sh -c 'xargs wc -l'",
+        ] {
+            assert!(!destructive(source), "false positive {source}");
+        }
+        for source in [
+            "find crates -name '*.rs' | xargs git worktree remove",
+            "xargs /usr/bin/git worktree prune",
+            r"xargs C:\tools\git.exe worktree prune",
+            "xargs 'g'it worktree prune",
+            "eval '$TOOL worktree prune'",
+            "sh -c 'xargs git worktree remove'",
+            "eval 'git worktree prune'",
+        ] {
+            assert!(destructive(source), "missed {source}");
+        }
+    }
 
     #[test]
     fn adoption_administration_checks_routed_argv_too() {
