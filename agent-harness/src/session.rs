@@ -1296,7 +1296,7 @@ impl Session {
         self.check_navigation()?;
         let entries = self.ingest(messages)?;
         let candidates = self.candidates(messages, &entries)?;
-        let start = entries
+        let mut start = entries
             .len()
             .saturating_sub(self.config.max_catalog_entries);
         let generated = |c: &crate::navigation::Candidate| is_generated(&self.events[&c.id]);
@@ -1314,6 +1314,20 @@ impl Session {
             .map(|c| c.id)
             .collect();
         complete_pairs(&candidates, &mut forced, |_| true);
+        // Required old sources consume catalog slots too. Slide the optional
+        // recent window rather than exceeding the cap or dropping a host pin.
+        let mut listed_cards = candidates
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| !generated(c) && (*i >= start || forced.contains(&c.id)))
+            .count();
+        while listed_cards > self.config.max_catalog_entries && start < candidates.len() {
+            let candidate = &candidates[start];
+            if !generated(candidate) && !forced.contains(&candidate.id) {
+                listed_cards -= 1;
+            }
+            start += 1;
+        }
         // What the host adds whatever is proposed comes out of the budget.
         let mut charged = candidates
             .iter()

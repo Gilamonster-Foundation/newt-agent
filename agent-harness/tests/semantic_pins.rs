@@ -318,3 +318,48 @@ fn observed_report_coalesced_render_replays_system_pin() {
         assert_eq!(restored.replay(prepared.id).unwrap(), prepared.bytes);
     }
 }
+
+/// A head-resident facts pin must not let a full recent window crowd an older
+/// required objective out of the bounded catalog during context recovery.
+#[test]
+fn observed_report_head_pin_leaves_catalog_room_for_required_objective() {
+    let mut session = Session::new(SessionConfig::default()).unwrap();
+    let mut messages = vec![
+        json!({"role":"system", "content":"[Harness observed facts] unavailable"}),
+        json!({"role":"user", "content":"original objective"}),
+    ];
+    for index in 0..100 {
+        messages.push(json!({"role":"assistant", "content":format!("history {index}")}));
+    }
+    messages.push(json!({"role":"user", "content":"continue"}));
+    session
+        .register_semantic_pins(
+            "one",
+            &mut messages,
+            &[
+                HostPin {
+                    class: PinClass::ObservedFacts,
+                    index: 0,
+                },
+                HostPin {
+                    class: PinClass::Objective,
+                    index: 1,
+                },
+            ],
+        )
+        .unwrap();
+    let catalog = session.catalog(&messages, 100_000).unwrap();
+    let cards = catalog["candidates"].as_array().unwrap();
+    assert!(cards.len() <= 64);
+    let selected = cards
+        .iter()
+        .filter(|card| card["required"] == true)
+        .map(|card| card["cid"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let projected = session
+        .project_selection(&messages, &selected, 100_000)
+        .unwrap();
+    assert!(projected.contains(&messages[0]));
+    assert!(projected.contains(&messages[1]));
+    assert!(projected.contains(messages.last().unwrap()));
+}
