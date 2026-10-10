@@ -372,6 +372,12 @@ async fn detached_branch_wrappers() {
     assert!(out.contains("Adopted task worktree:"), "{out}");
     let head = real_git_output(&task, &["rev-parse", "HEAD"]);
     for command in [
+        "git switch --create detached-task | tail -3; touch sibling-ran",
+        "git -C. checkout -b detached-task | tail -3; touch sibling-ran",
+        "git -C./ checkout -b detached-task | tail -3; touch sibling-ran",
+        "git branch --no-track detached-task HEAD | tail -3; touch sibling-ran",
+        "LANG=C git checkout -b detached-task; touch sibling-ran",
+        "env LANG=C git checkout -b detached-task; touch sibling-ran",
         "git checkout -b detached-task 2>&1 | tail -3",
         "git checkout -b detached-task 2>&1 && git branch --show-current",
         "git switch -c detached-task && echo done",
@@ -380,13 +386,19 @@ async fn detached_branch_wrappers() {
         let command = format!("cd '{}' && {command}", task.display());
         let out = dispatch(&session, &main, &caveats, &command).await;
         assert!(out.contains("capability denied"), "{command}: {out}");
-        assert!(out.contains("git checkout -b detached-task"), "{out}");
+        let retry = if command.contains("env LANG=C") {
+            "git checkout -b <name>"
+        } else {
+            "git checkout -b detached-task"
+        };
+        assert!(out.contains(retry), "{out}");
         assert!(out.contains(task.to_str().unwrap()), "{out}");
         assert_eq!(real_git_output(&task, &["branch", "--show-current"]), "");
         assert_eq!(real_git_output(&task, &["rev-parse", "HEAD"]), head);
         assert!(!main.join(".git/refs/heads/detached-task").exists());
         assert!(!main.join(".git/logs/refs/heads/detached-task").exists());
         assert!(!task.join("branch-output").exists());
+        assert!(!task.join("sibling-ran").exists());
     }
     let retry = format!("cd '{}' && git checkout -b detached-task", task.display());
     let out = dispatch(&session, &main, &caveats, &retry).await;

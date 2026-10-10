@@ -109,6 +109,14 @@ async fn adoption_refs_real_checkout_and_commit_preserve_original() {
     // refs/heads lock; this portable real-Git case grounds the same dispatch seam.
     let detached_head = git(&target, temp.path(), &["rev-parse", "HEAD"]);
     for command in [
+        "git switch --create blocked | tail -3; touch sibling-ran",
+        "git -C. checkout -b blocked | tail -3; touch sibling-ran",
+        "git -C./ checkout -b blocked | tail -3; touch sibling-ran",
+        "git branch --no-track blocked HEAD | tail -3; touch sibling-ran",
+        "LANG=C git checkout -b blocked; touch sibling-ran",
+        "env LANG=C git checkout -b blocked; touch sibling-ran",
+        "git checkout -b blocked | head -3",
+        "git checkout -b blocked; echo done",
         "git checkout -b blocked 2>&1 | tail -3",
         "git checkout -b blocked 2>&1 && git branch --show-current",
         "git checkout -b blocked 2>&1; echo \"rc=$?\"; git branch --show-current",
@@ -118,7 +126,12 @@ async fn adoption_refs_real_checkout_and_commit_preserve_original() {
     ] {
         let (text, outcome) = run(command, &target, &original, &c, &session).await;
         assert_eq!(outcome, Some(ExecOutcome::Denied), "{command}: {text}");
-        assert!(text.contains("git checkout -b blocked"), "{text}");
+        let retry = if command.starts_with("env ") {
+            "git checkout -b <name>"
+        } else {
+            "git checkout -b blocked"
+        };
+        assert!(text.contains(retry), "{command}: {text}");
         assert!(text.contains("cwd"), "{text}");
         assert!(!original.join(".git/refs/heads/blocked").exists());
         assert!(!original.join(".git/logs/refs/heads/blocked").exists());
