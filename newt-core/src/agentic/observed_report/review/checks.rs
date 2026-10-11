@@ -245,8 +245,8 @@ fn publication_kind(
         .filter(|p| {
             prefix != "Push observed:"
                 || (BRANCH
-                    .captures(clause)
-                    .is_none_or(|c| p.contains(&format!("branch {},", &c[1])))
+                    .captures_iter(clause)
+                    .all(|c| p.contains(&format!("branch {},", &c[1])))
                     && SHA.find_iter(clause).all(|m| {
                         p.split("revision ")
                             .nth(1)

@@ -165,6 +165,44 @@ fn report_h1_compound_publication_requires_both_matching_receipts() {
     }
 }
 
+/// PR #2856: a matching first branch cannot certify a later unmatched branch,
+/// revision or PR. Separately delimited supported claims remain untouched.
+#[test]
+fn report_h1_compound_publication_checks_every_mention() {
+    let dir = fixture();
+    let root = dir.path().to_str().unwrap();
+    let claims = TurnClaims::capture(root, &Scope::All, None);
+    publications(&claims, root, true, true);
+    let pr = "PR opened: https://github.com/example/project/pull/41";
+    for text in [
+        format!("Pushed branch refactor and pushed branch other, {pr}"),
+        format!("Pushed branch other and pushed branch refactor, {pr}"),
+        format!("Pushed branch `refactor` and pushed branch `other`, {pr}"),
+        format!("Pushed d879ac1 and pushed 123abcd, {pr}"),
+        "Pushed branch refactor, PR #41 opened and PR #42 opened".into(),
+        format!("Pushed branch refactor, {pr} and PR opened: https://github.com/example/project/pull/42"),
+    ] {
+        let rendered = finish(&text, root, &claims);
+        assert!(model_explanation(&rendered).contains("[unverified by newt:"), "{rendered}");
+    }
+    let supported = format!("Pushed branch refactor and pushed branch refactor, {pr}");
+    assert_eq!(
+        model_explanation(&finish(&supported, root, &claims)),
+        supported
+    );
+    let separated = format!("Pushed branch refactor; pushed branch other; {pr}");
+    let rendered = finish(&separated, root, &claims);
+    let explanation = model_explanation(&rendered);
+    assert!(
+        explanation.starts_with("Pushed branch refactor; [unverified by newt: pushed branch other"),
+        "{rendered}"
+    );
+    assert!(
+        explanation.contains(&format!("]; {pr}\n\nnewt review:")),
+        "{rendered}"
+    );
+}
+
 /// H1: exact descriptors still abstain for unknown/ambiguous/approximate counts
 /// and must not hide an unsupported quantitative residue.
 #[test]
