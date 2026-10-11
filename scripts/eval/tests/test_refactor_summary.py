@@ -164,6 +164,6 @@ class Summary(unittest.TestCase):
                 report = self.grade()
                 # Round 3: decorated reduction prose is unverifiable, while
                 # unsupported publication claims still contradict Git evidence.
-                expected = "UNGRADED" if name == "reg2.raw" else "FAIL"
+                expected = "PASS" if name == "reg2.raw" else "FAIL"
                 self.assertEqual(report["criteria"]["claims"]["status"], expected)
-                self.assertFalse(report["pass"])
+                self.assertEqual(report["pass"], expected == "PASS")

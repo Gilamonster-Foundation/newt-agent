@@ -8,8 +8,10 @@ from refactor_test_log import test_totals
 import refactor_diffstat
 
 ANSI = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
-NUMBER = r"[\d,]+"
+NUMBER = r"(?<![\w.])\d[\d,]*(?![\w.,])"
 FILE = r"[\w./-]+\.rs"
+# Unsupported decimal quantities still need an unverified evidence row.
+NUMERAL = r"(?<!\w)\d[\d,.]*(?![\w.,])"
 
 
 def clean_terminal(raw: str) -> str:
@@ -75,10 +77,26 @@ def named_test_lines(summary: str) -> list[str]:
     ]
 
 
+def split_prose(pattern: str, text: str) -> list[str]:
+    """Split assertions outside code spans, whose digits are not prose counts."""
+    parts = []
+    start = 0
+    for match in re.finditer(r"(`+).*?\1|(?P<boundary>" + pattern + ")", text, re.I):
+        if match["boundary"] is not None:
+            parts.append(text[start : match.start()])
+            start = match.end()
+    return parts + [text[start:]]
+
+
 def check_claims(
     summary: str, facts: dict, test_log: str = "", test_logs: dict | None = None
 ) -> list[dict]:
     """Check explicit assistant text; caller must establish its structured role."""
+    # Markdown emphasis is presentation; code spans keep their original text.
+    parts = re.split(r"(`+[^`]*`+)", summary)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"(\*\*|__|\*)(?=\S)(.+?)(?<=\S)\1", r"\2", parts[i])
+    summary = "".join(parts)
     rows: list[dict] = []
     supplied_evidence = test_totals(clean_terminal(test_log))
 
@@ -107,17 +125,27 @@ def check_claims(
             paths.intersection_update(facts["changed"])
         return next(iter(paths)) if len(paths) == 1 else None
 
-    def lines(path: str, count: str, stage: str) -> None:
+    def compare(values: list[int], expected: int, approximate: bool) -> bool | None:
+        if not values or any(not isinstance(n, int) for n in values):
+            return None
+        if expected in values:
+            return True
+        # Operator policy: within 10% is unverified, never rounded into proof.
+        if approximate and any(abs(expected - n) * 10 <= abs(n) for n in values):
+            return None
+        return False
+
+    def lines(path: str, count: str, stage: str, approximate: bool = False) -> None:
         actual = facts.get(stage, {}).get(resolve(path))
         expected = int(count.replace(",", ""))
         add(
             "lines",
             f"{path} {stage}: {expected}",
             actual,
-            None if actual is None else actual == expected,
+            compare([actual], expected, approximate),
         )
 
-    def unqualified(path: str, count: str) -> None:
+    def unqualified(path: str, count: str, approximate: bool = False) -> None:
         resolved = resolve(path)
         values = [
             facts[stage][resolved]
@@ -130,10 +158,10 @@ def check_claims(
             "lines",
             f"{path} absolute: {expected}",
             values if measurable else None,
-            expected in values if measurable else None,
+            compare(values, expected, approximate),
         )
 
-    def delta(path: str, count: str) -> None:
+    def delta(path: str, count: str, approximate: bool = False) -> None:
         resolved = resolve(path)
         before = facts.get("before", {}).get(resolved)
         after = facts.get("after", {}).get(resolved)
@@ -143,18 +171,35 @@ def check_claims(
             "line_delta",
             f"{path} net: {expected:+d}",
             actual,
-            None if actual is None else actual == expected,
+            compare([actual], expected, approximate),
         )
 
     # Line claims keep their entire sentence/clause. Splitting on coordination,
     # contrast, or commas can erase the subject ("difference between old and
     # new FILE is N lines") and falsely verify the remaining suffix.
     path_pattern = rf"(?P<quote>`?)(?P<path>{FILE})(?P=quote)"
-    for clause in re.split(r"\n|;|(?<=[.!?])\s+", summary):
+    # Mask code before splitting clauses: punctuation within a code span
+    # must not expose its digits as prose. Quoted paths still resolve normally.
+    line_summary = re.sub(
+        r"(`+)(.*?)\1",
+        lambda m: f"`{m[2]}`" if re.fullmatch(FILE, m[2]) else " ",
+        summary,
+    )
+    for clause in re.split(r"\n|;|(?<=[.!?])\s+", line_summary):
         clause = clause.strip().removesuffix(".")
+        approximate_delta = re.fullmatch(
+            r"(?:Net\s+)?"
+            + path_pattern
+            + rf"\s+shrinks\s+~(?P<count>{NUMBER})\s+lines",
+            clause,
+            re.I,
+        )
+        if approximate_delta:
+            delta(approximate_delta["path"], "-" + approximate_delta["count"], True)
+            continue
         absolute = re.fullmatch(
             path_pattern
-            + rf"(?:(?:\s+(?:is(?: now)?|now)\s+|:\s*)(?P<size>{NUMBER})\s+lines"
+            + rf"(?:(?:\s+(?:is(?: now)?|now)\s+|:\s*)(?P<approx>~?)(?P<size>{NUMBER})\s+lines"
             + rf"|\s+after\s*[:│]\s*(?P<after>{NUMBER})(?:\s+lines)?(?:\s*│)?)",
             clause,
             re.I,
@@ -173,7 +218,14 @@ def check_claims(
         sizes = list(
             re.finditer(
                 path_pattern
-                + rf"\s+\((?P<count>{NUMBER})\s+lines(?:\s*(?:→|->)\s*largest in repo)?\)",
+                + rf"\s+\((?P<approx>~?)(?P<count>{NUMBER})\s+lines(?:\s*(?:→|->)\s*largest in repo)?\)",
+                clause,
+            )
+        )
+        sizes.extend(
+            re.finditer(
+                path_pattern
+                + rf"\s+[—–]\s+(?P<approx>~?)(?P<count>{NUMBER})\s+lines\b",
                 clause,
             )
         )
@@ -209,14 +261,16 @@ def check_claims(
             flags=re.I,
         )
         residue = re.search(
-            rf"{NUMBER}\s*(?:-\s*)?lines?\b|{FILE}.*?\d", size_context, re.I
+            rf"{NUMERAL}\s*(?:-\s*)?lines?\b|{FILE}.*?{NUMERAL}", size_context, re.I
         )
         # Relocation prose may describe the move, but cannot hide extra counts.
-        if relocations and re.search(r"\d", re.sub(FILE, "", size_context)):
+        if relocations and re.search(NUMERAL, re.sub(FILE, "", size_context)):
             residue = True
         if (sizes or pairs) and not comparison and not residue:
             for size in sizes:
-                unqualified(size["path"], size["count"])
+                unqualified(
+                    size["path"], size["count"], bool(size.groupdict().get("approx"))
+                )
             for pair in pairs:
                 lines(pair["path"], pair["before"], "before")
                 lines(pair["path"], pair["after"], "after")
@@ -224,11 +278,18 @@ def check_claims(
                 if net is not None:
                     delta(pair["path"], net)
         elif absolute:
-            if absolute["after"] or comparison:
-                lines(absolute["path"], absolute["size"] or absolute["after"], "after")
+            if absolute["after"] or re.search(r"\bnow\b", clause, re.I):
+                lines(
+                    absolute["path"],
+                    absolute["size"] or absolute["after"],
+                    "after",
+                    bool(absolute["approx"]),
+                )
             else:
-                unqualified(absolute["path"], absolute["size"])
-        elif re.search(FILE, clause) and re.search(r"\d", re.sub(FILE, "", clause)):
+                unqualified(
+                    absolute["path"], absolute["size"], bool(absolute["approx"])
+                )
+        elif re.search(FILE, clause) and re.search(NUMERAL, re.sub(FILE, "", clause)):
             add("lines", clause + ": unrecognized line-count phrasing", None, None)
 
     # Sentence/contrast boundaries reset context. Within coordination, an
@@ -237,12 +298,12 @@ def check_claims(
     prose = "\n".join(
         line for line in summary.splitlines() if line not in command_lines
     )
-    clauses = re.split(r"\n|;|\bbut\b|,(?!\d)|(?<=[.!?])\s+", prose, flags=re.I)
+    clauses = split_prose(r"\n|;|\bbut\b|,(?!\d)|(?<=[.!?])\s+", prose)
     assertions = list(command_lines)
     for clause in clauses:
         negative = False
         future_auxiliary = False
-        for assertion in re.split(r"\band\b", clause, flags=re.I):
+        for assertion in split_prose(r"\band\b", clause):
             explicit = re.match(r"\s*(?:I|we|have|has|already)\b", assertion, re.I)
             if explicit:
                 negative = False
@@ -308,16 +369,17 @@ def check_claims(
             argv = named_test(line)
             test_evidence = test_totals(clean_terminal((test_logs or {}).get(argv, "")))
         counts = []
+        count_text = re.sub(r"(`+)(.*?)\1", " ", line)
         for count in re.finditer(
             rf"({NUMBER})\s+(?:[A-Za-z][\w-]*\s+)*?tests?(?:\s+(passed|pass|failed|fail|ignored|total)\b)?|({NUMBER})\s+(passed|failed|ignored|failures)\b",
-            line,
+            count_text,
             re.I,
         ):
             number = count[1] or count[3]
             # A count of test definitions is not a completed invocation.
             # Require a result qualifier, independently of inventory adjectives.
             kind = (count[2] or count[4] or "inventory").lower()
-            if re.search(r"\bwith\s*$", line[: count.start()], re.I):
+            if re.search(r"\bwith\s*$", count_text[: count.start()], re.I):
                 kind = "inventory"
             kind = {"pass": "passed", "fail": "failed", "failures": "failed"}.get(
                 kind, kind

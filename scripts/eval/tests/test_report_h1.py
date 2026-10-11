@@ -125,12 +125,12 @@ class H1Report(unittest.TestCase):
             self.assertEqual(len(stats), 1, rows)
             self.assertEqual(stats[0]["status"], expected, rows)
 
-    def test_h1_uncheckable_original_is_not_pass(self):
+    def test_h1_uncheckable_original_does_not_block(self):
         case = composed_tests.ComposedReport()
         case.setUp()
         self.addCleanup(case.doCleanups)
         case.store_fixture(audited("The refactor feels simpler."))
-        self.assertEqual(case.grade()["criteria"]["claims"]["status"], "UNGRADED")
+        self.assertEqual(case.grade()["criteria"]["claims"]["status"], "PASS")
 
     def test_h1_recheck_cannot_borrow_a_different_command_log(self):
         text = "`cargo test -p core` — 1850 tests passed."

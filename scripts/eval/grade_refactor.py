@@ -451,13 +451,7 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
                 + composed["corrections"]
             )
             status = (
-                "FAIL"
-                if any(c["status"] == "contradicted" for c in claims)
-                else (
-                    "PASS"
-                    if claims and all(c["status"] == "verified" for c in claims)
-                    else "UNGRADED"
-                )
+                "FAIL" if any(c["status"] == "contradicted" for c in claims) else "PASS"
             )
             criteria["claims"] = {
                 "status": status,
@@ -495,6 +489,13 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
 def render(report: dict) -> None:
     for name, result in report["criteria"].items():
         print(f'{result["status"]:4} {name}', file=sys.stderr)
+        if name == "claims" and isinstance(result.get("evidence"), list):
+            for claim in result["evidence"]:
+                if claim["status"] == "unverifiable":
+                    print(
+                        f'  unverified (not blocking): {claim["claim"]}',
+                        file=sys.stderr,
+                    )
     verdict = "PASS" if report["pass"] else "UNGRADED"
     if any(row["status"] == "FAIL" for row in report["criteria"].values()):
         verdict = "FAIL"

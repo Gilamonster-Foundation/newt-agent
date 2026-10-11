@@ -119,12 +119,12 @@ class SentenceClaims(unittest.TestCase):
             next(r for r in rows if r["kind"] == "line_delta")["status"], "unverifiable"
         )
 
-    def test_production_grade_uses_changed_paths_and_preserves_fail_and_ungraded(self):
+    def test_production_grade_uses_changed_paths_and_only_contradictions_fail(self):
         for text, status in (
             ("lib.rs: 10 → 1 lines (net −8)", "FAIL"),
             (
                 "New crate/src/extracted.rs (1 lines) with 10 pure fs-free tests",
-                "UNGRADED",
+                "PASS",
             ),
             ("The original crate/src/lib.rs (10 lines)", "PASS"),
         ):

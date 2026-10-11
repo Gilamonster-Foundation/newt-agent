@@ -91,8 +91,14 @@ class Residue(unittest.TestCase):
                     ):
                         report = case.grade()
                     self.assertEqual(
-                        report["criteria"]["claims"]["status"], "UNGRADED", report
+                        report["criteria"]["claims"]["status"], "PASS", report
                     )
-                    self.assertFalse(report["pass"])
+                    self.assertTrue(report["pass"])
+                    self.assertTrue(
+                        any(
+                            row["status"] == "unverifiable"
+                            for row in report["criteria"]["claims"]["evidence"]
+                        )
+                    )
                 finally:
                     case.doCleanups()

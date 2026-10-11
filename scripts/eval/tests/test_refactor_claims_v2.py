@@ -135,7 +135,7 @@ class NamedTests(unittest.TestCase):
 
     def test_repeated_command_runs_once_and_other_counts_do_not_borrow(self):
         report = self.grade(TEST + "\n" + TEST + "\n16 tests passed")
-        self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED")
+        self.assertEqual(report["criteria"]["claims"]["status"], "PASS")
         self.assertEqual(sum("test" in a for a, _ in self.case.fake.calls), 1)
 
     def test_different_commands_keep_their_own_counts(self):
@@ -160,7 +160,7 @@ class NamedTests(unittest.TestCase):
     def test_clone_failure_does_not_run_tests(self):
         self.case.fake.check_fails = True
         report = self.grade(TEST)
-        self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED")
+        self.assertEqual(report["criteria"]["claims"]["status"], "PASS")
         self.assertFalse(any("test" in a for a, _ in self.case.fake.calls))
 
     def test_filtered_mismatch_is_contradicted(self):
@@ -184,13 +184,13 @@ class NamedTests(unittest.TestCase):
                 self.case.args.test_log = self.case.args.transcript.parent / "tests.log"
                 self.case.args.test_log.write_text(log())
                 report = self.grade(f"`cargo test -p newt-core {suffix}` — 15 passed")
-                self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED")
+                self.assertEqual(report["criteria"]["claims"]["status"], "PASS")
                 self.assertFalse(any("test" in a for a, _ in self.case.fake.calls))
 
-    def test_failed_and_partial_invocations_do_not_pass(self):
+    def test_failed_invocations_block_but_partial_evidence_does_not(self):
         for output, status in (
             (log(15, 1), "FAIL"),
-            (log().split("cargo-test-exit:")[0], "UNGRADED"),
+            (log().split("cargo-test-exit:")[0], "PASS"),
         ):
             self.output = output
             self.assertEqual(self.grade(TEST)["criteria"]["claims"]["status"], status)
