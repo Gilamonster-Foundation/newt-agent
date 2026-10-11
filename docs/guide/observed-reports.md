@@ -34,7 +34,10 @@ ambiguous when they could refer to multiple observed files.
 These are historical observations. A previous successful check does not certify
 subsequent edits, and an observed PR creation URL does not certify its current
 remote state. A pipeline's recorded exit is the whole command's exit, not proof
-of an individual child's exit. Missing or inaccessible evidence is labelled
+of an individual child's exit. Compound commands show `pipeline exit N (inner
+command status not observed)`, with retained Cargo result/failure lines identified
+as excerpts. Failure markers override a passing outer exit; a successful test
+result excerpt does not establish whole-invocation success. Missing or inaccessible evidence is labelled
 unavailable; a dry-run push is not a publication receipt.
 
 The session retains facts across continuations of the same objective. A new
@@ -77,8 +80,12 @@ Fenced examples, quoted commands, future targets and unrelated identifiers are
 left alone. This is a bounded grammar, not a general natural-language truth
 verifier. Separate sentences and semicolon-delimited claims on one line are
 reviewed independently. A correct file count cannot hide a test or publication
-claim. Inseparable mixed families or multiple file subjects are unverified rather
-than assigning one observation to unrelated assertions.
+claim. A parenthetical absolute size binds to its adjacent unambiguous path even
+when the sentence names an extraction destination. Compound push/PR claims are
+accepted only when each matches a governed receipt, including any named revision
+and PR URL. Compact diffstats are isolated; without a retained scoped diff they
+are unverified rather than borrowing publication evidence. Other inseparable
+mixed claims abstain rather than borrowing another claim's observation.
 
 Every edited report retains the disclosed original draft and a byte-offset edit
 map identified by the existing canonical content-addressing codec. The current
@@ -86,7 +93,8 @@ observed-report CID binds its evidence reference. Prompt artifacts retain JSON
 chunks in order (`newt.report-review/v1`, `review_cid`, `part`, `last`); joining the
 bodies reconstructs the audit. Explicitly ephemeral sessions can instead retain
 the audit in the existing session spill store, with a `spill:` reference in the
-report. The inverse is checked before replacing prose, and spill retrieval checks
+report. Audit locators appear in a plain `newt review: …` footer, never a
+correction marker; the footer is excluded from assistant replay. The inverse is checked before replacing prose, and spill retrieval checks
 both record and review content identities. The same disclosure policy applies to
 the original, replacements and final display. If retention is unavailable, the
 original clause remains inline as unverified instead of being discarded.
@@ -98,7 +106,10 @@ new verified observations. Existing artifacts and transcript rows are not rewrit
 
 The refactor grader consumes this persisted composed report, not the raw assistant
 transcript. It validates retained review chunks and their reversible edit map,
-counts harness corrections as verified historical facts, and excludes unverified
-spans from claims. The disclosed original draft remains an unscored audit field.
+retains harness-detected contradictions as failures, and independently re-checks
+the original audited unverified spans against Git/GitHub/build evidence. A newt
+abstention is neither a grader failure nor positive evidence by itself. An
+uncheckable report remains ungraded. The full original draft remains an audit
+field; only unchanged prose and those audited unverified spans are re-checked.
 Missing, truncated or unauditable final reports remain ungraded; an older report
 or the original draft cannot supply fallback claims.
