@@ -33,7 +33,7 @@ fn git(root: &Path, args: &[&str]) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
-fn fixture() -> tempfile::TempDir {
+pub(crate) fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-q", "-b", "main"]);
     for path in ["src", "tests"] {
@@ -409,3 +409,6 @@ fn observed_report_capexit_notice_identity_and_bounds() {
         "Model words."
     );
 }
+
+#[path = "stage2_tests.rs"]
+mod stage2;
