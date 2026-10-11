@@ -60,8 +60,14 @@ Stage 2 reviews narrowly recognized factual clauses at the same finalization
 boundary on all four wires, including capped finishes. Exact file sizes,
 before/after pairs and signed net changes are compared with the scoped snapshots.
 Named Cargo test totals require the same command and directory, complete retained
-result lines and a consistent recorded exit. Counts never borrow another command's
-log. Approximations, ambiguous paths, missing observations and diff totals without
+result lines and a consistent recorded exit. Each observation carries a content
+witness from the existing bounded, authorized file snapshot. Ordinary/current-tree
+claims require a complete matching witness at finalization; subsequent edits
+(including new files or changes that preserve line counts) make the observation
+stale and the claim unverified. Missing or unauthorized witnesses also abstain.
+Explicit historical claims can describe the recorded invocation, but historical
+wording cannot override a current-tree qualifier. Counts never borrow another
+command's log. Approximations, ambiguous paths, missing observations and diff totals without
 a measured diffstat are unverified. A historical creation receipt does not verify
 that a PR is currently open or merged.
 
@@ -69,8 +75,10 @@ Contradicted clauses are replaced with `[corrected by newt: …]` and the observ
 value. Unsupported quantities are labelled `[unverified by newt: …]` inline.
 Fenced examples, quoted commands, future targets and unrelated identifiers are
 left alone. This is a bounded grammar, not a general natural-language truth
-verifier. If a line contains multiple file subjects it is marked unverified
-rather than assigning a count to the wrong file.
+verifier. Separate sentences and semicolon-delimited claims on one line are
+reviewed independently. A correct file count cannot hide a test or publication
+claim. Inseparable mixed families or multiple file subjects are unverified rather
+than assigning one observation to unrelated assertions.
 
 Every edited report retains the disclosed original draft and a byte-offset edit
 map identified by the existing canonical content-addressing codec. The current
