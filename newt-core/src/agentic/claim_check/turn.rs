@@ -9,6 +9,7 @@ pub(crate) struct TurnClaims<'a> {
     session: Option<&'a WorktreeSession>,
     baseline_root: PathBuf,
     head_before: Option<String>,
+    evidence: super::super::observed_report::review::Evidence<'a>,
     report: std::sync::Arc<std::sync::Mutex<super::super::observed_report::State>>,
 }
 
@@ -36,7 +37,35 @@ impl<'a> TurnClaims<'a> {
             session,
             baseline_root,
             head_before,
+            evidence: Default::default(),
         }
+    }
+
+    pub(crate) fn with_evidence(
+        mut self,
+        evidence: super::super::observed_report::review::Evidence<'a>,
+    ) -> Self {
+        self.evidence = evidence;
+        self
+    }
+
+    pub(crate) fn final_report(
+        &self,
+        workspace: &str,
+        scope: &crate::Scope<String>,
+        prose: &str,
+        source_draft: &str,
+        disclosure: Option<&crate::ocap::DisclosureFilter>,
+    ) -> String {
+        let root = root(workspace, self.session);
+        self.report.lock().expect("report state").compose(
+            &root,
+            scope,
+            prose,
+            source_draft,
+            self.evidence,
+            disclosure,
+        )
     }
 
     pub(crate) fn observe_report(
