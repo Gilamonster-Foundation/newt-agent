@@ -1,4 +1,4 @@
-use super::{future, number, regex, Facts, Verdict};
+use super::{future, number, regex, ClaimAssessment, Facts};
 use std::sync::LazyLock;
 
 static PATH: LazyLock<regex::Regex> =
@@ -42,24 +42,30 @@ pub(super) fn approximate(text: &str) -> bool {
     APPROX.is_match(text)
 }
 
-pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
+pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<ClaimAssessment> {
     let text = visible(clause);
     if future(&text) || !QUANTITY.is_match(&text) {
         return None;
     }
     if approximate(&text) {
-        return Some(Verdict::Unverified("approximate quantity"));
+        return Some(ClaimAssessment::Unverified("approximate quantity"));
     }
     if text.contains("insertion") || text.contains("deletion") || text.contains("files changed") {
-        return Some(Verdict::Unverified("no scoped diffstat observation"));
+        return Some(ClaimAssessment::Unverified(
+            "no scoped diffstat observation",
+        ));
     }
     let paths: Vec<_> = PATH.find_iter(&text).map(|m| m.as_str()).collect();
     if paths.len() > 1 {
-        return Some(Verdict::Unverified("multiple file subjects in one clause"));
+        return Some(ClaimAssessment::Unverified(
+            "multiple file subjects in one clause",
+        ));
     }
     let (before, after, subject) = if let Some(path) = paths.first() {
         let Some(resolved) = super::super::files::resolve(facts.before, facts.after, path) else {
-            return Some(Verdict::Unverified("missing or ambiguous file path"));
+            return Some(ClaimAssessment::Unverified(
+                "missing or ambiguous file path",
+            ));
         };
         (
             facts.before.and_then(|s| s.lines(&resolved)),
@@ -72,7 +78,7 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
             .zip(facts.after)
             .is_some_and(|(a, b)| a.same_paths(b))
         {
-            return Some(Verdict::Unverified(
+            return Some(ClaimAssessment::Unverified(
                 "objective file sets differ or are unavailable",
             ));
         }
@@ -82,10 +88,10 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
             "objective file total".into(),
         )
     } else {
-        return Some(Verdict::Unverified("no unique file subject"));
+        return Some(ClaimAssessment::Unverified("no unique file subject"));
     };
     let unverified = || {
-        Some(Verdict::Unverified(
+        Some(ClaimAssessment::Unverified(
             "scoped line count unavailable or unsupported phrasing",
         ))
     };
@@ -111,9 +117,9 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
                 .get(3)
                 .is_none_or(|m| number(m.as_str()) == Some(after - before));
         return Some(if matches {
-            Verdict::Correct
+            ClaimAssessment::Correct
         } else {
-            Verdict::Corrected(format!(
+            ClaimAssessment::Corrected(format!(
                 "{subject}: {before} → {after} lines (net {:+})",
                 after - before
             ))
@@ -174,7 +180,7 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
             && expected.is_some()
             && (expected == before || expected == after)
         {
-            return Some(Verdict::Correct);
+            return Some(ClaimAssessment::Correct);
         }
         return unverified();
     }
@@ -192,13 +198,13 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
         format!("{subject}: {value} lines"),
     ))
 }
-fn compare(claimed: Option<i64>, actual: i64, observed: String) -> Verdict {
+fn compare(claimed: Option<i64>, actual: i64, observed: String) -> ClaimAssessment {
     if claimed.is_none() {
-        return Verdict::Unverified("unsupported number syntax");
+        return ClaimAssessment::Unverified("unsupported number syntax");
     }
     if claimed == Some(actual) {
-        Verdict::Correct
+        ClaimAssessment::Correct
     } else {
-        Verdict::Corrected(observed)
+        ClaimAssessment::Corrected(observed)
     }
 }
