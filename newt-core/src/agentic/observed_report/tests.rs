@@ -412,3 +412,6 @@ fn observed_report_capexit_notice_identity_and_bounds() {
 
 #[path = "stage2_tests.rs"]
 mod stage2;
+
+#[path = "stage2_fixture.rs"]
+mod stage2_fixture;
