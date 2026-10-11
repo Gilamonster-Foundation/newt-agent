@@ -551,7 +551,11 @@ async fn check(row: Row) {
         );
         assert!(final_text.contains(row.contains), "{final_text}");
         if row.setup == Setup::Publish {
-            assert_eq!(crate::agentic::model_explanation(&final_text), row.claim);
+            assert_eq!(ledger.annotate_push_claim(row.claim.into()), row.claim);
+            // This dispatcher fixture supplies no scoped report receipt/sink.
+            // Stage 2 retains the claim as unverified, never assistant replay.
+            assert!(final_text.contains(&format!("[unverified by newt: {} —", row.claim)));
+            assert!(crate::agentic::model_reply_for_history(&final_text).is_empty());
         }
     }
     let refused = out.contains("capability denied")
