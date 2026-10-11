@@ -44,7 +44,7 @@ impl Evidence<'_> {
                 rest = &rest[end..];
                 part += 1;
             }
-            return Ok(format!("review {cid} in prompt artifacts"));
+            return Ok(format!("{cid} in prompt artifacts"));
         }
         let store = self
             .spill

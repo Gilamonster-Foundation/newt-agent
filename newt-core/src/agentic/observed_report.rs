@@ -1,5 +1,6 @@
 //! Objective-scoped, content-addressed facts. Model prose is not evidence.
 mod capture;
+mod check_status;
 mod files;
 mod prose;
 pub(crate) mod review;
@@ -264,13 +265,10 @@ impl State {
         }
         for check in &state.checks {
             out.push_str(&format!(
-                "- {} in {}: {}; exit {}.\n",
+                "- {} in {}: {}.\n",
                 literal(&check.command),
                 literal(&check.cwd),
-                check.outcome,
-                check
-                    .exit
-                    .map_or_else(|| "unavailable".into(), |v| v.to_string())
+                check.status_label()
             ));
             for line in &check.lines {
                 out.push_str(&format!("  {}\n", literal(line)));

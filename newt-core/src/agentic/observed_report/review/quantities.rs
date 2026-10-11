@@ -55,6 +55,9 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<ClaimAssessmen
             "no scoped diffstat observation",
         ));
     }
+    if let Some(assessment) = descriptors(&text, facts) {
+        return Some(assessment);
+    }
     let paths: Vec<_> = PATH.find_iter(&text).map(|m| m.as_str()).collect();
     if paths.len() > 1 {
         return Some(ClaimAssessment::Unverified(
@@ -207,4 +210,38 @@ fn compare(claimed: Option<i64>, actual: i64, observed: String) -> ClaimAssessme
     } else {
         ClaimAssessment::Corrected(observed)
     }
+}
+
+/// Parenthetical absolute sizes bind to the adjacent path, not every path in
+/// an extraction narrative. Retain the residue guard against hidden quantities.
+fn descriptors(text: &str, facts: &Facts<'_>) -> Option<ClaimAssessment> {
+    static DESCRIPTOR: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex(&format!(
+            r"(?i)({})\s*\(([\d,]+)\s+lines(?:\s*(?:→|->)\s*largest in repo)?\)",
+            PATH.as_str()
+        ))
+    });
+    let matches: Vec<_> = DESCRIPTOR.captures_iter(text).collect();
+    if matches.is_empty() {
+        return None;
+    }
+    let residue = DESCRIPTOR.replace_all(text, " ");
+    if QUANTITY.is_match(&residue) || COMPARISON.is_match(&residue) || CHANGE.is_match(&residue) {
+        return None;
+    }
+    for size in matches {
+        let path = super::super::files::resolve(facts.before, facts.after, &size[1]);
+        let expected = number(&size[2]);
+        let matches = path.is_some_and(|path| {
+            expected.is_some()
+                && (expected == facts.before.and_then(|s| s.lines(&path))
+                    || expected == facts.after.and_then(|s| s.lines(&path)))
+        });
+        if !matches {
+            return Some(ClaimAssessment::Unverified(
+                "absolute size lacks a matching unambiguous observation",
+            ));
+        }
+    }
+    Some(ClaimAssessment::Correct)
 }

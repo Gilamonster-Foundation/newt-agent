@@ -421,3 +421,6 @@ mod stage2_fixture;
 
 #[path = "round2_tests.rs"]
 mod round2;
+
+#[path = "h1_tests.rs"]
+mod h1;

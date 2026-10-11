@@ -104,8 +104,13 @@ pub(super) fn review(draft: &str, facts: Facts<'_>) -> Review {
         if !fence.advance(line) && !clause.starts_with("    ") && !trimmed.starts_with('>') {
             for range in spans::claims(clause) {
                 let claim = &clause[range.clone()];
-                let quantity = quantities::classify(claim, &facts);
-                let check = checks::classify(claim, &facts);
+                let diffstats = spans::diffstats(claim);
+                let mut residue = claim.to_owned();
+                for span in diffstats.iter().rev() {
+                    residue.replace_range(span.clone(), &" ".repeat(span.len()));
+                }
+                let quantity = quantities::classify(&residue, &facts);
+                let check = checks::classify(&residue, &facts);
                 let verdict = match (quantity, check) {
                     (Some(_), Some(_)) => Some(ClaimAssessment::Unverified(
                         "inseparable file and check/publication claims",
@@ -129,6 +134,19 @@ pub(super) fn review(draft: &str, facts: Facts<'_>) -> Review {
                         original: claim.into(),
                         replacement,
                     });
+                } else {
+                    for span in diffstats {
+                        let original = &claim[span.clone()];
+                        review.edits.push(Edit {
+                            start: offset + prefix + range.start + span.start,
+                            end: offset + prefix + range.start + span.end,
+                            original: original.into(),
+                            replacement: format!(
+                                "[unverified by newt: {} — no scoped diffstat observation]",
+                                spans::escape(original)
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -172,15 +190,21 @@ pub(super) fn review(draft: &str, facts: Facts<'_>) -> Review {
 pub(super) fn model_projection(prose: &str) -> String {
     // A plain model-authored mention of a marker is not a reviewed report.
     // Require the complete review footer as well as the outer report envelope.
-    let footer = prose.lines().last().unwrap_or("");
+    let tail = prose.trim_end_matches(['\r', '\n']);
+    let footer = tail.lines().last().unwrap_or("");
+    let reference = footer.strip_prefix("newt review: ").or_else(|| {
+        footer
+            .strip_prefix("[corrected by newt: review evidence ")?
+            .strip_suffix(']')
+    });
     let reviewed = footer == "[unverified by newt: review evidence unavailable]"
-        || footer
-            .strip_prefix("[corrected by newt: review evidence ")
-            .and_then(|s| s.strip_suffix(']'))
+        || reference == Some("evidence unavailable")
+        || reference
             .and_then(|s| {
                 s.strip_prefix("spill:").or_else(|| {
                     s.strip_prefix("review ")
-                        .and_then(|s| s.strip_suffix(" in prompt artifacts"))
+                        .unwrap_or(s)
+                        .strip_suffix(" in prompt artifacts")
                 })
             })
             .is_some_and(|s| crate::agentic::SpillCid::parse(s).is_ok());
@@ -189,7 +213,8 @@ pub(super) fn model_projection(prose: &str) -> String {
     }
     let mut fence = super::prose::Fence::default();
     let mut out = String::new();
-    for line in prose.split_inclusive('\n') {
+    let body = tail.rsplit_once('\n').map_or("", |(body, _)| body);
+    for line in body.split_inclusive('\n') {
         if fence.advance(line) || line.starts_with("    ") {
             out.push_str(line);
             continue;
@@ -231,7 +256,10 @@ fn future(text: &str) -> bool {
     static FUTURE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex(r"(?i)\b(?:will|would|could|should|aim|target|goal|plan to|example)\b")
     });
-    FUTURE.is_match(text)
+    // URL path components are locators, not future/example framing.
+    static URL: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex(r"https?://[^\s`]+"));
+    FUTURE.is_match(&URL.replace_all(text, " "))
 }
 
 impl super::State {
@@ -261,10 +289,7 @@ impl super::State {
             );
         }
         match evidence.retain(&review) {
-            Ok(reference) => format!(
-                "{report}{}\n\n[corrected by newt: review evidence {reference}]",
-                review.rendered()
-            ),
+            Ok(reference) => format!("{report}{}\n\nnewt review: {reference}", review.rendered()),
             Err(_) => {
                 // Never discard bytes if retention failed. The entire draft is
                 // still represented inline, with unsupported clauses labelled.
@@ -278,7 +303,7 @@ impl super::State {
                     );
                 }
                 format!(
-                    "{report}{}\n\n[unverified by newt: review evidence unavailable]",
+                    "{report}{}\n\nnewt review: evidence unavailable",
                     review.rendered()
                 )
             }
