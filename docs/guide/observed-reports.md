@@ -56,5 +56,49 @@ cannot create a governed receipt or replace a stored observation.
 
 Only complete copies matching the rendered report structure outside code fences
 are removed from model prose. Partial or ambiguous report-like text is preserved.
-Stage 1 otherwise leaves the model's explanation intact, including any conflicting
-numbers or conclusions. Clause-level correction of those claims is a later stage.
+Stage 2 reviews narrowly recognized factual clauses at the same finalization
+boundary on all four wires, including capped finishes. Exact file sizes,
+before/after pairs and signed net changes are compared with the scoped snapshots.
+Named Cargo test totals require the same command and directory, complete retained
+result lines and a consistent recorded exit. Each observation carries a content
+witness from the existing bounded, authorized file snapshot. Ordinary/current-tree
+claims require a complete matching witness at finalization; subsequent edits
+(including new files or changes that preserve line counts) make the observation
+stale and the claim unverified. Missing or unauthorized witnesses also abstain.
+Explicit historical claims can describe the recorded invocation, but historical
+wording cannot override a current-tree qualifier. Counts never borrow another
+command's log. Approximations, ambiguous paths, missing observations and diff totals without
+a measured diffstat are unverified. A historical creation receipt does not verify
+that a PR is currently open or merged.
+
+Contradicted clauses are replaced with `[corrected by newt: …]` and the observed
+value. Unsupported quantities are labelled `[unverified by newt: …]` inline.
+Fenced examples, quoted commands, future targets and unrelated identifiers are
+left alone. This is a bounded grammar, not a general natural-language truth
+verifier. Separate sentences and semicolon-delimited claims on one line are
+reviewed independently. A correct file count cannot hide a test or publication
+claim. Inseparable mixed families or multiple file subjects are unverified rather
+than assigning one observation to unrelated assertions.
+
+Every edited report retains the disclosed original draft and a byte-offset edit
+map identified by the existing canonical content-addressing codec. The current
+observed-report CID binds its evidence reference. Prompt artifacts retain JSON
+chunks in order (`newt.report-review/v1`, `review_cid`, `part`, `last`); joining the
+bodies reconstructs the audit. Explicitly ephemeral sessions can instead retain
+the audit in the existing session spill store, with a `spill:` reference in the
+report. The inverse is checked before replacing prose, and spill retrieval checks
+both record and review content identities. The same disclosure policy applies to
+the original, replacements and final display. If retention is unavailable, the
+original clause remains inline as unverified instead of being discarded.
+
+The operator-facing composed report is retained in the turn-outcome artifact.
+Harness-marked review clauses are omitted from assistant-authored replay, while
+unchanged explanation remains. Review artifacts are evidence, never a source of
+new verified observations. Existing artifacts and transcript rows are not rewritten.
+
+The refactor grader consumes this persisted composed report, not the raw assistant
+transcript. It validates retained review chunks and their reversible edit map,
+counts harness corrections as verified historical facts, and excludes unverified
+spans from claims. The disclosed original draft remains an unscored audit field.
+Missing, truncated or unauditable final reports remain ungraded; an older report
+or the original draft cannot supply fallback claims.

@@ -227,10 +227,10 @@ enum SpillKind {
 
 impl SpillKind {
     fn matches(self, provenance: &super::content_spill::SpillProvenance) -> bool {
-        use super::content_spill::SpillProvenance::{CompactionSpan, ToolOutput};
+        use super::content_spill::SpillProvenance::{CompactionSpan, ReportReview, ToolOutput};
         matches!(
             (self, provenance),
-            (Self::Spill, ToolOutput { .. }) | (Self::Compaction, CompactionSpan)
+            (Self::Spill, ToolOutput { .. } | ReportReview) | (Self::Compaction, CompactionSpan)
         )
     }
 }

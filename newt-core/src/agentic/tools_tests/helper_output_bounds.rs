@@ -546,6 +546,7 @@ fn observed_report_envelope_tap_precedes_output_trimming() {
     state.bind(dir.path(), &crate::Scope::All);
     state.observe(
         dir.path(),
+        &crate::Scope::All,
         &capture.lock().unwrap(),
         Some(crate::ExecOutcome::Failed),
         None,

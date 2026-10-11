@@ -21,7 +21,7 @@ import tempfile
 from refactor_helper import EvidenceError, HelperUnavailable, invoke_helper
 from refactor_transcript import read_tail, positive_mib
 from refactor_claims import check_claims, operator_inputs, named_test, named_test_lines
-from refactor_session import final_assistant
+from refactor_session import final_report
 
 # Reuse the eval scoreboard's crate-vector-pinned content addressing, not a
 # second encoder or ad-hoc digest. See newt-interaction/tests/vectors.rs.
@@ -374,12 +374,16 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
         row("worktree_commit", False, str(exc))
 
     summary = ""
+    composed = None
+    claim_text = ""
     summary_error = "no structured session source supplied; use --session-db"
     if getattr(args, "session_db", None):
         try:
-            summary = final_assistant(
+            composed = final_report(
                 args.session_db, getattr(args, "conversation_id", None)
             )
+            summary = composed["text"]
+            claim_text = composed["claim_text"]
             summary_error = None
         except ValueError as exc:
             summary_error = str(exc)
@@ -414,7 +418,7 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
                 True,
                 {"head": cloned, "crate": args.crate, "stdout": output[-2000:]},
             )
-            for line in named_test_lines(summary):
+            for line in named_test_lines(claim_text):
                 argv = named_test(line)
                 if argv is not None and argv not in test_logs:
                     try:
@@ -438,7 +442,10 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
     else:
         try:
             test_log = args.test_log.read_text() if args.test_log else ""
-            claims = check_claims(summary, facts, test_log, test_logs)
+            claims = (
+                check_claims(claim_text, facts, test_log, test_logs)
+                + composed["corrections"]
+            )
             status = (
                 "FAIL"
                 if any(c["status"] == "contradicted" for c in claims)
@@ -475,6 +482,8 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
         "criteria": criteria,
         "operator_inputs": inputs,
         "summary": summary,
+        "original_model_draft": composed["original_model_draft"] if composed else None,
+        "review_cid": composed["review_cid"] if composed else None,
         "errors": errors,
     }
 
@@ -541,7 +550,7 @@ def main() -> int:
     parser.add_argument(
         "--session-db",
         type=Path,
-        help="read-only newt conversations.db; required to grade claims",
+        help="read-only newt conversations.db; composed turn-outcome artifacts required to grade claims",
     )
     parser.add_argument(
         "--conversation-id",

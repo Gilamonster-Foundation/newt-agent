@@ -2,9 +2,9 @@
 //!
 //! The hooks in this module are deliberately narrower than general tool
 //! telemetry. They retain bounded harness-authored state, or locators plus
-//! digests for external state. Raw file contents, assistant replies, and tool
-//! streams never enter an artifact. Bounded harness reports may retain selected
-//! result excerpts as observations, separately from model prose.
+//! digests for external state. Raw file contents and tool streams do not enter these hooks. Final report
+//! outcomes retain the operator presentation; stage-2 review artifacts separately
+//! preserve disclosed model drafts and reversible corrections.
 
 use anyhow::Context as _;
 use serde_json::{json, Value};
@@ -60,7 +60,7 @@ const DIGEST_FIELDS: [&str; 2] = ["digest", "bytes"];
 /// `originating_prompt_id` is the submitted receipt, including a harness retry;
 /// `root_prompt_id` is the validated objective root. The active-operator id is
 /// intentionally not used here: it is a read selector, not the event origin.
-fn append(
+pub(crate) fn append(
     sink: &dyn PromptArtifactSink,
     context: ArtifactReadContext<'_>,
     artifact: NewPromptArtifact,
@@ -752,8 +752,8 @@ fn compaction_trigger_metadata(
 /// receipts, in turns, or in artifacts, and runs reaching rounds 145/236/285/320
 /// were indistinguishable from runs under the announced cap.
 ///
-/// The model explanation remains digest-only. The bounded operator-facing
-/// Observed section, when present, occupies the existing outcome body.
+/// The bounded composed operator report, when present, occupies the existing
+/// outcome body; unframed replies remain digest-only.
 /// `configured` is carried beside `rounds` so a reader sees the ESCALATION and
 /// not merely the result.
 pub fn record_turn_outcome(
@@ -783,7 +783,8 @@ pub fn record_turn_outcome(
     // Persist the operator-facing report separately from assistant-authored
     // transcript rows. This body is presentation data, never imported as a
     // verified check; fresh model facts still come from the typed report state.
-    if let Some((report, _)) = super::observed_report::split_report(reply) {
+    if super::observed_report::split_report(reply).is_some() {
+        let report = reply;
         let body = if report.len() <= crate::MAX_ARTIFACT_BODY_BYTES {
             report.to_owned()
         } else {
@@ -1718,9 +1719,9 @@ mod tests {
     }
 
     /// The operator's report is retained as an outcome artifact, not as
-    /// assistant speech or a second copy of the model explanation.
+    /// assistant speech. Stage 2 retains the composed explanation too.
     #[test]
-    fn observed_report_outcome_artifact_preserves_only_harness_section() {
+    fn observed_report_outcome_artifact_preserves_composed_operator_report() {
         let sink = RecordingSink::default();
         let (_, _, context) = context();
         let root = tempfile::tempdir().unwrap();
@@ -1739,11 +1740,8 @@ mod tests {
         record_turn_outcome(&sink, context, &reply, None, None, 1, None).unwrap();
         let artifacts = sink.artifacts();
         let body = artifacts[0].body().expect("operator report artifact");
-        assert_eq!(
-            body,
-            reply.split_once("\n## Model explanation\n\n").unwrap().0
-        );
-        assert!(!body.contains("private model explanation"));
+        assert_eq!(body, reply);
+        assert!(body.contains("private model explanation"));
     }
 
     #[test]

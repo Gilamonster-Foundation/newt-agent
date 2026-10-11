@@ -160,13 +160,21 @@ Claims come exclusively from `--session-db PATH`, newt's conversation store
 when the database contains multiple conversations. No conversation is chosen by
 wall-clock time or by guessing which workspace path represents the run.
 
-The real schema (`newt-core/src/store/schema.rs`) stores each turn's user text,
-assistant text, and tool-event JSON in separate `user`, `assistant`, and `events`
-columns. The grader reads the final `turns.assistant` value by sequence within a
-single writer. Multiple writers have incomparable clocks and are declined as
-UNGRADED. Empty final turns do not fall back to older claims. The complete stored
-assistant text is checked directly: no reply-marker, footer, or Summary-heading
-search can discard contradictory text or promote tool output to assistant text.
+The grader selects the latest prompt receipt by sequence within one writer and
+reads that prompt's final `turn_outcome` artifact. This is the composed report
+shown to the operator, including stage-2 correction markers. Raw `turns.assistant`,
+user text, tool events and terminal output are never fallback claims sources.
+Multiple writers have incomparable clocks and are declined as UNGRADED. A missing,
+incomplete or truncated final outcome does not fall back to an older report.
+
+For reviewed reports, the grader joins the same prompt's retained audit chunks,
+checks their canonical content ID and reversible edit map against the composed
+text, and retains `original_model_draft` as an **unscored audit field**. A retained
+`[corrected by newt: …]` edit contributes a verified historical observation.
+`[unverified by newt: …]` edits contribute no claims and no PASS evidence; a report
+with only unverified spans remains UNGRADED. Marker text without matching retained
+evidence cannot certify a correction. Missing or altered audits remain UNGRADED.
+The full composed report is retained in the grader's `summary` field.
 
 Access uses SQLite URI `mode=ro`, query-only mode and a short read transaction,
 with no busy wait. This preserves visibility of committed WAL rows without
@@ -177,11 +185,11 @@ this reader does not independently verify the store's cryptographic turn chain.
 
 The claim checker covers commit hashes, push claims, PR numbers/repository,
 merged state, numeric Rust line counts and test totals. Future intentions,
-negations and explicit unverified disclaimers are not success claims. The stored
-assistant message remains in the report for review; this deterministic checker
-is not a general natural-language truth detector.
+negations and explicit unverified disclaimers are not success claims. The composed
+operator report remains available for review; this deterministic checker is not
+a general natural-language truth detector.
 
-Test counts cannot be proved by Git or `cargo check`. Supply an independent
+Uncorrected model test counts cannot be proved by Git or `cargo check`. Supply an independent
 `--test-log` captured for the graded head and the claimed invocation to verify
 counts without a named command. A self-described result such as
 `cargo test -p newt-core cap_exit_unit_tests — 15 passed` is rerun in the

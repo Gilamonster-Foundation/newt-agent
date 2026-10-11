@@ -26,7 +26,12 @@ pub(in crate::agentic) fn model_prose(text: &str) -> String {
 /// The rendered reply is the operator's view. Project recognized legacy reports
 /// out of assistant speech without treating displayed text as trusted evidence.
 pub fn assistant_prose(text: &str) -> String {
-    model_prose(text)
+    let prose = model_prose(text);
+    if split_report(text).is_some() {
+        super::review::model_projection(&prose)
+    } else {
+        prose
+    }
 }
 
 pub(crate) fn replay_messages(messages: &[crate::MemMessage]) -> Vec<crate::MemMessage> {
@@ -209,10 +214,10 @@ fn literal(text: &str) -> bool {
 }
 
 #[derive(Default)]
-struct Fence(Option<(u8, usize)>);
+pub(super) struct Fence(Option<(u8, usize)>);
 impl Fence {
     /// True for both boundary lines and every line inside the current fence.
-    fn advance(&mut self, line: &str) -> bool {
+    pub(super) fn advance(&mut self, line: &str) -> bool {
         let was_open = self.0.is_some();
         let trimmed = line.trim_start_matches(' ');
         if line.len() - trimmed.len() <= 3 {
@@ -246,6 +251,7 @@ mod tests {
         state.bind(dir.path(), &crate::Scope::All);
         state.observe(
             dir.path(),
+            &crate::Scope::All,
             &super::super::Capture {
                 command: Some(("cargo check".into(), "project".into())),
                 exit: Some(0),

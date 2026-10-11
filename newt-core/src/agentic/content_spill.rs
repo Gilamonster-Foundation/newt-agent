@@ -63,6 +63,8 @@ pub enum SpillProvenance {
     ToolOutput { tool_name: Option<String> },
     /// A redacted middle span elided by the compactor (the `compaction:` handle).
     CompactionSpan,
+    /// Original disclosed model draft and reversible harness report corrections.
+    ReportReview,
 }
 
 /// The versioned, canonical spill record whose CID IS the handle. Serialized via
