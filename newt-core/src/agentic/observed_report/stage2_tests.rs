@@ -410,3 +410,10 @@ fn report_stage2_mixed_review_preserves_authored_marker_mentions() {
         }
     }
 }
+
+/// A true net delta must not hide a second unsupported quantitative assertion.
+#[test]
+fn report_stage2_net_residue_is_unverified() {
+    let review = review_fixture("src/mod.rs: net 0; helper is 999 lines.");
+    assert!(review.rendered().contains("[unverified by newt:"));
+}
