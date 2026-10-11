@@ -166,20 +166,42 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<ClaimAs
     });
     static PUSH: LazyLock<regex::Regex> =
         LazyLock::new(|| regex(r"(?i)\bpushed\b|\bpush\b.*\b(?:blocked|failed|succeeded)\b"));
-    static URL: LazyLock<regex::Regex> = LazyLock::new(|| regex(r"https://[^\s`)]+/pull/\d+"));
     let lower = visible.to_lowercase();
-    if PR.is_match(visible) && PUSH.is_match(visible) {
-        return Some(ClaimAssessment::Unverified(
-            "inseparable PR and push claims",
-        ));
+    let pr = PR.is_match(visible);
+    let push = PUSH.is_match(visible);
+    if pr && push {
+        return Some(
+            match (
+                publication_kind(clause, visible, facts, "PR creation observed:"),
+                publication_kind(clause, visible, facts, "Push observed:"),
+            ) {
+                (Some(ClaimAssessment::Correct), Some(ClaimAssessment::Correct)) => {
+                    ClaimAssessment::Correct
+                }
+                _ => ClaimAssessment::Unverified(
+                    "compound publication lacks matching evidence for every part",
+                ),
+            },
+        );
     }
-    let prefix = if PR.is_match(visible) {
+    let prefix = if pr {
         "PR creation observed:"
-    } else if PUSH.is_match(visible) {
+    } else if push {
         "Push observed:"
     } else {
         return None;
     };
+    publication_kind(clause, &lower, facts, prefix)
+}
+
+fn publication_kind(
+    clause: &str,
+    visible: &str,
+    facts: &Facts<'_>,
+    prefix: &str,
+) -> Option<ClaimAssessment> {
+    static URL: LazyLock<regex::Regex> = LazyLock::new(|| regex(r"https://[^\s`)]+/pull/\d+"));
+    let lower = visible.to_lowercase();
     // Backtick command examples alone are not assertions about execution.
     if clause.trim().starts_with('`') && clause.trim().ends_with('`') {
         return None;
@@ -208,20 +230,23 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<ClaimAs
         .iter()
         .filter(|p| p.starts_with(prefix))
         .filter(|p| {
-            URL.find(clause).is_none_or(|url| {
-                p.strip_prefix(prefix)
-                    .is_some_and(|observed| observed.trim() == url.as_str())
-            })
+            prefix != "PR creation observed:"
+                || URL.find(clause).is_none_or(|url| {
+                    p.strip_prefix(prefix)
+                        .is_some_and(|observed| observed.trim() == url.as_str())
+                })
         })
         .filter(|p| {
-            ID.captures(clause)
-                .is_none_or(|c| p.trim_end().ends_with(&format!("/pull/{}", &c[1])))
+            prefix != "PR creation observed:"
+                || ID
+                    .captures(clause)
+                    .is_none_or(|c| p.trim_end().ends_with(&format!("/pull/{}", &c[1])))
         })
         .filter(|p| {
             prefix != "Push observed:"
                 || (BRANCH
-                    .captures(clause)
-                    .is_none_or(|c| p.contains(&format!("branch {},", &c[1])))
+                    .captures_iter(clause)
+                    .all(|c| p.contains(&format!("branch {},", &c[1])))
                     && SHA.find_iter(clause).all(|m| {
                         p.split("revision ")
                             .nth(1)

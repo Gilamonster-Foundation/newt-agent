@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from refactor_test_log import test_totals
+import refactor_diffstat
 
 ANSI = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
 NUMBER = r"[\d,]+"
@@ -171,7 +172,8 @@ def check_claims(
         )
         sizes = list(
             re.finditer(
-                path_pattern + rf"\s+\((?P<count>{NUMBER})\s+lines\)",
+                path_pattern
+                + rf"\s+\((?P<count>{NUMBER})\s+lines(?:\s*(?:→|->)\s*largest in repo)?\)",
                 clause,
             )
         )
@@ -333,4 +335,8 @@ def check_claims(
             and not test_evidence["success"]
         ):
             add("tests", "supplied test invocation succeeded", False, False)
+    for claim, prefix, expected in refactor_diffstat.claims(summary):
+        sha = refactor_diffstat.resolve(prefix, (facts.get("commits") or []))
+        actual = facts.get("diffstats", {}).get(sha)
+        add("diffstat", claim, actual, None if actual is None else actual == expected)
     return rows

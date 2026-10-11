@@ -18,7 +18,8 @@ sys.path.insert(
 from newt_conformance import content_id, encode  # noqa: E402
 
 FOOTER = re.compile(
-    r"\n\n\[corrected by newt: review evidence review (\w+) in prompt artifacts\]$"
+    r"\n\n(?:newt review: (?P<current>\w+) in prompt artifacts|"
+    r"\[corrected by newt: review evidence review (?P<legacy>\w+) in prompt artifacts\])$"
 )
 
 
@@ -53,7 +54,7 @@ def review_payload(records: list[tuple], cid: str) -> dict:
 
 
 def project_report(report: str, records: list[tuple]) -> dict:
-    """Score retained host corrections; exclude unverified replacements entirely."""
+    """Retain contradictions; independently re-check audited unverified originals."""
     if (
         not report.startswith("## Observed\n")
         or "\n## Model explanation\n\n" not in report
@@ -64,7 +65,14 @@ def project_report(report: str, records: list[tuple]) -> dict:
     prose = report.split("\n## Model explanation\n\n", 1)[1]
     footer = FOOTER.search(prose)
     if footer is None:
-        if "[corrected by newt:" in prose or "[unverified by newt:" in prose:
+        if any(
+            marker in prose
+            for marker in (
+                "[corrected by newt:",
+                "[unverified by newt:",
+                "newt review:",
+            )
+        ):
             raise ValueError("reviewed report has no retained prompt-artifact audit")
         return {
             "text": report,
@@ -73,7 +81,7 @@ def project_report(report: str, records: list[tuple]) -> dict:
             "original_model_draft": prose,
             "review_cid": None,
         }
-    cid = footer[1]
+    cid = footer["current"] or footer["legacy"]
     review = review_payload(records, cid)
     if (
         review.get("observation") is not None
@@ -107,16 +115,20 @@ def project_report(report: str, records: list[tuple]) -> dict:
             corrections.append(
                 {
                     "kind": "harness_correction",
-                    "claim": replacement,
+                    "claim": edit["original"],
+                    "presentation": replacement,
                     "actual": replacement[len("[corrected by newt: ") : -1],
-                    "status": "verified",
+                    "status": "contradicted",
                     "review_cid": cid,
                 }
             )
         elif replacement.startswith("[unverified by newt: ") and replacement.endswith(
             "]"
         ):
-            pass  # Neither a claim nor positive evidence.
+            # Reconstitute only the audited span in its original context. The
+            # marker/reason is not evidence; independent Git/GitHub/build checks
+            # decide verified/contradicted/unverifiable below the reader boundary.
+            claims.extend(edit["original"].encode())
         elif replacement == "\\" + edit["original"]:
             claims.extend(edit["original"].encode())
         else:

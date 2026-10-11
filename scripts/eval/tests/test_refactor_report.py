@@ -43,29 +43,33 @@ class ComposedReport(unittest.TestCase):
             **kwargs,
         )
 
-    def test_real_rust_composed_report_is_scored_original_is_audit_only(self):
+    def test_real_rust_composed_report_preserves_contradictions_and_rechecks_abstentions(
+        self,
+    ):
         payload = self.fixture()
         self.store_fixture(payload)
         report = self.grade()
-        self.assertTrue(report["pass"], report)
+        self.assertFalse(report["pass"], report)
+        self.assertEqual(report["criteria"]["claims"]["status"], "FAIL")
         self.assertEqual(report["summary"], payload["report"])
         self.assertEqual(
             report["original_model_draft"], payload["original_model_draft"]
         )
         rows = report["criteria"]["claims"]["evidence"]
-        self.assertEqual(len(rows), 1, rows)
-        self.assertEqual(rows[0]["kind"], "harness_correction")
-        self.assertEqual(rows[0]["status"], "verified")
-        self.assertIn("1850 passed", rows[0]["actual"])
-        self.assertNotIn("1617", str(rows))
-        self.assertNotIn("3,800", str(rows))
-        self.assertNotIn("999", str(rows))
+        corrections = [r for r in rows if r["kind"] == "harness_correction"]
+        self.assertEqual(len(corrections), 1, rows)
+        self.assertEqual(corrections[0]["status"], "contradicted")
+        self.assertIn("1850 passed", corrections[0]["actual"])
+        self.assertIn("1617", corrections[0]["claim"])
+        prs = [r for r in rows if r["kind"] == "pr"]
+        self.assertEqual(prs[0]["status"], "contradicted")
+        self.assertIn("999", prs[0]["claim"])
         # PR #2855 R2: independently reviewed claims share one physical line.
         self.assertIn("Finished refactor. [corrected by newt:", report["summary"])
         self.assertIn("; [unverified by newt: PR #999", report["summary"])
         self.assertTrue(report["review_cid"])
 
-    def test_only_unverified_spans_cannot_make_claims_pass(self):
+    def test_unverified_spans_do_not_hide_independent_contradictions(self):
         import json
         from refactor_report import content_id, encode
 
@@ -86,7 +90,7 @@ class ComposedReport(unittest.TestCase):
         )
         self.store_fixture(payload)
         report = self.grade()
-        self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED", report)
+        self.assertEqual(report["criteria"]["claims"]["status"], "FAIL", report)
         self.assertFalse(report["pass"])
         self.assertEqual(
             report["original_model_draft"], payload["original_model_draft"]
@@ -151,7 +155,9 @@ class ComposedReport(unittest.TestCase):
             {"body": body[split:], "metadata": dict(metadata, part=1, last=True)},
         ]
         self.store_fixture(payload)
-        self.assertTrue(self.grade()["pass"])
+        report = self.grade()
+        self.assertTrue(report["review_cid"])
+        self.assertEqual(report["criteria"]["claims"]["status"], "FAIL")
         with sqlite3.connect(self.db) as db:
             db.execute(
                 "DELETE FROM prompt_artifacts WHERE json_extract(metadata,'$.part')=0"

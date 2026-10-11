@@ -97,3 +97,18 @@ pub(super) fn authored(line: &str) -> Vec<Range<usize>> {
     }
     ranges
 }
+
+/// Compact diffstats are a separate quantitative span, not evidence that a
+/// governed publication happened. No scoped diffstat receipt is retained yet.
+pub(super) fn diffstats(text: &str) -> Vec<Range<usize>> {
+    static DIFF: LazyLock<regex::Regex> =
+        LazyLock::new(|| super::regex(r"\+[\d,]+\s+[−-][\d,]+\b"));
+    let code: Vec<_> = CODE.find_iter(text).map(|m| m.range()).collect();
+    if super::future(text) {
+        return vec![];
+    }
+    DIFF.find_iter(text)
+        .filter(|m| !code.iter().any(|c| c.contains(&m.start())))
+        .map(|m| m.range())
+        .collect()
+}

@@ -181,12 +181,7 @@ fn report_row(row: &str, heading: &str) -> bool {
                     .and_then(after_literal)
                     .and_then(|s| s.strip_prefix(": "))
                     .and_then(|s| s.strip_suffix('.'))
-                    .and_then(|s| s.split_once("; exit "))
-                    .is_some_and(|(outcome, exit)| {
-                        !outcome.is_empty()
-                            && outcome.chars().all(|c| c.is_ascii_alphabetic())
-                            && (exit == "unavailable" || exit.parse::<i64>().is_ok())
-                    })
+                    .is_some_and(super::check_status::recognizes_label)
         }
         PUBLICATIONS_HEADING => row == "No governed receipt available." || literal(row),
         _ => false,
@@ -204,6 +199,10 @@ fn after_literal(text: &str) -> Option<&str> {
 
 /// Match the variable-width inline code spans used by the report renderer.
 fn literal(text: &str) -> bool {
+    // The renderer emits an empty captured output line as an empty code span.
+    if text == "``" {
+        return true;
+    }
     let width = text.bytes().take_while(|b| *b == b'`').count();
     width > 0
         && text.len() >= width * 2

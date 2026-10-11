@@ -22,6 +22,7 @@ from refactor_helper import EvidenceError, HelperUnavailable, invoke_helper
 from refactor_transcript import read_tail, positive_mib
 from refactor_claims import check_claims, operator_inputs, named_test, named_test_lines
 from refactor_session import final_report
+from refactor_diffstat import observe as observe_diffstats
 
 # Reuse the eval scoreboard's crate-vector-pinned content addressing, not a
 # second encoder or ad-hoc digest. See newt-interaction/tests/vectors.rs.
@@ -442,6 +443,9 @@ def collect_grade(args: argparse.Namespace, command=run) -> dict:
     else:
         try:
             test_log = args.test_log.read_text() if args.test_log else ""
+            facts["diffstats"] = observe_diffstats(
+                claim_text, (facts.get("commits") or []), git
+            )
             claims = (
                 check_claims(claim_text, facts, test_log, test_logs)
                 + composed["corrections"]

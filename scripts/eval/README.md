@@ -169,11 +169,15 @@ incomplete or truncated final outcome does not fall back to an older report.
 
 For reviewed reports, the grader joins the same prompt's retained audit chunks,
 checks their canonical content ID and reversible edit map against the composed
-text, and retains `original_model_draft` as an **unscored audit field**. A retained
-`[corrected by newt: …]` edit contributes a verified historical observation.
-`[unverified by newt: …]` edits contribute no claims and no PASS evidence; a report
-with only unverified spans remains UNGRADED. Marker text without matching retained
-evidence cannot certify a correction. Missing or altered audits remain UNGRADED.
+text, and retains `original_model_draft` as an audit field. A retained
+`[corrected by newt: …]` contradiction stays **contradicted**. For
+`[unverified by newt: …]` edits, it restores the original audited span in context
+and runs the independent Git/GitHub/build checks; the annotation itself supplies
+no PASS evidence. Correct, wrong, and uncheckable originals can therefore yield
+PASS, FAIL, and UNGRADED respectively. The whole raw draft is never a fallback.
+Missing or altered audits remain UNGRADED. New audit references use the plain
+`newt review: <cid> in prompt artifacts` footer; old correction-shaped footers
+remain readable without being counted as corrections.
 The full composed report is retained in the grader's `summary` field.
 
 Access uses SQLite URI `mode=ro`, query-only mode and a short read transaction,
@@ -184,7 +188,9 @@ with the reason. The operator must select the intended run's trusted store;
 this reader does not independently verify the store's cryptographic turn chain.
 
 The claim checker covers commit hashes, push claims, PR numbers/repository,
-merged state, numeric Rust line counts and test totals. Future intentions,
+merged state, numeric Rust line counts, compact diffstats tied to a uniquely
+named single-parent commit, and test totals. Diffstat counts come from that
+commit's Git numstat, with binary/unavailable diffs left unverified. Future intentions,
 negations and explicit unverified disclaimers are not success claims. The composed
 operator report remains available for review; this deterministic checker is not
 a general natural-language truth detector.
