@@ -87,3 +87,10 @@ The operator-facing composed report is retained in the turn-outcome artifact.
 Harness-marked review clauses are omitted from assistant-authored replay, while
 unchanged explanation remains. Review artifacts are evidence, never a source of
 new verified observations. Existing artifacts and transcript rows are not rewritten.
+
+The refactor grader consumes this persisted composed report, not the raw assistant
+transcript. It validates retained review chunks and their reversible edit map,
+counts harness corrections as verified historical facts, and excludes unverified
+spans from claims. The disclosed original draft remains an unscored audit field.
+Missing, truncated or unauditable final reports remain ungraded; an older report
+or the original draft cannot supply fallback claims.
