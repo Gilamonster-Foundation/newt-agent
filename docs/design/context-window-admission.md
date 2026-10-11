@@ -222,14 +222,43 @@ when present, otherwise says the count is unavailable rather than treating bytes
 as tokens. Summary fallbacks retain the notice with captured progress. Closing
 the client response does not guarantee immediate server-side slot reclamation.
 
-Provider-reported output exhaustion (`finish_reason: length` on Chat, or Responses
-`status: incomplete` with `incomplete_details.reason: max_output_tokens`) stops
-the turn before tool recovery, argument validation, completion classification or
-dispatch. Newt retains reported usage and visible partial prose with an explicit
-truncation notice. No tool from that response runs, even if another call in the
-same batch has complete arguments. The same notice and usage retention apply to
-tools-disabled summaries. The primary turn is marked failed, not completed.
-There is no automatic repair, continuation or thinking-off re-ask after this
-hard stop: endpoint continuation declarations and the legacy `overflow_retry`
-preference do not override it. The operator may issue a new request to continue,
-reduce the requested output, or explicitly change the configured cap.
+Provider-reported output exhaustion (`finish_reason: length` on Chat,
+`done_reason: length` on Ollama, `stop_reason: max_tokens` on Anthropic, or
+Responses `status: incomplete` with reason `max_output_tokens`) discards the
+entire tool batch before validation or execution. Even complete calls alongside
+an unfinished call do not run.
+
+When a primary reply contains a tool call, Newt retries within the same turn
+with one labelled harness loop-guidance note: nothing ran; use `write_file`
+with `copy_from` for large moves or several smaller `edit_file` calls. The
+partial reply and tool arguments are not replayed as assistant speech. At most
+two consecutive recoveries are allowed; a completed tool round with a successful
+result renews that allowance. Recovery requests preserve the tool-round budget, retain accumulated
+usage, and still pass ordinary cancellation and request-admission checks.
+
+After the allowance is exhausted, or for a prose-only truncation or a
+tools-disabled summary, Newt retains visible partial prose and reported usage
+with an explicit harness truncation notice. The primary turn is marked failed,
+not completed. Endpoint reasoning-continuation declarations and the legacy
+`overflow_retry` preference do not override this bound. The operator may then
+issue a new request, reduce the requested output, or change the configured cap.
+
+### Output-aware edit planning
+
+Each round's labelled harness facts include the configured per-reply output
+ceiling and recommend keeping all retyped content below one quarter of it.
+Chat and Responses use the same configured generation maximum and allowance
+resolver as dispatch; actual request admission may lower the wire cap.
+Anthropic uses its resolved `max_tokens`; Ollama uses an explicit output
+allowance, or reports the budget unknown when none is configured.
+
+For a valid pinned source or unfinished plan step naming an explicit line range
+(for example `source.rs:10-80`, `L10-L80`, or `lines 10-80`), Newt measures the
+current authorized source bytes. It estimates the serialized content with the
+configured characters-per-token heuristic; it does not equate lines with tokens.
+Ranges exceeding the quarter-budget recommendation get advice to use
+`write_file` with `copy_from {path, start_line, end_line}` (inclusive ranges,
+without retyping), or split into cohesive extractions, one per publish cycle.
+These notes never refuse an edit. Missing, unauthorized, changed-during-read or
+out-of-range sources remain unmeasured; ambiguous multi-source steps are not
+guessed. Advisory work is bounded to eight ranges and four MiB per source.

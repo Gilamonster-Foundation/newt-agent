@@ -62,6 +62,28 @@ pub(super) fn test_env(stream: bool) -> Vec<EnvGuard> {
     guards
 }
 
+/// PR #2860: stream fixtures sharing settings must own process_env before
+/// mutation and through restoration, not merely the Anthropic serial lane.
+pub(super) struct ProcessLockedTestEnv(Vec<EnvGuard>);
+
+impl Drop for ProcessLockedTestEnv {
+    fn drop(&mut self) {
+        assert!(
+            crate::process_env::held_by_current_thread(),
+            "restore fixture env under process_env"
+        );
+        self.0.clear();
+    }
+}
+
+pub(super) fn test_env_with_process_lock(stream: bool) -> ProcessLockedTestEnv {
+    assert!(
+        crate::process_env::held_by_current_thread(),
+        "acquire process_env before fixture env mutation"
+    );
+    ProcessLockedTestEnv(test_env(stream))
+}
+
 fn msgs() -> Vec<MemMessage> {
     vec![
         MemMessage::system("you are a test"),

@@ -115,6 +115,8 @@ pub struct AnthropicRound {
     /// "function":{"name","arguments":<object>}}`) so the loop's extractor,
     /// batch validation, and history replay work unchanged.
     pub tool_uses: Vec<serde_json::Value>,
+    /// A capped stream ended inside a tool block; its arguments stay discarded.
+    pub unfinished_tool_use: bool,
     /// `end_turn` | `tool_use` | `max_tokens` | `refusal` | `stop_sequence`
     /// | `pause_turn`.
     pub stop_reason: Option<String>,
@@ -262,6 +264,11 @@ impl SseAccumulator {
                 _ => None,
             };
         }
+        self.round.unfinished_tool_use = self.round.stop_reason.as_deref() == Some("max_tokens")
+            && self
+                .open
+                .values()
+                .any(|block| matches!(block, OpenBlock::ToolUse { .. }));
         self.round
     }
 

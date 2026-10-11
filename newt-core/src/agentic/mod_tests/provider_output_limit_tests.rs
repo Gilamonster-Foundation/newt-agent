@@ -1,4 +1,4 @@
-//! #2824: provider output exhaustion is terminal, not a completion or repair round.
+//! Output exhaustion discards every tool; only bounded primary repair is allowed.
 use super::*;
 
 async fn limited_reply(responses: bool, tools: bool, streamed: bool, summary: bool) {
@@ -71,10 +71,11 @@ async fn limited_reply(responses: bool, tools: bool, streamed: bool, summary: bo
     };
     let result = chat_complete(context, &mut NoMcp).await;
     let requests = server.received_requests().await.unwrap();
+    let attempts_expected = if tools && !summary { 3 } else { 1 };
     assert_eq!(
         requests.len(),
-        1,
-        "output limit must not buy another generation: {result:?}"
+        attempts_expected,
+        "bounded recovery: {result:?}"
     );
     assert!(
         !dir.path().join("marker").exists(),
@@ -105,8 +106,14 @@ async fn limited_reply(responses: bool, tools: bool, streamed: bool, summary: bo
         assert_eq!(end_reason, Some(crate::TurnEndReason::Failed));
     }
     assert_eq!(usage.unwrap().input_tokens, 40);
-    assert_eq!(usage.unwrap().output_tokens, 16_384);
-    assert_eq!(attempts.lock().unwrap().records().count(), 1);
+    assert_eq!(
+        usage.unwrap().output_tokens,
+        16_384 * attempts_expected as u32
+    );
+    assert_eq!(
+        attempts.lock().unwrap().records().count(),
+        attempts_expected
+    );
 }
 
 #[tokio::test]
@@ -118,7 +125,7 @@ async fn output_limit_chat_prose_is_explicit_and_terminal() {
     }
 }
 #[tokio::test]
-async fn output_limit_chat_cut_write_is_never_reasked_or_executed() {
+async fn output_limit_chat_cut_write_retries_are_bounded_and_never_executed() {
     for streamed in [false, true] {
         limited_reply(false, true, streamed, false).await;
     }
@@ -130,6 +137,6 @@ async fn output_limit_responses_prose_is_explicit_and_terminal() {
     }
 }
 #[tokio::test]
-async fn output_limit_responses_cut_write_is_never_reasked_or_executed() {
+async fn output_limit_responses_cut_write_retries_are_bounded_and_never_executed() {
     limited_reply(true, true, false, false).await;
 }

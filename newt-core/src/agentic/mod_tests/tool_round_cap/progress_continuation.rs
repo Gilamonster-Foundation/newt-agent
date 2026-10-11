@@ -418,11 +418,16 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
 
 /// Stage 2 applies at both finish seams on every wire, without another model
 /// request. Replaying the operator report must not attribute corrections to it.
+/// PR #2860: hold the shared env lane so concurrent SSE fixtures cannot flip
+/// this JSON fixture into streaming mode and silently erase its answer.
 #[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
 async fn report_stage2_four_wires_normal_cap_and_replay() {
+    // The serial lane alone does not exclude process_env-only fixtures.
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     for wire in ["ollama", "openai", "responses", "anthropic"] {
         for capped in [false, true] {
-            let _env = crate::agentic::anthropic_loop_tests::test_env(false);
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(false);
             let server = MockServer::start().await;
             let calls = Arc::new(AtomicUsize::new(0));
             Mock::given(method("POST"))
