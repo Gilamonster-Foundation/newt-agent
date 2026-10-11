@@ -4,6 +4,8 @@
 
 pub(super) mod publication;
 pub(super) mod push_command;
+mod push_failure;
+use push_failure::classify_failure;
 
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::caveats::{Caveats, CaveatsExt};
@@ -383,6 +385,7 @@ fn plan_governed_push(
 
     Ok(GovernedPushPlan {
         dry_run: request.dry_run,
+        remote: request.remote,
         url,
         owner,
         name,
@@ -401,6 +404,7 @@ fn plan_governed_push(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GovernedPushPlan {
     dry_run: bool,
+    remote: String,
     url: String,
     owner: String,
     name: String,
@@ -458,7 +462,7 @@ fn run_staged_push(
 
     // F3: push the APPROVED oid; no ref is resolved after approval.
     let refspec = format!("{}:refs/heads/{}", plan.oid, plan.branch);
-    let mut push_args = vec!["-c", "http.followRedirects=false", "push"];
+    let mut push_args = vec!["-c", "http.followRedirects=false", "push", "--porcelain"];
     if plan.dry_run {
         push_args.push("--dry-run");
     }
@@ -466,6 +470,8 @@ fn run_staged_push(
     let output = plan
         .tools
         .git(push_args)
+        // Classify Git-authored porcelain/status text independently of host locale.
+        .env("LC_ALL", "C")
         .current_dir(staging.path())
         .output()
         .map_err(|e| e.to_string())?;
@@ -482,32 +488,15 @@ fn run_staged_push(
         }
     } else {
         Outcome::Failed {
-            category: classify_failure(&output.stderr),
+            category: push_failure::classify_push(
+                &output.stdout,
+                &output.stderr,
+                &refspec,
+                &plan.branch,
+                &plan.remote,
+            ),
         }
     })
-}
-
-/// Best-effort classification of a failed dial from the child's stderr BYTES
-/// — read only in-process to pick one of a small fixed set of words (F6); the
-/// bytes themselves are never returned to the model, the terminal, or a log.
-fn classify_failure(stderr: &[u8]) -> crate::git_staging::FailureCategory {
-    use crate::git_staging::FailureCategory;
-    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    if text.contains("could not resolve host")
-        || text.contains("connection refused")
-        || text.contains("connection timed out")
-        || text.contains("network is unreachable")
-    {
-        FailureCategory::Network
-    } else if text.contains("authentication failed")
-        || text.contains("permission denied")
-        || text.contains("403")
-        || text.contains("401")
-    {
-        FailureCategory::Auth
-    } else {
-        FailureCategory::GitError
-    }
 }
 
 /// #2740: requested branches are assertions, never authority to select a
@@ -2678,6 +2667,83 @@ mod governed_push_tests {
                 );
             }
         }
+    }
+
+    /// H3 regression: divergent remote history must name the collision and a
+    /// supported retry, while a subsequent fast-forward still publishes.
+    #[test]
+    fn divergent_remote_push_explains_collision_and_fast_forward_still_works() {
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let remote = tempdir();
+        git(remote.path(), &["init", "--bare", "-q"]);
+        git(
+            repo.path(),
+            &["push", remote.path().to_str().unwrap(), "task"],
+        );
+        git(repo.path(), &["checkout", "-q", "-b", "old-run"]);
+        let remote_oid = commit(repo.path(), "remote.txt", "older run\n");
+        git(
+            repo.path(),
+            &["push", remote.path().to_str().unwrap(), "HEAD:task"],
+        );
+        git(repo.path(), &["checkout", "-q", "task"]);
+        let local_oid = commit(repo.path(), "local.txt", "new run\n");
+        let caveats = scoped_caveats();
+        let mut plan = plan_push_test(
+            "git push origin",
+            repo.path(),
+            &caveats,
+            &mut Some(&mut Gate {
+                allow: true,
+                requests: vec![],
+            }),
+        )
+        .unwrap();
+        // Test-only destination seam: real Git and a real bare remote, without
+        // relaxing the production planner's github.com destination check.
+        plan.url = remote.path().to_string_lossy().into_owned();
+        let command = push_command::GovernedCommand::parse("git push origin").unwrap();
+        let result = run_push_test(&plan, &caveats);
+        let text = render_governed_result(&command, result, push_command::RETRY);
+        assert!(
+            text.contains("remote branch 'task' already exists"),
+            "{text}"
+        );
+        assert!(text.contains("force-push is not allowed"), "{text}");
+        assert!(text.contains("git checkout -b task-2"), "{text}");
+        assert!(text.contains("git push origin"), "{text}");
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/heads/task"]),
+            remote_oid
+        );
+        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), local_oid);
+        // Continue the remote history, then publish through the same broker.
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "merge",
+                "--no-edit",
+                "old-run",
+            ],
+        );
+        plan.oid = git(repo.path(), &["rev-parse", "HEAD"]);
+        let result = run_push_test(&plan, &caveats).unwrap();
+        assert!(
+            matches!(result, crate::git_staging::Outcome::Pushed { .. }),
+            "{result:?}"
+        );
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/heads/task"]),
+            plan.oid
+        );
     }
 
     /// F3 regression + destination proof, traced at the endpoint from the
