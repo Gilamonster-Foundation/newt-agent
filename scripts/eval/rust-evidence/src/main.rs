@@ -3,8 +3,6 @@ use quote::ToTokens;
 use std::{env, fs, process};
 use syn::{Attribute, Item};
 
-mod forwarding;
-
 fn allowed(attrs: &[Attribute], derive: bool) -> bool {
     attrs
         .iter()
@@ -21,8 +19,35 @@ fn attributes(item: &Item) -> Option<&[Attribute]> {
         Item::Type(x) => Some(&x.attrs),
         Item::Const(x) => Some(&x.attrs),
         Item::Static(x) => Some(&x.attrs),
+        Item::Macro(x) if x.mac.path.is_ident("macro_rules") => Some(&x.attrs),
         _ => None,
     }
+}
+
+// This is a transient syntactic matching key, not a persisted content identity.
+// Impl self-types and traits keep their parsed syntax (including generic arguments).
+fn identity(item: &Item) -> Option<(&'static str, String, Option<String>)> {
+    let (kind, name) = match item {
+        Item::Fn(x) => ("fn", &x.sig.ident),
+        Item::Struct(x) => ("struct", &x.ident),
+        Item::Enum(x) => ("enum", &x.ident),
+        Item::Trait(x) => ("trait", &x.ident),
+        Item::Type(x) => ("type", &x.ident),
+        Item::Const(x) => ("const", &x.ident),
+        Item::Static(x) => ("static", &x.ident),
+        Item::Macro(x) if x.mac.path.is_ident("macro_rules") => ("macro_rules", x.ident.as_ref()?),
+        Item::Impl(x) => {
+            return Some((
+                "impl",
+                x.self_ty.to_token_stream().to_string(),
+                x.trait_
+                    .as_ref()
+                    .map(|(negative, path, _)| quote::quote!(#negative #path).to_string()),
+            ));
+        }
+        _ => return None,
+    };
+    Some((kind, name.to_string(), None))
 }
 
 fn evidence(old: &str, new: &str, module: &str, name: &str) -> Result<bool, String> {
@@ -44,34 +69,27 @@ fn evidence(old: &str, new: &str, module: &str, name: &str) -> Result<bool, Stri
     {
         return Err("unsupported attributes affecting candidate module".into());
     }
-    // Compare parsed token trees, not lines that may live inside strings,
-    // comments, macro bodies, or unrelated conditional/test modules.
-    let tokens = |item: &Item| match item {
-        // Extraction commonly widens visibility and changes documentation while
-        // leaving a forwarding wrapper behind. Signature + body prove motion;
-        // attributes were checked separately before using this evidence.
-        Item::Fn(f) => {
-            let (sig, body) = (&f.sig, &f.block);
-            quote::quote!(#sig #body).to_string()
-        }
-        _ => item.to_token_stream().to_string(),
-    };
+    // Parsed kind/name establishes structural movement. Body/signature edits
+    // are permitted, but retaining that identity (even a wrapper) is a copy.
     let mut unsupported = false;
     for item in &candidate.items {
         let Some(attrs) = attributes(item) else {
             continue;
         };
-        let text = tokens(item);
+        let Some(key) = identity(item) else {
+            continue;
+        };
         if !allowed(attrs, true) {
             unsupported = true;
             continue;
         }
-        if before
+        if before.items.iter().any(|old| {
+            attributes(old).is_some_and(|a| allowed(a, true))
+                && identity(old).as_ref() == Some(&key)
+        }) && !after
             .items
             .iter()
-            .any(|old| attributes(old).is_some_and(|a| allowed(a, true)) && tokens(old) == text)
-            && !after.items.iter().any(|new| tokens(new) == text)
-            && forwarding::removed_or_forwarded(item, &after.items, name)
+            .any(|new| identity(new).as_ref() == Some(&key))
         {
             return Ok(true);
         }
@@ -116,7 +134,7 @@ mod tests {
         assert_eq!(
             evidence(
                 &format!("{shared} fn moved() {{}}"),
-                &format!("{shared} mod extracted; fn moved() {{ extracted::moved() }}"),
+                &format!("{shared} mod extracted;"),
                 "/// Changed documentation.\npub fn moved() {} #[cfg(test)] mod tests { #[test] fn smoke() {} }",
                 "extracted"
             ),
@@ -140,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn genuine_wrapper_passes_each_parameter_through_in_order() {
+    fn a_forwarding_wrapper_still_retains_the_original_identity() {
         let old = "fn moved(x: i32, y: i32) -> i32 { x + y }";
         assert_eq!(
             evidence(
@@ -149,12 +167,12 @@ mod tests {
                 old,
                 "extracted"
             ),
-            Ok(true)
+            Ok(false)
         );
     }
 
     #[test]
-    fn direct_return_and_unit_statement_wrappers_forward() {
+    fn direct_return_and_unit_wrappers_are_not_removal() {
         for (old, wrapper) in [
             (
                 "fn moved(x: i32) -> i32 { x + 1 }",
@@ -167,7 +185,7 @@ mod tests {
         ] {
             assert_eq!(
                 evidence(old, &format!("mod extracted; {wrapper}"), old, "extracted"),
-                Ok(true)
+                Ok(false)
             );
         }
     }
@@ -264,3 +282,6 @@ mod tests {
         assert!(evidence("not rust", "mod extracted;", "", "extracted").is_err());
     }
 }
+
+#[cfg(test)]
+mod identity_tests;

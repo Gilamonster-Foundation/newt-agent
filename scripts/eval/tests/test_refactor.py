@@ -195,9 +195,7 @@ class Grade(unittest.TestCase):
             "#[derive(Debug)]\nstruct State;\n"
         )
         self.fake.trees[SEED][TARGET] = shared + OLD
-        self.fake.trees[HEAD][TARGET] = (
-            shared + NEW + "fn moved() { extracted::moved() }\n"
-        )
+        self.fake.trees[HEAD][TARGET] = shared + NEW
         self.fake.trees[HEAD]["crate/src/extracted.rs"] = (
             "/// Newly documented public helper.\npub fn moved() {}\n"
             "#[cfg(test)]\nmod tests { #[test] fn smoke() {} }\n"

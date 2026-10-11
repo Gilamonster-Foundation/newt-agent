@@ -108,14 +108,20 @@ macro bodies, and unrelated conditional/test sections cannot supply evidence.
 Candidate modules/file roots must have only doc attributes; moved declarations
 may have doc/derive attributes. Conditional or custom attributes affecting those
 candidates explicitly fail as unsupported (cfg is not evaluated). Unrelated
-attributes are ignored. Functions are compared by parsed signature and body,
-allowing new visibility/documentation. A retained function must be a parsed
-forwarding wrapper with the same signature: one call to `module::function`
-passing each parameter unchanged and in order. Tail calls, explicit returns,
-and unit-returning call statements are supported. Other retained bodies,
-conditional wrappers, and generic/async/unsafe wrappers are declined; this
-helper does not resolve arbitrary paths or prove their semantics.
-This remains structural evidence, not macro expansion or semantic equivalence.
+attributes are ignored. Identity is the parsed item **kind and name**: `fn`,
+`struct`, `enum`, `trait`, `const`, `static`, `type`, and `macro_rules!`.
+An `impl` is identified by its parsed self-type plus optional trait (including
+generic arguments and trait polarity); these type/trait paths are not resolved
+through imports or aliases. Formatting is normalized by parsing.
+
+An identity must exist in the original file and be absent from its updated
+items, while appearing in the directly declared new module. Visibility,
+documentation, function signatures, path spelling inside signatures/bodies,
+and implementation edits do not need to match. Renamed or different-kind
+items do not count. Copies and retained forwarding wrappers do not count:
+the original identity must be removed. A `macro_rules!` declaration can move,
+but declarations inside its token body do not supply evidence.
+This is strictly structural evidence, not macro expansion or semantic equivalence.
 
 Prepare the trusted `newt-refactor-evidence` parser once with registry access:
 
