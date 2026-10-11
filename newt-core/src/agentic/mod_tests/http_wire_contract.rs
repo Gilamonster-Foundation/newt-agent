@@ -508,17 +508,43 @@ async fn capable_chat_bodies(
         .iter()
         .map(|request| {
             let body = String::from_utf8_lossy(&request.body);
-            serde_json::from_str(&address.replace_all(&body, "prompt:ID")).expect("json body")
+            let mut body: serde_json::Value =
+                serde_json::from_str(&address.replace_all(&body, "prompt:ID")).expect("json body");
+            // Output capacity now changes its host planning statement too.
+            // Verify that exact statement before normalizing it; keep every
+            // other prompt byte and generation field in the equality check.
+            let cap = u32::try_from(body["max_tokens"].as_u64().unwrap()).unwrap();
+            let guidance = output_budget::guidance(
+                Some(cap),
+                None,
+                std::path::Path::new(NO_CHECKS_WORKSPACE),
+                &crate::Scope::All,
+                crate::tokens::TokenEstimation::default(),
+            );
+            let mut found = 0;
+            for message in body["messages"].as_array_mut().unwrap() {
+                if let Some(text) = message["content"]
+                    .as_str()
+                    .filter(|text| text.contains(&guidance))
+                {
+                    assert_eq!(message["role"], "system");
+                    found += text.matches(&guidance).count();
+                    message["content"] =
+                        serde_json::json!(text.replace(&guidance, "[verified output planning]"));
+                }
+            }
+            assert_eq!(found, 1, "one accurate host planning note");
+            body
         })
         .collect()
 }
 
-/// #2312 (A1/A2): an explicit output allowance varies ONLY the wire cap. The
+/// #2312 (A1/A2): output allowance changes the cap and its planning note. The
 /// cognition dial, thinking enablement and sampling stay byte-identical, so an
 /// operator can compare two allowances at one cognition level. With no
 /// override the cognition table still supplies the historical 10,000.
 #[tokio::test]
-async fn openai_chat_output_allowance_varies_only_the_cap_field() {
+async fn openai_chat_output_allowance_varies_cap_and_planning_guidance() {
     let thoughtful = Some(crate::role_profile::Cognition::Thoughtful);
     let default_bodies = capable_chat_bodies(thoughtful, None).await;
     let small_bodies = capable_chat_bodies(thoughtful, Some(3_000)).await;
@@ -543,7 +569,7 @@ async fn openai_chat_output_allowance_varies_only_the_cap_field() {
         assert_eq!(default_cap, Some(serde_json::json!(10_000)));
         assert_eq!(small_cap, Some(serde_json::json!(3_000)));
         assert_eq!(large_cap, Some(serde_json::json!(12_000)));
-        // Body-minus-cap equality: temperature, top_p, chat_template_kwargs
+        // With cap and verified planning normalized, temperature, top_p, chat_template_kwargs
         // and every other field are identical across the three allowances.
         assert_eq!(default["temperature"], 0.6);
         assert_eq!(default["chat_template_kwargs"]["enable_thinking"], true);
@@ -581,7 +607,10 @@ async fn openai_chat_output_allowance_is_sent_without_a_cognition_dial() {
                 .remove("max_tokens"),
             Some(serde_json::json!(3_000))
         );
-        assert_eq!(capped, unset, "only `max_tokens` may differ");
+        assert_eq!(
+            capped, unset,
+            "only max_tokens and its verified planning guidance may differ"
+        );
     }
 }
 
@@ -594,7 +623,7 @@ fn command_budget_2747_concurrent_wire_contract() {
         scope
             .spawn(super::verification_outcomes::every_verification_case_ends_within_its_allowance);
         for _ in 0..30 {
-            openai_chat_output_allowance_varies_only_the_cap_field();
+            openai_chat_output_allowance_varies_cap_and_planning_guidance();
         }
     });
 }

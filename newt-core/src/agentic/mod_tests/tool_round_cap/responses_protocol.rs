@@ -557,6 +557,17 @@ async fn responses_output_allowance_bounds_the_request_body() {
             "{output_allowance:?}"
         );
         assert_eq!(body["reasoning"]["effort"], "high");
+        let guidance = crate::agentic::output_budget::guidance(
+            Some(bounded),
+            None,
+            std::path::Path::new("."),
+            &crate::Scope::All,
+            crate::tokens::TokenEstimation::default(),
+        );
+        let instructions = body["instructions"].as_str().expect("host instructions");
+        assert_eq!(instructions.matches(&guidance).count(), 1);
+        body["instructions"] =
+            serde_json::json!(instructions.replace(&guidance, "[verified output planning]"));
         body.as_object_mut().unwrap().remove("max_output_tokens");
         bodies.push(body);
     }
