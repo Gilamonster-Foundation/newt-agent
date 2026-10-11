@@ -88,6 +88,11 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
         return None;
     }
     if COUNT.is_match(&visible) {
+        if super::quantities::approximate(&visible) || COMMAND.captures_iter(clause).count() > 1 {
+            return Some(Verdict::Unverified(
+                "approximate quantity or multiple named invocations",
+            ));
+        }
         let Some(command) = COMMAND
             .captures(clause)
             .and_then(|c| c.get(1).or_else(|| c.get(2)))
@@ -106,9 +111,6 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
                 "named invocation lacks complete scoped totals",
             ));
         };
-        if clause.contains('~') || clause.contains("approximately") || clause.contains("about ") {
-            return Some(Verdict::Unverified("approximate test quantity"));
-        }
         let mut correct = true;
         for c in COUNT.captures_iter(&visible) {
             let index = match c[2].to_lowercase().as_str() {
