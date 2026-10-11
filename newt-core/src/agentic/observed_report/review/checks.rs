@@ -169,15 +169,27 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<Verdict
     {
         return Some(Verdict::Unverified("no live PR-state observation"));
     }
-    static ID: LazyLock<regex::Regex> = LazyLock::new(|| regex(r"(?i)\bPR\s*#(\d+)"));
+    static ID: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex(r"(?i)\b(?:PR|pull request)\s*#(\d+)"));
     static BRANCH: LazyLock<regex::Regex> =
         LazyLock::new(|| regex(r"(?i)\bbranch\s+`?([\w./-]+)`?"));
     static SHA: LazyLock<regex::Regex> = LazyLock::new(|| regex(r"\b[0-9a-f]{7,40}\b"));
+    static NUMBERED: LazyLock<regex::Regex> = LazyLock::new(|| regex(r"#\d+\b"));
+    if prefix == "PR creation observed:"
+        && (NUMBERED.find_iter(clause).count() > 1 || URL.find_iter(clause).count() > 1)
+    {
+        return Some(Verdict::Unverified("multiple PR objects in one clause"));
+    }
     let matches: Vec<_> = facts
         .publications
         .iter()
         .filter(|p| p.starts_with(prefix))
-        .filter(|p| URL.find(clause).is_none_or(|url| p.contains(url.as_str())))
+        .filter(|p| {
+            URL.find(clause).is_none_or(|url| {
+                p.strip_prefix(prefix)
+                    .is_some_and(|observed| observed.trim() == url.as_str())
+            })
+        })
         .filter(|p| {
             ID.captures(clause)
                 .is_none_or(|c| p.trim_end().ends_with(&format!("/pull/{}", &c[1])))
