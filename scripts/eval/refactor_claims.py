@@ -185,7 +185,12 @@ def check_claims(
             sizes.extend(re.finditer(r"\(" + descriptor + r"\)", clause))
         # Remove only the parsed spans before examining the remaining prose.
         # A recognized pair/net must not hide an unsupported comparison nearby.
-        context = clause
+        # An arrow to a path denotes relocation, not a numeric comparison.
+        # Mask only that marker, preserving offsets for the parsed size spans.
+        relocation = rf"(?:→|->)\s+(?:new\s+)?(?={path_pattern}(?![\w./-]))"
+        context, relocations = re.subn(
+            relocation, lambda m: " " * len(m[0]), clause, flags=re.I
+        )
         for match in sorted(pairs + sizes, key=lambda m: m.start(), reverse=True):
             context = context[: match.start()] + " " + context[match.end() :]
         comparison = re.search(
@@ -206,6 +211,9 @@ def check_claims(
         residue = re.search(
             rf"{NUMBER}\s*(?:-\s*)?lines?\b|{FILE}.*?\d", size_context, re.I
         )
+        # Relocation prose may describe the move, but cannot hide extra counts.
+        if relocations and re.search(r"\d", re.sub(FILE, "", size_context)):
+            residue = True
         if (sizes or pairs) and not comparison and not residue:
             for size in sizes:
                 unqualified(size["path"], size["count"])
