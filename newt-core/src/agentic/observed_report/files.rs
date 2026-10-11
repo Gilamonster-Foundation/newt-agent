@@ -25,6 +25,16 @@ impl ContentAddressable for Snapshot {
     }
 }
 
+impl Snapshot {
+    /// Incomplete/unauthorized reads never witness a check's input content.
+    pub(super) fn witness(&self) -> Option<ContentId> {
+        if self.0.values().any(|entry| entry.file == File::Unverified) {
+            return None;
+        }
+        self.content_id().ok()
+    }
+}
+
 fn read(scope: &Scope<String>, path: &Path, remaining: &mut usize) -> File {
     use crate::agentic::tools::file_capture::{is_absent_leaf, open_for_scope};
     match open_for_scope(scope, path, true) {
@@ -208,4 +218,36 @@ pub(super) fn ambiguous(snapshot: &Snapshot, prose: &str) -> Vec<String> {
         .map(|(name, _)| literal(name))
         .take(16)
         .collect()
+}
+
+impl Snapshot {
+    pub(super) fn lines(&self, path: &str) -> Option<i64> {
+        match &self.0.get(path)?.file {
+            File::Absent => Some(0),
+            File::Present { lf: Some(n), .. } => i64::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+    pub(super) fn same_paths(&self, other: &Self) -> bool {
+        self.0.keys().eq(other.0.keys())
+    }
+    pub(super) fn total_lines(&self) -> Option<i64> {
+        self.0
+            .keys()
+            .try_fold(0_i64, |sum, path| sum.checked_add(self.lines(path)?))
+    }
+}
+
+pub(super) fn resolve(
+    before: Option<&Snapshot>,
+    after: Option<&Snapshot>,
+    name: &str,
+) -> Option<String> {
+    let paths: std::collections::BTreeSet<_> = before
+        .into_iter()
+        .chain(after)
+        .flat_map(|s| s.0.keys())
+        .filter(|path| path.as_str() == name || path.ends_with(&format!("/{name}")))
+        .collect();
+    (paths.len() == 1).then(|| (*paths.into_iter().next().expect("one path")).clone())
 }

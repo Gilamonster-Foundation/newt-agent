@@ -184,6 +184,20 @@ fn final_claim(ledger: &VerificationLedger, text: &str) -> String {
     )
 }
 
+// Stage 2 requires the scoped report observation as well as the legacy ledger.
+// This fixture deliberately supplies only the latter and no evidence sink.
+fn assert_unverified_without_scoped_receipts(report: &str, original: &str) {
+    assert!(
+        report.contains(&format!("[unverified by newt: {original} —")),
+        "{report}"
+    );
+    assert!(report.contains("review evidence unavailable"), "{report}");
+    assert!(
+        crate::agentic::model_reply_for_history(report).is_empty(),
+        "{report}"
+    );
+}
+
 /// #2741 round 2: each coordinated creation has its own governed receipt.
 #[test]
 fn issue_2741_round2_multiple_created_prs_pass_finalizer() {
@@ -197,10 +211,8 @@ fn issue_2741_round2_multiple_created_prs_pass_finalizer() {
         "Created pull request #7 and pull request #8.",
         "Opened PR #7: https://github.com/o/r/pull/7 and PR #8: https://github.com/o/r/pull/8",
     ] {
-        assert_eq!(
-            crate::agentic::model_explanation(&(final_claim(&ledger, text))),
-            text
-        );
+        assert_eq!(ledger.annotate_pr_claim(text.into()), text);
+        assert_unverified_without_scoped_receipts(&final_claim(&ledger, text), text);
     }
 }
 
@@ -213,10 +225,8 @@ fn issue_2741_round2_comparison_reference_is_not_a_creation() {
         "Opened PR #7 and closed PR #6.",
         "Created PR #7 unlike PR #6.",
     ] {
-        assert_eq!(
-            crate::agentic::model_explanation(&(final_claim(&created(), text))),
-            text
-        );
+        assert_eq!(created().annotate_pr_claim(text.into()), text);
+        assert_unverified_without_scoped_receipts(&final_claim(&created(), text), text);
     }
 }
 
@@ -235,7 +245,7 @@ fn issue_2741_round2_false_creation_among_true_ones_is_refuted() {
         "Opened PR #7: https://github.com/o/r/pull/8",
     ] {
         let got = final_claim(&ledger, text);
-        assert!(crate::agentic::model_explanation(&got).starts_with(text));
+        assert_unverified_without_scoped_receipts(&got, text);
         assert!(got.contains("Refuted"), "{got}");
     }
 }
@@ -254,10 +264,8 @@ fn issue_2741_round2_coordinated_bare_references() {
         "Created PR #7,#8.",
         "Created PR https://github.com/o/r/pull/7 and https://github.com/o/r/pull/8",
     ] {
-        assert_eq!(
-            crate::agentic::model_explanation(&(final_claim(&ledger, text))),
-            text
-        );
+        assert_eq!(ledger.annotate_pr_claim(text.into()), text);
+        assert_unverified_without_scoped_receipts(&final_claim(&ledger, text), text);
     }
     for text in ["Opened PR #7 and #9.", "Opened PR #7, #8, #9."] {
         let got = final_claim(&ledger, text);

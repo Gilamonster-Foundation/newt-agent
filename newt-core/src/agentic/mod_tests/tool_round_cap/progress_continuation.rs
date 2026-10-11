@@ -415,3 +415,100 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
         );
     }
 }
+
+/// Stage 2 applies at both finish seams on every wire, without another model
+/// request. Replaying the operator report must not attribute corrections to it.
+#[tokio::test]
+async fn report_stage2_four_wires_normal_cap_and_replay() {
+    for wire in ["ollama", "openai", "responses", "anthropic"] {
+        for capped in [false, true] {
+            let _env = crate::agentic::anthropic_loop_tests::test_env(false);
+            let server = MockServer::start().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            Mock::given(method("POST"))
+                .respond_with(ToolsThenAnswer {
+                    wire,
+                    calls: calls.clone(),
+                    tools: if capped {
+                        vec![("definitely_not_a_real_tool", serde_json::json!({}))]
+                    } else {
+                        vec![]
+                    },
+                    answer: "src/mod.rs is 999 lines.",
+                })
+                .mount(&server)
+                .await;
+            let dir = crate::agentic::observed_report::tests::fixture();
+            let workspace = dir.path().to_str().unwrap();
+            let messages = msgs();
+            let caveats = Caveats::top();
+            let spill = SessionSpillStore::new([9; 16]);
+            let uri = server.uri();
+            let kind = match wire {
+                "ollama" => BackendKind::Ollama,
+                "anthropic" => BackendKind::Anthropic,
+                _ => BackendKind::Openai,
+            };
+            let mut context = hard_budget_ctx(&uri, &messages, &caveats, "report file size", kind);
+            context.workspace = workspace;
+            context.safe_context = None;
+            context.model = "test-model";
+            context.spill_store = Some(&spill);
+            context.action_nudges = false;
+            let (out, ..) = if wire == "responses" {
+                openai_responses_complete(context, &mut NoMcp).await
+            } else {
+                chat_complete(context, &mut NoMcp).await
+            }
+            .unwrap();
+            assert!(
+                out.contains("[corrected by newt: src/mod.rs: 2 lines]"),
+                "{wire}/{capped}: {out}"
+            );
+            assert!(!model_reply_for_history(&out).contains("999"));
+            assert!(!model_reply_for_history(&out).contains("corrected by newt"));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if capped { 2 } else { 1 },
+                "{wire}: extra repair request"
+            );
+            let replay = vec![
+                MemMessage::system("test"),
+                MemMessage::user("report file size"),
+                MemMessage::assistant(out),
+                MemMessage::user("continue"),
+            ];
+            let mut context = hard_budget_ctx(&uri, &replay, &caveats, "continue", kind);
+            context.workspace = workspace;
+            context.safe_context = None;
+            context.model = "test-model";
+            context.spill_store = Some(&spill);
+            context.action_nudges = false;
+            if wire == "responses" {
+                openai_responses_complete(context, &mut NoMcp).await
+            } else {
+                chat_complete(context, &mut NoMcp).await
+            }
+            .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            for message in body[if wire == "responses" {
+                "input"
+            } else {
+                "messages"
+            }]
+            .as_array()
+            .unwrap()
+            {
+                if message["role"] == "assistant" {
+                    let text = message.to_string();
+                    assert!(
+                        !text.contains("corrected by newt") && !text.contains("999"),
+                        "{wire}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}

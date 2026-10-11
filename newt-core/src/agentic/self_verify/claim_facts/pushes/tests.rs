@@ -114,17 +114,24 @@ fn push_2769_finalizer_and_updated_facts() {
     let model = "Pushed: origin/topic is live.";
     let text = finalize(model.to_owned(), &ledger);
     assert!(text.contains("#2769"), "{text}");
-    assert_eq!(crate::agentic::model_reply_for_history(&text), model);
-    // Rechecking a rendered report goes through finalization, which projects
-    // model prose first; annotation helpers only consume that prose.
-    assert_eq!(finalize(text.clone(), &ledger), text);
+    // Stage 2 marks the unsupported claim inline, preserving the original for
+    // the operator but excluding host presentation from assistant history.
+    assert!(text.contains(&format!("[unverified by newt: {model} —")));
+    assert!(crate::agentic::model_reply_for_history(&text).is_empty());
+    assert!(crate::agentic::model_reply_for_history(&finalize(text.clone(), &ledger)).is_empty());
     ledger.record_publication_outcome(&crate::git_staging::Outcome::Pushed {
         oid: "abc".into(),
         owner: "org".into(),
         name: "repo".into(),
         branch: "topic".into(),
     });
-    assert!(!finalize(text.replace("origin/topic", "org/repo/topic"), &ledger).contains("#2769"));
+    let updated = finalize(model.replace("origin/topic", "org/repo/topic"), &ledger);
+    assert!(!updated.contains("#2769"), "{updated}");
+    assert!(
+        updated.contains("[unverified by newt:"),
+        "the scoped report still has no receipt: {updated}"
+    );
+    assert!(crate::agentic::model_reply_for_history(&updated).is_empty());
 }
 
 /// #2769: the actual tool-result funnel, not an ok-looking tool string, owns

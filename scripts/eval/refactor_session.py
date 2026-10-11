@@ -1,20 +1,22 @@
-"""Read assistant-owned text from newt's conversation store, never screen output."""
+"""Read the final composed operator report from newt's structured outcome store."""
 
 from __future__ import annotations
 
 from contextlib import closing
 from pathlib import Path
 import sqlite3
+import json
+
+from refactor_report import project_report
 
 
-def final_assistant(path: Path, conversation_id: str | None = None) -> str:
-    """Read a short, consistent read-only snapshot; preserve live WAL visibility.
+def final_report(path: Path, conversation_id: str | None = None) -> dict:
+    """Read one consistent read-only snapshot, including live committed WAL rows.
 
-    Schema: newt-core/src/store/schema.rs conversations/turns. Store ordering is
-    writer_fingerprint + seq (turn_chain.rs), never ts_claim. Multiple
-    writers have incomparable clocks, so decline rather than invent chronology.
-    Tool output belongs to events; user and assistant are separate text columns.
-    This reader trusts the operator-selected store; it does not verify its chain.
+    Select the latest prompt by writer/sequence, then its completed outcome.
+    Missing/incomplete outcomes never fall back to raw assistant text or an
+    older successful prompt. The operator-selected database remains the trust
+    boundary; this reader validates the review CID, not the whole store chain.
     """
     try:
         with closing(
@@ -36,21 +38,36 @@ def final_assistant(path: Path, conversation_id: str | None = None) -> str:
             ).fetchone():
                 raise ValueError("selected conversation does not exist")
             writers = db.execute(
-                "SELECT DISTINCT writer_fingerprint FROM turns WHERE conversation_id=? LIMIT 2",
+                "SELECT DISTINCT writer_fingerprint FROM prompt_receipts WHERE conversation_id=? LIMIT 2",
                 (conversation_id,),
             ).fetchall()
             if len(writers) != 1:
                 raise ValueError(
-                    "selected conversation has no turns or ambiguous writer ordering"
+                    "selected conversation has no prompts or ambiguous writer ordering"
                 )
-            row = db.execute(
-                "SELECT assistant FROM turns WHERE conversation_id=? AND writer_fingerprint=? ORDER BY seq DESC LIMIT 1",
+            prompt = db.execute(
+                "SELECT id FROM prompt_receipts WHERE conversation_id=? AND writer_fingerprint=? ORDER BY seq DESC LIMIT 1",
                 (conversation_id, writers[0][0]),
+            ).fetchone()[0]
+            outcome = db.execute(
+                "SELECT seq,body,metadata FROM prompt_artifacts WHERE conversation_id=? AND prompt_id=? "
+                "AND kind='turn_outcome' ORDER BY seq DESC LIMIT 1",
+                (conversation_id, prompt),
             ).fetchone()
-            if row is None or not isinstance(row[0], str) or not row[0].strip():
+            if (
+                outcome is None
+                or not isinstance(outcome[1], str)
+                or not outcome[1].strip()
+                or not isinstance(json.loads(outcome[2]).get("reply_digest"), str)
+            ):
                 raise ValueError(
-                    "final stored assistant message is empty or unavailable"
+                    "final composed turn-outcome report is empty or unavailable"
                 )
-            return row[0]
-    except sqlite3.Error as exc:
+            records = db.execute(
+                "SELECT body,metadata FROM prompt_artifacts WHERE conversation_id=? AND prompt_id=? "
+                "AND kind='turn_outcome' AND seq<? ORDER BY seq",
+                (conversation_id, prompt, outcome[0]),
+            ).fetchall()
+            return project_report(outcome[1], records)
+    except (sqlite3.Error, KeyError, TypeError, UnicodeError) as exc:
         raise ValueError(f"session DB unavailable or unsupported: {exc}") from exc
