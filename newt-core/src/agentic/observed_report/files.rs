@@ -25,6 +25,16 @@ impl ContentAddressable for Snapshot {
     }
 }
 
+impl Snapshot {
+    /// Incomplete/unauthorized reads never witness a check's input content.
+    pub(super) fn witness(&self) -> Option<ContentId> {
+        if self.0.values().any(|entry| entry.file == File::Unverified) {
+            return None;
+        }
+        self.content_id().ok()
+    }
+}
+
 fn read(scope: &Scope<String>, path: &Path, remaining: &mut usize) -> File {
     use crate::agentic::tools::file_capture::{is_absent_leaf, open_for_scope};
     match open_for_scope(scope, path, true) {

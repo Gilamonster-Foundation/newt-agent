@@ -11,13 +11,13 @@ fn report_stage2_grader_fixture_is_a_real_composed_report() {
     let context = ArtifactReadContext::new(Some(prompt), Some(prompt), Some(prompt), Some(&store));
     let mut state = State::default();
     state.bind(root, &Scope::All);
-    state.observe(root, &Capture {
+    state.observe(root, &Scope::All, &Capture {
         command: Some(("cargo test -p core".into(), root.display().to_string())),
         exit: Some(0),
         lines: vec!["test result: ok. 1850 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.0s".into()],
         truncated: false,
     }, Some(ExecOutcome::Passed), None);
-    let original = "Finished refactor.\n`cargo test -p core` — 1617 tests passed.\nThe largest file is ~3,800 lines.\n";
+    let original = "Finished refactor. Previously, `cargo test -p core` — 1617 tests passed; PR #999 created.\nThe largest file is ~3,800 lines.\n";
     let report = state.compose(
         root,
         &Scope::All,

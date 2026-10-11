@@ -8,6 +8,7 @@ fn observation(command: &str, lines: &[&str]) -> super::super::super::Check {
         exit: Some(0),
         lines: lines.iter().map(|s| (*s).into()).collect(),
         truncated: false,
+        observed_content: None,
     }
 }
 
@@ -66,7 +67,7 @@ fn report_stage2_named_target_command_is_not_a_future_target() {
     };
     assert!(matches!(
         classify(
-            "`cargo test -p core --target test-platform` — 1617 tests passed.",
+            "Previously, `cargo test -p core --target test-platform` — 1617 tests passed.",
             &facts
         ),
         Some(ClaimAssessment::Corrected(_))

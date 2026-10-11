@@ -79,7 +79,7 @@ impl<'a> TurnClaims<'a> {
         let root = root(workspace, self.session);
         let mut report = self.report.lock().expect("report state");
         report.bind(&root, scope);
-        report.observe(&root, capture, outcome, publication);
+        report.observe(&root, scope, capture, outcome, publication);
     }
 
     pub(crate) fn set_notices(

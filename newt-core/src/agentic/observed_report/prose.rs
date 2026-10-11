@@ -251,6 +251,7 @@ mod tests {
         state.bind(dir.path(), &crate::Scope::All);
         state.observe(
             dir.path(),
+            &crate::Scope::All,
             &super::super::Capture {
                 command: Some(("cargo check".into(), "project".into())),
                 exit: Some(0),

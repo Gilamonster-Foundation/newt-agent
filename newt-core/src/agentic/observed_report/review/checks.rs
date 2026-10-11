@@ -88,6 +88,11 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<ClaimAssessmen
         return None;
     }
     if COUNT.is_match(&visible) {
+        if publication(clause, &visible, facts).is_some() {
+            return Some(ClaimAssessment::Unverified(
+                "inseparable test and publication claims",
+            ));
+        }
         if super::quantities::approximate(&visible) || COMMAND.captures_iter(clause).count() > 1 {
             return Some(ClaimAssessment::Unverified(
                 "approximate quantity or multiple named invocations",
@@ -111,6 +116,15 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<ClaimAssessmen
                 "named invocation lacks complete scoped totals",
             ));
         };
+        // A historical result is evidence about that invocation, not a later tree.
+        // Compare the same bounded, authorized content witness used by the report.
+        let observed = check.and_then(|check| check.observed_content.as_ref());
+        let current = facts.after.and_then(super::super::files::Snapshot::witness);
+        if !historical(&visible) && (observed.is_none() || observed != current.as_ref()) {
+            return Some(ClaimAssessment::Unverified(
+                "check is stale or its current content witness is unavailable",
+            ));
+        }
         let mut correct = true;
         for c in COUNT.captures_iter(&visible) {
             let index = match c[2].to_lowercase().as_str() {
@@ -154,6 +168,11 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<ClaimAs
         LazyLock::new(|| regex(r"(?i)\bpushed\b|\bpush\b.*\b(?:blocked|failed|succeeded)\b"));
     static URL: LazyLock<regex::Regex> = LazyLock::new(|| regex(r"https://[^\s`)]+/pull/\d+"));
     let lower = visible.to_lowercase();
+    if PR.is_match(visible) && PUSH.is_match(visible) {
+        return Some(ClaimAssessment::Unverified(
+            "inseparable PR and push claims",
+        ));
+    }
     let prefix = if PR.is_match(visible) {
         "PR creation observed:"
     } else if PUSH.is_match(visible) {
@@ -229,6 +248,16 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<ClaimAs
     } else {
         ClaimAssessment::Correct
     })
+}
+
+/// Explicit historical framing never overrides an explicit current-tree claim.
+fn historical(visible: &str) -> bool {
+    static PAST: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex(r"(?i)^\s*(?:previously|earlier|last observed|before later edits)\b")
+    });
+    static CURRENT: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex(r"(?i)\b(?:current|now|latest|final|after)\b"));
+    PAST.is_match(visible) && !CURRENT.is_match(visible)
 }
 
 #[cfg(test)]

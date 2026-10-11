@@ -2,6 +2,7 @@
 mod checks;
 mod evidence;
 mod quantities;
+mod spans;
 use super::{files::Snapshot, Check};
 use content_addressable::{canonical, ContentAddressable, ContentError};
 pub(crate) use evidence::Evidence;
@@ -101,24 +102,34 @@ pub(super) fn review(draft: &str, facts: Facts<'_>) -> Review {
         let clause = &whole[prefix..];
         let trimmed = clause.trim_start();
         if !fence.advance(line) && !clause.starts_with("    ") && !trimmed.starts_with('>') {
-            let verdict =
-                quantities::classify(clause, &facts).or_else(|| checks::classify(clause, &facts));
-            let replacement = match verdict {
-                Some(ClaimAssessment::Corrected(observed)) => {
-                    Some(format!("[corrected by newt: {observed}]"))
+            for range in spans::claims(clause) {
+                let claim = &clause[range.clone()];
+                let quantity = quantities::classify(claim, &facts);
+                let check = checks::classify(claim, &facts);
+                let verdict = match (quantity, check) {
+                    (Some(_), Some(_)) => Some(ClaimAssessment::Unverified(
+                        "inseparable file and check/publication claims",
+                    )),
+                    (quantity, check) => quantity.or(check),
+                };
+                let replacement = match verdict {
+                    Some(ClaimAssessment::Corrected(observed)) => {
+                        Some(format!("[corrected by newt: {}]", spans::escape(&observed)))
+                    }
+                    Some(ClaimAssessment::Unverified(reason)) => Some(format!(
+                        "[unverified by newt: {} — {reason}]",
+                        spans::escape(claim)
+                    )),
+                    _ => None,
+                };
+                if let Some(replacement) = replacement {
+                    review.edits.push(Edit {
+                        start: offset + prefix + range.start,
+                        end: offset + prefix + range.end,
+                        original: claim.into(),
+                        replacement,
+                    });
                 }
-                Some(ClaimAssessment::Unverified(reason)) => {
-                    Some(format!("[unverified by newt: {clause} — {reason}]"))
-                }
-                _ => None,
-            };
-            if let Some(replacement) = replacement {
-                review.edits.push(Edit {
-                    start: offset + prefix,
-                    end: offset + whole.len(),
-                    original: clause.into(),
-                    replacement,
-                });
             }
         }
         offset += line.len();
@@ -133,17 +144,21 @@ pub(super) fn review(draft: &str, facts: Facts<'_>) -> Review {
             let whole = line.trim_end_matches(['\r', '\n']);
             let prefix = LIST.find(whole).map_or(0, |m| m.end());
             let clause = &whole[prefix..];
-            if !fence.advance(line)
-                && !line.starts_with("    ")
-                && marker(clause.trim_start_matches('\\'))
-                && !review.edits.iter().any(|e| e.start == offset + prefix)
-            {
-                review.edits.push(Edit {
-                    start: offset + prefix,
-                    end: offset + whole.len(),
-                    original: clause.into(),
-                    replacement: format!("\\{clause}"),
-                });
+            if !fence.advance(line) && !line.starts_with("    ") {
+                for range in spans::authored(clause) {
+                    let start = offset + prefix + range.start;
+                    let end = offset + prefix + range.end;
+                    if review.edits.iter().any(|e| e.start < end && start < e.end) {
+                        continue;
+                    }
+                    let original = &clause[range];
+                    review.edits.push(Edit {
+                        start,
+                        end,
+                        original: original.into(),
+                        replacement: format!("\\{original}"),
+                    });
+                }
             }
             offset += line.len();
         }
@@ -179,16 +194,11 @@ pub(super) fn model_projection(prose: &str) -> String {
             out.push_str(line);
             continue;
         }
-        let prefix = LIST.find(line).map_or(0, |m| m.end());
-        let clause = &line[prefix..];
-        if let Some(escaped) = clause
-            .strip_prefix('\\')
-            .filter(|s| marker(s.trim_start_matches('\\')))
-        {
-            out.push_str(&line[..prefix]);
-            out.push_str(escaped);
-        } else if !(marker(clause) && clause.trim_end_matches(['\r', '\n']).ends_with(']')) {
-            out.push_str(line);
+        let projected = spans::project(line);
+        let prefix = LIST.find(&projected).map_or(0, |m| m.end());
+        // Removing host clauses must not manufacture a list item or separator.
+        if projected == line || projected[prefix..].chars().any(|c| c.is_alphanumeric()) {
+            out.push_str(&projected);
         }
     }
     if out.trim().is_empty() {
@@ -264,7 +274,7 @@ impl super::State {
                     }
                     edit.replacement = format!(
                         "[unverified by newt: {} — review evidence unavailable]",
-                        edit.original
+                        spans::escape(&edit.original)
                     );
                 }
                 format!(

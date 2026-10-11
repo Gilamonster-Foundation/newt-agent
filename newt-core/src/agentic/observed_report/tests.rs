@@ -131,6 +131,7 @@ fn observed_report_captures_bounded_results_and_last_exact_scope() {
         view.execution_result(&serde_json::json!({"exit_code":code,"stdout":"test result: ok. 3 passed; 0 failed\n", "stderr":"error: 1 target failed"}));
         state.observe(
             dir.path(),
+            &Scope::All,
             &capture.lock().unwrap(),
             Some(if code == 0 {
                 ExecOutcome::Passed
@@ -157,6 +158,7 @@ fn observed_report_missing_evidence_is_explicit() {
     state.bind(dir.path(), &Scope::none());
     state.observe(
         dir.path(),
+        &Scope::All,
         &Capture::default(),
         Some(ExecOutcome::Passed),
         Some(&crate::git_staging::Outcome::DryRunChecked),
@@ -178,6 +180,7 @@ fn observed_report_objective_reset_and_root_isolation() {
     state.bind(dir.path(), &Scope::All);
     state.observe(
         dir.path(),
+        &Scope::All,
         &Capture::default(),
         None,
         Some(&crate::git_staging::Outcome::Pushed {
@@ -415,3 +418,6 @@ mod stage2;
 
 #[path = "stage2_fixture.rs"]
 mod stage2_fixture;
+
+#[path = "round2_tests.rs"]
+mod round2;

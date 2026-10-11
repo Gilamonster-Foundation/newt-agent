@@ -59,6 +59,10 @@ class ComposedReport(unittest.TestCase):
         self.assertIn("1850 passed", rows[0]["actual"])
         self.assertNotIn("1617", str(rows))
         self.assertNotIn("3,800", str(rows))
+        self.assertNotIn("999", str(rows))
+        # PR #2855 R2: independently reviewed claims share one physical line.
+        self.assertIn("Finished refactor. [corrected by newt:", report["summary"])
+        self.assertIn("; [unverified by newt: PR #999", report["summary"])
         self.assertTrue(report["review_cid"])
 
     def test_only_unverified_spans_cannot_make_claims_pass(self):

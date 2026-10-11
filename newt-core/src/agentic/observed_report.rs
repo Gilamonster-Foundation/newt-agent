@@ -47,6 +47,7 @@ struct Check {
     exit: Option<i64>,
     lines: Vec<String>,
     truncated: bool,
+    observed_content: Option<ContentId>,
 }
 
 /// The first harness-owned report item. CID covers scope, baseline, facts and
@@ -128,6 +129,7 @@ impl State {
     pub(crate) fn observe(
         &mut self,
         root: &Path,
+        scope: &Scope<String>,
         capture: &Capture,
         outcome: Option<ExecOutcome>,
         publication: Option<&crate::git_staging::Outcome>,
@@ -143,6 +145,13 @@ impl State {
                 exit: capture.exit,
                 lines: capture.lines.clone(),
                 truncated: capture.truncated,
+                observed_content: files::snapshot_with_baseline(
+                    root,
+                    scope,
+                    state.baseline.as_ref(),
+                )
+                .as_ref()
+                .and_then(files::Snapshot::witness),
             };
             state
                 .checks
