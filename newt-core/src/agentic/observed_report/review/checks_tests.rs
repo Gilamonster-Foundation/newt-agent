@@ -69,7 +69,7 @@ fn report_stage2_named_target_command_is_not_a_future_target() {
             "`cargo test -p core --target test-platform` — 1617 tests passed.",
             &facts
         ),
-        Some(Verdict::Corrected(_))
+        Some(ClaimAssessment::Corrected(_))
     ));
 }
 
@@ -90,7 +90,7 @@ fn report_stage2_publication_objects_cannot_borrow_a_receipt() {
         "Created PR #70 and #99.",
     ] {
         assert!(
-            matches!(classify(text, &facts), Some(Verdict::Unverified(_))),
+            matches!(classify(text, &facts), Some(ClaimAssessment::Unverified(_))),
             "{text}"
         );
     }
@@ -115,7 +115,7 @@ fn report_stage2_test_quantity_boundaries_are_unverified() {
         "`cargo test -p core` and `cargo test -p other` — 1850 tests passed.",
     ] {
         assert!(
-            matches!(classify(text, &facts), Some(Verdict::Unverified(_))),
+            matches!(classify(text, &facts), Some(ClaimAssessment::Unverified(_))),
             "{text}"
         );
     }
