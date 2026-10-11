@@ -887,8 +887,16 @@ pub(super) fn add_observed_note(
     workspace: &str,
 ) {
     let claims = claim_check::TurnClaims::capture(workspace, &crate::Scope::All, None);
+    let mut projection = semantic_pins::Projection::default();
+    projection.planning = output_budget::guidance(
+        None,
+        None,
+        std::path::Path::new(workspace),
+        &crate::Scope::All,
+        crate::tokens::TokenEstimation::default(),
+    );
     semantic_pins::refresh(
-        &mut semantic_pins::Projection::default(),
+        &mut projection,
         None,
         messages,
         prompt_read::PromptReadContext::new(None, task, None),
