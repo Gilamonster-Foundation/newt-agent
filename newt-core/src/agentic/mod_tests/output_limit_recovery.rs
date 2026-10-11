@@ -1,7 +1,7 @@
 //! A truncated tool batch must be discarded and retried with bounded host guidance.
 use super::*;
 
-fn reply(wire: &str, attempt: usize, limited: bool, tool: bool) -> ResponseTemplate {
+pub(super) fn reply(wire: &str, attempt: usize, limited: bool, tool: bool) -> ResponseTemplate {
     let args = if limited {
         "{\"path\":\"partial\",\"content\":\"cut".into()
     } else {

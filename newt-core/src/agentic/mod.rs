@@ -50,6 +50,7 @@ mod display;
 mod generation_bounds;
 mod generation_policy;
 mod generation_repetition;
+mod output_budget;
 mod output_limit_recovery;
 pub use generation_policy::{
     preview_chat_generation, projected_cognition, validate_output_allowance, ChatGenerationPreview,
@@ -2382,6 +2383,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             &caveats.fs_read,
             worktree_session,
             false,
+        );
+        observed_facts.planning = output_budget::guidance(
+            output_allowance,
+            step_ledger,
+            &selected_target::root(workspace, worktree_session),
+            &caveats.fs_read,
+            estimation,
         );
         semantic_pins::refresh(
             &mut observed_facts,
@@ -7519,6 +7527,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        observed_facts.planning = output_budget::guidance(
+            Some(generation_bounds::output_cap(
+                generation_policy.output_allowance,
+                None,
+                0,
+            )?),
+            step_ledger,
+            &selected_target::root(workspace, worktree_session),
+            &caveats.fs_read,
+            estimation,
+        );
         semantic_pins::refresh(
             &mut observed_facts,
             smart_harness,
@@ -10347,6 +10366,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        observed_facts.planning = output_budget::guidance(
+            Some(max_tokens),
+            step_ledger,
+            &selected_target::root(workspace, worktree_session),
+            &caveats.fs_read,
+            estimation,
+        );
         semantic_pins::refresh(
             &mut observed_facts,
             smart_harness,
@@ -12912,6 +12938,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             &caveats.fs_read,
             worktree_session,
             true,
+        );
+        observed_facts.planning = output_budget::guidance(
+            Some(generation_bounds::output_cap(
+                generation_policy.output_allowance,
+                None,
+                0,
+            )?),
+            step_ledger,
+            &selected_target::root(workspace, worktree_session),
+            &caveats.fs_read,
+            estimation,
         );
         semantic_pins::refresh(
             &mut observed_facts,
