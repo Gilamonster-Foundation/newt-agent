@@ -209,3 +209,35 @@ pub(super) fn ambiguous(snapshot: &Snapshot, prose: &str) -> Vec<String> {
         .take(16)
         .collect()
 }
+
+impl Snapshot {
+    pub(super) fn lines(&self, path: &str) -> Option<i64> {
+        match &self.0.get(path)?.file {
+            File::Absent => Some(0),
+            File::Present { lf: Some(n), .. } => i64::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+    pub(super) fn same_paths(&self, other: &Self) -> bool {
+        self.0.keys().eq(other.0.keys())
+    }
+    pub(super) fn total_lines(&self) -> Option<i64> {
+        self.0
+            .keys()
+            .try_fold(0_i64, |sum, path| sum.checked_add(self.lines(path)?))
+    }
+}
+
+pub(super) fn resolve(
+    before: Option<&Snapshot>,
+    after: Option<&Snapshot>,
+    name: &str,
+) -> Option<String> {
+    let paths: std::collections::BTreeSet<_> = before
+        .into_iter()
+        .chain(after)
+        .flat_map(|s| s.0.keys())
+        .filter(|path| path.as_str() == name || path.ends_with(&format!("/{name}")))
+        .collect();
+    (paths.len() == 1).then(|| (*paths.into_iter().next().expect("one path")).clone())
+}
