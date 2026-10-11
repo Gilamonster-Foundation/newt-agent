@@ -242,3 +242,23 @@ with an explicit harness truncation notice. The primary turn is marked failed,
 not completed. Endpoint reasoning-continuation declarations and the legacy
 `overflow_retry` preference do not override this bound. The operator may then
 issue a new request, reduce the requested output, or change the configured cap.
+
+### Output-aware edit planning
+
+Each round's labelled harness facts include the configured per-reply output
+ceiling and recommend keeping all retyped content below one quarter of it.
+Chat and Responses use the same configured generation maximum and allowance
+resolver as dispatch; actual request admission may lower the wire cap.
+Anthropic uses its resolved `max_tokens`; Ollama uses an explicit output
+allowance, or reports the budget unknown when none is configured.
+
+For a valid pinned source or unfinished plan step naming an explicit line range
+(for example `source.rs:10-80`, `L10-L80`, or `lines 10-80`), Newt measures the
+current authorized source bytes. It estimates the serialized content with the
+configured characters-per-token heuristic; it does not equate lines with tokens.
+Ranges exceeding the quarter-budget recommendation get advice to use
+`write_file` with `copy_from {path, start_line, end_line}` (inclusive ranges,
+without retyping), or split into cohesive extractions, one per publish cycle.
+These notes never refuse an edit. Missing, unauthorized, changed-during-read or
+out-of-range sources remain unmeasured; ambiguous multi-source steps are not
+guessed. Advisory work is bounded to eight ranges and four MiB per source.
