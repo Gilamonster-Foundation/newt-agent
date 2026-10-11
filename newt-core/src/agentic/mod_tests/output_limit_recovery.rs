@@ -142,7 +142,10 @@ macro_rules! wire_test {
         /// Output-limit recovery executes the fresh tool, resets after progress,
         /// and stops honestly after two consecutive retries on this wire.
         #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
         async fn $name() {
+            // PR #2860: pin SSE before another fixture can select JSON mode.
+            let _env = crate::agentic::anthropic_loop_tests::test_env(true);
             scenario($wire, false).await;
             scenario($wire, true).await;
         }
