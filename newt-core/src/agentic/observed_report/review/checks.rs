@@ -1,4 +1,4 @@
-use super::{future, number, regex, Facts, Verdict};
+use super::{future, number, regex, ClaimAssessment, Facts};
 use std::sync::LazyLock;
 
 static COUNT: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -81,7 +81,7 @@ fn totals(check: &super::super::Check) -> Option<[i64; 4]> {
     Some(totals)
 }
 
-pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
+pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<ClaimAssessment> {
     static CODE: LazyLock<regex::Regex> = LazyLock::new(|| regex(r"`+[^`\n]*`+"));
     let visible = CODE.replace_all(clause, " ");
     if future(&visible) {
@@ -89,7 +89,7 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
     }
     if COUNT.is_match(&visible) {
         if super::quantities::approximate(&visible) || COMMAND.captures_iter(clause).count() > 1 {
-            return Some(Verdict::Unverified(
+            return Some(ClaimAssessment::Unverified(
                 "approximate quantity or multiple named invocations",
             ));
         }
@@ -98,7 +98,7 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
             .and_then(|c| c.get(1).or_else(|| c.get(2)))
             .map(|m| m.as_str())
         else {
-            return Some(Verdict::Unverified(
+            return Some(ClaimAssessment::Unverified(
                 "test quantity has no exact named invocation",
             ));
         };
@@ -107,7 +107,7 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
             .iter()
             .find(|c| c.command == command && Path::new(&c.cwd) == facts.root);
         let Some(counts) = check.and_then(totals) else {
-            return Some(Verdict::Unverified(
+            return Some(ClaimAssessment::Unverified(
                 "named invocation lacks complete scoped totals",
             ));
         };
@@ -120,22 +120,22 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
                 _ => 3,
             };
             if counts[index] < 0 {
-                return Some(Verdict::Unverified("test category not observed"));
+                return Some(ClaimAssessment::Unverified("test category not observed"));
             }
             let Some(claimed) = number(&c[1]) else {
-                return Some(Verdict::Unverified("unsupported number syntax"));
+                return Some(ClaimAssessment::Unverified("unsupported number syntax"));
             };
             correct &= claimed == counts[index];
         }
         return Some(if correct {
-            Verdict::Correct
+            ClaimAssessment::Correct
         } else {
             let ignored = if counts[2] >= 0 {
                 format!(", {} ignored", counts[2])
             } else {
                 String::new()
             };
-            Verdict::Corrected(format!(
+            ClaimAssessment::Corrected(format!(
                 "last observed `{command}` in `{}`: {} passed, {} failed{ignored}, {} executed tests (historical)", facts.root.display(), counts[0], counts[1], counts[3]
             ))
         });
@@ -144,7 +144,7 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
 }
 use std::path::Path;
 
-fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<Verdict> {
+fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<ClaimAssessment> {
     static PR: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex(
             r"(?i)\b(?:PR|pull request)\b.*\b(?:created|opened|blocked|failed|open|merged)\b|\b(?:created|opened|merged)\b.*\b(?:PR|pull request)\b",
@@ -169,7 +169,7 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<Verdict
         .split(|c: char| !c.is_alphabetic())
         .any(|w| matches!(w, "open" | "closed" | "merged" | "later" | "currently"))
     {
-        return Some(Verdict::Unverified("no live PR-state observation"));
+        return Some(ClaimAssessment::Unverified("no live PR-state observation"));
     }
     static ID: LazyLock<regex::Regex> =
         LazyLock::new(|| regex(r"(?i)\b(?:PR|pull request)\s*#(\d+)"));
@@ -180,7 +180,9 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<Verdict
     if prefix == "PR creation observed:"
         && (NUMBERED.find_iter(clause).count() > 1 || URL.find_iter(clause).count() > 1)
     {
-        return Some(Verdict::Unverified("multiple PR objects in one clause"));
+        return Some(ClaimAssessment::Unverified(
+            "multiple PR objects in one clause",
+        ));
     }
     let matches: Vec<_> = facts
         .publications
@@ -209,7 +211,7 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<Verdict
         })
         .collect();
     if matches.len() != 1 {
-        return Some(Verdict::Unverified(
+        return Some(ClaimAssessment::Unverified(
             "no unique matching governed publication receipt",
         ));
     }
@@ -220,12 +222,12 @@ fn publication(clause: &str, visible: &str, facts: &Facts<'_>) -> Option<Verdict
     });
     let negative = NEGATIVE.is_match(&lower);
     Some(if negative {
-        Verdict::Corrected(format!(
+        ClaimAssessment::Corrected(format!(
             "{} (historical receipt; later failures are separate attempts)",
             matches[0]
         ))
     } else {
-        Verdict::Correct
+        ClaimAssessment::Correct
     })
 }
 
