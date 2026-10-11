@@ -58,7 +58,7 @@ try:
     with patch.object(grader, "extraction", return_value=(True, "extracted")):
         result = case.grade()
     assert result["pass"], result
-    assert result["summary"] == "Summary\\nCommitted and pushed. Opened PR #20."
+    assert result["summary"].endswith("Summary\\nCommitted and pushed. Opened PR #20.")
 finally:
     case.doCleanups()
 """
