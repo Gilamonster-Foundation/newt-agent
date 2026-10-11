@@ -6554,7 +6554,7 @@ fn finalize_final_text(
 ) -> String {
     let mut reply = text.into();
     let source_draft = redact_model_facing(disclosure, reply.model.clone());
-    reply.model = observed_report::model_prose(&source_draft);
+    reply.model = observed_report::assistant_prose(&source_draft);
     // Evaluate each gate against model prose only. Its appended diagnostics are
     // harness evidence, not words to attribute to the assistant.
     reply.annotation(capability_check::annotate_unobserved_probe(
