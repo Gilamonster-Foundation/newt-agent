@@ -2195,7 +2195,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // moved. `None` (off-repo, or the read scope refuses the probe) must
     // never manufacture a false refutation — see `claim_check::TurnGitEvidence`.
     let turn_claims =
-        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session);
+        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session)
+            .with_evidence(observed_report::review::Evidence {
+                sink: artifact_sink,
+                context: artifact_context,
+                spill: spill_store,
+            });
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -6548,7 +6553,8 @@ fn finalize_final_text(
     verification: &self_verify::VerificationLedger,
 ) -> String {
     let mut reply = text.into();
-    reply.model = observed_report::model_prose(&reply.model);
+    let source_draft = redact_model_facing(disclosure, reply.model.clone());
+    reply.model = observed_report::model_prose(&source_draft);
     // Evaluate each gate against model prose only. Its appended diagnostics are
     // harness evidence, not words to attribute to the assistant.
     reply.annotation(capability_check::annotate_unobserved_probe(
@@ -6565,8 +6571,16 @@ fn finalize_final_text(
     reply.annotation(verification.annotate_pr_claim(reply.model.clone()));
     reply.annotation(verification.annotate_push_claim(reply.model.clone()));
     turn_claims.set_notices(workspace, read_scope, &reply.notices);
-    let observed = turn_claims.observed_report(workspace, read_scope, &reply.model);
-    redact_model_facing(disclosure, format!("{observed}{}", reply.model))
+    redact_model_facing(
+        disclosure,
+        turn_claims.final_report(
+            workspace,
+            read_scope,
+            &reply.model,
+            &source_draft,
+            disclosure,
+        ),
+    )
 }
 
 /// The cap-exit context threaded into a final tools-disabled summary (Step
@@ -7324,7 +7338,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // moved. `None` (off-repo, or the read scope refuses the probe) must
     // never manufacture a false refutation — see `claim_check::TurnGitEvidence`.
     let turn_claims =
-        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session);
+        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session)
+            .with_evidence(observed_report::review::Evidence {
+                sink: artifact_sink,
+                context: artifact_context,
+                spill: spill_store,
+            });
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -10139,7 +10158,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // moved. `None` (off-repo, or the read scope refuses the probe) must
     // never manufacture a false refutation — see `claim_check::TurnGitEvidence`.
     let turn_claims =
-        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session);
+        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session)
+            .with_evidence(observed_report::review::Evidence {
+                sink: artifact_sink,
+                context: artifact_context,
+                spill: spill_store,
+            });
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -12725,7 +12749,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // moved. `None` (off-repo, or the read scope refuses the probe) must
     // never manufacture a false refutation — see `claim_check::TurnGitEvidence`.
     let turn_claims =
-        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session);
+        claim_check::TurnClaims::capture(workspace, &caveats.fs_read, worktree_session)
+            .with_evidence(observed_report::review::Evidence {
+                sink: artifact_sink,
+                context: artifact_context,
+                spill: spill_store,
+            });
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
