@@ -95,3 +95,28 @@ fn report_stage2_publication_objects_cannot_borrow_a_receipt() {
         );
     }
 }
+
+/// Approximate totals and multiple named invocations are never exact proof.
+#[test]
+fn report_stage2_test_quantity_boundaries_are_unverified() {
+    let check = observation("cargo test -p core", &[
+        "test result: ok. 1850 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.0s",
+    ]);
+    let facts = Facts {
+        before: None,
+        after: None,
+        checks: &[check],
+        publications: &[],
+        root: Path::new("project"),
+    };
+    for text in [
+        "`cargo test -p core` — roughly 1850 tests passed.",
+        "`cargo test -p core` — ≈1850 tests passed.",
+        "`cargo test -p core` and `cargo test -p other` — 1850 tests passed.",
+    ] {
+        assert!(
+            matches!(classify(text, &facts), Some(Verdict::Unverified(_))),
+            "{text}"
+        );
+    }
+}
