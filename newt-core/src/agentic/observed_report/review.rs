@@ -72,7 +72,7 @@ pub(super) struct Facts<'a> {
     pub root: &'a Path,
 }
 
-pub(super) enum Verdict {
+pub(super) enum ClaimAssessment {
     Correct,
     Corrected(String),
     Unverified(&'static str),
@@ -104,10 +104,10 @@ pub(super) fn review(draft: &str, facts: Facts<'_>) -> Review {
             let verdict =
                 quantities::classify(clause, &facts).or_else(|| checks::classify(clause, &facts));
             let replacement = match verdict {
-                Some(Verdict::Corrected(observed)) => {
+                Some(ClaimAssessment::Corrected(observed)) => {
                     Some(format!("[corrected by newt: {observed}]"))
                 }
-                Some(Verdict::Unverified(reason)) => {
+                Some(ClaimAssessment::Unverified(reason)) => {
                     Some(format!("[unverified by newt: {clause} — {reason}]"))
                 }
                 _ => None,
