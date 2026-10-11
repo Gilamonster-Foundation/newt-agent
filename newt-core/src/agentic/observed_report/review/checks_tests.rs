@@ -72,3 +72,26 @@ fn report_stage2_named_target_command_is_not_a_future_target() {
         Some(Verdict::Corrected(_))
     ));
 }
+
+/// Stage 2 must not certify later objects from the first matching receipt, nor
+/// confuse a URL with another URL whose PR number merely shares its prefix.
+#[test]
+fn report_stage2_publication_objects_cannot_borrow_a_receipt() {
+    let facts = Facts {
+        before: None,
+        after: None,
+        checks: &[],
+        publications: &["PR creation observed: https://github.com/o/r/pull/70".into()],
+        root: Path::new("project"),
+    };
+    for text in [
+        "Created PR https://github.com/o/r/pull/7",
+        "Created PR #70 and PR #99.",
+        "Created PR #70 and #99.",
+    ] {
+        assert!(
+            matches!(classify(text, &facts), Some(Verdict::Unverified(_))),
+            "{text}"
+        );
+    }
+}
