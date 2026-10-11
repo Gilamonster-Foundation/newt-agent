@@ -144,8 +144,9 @@ macro_rules! wire_test {
         #[tokio::test]
         #[serial_test::serial(anthropic_loop_env)]
         async fn $name() {
-            // PR #2860: pin SSE before another fixture can select JSON mode.
-            let _env = crate::agentic::anthropic_loop_tests::test_env(true);
+            // Hold process_env across both scenarios and env restoration.
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
             scenario($wire, false).await;
             scenario($wire, true).await;
         }

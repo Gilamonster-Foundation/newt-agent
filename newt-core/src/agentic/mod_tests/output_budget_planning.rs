@@ -6,10 +6,9 @@ use super::*;
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn output_budget_planning_tracks_cap_and_measures_pinned_range() {
-    // PR #2860: the Anthropic fixture emits SSE; pin its process-wide mode
-    // under the same lock as the JSON and streaming provider fixtures.
-    let _env = crate::agentic::anthropic_loop_tests::test_env(true);
+    // Declare settings first so process_env outlives stream-mode restoration.
     let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
     for wire in ["openai", "responses", "ollama", "anthropic"] {
         for (cap, lines, oversized) in [(1200, "lines 1-2", false), (2400, "lines 1-80", true)] {
             let server = MockServer::start().await;
