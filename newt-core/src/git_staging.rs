@@ -1684,29 +1684,9 @@ pub enum Outcome {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureCategory {
-    Network,
-    Auth,
-    RefusedByHarness,
-    GitError,
-    /// `gh pr create` exited zero but printed something that doesn't parse
-    /// as `https://github.com/<owner>/<name>/pull/<digits>`.
-    Parse,
-}
-
-impl std::fmt::Display for FailureCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::Network => "network",
-            Self::Auth => "auth",
-            Self::RefusedByHarness => "refused_by_harness",
-            Self::GitError => "git_error",
-            Self::Parse => "parse",
-        };
-        f.write_str(s)
-    }
-}
+#[path = "git_staging/failure.rs"]
+mod failure;
+pub use failure::FailureCategory;
 
 impl std::fmt::Display for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1721,7 +1701,10 @@ impl std::fmt::Display for Outcome {
                 write!(f, "pushed {oid} → github.com/{owner}/{name}:{branch}")
             }
             Self::PrCreated { url } => write!(f, "pr_created {url}"),
-            Self::Failed { category } => write!(f, "failed({category})"),
+            Self::Failed { category } => {
+                write!(f, "failed({category})")?;
+                category.write_guidance(f)
+            }
         }
     }
 }
