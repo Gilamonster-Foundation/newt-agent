@@ -2,6 +2,7 @@
 mod capture;
 mod files;
 mod prose;
+pub(crate) mod review;
 pub use prose::assistant_prose;
 pub(super) use prose::model_prose;
 pub(crate) use prose::{replay_messages, split_report};
@@ -27,6 +28,7 @@ pub(crate) struct State {
     objective: Option<crate::prompt::PromptId>,
     /// Canonical bytes of the latest pinned report; replaced, never mistaken for history.
     pinned: Option<(ContentId, Vec<u8>)>,
+    review: Option<review::Review>,
 }
 
 #[derive(Debug)]
@@ -180,10 +182,30 @@ impl State {
 
     pub(crate) fn render(&mut self, root: &Path, scope: &Scope<String>, prose: &str) -> String {
         self.pinned = None;
+        self.review = Some(review::review(
+            prose,
+            review::Facts {
+                before: None,
+                after: None,
+                checks: &[],
+                publications: &[],
+                root,
+            },
+        ));
         let Some(state) = self.roots.get(root) else {
             return "## Observed\n\nFacts unavailable: root retention limit reached.\n\n## Model explanation\n\n".into();
         };
         let current = files::snapshot_with_baseline(root, scope, state.baseline.as_ref());
+        self.review = Some(review::review(
+            prose,
+            review::Facts {
+                before: state.baseline.as_ref(),
+                after: current.as_ref(),
+                checks: &state.checks,
+                publications: &state.publications,
+                root,
+            },
+        ));
         let rows = match (&state.baseline, &current) {
             (Some(before), Some(after)) => files::changes(before, after),
             _ => vec!["File counts unavailable: incomplete or unauthorized snapshot.".into()],
