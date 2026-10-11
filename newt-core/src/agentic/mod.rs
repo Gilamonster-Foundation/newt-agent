@@ -50,6 +50,7 @@ mod display;
 mod generation_bounds;
 mod generation_policy;
 mod generation_repetition;
+mod output_limit_recovery;
 pub use generation_policy::{
     preview_chat_generation, projected_cognition, validate_output_allowance, ChatGenerationPreview,
 };
@@ -2208,6 +2209,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut suspicious_empty_retries: u32 = 0;
     // Consecutive context-window recoveries (parse limit → trim → retry).
     let mut cw_retries: u32 = 0;
+    let mut output_recovery = output_limit_recovery::Recovery::default();
     // Some models reject ANY request carrying a `tools` field (e.g.
     // deepseek-r1). Once one 400s with "does not support tools", drop tools for
     // the rest of the session so even a bare "hello" works; notice it once.
@@ -2372,6 +2374,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut selected_source = selected_target::Projection::default();
     let mut observed_facts = semantic_pins::Projection::default();
     'round_loop: for round in 0..usize::MAX {
+        let round = round.saturating_sub(output_recovery.skipped_rounds);
         selected_source.refresh(
             &mut messages,
             step_ledger,
@@ -3188,6 +3191,34 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             emits_leading_reasoning,
         );
 
+        if json["done_reason"] == "length" {
+            if output_recovery.retry(
+                message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty()),
+                &mut messages,
+                smart_harness,
+            )? {
+                continue;
+            }
+            let text = finalize_final_text(
+                generation_bounds::output_limit_notice(probe_content, round_usage),
+                workspace,
+                &caveats.fs_read,
+                &capability_evidence,
+                disclosure,
+                &turn_claims,
+                &verification,
+            );
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::Failed);
+            }
+            if let Some(harness) = smart_harness {
+                harness.outcome(crate::TurnEndReason::Failed, &text)?;
+            }
+            return Ok((text, false, accumulated_usage, hallucination_count));
+        }
+
         let native_calls = message["tool_calls"].as_array();
         // Recover tool calls a weak model emitted in CONTENT instead of the
         // native `tool_calls` field — the #1 weak-model failure (see
@@ -3917,6 +3948,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         let mut round_wrote = false;
         let mut round_modified_workspace = false;
         let mut round_progress = false;
+        let mut round_succeeded = false;
         let tcs = tool_calls.unwrap();
         // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch before
         // any side effect. This Ollama/Anthropic-native wire carries no per-call
@@ -4208,6 +4240,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember outcomes that should make
             // an exact repeat self-correct next round.
             let ok = tools::tool_ok(&result, execution.get().copied());
+            round_succeeded |= ok;
             attribution_epoch.finish(&args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
@@ -4316,6 +4349,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         }
         if let Some(harness) = smart_harness {
             harness.record_messages(&messages)?;
+        }
+        if round_succeeded {
+            output_recovery.completed_tool_round();
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
@@ -7349,6 +7385,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
     // Consecutive context-window recoveries (parse limit → trim → retry).
     let mut cw_retries: u32 = 0;
+    let mut output_recovery = output_limit_recovery::Recovery::default();
     // No-tools recovery (mirrors the Ollama path): a model that rejects the
     // `tools` field 400s even on "hello"; drop tools and retry, notice once.
     let mut tools_supported = true;
@@ -7473,6 +7510,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut selected_source = selected_target::Projection::default();
     let mut observed_facts = semantic_pins::Projection::default();
     'round_loop: for round in 0..usize::MAX {
+        let round = round.saturating_sub(output_recovery.skipped_rounds);
         selected_source.refresh(
             &mut messages,
             step_ledger,
@@ -8335,9 +8373,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             completed_spill_renderer.as_deref(),
             color,
         );
-        // #2824: stop before content recovery, validation, nudges or dispatch.
-        // A provider capability or old thinking-off setting cannot buy a retry.
+        // Discard the whole capped batch before parsing or dispatching tools.
         if generation_bounds::output_limited(&json) {
+            if output_recovery.retry(
+                message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty()),
+                &mut messages,
+                smart_harness,
+            )? {
+                continue;
+            }
             if let Some(obs) = solve_obs.as_deref_mut() {
                 obs.behavior_signals
                     .push(observability::BehaviorSignal::ChatCompletionFinish {
@@ -8917,6 +8963,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         messages.push(assistant_turn);
         let mut round_modified_workspace = false;
         let mut round_progress = false;
+        let mut round_succeeded = false;
         let tcs = tool_calls.unwrap();
         // Phase 1 (invariant #3, BATCH level): validate the ENTIRE batch before
         // any side effect. Every OpenAI `tool_call` must have a non-empty, UNIQUE
@@ -9261,6 +9308,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_ok(&result, execution.get().copied());
+            round_succeeded |= ok;
             attribution_epoch.finish(&args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
@@ -9363,6 +9411,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         }
         if let Some(harness) = smart_harness {
             harness.record_messages(&messages)?;
+        }
+        if round_succeeded {
+            output_recovery.completed_tool_round();
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
@@ -10175,6 +10226,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut pause_turn_retried = false;
     // Consecutive context-window recoveries (parse limit → trim → retry).
     let mut cw_retries: u32 = 0;
+    let mut output_recovery = output_limit_recovery::Recovery::default();
     // No-tools recovery (mirrors the OpenAI path): real Anthropic never
     // rejects `tools`, but façades might; drop tools and retry, notice once.
     let mut tools_supported = true;
@@ -10286,6 +10338,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut selected_source = selected_target::Projection::default();
     let mut observed_facts = semantic_pins::Projection::default();
     'round_loop: for round in 0..usize::MAX {
+        let round = round.saturating_sub(output_recovery.skipped_rounds);
         selected_source.refresh(
             &mut messages,
             step_ledger,
@@ -10942,6 +10995,32 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             }
         }
 
+        if model_reply.stop_reason.as_deref() == Some("max_tokens") {
+            if output_recovery.retry(
+                !model_reply.tool_uses.is_empty() || model_reply.unfinished_tool_use,
+                &mut messages,
+                smart_harness,
+            )? {
+                continue;
+            }
+            let text = finalize_final_text(
+                generation_bounds::output_limit_notice(model_reply.text, round_usage),
+                workspace,
+                &caveats.fs_read,
+                &capability_evidence,
+                disclosure,
+                &turn_claims,
+                &verification,
+            );
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::Failed);
+            }
+            if let Some(harness) = smart_harness {
+                harness.outcome(crate::TurnEndReason::Failed, &text)?;
+            }
+            return Ok((text, false, accumulated_usage, hallucination_count));
+        }
+
         // `refusal` stop semantics (this wire only): NOT a tool round, NOT an
         // error. The streamed/parsed text — if any — IS the answer; an empty
         // refusal gets an honest placeholder. No rescue nudges: nudging a
@@ -11590,6 +11669,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         }));
         let mut round_modified_workspace = false;
         let mut round_progress = false;
+        let mut round_succeeded = false;
         let tcs = tool_calls.unwrap();
         // Phase 1 (invariant #3, BATCH level) — mirrors the OpenAI path. The
         // decoded `tool_uses` are already the internal shape (arguments as
@@ -11915,6 +11995,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             }
             // 17.6 + 27.3 — mirrors the OpenAI path.
             let ok = tools::tool_ok(&result, execution.get().copied());
+            round_succeeded |= ok;
             attribution_epoch.finish(&args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
@@ -12020,6 +12101,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         }
         if let Some(harness) = smart_harness {
             harness.record_messages(&messages)?;
+        }
+        if round_succeeded {
+            output_recovery.completed_tool_round();
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(
@@ -12721,6 +12805,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // #1528: consecutive context-window recoveries (parse limit → tighten
     // → compact → redispatch), bounded to 2 until a generation succeeds.
     let mut cw_retries: u32 = 0;
+    let mut output_recovery = output_limit_recovery::Recovery::default();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     preflight_irreducible_request(
         &msgs_json,
@@ -12819,6 +12904,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut selected_source = selected_target::Projection::default();
     let mut observed_facts = semantic_pins::Projection::default();
     for round in 0..usize::MAX {
+        let round = round.saturating_sub(output_recovery.skipped_rounds);
         selected_source.refresh(
             &mut input,
             step_ledger,
@@ -13249,6 +13335,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         if generation_bounds::output_limited(&json) {
             let usage = crate::responses_wire::decode_usage(&json["usage"]);
             accumulated_usage = merge_round_usage(accumulated_usage, usage);
+            if output_recovery.retry(
+                json["output"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call")),
+                &mut input,
+                smart_harness,
+            )? {
+                continue;
+            }
             let text = finalize_final_text(
                 generation_bounds::output_limit_notice(
                     generation_bounds::partial_responses_text(&json),
@@ -13587,6 +13682,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             .transpose()?;
         let mut round_modified_workspace = false;
         let mut round_progress = false;
+        let mut round_succeeded = false;
         let mut tool_warnings = Vec::new();
         // Phase 2: execute in order.
         for (call_index, (call, vc)) in calls.iter().zip(validated.iter()).enumerate() {
@@ -13815,6 +13911,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_ok(&result, execution.get().copied());
+            round_succeeded |= ok;
             let after_change = if before_change.is_some() {
                 progress_workspace_state(name, &args, workspace, &caveats.fs_read).await
             } else {
@@ -13916,6 +14013,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
         if let Some(harness) = smart_harness {
             harness.record_responses_messages(instructions.as_deref(), &input)?;
+        }
+        if round_succeeded {
+            output_recovery.completed_tool_round();
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
         if let Some(text) = pending_plan_approval_handoff(

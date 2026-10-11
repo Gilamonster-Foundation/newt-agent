@@ -537,3 +537,6 @@ mod publish_early_tests;
 
 #[path = "http_context_composition.rs"]
 mod context_composition;
+
+#[path = "output_limit_recovery.rs"]
+mod output_limit_recovery;
