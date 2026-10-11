@@ -38,12 +38,16 @@ fn visible(text: &str) -> String {
     .into_owned()
 }
 
+pub(super) fn approximate(text: &str) -> bool {
+    APPROX.is_match(text)
+}
+
 pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
     let text = visible(clause);
     if future(&text) || !QUANTITY.is_match(&text) {
         return None;
     }
-    if APPROX.is_match(&text) {
+    if approximate(&text) {
         return Some(Verdict::Unverified("approximate quantity"));
     }
     if text.contains("insertion") || text.contains("deletion") || text.contains("files changed") {
@@ -116,6 +120,11 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<Verdict> {
         });
     }
     if let Some(net) = NET.captures(&text) {
+        let residue = text.replacen(&net[0], "", 1);
+        if QUANTITY.is_match(&residue) || COMPARISON.is_match(&residue) || CHANGE.is_match(&residue)
+        {
+            return unverified();
+        }
         let (Some(before), Some(after)) = (before, after) else {
             return unverified();
         };
