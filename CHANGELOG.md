@@ -11,6 +11,19 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [0.8.0] — 2026-10-12
 
+### Fixed — release blockers found by the first v0.8.0 publish run
+
+- Native Git commits no longer fail when `/etc/gitconfig` exists as a regular
+  file: held read roots now bind exact files as files (no-follow, regular-file
+  only, no parent access) instead of as directories. CI now runs the native
+  file-read-root proof on Linux and macOS, which the regular test job had
+  skipped (#2865).
+- Every workspace crate is now publishable to crates.io in dependency order.
+  The `agent-harness` crate is published as **`newt-harness`** (the name
+  `agent-harness` belongs to an unrelated project); Rust code still imports it
+  as `agent_harness`. The test-only helpers `tests-common` and `tests-pty` stay
+  unpublished (#2866).
+
 ### Changed — plan approval defaults to yes
 
 - Plan approval offers yes, no, then discuss, with `[Y/n/discuss]` guidance.
