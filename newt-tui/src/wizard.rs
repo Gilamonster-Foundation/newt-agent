@@ -232,6 +232,17 @@ fn probe_candidates() -> Vec<String> {
             candidates.insert(0, url);
         }
     }
+    // An explicit NEWT_DGX_OLLAMA_URL outranks everything: the config written
+    // here wins over the env shim at session start, so probing it is the only
+    // way the operator's explicit endpoint survives first run.
+    if let Some(url) = std::env::var("NEWT_DGX_OLLAMA_URL")
+        .ok()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+    {
+        candidates.retain(|c| c != &url);
+        candidates.insert(0, url);
+    }
     candidates
 }
 
@@ -381,6 +392,27 @@ mod tests {
         assert!(c.iter().any(|u| u.contains("myhost.local")));
         // env host is probed first
         assert!(c[0].contains("myhost.local"));
+    }
+
+    /// Regression: first run ignored NEWT_DGX_OLLAMA_URL and wrote a localhost
+    /// config, which then outranked the env shim, so the session never reached
+    /// the operator's endpoint (newt-web dock E2E red since 2026-08-23).
+    #[serial_test::serial(wizard_env)]
+    #[test]
+    fn probe_candidates_puts_explicit_ollama_url_first() {
+        std::env::set_var("NEWT_DGX_HOST", "myhost.local");
+        std::env::set_var("NEWT_DGX_OLLAMA_URL", "http://127.0.0.1:4321/");
+        let c = probe_candidates();
+        std::env::set_var("NEWT_DGX_OLLAMA_URL", "  ");
+        let blank = probe_candidates();
+        std::env::remove_var("NEWT_DGX_OLLAMA_URL");
+        std::env::remove_var("NEWT_DGX_HOST");
+        assert_eq!(c[0], "http://127.0.0.1:4321", "{c:?}");
+        assert!(c[1].contains("myhost.local"), "{c:?}");
+        assert!(
+            blank[0].contains("myhost.local"),
+            "blank is unset: {blank:?}"
+        );
     }
 
     #[serial_test::serial(real_fs)]
