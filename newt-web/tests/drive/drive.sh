@@ -94,7 +94,9 @@ start_web() { # peer 1, shares the peer-1 store; ALSO exposes over the mesh
   # The mesh responder binds before the HTTP server accepts, so its line is in
   # the log by now: "mesh dock service on udp/<port> (agent …, pubkey <hex>)".
   MESH_PORT="$(grep -oE 'udp/[0-9]+' "$WORK/web.log" | head -1 | cut -d/ -f2)"
-  MESH_PUBKEY="$(grep -oE 'pubkey [0-9a-f]{64}' "$WORK/web.log" | head -1 | awk '{print $2}')"
+  # The SERVICE line's key: since #2613 the dial client logs its own `hub pubkey`
+  # first, and dialing/approving that key fails the handshake (UnknownIssuer).
+  MESH_PUBKEY="$(grep 'mesh dock service on' "$WORK/web.log" | grep -oE 'pubkey [0-9a-f]{64}' | head -1 | awk '{print $2}')"
 }
 start_peer2() { # peer 2, its own store
   PEER2_PORT="$(free_port)"
@@ -132,7 +134,16 @@ start_gated_hub() {
 ghub_get() { curl -fsS "http://127.0.0.1:$GHUB_PORT$1"; }
 hub_get() { curl -fsS "http://127.0.0.1:$HUB_PORT$1"; }
 web_get()  { curl -fsS "http://127.0.0.1:$WEB_PORT$1"; }
-web_post() { local path="$1"; shift; curl -fsS -X POST "http://127.0.0.1:$WEB_PORT$path" "$@"; }
+# A browser POST, as the C3b gate (#1868) requires: same-origin Origin plus the
+# double-submit CSRF token (cookie == form field). Bare curl POSTs are refused
+# 403 "cross-site request refused", which kept this drive red from #1868 on.
+# HX-Request: the cockpit's forms post via htmx; without it a form gets the
+# no-JS 303 redirect instead of the panel fragment this drive inspects.
+DRIVE_CSRF="drive-csrf-token"
+browser_post() { local port="$1" path="$2"; shift 2
+  curl -X POST "http://127.0.0.1:$port$path" -H "Origin: http://127.0.0.1:$port" -H "HX-Request: true" \
+    -H "Cookie: newt_csrf=$DRIVE_CSRF" --data-urlencode "csrf=$DRIVE_CSRF" "$@"; }
+web_post() { local path="$1"; shift; browser_post "$WEB_PORT" "$path" -fsS "$@"; }
 
 # --- store probe (arg 1 = config dir holding conversations.db) -------------
 store_conv()  { python3 -c "import sqlite3;r=sqlite3.connect('$1/conversations.db').execute('select id from conversations').fetchone();print(r[0] if r else '')"; }
@@ -166,7 +177,7 @@ main() {
   FOLLOW="$(web_post /follow --data-urlencode "conv_id=$CONV" --data-urlencode "title=hello from the driver" --data-urlencode "workspace=$WSP")"
   AID="$(printf '%s' "$FOLLOW" | grep -oE '/agents/[0-9]+/' | head -1 | grep -oE '[0-9]+')"
   [ -n "$AID" ] && ok "web follow/attach created a tab (agent $AID)" || bad "follow did not create a tab"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$WEB_PORT/agents/$AID/prompt" --data-urlencode "text=INJECTED_VIA_WEB run the tests")"
+  code="$(browser_post "$WEB_PORT" "/agents/$AID/prompt" -s -o /dev/null -w '%{http_code}' --data-urlencode "text=INJECTED_VIA_WEB run the tests")"
   [ "$code" = "204" ] && ok "inject accepted (204)" || bad "inject returned $code"
   [ "$(store_inbox "$WORK/cfg")" -ge 1 ] && ok "inbox row landed in the shared store" || bad "no inbox row"
 
@@ -230,7 +241,7 @@ main() {
     || bad "mesh select did not mirror the transcript"
 
   say "INJECT OVER A DOCK (D2 across the dock: the remote host stays sole writer)"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$HUB_PORT/dock/inject?peer=laptop-b&conv=$CONV" --data-urlencode "text=DOCK_INJECT check the lints")"
+  code="$(browser_post "$HUB_PORT" "/dock/inject?peer=laptop-b&conv=$CONV" -s -o /dev/null -w '%{http_code}' --data-urlencode "text=DOCK_INJECT check the lints")"
   [ "$code" = "200" ] && ok "hub /dock/inject accepted (re-mirrors the panel)" || bad "dock inject returned $code"
   [ "$(store_inbox "$WORK/cfg")" -ge 2 ] \
     && ok "the inject landed in the REMOTE peer's store inbox (the hub only enqueued)" \
@@ -302,7 +313,8 @@ main() {
     PEER_WORD="$(grep -oE 'dock key words: [a-z]+' "$WORK/web.log" | head -1 | awk '{print $4}')"
     tmux new-session -d -s "$CSESS" -x 200 -y 50 \
       "'$NEWT_BIN' --config '$WORK/ghub/config.toml' dock approve --operator-key-path '$WORK/ghub/identity.pem' --pubkey '$MESH_PUBKEY' --label meshpeer; echo CEREMONY_EXIT=\$? >> '$WORK/ghub/approve.out'"
-    if tui_wait "$CSESS" 'y/N' 20; then
+    # The confirm is the shared choice picker ("[y]es, approve it"), not a y/N line.
+    if tui_wait "$CSESS" 'approve dock with' 20; then
       tui_capture "$CSESS" | grep -q 'key words' \
         && ok "approve shows the peer pubkey's 6-word mnemonic" \
         || bad "approve did not display the key words"
@@ -331,7 +343,7 @@ main() {
     tmux kill-session -t "$CSESS" 2>/dev/null || true
     tmux new-session -d -s "$CSESS" -x 200 -y 50 \
       "'$NEWT_BIN' --config '$WORK/ghub/config.toml' dock revoke-all --operator-key-path '$WORK/ghub/identity.pem'; echo REVOKE_EXIT=\$? >> '$WORK/ghub/approve.out'"
-    tui_wait "$CSESS" 'y/N' 15 && tmux send-keys -t "$CSESS" 'y' C-m
+    tui_wait "$CSESS" 'revoke ALL live docks' 15 && tmux send-keys -t "$CSESS" 'y' C-m
     tui_wait "$CSESS" 'REVOKE_EXIT=' 15 || wait_ms 1.0
     "$NEWT_BIN" --config "$WORK/ghub/config.toml" dock list --operator-key-path "$WORK/ghub/identity.pem" 2>/dev/null | grep -q 'meshpeer' \
       && bad "revoke-all did not remove the approval" \
