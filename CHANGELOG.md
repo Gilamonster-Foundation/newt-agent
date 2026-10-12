@@ -9,6 +9,8 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-12
+
 ### Changed — plan approval defaults to yes
 
 - Plan approval offers yes, no, then discuss, with `[Y/n/discuss]` guidance.
