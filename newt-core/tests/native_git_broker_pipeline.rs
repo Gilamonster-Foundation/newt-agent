@@ -115,6 +115,11 @@ fn main() {
         return;
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if std::env::args().any(|arg| arg == "--file-read-root") {
+        native::file_read_root_regression();
+        return;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if std::env::args().any(|arg| arg == "--regression-2813") {
         regression_2813::run();
         return;
@@ -199,6 +204,32 @@ mod native {
             super::cancellation::run().await;
             println!("{MARKER}");
         });
+    }
+
+    /// Release regression: a system gitconfig read grant can name a regular
+    /// file or an absent path. Never mutate the machine's real /etc/gitconfig.
+    pub fn file_read_root_regression() {
+        assert!(
+            !skip_without_real_kernel_fence(),
+            "file-root proof requires a kernel fence"
+        );
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = config_dir.path().join("system-gitconfig");
+        newt_core::process_env::set_var("NEWT_SHELL_ENGINE", "safe-subset");
+        newt_core::process_env::set_var(
+            "NEWT_EVENT_JOURNAL",
+            config_dir.path().join("events.jsonl").to_str().unwrap(),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            governed_commit_with_read_root(false, false, Some(&config)).await;
+            std::fs::write(&config, "[fixture]\n  present = true\n").unwrap();
+            governed_commit_with_read_root(false, false, Some(&config)).await;
+        });
+        println!("NATIVE_GIT_FILE_READ_ROOT_CONFIRMED");
     }
 
     const FIXTURE_GIT: &str = "/usr/bin/git";
@@ -401,13 +432,24 @@ mod native {
         full_access: bool,
         signing_required: bool,
     ) {
+        governed_commit_with_read_root(full_access, signing_required, None).await;
+    }
+
+    async fn governed_commit_with_read_root(
+        full_access: bool,
+        signing_required: bool,
+        extra_read_root: Option<&Path>,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let (main, wt) = init_worktree(root.path());
-        let session = if full_access {
+        let mut session = if full_access {
             Caveats::top()
         } else {
             session_caveats(&wt)
         };
+        if let (Some(path), Scope::Only(roots)) = (extra_read_root, &mut session.fs_read) {
+            roots.insert(path.to_string_lossy().into_owned());
+        }
         let git_tool = TrailerGitTool(signing_required);
         let old_tip = real_git_output(&wt, &["rev-parse", "HEAD"]);
 

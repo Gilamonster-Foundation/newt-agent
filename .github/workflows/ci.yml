@@ -209,6 +209,13 @@ jobs:
         # of the inward layer's runtime closure (#1828); enabling it here is
         # what keeps the published JSON Schemas from going stale unnoticed.
         run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
+      - name: native commit with regular and absent file read grants
+        # HOOK PARITY: native Git/kernel-fence proof, CI-only in .githooks/pre-push.
+        # Injects a regular system-gitconfig fixture even when /etc/gitconfig is absent.
+        run: cargo test -p newt-core --test native_git_broker_pipeline -- --file-read-root
+      - name: held file grant keeps inode authority (Landlock)
+        # HOOK PARITY: explicit real-kernel vendor proof, CI-only in .githooks/pre-push.
+        run: cargo test --manifest-path vendor/agent-bridle-core/Cargo.toml --target-dir target/vendor-core --features linux-landlock --lib held_regular_file_root
       - name: private native commit dispatch proof (#2813)
         # HOOK PARITY: real Git/kernel-fence tier, CI-only in .githooks/pre-push.
         run: cargo test -p newt-core --test native_git_broker_pipeline -- --regression-2813

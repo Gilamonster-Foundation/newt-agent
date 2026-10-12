@@ -62,6 +62,9 @@ jobs:
           set -o pipefail
           nice -n 10 cargo test --locked -p newt-core --test native_git_broker_pipeline \
             -- --confined-contract 2>&1 | tee macos-native-contract.log
+      - name: Native commit with regular and absent file read grants
+        # HOOK PARITY: explicit Seatbelt regression is CI-only in .githooks/pre-push.
+        run: cargo test --locked -p newt-core --test native_git_broker_pipeline -- --file-read-root
       # Required production publication proof after integrating PR #2818.
       - name: Governed commit and task-ref publication
         id: publication

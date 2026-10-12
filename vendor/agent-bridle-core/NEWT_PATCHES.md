@@ -271,3 +271,12 @@ Newt #2835 extends the same descriptor mechanism through
 `SandboxedWorker::held_read_roots`. The worker delegates the handles to its
 existing `ConfinedCommand`; admission and wrapper-backend refusal remain there.
 No handles or new fields are serialized into the worker protocol.
+
+## Held file read roots (system gitconfig release regression)
+
+Landlock's descriptor-bound read rules now choose ReadFile for non-directory
+objects and ReadFile|ReadDir for directories, based on fstat of the held fd.
+The inode/provenance binding and admitted-root checks are unchanged; a file
+root never grants its parent directory. A real Landlock regression holds a
+regular file across replacement and verifies the original inode remains
+readable while the replacement and a sibling remain denied.
