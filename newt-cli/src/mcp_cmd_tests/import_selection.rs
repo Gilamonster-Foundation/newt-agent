@@ -250,9 +250,17 @@ fn import_flags_stdio_command_that_resolves_to_nothing() {
     // A UNC path names a remote host from an UNTRUSTED file: probing it would
     // open an SMB connection before import. Never probed, so never flagged.
     assert!(win("\\\\host\\s\\y").is_none());
-    // Windows bare commands need PATHEXT: skipped.
-    let e = stdio_entry("srv", Some("npx"));
-    assert!(missing_stdio_command(&e, &dirs, true, has).is_none());
+    // Windows bare commands resolve through the PATHEXT extensions. Regression:
+    // they were never flagged, so the release-tier import warning failed on Windows.
+    let has_npx = |p: &Path| p == Path::new("/bin").join("npx.cmd");
+    let bare =
+        |cmd: &str| missing_stdio_command(&stdio_entry("srv", Some(cmd)), &dirs, true, has_npx);
+    assert!(bare("npx").is_none(), "npx.cmd on PATH resolves npx");
+    assert!(
+        bare("npx.cmd").is_none(),
+        "an explicit extension resolves too"
+    );
+    assert!(bare("ghost").unwrap().contains("was not found"));
     let mut http = stdio_entry("h", None);
     http.transport = TransportKind::Http;
     assert!(missing_stdio_command(&http, &dirs, false, has).is_none());
