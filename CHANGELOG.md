@@ -28,6 +28,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   extensions). The release-tier MCP import acceptance test now expects the
   SSRF refusal for its loopback review URL that agent-bridle 0.8.0-rc.5
   introduced; that weekly tier had been failing unnoticed since 2026-09-27.
+- First run now honors an explicit `NEWT_DGX_OLLAMA_URL`: setup probes it
+  first, so the config it writes points at that endpoint instead of
+  localhost. Previously the written config silently overrode the variable.
+  This also turns the newt-web dock E2E green again, after it had been red
+  since 2026-08-23.
 
 ### Changed — plan approval defaults to yes
 
