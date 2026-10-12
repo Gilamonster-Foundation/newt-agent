@@ -42,6 +42,8 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - MCP import real-resource tier, .github/workflows/mcp-import-real.yml
+#     (weekly + release): --ignored subprocess/filesystem acceptance on all OSes.
 #   - linked-worktree build metadata reads and hostile-env fixture (#2835),
 #     .github/workflows/macos-confined-contract.yml: linked_worktree_build_git
 #     runs natively under Seatbelt; Linux covers the same binary in scope.

@@ -5,6 +5,10 @@ name: MCP import real-resource tier
 # sanitizer, selector, and injected transaction tests; this lane grounds those
 # mocks on a weekly schedule and when called by the release workflow,
 # single-threaded.
+#
+# HOOK PARITY: CI-only. These are --ignored real-resource tests; the changed-
+# scope pre-push hook (.githooks/pre-push) does not run them. When editing this
+# file, keep that hook's CI-only list in step.
 
 "on":
   schedule:
@@ -64,7 +68,7 @@ jobs:
         shell: bash
         run: >-
           bash .github/scripts/cargo-test-nonempty.sh
-          -p newt-core atomic_fs::tests::
+          -p newt-core --lib atomic_fs::tests::
           -- --ignored --test-threads=1
 
       - name: Run confined child timezone inheritance acceptance
