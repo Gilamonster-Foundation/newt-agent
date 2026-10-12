@@ -1834,8 +1834,15 @@ fn missing_stdio_command(
     let found = if command.contains(['/', '\\']) {
         unc || !is_absolute_for(command, windows) || exists(Path::new(command))
     } else if windows {
-        // ponytail: no PATHEXT (.exe/.cmd) lookup, so skip; try each extension to upgrade.
-        true
+        // ponytail: fixed common PATHEXT list, not the live %PATHEXT%; read it if a
+        // user's custom extension is ever wrongly flagged.
+        let names: Vec<String> = ["", ".exe", ".cmd", ".bat", ".com"]
+            .iter()
+            .map(|ext| format!("{command}{ext}"))
+            .collect();
+        names
+            .iter()
+            .any(|n| first_existing(&binary_candidates_in(path_dirs, None, n), &exists).is_some())
     } else {
         first_existing(&binary_candidates_in(path_dirs, None, command), exists).is_some()
     };

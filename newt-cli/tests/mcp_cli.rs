@@ -566,9 +566,13 @@ mod composed_private_mcp_uat {
             .map(|request| String::from_utf8_lossy(&request.body))
             .collect::<Vec<_>>()
             .join("\n");
+        // The review URL is the loopback mock and `--grant-net` does not opt it
+        // into private-address space, so the real SSRF guard (agent-bridle
+        // 0.8.0-rc.5) refuses it before any HTTP exchange. Regression: this
+        // asserted the pre-rc.5 HTTP 401, failing the release tier on every OS.
         assert!(
-            model_wire.contains("error: web_fetch returned HTTP 401"),
-            "the raw-fetch authentication failure must remain intact: {model_wire}"
+            model_wire.contains("error: denied: SSRF block"),
+            "the raw-fetch refusal must remain intact: {model_wire}"
         );
         assert!(
             model_wire.contains("Authenticated-source recovery"),
