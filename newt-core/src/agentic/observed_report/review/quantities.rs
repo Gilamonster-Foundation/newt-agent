@@ -1,3 +1,5 @@
+#[path = "approximation.rs"]
+mod approximation;
 use super::{future, number, regex, ClaimAssessment, Facts};
 use std::sync::LazyLock;
 
@@ -48,7 +50,7 @@ pub(super) fn classify(clause: &str, facts: &Facts<'_>) -> Option<ClaimAssessmen
         return None;
     }
     if approximate(&text) {
-        return Some(ClaimAssessment::Unverified("approximate quantity"));
+        return Some(approximation::classify(&text, facts));
     }
     if text.contains("insertion") || text.contains("deletion") || text.contains("files changed") {
         return Some(ClaimAssessment::Unverified(

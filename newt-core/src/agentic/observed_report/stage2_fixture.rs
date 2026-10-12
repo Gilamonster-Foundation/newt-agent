@@ -40,7 +40,7 @@ fn report_stage2_grader_fixture_is_a_real_composed_report() {
         .filter(|r| r.metadata["schema"] == "newt.report-review/v1")
         .map(|r| serde_json::json!({"body":r.body,"metadata":r.metadata}))
         .collect();
-    let fixture = serde_json::json!({"report":report, "original_model_draft":original, "review_records":audits});
+    let fixture = serde_json::json!({"approximation_divisor": *review::APPROXIMATION_DIVISOR, "report":report, "original_model_draft":original, "review_records":audits});
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../scripts/eval/tests/fixtures/refactor/composed-report.json"

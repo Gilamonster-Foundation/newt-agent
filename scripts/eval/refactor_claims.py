@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from refactor_test_log import test_totals
 import refactor_diffstat
+
+# Shared with report stage 2; inclusive 1/divisor of the observed magnitude.
+APPROXIMATION_DIVISOR = int(
+    (
+        Path(__file__).resolve().parents[2]
+        / "newt-core/src/agentic/observed_report/review/approximation-divisor.txt"
+    )
+    .read_text()
+    .strip()
+)
 
 ANSI = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
 NUMBER = r"(?<![\w.])\d[\d,]*(?![\w.,])"
@@ -131,7 +142,9 @@ def check_claims(
         if expected in values:
             return True
         # Operator policy: within 10% is unverified, never rounded into proof.
-        if approximate and any(abs(expected - n) * 10 <= abs(n) for n in values):
+        if approximate and any(
+            abs(expected - n) * APPROXIMATION_DIVISOR <= abs(n) for n in values
+        ):
             return None
         return False
 
