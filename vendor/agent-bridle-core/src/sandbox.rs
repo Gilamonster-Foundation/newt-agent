@@ -53,7 +53,7 @@ pub struct HeldReadRoot {
 }
 
 impl HeldReadRoot {
-    /// Bind `fd` — a directory descriptor the caller keeps, or a dup of one
+    /// Bind `fd` — a file or directory descriptor the caller keeps, or a dup of one
     /// (same object) — to `provenance`, the root the grant spells it as. This
     /// is the ONLY constructor: fields are private and there is no public
     /// struct literal, and this one REFUSES unless `fd`'s `(dev, ino)` equals
@@ -97,7 +97,7 @@ impl HeldReadRoot {
         &self.provenance
     }
 
-    /// The held directory descriptor the rule anchors on.
+    /// The held file or directory descriptor the rule anchors on.
     #[cfg(unix)]
     #[must_use]
     pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
@@ -1766,9 +1766,19 @@ pub(crate) mod landlock_impl {
                 let ruleset = ruleset
                     .add_rules(path_beneath_rules(&read_roots, read))
                     .map_err(landlock_denied)?;
-                held.iter()
-                    .try_fold(ruleset, |rs, h| rs.add_rule(PathBeneath::new(h.fd(), read)))
-                    .map_err(landlock_denied)?
+                held.iter().try_fold(ruleset, |rs, h| {
+                    // Landlock rejects ReadDir on a regular file. Determine
+                    // type from the held object, never reopen its pathname.
+                    let file =
+                        std::fs::File::from(h.fd().try_clone_to_owned().map_err(landlock_denied)?);
+                    let access = if file.metadata().map_err(landlock_denied)?.is_dir() {
+                        read
+                    } else {
+                        AccessFs::ReadFile.into()
+                    };
+                    rs.add_rule(PathBeneath::new(h.fd(), access))
+                        .map_err(landlock_denied)
+                })?
             } else {
                 ruleset
             };
@@ -4963,6 +4973,47 @@ mod landlock_kernel_tests {
 
         let _ = fs::remove_dir_all(&allowed);
         let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    /// File grants need ReadFile, not ReadDir, and must not admit siblings
+    /// or a replacement inode at the original pathname.
+    #[test]
+    fn held_regular_file_root_stays_object_bound_and_does_not_grant_parent() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let root = unique_dir("held-file-root");
+        let path = root.join("gitconfig");
+        let aside = root.join("original");
+        let sibling = root.join("private");
+        fs::write(&path, b"held").unwrap();
+        fs::write(&sibling, b"private").unwrap();
+        let held = crate::HeldReadRoot::bind(
+            path.to_string_lossy().into_owned(),
+            fs::File::open(&path).unwrap().into(),
+        )
+        .unwrap();
+        let caveats = Caveats {
+            fs_read: Scope::only([path.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        fs::rename(&path, &aside).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        std::thread::spawn(move || {
+            LandlockSandbox::new()
+                .apply_with_held_roots(&caveats, &[held])
+                .unwrap();
+            assert_eq!(fs::read(&aside).unwrap(), b"held");
+            for denied in [&path, &sibling] {
+                assert_eq!(
+                    fs::read(denied).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+        })
+        .join()
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// A read root bound to a HELD descriptor anchors on the object, not the

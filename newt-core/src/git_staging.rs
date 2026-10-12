@@ -375,7 +375,11 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// The session's read roots, bound ONCE per broker call as held directory
+#[cfg(unix)]
+#[path = "git_staging/held_root.rs"]
+mod held_root;
+
+/// The session's read roots, bound ONCE per broker call as held file or directory
 /// handles (INV-BENEATH, `agent-bridle-fdguard/src/beneath.rs`): the handle
 /// is the authority, the canonical path is its provenance. Every planning
 /// read opens beneath a held handle, and the confined copy's roots are
@@ -388,7 +392,7 @@ pub struct HeldRoots {
     /// Provenance of `handles[i]` — the path it was acquired from.
     canonical: Vec<PathBuf>,
     #[cfg(unix)]
-    handles: Vec<agent_bridle_fdguard::GrantedRoot>,
+    handles: Vec<held_root::HeldRoot>,
 }
 
 impl HeldRoots {
@@ -403,7 +407,7 @@ impl HeldRoots {
         let handles = canonical
             .iter()
             .map(|root| {
-                agent_bridle_fdguard::GrantedRoot::acquire(root).map_err(|e| {
+                held_root::HeldRoot::acquire(root).map_err(|e| {
                     Refusal::from(format!(
                         "refused: cannot bind read root '{}' ({e})",
                         root.display()
@@ -456,22 +460,27 @@ impl HeldRoots {
                 anchor.display()
             )
         })?;
-        let Some((idx, root)) = self
-            .canonical
-            .iter()
-            .enumerate()
-            .find(|(_, cr)| canon.starts_with(cr))
-        else {
+        let Some((idx, root)) = self.canonical.iter().enumerate().find(|(index, cr)| {
+            if self.handles[*index].directory().is_some() {
+                canon.starts_with(cr)
+            } else {
+                canon.join(rel) == **cr
+            }
+        }) else {
             return Err(format!(
                 "refused: '{}' is outside this session's filesystem read authority",
                 anchor.display()
             )
             .into());
         };
-        let beneath = canon
-            .strip_prefix(root)
-            .map_err(|e| format!("refused: '{}': {e}", anchor.display()))?
-            .join(rel);
+        let beneath = if self.handles[idx].directory().is_none() {
+            PathBuf::new()
+        } else {
+            canon
+                .strip_prefix(root)
+                .map_err(|e| format!("refused: '{}': {e}", anchor.display()))?
+                .join(rel)
+        };
         match self.handles[idx].open_read(&beneath) {
             Ok(file) => Ok(Some(file)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -492,14 +501,12 @@ impl HeldRoots {
         anchor: &Path,
         rel: &Path,
     ) -> Result<Option<String>, Refusal> {
-        use std::io::Read;
-        let Some(mut file) = self.open_read(anchor, rel)? else {
+        let Some(file) = self.open_read(anchor, rel)? else {
             return Ok(None);
         };
-        let mut content = String::new();
-        file.read_to_string(&mut content)
-            .map_err(|e| format!("refused: '{}/{}': {e}", anchor.display(), rel.display()))?;
-        Ok(Some(content))
+        held_root::read_from_start(&file)
+            .map(Some)
+            .map_err(|e| format!("refused: '{}/{}': {e}", anchor.display(), rel.display()).into())
     }
 
     // The broker refuses at preflight_availability() on non-unix platforms,
@@ -530,7 +537,10 @@ impl HeldRoots {
             let Ok(relative) = path.strip_prefix(root) else {
                 return false;
             };
-            crate::fs_cap::WorkspaceDir::from_granted_root(&self.handles[index])
+            let Some(directory) = self.handles[index].directory() else {
+                return relative.as_os_str().is_empty();
+            };
+            crate::fs_cap::WorkspaceDir::from_granted_root(directory)
                 .and_then(|directory| directory.open_regular(relative, true))
                 .is_ok()
         })
@@ -568,8 +578,13 @@ impl HeldRoots {
                 let held = handle.identity();
                 if (now.dev(), now.ino()) != (held.device, held.inode) {
                     return Err(format!(
-                        "refused: read root '{}' no longer names the directory bound at plan time",
-                        root.display()
+                        "refused: read root '{}' no longer names the {} bound at plan time",
+                        root.display(),
+                        if handle.directory().is_some() {
+                            "directory"
+                        } else {
+                            "file"
+                        }
                     )
                     .into());
                 }
@@ -579,7 +594,7 @@ impl HeldRoots {
     }
 
     /// The held handles, duplicated, for a fence that anchors on descriptors
-    /// (Linux Landlock): the SAME directory objects [`Self::verify_identities`]
+    /// (Linux Landlock): the SAME file or directory objects [`Self::verify_identities`]
     /// compared, so nothing after that check can re-point the fence by path.
     /// `HeldReadRoot::bind` re-checks the pairing itself (`fstat` vs `stat`),
     /// so a root swapped between `verify_identities` and here is still caught
@@ -882,12 +897,19 @@ pub fn discover_git_dirs(cwd: &Path, held: &HeldRoots) -> Result<(PathBuf, PathB
         let git_dir = if is_dir {
             dot_git
         } else {
-            use std::io::Read;
-            let mut text = String::new();
-            let mut entry = entry;
-            entry
-                .read_to_string(&mut text)
+            #[cfg(unix)]
+            let text = held_root::read_from_start(&entry)
                 .map_err(|e| format!("refused: '{}': {e}", dot_git.display()))?;
+            #[cfg(not(unix))]
+            let text = {
+                use std::io::Read;
+                let mut text = String::new();
+                let mut entry = entry;
+                entry
+                    .read_to_string(&mut text)
+                    .map_err(|e| format!("refused: '{}': {e}", dot_git.display()))?;
+                text
+            };
             let target = text
                 .strip_prefix("gitdir:")
                 .map(str::trim)
@@ -2758,19 +2780,59 @@ file:/h/.gitconfig\0credential.interactive\0";
         assert!(err.contains("failed its identity check"), "{err}");
     }
 
-    /// A read root that exists but cannot be acquired as a handle refuses the
-    /// whole binding — it is never recorded by its pathname.
-    #[cfg(unix)]
+    /// Release regression: file read grants bind without widening to siblings;
+    /// absent grants remain inert and replacement is refused before admission.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn held_roots_bind_refuses_a_root_it_cannot_hold() {
+    fn held_roots_bind_regular_files_without_granting_the_parent() {
         let dir = tempdir();
-        let file_root = owned_file(dir.path(), "not-a-dir", 0o600);
-        let err = HeldRoots::bind(&scope(&[file_root.to_str().unwrap()]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cannot bind read root"), "{err}");
-        // An absent root grants nothing and is skipped, not refused.
-        assert!(HeldRoots::bind(&scope(&["/nonexistent/newt-2641-root"])).is_ok());
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("gitconfig");
+        let absent = HeldRoots::bind(&scope(&[path.to_str().unwrap()])).unwrap();
+        assert!(absent.canonical().is_empty());
+        std::fs::write(&path, "[fixture]\n").unwrap();
+        let held = HeldRoots::bind(&scope(&[path.to_str().unwrap()])).unwrap();
+        assert_eq!(held.canonical(), std::slice::from_ref(&path));
+        for _ in 0..2 {
+            assert_eq!(
+                held.read_to_string(&root, Path::new("gitconfig"))
+                    .unwrap()
+                    .as_deref(),
+                Some("[fixture]\n")
+            );
+        }
+        assert!(held.is_regular_file(&path));
+        assert!(!held.is_regular_file(&root));
+        std::fs::write(root.join("sibling"), "private").unwrap();
+        assert!(held.read_to_string(&root, Path::new("sibling")).is_err());
+        assert!(held.read_to_string(&path, Path::new("child")).is_err());
+        held.verify_identities().unwrap();
+        std::fs::rename(&path, root.join("old")).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        assert!(held.verify_identities().is_err());
+        #[cfg(target_os = "linux")]
+        assert!(held.held_read_roots().is_err());
+    }
+
+    /// File-root .git pointers must be readable repeatedly through cloned fds.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn held_git_pointer_file_can_be_discovered_repeatedly() {
+        let dir = tempdir();
+        let root = dir.path().canonicalize().unwrap();
+        let admin = root.join("admin");
+        let worktree = root.join("worktree");
+        std::fs::create_dir(&admin).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        let pointer = worktree.join(".git");
+        std::fs::write(&pointer, format!("gitdir: {}\n", admin.display())).unwrap();
+        let held = held(&[pointer.to_str().unwrap(), admin.to_str().unwrap()]);
+        for _ in 0..2 {
+            assert_eq!(
+                discover_git_dirs(&worktree, &held).unwrap(),
+                (admin.clone(), admin.clone())
+            );
+        }
     }
 
     /// The write-root exclusion is bound at the start of the call, not
