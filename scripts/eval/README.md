@@ -270,7 +270,11 @@ Approximate absolute sizes (`FILE is ~N lines`, `FILE (~N lines)`, or
 `FILE — ~N lines`) and the approximate delta `Net FILE shrinks ~N lines` use
 this tolerance: an exact match verifies; a non-exact difference of **at most
 10% of the measured magnitude** remains unverifiable; a difference over 10%
-is contradicted. For a measured zero, only zero matches. Absolute sizes consider
+is contradicted. The divisor is defined once in
+`newt-core/src/agentic/observed_report/review/approximation-divisor.txt`,
+read by this grader and embedded by report stage 2. Stage 2 preserves close
+approximate absolute sizes and replaces contradictions with scoped observed
+counts; unavailable or ambiguous evidence still abstains. For a measured zero, only zero matches. Absolute sizes consider
 either measured revision; a shrink is compared to the signed after-minus-before
 delta. Missing or ambiguous measurements remain unverifiable. Exact signed net
 claims retain exact equality: `net −106` versus −94 is contradicted.
