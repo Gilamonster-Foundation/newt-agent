@@ -35,6 +35,10 @@
 # empty cfg(windows) binary. Includes dedicated-runner selection from a non-CLI
 # host, missing-runner cmd fallback, POSIX syntax, cmd opt-out and tree kill.
 #
+# Release parity: publish-matrix tests and validation run here on manifest or
+# release-gate changes. Release binaries, wheels, npm artifacts and registry
+# publication (.github/workflows/release.yml) remain CI-only.
+#
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
@@ -180,8 +184,8 @@
 #   nextest's summary (visible, not hidden); one that fails every attempt still
 #   fails the hook. CI stays the authoritative full gate.
 #
-# PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml -- see that
-# file's HOOK PARITY comment for the job-by-job mapping. Editing either one
+# PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml and
+# .github/workflows/release.yml; see their HOOK PARITY comments. Editing either one
 # triggers an audit of the other (CRAFT-14 rule 3, Push Hook Governance
 # rule 3).
 #
@@ -352,6 +356,17 @@ if [ -z "$SCOPE" ]; then
     exit 0
 fi
 
+# Fixture/non-release workspaces have no release workflow. In this repository,
+# manifest and gate changes must pass the same publish check as release CI.
+if [ -f .github/workflows/release.yml ] && printf '%s\n' "$_changed" | grep -Eq '(^|/)Cargo\.toml$|^\.github/workflows/(release|ci)\.yml$|^scripts/(check|test)_publish_order\.py$|^\.githooks/pre-push$'; then
+    echo "[pre-push] checking release matrix coverage and dependency order..."
+    python3 scripts/test_publish_order.py
+    (
+        set -o pipefail
+        cargo metadata --no-deps --format-version 1 | python3 scripts/check_publish_order.py -
+    )
+fi
+
 echo "[pre-push] running python3 scripts/spawn_inventory.py..."
 python3 scripts/spawn_inventory.py
 
@@ -371,7 +386,7 @@ cargo fmt --all -- --check
 # treats the mere PRESENCE of "--ignored" in argv as "run the real confined
 # git test" (tests/native_git_commit.rs:11) instead of gating on an exact
 # match, so nextest's discovery pass runs it for real outside a sandboxed CI
-# runner; agent-harness::writer_inheritance ignores argv entirely and always
+# runner; newt-harness::writer_inheritance ignores argv entirely and always
 # runs its fork-based test (tests/writer_inheritance.rs:149), which then hits
 # a broken pipe when nextest closes the child's stdout after the list request
 # it never asked for. newt-core::brush_build_pipeline and (#2693)
@@ -417,7 +432,7 @@ cargo fmt --all -- --check
 # change both together.
 NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-core::native_git_broker_pipeline)
-    and not binary_id(agent-harness::writer_inheritance)
+    and not binary_id(newt-harness::writer_inheritance)
     and not binary_id(newt-git::native_git_commit)
     and not binary_id(newt-agent::lean_surface_purity)
     and not binary_id(newt-agent::stdout_purity)

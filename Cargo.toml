@@ -132,9 +132,9 @@ authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 
 [workspace.dependencies]
 agent-frame = { path = "agent-frame", version = "=0.8.0" }
-agent-harness = { path = "agent-harness", version = "=0.8.0" }
+agent-harness = { package = "newt-harness", path = "agent-harness", version = "=0.8.0" }
 agent-harness-py = { path = "agent-harness-py", version = "=0.8.0" }
-agent-toolchain = { path = "agent-toolchain", version = "0.1.0" }
+agent-toolchain = { path = "agent-toolchain", version = "=0.1.0" }
 # Core utilities
 anyhow = "1.0"
 # Git and other Windows children need ordinary path spellings where equivalent.

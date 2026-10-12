@@ -56,11 +56,11 @@ fn closure(pkg: &str) -> BTreeSet<String> {
 
 #[test]
 fn the_harness_has_no_service_or_terminal_edge() {
-    let shipped = closure("agent-harness");
+    let shipped = closure("newt-harness");
     let found: Vec<&&str> = FORBIDDEN.iter().filter(|f| shipped.contains(**f)).collect();
     assert!(
         found.is_empty(),
-        "agent-harness resolves {found:?}. Network, inference, async, and terminal \
+        "newt-harness resolves {found:?}. Network, inference, async, and terminal \
          dependencies belong in a consumer, not the reusable harness."
     );
 }
@@ -84,10 +84,10 @@ fn the_harness_stays_small() {
     // Lower this when the number shrinks. Never raise it to make a red test
     // pass -- a closure that grew is a finding, not a number to edit.
     const CEILING: usize = 54;
-    let n = closure("agent-harness").len();
+    let n = closure("newt-harness").len();
     assert!(
         n <= CEILING,
-        "agent-harness resolves {n} crates, over its {CEILING} ceiling. The reusable \
+        "newt-harness resolves {n} crates, over its {CEILING} ceiling. The reusable \
          harness must not acquire a consumer's dependency closure. Lower the ceiling \
          when it shrinks; never raise it to make this pass."
     );

@@ -1,7 +1,7 @@
 # agent-frame
 
 A pure Rust derivation and causal-event kernel. It has no filesystem, async,
-HTTP, or inference dependency. The `agent-harness` crate adds durable storage,
+HTTP, or inference dependency. The `newt-harness` crate adds durable storage,
 ordered request projection, navigation policy, and restoration; `agent-harness-py`
 exposes the same admission boundaries to Python through PyO3.
 

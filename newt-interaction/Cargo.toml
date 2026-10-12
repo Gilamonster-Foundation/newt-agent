@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 description = "Renderer-neutral interaction protocol model for Newt Markup (epic #1803, slice A2)"
-publish = false
 
 # DEPENDENCY DIRECTION IS BINDING (epic #1803, A2's dependency guard).
 # This crate is the INWARD layer: no Ratatui, crossterm, Axum, HTMX, ammonia,

@@ -10,6 +10,6 @@ tree = subprocess.check_output(
     text=True,
 )
 names = {line.split()[0] for line in tree.splitlines() if line.strip()}
-assert {"smart-harness-consumer", "agent-harness-py", "agent-frame", "agent-harness", "pyo3"} <= names
+assert {"smart-harness-consumer", "agent-harness-py", "agent-frame", "newt-harness", "pyo3"} <= names
 forbidden = {"newt-core", "newt-tui", "newt-agent", "newt-agent-py", "reqwest", "tokio"}
 assert not names & forbidden, f"foreign consumer acquired {sorted(names & forbidden)}"

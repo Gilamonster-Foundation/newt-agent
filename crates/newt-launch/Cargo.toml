@@ -15,6 +15,7 @@ authors.workspace = true
 description = "The validated launch configuration a newt run started with: continuity mode, defaults, and a validation that fails startup rather than a check every call site must remember."
 keywords = ["newt", "agent", "configuration", "hermetic", "resume"]
 categories = ["command-line-utilities", "config"]
+readme = "README.md"
 
 # NO dependencies, deliberately.
 #

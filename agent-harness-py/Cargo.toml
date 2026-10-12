@@ -7,10 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Composable Python bindings for the agent-frame kernel and smart harness"
 readme = "README.md"
-publish = false
 
 [dependencies]
-agent-frame = { path = "../agent-frame" }
+agent-frame.workspace = true
 agent-harness = { workspace = true }
 content-addressable = { workspace = true }
 pyo3 = { workspace = true }
