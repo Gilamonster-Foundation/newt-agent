@@ -367,7 +367,15 @@ def check_claims(
             if facts.get("github") and any(repo != facts["github"] for repo in urls):
                 ok = False
             add("pr", f"PR #{number} belongs to this branch/head", pr, ok)
-        if re.search(r"\bmerged\b", line, re.I):
+        # Require a completed assertion, not readiness or a hypothetical merge.
+        if re.match(
+            r"\s*(?:[-*•]\s+)?(?:"
+            r"(?:(?:I|we)\s+(?:have\s+)?)?merged\s+(?:PR\s*#?\d+\b|into\s+\S+)"
+            r"|(?:(?:PR\s*#?\d+|the\s+(?:PR|pull request|refactor)|it)\s+)?"
+            r"(?:has\s+been|have\s+been|was|is)\s+merged(?![\w-]))",
+            line,
+            re.I,
+        ):
             prs = facts.get("prs")
             add(
                 "merged",
