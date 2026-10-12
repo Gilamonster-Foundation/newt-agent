@@ -209,6 +209,16 @@ mod native {
     /// Release regression: a system gitconfig read grant can name a regular
     /// file or an absent path. Never mutate the machine's real /etc/gitconfig.
     pub fn file_read_root_regression() {
+        // PR #2865: host PATH may select Homebrew Git while confined macOS
+        // lookup prepends Xcode's Git. Match the confined-contract fixture:
+        // admit and dispatch the same system Git, retaining the broker's
+        // image-identity check. Set this before any runtime/worker starts.
+        for key in ["NEWT_VENV", "VIRTUAL_ENV"] {
+            newt_core::process_env::remove_var(key);
+        }
+        for key in ["PATH", "NEWT_EXEC_PATHS"] {
+            newt_core::process_env::set_var(key, "/usr/bin:/bin");
+        }
         assert!(
             !skip_without_real_kernel_fence(),
             "file-root proof requires a kernel fence"
@@ -226,8 +236,10 @@ mod native {
             .unwrap();
         rt.block_on(async {
             governed_commit_with_read_root(false, false, Some(&config)).await;
+            println!("PASS absent_file_read_root_commit_with_attribution");
             std::fs::write(&config, "[fixture]\n  present = true\n").unwrap();
             governed_commit_with_read_root(false, false, Some(&config)).await;
+            println!("PASS regular_file_read_root_commit_with_attribution");
         });
         println!("NATIVE_GIT_FILE_READ_ROOT_CONFIRMED");
     }
