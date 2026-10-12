@@ -210,15 +210,15 @@ mod native {
     /// file or an absent path. Never mutate the machine's real /etc/gitconfig.
     pub fn file_read_root_regression() {
         // PR #2865: host PATH may select Homebrew Git while confined macOS
-        // lookup prepends Xcode's Git. Match the confined-contract fixture:
-        // admit and dispatch the same system Git, retaining the broker's
-        // image-identity check. Set this before any runtime/worker starts.
-        for key in ["NEWT_VENV", "VIRTUAL_ENV"] {
+        // lookup prepends Xcode's Git. Admit the system Git, then let the
+        // production macOS lookup select its authenticated native image.
+        // Do not prepend /usr/bin with NEWT_EXEC_PATHS: the xcrun shim needs
+        // ambient caches that the confined commit cannot write. Set this
+        // before any runtime/worker starts; keep the image check intact.
+        for key in ["NEWT_VENV", "VIRTUAL_ENV", "NEWT_EXEC_PATHS"] {
             newt_core::process_env::remove_var(key);
         }
-        for key in ["PATH", "NEWT_EXEC_PATHS"] {
-            newt_core::process_env::set_var(key, "/usr/bin:/bin");
-        }
+        newt_core::process_env::set_var("PATH", "/usr/bin:/bin");
         assert!(
             !skip_without_real_kernel_fence(),
             "file-root proof requires a kernel fence"
