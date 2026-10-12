@@ -23,6 +23,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   `agent-harness` belongs to an unrelated project); Rust code still imports it
   as `agent_harness`. The test-only helpers `tests-common` and `tests-pty` stay
   unpublished (#2866).
+- On Windows, `newt mcp import` again warns when a stdio server's bare command
+  is not on `PATH` (it now tries the usual `.exe`/`.cmd`/`.bat`/`.com`
+  extensions). The release-tier MCP import acceptance test now expects the
+  SSRF refusal for its loopback review URL that agent-bridle 0.8.0-rc.5
+  introduced; that weekly tier had been failing unnoticed since 2026-09-27.
 
 ### Changed — plan approval defaults to yes
 
