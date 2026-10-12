@@ -18,7 +18,6 @@ class AbsoluteSizes(unittest.TestCase):
             "mod.rs is 980 lines smaller",
             "mod.rs has about 980 lines fewer",
             "mod.rs trimmed roughly 980 lines",
-            "mod.rs is ~980 lines",
             "mod.rs down 980 lines",
             "mod.rs cut ~980 lines",
             "mod.rs mysteriously 980 lines",
@@ -52,8 +51,8 @@ class AbsoluteSizes(unittest.TestCase):
                 self.assertTrue(rows)
                 self.assertTrue(all(row["status"] == "verified" for row in rows), rows)
 
-    def test_unknown_reduction_keeps_production_grade_ungraded(self):
-        """A verified push cannot hide an unrecognized numeric claim."""
+    def test_unknown_reduction_remains_visible_without_blocking(self):
+        """An unrecognized numeric claim remains unverified but no longer blocks."""
         case = fixtures.Grade()
         case.setUp()
         self.addCleanup(case.doCleanups)
@@ -64,5 +63,11 @@ class AbsoluteSizes(unittest.TestCase):
         )
         with patch.object(fixtures.grader, "extraction", return_value=["extracted.rs"]):
             report = case.grade()
-        self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED")
-        self.assertFalse(report["pass"])
+        self.assertEqual(report["criteria"]["claims"]["status"], "PASS")
+        self.assertTrue(report["pass"])
+        self.assertTrue(
+            any(
+                row["status"] == "unverifiable"
+                for row in report["criteria"]["claims"]["evidence"]
+            )
+        )

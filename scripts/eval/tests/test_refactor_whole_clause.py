@@ -47,7 +47,7 @@ class WholeClause(unittest.TestCase):
         rows = fixtures.claims.check_claims("mod.rs is 979 lines", self.facts)
         self.assertEqual(rows[0]["status"], "contradicted")
 
-    def test_reviewer_prefixes_leave_production_grade_ungraded(self):
+    def test_reviewer_prefixes_remain_unverified_without_blocking(self):
         """A verified publication cannot hide an ambiguous numeric sentence."""
         for prefix in ("The reduction in", "The difference between old and new"):
             with self.subTest(prefix=prefix):
@@ -63,7 +63,13 @@ class WholeClause(unittest.TestCase):
                         fixtures.grader, "extraction", return_value=["extracted.rs"]
                     ):
                         report = case.grade()
-                    self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED")
-                    self.assertFalse(report["pass"])
+                    self.assertEqual(report["criteria"]["claims"]["status"], "PASS")
+                    self.assertTrue(report["pass"])
+                    self.assertTrue(
+                        any(
+                            row["status"] == "unverifiable"
+                            for row in report["criteria"]["claims"]["evidence"]
+                        )
+                    )
                 finally:
                     case.doCleanups()

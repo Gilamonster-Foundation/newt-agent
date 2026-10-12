@@ -76,7 +76,7 @@ The endpoint template (host stays local) is `loop-template.example`.
 
 `grade_refactor.py` grades the seed-to-branch diff and the run's final claims.
 It prints a content-addressed JSON envelope on stdout and PASS/FAIL per criterion
-on stderr. Exit codes: 0 all criteria pass, 1 failed/unverifiable criterion,
+on stderr. Exit codes: 0 all criteria pass, 1 failed or ungraded criterion,
 2 invalid invocation, report, or grader infrastructure. No model is called; GitHub commands only read.
 
 ```bash
@@ -180,7 +180,7 @@ text, and retains `original_model_draft` as an audit field. A retained
 `[unverified by newt: …]` edits, it restores the original audited span in context
 and runs the independent Git/GitHub/build checks; the annotation itself supplies
 no PASS evidence. Correct, wrong, and uncheckable originals can therefore yield
-PASS, FAIL, and UNGRADED respectively. The whole raw draft is never a fallback.
+PASS, FAIL, and PASS with unverified evidence respectively. The whole raw draft is never a fallback.
 Missing or altered audits remain UNGRADED. New audit references use the plain
 `newt review: <cid> in prompt artifacts` footer; old correction-shaped footers
 remain readable without being counted as corrections.
@@ -212,7 +212,8 @@ a Markdown bullet are optional. Other options, shell syntax, or unsupported
 command/result phrasing stay unverifiable and cannot borrow `--test-log`.
 Each distinct admitted command runs once with the check's environment and
 portable low-priority prefix. Its stdout/stderr are captured together, with
-its exit status appended by the grader. Missing/timeout evidence is ungraded.
+its exit status appended by the grader. Missing/timeout evidence is unverified
+and does not block the claims criterion.
 
 Totals sum every libtest binary, including doctests: `total` means
 passed + failed; ignored tests are reported separately. Any failed binary or
@@ -243,7 +244,10 @@ Unqualified absolute sizes (`N-line FILE`, `FILE (N lines)`, `FILE is N lines`,
 resolved path. A match to neither count is contradicted; ambiguous or missing
 measurements remain unverifiable. Parenthesized descriptors in prose, such as
 ``Extracted the cluster (11,726-line `module.rs`) into a submodule``, are accepted.
-Backticks around paths and a final period are accepted. Explicit `now`/`after`
+Backticks around paths, Markdown emphasis around paths/counts, and a final period
+are accepted. Attached `FILE — N lines` sizes also work in descriptive prose.
+Digits inside code spans or identifier tokens (`RecoverCw400`, `E0432`, `u8`)
+are not prose quantities; quoted Rust paths still identify their files. Explicit `now`/`after`
 sizes still refer only to the after revision. Attached `FILE (N lines)` sizes
 also work in sentences, such as `The largest file was FILE (N lines)` and
 `New FILE (N lines) with 10 pure fs-free tests`. The latter test inventory stays
@@ -262,20 +266,34 @@ supported as a standalone pair. Bare filenames resolve only among changed
 files; full paths can identify unchanged files too. Ambiguous basenames or
 missing measurements remain unverifiable.
 
-The checker retains whole-clause context: reduction/comparison language and
-approximations remain unverifiable even if a number matches a measured size.
+Approximate absolute sizes (`FILE is ~N lines`, `FILE (~N lines)`, or
+`FILE — ~N lines`) and the approximate delta `Net FILE shrinks ~N lines` use
+this tolerance: an exact match verifies; a non-exact difference of **at most
+10% of the measured magnitude** remains unverifiable; a difference over 10%
+is contradicted. For a measured zero, only zero matches. Absolute sizes consider
+either measured revision; a shrink is compared to the signed after-minus-before
+delta. Missing or ambiguous measurements remain unverifiable. Exact signed net
+claims retain exact equality: `net −106` versus −94 is contradicted.
+
+The checker retains whole-clause context: unsupported reduction/comparison
+language remains unverifiable even if a number matches a measured size.
 It does not split line claims on commas, `and`, or `but`. Only explicitly
 parsed signed `net` deltas are checked; unparsed comparison vocabulary in
 the surrounding clause still makes that clause unverifiable.
 Extra prose outside the supported absolute/parenthesized forms remains
-unverifiable. Unknown clauses remain evidence rows, so verified publication
-claims cannot turn them into a claims PASS. After recognized spans are removed,
+unverifiable. Unknown numeric clauses remain unverified evidence rows even when the claims
+criterion passes. After recognized spans are removed,
 remaining size-shaped numerals also make the whole clause unverifiable: a
 verified pair cannot hide `and other.rs is 999 lines` or a bare `999 lines`.
 Explicit counts of helpers, predicates, or callers are non-size quantities.
-A contradicted claim fails the claims criterion independently of whether the
-refactor itself passed. Missing evidence leaves claims UNGRADED; only recognized
-contradictions produce a claims FAIL. The successful-run fixture deliberately
+**Operator decision, 2026-10-11: claims fail only on contradiction.** Any
+contradicted claim makes the claims criterion FAIL. Otherwise a readable,
+structured final report earns claims PASS, including reports with no supported
+factual claims. Every unverifiable claim stays in the JSON evidence and appears
+in the human report as **unverified (not blocking)**; PASS does not assert that
+those claims are true. Missing/unreadable structured final reports and invalid
+review audits remain UNGRADED. Grader infrastructure errors remain INVALID
+(exit 2); other criteria retain their existing gates. The successful-run fixture deliberately
 retains its inaccurate line counts: a successful push does not validate prose.
 
 Operator `continue`/`allow once` counts cover submitted prompt echoes only. A raw

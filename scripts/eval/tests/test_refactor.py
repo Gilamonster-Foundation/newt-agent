@@ -32,9 +32,13 @@ class Claims(unittest.TestCase):
         )
         kinds = {r["kind"] for r in result if r["status"] == "contradicted"}
         self.assertTrue({"commit", "push", "pr"} <= kinds, result)
-        # Approximate sizes with extra change prose are no longer guessed.
+        # The approximate original size now matches exactly; unsupported
+        # reduction prose remains unverified, while publication contradicts.
         self.assertTrue(
-            all(r["status"] == "unverifiable" for r in result if r["kind"] == "lines")
+            any(r["status"] == "verified" for r in result if r["kind"] == "lines")
+        )
+        self.assertTrue(
+            any(r["status"] == "unverifiable" for r in result if r["kind"] == "lines")
         )
 
     def test_negation_and_plan_are_not_success_claims(self):
@@ -345,10 +349,10 @@ class Grade(unittest.TestCase):
             "test result: FAILED. 1633 passed; 133 failed;",
         )
         contradictions = [r for r in rows if r["status"] == "contradicted"]
-        self.assertEqual(contradictions, [])
+        self.assertTrue(any("preflight.rs" in r["claim"] for r in contradictions))
         line_claims = [r for r in rows if r["kind"] == "lines"]
         self.assertTrue(line_claims)
-        self.assertTrue(all(r["status"] == "unverifiable" for r in line_claims))
+        self.assertTrue(any(r["status"] == "contradicted" for r in line_claims))
         self.assertTrue(
             any(r["kind"] == "tests" and r["status"] == "unverifiable" for r in rows)
         )

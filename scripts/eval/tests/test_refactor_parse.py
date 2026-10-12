@@ -150,8 +150,8 @@ class CompleteLogControls(unittest.TestCase):
 
 
 class GradeEvidenceControls(unittest.TestCase):
-    def test_incomplete_counts_remain_ungraded_and_never_pass(self):
-        """Incomplete invocation evidence must preserve UNGRADED != PASS."""
+    def test_incomplete_counts_are_unverified_but_not_blocking(self):
+        """Incomplete invocation evidence is not proof, but no longer blocks."""
         from unittest.mock import patch
         from session_fixture import session_db
 
@@ -165,5 +165,11 @@ class GradeEvidenceControls(unittest.TestCase):
         )
         with patch.object(fixtures.grader, "extraction", return_value=["extracted.rs"]):
             report = case.grade()
-        self.assertEqual(report["criteria"]["claims"]["status"], "UNGRADED")
-        self.assertFalse(report["pass"])
+        self.assertEqual(report["criteria"]["claims"]["status"], "PASS")
+        self.assertTrue(report["pass"])
+        self.assertTrue(
+            any(
+                row["status"] == "unverifiable"
+                for row in report["criteria"]["claims"]["evidence"]
+            )
+        )
