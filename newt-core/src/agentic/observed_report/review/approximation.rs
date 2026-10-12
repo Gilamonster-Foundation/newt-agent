@@ -6,12 +6,27 @@ pub(super) fn classify(text: &str, facts: &Facts<'_>) -> ClaimAssessment {
     let unverified = ClaimAssessment::Unverified("approximate quantity");
     // Preserve conservative handling of mixed quantities and comparisons.
     static QUALIFIED_NUMBER: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex(r"(?i)(?:~|≈|\b(?:about|roughly|approximately|around)\b)\s*([+−-]?\d)")
+        regex(r"(?i)(?:~|≈|\b(?:about|roughly|approximately|around)\b)\s*([+−-]?\d[\d,]*)")
     });
     if !QUALIFIED_NUMBER.is_match(text) {
         return unverified;
     }
-    let text = QUALIFIED_NUMBER.replace_all(text, "$1");
+    let raw_sizes: Vec<_> = SIZE.captures_iter(text).collect();
+    if raw_sizes.len() != 1 {
+        return unverified;
+    }
+    let numeral = raw_sizes[0].get(1).expect("size numeral");
+    // A qualifier belongs to this complete numeral only. Equal digits at a
+    // different position (e.g. "about 110 helpers") cannot relax exact lines.
+    let qualified = QUALIFIED_NUMBER
+        .captures_iter(text)
+        .find(|caps| caps.get(1).is_some_and(|n| n.range() == numeral.range()));
+    let approximate_size = qualified.is_some();
+    let mut normalized = text.to_owned();
+    if let Some(caps) = qualified {
+        normalized.replace_range(caps.get(0).expect("qualified numeral").range(), &caps[1]);
+    }
+    let text = normalized;
     if CHANGE.is_match(&text)
         || COMPARISON.is_match(&text)
         || NET.is_match(&text)
@@ -66,8 +81,11 @@ pub(super) fn classify(text: &str, facts: &Facts<'_>) -> ClaimAssessment {
         return unverified;
     }
     if values.iter().any(|&actual| {
-        (i128::from(expected) - i128::from(actual)).abs() * *super::super::APPROXIMATION_DIVISOR
-            <= i128::from(actual).abs()
+        expected == actual
+            || (approximate_size
+                && (i128::from(expected) - i128::from(actual)).abs()
+                    * *super::super::APPROXIMATION_DIVISOR
+                    <= i128::from(actual).abs())
     }) {
         // Verify the approximate statement, leaving its qualifier in place.
         return ClaimAssessment::Correct;

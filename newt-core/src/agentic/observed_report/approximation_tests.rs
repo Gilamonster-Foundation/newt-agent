@@ -168,3 +168,62 @@ fn report_approximation_final_composition_preserves_voice_and_evidence() {
     assert!(!report.contains("4400"), "{report}");
     assert!(!assistant_prose(&report).contains("corrected by newt"));
 }
+
+fn review_unique_size(text: &str, observed: usize) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/mod.rs"), "x\n".repeat(observed)).unwrap();
+    git(dir.path(), &["add", "."]);
+    let snapshot = files::snapshot(dir.path(), &Scope::All).unwrap();
+    review::review(
+        text,
+        review::Facts {
+            before: None,
+            after: Some(&snapshot),
+            checks: &[],
+            publications: &[],
+            root: dir.path(),
+        },
+    )
+    .rendered()
+}
+
+/// PR #2862: an approximate helper count cannot relax an exact line count.
+#[test]
+fn report_approximation_does_not_borrow_trailing_qualifier() {
+    let text = "src/mod.rs is 110 lines with about 5 helpers";
+    let rendered = review_unique_size(text, 100);
+    assert!(
+        rendered.contains("[corrected by newt: src/mod.rs: 100 lines]"),
+        "{rendered}"
+    );
+}
+
+/// PR #2862: an approximate file inventory cannot relax a later exact size.
+#[test]
+fn report_approximation_does_not_borrow_leading_qualifier() {
+    let text = "about 3 files, mod.rs is 11,000 lines";
+    let rendered = review_unique_size(text, 11726);
+    assert!(
+        rendered.contains("[corrected by newt: src/mod.rs: 11726 lines]"),
+        "{rendered}"
+    );
+}
+
+/// Binding uses positions, not equal numeral strings or clause-wide qualifiers.
+#[test]
+fn report_approximation_qualifier_binding_controls() {
+    for qualifier in ["~", "≈", "about ", "approximately ", "roughly "] {
+        for count in ["90", "110"] {
+            let text = format!("src/mod.rs is {qualifier}{count} lines with about 5 helpers");
+            assert_eq!(review_unique_size(&text, 100), text);
+        }
+        let outside = format!("src/mod.rs is {qualifier}111 lines");
+        assert!(review_unique_size(&outside, 100).contains("corrected by newt"));
+        let separate = format!("{qualifier}110 helpers, src/mod.rs is 110 lines");
+        assert!(review_unique_size(&separate, 100).contains("corrected by newt"));
+    }
+    let exact = "about 5 helpers, src/mod.rs is 100 lines";
+    assert_eq!(review_unique_size(exact, 100), exact);
+}
