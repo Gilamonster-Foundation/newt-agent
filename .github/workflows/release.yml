@@ -1,7 +1,7 @@
 name: Release
 
-# HOOK PARITY: .githooks/pre-push mirrors npm tests through `just check`.
-# npm artifact assembly and registry publication are tag-only lanes.
+# HOOK PARITY: .githooks/pre-push checks publish coverage/order on manifest and
+# release-gate changes. Binary/wheel/npm assembly and publication are CI-only.
 
 # Patterned on agent-mesh's release.yml: a single PyO3 cdylib wheel
 # (`newt-agent-py`) for two OSes (Linux + macOS — Windows fails on
@@ -337,78 +337,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo metadata --no-deps --format-version 1 > /tmp/workspace-metadata.json
-          python3 - <<'EOF'
-          import json, sys, yaml
-
-          wf = yaml.safe_load(open(".github/workflows/release.yml"))
-          matrix = wf["jobs"]["publish-crates"]["strategy"]["matrix"]["crate"]
-
-          pkgs = json.load(open("/tmp/workspace-metadata.json"))["packages"]
-          names = {p["name"] for p in pkgs}
-          # Internal deps that survive `cargo publish`: all NORMAL and BUILD
-          # deps (kind null/"build"), plus any dev-dep carrying a version
-          # requirement. Only path-only DEV-deps (kind "dev", req "*", e.g.
-          # tests-common) are stripped from the published manifest and impose
-          # no ordering constraint. A NORMAL dep that is path-only (req "*")
-          # is NOT stripped — `cargo publish` fails outright on it ("all
-          # dependencies must have a version requirement"). That blind spot
-          # let the v0.7.2 release through with a path-only newt-tuner dep
-          # in newt-core; flag it as an error here instead. Same for a
-          # wildcard/path-only dep pointing OUTSIDE the workspace — cargo
-          # rejects those at publish time too, so flag any non-dev `*` req.
-          deps = {p["name"]: sorted({d["name"] for d in p["dependencies"]
-                                     if d["name"] in names
-                                     and (d.get("kind") != "dev" or d.get("req") != "*")})
-                  for p in pkgs}
-          pathonly = {p["name"]: sorted({d["name"] for d in p["dependencies"]
-                                         if d.get("kind") != "dev" and d.get("req") == "*"})
-                      for p in pkgs}
-
-          pos = {c: i for i, c in enumerate(matrix)}
-          errors = []
-          for c in matrix:
-              if c not in names:
-                  errors.append(f"'{c}' is in the publish matrix but is not a workspace package")
-                  continue
-              for d in pathonly[c]:
-                  errors.append(f"'{c}' has a path-only dependency on '{d}' (no version requirement) — cargo publish will fail; pin it with a version")
-              for d in deps[c]:
-                  if d not in pos:
-                      errors.append(f"'{c}' depends on '{d}', which is missing from the publish matrix")
-                  elif pos[d] > pos[c]:
-                      errors.append(f"'{c}' is published before its dependency '{d}'")
-
-          if errors:
-              for e in errors:
-                  print(f"::error::publish matrix: {e}")
-              # Derive and print a valid order for the dep closure of the
-              # current matrix, so fixing the list is copy-paste.
-              need = set(matrix) & names
-              grew = True
-              while grew:
-                  grew = False
-                  for c in sorted(need):
-                      for d in deps.get(c, []):
-                          if d not in need:
-                              need.add(d)
-                              grew = True
-              order = []
-              remaining = {c: set(deps[c]) & need for c in need}
-              while remaining:
-                  ready = sorted(c for c, ds in remaining.items() if ds <= set(order))
-                  if not ready:
-                      print("::error::dependency cycle among: " + ", ".join(sorted(remaining)))
-                      break
-                  order += ready
-                  for c in ready:
-                      del remaining[c]
-              print("a valid topological order would be:")
-              for c in order:
-                  print(f"          - {c}")
-              sys.exit(1)
-
-          print(f"publish matrix OK: {len(matrix)} crates in topological order")
-          EOF
+          python3 scripts/test_publish_order.py
+          python3 scripts/check_publish_order.py /tmp/workspace-metadata.json
 
   publish-crates:
     name: Publish ${{ matrix.crate }} → crates.io
@@ -423,69 +353,38 @@ jobs:
       fail-fast: false   # leaves keep going if one fails
       max-parallel: 1    # but ONE at a time — internal deps need order
       matrix:
-        # TOPOLOGICAL ORDER — dependencies BEFORE dependents (#120).
-        # `cargo publish` of a crate fails outright when an internal dep is
-        # not on crates.io yet, and with `fail-fast: false` a mis-ordered
-        # matrix cascades into a partial release (v0.6.5 shipped 4/10). The
-        # list must contain the FULL closure of internal deps of every
-        # published crate. The comment on each line is that crate's internal
-        # deps (the `=0.6.x` workspace pins; path-only dev-deps like
-        # tests-common are stripped by cargo at publish time and don't count).
-        #
-        # The check-publish-order job above verifies this list against
-        # `cargo metadata` before any publish starts. To regenerate the
-        # order after a dependency change, topo-sort the workspace:
-        #
-        #   cargo metadata --no-deps --format-version 1 | python3 -c '
-        #   import json, sys
-        #   pkgs = json.load(sys.stdin)["packages"]
-        #   names = {p["name"] for p in pkgs}
-        #   deps = {p["name"]: {d["name"] for d in p["dependencies"]
-        #           if d["name"] in names
-        #           and (d.get("kind") != "dev" or d.get("req") != "*")} for p in pkgs}
-        #   order = []
-        #   while deps:
-        #       ready = sorted(n for n, ds in deps.items() if ds <= set(order))
-        #       assert ready, "dependency cycle"
-        #       order += ready
-        #       for n in ready: del deps[n]
-        #   print("\n".join(order))'
-        #
-        # then drop the crates that are NOT published to crates.io:
-        # newt-agent-py (ships as the PyPI wheel), newt-eval and
-        # newt-provider-openai (unpublished; nothing published depends on
-        # them), tests-common (path-only dev-dep). newt-mesh is excluded
-        # from the workspace entirely.
+        # All publishable workspace packages, dependencies before dependents.
+        # scripts/check_publish_order.py checks coverage, exact pins and order
+        # and prints a replacement order when this list becomes stale.
         crate:
-          - newt-skills       # (no internal deps)
-          - plugins-protocol  # (no internal deps)
-          - newt-tuner        # (no internal deps) — model tuning persistence
-                              #   (Step 19.6); newt-core depends on it, so it
-                              #   must be published first (missing from the
-                              #   matrix broke the v0.7.2 release)
-          - newt-core         # newt-skills, newt-tuner
-          - newt-git          # newt-core — embedded git engine; newt-tui/newt-agent
-                              #   depend on it with a version pin, so it must be
-                              #   published before them (added 0.7.1: prior matrix
-                              #   drift broke the 2026-06-14 release)
-          - newt-data         # (no internal deps) — Phase 21 SQLite engine; must
-                              #   precede newt-mcp-data, which depends on it
-          - newt-identity     # newt-core
-          - newt-tools        # newt-core
-          - newt-mcp-client   # newt-core
-          - newt-inference    # newt-core, newt-identity, plugins-protocol
-          - newt-scheduler    # newt-core, newt-inference — orchestration crate;
-                              #   newt-agent depends on it with a version pin
-                              #   (added 0.7.1 alongside newt-git)
-          - newt-mcp-server   # newt-core, newt-inference, newt-tools
-          - newt-coder        # newt-core, newt-identity, newt-inference, newt-tools, plugins-protocol
-          - newt-tui          # newt-core, newt-git, newt-identity, newt-inference, newt-mcp-client, newt-skills, newt-tools
-          - newt-acp-worker   # newt-coder, newt-core, newt-identity, newt-inference, newt-tools
-          # package name for the newt-cli/ dir (binary: `newt`); depends on
-          # newt-acp-worker, newt-core, newt-identity, newt-inference,
-          # newt-mcp-client, newt-mcp-server, newt-scheduler, newt-skills,
-          # newt-tools, newt-tui
+          - agent-frame
+          - agent-toolchain
+          - newt-carried-tools
+          - newt-data
+          - newt-interaction
+          - newt-launch
+          - newt-refactor-evidence
+          - newt-skills
+          - newt-tuner
+          - plugins-protocol
+          - newt-harness
+          - newt-mcp-data
+          - newt-provider-openai
+          - agent-harness-py
+          - newt-core
+          - newt-git
+          - newt-identity
+          - newt-mcp-client
+          - newt-tools
+          - newt-inference
+          - newt-coder
+          - newt-mcp-server
+          - newt-scheduler
+          - newt-tui
+          - newt-acp-worker
           - newt-agent
+          - newt-eval
+          - newt-agent-py
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -41,7 +41,7 @@ newt-mcp-server.workspace = true
 newt-mcp-client.workspace = true
 newt-identity.workspace = true
 newt-launch.workspace = true
-agent-frame = { path = "../agent-frame" }
+agent-frame.workspace = true
 agent-harness = { workspace = true }
 anyhow.workspace = true
 clap.workspace = true

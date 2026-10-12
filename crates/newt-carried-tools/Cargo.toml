@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 readme = "README.md"
 description = "Native command pack for Newt ambient shells"
 

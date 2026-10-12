@@ -81,6 +81,11 @@ jobs:
       - name: fmt check
         if: always()
         run: cargo fmt --all -- --check
+      # HOOK PARITY: .githooks/pre-push runs this gate on release/manifest changes.
+      - name: release matrix coverage and order regression
+        run: |
+          python3 scripts/test_publish_order.py
+          cargo metadata --no-deps --format-version 1 | python3 scripts/check_publish_order.py -
       # HOOK PARITY: the hook no longer calls `just check` (#1098); these are
       # its own regression suites, scheduled here directly per CRAFT-14 rule
       # 4 (fix-first review on #2658, finding P2 #4) since nothing else runs

@@ -1,5 +1,5 @@
 [package]
-name = "agent-harness"
+name = "newt-harness"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Host-controlled context projection and accounted agent sessions"
 readme = "README.md"
-publish = false
+
+[lib]
+name = "agent_harness"
 
 [dependencies]
 agent-frame.workspace = true

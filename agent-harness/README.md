@@ -1,4 +1,4 @@
-# agent-harness
+# newt-harness
 
 Host-controlled context projection, bounded navigation, and recorded agent
 sessions over `agent-frame`. Models propose relevance and classifications;
@@ -143,3 +143,5 @@ append-only continuations with unchanged objective/pins may carry the offered
 inventory forward. Unknown or unoffered occurrences cannot be queued; `summarise`
 is retained as an explicit unsupported refusal. Restart retains pending proposals;
 publication still uses the existing atomic decision checkpoint.
+
+The crates.io package is `newt-harness`; its Rust library remains `agent_harness`.
