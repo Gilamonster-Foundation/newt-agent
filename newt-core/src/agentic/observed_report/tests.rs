@@ -424,3 +424,6 @@ mod round2;
 
 #[path = "h1_tests.rs"]
 mod h1;
+
+#[path = "approximation_tests.rs"]
+mod approximation;

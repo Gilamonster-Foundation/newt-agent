@@ -9,6 +9,15 @@ pub(crate) use evidence::Evidence;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// One inclusive observed-relative tolerance, also consumed by the Python grader.
+pub(super) static APPROXIMATION_DIVISOR: std::sync::LazyLock<i128> =
+    std::sync::LazyLock::new(|| {
+        include_str!("review/approximation-divisor.txt")
+            .trim()
+            .parse()
+            .expect("fixed approximation divisor")
+    });
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Edit {
     start: usize,
