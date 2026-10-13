@@ -48,7 +48,7 @@ mod crew_attest;
 mod crew_tool;
 use attribution::AttributionEpoch;
 use attribution::{
-    append_clean_build_warning, ledger_note_attribution, ledger_note_write,
+    append_clean_build_warning, ledger_note_write,
     record_completed_tool_event, record_organic_note_use, record_phantom_reach,
 };
 pub(crate) mod cw_overflow;
@@ -101,7 +101,7 @@ mod diagnostics;
 use diagnostics::{
     announce_tool_activity, cancellable, dismiss_completed_spill, is_cancelled,
     is_ollama_tool_xml_error, is_tools_unsupported_error, legacy_caps, ollama_tool_xml_retry_nudge,
-    present_synthetic_tool_result, print_synthetic_tool_result,
+    print_synthetic_tool_result,
 };
 mod driver;
 mod file_change_display;
