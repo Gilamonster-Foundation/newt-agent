@@ -5,10 +5,11 @@
 //! dismiss a completed-spill viewport, print a synthetic tool result, or
 //! announce activity. Pure and side-effect-free (aside from terminal output);
 //! the loop threads in the same sinks it always did.
-use super::CompletedSpillRenderer;
 use super::display;
 use super::tools;
-use std::io::{self, Write as _};/// True when a backend 400 says the model can't accept a `tools` field./// Ollama phrases it `"<model> does not support tools"`; OpenAI-compatible
+use super::CompletedSpillRenderer;
+use std::io::{self, Write as _};
+/// True when a backend 400 says the model can't accept a `tools` field./// Ollama phrases it `"<model> does not support tools"`; OpenAI-compatible
 /// servers vary, so we also accept the looser `"not support tools"`. Used to
 /// drop tools and retry once, then keep them off for the turn (deepseek-r1).
 pub(super) fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
@@ -56,7 +57,9 @@ pub(super) fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bo
 /// breaks the rewind math. The committed excerpt above the frame is the
 /// durable record, so dismissal loses nothing. Idempotent — an inner
 /// recovery-loop retry re-calling this is a no-op.
-pub(super) fn dismiss_completed_spill(renderer: &Option<std::sync::Arc<dyn CompletedSpillRenderer>>) {
+pub(super) fn dismiss_completed_spill(
+    renderer: &Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
+) {
     if let Some(renderer) = renderer {
         renderer.erase();
     }
@@ -175,4 +178,3 @@ pub(super) fn announce_tool_activity(name: &str) {
         });
     }
 }
-

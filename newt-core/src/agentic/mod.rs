@@ -41,11 +41,11 @@ pub use claim_check::{
 };
 #[cfg(test)]
 pub(crate) use observed_report::tests::model_explanation;
+mod attribution;
 pub(crate) mod compress;
 mod context_recovery;
 mod crew_attest;
 mod crew_tool;
-mod attribution;
 use attribution::AttributionEpoch;
 use attribution::{
     append_clean_build_warning, ledger_note_attribution, ledger_note_write,
@@ -59,10 +59,10 @@ mod generation_repetition;
 mod output_budget;
 mod output_limit_recovery;
 mod output_stream;
-use output_stream::CompletedSpillDismissGuard;
 pub use generation_policy::{
     preview_chat_generation, projected_cognition, validate_output_allowance, ChatGenerationPreview,
 };
+use output_stream::CompletedSpillDismissGuard;
 pub use output_stream::{
     CompletedSpillRenderer, LiveToolOutput, RoundObservation, ToolOutputStream,
 };
@@ -100,8 +100,8 @@ pub(crate) mod tool_recovery;
 mod diagnostics;
 use diagnostics::{
     announce_tool_activity, cancellable, dismiss_completed_spill, is_cancelled,
-    is_ollama_tool_xml_error, is_tools_unsupported_error, legacy_caps,
-    ollama_tool_xml_retry_nudge, print_synthetic_tool_result, present_synthetic_tool_result,
+    is_ollama_tool_xml_error, is_tools_unsupported_error, legacy_caps, ollama_tool_xml_retry_nudge,
+    present_synthetic_tool_result, print_synthetic_tool_result,
 };
 mod driver;
 mod file_change_display;
@@ -1244,7 +1244,6 @@ pub struct ChatCtx<'a> {
     /// request bodies are bit-for-bit today's.
     pub steering: Option<&'a dyn SteeringInbox>,
 }
-
 
 /// Drain operator steering into `messages` as genuine user turns (#952/#1669).
 ///

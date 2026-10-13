@@ -7,11 +7,11 @@
 //! note. These helpers are pure record-keeping: the loop supplies the sink,
 //! the ledger, and the values; this module shapes them into notes.
 
-use super::NoteSink;
-use super::NoteNudge;
-use super::lexical_normalize;
 use super::is_read_only_call;
+use super::lexical_normalize;
 use super::GitTool;
+use super::NoteNudge;
+use super::NoteSink;
 use crate::agentic::{compress, smart_harness, tools};
 
 /// Record organic save_note use after repeat rejection and before dispatch.

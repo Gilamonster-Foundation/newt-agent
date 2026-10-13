@@ -165,7 +165,9 @@ pub trait CompletedSpillRenderer: Send + Sync {
 /// This makes the worst failure — a stale `MoveUp` rewind executing on a later
 /// turn, over the prompt and the user's typed input — unrepresentable: the
 /// bookkeeping cannot outlive the turn that painted the frame.
-pub(super) struct CompletedSpillDismissGuard<'a>(pub(super) &'a Option<std::sync::Arc<dyn CompletedSpillRenderer>>);
+pub(super) struct CompletedSpillDismissGuard<'a>(
+    pub(super) &'a Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
+);
 
 impl Drop for CompletedSpillDismissGuard<'_> {
     fn drop(&mut self) {
