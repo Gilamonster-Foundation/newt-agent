@@ -48,8 +48,8 @@ mod crew_attest;
 mod crew_tool;
 use attribution::AttributionEpoch;
 use attribution::{
-    append_clean_build_warning, ledger_note_write,
-    record_completed_tool_event, record_organic_note_use, record_phantom_reach,
+    append_clean_build_warning, ledger_note_write, record_completed_tool_event,
+    record_organic_note_use, record_phantom_reach,
 };
 pub(crate) mod cw_overflow;
 mod display;
