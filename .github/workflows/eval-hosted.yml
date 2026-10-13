@@ -31,13 +31,15 @@ name: Live eval (BAT/UAT vs a hosted model)
 # bash array rather than a concatenated string.
 #   https://docs.github.com/en/actions/concepts/security/script-injections
 #
-# CONFIGURATION CONTRACT — deliberately different per trigger:
-#   * schedule / workflow_dispatch → unconfigured is a SKIP. The failure mode
-#     being replaced was a scheduled job going red nightly for a reason nobody
-#     could act on, and a fork has no endpoint to call.
-#   * push to release/**          → unconfigured FAILS CLOSED. A release gate
-#     that silently skips is not a gate. If we cannot prove the release against
-#     a real model, that is a red release, not a quiet pass.
+# HOOK PARITY: CI-only (needs a hosted model + secret); named in the CI-only
+# list of .githooks/pre-push. When editing this file, keep that entry in step.
+#
+# CONFIGURATION CONTRACT — unconfigured is a SKIP on every trigger, with a
+# notice (a warning on release/**). A job red for a reason nobody can act on
+# hides the reds that matter, and a red workflow cancels a release. Until the
+# hosted endpoint exists, the real-model proof for a release is gate (a): the
+# graded refactor-lab runs recorded in docs/releases/<version>.md. Once
+# configured, a failing eval is red on every trigger, release included.
 
 on:
   schedule:
@@ -95,8 +97,8 @@ jobs:
           fi
           echo "configured=false" >> "$GITHUB_OUTPUT"
           if [[ "$IS_RELEASE" == "true" ]]; then
-            echo "::error::Release gate cannot run: set the EVAL_BASE_URL repo variable and the EVAL_API_KEY secret. A release is not proven against a real model without them."
-            exit 1
+            echo "::warning::Hosted eval tier not configured — this release is not proven against a hosted model here; gate (a) in docs/releases/ carries the real-model proof. Set EVAL_BASE_URL and EVAL_API_KEY to enable it."
+            exit 0
           fi
           echo "::notice::Hosted eval tier not configured — set the EVAL_BASE_URL repo variable and the EVAL_API_KEY secret to enable it. Skipping."
 
