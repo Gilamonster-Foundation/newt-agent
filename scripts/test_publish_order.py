@@ -2,7 +2,13 @@
 
 import unittest
 
-from check_publish_order import check, topological_order
+from check_publish_order import (
+    caret_matches,
+    check,
+    git_dependencies,
+    registry_gaps,
+    topological_order,
+)
 
 
 def package(name, dependencies=(), publish=None):
@@ -82,6 +88,42 @@ class PublishOrder(unittest.TestCase):
             (["app", "unknown"], "'unknown' is not a workspace package"),
         ):
             self.assertIn(message, check(crates, matrix))
+
+
+GIT = "git+https://github.com/Gilamonster-Foundation/newtui?rev=b7ce8ee"
+
+
+class GitDependencies(unittest.TestCase):
+    """v0.8.0: newt-core shipped a git-only `newtui` dep that crates.io lacked."""
+
+    def test_git_only_dependency_missing_from_crates_io_fails(self):
+        crates = [package("newt-core", [dependency("newtui", "^0.1.0", source=GIT)])]
+        deps = git_dependencies(crates, ["newt-core"])
+        self.assertEqual(deps, [("newt-core", "newtui", "^0.1.0")])
+        self.assertTrue(registry_gaps(deps, lambda _: []))
+        self.assertTrue(registry_gaps(deps, lambda _: ["0.1.0-rc.1"]))
+        self.assertEqual(registry_gaps(deps, lambda _: ["0.1.0"]), [])
+
+    def test_dev_and_unpublished_crates_are_not_checked(self):
+        crates = [
+            package("app", [dependency("newtui", "^0.1.0", "dev", source=GIT)]),
+            package("tool", [dependency("newtui", "^0.1.0", source=GIT)], []),
+        ]
+        self.assertEqual(git_dependencies(crates, ["app"]), [])
+
+    def test_caret_semantics(self):
+        for req, version, ok in (
+            ("^0.1", "0.1.0", True),
+            ("^0.1", "0.1.9", True),
+            ("^0.1", "0.2.0", False),
+            ("^0.1.2", "0.1.1", False),
+            ("^1.2", "1.9.0", True),
+            ("^1.2", "2.0.0", False),
+            ("^0.0.3", "0.0.4", False),
+            ("^0.1", "0.1.0-rc.1", False),
+            ("=0.1.0", "0.1.0", False),  # unsupported req fails closed
+        ):
+            self.assertEqual(caret_matches(req, version), ok, (req, version))
 
 
 if __name__ == "__main__":
