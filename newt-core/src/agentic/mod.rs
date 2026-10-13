@@ -47,9 +47,10 @@ mod context_recovery;
 mod crew_attest;
 mod crew_tool;
 use attribution::AttributionEpoch;
+#[allow(unused_imports)]
 use attribution::{
-    append_clean_build_warning, ledger_note_write, record_completed_tool_event,
-    record_organic_note_use, record_phantom_reach,
+    append_clean_build_warning, ledger_note_attribution, ledger_note_write,
+    record_completed_tool_event, record_organic_note_use, record_phantom_reach,
 };
 pub(crate) mod cw_overflow;
 mod display;
@@ -103,6 +104,10 @@ use diagnostics::{
     is_ollama_tool_xml_error, is_tools_unsupported_error, legacy_caps, ollama_tool_xml_retry_nudge,
     print_synthetic_tool_result,
 };
+// `present_synthetic_tool_result` is used only by the `mod_tests` glob
+// (`use super::*`), which clippy's unused-import analysis doesn't trace.
+#[allow(unused_imports)]
+use diagnostics::present_synthetic_tool_result;
 mod driver;
 mod file_change_display;
 pub use file_change_display::{file_change_style, write_file_change_row, FileChangePresentation};
