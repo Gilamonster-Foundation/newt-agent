@@ -1777,6 +1777,10 @@ fn reclaim_within_trailing_group(
 /// Cap on each digest list (#2875 part 2): enough to name the work, bounded so
 /// the marker stays small.
 const DIGEST_CAP: usize = 20;
+/// Per-entry character cap for the digest (#2875 r2).
+const DIGEST_ENTRY_CAP: usize = 160;
+/// Whole-digest character cap (#2875 r2).
+const DIGEST_TOTAL_CAP: usize = 2_000;
 
 /// The static marker, plus a short digest of the removed span: the files the
 /// file-writing tools touched and the `git commit` commands run. The summary is
@@ -1820,19 +1824,24 @@ fn static_fallback_text(removed: &[Value]) -> String {
         "Summary generation was unavailable. {} message(s) were removed.",
         removed.len()
     );
-    if !files.is_empty() {
-        let shown: Vec<_> = files.iter().take(DIGEST_CAP).map(String::as_str).collect();
-        out.push_str(&format!("\nFiles touched: {}", shown.join(", ")));
-    }
-    if !commits.is_empty() {
-        let shown: Vec<_> = commits
+    // Every entry passes the same redaction as summarizer input, then a per-entry
+    // cap; the whole digest is capped too so one oversized argument cannot inflate
+    // the marker (#2875 r2, findings 2–3).
+    let line = |label: &str, items: &[String], sep: &str| {
+        let shown: Vec<String> = items
             .iter()
             .take(DIGEST_CAP)
-            .map(String::as_str)
+            .map(|s| excerpt(&redact_secrets(s), DIGEST_ENTRY_CAP))
             .collect();
-        out.push_str(&format!("\nCommands: {}", shown.join("; ")));
+        format!("\n{label}: {}", shown.join(sep))
+    };
+    if !files.is_empty() {
+        out.push_str(&line("Files touched", &files, ", "));
     }
-    out
+    if !commits.is_empty() {
+        out.push_str(&line("Commands", &commits, "; "));
+    }
+    excerpt(&out, DIGEST_TOTAL_CAP)
 }
 
 /// Wrap a summary body in the compaction markers as a `user` message.

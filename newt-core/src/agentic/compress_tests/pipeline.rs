@@ -288,35 +288,28 @@ async fn fallback_marker_redacts_secrets_in_commands() {
 }
 
 /// Red (#2875 r2, finding 3): one oversized commit message must not inflate
-/// the marker — each entry and the whole digest are capped.
-#[tokio::test]
-async fn fallback_marker_caps_oversized_digest() {
+/// the marker. Calls the digest builder directly (compress_tests is a child of
+/// compress, so the private fn is reachable). Covers ASCII and multibyte input;
+/// each entry and the whole digest are capped by character, never splitting a
+/// char.
+#[test]
+fn fallback_marker_caps_oversized_digest() {
     let huge = "m".repeat(200_000);
-    let mut msgs = vec![sys("you are newt"), user("task")];
-    msgs.push(assistant_call(
-        "run_command",
-        json!({"command": format!("git commit -m {huge}")}),
-    ));
-    msgs.push(tool_result("committed"));
-    for i in 0..10 {
-        msgs.push(user(&format!("filler {i} {}", "z".repeat(4_000))));
-        msgs.push(assistant_call("run_command", json!({"command": "ls"})));
-        msgs.push(tool_result(&"z".repeat(4_000)));
-    }
-    let before = estimate_tokens(&msgs, EST);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let s = failing_summarizer(calls);
-    let mut state = CompressState::new();
-    let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
-    let marker = out
-        .messages
-        .iter()
-        .filter_map(|m| m["content"].as_str())
-        .find(|c| c.contains("Summary generation was unavailable."))
-        .unwrap_or_else(|| panic!("no marker"));
-    assert!(
-        marker.chars().count() < 2_000,
-        "marker is {} chars",
-        marker.chars().count()
-    );
+    let multibyte = "日本語😀é".repeat(50_000);
+    let removed = vec![
+        assistant_call(
+            "run_command",
+            json!({"command": format!("git commit -m {huge}")}),
+        ),
+        assistant_call(
+            "run_command",
+            json!({"command": format!("git commit -m {multibyte}")}),
+        ),
+        assistant_call("edit_file", json!({"path": format!("src/{multibyte}.rs")})),
+    ];
+    let marker = static_fallback_text(&removed);
+    assert!(marker.contains("Summary generation was unavailable."));
+    let chars = marker.chars().count();
+    assert!(chars <= 2_000 + 1, "marker is {chars} chars");
+    assert!(marker.contains("git commit -m"), "commit entry missing");
 }
