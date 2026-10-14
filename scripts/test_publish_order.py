@@ -114,13 +114,63 @@ class GitDependencies(unittest.TestCase):
         self.assertTrue(registry_gaps(deps, lambda _: ["0.1.0-rc.1"]))
         self.assertEqual(registry_gaps(deps, lambda _: ["0.1.0"]), [])
 
+    def manifests(self, app, workspace=None):
+        """An injected Cargo.toml loader: path -> parsed TOML (no filesystem)."""
+        files = {"app/Cargo.toml": app, "Cargo.toml": workspace or {}}
+        return lambda path: files[path]
+
+    def dev_star(self, **extra):
+        crate = package("app", [dependency("newtui", "*", "dev", source=GIT, **extra)])
+        crate["manifest_path"] = "app/Cargo.toml"
+        return crate
+
     def test_unversioned_dev_helpers_and_unpublished_crates_are_not_checked(self):
         """Cargo strips a dev-dependency with no version from the package."""
         crates = [
-            package("app", [dependency("newtui", "*", "dev", source=GIT)]),
+            self.dev_star(),
             package("tool", [dependency("newtui", "^0.1.0", source=GIT)], []),
         ]
-        self.assertEqual(git_dependencies(crates, ["app"]), [])
+        load = self.manifests({"dev-dependencies": {"newtui": {"git": "u"}}})
+        self.assertEqual(git_dependencies(crates, ["app"], load), [])
+
+    def test_explicit_wildcard_version_dev_dependency_is_checked(self):
+        """Metadata says `req: "*"` both for an omitted version and for an
+        explicit `version = "*"`; only the first is stripped, so the
+        declaration decides (PR #2871 r2 P2-2)."""
+        load = self.manifests(
+            {"dev-dependencies": {"newtui": {"git": "u", "version": "*"}}}
+        )
+        deps = git_dependencies([self.dev_star()], ["app"], load)
+        self.assertEqual(deps, [("app", "newtui", "*")])
+        self.assertTrue(registry_gaps(deps, lambda _: []))
+
+    def test_renamed_and_target_specific_declarations_are_found(self):
+        renamed = {"dev-dependencies": {"tui": {"package": "newtui", "version": "*"}}}
+        crate = self.dev_star(rename="tui")
+        self.assertTrue(git_dependencies([crate], ["app"], self.manifests(renamed)))
+        target = {
+            "target": {
+                "cfg(unix)": {"dev-dependencies": {"newtui": {"git": "u", "version": "*"}}}
+            }
+        }
+        crate = self.dev_star(target="cfg(unix)")
+        self.assertTrue(git_dependencies([crate], ["app"], self.manifests(target)))
+
+    def test_workspace_inherited_dev_dependency_uses_the_workspace_entry(self):
+        app = {"dev-dependencies": {"newtui": {"workspace": True}}}
+        versioned = {"workspace": {"dependencies": {"newtui": {"git": "u", "version": "*"}}}}
+        bare = {"workspace": {"dependencies": {"newtui": {"git": "u"}}}}
+        crate = self.dev_star()
+        self.assertTrue(git_dependencies([crate], ["app"], self.manifests(app, versioned)))
+        self.assertEqual(git_dependencies([crate], ["app"], self.manifests(app, bare)), [])
+
+    def test_unreadable_or_missing_declaration_fails_closed(self):
+        """When the declaration cannot be found, check the dependency."""
+        def broken(_):
+            raise OSError("gone")
+
+        self.assertTrue(git_dependencies([self.dev_star()], ["app"], broken))
+        self.assertTrue(git_dependencies([self.dev_star()], ["app"], self.manifests({})))
 
     def test_versioned_dev_dependency_is_checked(self):
         """Cargo keeps a versioned dev-dependency in the published manifest, and

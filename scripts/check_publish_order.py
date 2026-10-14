@@ -1,9 +1,11 @@
 """Validate release coverage and dependency order from Cargo metadata."""
 
 import json
+import os
 from pathlib import Path
 import re
 import sys
+import tomllib
 import urllib.error
 import urllib.request
 
@@ -81,11 +83,39 @@ def check(packages, matrix):
     return errors
 
 
-def git_dependencies(packages, matrix):
+def _load_toml(path):
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _declares_version(package, dep, load, workspace_manifest):
+    """Whether the dev-dependency's declaration carries a `version` key.
+
+    Metadata reports `req: "*"` both for an omitted version (Cargo strips that
+    dev helper) and for an explicit `version = "*"` (Cargo ships it), so only
+    the declaration can tell them apart. Anything unreadable counts as
+    versioned, which keeps the dependency checked (fail closed).
+    """
+    key = dep.get("rename") or dep["name"]
+    try:
+        manifest = load(package["manifest_path"])
+        if dep.get("target"):
+            manifest = manifest["target"][dep["target"]]
+        table = manifest.get("dev-dependencies", manifest.get("dev_dependencies", {}))
+        entry = table[key]
+        if isinstance(entry, dict) and entry.get("workspace") is True:
+            entry = load(workspace_manifest)["workspace"]["dependencies"][key]
+    except (OSError, KeyError, TypeError, AttributeError, tomllib.TOMLDecodeError):
+        return True
+    return not isinstance(entry, dict) or "version" in entry
+
+
+def git_dependencies(packages, matrix, load=_load_toml, workspace_manifest="Cargo.toml"):
     """(crate, dependency, req) for every shipped git dependency of a published crate.
 
     `cargo publish` drops the git source and resolves `req` on crates.io, so a
     git-only dependency blocks the upload (v0.8.0: newtui was never on crates.io).
+    Cargo strips only a dev-dependency declared without a `version` key.
     """
     published = set(matrix)
     return [
@@ -94,8 +124,11 @@ def git_dependencies(packages, matrix):
         if p["name"] in published
         for d in p["dependencies"]
         if (d.get("source") or "").startswith("git+")
-        # Cargo strips only unversioned dev helpers; a versioned one ships.
-        and not (d.get("kind") == "dev" and d["req"] == "*")
+        and not (
+            d.get("kind") == "dev"
+            and d["req"] == "*"
+            and not _declares_version(p, d, load, workspace_manifest)
+        )
     ]
 
 
@@ -314,7 +347,12 @@ def main():
     matrix = workflow["jobs"]["publish-crates"]["strategy"]["matrix"]["crate"]
     errors = check(metadata["packages"], matrix) + gate_errors(workflow["jobs"])
     errors += registry_gaps(
-        git_dependencies(metadata["packages"], matrix), crates_io_versions
+        git_dependencies(
+            metadata["packages"],
+            matrix,
+            workspace_manifest=os.path.join(metadata.get("workspace_root", "."), "Cargo.toml"),
+        ),
+        crates_io_versions,
     )
     for error in errors:
         print(f"::error::publish matrix: {error}")
