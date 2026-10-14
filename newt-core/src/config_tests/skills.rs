@@ -9,8 +9,14 @@ use super::*;
 #[serial_test::serial(real_fs)]
 #[test]
 fn skill_search_dirs_defaults_to_single_newt_dir() {
+    let saved = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+    std::env::remove_var(NEWT_CONFIG_DIR_ENV);
     let cfg = Config::default();
     let dirs = cfg.skill_search_dirs_with(None, |_| false);
+    match saved {
+        Some(v) => std::env::set_var(NEWT_CONFIG_DIR_ENV, v),
+        None => std::env::remove_var(NEWT_CONFIG_DIR_ENV),
+    }
     assert_eq!(dirs.len(), 1);
     assert!(dirs[0].ends_with("skills"));
     // The parent component is `.newt`.
@@ -26,7 +32,13 @@ fn skill_search_dirs_defaults_to_single_newt_dir() {
 #[serial_test::serial(real_fs)] // same NEWT_CONFIG_DIR-reader race as above
 #[test]
 fn personas_dir_is_a_sibling_of_the_newt_config_dir() {
+    let saved = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+    std::env::remove_var(NEWT_CONFIG_DIR_ENV);
     let dir = Config::personas_dir();
+    match saved {
+        Some(v) => std::env::set_var(NEWT_CONFIG_DIR_ENV, v),
+        None => std::env::remove_var(NEWT_CONFIG_DIR_ENV),
+    }
     assert!(dir.ends_with("personas"));
     assert_eq!(
         dir.parent().and_then(|p| p.file_name()),
