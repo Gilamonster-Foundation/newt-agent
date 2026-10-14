@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // A HANG-GUARD, never a latency bound. Every use below waits on a
 // `spawn_blocking` worker that holds the admission permit; the successor path
@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 // 2026-09-08), and the pair at lines 72 and 128 failed there while passing on
 // the same commit in the uninstrumented job. Widening a hang-guard weakens no
 // assertion in this file -- the one real latency bound is the separate
-// `Duration::from_secs(1)` below, which is unchanged. The sibling comment at
-// "not required to beat a short timer on a contended test machine" records the
-// same lesson for a wait that was fixed by pausing the clock instead.
+// `Duration::from_secs(1)` below, which is unchanged. These tests keep real
+// time: pausing the clock was tried on the idle-poll test and it hung past 60 s
+// (the poll blocks in the injected clock until the worker checkpoints). The idle
+// bound itself is always the injected fake clock, never a sleep.
 const WATCHDOG: Duration = Duration::from_secs(60);
 
 #[tokio::test]
@@ -25,7 +26,7 @@ async fn expired_generation_does_not_start_the_loader() {
     let worker_started = started.clone();
     let result = run_generation(
         Arc::new(tokio::sync::Semaphore::new(1)),
-        Some(Instant::now()),
+        Some(Duration::ZERO),
         move |_checkpoint| {
             worker_started.store(true, Ordering::SeqCst);
             Ok("unexpected generation".into())
@@ -114,9 +115,12 @@ async fn deadline_returns_while_the_current_step_still_owns_admission() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let continued = Arc::new(AtomicBool::new(false));
     let worker_continued = continued.clone();
-    let first = tokio::spawn(run_generation(
+    let clock = super::idle_tests::FakeClock::new();
+    let reader = clock.clone();
+    let first = tokio::spawn(super::run_generation_with_clock(
         admission.clone(),
-        Some(Instant::now() + Duration::from_secs(60)),
+        Some(Duration::from_secs(60)),
+        move || reader.now(),
         move |checkpoint| {
             let _ = started_tx.send(());
             release_rx.recv_timeout(WATCHDOG)?;
@@ -129,11 +133,8 @@ async fn deadline_returns_while_the_current_step_still_owns_admission() {
         .await
         .unwrap()
         .unwrap();
-    // Advance the async clock only after real worker readiness; its startup is
-    // not required to beat a short timer on a contended test machine.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(61)).await;
-    tokio::time::resume();
+    // The worker is now silent; the fake clock moves past the 60s idle bound.
+    clock.advance(Duration::from_secs(61));
     let result = tokio::time::timeout(Duration::from_secs(1), first).await;
     let held = admission.available_permits() == 0;
     let _ = release_tx.send(());

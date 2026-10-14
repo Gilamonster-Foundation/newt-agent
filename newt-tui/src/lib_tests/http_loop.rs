@@ -18,7 +18,7 @@ async fn loop_summarizer_sends_num_ctx_to_ollama() {
         fn respond(&self, req: &Request) -> ResponseTemplate {
             *self.body.lock().unwrap() = serde_json::from_slice(&req.body).ok();
             ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"message": {"content": "SUM"}}))
+                .set_body_json(serde_json::json!({"message": {"content": "SUM"}, "done": true}))
         }
     }
 
@@ -44,6 +44,10 @@ async fn loop_summarizer_sends_num_ctx_to_ollama() {
     let (out, _) = s("summarize the middle".into()).await.unwrap();
     assert_eq!(out, "SUM");
     let captured = body.lock().unwrap().clone().expect("request captured");
+    assert_eq!(
+        captured["stream"], true,
+        "the summary request must stream so timeout_secs bounds frame gaps"
+    );
     assert_eq!(
         captured["options"]["num_ctx"], 4_096,
         "the summarizer request must cap Ollama's window like the main loop"
@@ -80,7 +84,8 @@ async fn loop_summarizer_refuses_when_the_shared_run_allowance_is_exhausted() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": {"content": "SUM"}
+            "message": {"content": "SUM"},
+            "done": true
         })))
         .expect(0)
         .mount(&server)
@@ -117,7 +122,8 @@ async fn loop_summarizer_reserves_one_call_from_the_shared_allowance_on_success(
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": {"content": "SUM"}
+            "message": {"content": "SUM"},
+            "done": true
         })))
         .mount(&server)
         .await;
@@ -172,7 +178,7 @@ async fn loop_summarizer_warms_the_model_first() {
         .and(path("/api/chat"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"message": {"content": "SUM"}})),
+                .set_body_json(serde_json::json!({"message": {"content": "SUM"}, "done": true})),
         )
         .mount(&server)
         .await;
@@ -214,7 +220,7 @@ async fn loop_summarizer_retries_then_succeeds() {
                 ResponseTemplate::new(500) // first attempt fails
             } else {
                 ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"message": {"content": "SUM"}}))
+                    .set_body_json(serde_json::json!({"message": {"content": "SUM"}, "done": true}))
             }
         }
     }
@@ -286,8 +292,9 @@ async fn loop_summarizer_falls_back_to_secondary_model() {
         fn respond(&self, req: &Request) -> ResponseTemplate {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
             if body["model"] == "fallback-model" {
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"message": {"content": "FB SUM"}}))
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"message": {"content": "FB SUM"}, "done": true}),
+                )
             } else {
                 ResponseTemplate::new(500) // the primary model always fails
             }
@@ -331,8 +338,9 @@ async fn loop_summarizer_does_not_auto_pick_fallback_when_unset() {
             // The installed small model would succeed, but it was not
             // explicitly configured as the summarizer fallback.
             if body["model"] == "nemotron-mini:4b" {
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"message": {"content": "UNCONFIGURED FB"}}))
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"message": {"content": "UNCONFIGURED FB"}, "done": true}),
+                )
             } else {
                 ResponseTemplate::new(500) // the primary model always fails
             }
@@ -543,6 +551,8 @@ async fn loop_summarizer_omits_num_ctx_on_openai() {
     let (out, _) = s("summarize the middle".into()).await.unwrap();
     assert_eq!(out, "SUM");
     let captured = body.lock().unwrap().clone().expect("request captured");
+    assert_eq!(captured["stream"], true);
+    assert_eq!(captured["stream_options"]["include_usage"], true);
     assert!(
         captured.get("options").is_none(),
         "num_ctx is Ollama-only; OpenAI windows are server-side"
@@ -568,8 +578,9 @@ async fn summarizing_provider_delegates_through_loop_summarizer() {
                 .lock()
                 .unwrap()
                 .push(serde_json::from_slice(&req.body).unwrap());
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"message": {"content": "WIRE SUMMARY"}}))
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"message": {"content": "WIRE SUMMARY"}, "done": true}),
+            )
         }
     }
 

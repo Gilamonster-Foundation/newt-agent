@@ -36,7 +36,8 @@
 # host, missing-runner cmd fallback, POSIX syntax, cmd opt-out and tree kill.
 #
 # Release parity: publish-matrix tests and validation run here on manifest or
-# release-gate changes. Release binaries, wheels, npm artifacts and registry
+# release-gate changes, including the check that every registry publish job
+# needs every release gate (#2873). Release binaries, wheels, npm artifacts and registry
 # publication (.github/workflows/release.yml) remain CI-only.
 #
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box

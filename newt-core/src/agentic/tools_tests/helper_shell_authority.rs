@@ -193,10 +193,19 @@ fn host_shell_command_strips_authority_env() {
         "NEWT_AGENT_KEY",
         "NEWT_OPERATOR_KEY",
         "NEWT_TOKEN_PASSPHRASE",
+        "NEWT_CONFIG_DIR",
+        "NEWT_CONFIG",
     ] {
         assert!(
             removed.iter().any(|k| k == critical),
             "{critical} must never reach a host-shell child"
+        );
+    }
+    // #2876: named, because the loop above passes for any list contents.
+    for kept in ["NEWT_FLIGHT_RECORDER", "NEWT_DENIAL_JOURNAL"] {
+        assert!(
+            !removed.iter().any(|k| k == kept),
+            "{kept} must still reach a host-shell child"
         );
     }
 }
