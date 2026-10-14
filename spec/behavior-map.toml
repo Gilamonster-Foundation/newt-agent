@@ -996,7 +996,7 @@ symbol = "validated_calls_emit_at_most_one_accepted_observation"
 module = "NewtPolicy.ResponsesUsage"
 symbol = "accepted_emitted_le_one"
 [[BHV-USAGE-001.refs.production]]
-path = "newt-core/src/agentic/mod.rs"
+path = "newt-core/src/agentic/output_stream.rs"
 symbol = "RoundObservation"
 [[BHV-USAGE-001.refs.rust_tests]]
 path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
@@ -1040,7 +1040,7 @@ symbol = "tighten_hard_never_increases"
 module = "NewtPolicy.ResponsesUsage"
 symbol = "hard_ceiling_never_increases"
 [[BHV-USAGE-002.refs.production]]
-path = "newt-core/src/agentic/mod.rs"
+path = "newt-core/src/agentic/output_stream.rs"
 symbol = "RoundObservation"
 [[BHV-USAGE-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
