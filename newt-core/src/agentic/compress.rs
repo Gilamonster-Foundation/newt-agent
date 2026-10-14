@@ -1163,7 +1163,7 @@ pub(crate) async fn compress(
         } else {
             CompressAction::StaticFallback
         };
-        let mut body = body.unwrap_or_else(|| static_fallback_text(middle.len()));
+        let mut body = body.unwrap_or_else(|| static_fallback_text(middle));
         // #319: the summary is prose and does NOT preserve verbatim file
         // contents. A coding model that recalls an API/signature from the
         // summary will hallucinate it. Name the files read in the compacted
@@ -1774,8 +1774,55 @@ fn reclaim_within_trailing_group(
 
 /// The static fallback marker body — the only surviving form of the old
 /// placeholder-discard.
-fn static_fallback_text(removed: usize) -> String {
-    format!("Summary generation was unavailable. {removed} message(s) were removed.")
+/// Cap on each digest list (#2875 part 2): enough to name the work, bounded so
+/// the marker stays small.
+const DIGEST_CAP: usize = 20;
+
+/// The static marker, plus a short digest of the removed span: the files the
+/// file-writing tools touched and the `git commit` commands run. The summary is
+/// lost when the summarizer stalls; this keeps the handful of facts a model
+/// needs to resume without re-deriving them.
+fn static_fallback_text(removed: &[Value]) -> String {
+    let mut files: Vec<String> = Vec::new();
+    let mut commits: Vec<String> = Vec::new();
+    for m in removed.iter().filter(|m| m["role"].as_str() == Some("assistant")) {
+        for call in m["tool_calls"].as_array().into_iter().flatten() {
+            let func = &call["function"];
+            // `arguments` may be a JSON object (Ollama) or a JSON string (OpenAI).
+            let args = match func["arguments"].as_str() {
+                Some(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+                None => func["arguments"].clone(),
+            };
+            match func["name"].as_str() {
+                Some("edit_file") | Some("write_file") => {
+                    if let Some(p) = args["path"].as_str() {
+                        if !files.iter().any(|f| f == p) {
+                            files.push(p.to_string());
+                        }
+                    }
+                }
+                Some("run_command") => {
+                    if let Some(c) = args["command"].as_str().filter(|c| c.contains("git commit")) {
+                        commits.push(c.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = format!(
+        "Summary generation was unavailable. {} message(s) were removed.",
+        removed.len()
+    );
+    if !files.is_empty() {
+        let shown: Vec<_> = files.iter().take(DIGEST_CAP).map(String::as_str).collect();
+        out.push_str(&format!("\nFiles touched: {}", shown.join(", ")));
+    }
+    if !commits.is_empty() {
+        let shown: Vec<_> = commits.iter().take(DIGEST_CAP).map(String::as_str).collect();
+        out.push_str(&format!("\nCommands: {}", shown.join("; ")));
+    }
+    out
 }
 
 /// Wrap a summary body in the compaction markers as a `user` message.

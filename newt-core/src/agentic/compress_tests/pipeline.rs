@@ -209,3 +209,41 @@ async fn second_compression_still_shrinks_and_keeps_fresh_results() {
     assert!(!state.disabled);
     assert_eq!(state.attempts, 0);
 }
+
+/// Red (#2875 part 2): when the summarizer stalls and the static fallback
+/// marker is used, the marker must still name the files written and the
+/// commits made in the removed span, so the model is not left blind to them.
+#[tokio::test]
+async fn fallback_marker_names_touched_files_and_commits() {
+    let big = "z".repeat(4_000);
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call(
+            "edit_file",
+            json!({"path": "src/a.rs", "old_string": "a", "new_string": "b"}),
+        ),
+        tool_result("ok"),
+        assistant_call("run_command", json!({"command": "git commit -m x"})),
+        tool_result("committed"),
+    ];
+    for i in 0..10 {
+        msgs.push(user(&format!("filler {i} {big}")));
+        msgs.push(assistant_call("run_command", json!({"command": "ls"})));
+        msgs.push(tool_result(&big));
+    }
+    let before = estimate_tokens(&msgs, EST);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let s = failing_summarizer(calls.clone());
+    let mut state = CompressState::new();
+    let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
+    assert_eq!(out.action, CompressAction::StaticFallback, "{:?}", out.action);
+    let summary = out
+        .messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("Summary generation was unavailable."))
+        .unwrap_or_else(|| panic!("no marker in {:#?}", out.messages));
+    assert!(summary.contains("src/a.rs"), "names the file: {summary}");
+    assert!(summary.contains("git commit -m x"), "names the commit: {summary}");
+}
