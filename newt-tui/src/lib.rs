@@ -2749,7 +2749,12 @@ async fn summarize_attempt(
     if !resp.status().is_success() {
         anyhow::bail!("summarizer endpoint {}", resp.status());
     }
-    let json: serde_json::Value = resp.json().await?;
+    let bytes = resp.bytes().await?;
+    let json = if openai {
+        newt_core::agentic::openai_sse::decode_response(&bytes)?
+    } else {
+        newt_inference::local::decode_ollama_stream(&bytes)?
+    };
     extract_summary(&json, openai)
 }
 
@@ -2831,7 +2836,8 @@ async fn summarize_one_model(
         serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": false,
+            "stream": true,
+            "stream_options": {"include_usage": true},
         })
     } else {
         // `think: false` — a summary is a direct extraction task, not a
@@ -2842,7 +2848,7 @@ async fn summarize_one_model(
         let mut b = serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": false,
+            "stream": true,
             "think": false,
             "keep_alive": opts.keep_alive,
         });
@@ -2853,8 +2859,12 @@ async fn summarize_one_model(
     };
     // Step 24.2 (#559): retry with backoff before giving up. The per-request
     // timeout is configurable (`summarizer.toml` `timeout_secs`).
+    // #2875: the request streams, so `timeout_secs` bounds the gap between
+    // frames (an IDLE bound), not the total — a summary still producing frames
+    // past it must succeed. The connect timeout keeps its own bound.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(opts.timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(opts.timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(opts.timeout_secs))
         .build()?;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=opts.retries {
@@ -2879,7 +2889,23 @@ async fn summarize_one_model(
         if let Some(allowance) = &opts.run_allowance {
             allowance.try_reserve()?;
         }
-        match summarize_attempt(&client, &chat_url, &body, api_key, openai).await {
+        // The idle bound above restarts on every frame, so a server drip-feeding
+        // keep-alives would hold compaction forever. Cap the attempt's total at
+        // a multiple of it, as the main stream path does (local.rs).
+        let total = std::time::Duration::from_secs(opts.timeout_secs)
+            * newt_inference::local::STREAM_TOTAL_TIMEOUT_MULTIPLIER;
+        let attempt_result = tokio::time::timeout(
+            total,
+            summarize_attempt(&client, &chat_url, &body, api_key, openai),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "summarizer stream exceeded its {}s total bound",
+                total.as_secs()
+            ))
+        });
+        match attempt_result {
             Ok(s) => return Ok(s),
             Err(e) => last_err = Some(e),
         }
@@ -2957,8 +2983,10 @@ fn failing_summarizer(msg: String) -> newt_core::Summarizer {
 
 /// Build the in-process candle summarizer (#661 group C). Backend metadata is
 /// shared across calls; each call loads its GGUF on a bounded blocking worker.
-/// The configured per-request timeout covers loading and generation, with
-/// cooperative cancellation between synchronous steps. Falls back to a failing
+/// The configured per-request `timeout_secs` bounds the gap between progress
+/// events (a checkpoint while loading or generating), not the whole attempt, so
+/// a generation that keeps progressing is not cut off. Cooperative cancellation
+/// happens between synchronous steps. Falls back to a failing
 /// summarizer (→ static marker) when the model file is missing or the build lacks
 /// the `embedded` feature.
 #[cfg_attr(not(feature = "embedded"), allow(unused_variables))]
@@ -8763,6 +8791,10 @@ fn resolve_summarizer_backend(
 #[cfg(test)]
 #[path = "lib_tests/summarizer_default_tests.rs"]
 mod summarizer_default_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/summarizer_idle_timeout_tests.rs"]
+mod summarizer_idle_timeout_tests;
 
 /// Whether a SESSION-INHERITING summarizer — one that resolves onto the active
 /// inference backend, including the degraded fallback when the embedded engine

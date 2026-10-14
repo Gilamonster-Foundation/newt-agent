@@ -657,3 +657,24 @@ async fn a_real_read_file_success_with_error_prefixed_content_ledgers_as_ok() {
         "a successful read whose content starts with 'error ' must ledger ok=true: {out}"
     );
 }
+
+/// The compaction digest reads the code back out of the rendered result
+/// (`compress::exit_code_of`). Round-trip it against the real formatter so a
+/// rewording of `error: command exited N` breaks here, not silently in a marker
+/// (#2875 r2 round 4).
+#[test]
+fn exit_code_of_round_trips_the_rendered_failure() {
+    for code in [1, 3, 101, 127] {
+        for (stdout, stderr) in [("", ""), ("out\n", "err\n")] {
+            let envelope = serde_json::json!({
+                "exit_code": code, "stdout": stdout, "stderr": stderr,
+            });
+            let out = render(&envelope);
+            assert_eq!(
+                crate::agentic::compress::exit_code_of(&out),
+                Some(code),
+                "rendered: {out}"
+            );
+        }
+    }
+}

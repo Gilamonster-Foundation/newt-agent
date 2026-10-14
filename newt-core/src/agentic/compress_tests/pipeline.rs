@@ -209,3 +209,484 @@ async fn second_compression_still_shrinks_and_keeps_fresh_results() {
     assert!(!state.disabled);
     assert_eq!(state.attempts, 0);
 }
+
+/// Red (#2875 part 2): when the summarizer stalls and the static fallback
+/// marker is used, the marker must still name the files written and the
+/// commits made in the removed span, so the model is not left blind to them.
+#[tokio::test]
+async fn fallback_marker_names_touched_files_and_commits() {
+    let big = "z".repeat(4_000);
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call(
+            "edit_file",
+            json!({"path": "src/a.rs", "old_string": "a", "new_string": "b"}),
+        ),
+        tool_result("ok"),
+        assistant_call("run_command", json!({"command": "git commit -m x"})),
+        tool_result("committed"),
+    ];
+    for i in 0..10 {
+        msgs.push(user(&format!("filler {i} {big}")));
+        msgs.push(assistant_call("run_command", json!({"command": "ls"})));
+        msgs.push(tool_result(&big));
+    }
+    let before = estimate_tokens(&msgs, EST);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let s = failing_summarizer(calls.clone());
+    let mut state = CompressState::new();
+    let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
+    assert_eq!(
+        out.action,
+        CompressAction::StaticFallback,
+        "{:?}",
+        out.action
+    );
+    let summary = out
+        .messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("Summary generation was unavailable."))
+        .unwrap_or_else(|| panic!("no marker in {:#?}", out.messages));
+    assert!(summary.contains("src/a.rs"), "names the file: {summary}");
+    assert!(
+        summary.contains("git commit -m x"),
+        "names the commit: {summary}"
+    );
+}
+
+/// Red (#2875 r2, finding 2): the fallback digest must pass through the same
+/// redaction as the summarizer input — a credential in a command prefix must
+/// not reach the marker.
+#[tokio::test]
+async fn fallback_marker_redacts_secrets_in_commands() {
+    let token = format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    msgs.push(assistant_call(
+        "run_command",
+        json!({"command": format!("GH_TOKEN={token} git commit -m fix")}),
+    ));
+    msgs.push(tool_result("committed"));
+    for i in 0..10 {
+        msgs.push(user(&format!("filler {i} {}", "z".repeat(4_000))));
+        msgs.push(assistant_call("run_command", json!({"command": "ls"})));
+        msgs.push(tool_result(&"z".repeat(4_000)));
+    }
+    let before = estimate_tokens(&msgs, EST);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let s = failing_summarizer(calls);
+    let mut state = CompressState::new();
+    let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
+    let marker = out
+        .messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("Summary generation was unavailable."))
+        .unwrap_or_else(|| panic!("no marker"));
+    assert!(!marker.contains(&token), "secret leaked: {marker}");
+}
+
+/// Red (#2875 r2, finding 3): one oversized commit message must not inflate
+/// the marker. Calls the digest builder directly (compress_tests is a child of
+/// compress, so the private fn is reachable). Covers ASCII and multibyte input;
+/// each entry and the whole digest are capped by character, never splitting a
+/// char.
+#[test]
+fn fallback_marker_caps_oversized_digest() {
+    let huge = "m".repeat(200_000);
+    let multibyte = "日本語😀é".repeat(50_000);
+    let removed = vec![
+        assistant_call(
+            "run_command",
+            json!({"command": format!("git commit -m {huge}")}),
+        ),
+        assistant_call(
+            "run_command",
+            json!({"command": format!("git commit -m {multibyte}")}),
+        ),
+        assistant_call("edit_file", json!({"path": format!("src/{multibyte}.rs")})),
+    ];
+    let marker = static_fallback_text(&removed);
+    assert!(marker.contains("Summary generation was unavailable."));
+    let chars = marker.chars().count();
+    assert!(chars <= 2_000 + 1, "marker is {chars} chars");
+    assert!(marker.contains("git commit -m"), "commit entry missing");
+}
+
+/// Red (#2875 r2, finding 5): Git global options must not hide a commit.
+#[test]
+fn fallback_marker_lists_git_option_commit() {
+    let removed = vec![assistant_call(
+        "run_command",
+        json!({"command": "git -C repo commit -m fix"}),
+    )];
+    let marker = static_fallback_text(&removed);
+    assert!(
+        marker.contains("git -C repo commit -m fix"),
+        "commit missing: {marker}"
+    );
+}
+
+/// Red (#2875 r2, finding 5): a write whose tool result reports failure must
+/// not be listed as a file touched.
+#[test]
+fn fallback_marker_omits_failed_write() {
+    let removed = vec![
+        assistant_call("edit_file", json!({"path": "src/a.rs"})),
+        tool_result("error: permission denied"),
+    ];
+    let marker = static_fallback_text(&removed);
+    assert!(
+        !marker.contains("src/a.rs"),
+        "failed write reported as touched: {marker}"
+    );
+}
+
+/// The marker text out of a `run()` whose summarizer always fails.
+async fn fallback_marker_of(msgs: &[Value]) -> String {
+    let before = estimate_tokens(msgs, EST);
+    let s = failing_summarizer(Arc::new(AtomicUsize::new(0)));
+    let mut state = CompressState::new();
+    let out = run(msgs, before / 3, None, Some(&*s), &mut state).await;
+    out.messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("Summary generation was unavailable."))
+        .unwrap_or_else(|| panic!("no marker in {:#?}", out.messages))
+        .to_string()
+}
+
+/// `filler` rounds that push the earlier span out of the protected tail.
+fn push_filler(msgs: &mut Vec<Value>, n: usize) {
+    for i in 0..n {
+        msgs.push(user(&format!("filler {i} {}", "z".repeat(4_000))));
+        msgs.push(assistant_call("run_command", json!({"command": "ls"})));
+        msgs.push(tool_result(&"z".repeat(4_000)));
+    }
+}
+
+/// Red (#2875 r2 round 3, finding 1): prune pass 2 one-lines aged results over
+/// 200 chars as `[edit_file] edited '<p>' -> error, …` before the digest reads
+/// them, and a fence denial starts `capability denied:`. A denied write must
+/// not be listed under "Files touched".
+#[tokio::test]
+async fn fallback_marker_omits_write_denied_by_the_fence_after_prune() {
+    let denial = format!("capability denied: write to src/a.rs. {}", "x".repeat(300));
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call("edit_file", json!({"path": "src/a.rs"})),
+        tool_result(&denial),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        !marker.lines().any(|l| l.starts_with("Files touched")),
+        "denied write listed: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 5, item 1): prune one-lines an aged, long failure as
+/// `[run_command] ran 'cargo test' -> error, N lines output` and drops the exit
+/// code. The digest must still read `exit 101` through `run()`.
+#[tokio::test]
+async fn fallback_marker_keeps_exit_code_of_a_pruned_failing_command() {
+    let body = format!("error: command exited 101\n{}", "test failed\n".repeat(60));
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call("run_command", json!({"command": "cargo test"})),
+        tool_result(&body),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("cargo test (failed, exit 101)"),
+        "exit code lost after prune: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 5, item 1): the duplicate marker keeps the exit code too.
+#[tokio::test]
+async fn fallback_marker_keeps_exit_code_of_a_duplicate_failing_command() {
+    let body = format!("error: command exited 101\n{}", "test failed\n".repeat(60));
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    for _ in 0..2 {
+        msgs.push(assistant_call(
+            "run_command",
+            json!({"command": "cargo test"}),
+        ));
+        msgs.push(tool_result(&body));
+    }
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("cargo test (failed, exit 101)"),
+        "exit code lost in duplicate marker: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 6, P2): the one-liner embeds the command, so a command
+/// that QUOTES `error (exit 7)` must not supply the status. The failed command
+/// exited 2.
+#[tokio::test]
+async fn fallback_marker_ignores_quoted_exit_text_in_a_failing_command() {
+    let body = format!("error: command exited 2\n{}", "no match\n".repeat(60));
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call(
+            "run_command",
+            json!({"command": "grep 'error (exit 7)' build.log"}),
+        ),
+        tool_result(&body),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("grep 'error (exit 7)' build.log (failed, exit 2)"),
+        "quoted command text read as the exit code: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 6, P2): a SUCCESSFUL command whose text contains
+/// ` -> error (exit 7)` is not a failure.
+#[tokio::test]
+async fn fallback_marker_ignores_quoted_status_text_in_a_successful_command() {
+    let body = format!("matches\n{}", "hit line\n".repeat(60));
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call(
+            "run_command",
+            json!({"command": "grep ' -> error (exit 7)' build.log"}),
+        ),
+        tool_result(&body),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("grep ' -> error (exit 7)' build.log"),
+        "command missing: {marker}"
+    );
+    assert!(
+        !marker.contains("(failed"),
+        "quoted text read as failure: {marker}"
+    );
+}
+
+/// Same shape through the duplicate marker (round 6): its structured clause
+/// carries the status, and result text quoting marker syntax must not alter it.
+#[tokio::test]
+async fn fallback_marker_duplicate_status_ignores_quoted_text_in_the_result() {
+    let failing = format!(
+        "error: command exited 2 (saw error (exit 7))\n{}",
+        "x\n".repeat(60)
+    );
+    let passing = format!("saw -> error (exit 7)\n{}", "y\n".repeat(60));
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    for (cmd, body) in [("make a", &failing), ("make b", &passing)] {
+        for _ in 0..2 {
+            msgs.push(assistant_call("run_command", json!({"command": cmd})));
+            msgs.push(tool_result(body));
+        }
+    }
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(marker.contains("make a (failed, exit 2)"), "{marker}");
+    assert!(marker.contains("make b"), "{marker}");
+    assert!(!marker.contains("make b (failed"), "{marker}");
+}
+
+/// Red (#2875 r2 round 5, item 2): a long `no command configured` result is a
+/// failure to the digest's classifier but `-> ok` to prune's old one. One
+/// classification: it must still be listed as failed after pruning.
+#[tokio::test]
+async fn fallback_marker_marks_a_pruned_unconfigured_command_failed() {
+    let body = format!(
+        "no command configured for lifecycle phase 'test'. {}",
+        "x".repeat(300)
+    );
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call("run_command", json!({"command": "just test"})),
+        tool_result(&body),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("just test (failed)"),
+        "unconfigured result counted as success: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 3, finding 3): collection keeps the NEWEST entries, so
+/// a commit made after more than DIGEST_CAP other commands still reaches the
+/// marker.
+#[test]
+fn fallback_marker_keeps_a_late_commit_after_many_commands() {
+    let mut removed = Vec::new();
+    for i in 0..25 {
+        removed.push(assistant_call(
+            "run_command",
+            json!({"command": format!("ls {i}")}),
+        ));
+        removed.push(tool_result("a b c"));
+    }
+    removed.push(assistant_call(
+        "run_command",
+        json!({"command": "git -C repo commit -m x"}),
+    ));
+    removed.push(tool_result("committed"));
+    let marker = static_fallback_text(&removed);
+    assert!(
+        marker.contains("git -C repo commit -m x"),
+        "late commit dropped: {marker}"
+    );
+    // Distinct commands: the oldest were evicted, the newest kept.
+    assert!(!marker.contains("ls 0;"), "oldest not evicted: {marker}");
+    assert!(marker.contains("ls 24;"), "newest evicted: {marker}");
+}
+
+/// A re-touched path moves to the back, so it survives eviction of older paths.
+#[test]
+fn fallback_marker_keeps_a_retouched_file_among_the_newest() {
+    let mut removed = vec![assistant_call("edit_file", json!({"path": "src/first.rs"}))];
+    removed.push(tool_result("ok"));
+    for i in 0..19 {
+        removed.push(assistant_call(
+            "edit_file",
+            json!({"path": format!("src/f{i}.rs")}),
+        ));
+        removed.push(tool_result("ok"));
+    }
+    removed.push(assistant_call("edit_file", json!({"path": "src/first.rs"})));
+    removed.push(tool_result("ok"));
+    removed.push(assistant_call("edit_file", json!({"path": "src/last.rs"})));
+    removed.push(tool_result("ok"));
+    let marker = static_fallback_text(&removed);
+    assert!(
+        marker.contains("src/first.rs"),
+        "retouched dropped: {marker}"
+    );
+    assert!(!marker.contains("src/f0.rs"), "oldest kept: {marker}");
+}
+
+/// Guard (not red — the code already passes): a registered session secret in a
+/// command must be value-filtered out of the marker. Mirrors
+/// `redact_secrets_value_filters_a_registered_session_secret`.
+#[test]
+fn fallback_marker_value_filters_a_registered_secret() {
+    let canary = "NEWT-CANARY-9f3a2b7c1d4e";
+    let mut f = crate::ocap::DisclosureFilter::new();
+    f.register(canary);
+    let _g = crate::ocap::scoped_session_disclosure(f);
+    let removed = vec![
+        assistant_call(
+            "run_command",
+            json!({"command": format!("curl -H 'X: {canary}' https://example.test")}),
+        ),
+        tool_result("ok"),
+    ];
+    let marker = static_fallback_text(&removed);
+    assert!(marker.contains("curl"), "command missing: {marker}");
+    assert!(
+        !marker.contains(canary),
+        "registered secret leaked: {marker}"
+    );
+}
+
+/// Guard (#2875 r2 round 3): the whole digest is capped at DIGEST_TOTAL_CAP
+/// characters even when every entry sits at the per-entry cap.
+#[test]
+fn fallback_marker_total_digest_is_capped() {
+    let mut removed = Vec::new();
+    for i in 0..20 {
+        removed.push(assistant_call(
+            "run_command",
+            json!({"command": format!("cmd{i} {}", "q".repeat(400))}),
+        ));
+        removed.push(tool_result("ok"));
+        removed.push(assistant_call(
+            "edit_file",
+            json!({"path": format!("src/{i}/{}.rs", "p".repeat(400))}),
+        ));
+        removed.push(tool_result("ok"));
+    }
+    let marker = static_fallback_text(&removed);
+    let chars = marker.chars().count();
+    assert!(chars <= DIGEST_TOTAL_CAP + 1, "marker is {chars} chars");
+    assert!(marker.ends_with('…'), "total cap not applied: {marker}");
+}
+
+/// Red (#2875 r2 round 3): `(failed)` and the exit code come AFTER the excerpt,
+/// so a long command still shows its outcome. #2875 asks for exit codes; the
+/// result text carries `error: command exited N`.
+#[test]
+fn fallback_marker_shows_outcome_and_exit_code_after_a_long_command() {
+    let removed = vec![
+        assistant_call(
+            "run_command",
+            json!({"command": format!("cargo test {}", "x".repeat(300))}),
+        ),
+        tool_result("error: command exited 101\nerror[E0308]: mismatched types"),
+        assistant_call("run_command", json!({"command": "make"})),
+        tool_result("error: command exited 2"),
+    ];
+    let marker = static_fallback_text(&removed);
+    assert!(
+        marker.contains("… (failed, exit 101)"),
+        "long command outcome lost: {marker}"
+    );
+    assert!(marker.contains("make (failed, exit 2)"), "{marker}");
+}
+
+/// Red (#2875 r2 round 4, finding 1): the whole-digest cap must drop the OLDEST
+/// entries, not truncate the tail. Twenty distinct ~110-char commands overflow
+/// the cap, and the commit — the newest — must survive.
+#[test]
+fn fallback_marker_total_cap_keeps_the_newest_command() {
+    let mut removed = Vec::new();
+    for i in 0..19 {
+        let cmd = format!(
+            "cargo test -p some-crate --features f{i} -- --test-threads=1 {}",
+            "p".repeat(50)
+        );
+        removed.push(assistant_call("run_command", json!({ "command": cmd })));
+        removed.push(tool_result("ok"));
+    }
+    let commit = format!("git -C repo commit -m {}", "m".repeat(85));
+    removed.push(assistant_call("run_command", json!({ "command": commit })));
+    removed.push(tool_result("committed"));
+    let marker = static_fallback_text(&removed);
+    assert!(marker.chars().count() <= 2_000 + 1, "marker over cap");
+    assert!(
+        marker.contains("git -C repo commit"),
+        "newest commit cut: {marker}"
+    );
+    assert!(
+        !marker.contains("--features f0 "),
+        "oldest command kept: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 4, finding 3): prune pass 1 rewrites an aged repeat of an
+/// identical long result to `[duplicate of message N: …]`. A retried, identical,
+/// long fence denial must not turn the write into a touched file.
+#[tokio::test]
+async fn fallback_marker_omits_a_retried_long_denial_collapsed_to_a_duplicate_marker() {
+    let denial = format!("capability denied: write to src/a.rs. {}", "x".repeat(300));
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    for _ in 0..2 {
+        msgs.push(assistant_call("edit_file", json!({"path": "src/a.rs"})));
+        msgs.push(tool_result(&denial));
+    }
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        !marker.lines().any(|l| l.starts_with("Files touched")),
+        "retried denial listed: {marker}"
+    );
+}
