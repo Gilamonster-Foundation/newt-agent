@@ -173,8 +173,16 @@ pub fn collapse_duplicate_tool_results(messages: &[Value], cfg: &PruneConfig) ->
             // so comparing against `out[first]` is comparing originals).
             Some(&first) if i < aged && out[first]["content"].as_str() == Some(content) => {
                 let n = content.chars().count();
+                // The marker keeps the failure status: a reader that sees only the
+                // pruned history (the compaction digest) must still know a
+                // repeated denial was a denial (#2875 r2 round 4).
+                let kind = if tool_result_failed(content) {
+                    "error"
+                } else {
+                    "tool"
+                };
                 let line = format!(
-                    "[duplicate of message {first}: identical {n}-char tool result elided]"
+                    "[duplicate of message {first}: identical {n}-char {kind} result elided]"
                 );
                 if json_str_len(&line) < json_str_len(content) {
                     replacements.push((i, line));
@@ -267,22 +275,24 @@ pub fn shrink_tool_call_args(messages: &[Value], cfg: &PruneConfig) -> Vec<Value
 // internals
 // ---------------------------------------------------------------------------
 
-/// A tool call paired to its result message: the tool name plus its parsed
-/// arguments (string-encoded arguments are parsed; unparseable ones → Null).
-struct PairedCall {
-    name: String,
-    args: Value,
+/// A tool call: the tool name plus its parsed arguments (string-encoded
+/// arguments are parsed; unparseable ones -> Null).
+pub(crate) struct PairedCall {
+    pub(crate) name: String,
+    pub(crate) args: Value,
 }
 
-/// For each message index, the tool call that produced it (None for
-/// non-results and orphans). Results match their assistant's `tool_calls`
-/// by `tool_call_id` when present (OpenAI dialect) or positionally (Ollama
-/// dialect, which emits `role:"tool"` results without ids).
-fn pair_tool_results(messages: &[Value]) -> Vec<Option<PairedCall>> {
-    let mut paired = Vec::with_capacity(messages.len());
-    let mut pending: Vec<(String, PairedCall)> = Vec::new();
+/// Every tool call in `messages`, in call order, with the index of the result
+/// message that answered it (`None` for an unanswered call). Results match their
+/// assistant's `tool_calls` by `tool_call_id` when present (OpenAI dialect) or
+/// positionally (Ollama dialect, which emits `role:"tool"` results without ids).
+/// A non-tool message ends the window in which a call can still be answered.
+pub(crate) fn pair_calls(messages: &[Value]) -> Vec<(PairedCall, Option<usize>)> {
+    let mut calls: Vec<(PairedCall, Option<usize>)> = Vec::new();
+    // (tool_call_id, index into `calls`) of calls still awaiting a result.
+    let mut pending: Vec<(String, usize)> = Vec::new();
 
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         let role = msg["role"].as_str().unwrap_or("");
         if role == "tool" {
             let id = msg["tool_call_id"].as_str().unwrap_or("");
@@ -291,27 +301,39 @@ fn pair_tool_results(messages: &[Value]) -> Vec<Option<PairedCall>> {
             } else {
                 pending.iter().position(|(pid, _)| pid == id)
             };
-            paired.push(pos.map(|p| pending.remove(p).1));
+            if let Some(p) = pos {
+                calls[pending.remove(p).1].1 = Some(i);
+            }
             continue;
         }
         pending.clear();
         if role == "assistant" {
-            if let Some(tcs) = msg["tool_calls"].as_array() {
-                for tc in tcs {
-                    let id = tc["id"].as_str().unwrap_or("").to_string();
-                    let name = tc["function"]["name"]
-                        .as_str()
-                        .unwrap_or("tool")
-                        .to_string();
-                    let args = match &tc["function"]["arguments"] {
-                        Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
-                        v => v.clone(),
-                    };
-                    pending.push((id, PairedCall { name, args }));
-                }
+            for tc in msg["tool_calls"].as_array().into_iter().flatten() {
+                let id = tc["id"].as_str().unwrap_or("").to_string();
+                let name = tc["function"]["name"]
+                    .as_str()
+                    .unwrap_or("tool")
+                    .to_string();
+                let args = match &tc["function"]["arguments"] {
+                    Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+                    v => v.clone(),
+                };
+                pending.push((id, calls.len()));
+                calls.push((PairedCall { name, args }, None));
             }
         }
-        paired.push(None);
+    }
+    calls
+}
+
+/// For each message index, the tool call that produced it (None for
+/// non-results and orphans).
+fn pair_tool_results(messages: &[Value]) -> Vec<Option<PairedCall>> {
+    let mut paired: Vec<Option<PairedCall>> = messages.iter().map(|_| None).collect();
+    for (call, result) in pair_calls(messages) {
+        if let Some(i) = result {
+            paired[i] = Some(call);
+        }
     }
     paired
 }
@@ -742,6 +764,9 @@ fn excerpt(s: &str, max_chars: usize) -> String {
 /// after pruning needs no third copy of either format (#2875 r2 round 3).
 #[must_use]
 pub(crate) fn tool_result_failed(content: &str) -> bool {
+    if content.starts_with("[duplicate of message ") {
+        return content.contains("-char error result elided]");
+    }
     if is_one_line_summary(content) {
         return content.contains(" -> error, ");
     }

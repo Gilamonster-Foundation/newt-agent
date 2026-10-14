@@ -1787,50 +1787,43 @@ const DIGEST_TOTAL_CAP: usize = 2_000;
 /// file-writing tools touched and the `git commit` commands run. The summary is
 /// lost when the summarizer stalls; this keeps the handful of facts a model
 /// needs to resume without re-deriving them.
+///
+/// Calls are paired to their results by `prune::pair_calls`, and a result that
+/// reports failure (raw, or already rewritten by prune) marks its call failed,
+/// so a failed write is not reported as touched. When the rendered digest is
+/// over [`DIGEST_TOTAL_CAP`], the OLDEST entries are dropped, never the tail.
 fn static_fallback_text(removed: &[Value]) -> String {
     let mut files: VecDeque<String> = VecDeque::new();
     let mut commands: VecDeque<String> = VecDeque::new();
-    // Tool results follow their calls in order, so a result pairs with the oldest
-    // unanswered call. A result that reports failure marks its call failed, so a
-    // failed write is not reported as touched (#2875 r2).
-    let mut pending: VecDeque<(String, Value)> = VecDeque::new();
-    for m in removed {
-        match m["role"].as_str() {
-            Some("assistant") => {
-                for call in m["tool_calls"].as_array().into_iter().flatten() {
-                    let func = &call["function"];
-                    // `arguments` may be a JSON object (Ollama) or a JSON string (OpenAI).
-                    let args = match func["arguments"].as_str() {
-                        Some(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
-                        None => func["arguments"].clone(),
-                    };
-                    let name = func["name"].as_str().unwrap_or_default().to_string();
-                    pending.push_back((name, args));
-                }
-            }
-            Some("tool") => {
-                if let Some((name, args)) = pending.pop_front() {
-                    let result = m["content"].as_str();
-                    record_digest_call(&name, &args, result, &mut files, &mut commands);
-                }
-            }
-            _ => {}
+    for (call, result) in crate::prune::pair_calls(removed) {
+        let result = result.and_then(|i| removed[i]["content"].as_str());
+        record_digest_call(&call.name, &call.args, result, &mut files, &mut commands);
+    }
+    let render = |files: &VecDeque<String>, commands: &VecDeque<String>| {
+        let mut out = format!(
+            "Summary generation was unavailable. {} message(s) were removed.",
+            removed.len()
+        );
+        if !files.is_empty() {
+            out.push_str(&format!("\nFiles touched: {}", join_deque(files, ", ")));
         }
+        if !commands.is_empty() {
+            out.push_str(&format!("\nCommands: {}", join_deque(commands, "; ")));
+        }
+        out
+    };
+    let mut out = render(&files, &commands);
+    while out.chars().count() > DIGEST_TOTAL_CAP && !(files.is_empty() && commands.is_empty()) {
+        // Drop the oldest entry of whichever list is the longer rendering.
+        let longer = if join_deque(&files, ", ").len() > join_deque(&commands, "; ").len() {
+            &mut files
+        } else {
+            &mut commands
+        };
+        longer.pop_front();
+        out = render(&files, &commands);
     }
-    for (name, args) in pending {
-        record_digest_call(&name, &args, None, &mut files, &mut commands);
-    }
-    let mut out = format!(
-        "Summary generation was unavailable. {} message(s) were removed.",
-        removed.len()
-    );
-    if !files.is_empty() {
-        out.push_str(&format!("\nFiles touched: {}", join_deque(&files, ", ")));
-    }
-    if !commands.is_empty() {
-        out.push_str(&format!("\nCommands: {}", join_deque(&commands, "; ")));
-    }
-    excerpt(&out, DIGEST_TOTAL_CAP)
+    out
 }
 
 fn join_deque(items: &VecDeque<String>, sep: &str) -> String {
