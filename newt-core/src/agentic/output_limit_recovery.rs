@@ -40,3 +40,42 @@ impl Recovery {
         self.consecutive = 0;
     }
 }
+
+/// The cap for the retry after a capped request: doubled, clamped to the
+/// ceiling, and `None` when that would not raise it (already at the ceiling,
+/// or a zero cap that doubling cannot move).
+pub(super) fn next_cap(_cap: u32, _ceiling: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_cap;
+
+    #[test]
+    fn next_cap_doubles_within_the_ceiling() {
+        assert_eq!(next_cap(1_000, 16_384), Some(2_000));
+    }
+
+    #[test]
+    fn next_cap_clamps_to_the_ceiling() {
+        assert_eq!(next_cap(10_000, 16_384), Some(16_384));
+    }
+
+    #[test]
+    fn next_cap_at_or_above_the_ceiling_does_not_raise() {
+        assert_eq!(next_cap(16_384, 16_384), None);
+        assert_eq!(next_cap(20_000, 16_384), None);
+    }
+
+    #[test]
+    fn next_cap_saturates_instead_of_overflowing() {
+        assert_eq!(next_cap(u32::MAX - 1, u32::MAX), Some(u32::MAX));
+        assert_eq!(next_cap(u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn next_cap_zero_cannot_move() {
+        assert_eq!(next_cap(0, 16_384), None);
+    }
+}
