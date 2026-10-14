@@ -35,7 +35,7 @@ on:
   push:
     branches: ["main", "feat/**", "fix/**", "step-*", "release/**"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "release/**"]
 
 env:
   RUST_BACKTRACE: 1
