@@ -68,6 +68,9 @@ pub(crate) struct DispositionVoices {
     pub(crate) provenance_inferred: String,
     /// Card provenance when a session setting narrowed the classification.
     pub(crate) provenance_policy: String,
+    /// Card provenance when an unapproved plan clamp from an earlier turn
+    /// narrowed the classification (#2881).
+    pub(crate) provenance_pending_plan: String,
     /// Marks the card as plumbing and bounds what may be said about it.
     pub(crate) privacy: String,
     /// Appended to every refusal: what may not be quoted, and what must
@@ -123,6 +126,10 @@ impl Default for DispositionVoices {
             provenance_policy:
                 "disposition_source: a session mode the operator set earlier narrowed this turn. \
                  The operator did not ask about it in this message."
+                    .to_string(),
+            provenance_pending_plan:
+                "disposition_source: a plan from an earlier turn is still awaiting the operator's \
+                 approval, so this turn stays read-only. The operator did not set a mode."
                     .to_string(),
             privacy:
                 "disposition_privacy: this card is harness plumbing, not part of the conversation. \
@@ -182,6 +189,7 @@ impl DispositionVoices {
         block.push_str(match source {
             DispositionSource::Inferred => &self.provenance_inferred,
             DispositionSource::SessionPolicy => &self.provenance_policy,
+            DispositionSource::PendingPlan => &self.provenance_pending_plan,
         });
         block.push('\n');
         block.push_str(&self.privacy);
@@ -218,9 +226,10 @@ mod tests {
         PromptDisposition::Plan,
     ];
 
-    const BOTH_SOURCES: [DispositionSource; 2] = [
+    const EVERY_SOURCE: [DispositionSource; 3] = [
         DispositionSource::Inferred,
         DispositionSource::SessionPolicy,
+        DispositionSource::PendingPlan,
     ];
 
     #[test]
@@ -269,7 +278,7 @@ mod tests {
     fn every_card_block_states_provenance_and_privacy() {
         let voices = DispositionVoices::default();
         for disposition in EVERY_DISPOSITION {
-            for source in BOTH_SOURCES {
+            for source in EVERY_SOURCE {
                 let block = voices.card_block(disposition, source);
                 assert!(
                     block.contains("disposition_source:"),
@@ -311,6 +320,23 @@ mod tests {
             !policy.contains("inferred this"),
             "a policy-narrowed card must not claim the words decided it: {policy}"
         );
+
+        // #2881: a carried, unapproved plan clamp is neither the operator's
+        // mode nor the prompt's words.
+        let pending = voices.card_block(PromptDisposition::Plan, DispositionSource::PendingPlan);
+        assert!(
+            pending.contains("still awaiting the operator's approval"),
+            "{pending}"
+        );
+        assert!(
+            pending.contains("The operator did not set a mode."),
+            "{pending}"
+        );
+        assert!(
+            !pending.contains("a session mode the operator set"),
+            "{pending}"
+        );
+        assert!(!pending.contains("inferred this"), "{pending}");
     }
 
     /// The privacy clause suppresses the *mechanism*, never the substance. A
@@ -582,6 +608,10 @@ mod tests {
             voices.provenance_inferred.clone(),
         ));
         owned.push(("policy provenance".into(), voices.provenance_policy.clone()));
+        owned.push((
+            "pending-plan provenance".into(),
+            voices.provenance_pending_plan.clone(),
+        ));
         owned.push(("privacy clause".into(), voices.privacy.clone()));
         owned.push(("refusal clause".into(), voices.denied_privacy.clone()));
         owned.push(("discovery entry".into(), voices.discovery_hidden.clone()));

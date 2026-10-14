@@ -758,8 +758,11 @@ fn attribute_carried_plan_clamp(
     configured: OperatingMode,
     plan_mode_active: bool,
 ) {
-    // Red (#2881): not yet implemented.
-    let _ = (intake, configured, plan_mode_active);
+    // The operator chose a Plan clamp only via `/mode plan`; any other
+    // configured mode under an active clamp means the model armed it.
+    if plan_mode_active && configured != OperatingMode::Plan {
+        intake.attribute_narrowing_to_pending_plan();
+    }
 }
 
 /// What a clarification-reply classifier read a non-explicit reply as
