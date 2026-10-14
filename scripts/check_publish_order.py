@@ -160,7 +160,8 @@ def _compare(op, major, minor, patch, pre, ver):
         return (
             vmaj == major
             and minor in (None, vmin)
-            and (op == "*" or (patch in (None, vpat) and vpre == pre))
+            and patch in (None, vpat)
+            and vpre == pre  # a wildcard, too, excludes prereleases on its own
         )
     if op in (">", "<"):
         sign = 1 if op == ">" else -1
@@ -176,16 +177,14 @@ def _compare(op, major, minor, patch, pre, ver):
         )
     if vmaj != major:
         return False
-    if minor is None:
-        return True
     if op == "~":
-        if vmin != minor:
+        if minor is not None and vmin != minor:
             return False
-        if patch is None:
-            return True
-        if vpat != patch:
+        if patch is not None and vpat != patch:
             return vpat > patch
     else:  # caret: compatible up to the leftmost non-zero component
+        if minor is None:
+            return True  # `^1` is the one partial form with no prerelease rule
         if patch is None:
             return vmin >= minor if major > 0 else vmin == minor
         if vmin != minor:

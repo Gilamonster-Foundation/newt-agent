@@ -181,6 +181,25 @@ class GitDependencies(unittest.TestCase):
         ):
             self.assertEqual(req_matches(req, version), ok, (req, version))
 
+    def test_each_comparator_keeps_its_own_prerelease_rule(self):
+        """A wildcard or partial tilde rejects a prerelease on its own; another
+        comparator naming that prerelease cannot rescue it (PR #2871 r2 P2-1).
+        Expected values are `semver::VersionReq::matches` 1.0.28."""
+        for req, version, ok in (
+            ("1.*, >=1.2.3-alpha", "1.2.3-alpha", False),
+            ("~1.2, >=1.2.3-alpha", "1.2.3-alpha", False),
+            ("1.2.*, >=1.2.3-alpha", "1.2.3-alpha", False),
+            ("~1, >=1.2.3-alpha", "1.2.3-alpha", False),
+            ("=1.2, >=1.2.3-alpha", "1.2.3-alpha", False),
+            # Partial carets have no prerelease restriction of their own.
+            ("^1.2, >=1.2.3-alpha", "1.2.3-alpha", True),
+            ("^1, >=1.2.3-alpha", "1.2.3-alpha", True),
+            ("~1.2.3-alpha", "1.2.3-alpha", True),
+        ):
+            self.assertEqual(req_matches(req, version), ok, (req, version))
+        deps = [("app", "newtui", "1.*, >=1.2.3-alpha")]
+        self.assertTrue(registry_gaps(deps, lambda _: ["1.2.3-alpha"]))
+
     def test_build_metadata_is_ignored(self):
         self.assertTrue(req_matches("^0.1.0", "0.1.0+build.1"))
         self.assertTrue(req_matches("=0.1.0", "0.1.0+build.1"))
