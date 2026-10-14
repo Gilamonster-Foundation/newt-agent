@@ -9,6 +9,47 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+## [0.8.1] — unreleased
+
+### Security
+
+- Bumps `rustls` to 0.23.46, which fixes RUSTSEC-2026-0346 through 0349. The
+  fixes cover TLS secrets leaking through `Debug` output, early application
+  data sent after an ECH rejection, a 1 GiB allocation from Brotli certificate
+  decompression before authentication, and a classical key-exchange downgrade
+  from an unauthenticated ServerHello (#2889).
+
+### Fixed
+
+- Commands run by `run_command` no longer inherit `NEWT_CONFIG_DIR` or
+  `NEWT_CONFIG`. Your code under test, and any nested `newt`, now resolve their
+  own configuration. To keep a config redirect in a nested `newt`, pass
+  `--config-dir` explicitly (#2887).
+- A host-shell command that times out now kills its whole process group, not
+  just the direct `bash`, so no orphaned children keep running. Output printed
+  before the timeout is kept, and the result carries a timed-out note (#2892).
+- Context compaction no longer stalls on a slow summarizer. The summary request
+  streams, so the timeout bounds the gap between frames rather than the whole
+  generation (#2878).
+- When compaction falls back to its static marker, the marker now keeps a
+  digest of the removed work: touched files, and failed commands with their
+  exit codes. The newest entries survive if the digest has to be trimmed (#2878).
+- When an unapproved plan from an earlier turn keeps the next turn read-only, the
+  model is now told that a plan is awaiting approval. Before, it was told the
+  operator had set a session mode (#2895).
+
+### Release/CI
+
+- CI now gates pull requests to `release/**` the same way it gates PRs to
+  `main`, so backport PRs get full checks before merge (#2888).
+- Every registry publish job now waits for every release gate, so a failing gate
+  holds crates.io, npm and PyPI together (#2891). An npm trust/auth preflight is
+  still to come (#2873).
+- The release preflight fails when a published crate depends on a git
+  dependency that is not on crates.io (#2871).
+- Config tests pin `NEWT_CONFIG_DIR`, so they pass when run under newt
+  (#2877).
+
 ## [0.8.0] — 2026-10-12
 
 ### Fixed — release blockers found by the first v0.8.0 publish run
