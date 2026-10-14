@@ -14,9 +14,10 @@ use std::time::Duration;
 // 2026-09-08), and the pair at lines 72 and 128 failed there while passing on
 // the same commit in the uninstrumented job. Widening a hang-guard weakens no
 // assertion in this file -- the one real latency bound is the separate
-// `Duration::from_secs(1)` below, which is unchanged. The sibling comment at
-// "not required to beat a short timer on a contended test machine" records the
-// same lesson for a wait that was fixed by pausing the clock instead.
+// `Duration::from_secs(1)` below, which is unchanged. These tests keep real
+// time: pausing the clock was tried on the idle-poll test and it hung past 60 s
+// (the poll blocks in the injected clock until the worker checkpoints). The idle
+// bound itself is always the injected fake clock, never a sleep.
 const WATCHDOG: Duration = Duration::from_secs(60);
 
 #[tokio::test]

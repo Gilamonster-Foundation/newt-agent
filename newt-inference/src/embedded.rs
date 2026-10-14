@@ -160,9 +160,11 @@ impl EmbeddedBackend {
         self.model
     }
 
-    /// Complete with a budget covering admission, model loading and generation.
-    /// Returning on timeout or dropping this future signals cooperative worker
-    /// cancellation; one synchronous load/forward may still be finishing.
+    /// Complete with an idle bound: `timeout` limits the time since the last
+    /// progress checkpoint (admission, model loading and generation each make
+    /// progress), not the total elapsed time. Returning on timeout or dropping
+    /// this future signals cooperative worker cancellation; one synchronous
+    /// load/forward may still be finishing.
     ///
     /// # Errors
     /// An unrepresentable or expired deadline, busy worker, or inference error.

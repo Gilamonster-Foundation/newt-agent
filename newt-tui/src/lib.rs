@@ -2733,10 +2733,6 @@ fn summarizer_notice(msg: String) -> newt_core::tty::Notice<'static> {
     newt_core::tty::Notice::new(newt_core::tty::Level::Warn, "", msg)
 }
 
-/// Total attempt bound as a multiple of `timeout_secs` (mirrors the main
-/// stream path's `STREAM_TOTAL_TIMEOUT_MULTIPLIER`).
-const SUMMARY_TOTAL_TIMEOUT_MULTIPLIER: u32 = 5;
-
 /// One summary attempt: send, check status, parse the content.
 async fn summarize_attempt(
     client: &reqwest::Client,
@@ -2896,8 +2892,8 @@ async fn summarize_one_model(
         // The idle bound above restarts on every frame, so a server drip-feeding
         // keep-alives would hold compaction forever. Cap the attempt's total at
         // a multiple of it, as the main stream path does (local.rs).
-        let total =
-            std::time::Duration::from_secs(opts.timeout_secs) * SUMMARY_TOTAL_TIMEOUT_MULTIPLIER;
+        let total = std::time::Duration::from_secs(opts.timeout_secs)
+            * newt_inference::local::STREAM_TOTAL_TIMEOUT_MULTIPLIER;
         let attempt_result = tokio::time::timeout(
             total,
             summarize_attempt(&client, &chat_url, &body, api_key, openai),
@@ -2987,8 +2983,10 @@ fn failing_summarizer(msg: String) -> newt_core::Summarizer {
 
 /// Build the in-process candle summarizer (#661 group C). Backend metadata is
 /// shared across calls; each call loads its GGUF on a bounded blocking worker.
-/// The configured per-request timeout covers loading and generation, with
-/// cooperative cancellation between synchronous steps. Falls back to a failing
+/// The configured per-request `timeout_secs` bounds the gap between progress
+/// events (a checkpoint while loading or generating), not the whole attempt, so
+/// a generation that keeps progressing is not cut off. Cooperative cancellation
+/// happens between synchronous steps. Falls back to a failing
 /// summarizer (→ static marker) when the model file is missing or the build lacks
 /// the `embedded` feature.
 #[cfg_attr(not(feature = "embedded"), allow(unused_variables))]

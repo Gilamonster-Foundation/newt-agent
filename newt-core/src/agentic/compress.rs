@@ -1845,7 +1845,7 @@ fn push_newest(list: &mut VecDeque<String>, entry: String) {
 }
 
 /// The `N` of the tool layer's `error: command exited N` (#2875 r2 round 3).
-fn exit_code_of(result: &str) -> Option<i32> {
+pub(crate) fn exit_code_of(result: &str) -> Option<i32> {
     let rest = result.trim_start().strip_prefix("error: command exited ")?;
     let digits: String = rest
         .chars()

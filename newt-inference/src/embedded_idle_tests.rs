@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // Deterministic idle-bound tests (#2875). The clock is fake and advances only
-// inside the fixture generate, so nothing sleeps. The bound is idle time since
-// the last checkpoint, not total elapsed time.
+// inside the fixture generate, so no test waits on the idle bound itself. The
+// bound is idle time since the last checkpoint, not total elapsed time.
 const IDLE_BOUND: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -80,6 +80,11 @@ async fn idle_bound_fails_a_generation_silent_past_the_bound() {
 /// the poll sees `last = 0`, idle 13 s, and fails a generation that just
 /// progressed. Worker-thread reads return the current fake time without
 /// counting, so only the poll's samples advance the script.
+///
+/// Real time, on purpose. The first poll costs one real 50 ms `IDLE_POLL` tick.
+/// Pausing the clock was tried and hangs: the poll thread blocks inside the
+/// injected clock until the blocking worker checkpoints, so tokio's paused-time
+/// auto-advance and the worker's std-channel handshake wait on each other.
 #[tokio::test]
 async fn idle_poll_samples_the_clock_before_the_progress_mark() {
     let clock = FakeClock::new();
