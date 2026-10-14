@@ -313,3 +313,32 @@ fn fallback_marker_caps_oversized_digest() {
     assert!(chars <= 2_000 + 1, "marker is {chars} chars");
     assert!(marker.contains("git commit -m"), "commit entry missing");
 }
+
+/// Red (#2875 r2, finding 5): Git global options must not hide a commit.
+#[test]
+fn fallback_marker_lists_git_option_commit() {
+    let removed = vec![assistant_call(
+        "run_command",
+        json!({"command": "git -C repo commit -m fix"}),
+    )];
+    let marker = static_fallback_text(&removed);
+    assert!(
+        marker.contains("git -C repo commit -m fix"),
+        "commit missing: {marker}"
+    );
+}
+
+/// Red (#2875 r2, finding 5): a write whose tool result reports failure must
+/// not be listed as a file touched.
+#[test]
+fn fallback_marker_omits_failed_write() {
+    let removed = vec![
+        assistant_call("edit_file", json!({"path": "src/a.rs"})),
+        tool_result("error: permission denied"),
+    ];
+    let marker = static_fallback_text(&removed);
+    assert!(
+        !marker.contains("src/a.rs"),
+        "failed write reported as touched: {marker}"
+    );
+}

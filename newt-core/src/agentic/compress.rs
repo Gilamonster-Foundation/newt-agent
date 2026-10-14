@@ -1788,37 +1788,35 @@ const DIGEST_TOTAL_CAP: usize = 2_000;
 /// needs to resume without re-deriving them.
 fn static_fallback_text(removed: &[Value]) -> String {
     let mut files: Vec<String> = Vec::new();
-    let mut commits: Vec<String> = Vec::new();
-    for m in removed
-        .iter()
-        .filter(|m| m["role"].as_str() == Some("assistant"))
-    {
-        for call in m["tool_calls"].as_array().into_iter().flatten() {
-            let func = &call["function"];
-            // `arguments` may be a JSON object (Ollama) or a JSON string (OpenAI).
-            let args = match func["arguments"].as_str() {
-                Some(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
-                None => func["arguments"].clone(),
-            };
-            match func["name"].as_str() {
-                Some("edit_file") | Some("write_file") => {
-                    if let Some(p) = args["path"].as_str() {
-                        if !files.iter().any(|f| f == p) {
-                            files.push(p.to_string());
-                        }
-                    }
+    let mut commands: Vec<String> = Vec::new();
+    // Tool results follow their calls in order. A result that reports an error
+    // marks its call failed, so a failed write is not reported as touched (#2875 r2).
+    let mut pending: std::collections::VecDeque<(String, Value)> = Default::default();
+    for m in removed {
+        match m["role"].as_str() {
+            Some("assistant") => {
+                for call in m["tool_calls"].as_array().into_iter().flatten() {
+                    let func = &call["function"];
+                    // `arguments` may be a JSON object (Ollama) or a JSON string (OpenAI).
+                    let args = match func["arguments"].as_str() {
+                        Some(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+                        None => func["arguments"].clone(),
+                    };
+                    let name = func["name"].as_str().unwrap_or_default().to_string();
+                    pending.push_back((name, args));
                 }
-                Some("run_command") => {
-                    if let Some(c) = args["command"]
-                        .as_str()
-                        .filter(|c| c.contains("git commit"))
-                    {
-                        commits.push(c.to_string());
-                    }
-                }
-                _ => {}
             }
+            Some("tool") => {
+                let failed = m["content"].as_str().is_some_and(is_error_result);
+                if let Some((name, args)) = pending.pop_front() {
+                    record_digest_call(&name, &args, failed, &mut files, &mut commands);
+                }
+            }
+            _ => {}
         }
+    }
+    for (name, args) in pending {
+        record_digest_call(&name, &args, false, &mut files, &mut commands);
     }
     let mut out = format!(
         "Summary generation was unavailable. {} message(s) were removed.",
@@ -1838,10 +1836,47 @@ fn static_fallback_text(removed: &[Value]) -> String {
     if !files.is_empty() {
         out.push_str(&line("Files touched", &files, ", "));
     }
-    if !commits.is_empty() {
-        out.push_str(&line("Commands", &commits, "; "));
+    if !commands.is_empty() {
+        out.push_str(&line("Commands", &commands, "; "));
     }
     excerpt(&out, DIGEST_TOTAL_CAP)
+}
+
+/// Record one digest call: a write (`edit_file`/`write_file`) that succeeded
+/// names its path as touched; any other command is listed generically with
+/// `(failed)` when its result reported an error (#2875 r2, finding 5).
+fn record_digest_call(
+    name: &str,
+    args: &Value,
+    failed: bool,
+    files: &mut Vec<String>,
+    commands: &mut Vec<String>,
+) {
+    match name {
+        "edit_file" | "write_file" => {
+            if let (false, Some(p)) = (failed, args["path"].as_str()) {
+                if !files.iter().any(|f| f == p) {
+                    files.push(p.to_string());
+                }
+            }
+        }
+        "run_command" => {
+            if let Some(c) = args["command"].as_str() {
+                let tag = if failed { " (failed)" } else { "" };
+                commands.push(format!("{c}{tag}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a tool result reports failure. Matches the leading `error:` marker
+/// the tool layer emits (case-insensitive).
+fn is_error_result(content: &str) -> bool {
+    content
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("error")
 }
 
 /// Wrap a summary body in the compaction markers as a `user` message.
