@@ -9,7 +9,8 @@ use super::display;
 use super::tools;
 use super::CompletedSpillRenderer;
 use std::io;
-/// True when a backend 400 says the model can't accept a `tools` field./// Ollama phrases it `"<model> does not support tools"`; OpenAI-compatible
+/// True when a backend 400 says the model can't accept a `tools` field.
+/// Ollama phrases it `"<model> does not support tools"`; OpenAI-compatible
 /// servers vary, so we also accept the looser `"not support tools"`. Used to
 /// drop tools and retry once, then keep them off for the turn (deepseek-r1).
 pub(super) fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
