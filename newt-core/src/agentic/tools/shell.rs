@@ -2308,9 +2308,12 @@ fn host_shell_command_at(
 }
 
 /// Kills the child's process group when dropped, unless [`Self::disarm`]ed by
-/// a normal finish. The one owner of every other exit — the wall, a failed
-/// pipe read, and the tool future being dropped on a user interrupt — so no
-/// exit can leave the group running (#2882).
+/// a normal finish. It owns the wall, a failed pipe read, and the tool future
+/// being dropped on a user interrupt, so none of those leaves the in-group
+/// descendants running (#2882). It is sound only while the group leader is
+/// unreaped: [`supervise_host_child`] reaps the leader as its last step and
+/// disarms in that same step, so the pgid it kills cannot have been reused.
+/// Descendants that leave the group are out of its reach.
 #[cfg(not(windows))]
 struct KillGroupOnDrop<K: FnOnce()>(Option<K>);
 
@@ -2333,9 +2336,11 @@ impl<K: FnOnce()> Drop for KillGroupOnDrop<K> {
 /// The host-shell supervisor, behind a seam the unit tier can drive without
 /// spawning (#2882): `wait` resolves to the child's exit code, `kill_tree`
 /// kills the child's whole process group, and the two readers are its pipes.
-/// Every exit but a normal finish kills the group ([`KillGroupOnDrop`]). On
-/// the wall's expiry the output already drained is KEPT, so the model sees
-/// what ran before the kill.
+/// Every exit but a normal finish kills the group ([`KillGroupOnDrop`]). The
+/// pipes are drained before `wait` is polled, so the leader stays unreaped
+/// (and its pgid reserved) for as long as the guard can fire. On the wall's
+/// expiry the output already drained is KEPT, so the model sees what ran
+/// before the kill.
 #[cfg(not(windows))]
 pub(super) async fn supervise_host_child<W, K, O, E>(
     wait: W,
@@ -2354,9 +2359,13 @@ where
     let guard = KillGroupOnDrop(Some(kill_tree));
     let mut out = Vec::new();
     let mut err = Vec::new();
+    // Drain both pipes BEFORE reaping the leader. An unreaped (zombie) leader
+    // is still a member of its group, so its pgid cannot be reused while the
+    // guard is armed; reaping it first and killing later could signal an
+    // unrelated group that took the number. `wait` is polled only once the
+    // pipes close, and the guard disarms in the same step that reaps.
     let completed = async {
-        let (code, (), ()) = tokio::try_join!(
-            wait,
+        tokio::try_join!(
             drain_host_pipe(
                 stdout,
                 &mut out,
@@ -2370,7 +2379,7 @@ where
                 crate::agentic::ToolOutputStream::Stderr
             ),
         )?;
-        Ok::<_, std::io::Error>(code)
+        wait.await
     };
     // Bound so `completed` (which borrows the buffers) drops before they are
     // read back, whether it finished or the wall fired.
@@ -2391,6 +2400,9 @@ where
             // `kill_on_drop` kills only the direct child; descendants in its
             // group would survive as orphans. Kill the whole group (#2882).
             drop(guard);
+            if !err.is_empty() && !err.ends_with(b"\n") {
+                err.push(b'\n');
+            }
             err.extend_from_slice(
                 format!(
                     "command exceeded {}s host-shell timeout and was killed\n",
@@ -2564,6 +2576,9 @@ async fn supervise_windows_shell(
         }),
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => {
+            if !err.is_empty() && !err.ends_with(b"\n") {
+                err.extend_from_slice(b"\r\n");
+            }
             err.extend_from_slice(
                 format!(
                     "command exceeded {}s host-shell timeout and was killed\r\n",
