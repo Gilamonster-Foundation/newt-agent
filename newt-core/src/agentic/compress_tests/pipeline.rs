@@ -255,3 +255,68 @@ async fn fallback_marker_names_touched_files_and_commits() {
         "names the commit: {summary}"
     );
 }
+
+/// Red (#2875 r2, finding 2): the fallback digest must pass through the same
+/// redaction as the summarizer input — a credential in a command prefix must
+/// not reach the marker.
+#[tokio::test]
+async fn fallback_marker_redacts_secrets_in_commands() {
+    let token = format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    msgs.push(assistant_call(
+        "run_command",
+        json!({"command": format!("GH_TOKEN={token} git commit -m fix")}),
+    ));
+    msgs.push(tool_result("committed"));
+    for i in 0..10 {
+        msgs.push(user(&format!("filler {i} {}", "z".repeat(4_000))));
+        msgs.push(assistant_call("run_command", json!({"command": "ls"})));
+        msgs.push(tool_result(&"z".repeat(4_000)));
+    }
+    let before = estimate_tokens(&msgs, EST);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let s = failing_summarizer(calls);
+    let mut state = CompressState::new();
+    let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
+    let marker = out
+        .messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("Summary generation was unavailable."))
+        .unwrap_or_else(|| panic!("no marker"));
+    assert!(!marker.contains(&token), "secret leaked: {marker}");
+}
+
+/// Red (#2875 r2, finding 3): one oversized commit message must not inflate
+/// the marker — each entry and the whole digest are capped.
+#[tokio::test]
+async fn fallback_marker_caps_oversized_digest() {
+    let huge = "m".repeat(200_000);
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    msgs.push(assistant_call(
+        "run_command",
+        json!({"command": format!("git commit -m {huge}")}),
+    ));
+    msgs.push(tool_result("committed"));
+    for i in 0..10 {
+        msgs.push(user(&format!("filler {i} {}", "z".repeat(4_000))));
+        msgs.push(assistant_call("run_command", json!({"command": "ls"})));
+        msgs.push(tool_result(&"z".repeat(4_000)));
+    }
+    let before = estimate_tokens(&msgs, EST);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let s = failing_summarizer(calls);
+    let mut state = CompressState::new();
+    let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
+    let marker = out
+        .messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("Summary generation was unavailable."))
+        .unwrap_or_else(|| panic!("no marker"));
+    assert!(
+        marker.chars().count() < 2_000,
+        "marker is {} chars",
+        marker.chars().count()
+    );
+}
