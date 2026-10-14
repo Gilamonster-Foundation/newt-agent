@@ -84,3 +84,45 @@ fn host_timeout_result_carries_the_confined_timed_out_note() {
         "{text}"
     );
 }
+
+/// Grounds [`host_timeout_kills_the_group_and_keeps_partial_output`]: that
+/// mocked test believes the kill closure `run_one` hands the supervisor really
+/// reaps a backgrounded grandchild, and that output printed before the wall
+/// survives. This spawns a real `sh` tree and checks both. It does not touch
+/// the process environment.
+#[cfg(unix)]
+#[ignore = "real process tree; grounds host_timeout_kills_the_group_and_keeps_partial_output (#2882)"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_host_timeout_leaves_no_survivor_in_the_group() {
+    let run = super::shell::host_shell_output_with_timeout(
+        super::shell::ShellRoute::BashSh,
+        "echo pgid=$(ps -o pgid= -p $$ | tr -d ' '); sleep 600 & echo started; wait",
+        ".",
+        None,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert!(run.timed_out);
+    let stdout = super::shell::decode_shell_stream(&run.stdout);
+    assert!(stdout.contains("started"), "{stdout}");
+    let pgid: i32 = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("pgid="))
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no pgid in {stdout}"));
+    // killpg(pgid, 0) is a liveness probe: ESRCH means no member survives.
+    let mut alive = true;
+    for _ in 0..50 {
+        // SAFETY: signal 0 delivers nothing; it only checks existence.
+        alive = unsafe { libc::killpg(pgid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !alive,
+        "process group {pgid} still has members after the timeout"
+    );
+}

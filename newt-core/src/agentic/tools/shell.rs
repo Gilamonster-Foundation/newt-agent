@@ -1942,7 +1942,6 @@ pub(super) fn host_result(
     render: impl FnOnce(&serde_json::Value) -> String,
     command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
-    let _ = command_budget;
     let outcome = match envelope_outcome(envelope) {
         ExecOutcome::Failed
             if envelope
@@ -1956,7 +1955,20 @@ pub(super) fn host_result(
         }
         outcome => outcome,
     };
-    (render(envelope), outcome)
+    let mut text = render(envelope);
+    // The same note, from the same owner, the confined route appends (#2882).
+    if outcome == ExecOutcome::TimedOut {
+        if let Some(secs) = envelope
+            .get("timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+        {
+            text.push_str(&timed_out_note(
+                std::time::Duration::from_secs(secs),
+                command_budget,
+            ));
+        }
+    }
+    (text, outcome)
 }
 
 /// How the host shells [`host_shell_output`] runs (bash, else sh) name a
@@ -2139,8 +2151,9 @@ async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
 /// shell ran, so [`venv_cmd_prefix`]'s `export …;` prefix works unchanged.
 ///
 /// Hardened (#297) so a hung child can never wedge the turn:
-/// - `kill_on_drop(true)` + `process_group(0)` (own process group) so the whole
-///   child *tree* dies when we drop the handle, not just the immediate `bash`.
+/// - `kill_on_drop(true)` + `process_group(0)` (own process group); on timeout
+///   [`supervise_host_child`] `killpg`s the whole group, because
+///   `kill_on_drop` alone reaps only the immediate `bash` (#2882).
 /// - stdin redirected from `/dev/null` so a child that reads stdin sees EOF
 ///   instead of blocking forever waiting on a tty the agent can't feed.
 /// - a [`host_exec_timeout`] wall-clock ceiling: on expiry the child is killed
@@ -2309,7 +2322,6 @@ where
     O: tokio::io::AsyncRead + Unpin,
     E: tokio::io::AsyncRead + Unpin,
 {
-    let _ = kill_tree;
     let mut out = Vec::new();
     let mut err = Vec::new();
     let completed = async {
@@ -2330,7 +2342,10 @@ where
         )?;
         Ok::<_, std::io::Error>(code)
     };
-    match tokio::time::timeout(timeout, completed).await {
+    // Bound so `completed` (which borrows the buffers) drops before they are
+    // read back, whether it finished or the wall fired.
+    let result = tokio::time::timeout(timeout, completed).await;
+    match result {
         Ok(Ok(exit_code)) => Ok(HostShellRun {
             exit_code,
             stdout: out,
@@ -2338,16 +2353,24 @@ where
             timed_out: false,
         }),
         Ok(Err(e)) => Err(e),
-        Err(_elapsed) => Ok(HostShellRun {
-            exit_code: 124,
-            stdout: Vec::new(),
-            stderr: format!(
-                "command exceeded {}s host-shell timeout and was killed\n",
-                timeout.as_secs()
-            )
-            .into_bytes(),
-            timed_out: true,
-        }),
+        Err(_elapsed) => {
+            // `kill_on_drop` reaps only the direct child; descendants in its
+            // group would survive as orphans. Kill the whole group (#2882).
+            kill_tree();
+            err.extend_from_slice(
+                format!(
+                    "command exceeded {}s host-shell timeout and was killed\n",
+                    timeout.as_secs()
+                )
+                .as_bytes(),
+            );
+            Ok(HostShellRun {
+                exit_code: 124,
+                stdout: out,
+                stderr: err,
+                timed_out: true,
+            })
+        }
     }
 }
 
@@ -2497,7 +2520,8 @@ async fn supervise_windows_shell(
         )?;
         Ok::<_, std::io::Error>(status)
     };
-    match tokio::time::timeout(timeout, completed).await {
+    let result = tokio::time::timeout(timeout, completed).await;
+    match result {
         Ok(Ok(status)) => Ok(HostShellRun {
             exit_code: status.code().unwrap_or(-1) as i64,
             stdout: out,
@@ -2505,16 +2529,21 @@ async fn supervise_windows_shell(
             timed_out: false,
         }),
         Ok(Err(e)) => Err(e),
-        Err(_elapsed) => Ok(HostShellRun {
-            exit_code: 124,
-            stdout: Vec::new(),
-            stderr: format!(
-                "command exceeded {}s host-shell timeout and was killed\r\n",
-                timeout.as_secs()
-            )
-            .into_bytes(),
-            timed_out: true,
-        }),
+        Err(_elapsed) => {
+            err.extend_from_slice(
+                format!(
+                    "command exceeded {}s host-shell timeout and was killed\r\n",
+                    timeout.as_secs()
+                )
+                .as_bytes(),
+            );
+            Ok(HostShellRun {
+                exit_code: 124,
+                stdout: out,
+                stderr: err,
+                timed_out: true,
+            })
+        }
     }
 }
 
