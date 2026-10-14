@@ -25,15 +25,18 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   `NEWT_CONFIG`. Your code under test, and any nested `newt`, now resolve their
   own configuration. To keep a config redirect in a nested `newt`, pass
   `--config-dir` explicitly (#2887).
-- A host-shell command that times out now kills its whole process group, not
-  just the direct `bash`, so no orphaned children keep running. Output printed
-  before the timeout is kept, and the result carries a timed-out note (#2892).
+- On Linux and macOS, a host-shell command that times out or is interrupted now
+  kills its whole process group, not just the direct `bash`. Output already
+  captured is kept, and a timeout carries a timed-out note. Descendants that
+  leave the group can survive, and on Windows the `cmd` route still kills only
+  `cmd.exe` (#2892).
 - Context compaction no longer stalls on a slow summarizer. The summary request
   streams, so the timeout bounds the gap between frames rather than the whole
-  generation (#2878).
+  generation; one attempt is still capped at five times the timeout (#2878).
 - When compaction falls back to its static marker, the marker now keeps a
-  digest of the removed work: touched files, and failed commands with their
-  exit codes. The newest entries survive if the digest has to be trimmed (#2878).
+  digest of the removed work: touched files, and the commands run, with exit
+  codes for failures. The newest entries survive if the digest has to be
+  trimmed (#2878).
 - When an unapproved plan from an earlier turn keeps the next turn read-only, the
   model is now told that a plan is awaiting approval. Before, it was told the
   operator had set a session mode (#2895).
