@@ -104,12 +104,21 @@ class GitDependencies(unittest.TestCase):
         self.assertTrue(registry_gaps(deps, lambda _: ["0.1.0-rc.1"]))
         self.assertEqual(registry_gaps(deps, lambda _: ["0.1.0"]), [])
 
-    def test_dev_and_unpublished_crates_are_not_checked(self):
+    def test_unversioned_dev_helpers_and_unpublished_crates_are_not_checked(self):
+        """Cargo strips a dev-dependency with no version from the package."""
         crates = [
-            package("app", [dependency("newtui", "^0.1.0", "dev", source=GIT)]),
+            package("app", [dependency("newtui", "*", "dev", source=GIT)]),
             package("tool", [dependency("newtui", "^0.1.0", source=GIT)], []),
         ]
         self.assertEqual(git_dependencies(crates, ["app"]), [])
+
+    def test_versioned_dev_dependency_is_checked(self):
+        """Cargo keeps a versioned dev-dependency in the published manifest, and
+        `cargo package` fails when the registry lacks it (PR #2871 review P2-2)."""
+        crates = [package("app", [dependency("newtui", "^0.1.0", "dev", source=GIT)])]
+        deps = git_dependencies(crates, ["app"])
+        self.assertEqual(deps, [("app", "newtui", "^0.1.0")])
+        self.assertTrue(registry_gaps(deps, lambda _: []))
 
     def test_caret_semantics(self):
         for req, version, ok in (

@@ -59,7 +59,9 @@ def git_dependencies(packages, matrix):
         for p in packages
         if p["name"] in published
         for d in p["dependencies"]
-        if d.get("kind") != "dev" and (d.get("source") or "").startswith("git+")
+        if (d.get("source") or "").startswith("git+")
+        # Cargo strips only unversioned dev helpers; a versioned one ships.
+        and not (d.get("kind") == "dev" and d["req"] == "*")
     ]
 
 
