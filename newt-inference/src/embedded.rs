@@ -319,8 +319,13 @@ where
         tokio::select! {
             joined = &mut worker => break joined,
             () = tokio::time::sleep(IDLE_POLL) => {
+                // Sample the clock before the progress mark. A checkpoint that
+                // lands between the two reads then makes `last` newer than
+                // `at`, which saturates to zero idle time and cannot fail a
+                // generation that just progressed.
+                let at = (*now)();
                 let last = *progress.lock().unwrap_or_else(|p| p.into_inner());
-                if !idle_within(last, (*now)(), bound) {
+                if !idle_within(last, at, bound) {
                     anyhow::bail!(
                         "embedded inference deadline exceeded; the current synchronous step may still be finishing"
                     );
