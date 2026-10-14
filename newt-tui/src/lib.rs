@@ -2853,8 +2853,12 @@ async fn summarize_one_model(
     };
     // Step 24.2 (#559): retry with backoff before giving up. The per-request
     // timeout is configurable (`summarizer.toml` `timeout_secs`).
+    // #2875: `timeout_secs` is an IDLE bound (gap between reads), not a total
+    // deadline — a summary still streaming past it must succeed. The connect
+    // timeout keeps its own bound.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(opts.timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(opts.timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(opts.timeout_secs))
         .build()?;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=opts.retries {
