@@ -177,6 +177,8 @@
 #   - the vendored crossterm regression (`vendor/crossterm-0.28.1-patched`,
 #     `just check-vendor-crossterm`) -- outside the workspace the changed-
 #     scope classifier maps against
+#   - `reuse lint` (ci.yml lint job, fsfe/reuse-action) -- needs the `reuse`
+#     Python tool, which a dev box does not carry; REUSE.toml covers every file
 #   - the `windows` and `musl` jobs (ci.yml) -- no Windows dev box / musl
 #     cross-target+musl-tools on a typical dev box; ci.yml's own top comment
 #     names these as the same kind of exception
