@@ -845,3 +845,49 @@ fn plan_default_yes_blank_approval_seeds_implementation() {
         }
     }
 }
+
+/// #2881: an Act turn armed the Plan clamp (plan-before-act) and nothing
+/// approved it; the next fresh operator prompt is narrowed to Plan by that
+/// carried clamp. The operator set no mode, so the card must not say one did,
+/// and must say a plan is still awaiting the operator's approval.
+#[test]
+fn a_carried_plan_clamp_card_names_the_pending_plan_not_an_operator_mode() {
+    let states = ConversationModeStates::default();
+    states.plan.set_plan_mode(true).unwrap();
+    let plan_mode_active = states.plan.is_active();
+    let mut recorded = RecordedDispositions::new();
+    let lexicon = newt_core::agentic::DispositionLexicon::default();
+    let (mut intake, _) = comprehend_accepted_prompt(
+        &ModelInputOrigin::Operator,
+        "Implement the parser change.",
+        None,
+        None,
+        &mut recorded,
+        &lexicon,
+        |_| (OperatingMode::Plan, OperatingMode::Plan),
+    );
+    attribute_carried_plan_clamp(&mut intake, OperatingMode::Dev, plan_mode_active);
+    assert_eq!(intake.disposition(), PromptDisposition::Plan);
+    let card = intake.model_card();
+    assert!(
+        !card.contains("a session mode the operator set"),
+        "the operator set no mode: {card}"
+    );
+    assert!(
+        card.contains("a plan from an earlier turn is still awaiting the operator's approval"),
+        "{card}"
+    );
+    assert!(card.contains("The operator did not set a mode."), "{card}");
+}
+
+/// The operator's own `/mode plan` keeps the session-policy attribution even
+/// when the model also entered the plan phase.
+#[test]
+fn an_operator_mode_plan_card_keeps_the_session_mode_attribution() {
+    let mut intake = newt_core::agentic::PromptIntake::analyze("Implement the parser change.");
+    intake.enforce_read_only(PromptDisposition::Plan);
+    attribute_carried_plan_clamp(&mut intake, OperatingMode::Plan, true);
+    let card = intake.model_card();
+    assert!(card.contains("a session mode the operator set"), "{card}");
+    assert!(!card.contains("awaiting the operator's approval"), "{card}");
+}
