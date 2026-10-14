@@ -1363,20 +1363,24 @@ pub(super) async fn exec_confined_command_with_broker(
             live.finish();
         }
         return match run {
-            Ok(envelope) => host_result(&envelope, |envelope| {
-                let mut text = shell_envelope_output(
-                    envelope,
-                    tool_output_lines,
-                    color,
-                    tool_offload,
-                    spill_store,
-                    Some(&mut *presentation),
-                );
-                if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope) {
-                    text.push_str(hint);
-                }
-                text
-            }),
+            Ok(envelope) => host_result(
+                &envelope,
+                |envelope| {
+                    let mut text = shell_envelope_output(
+                        envelope,
+                        tool_output_lines,
+                        color,
+                        tool_offload,
+                        spill_store,
+                        Some(&mut *presentation),
+                    );
+                    if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope) {
+                        text.push_str(hint);
+                    }
+                    text
+                },
+                command_budget,
+            ),
             Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
         };
     }
@@ -1936,6 +1940,7 @@ pub(super) fn timed_out_note(
 pub(super) fn host_result(
     envelope: &serde_json::Value,
     render: impl FnOnce(&serde_json::Value) -> String,
+    command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
     let outcome = match envelope_outcome(envelope) {
         ExecOutcome::Failed
@@ -1950,7 +1955,20 @@ pub(super) fn host_result(
         }
         outcome => outcome,
     };
-    (render(envelope), outcome)
+    let mut text = render(envelope);
+    // The same note, from the same owner, the confined route appends (#2882).
+    if outcome == ExecOutcome::TimedOut {
+        if let Some(secs) = envelope
+            .get("timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+        {
+            text.push_str(&timed_out_note(
+                std::time::Duration::from_secs(secs),
+                command_budget,
+            ));
+        }
+    }
+    (text, outcome)
 }
 
 /// How the host shells [`host_shell_output`] runs (bash, else sh) name a
@@ -2008,7 +2026,7 @@ pub(super) async fn host_shell_dispatch(
 pub(super) struct HostShellRun {
     pub(super) exit_code: i64,
     pub(super) stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
     pub(super) timed_out: bool,
 }
 
@@ -2105,19 +2123,21 @@ fn parse_cat_v_meta_byte(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
     }
 }
 
+/// Drain `reader` into `output` as it arrives, so a caller that abandons the
+/// drain (a timeout) still holds every byte read before it (#2882).
 async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
+    output: &mut Vec<u8>,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     stream: crate::agentic::ToolOutputStream,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt as _;
 
-    let mut output = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
-            return Ok(output);
+            return Ok(());
         }
         if let Some(live) = live.as_ref() {
             live.write(stream, &chunk[..read]);
@@ -2131,8 +2151,10 @@ async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
 /// shell ran, so [`venv_cmd_prefix`]'s `export …;` prefix works unchanged.
 ///
 /// Hardened (#297) so a hung child can never wedge the turn:
-/// - `kill_on_drop(true)` + `process_group(0)` (own process group) so the whole
-///   child *tree* dies when we drop the handle, not just the immediate `bash`.
+/// - `kill_on_drop(true)` + `process_group(0)` (own process group); on every
+///   exit but a normal finish [`supervise_host_child`] `killpg`s the whole
+///   group, because `kill_on_drop` alone kills only the immediate `bash`
+///   (#2882).
 /// - stdin redirected from `/dev/null` so a child that reads stdin sees EOF
 ///   instead of blocking forever waiting on a tty the agent can't feed.
 /// - a [`host_exec_timeout`] wall-clock ceiling: on expiry the child is killed
@@ -2150,7 +2172,7 @@ pub(super) async fn host_shell_output(
 }
 
 /// newt's control-plane env vars that must NEVER flow into a host-shell child
-/// (#8 / invariant 9). Two classes, both newt-internal:
+/// (#8 / invariant 9). Three classes, all newt-internal:
 ///
 /// - **authority switches** — an inherited `NEWT_DISABLE_OCAP` /
 ///   `NEWT_FULL_ACCESS` / `NEWT_UNSAFE_HOST_EXEC` / … would silently re-assert
@@ -2159,7 +2181,12 @@ pub(super) async fn host_shell_output(
 ///   authority-switch-survives-one-hop hole);
 /// - **newt's own secrets** — `NEWT_AGENT_KEY` (the capability envelope),
 ///   `NEWT_OPERATOR_KEY`, and `NEWT_TOKEN_PASSPHRASE` (the encrypted-token-store
-///   unlock) would let the child forge capabilities or decrypt the token store.
+///   unlock) would let the child forge capabilities or decrypt the token store;
+/// - **config redirects** (#2876) — `--config-dir` / `--config` publish
+///   `NEWT_CONFIG_DIR` / `NEWT_CONFIG` in newt's own env; inherited, they make
+///   the user's code under test read newt's configuration. The capture paths a
+///   nested newt records through (`NEWT_FLIGHT_RECORDER`, `NEWT_DENIAL_JOURNAL`)
+///   are deliberately NOT listed, so they still reach the child.
 ///
 /// Knowledge in data (three Cs): a new `NEWT_` control switch is added here. The
 /// child KEEPS the operator's *general* environment — the `--full-access` /
@@ -2182,6 +2209,8 @@ pub(super) const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
     "NEWT_AGENT_KEY",
     "NEWT_OPERATOR_KEY",
     "NEWT_TOKEN_PASSPHRASE",
+    crate::config::NEWT_CONFIG_DIR_ENV,
+    "NEWT_CONFIG",
 ];
 
 /// Excise newt's whole control plane ([`CHILD_STRIPPED_AUTHORITY_ENV`]) from a
@@ -2195,12 +2224,16 @@ fn strip_child_authority_env(c: &mut tokio::process::Command) {
 }
 
 /// Build the host-shell child command, stripping newt's whole control plane
-/// (authority switches + newt's own secrets, [`strip_child_authority_env`]) so
+/// (authority switches, newt's own secrets, config redirects —
+/// [`strip_child_authority_env`]) so
 /// none can flow into the child and re-assert authority the session did not
 /// grant it or leak newt's credentials (#8 / step-7.1a, invariant 9). The child
 /// inherits the rest of the environment (the Yolo lane's explicit ambient-
-/// authority grant). Own process group (setsid-equivalent) + `kill_on_drop` so a
-/// hung or tty-stealing child is reaped as a whole tree.
+/// authority grant). Own process group (setsid-equivalent) + `kill_on_drop`.
+/// `kill_on_drop` kills only the direct child: on unix the whole group is
+/// killed by [`supervise_host_child`]'s drop guard on every exit but a normal
+/// finish, and on Windows the ambient-Brush route's job object kills the tree
+/// (the cmd route kills only `cmd.exe`).
 pub(super) fn host_shell_command(
     route: ShellRoute,
     fallback: bool,
@@ -2282,6 +2315,119 @@ fn host_shell_command_at(
     Ok(c)
 }
 
+/// Kills the child's process group when dropped, unless [`Self::disarm`]ed by
+/// a normal finish. It owns the wall, a failed pipe read, and the tool future
+/// being dropped on a user interrupt, so none of those leaves the in-group
+/// descendants running (#2882). It is sound only while the group leader is
+/// unreaped: [`supervise_host_child`] reaps the leader as its last step and
+/// disarms in that same step, so the pgid it kills cannot have been reused.
+/// Descendants that leave the group are out of its reach.
+#[cfg(not(windows))]
+struct KillGroupOnDrop<K: FnOnce()>(Option<K>);
+
+#[cfg(not(windows))]
+impl<K: FnOnce()> KillGroupOnDrop<K> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(not(windows))]
+impl<K: FnOnce()> Drop for KillGroupOnDrop<K> {
+    fn drop(&mut self) {
+        if let Some(kill_tree) = self.0.take() {
+            kill_tree();
+        }
+    }
+}
+
+/// The host-shell supervisor, behind a seam the unit tier can drive without
+/// spawning (#2882): `wait` resolves to the child's exit code, `kill_tree`
+/// kills the child's whole process group, and the two readers are its pipes.
+/// Every exit but a normal finish kills the group ([`KillGroupOnDrop`]). The
+/// pipes are drained before `wait` is polled, so the leader stays unreaped
+/// (and its pgid reserved) for as long as the guard can fire. On the wall's
+/// expiry the output already drained is KEPT, so the model sees what ran
+/// before the kill.
+#[cfg(not(windows))]
+pub(super) async fn supervise_host_child<W, K, O, E>(
+    wait: W,
+    kill_tree: K,
+    stdout: O,
+    stderr: E,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout: std::time::Duration,
+) -> std::io::Result<HostShellRun>
+where
+    W: std::future::Future<Output = std::io::Result<i64>>,
+    K: FnOnce(),
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
+    let guard = KillGroupOnDrop(Some(kill_tree));
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    // Drain both pipes BEFORE reaping the leader. An unreaped (zombie) leader
+    // is still a member of its group, so its pgid cannot be reused while the
+    // guard is armed; reaping it first and killing later could signal an
+    // unrelated group that took the number. `wait` is polled only once the
+    // pipes close, and the guard disarms in the same step that reaps.
+    let completed = async {
+        tokio::try_join!(
+            drain_host_pipe(
+                stdout,
+                &mut out,
+                live.clone(),
+                crate::agentic::ToolOutputStream::Stdout
+            ),
+            drain_host_pipe(
+                stderr,
+                &mut err,
+                live,
+                crate::agentic::ToolOutputStream::Stderr
+            ),
+        )?;
+        wait.await
+    };
+    // Bound so `completed` (which borrows the buffers) drops before they are
+    // read back, whether it finished or the wall fired.
+    let result = tokio::time::timeout(timeout, completed).await;
+    match result {
+        Ok(Ok(exit_code)) => {
+            guard.disarm();
+            Ok(HostShellRun {
+                exit_code,
+                stdout: out,
+                stderr: err,
+                timed_out: false,
+            })
+        }
+        // The guard kills the group as it drops on return.
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => {
+            // `kill_on_drop` kills only the direct child; descendants in its
+            // group would survive as orphans. Kill the whole group (#2882).
+            drop(guard);
+            if !err.is_empty() && !err.ends_with(b"\n") {
+                err.push(b'\n');
+            }
+            err.extend_from_slice(
+                format!(
+                    "command exceeded {}s host-shell timeout and was killed\n",
+                    timeout.as_secs()
+                )
+                .as_bytes(),
+            );
+            Ok(HostShellRun {
+                exit_code: 124,
+                stdout: out,
+                stderr: err,
+                timed_out: true,
+            })
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub(super) async fn host_shell_output_with_timeout(
     route: ShellRoute,
@@ -2303,37 +2449,22 @@ pub(super) async fn host_shell_output_with_timeout(
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
-        let completed = async {
-            let (status, stdout, stderr) = tokio::try_join!(
-                child.wait(),
-                drain_host_pipe(
-                    stdout,
-                    live.clone(),
-                    crate::agentic::ToolOutputStream::Stdout
-                ),
-                drain_host_pipe(stderr, live, crate::agentic::ToolOutputStream::Stderr),
-            )?;
-            Ok::<_, std::io::Error>((status, stdout, stderr))
+        // The child leads its own process group (`process_group(0)`), so its
+        // pid is the pgid every descendant inherits.
+        let pgid = child.id();
+        let wait = async {
+            let status = child.wait().await?;
+            Ok(status.code().unwrap_or(-1) as i64)
         };
-        match tokio::time::timeout(timeout, completed).await {
-            Ok(Ok((status, stdout, stderr))) => Ok(HostShellRun {
-                exit_code: status.code().unwrap_or(-1) as i64,
-                stdout,
-                stderr,
-                timed_out: false,
-            }),
-            Ok(Err(e)) => Err(e),
-            Err(_elapsed) => Ok(HostShellRun {
-                exit_code: 124,
-                stdout: Vec::new(),
-                stderr: format!(
-                    "command exceeded {}s host-shell timeout and was killed\n",
-                    timeout.as_secs()
-                )
-                .into_bytes(),
-                timed_out: true,
-            }),
-        }
+        let kill_tree = move || {
+            #[cfg(unix)]
+            if let Some(pgid) = pgid {
+                crate::confined_exec::kill_process_group(pgid);
+            }
+            #[cfg(not(unix))]
+            let _ = pgid;
+        };
+        supervise_host_child(wait, kill_tree, stdout, stderr, live, timeout).await
     }
 
     match host_shell_command(route, false, cmd, cwd)?.spawn() {
@@ -2414,6 +2545,8 @@ async fn supervise_windows_shell(
         .stderr
         .take()
         .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
     let completed = async {
         if let Some(script) = script {
             let mut input = stdin
@@ -2424,35 +2557,50 @@ async fn supervise_windows_shell(
             input.shutdown().await?;
             drop(input);
         }
-        let (status, stdout, stderr) = tokio::try_join!(
+        let (status, (), ()) = tokio::try_join!(
             child.wait(),
             drain_host_pipe(
                 stdout,
+                &mut out,
                 live.clone(),
                 crate::agentic::ToolOutputStream::Stdout
             ),
-            drain_host_pipe(stderr, live, crate::agentic::ToolOutputStream::Stderr),
+            drain_host_pipe(
+                stderr,
+                &mut err,
+                live,
+                crate::agentic::ToolOutputStream::Stderr
+            ),
         )?;
-        Ok::<_, std::io::Error>((status, stdout, stderr))
+        Ok::<_, std::io::Error>(status)
     };
-    match tokio::time::timeout(timeout, completed).await {
-        Ok(Ok((status, stdout, stderr))) => Ok(HostShellRun {
+    let result = tokio::time::timeout(timeout, completed).await;
+    match result {
+        Ok(Ok(status)) => Ok(HostShellRun {
             exit_code: status.code().unwrap_or(-1) as i64,
-            stdout,
-            stderr,
+            stdout: out,
+            stderr: err,
             timed_out: false,
         }),
         Ok(Err(e)) => Err(e),
-        Err(_elapsed) => Ok(HostShellRun {
-            exit_code: 124,
-            stdout: Vec::new(),
-            stderr: format!(
-                "command exceeded {}s host-shell timeout and was killed\r\n",
-                timeout.as_secs()
-            )
-            .into_bytes(),
-            timed_out: true,
-        }),
+        Err(_elapsed) => {
+            if !err.is_empty() && !err.ends_with(b"\n") {
+                err.extend_from_slice(b"\r\n");
+            }
+            err.extend_from_slice(
+                format!(
+                    "command exceeded {}s host-shell timeout and was killed\r\n",
+                    timeout.as_secs()
+                )
+                .as_bytes(),
+            );
+            Ok(HostShellRun {
+                exit_code: 124,
+                stdout: out,
+                stderr: err,
+                timed_out: true,
+            })
+        }
     }
 }
 
