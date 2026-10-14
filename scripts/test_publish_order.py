@@ -3,10 +3,10 @@
 import unittest
 
 from check_publish_order import (
-    caret_matches,
     check,
     git_dependencies,
     registry_gaps,
+    req_matches,
     topological_order,
 )
 
@@ -121,10 +121,65 @@ class GitDependencies(unittest.TestCase):
             ("^1.2", "2.0.0", False),
             ("^0.0.3", "0.0.4", False),
             ("^0.1", "0.1.0-rc.1", False),
-            ("=0.1.0", "0.1.0", False),  # unsupported req fails closed
+            ("0.1", "0.1.5", True),  # bare requirement is caret
+            ("^0", "0.9.0", True),
         ):
-            self.assertEqual(caret_matches(req, version), ok, (req, version))
+            self.assertEqual(req_matches(req, version), ok, (req, version))
 
+    def test_cargo_requirement_operators(self):
+        """Cargo's requirement syntax, not just caret (PR #2871 review P2-1)."""
+        for req, version, ok in (
+            ("=0.1.0", "0.1.0", True),
+            ("=0.1.0", "0.1.1", False),
+            ("=0.1", "0.1.7", True),
+            ("~0.1.0", "0.1.5", True),
+            ("~0.1.2", "0.1.1", False),
+            ("~0.1", "0.2.0", False),
+            ("~1", "1.9.0", True),
+            (">=0.1.0, <0.2.0", "0.1.3", True),
+            (">=0.1.0, <0.2.0", "0.2.0", False),
+            (">0.1.0", "0.1.0", False),
+            ("<=0.1.0", "0.1.0", True),
+            ("*", "3.4.5", True),
+            ("0.1.*", "0.1.9", True),
+            ("0.1.*", "0.2.0", False),
+            ("1.x", "1.4.0", True),
+        ):
+            self.assertEqual(req_matches(req, version), ok, (req, version))
+
+    def test_prereleases_match_only_when_requested(self):
+        for req, version, ok in (
+            ("^0.1.0-rc.1", "0.1.0-rc.1", True),
+            ("^0.1.0-rc.1", "0.1.0-rc.2", True),
+            ("^0.1.0-rc.1", "0.1.0", True),
+            ("^0.1.0-rc.2", "0.1.0-rc.1", False),
+            ("^0.1.0-rc.1", "0.1.1-rc.1", False),  # other triple's prerelease
+            ("=0.1.0-alpha.10", "0.1.0-alpha.10", True),
+            ("^0.1.0-alpha.2", "0.1.0-alpha.10", True),  # numeric identifiers
+            ("^0.1.0-alpha", "0.1.0-alpha.1", True),
+            (">=0.1.0-beta", "0.1.0-alpha", False),
+            ("*", "1.0.0-rc.1", False),
+        ):
+            self.assertEqual(req_matches(req, version), ok, (req, version))
+
+    def test_build_metadata_is_ignored(self):
+        self.assertTrue(req_matches("^0.1.0", "0.1.0+build.1"))
+        self.assertTrue(req_matches("=0.1.0", "0.1.0+build.1"))
+        self.assertTrue(req_matches("^0.1.0-rc.1", "0.1.0-rc.1+sha.abc"))
+        deps = [("newt-core", "newtui", "^0.1.0")]
+        self.assertEqual(registry_gaps(deps, lambda _: ["0.1.0+build.1"]), [])
+
+    def test_exact_pin_in_registry_is_not_a_gap(self):
+        deps = [("newt-core", "newtui", "=0.1.0")]
+        self.assertEqual(registry_gaps(deps, lambda _: ["0.1.0"]), [])
+        self.assertTrue(registry_gaps(deps, lambda _: ["0.1.1"]))
+
+    def test_unparseable_requirement_or_index_version_fails_closed(self):
+        deps = [("newt-core", "newtui", "^not.a.version")]
+        self.assertIn("cannot parse", registry_gaps(deps, lambda _: ["0.1.0"])[0])
+        ok = [("newt-core", "newtui", "^0.1.0")]
+        self.assertEqual(registry_gaps(ok, lambda _: ["garbage", "0.1.0"]), [])
+        self.assertTrue(registry_gaps(ok, lambda _: ["garbage"]))
 
 if __name__ == "__main__":
     unittest.main()

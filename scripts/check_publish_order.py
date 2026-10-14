@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -62,37 +63,137 @@ def git_dependencies(packages, matrix):
     ]
 
 
-def _version(text):
-    return tuple(int(part) for part in text.split("."))
+_VERSION = re.compile(
+    r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?"
+)
+_COMPARATOR = re.compile(
+    r"(=|>=|>|<=|<|~|\^)?\s*(\d+|[*xX])(?:\.(\d+|[*xX]))?(?:\.(\d+|[*xX]))?"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?"
+)
 
 
-def caret_matches(req, version):
-    """Cargo caret semantics for a plain release version; prereleases never match."""
-    if "-" in version or not req.startswith("^"):
+def _pre_key(pre):
+    """SemVer precedence: a release outranks any prerelease of the same triple."""
+    if not pre:
+        return ((2,),)
+    return tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split("."))
+
+
+def parse_version(text):
+    """(major, minor, patch, pre); build metadata is dropped, as Cargo ignores it."""
+    m = _VERSION.fullmatch(text.strip())
+    if not m:
+        raise ValueError(f"invalid version {text!r}")
+    return int(m[1]), int(m[2]), int(m[3]), m[4] or ""
+
+
+def parse_req(text):
+    """Cargo requirement -> comparators (op, major, minor|None, patch|None, pre).
+
+    `*` yields no comparators; a bare requirement is caret.
+    """
+    comparators = []
+    for part in text.split(","):
+        part = part.strip()
+        m = _COMPARATOR.fullmatch(part)
+        if not m:
+            raise ValueError(f"cannot parse requirement {text!r}")
+        op, *nums, pre = m.groups()
+        fields = [None if n is None or n in "*xX" else int(n) for n in nums]
+        wild = any(n is not None and n in "*xX" for n in nums)
+        if wild:
+            # A wildcard ends the version; nothing concrete may follow it.
+            first = next(i for i, n in enumerate(nums) if n is not None and n in "*xX")
+            if any(f is not None for f in fields[first:]) or pre or op not in (None, "="):
+                raise ValueError(f"cannot parse requirement {text!r}")
+            if fields[0] is None:
+                if len(text.split(",")) > 1:
+                    raise ValueError(f"cannot parse requirement {text!r}")
+                continue  # `*`: matches every release
+            op = "*"
+        elif pre and fields[2] is None:
+            raise ValueError(f"cannot parse requirement {text!r}")
+        comparators.append((op or "^", *fields, pre or ""))
+    return comparators
+
+
+def _compare(op, major, minor, patch, pre, ver):
+    vmaj, vmin, vpat, vpre = ver
+    if op in ("=", "*"):
+        return (
+            vmaj == major
+            and minor in (None, vmin)
+            and (op == "*" or (patch in (None, vpat) and vpre == pre))
+        )
+    if op in (">", "<"):
+        sign = 1 if op == ">" else -1
+        for want, have in ((major, vmaj), (minor, vmin), (patch, vpat)):
+            if want is None:
+                return False
+            if have != want:
+                return (have - want) * sign > 0
+        return (_pre_key(vpre) > _pre_key(pre)) == (sign > 0) and vpre != pre
+    if op in (">=", "<="):
+        return _compare("=", major, minor, patch, pre, ver) or _compare(
+            op[0], major, minor, patch, pre, ver
+        )
+    if vmaj != major:
         return False
-    base = req[1:].split(".")
-    have = _version(version)
-    if have < _version(".".join(base + ["0"] * (3 - len(base)))):
-        return False
-    # Same components up to and including the leftmost non-zero one.
-    for i, part in enumerate(base):
-        if have[i] != int(part):
+    if minor is None:
+        return True
+    if op == "~":
+        if vmin != minor:
             return False
-        if part != "0" or i == len(base) - 1:
+        if patch is None:
             return True
-    return True
+        if vpat != patch:
+            return vpat > patch
+    else:  # caret: compatible up to the leftmost non-zero component
+        if patch is None:
+            return vmin >= minor if major > 0 else vmin == minor
+        if vmin != minor:
+            return major > 0 and vmin > minor
+        if vpat != patch:
+            return (major > 0 or minor > 0) and vpat > patch
+    return _pre_key(vpre) >= _pre_key(pre)
+
+
+def req_matches(req, version):
+    """Cargo's `VersionReq::matches`: every comparator holds, and a prerelease
+    matches only a comparator that names a prerelease of the same triple."""
+    comparators = parse_req(req) if isinstance(req, str) else req
+    ver = parse_version(version)
+    if not all(_compare(*c, ver) for c in comparators):
+        return False
+    return not ver[3] or any(
+        c[4] and c[1:4] == ver[:3] for c in comparators
+    )
 
 
 def registry_gaps(git_deps, versions_of):
     """Errors for git dependencies whose `req` no crates.io release satisfies."""
     errors = []
     for crate, dep, req in git_deps:
-        if not any(caret_matches(req, v) for v in versions_of(dep)):
+        try:
+            comparators = parse_req(req)
+        except ValueError:
+            errors.append(f"'{crate}' depends on '{dep}' with {req!r}: cannot parse it")
+            continue
+        if not any(_matches_quietly(comparators, v) for v in versions_of(dep)):
             errors.append(
                 f"'{crate}' depends on '{dep}' {req} from git, but crates.io has no "
                 f"release matching it; publish '{dep}' to crates.io first"
             )
     return errors
+
+
+def _matches_quietly(comparators, version):
+    """An index entry we cannot parse satisfies nothing (fail closed)."""
+    try:
+        return req_matches(comparators, version)
+    except ValueError:
+        return False
 
 
 def crates_io_versions(name):
