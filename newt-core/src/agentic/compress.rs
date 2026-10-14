@@ -52,6 +52,7 @@
 //! Step 18.5 — the seam is the summary message this module inserts.
 
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -1787,11 +1788,12 @@ const DIGEST_TOTAL_CAP: usize = 2_000;
 /// lost when the summarizer stalls; this keeps the handful of facts a model
 /// needs to resume without re-deriving them.
 fn static_fallback_text(removed: &[Value]) -> String {
-    let mut files: Vec<String> = Vec::new();
-    let mut commands: Vec<String> = Vec::new();
-    // Tool results follow their calls in order. A result that reports an error
-    // marks its call failed, so a failed write is not reported as touched (#2875 r2).
-    let mut pending: std::collections::VecDeque<(String, Value)> = Default::default();
+    let mut files: VecDeque<String> = VecDeque::new();
+    let mut commands: VecDeque<String> = VecDeque::new();
+    // Tool results follow their calls in order, so a result pairs with the oldest
+    // unanswered call. A result that reports failure marks its call failed, so a
+    // failed write is not reported as touched (#2875 r2).
+    let mut pending: VecDeque<(String, Value)> = VecDeque::new();
     for m in removed {
         match m["role"].as_str() {
             Some("assistant") => {
@@ -1807,76 +1809,89 @@ fn static_fallback_text(removed: &[Value]) -> String {
                 }
             }
             Some("tool") => {
-                let failed = m["content"].as_str().is_some_and(is_error_result);
                 if let Some((name, args)) = pending.pop_front() {
-                    record_digest_call(&name, &args, failed, &mut files, &mut commands);
+                    let result = m["content"].as_str();
+                    record_digest_call(&name, &args, result, &mut files, &mut commands);
                 }
             }
             _ => {}
         }
     }
     for (name, args) in pending {
-        record_digest_call(&name, &args, false, &mut files, &mut commands);
+        record_digest_call(&name, &args, None, &mut files, &mut commands);
     }
     let mut out = format!(
         "Summary generation was unavailable. {} message(s) were removed.",
         removed.len()
     );
-    // Every entry passes the same redaction as summarizer input, then a per-entry
-    // cap; the whole digest is capped too so one oversized argument cannot inflate
-    // the marker (#2875 r2, findings 2–3).
-    let line = |label: &str, items: &[String], sep: &str| {
-        let shown: Vec<String> = items
-            .iter()
-            .take(DIGEST_CAP)
-            .map(|s| excerpt(&redact_secrets(s), DIGEST_ENTRY_CAP))
-            .collect();
-        format!("\n{label}: {}", shown.join(sep))
-    };
     if !files.is_empty() {
-        out.push_str(&line("Files touched", &files, ", "));
+        out.push_str(&format!("\nFiles touched: {}", join_deque(&files, ", ")));
     }
     if !commands.is_empty() {
-        out.push_str(&line("Commands", &commands, "; "));
+        out.push_str(&format!("\nCommands: {}", join_deque(&commands, "; ")));
     }
     excerpt(&out, DIGEST_TOTAL_CAP)
 }
 
+fn join_deque(items: &VecDeque<String>, sep: &str) -> String {
+    items
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// Keep only the newest [`DIGEST_CAP`] entries: a re-touched entry moves to the
+/// back, and the oldest is evicted past the cap (#2875 r2 round 3).
+fn push_newest(list: &mut VecDeque<String>, entry: String) {
+    list.retain(|e| *e != entry);
+    list.push_back(entry);
+    if list.len() > DIGEST_CAP {
+        list.pop_front();
+    }
+}
+
+/// The `N` of the tool layer's `error: command exited N` (#2875 r2 round 3).
+fn exit_code_of(result: &str) -> Option<i32> {
+    let rest = result.trim_start().strip_prefix("error: command exited ")?;
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
 /// Record one digest call: a write (`edit_file`/`write_file`) that succeeded
-/// names its path as touched; any other command is listed generically with
-/// `(failed)` when its result reported an error (#2875 r2, finding 5).
+/// names its path as touched; a `run_command` is listed with ` (failed)` and the
+/// exit code AFTER its capped excerpt when its result reported failure. Every
+/// entry is redacted before it is capped (#2875 r2, findings 2-3 and 5).
 fn record_digest_call(
     name: &str,
     args: &Value,
-    failed: bool,
-    files: &mut Vec<String>,
-    commands: &mut Vec<String>,
+    result: Option<&str>,
+    files: &mut VecDeque<String>,
+    commands: &mut VecDeque<String>,
 ) {
+    let failed = result.is_some_and(crate::prune::tool_result_failed);
+    let entry = |text: &str| excerpt(&redact_secrets(text), DIGEST_ENTRY_CAP);
     match name {
         "edit_file" | "write_file" => {
             if let (false, Some(p)) = (failed, args["path"].as_str()) {
-                if !files.iter().any(|f| f == p) {
-                    files.push(p.to_string());
-                }
+                push_newest(files, entry(p));
             }
         }
         "run_command" => {
             if let Some(c) = args["command"].as_str() {
-                let tag = if failed { " (failed)" } else { "" };
-                commands.push(format!("{c}{tag}"));
+                let tag = match (failed, result.and_then(exit_code_of)) {
+                    (true, Some(code)) => format!(" (failed, exit {code})"),
+                    (true, None) => " (failed)".to_string(),
+                    _ => String::new(),
+                };
+                push_newest(commands, format!("{}{tag}", entry(c)));
             }
         }
         _ => {}
     }
-}
-
-/// Whether a tool result reports failure. Matches the leading `error:` marker
-/// the tool layer emits (case-insensitive).
-fn is_error_result(content: &str) -> bool {
-    content
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("error")
 }
 
 /// Wrap a summary body in the compaction markers as a `user` message.

@@ -735,6 +735,19 @@ fn excerpt(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Whether a tool result reports failure, in either of its shapes: the raw
+/// text (`error...`, `capability denied:`, and the other failure prefixes of
+/// `tool_result_ok`) or the pass-2 one-liner this module rewrote it into
+/// (`... -> error, N lines ...`). One predicate, so a reader that sees results
+/// after pruning needs no third copy of either format (#2875 r2 round 3).
+#[must_use]
+pub(crate) fn tool_result_failed(content: &str) -> bool {
+    if is_one_line_summary(content) {
+        return content.contains(" -> error, ");
+    }
+    looks_like_error(content) || !crate::agentic::tools::tool_result_ok(content)
+}
+
 /// Matches the error shapes `execute_tool` produces (`error…`,
 /// `capability denied…`).
 fn looks_like_error(content: &str) -> bool {

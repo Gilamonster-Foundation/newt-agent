@@ -426,7 +426,10 @@ fn fallback_marker_keeps_a_retouched_file_among_the_newest() {
     removed.push(assistant_call("edit_file", json!({"path": "src/last.rs"})));
     removed.push(tool_result("ok"));
     let marker = static_fallback_text(&removed);
-    assert!(marker.contains("src/first.rs"), "retouched dropped: {marker}");
+    assert!(
+        marker.contains("src/first.rs"),
+        "retouched dropped: {marker}"
+    );
     assert!(!marker.contains("src/f0.rs"), "oldest kept: {marker}");
 }
 
@@ -448,7 +451,10 @@ fn fallback_marker_value_filters_a_registered_secret() {
     ];
     let marker = static_fallback_text(&removed);
     assert!(marker.contains("curl"), "command missing: {marker}");
-    assert!(!marker.contains(canary), "registered secret leaked: {marker}");
+    assert!(
+        !marker.contains(canary),
+        "registered secret leaked: {marker}"
+    );
 }
 
 /// Guard (#2875 r2 round 3): the whole digest is capped at DIGEST_TOTAL_CAP
