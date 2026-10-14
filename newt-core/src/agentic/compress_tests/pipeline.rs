@@ -342,3 +342,47 @@ fn fallback_marker_omits_failed_write() {
         "failed write reported as touched: {marker}"
     );
 }
+
+/// The marker text out of a `run()` whose summarizer always fails.
+async fn fallback_marker_of(msgs: &[Value]) -> String {
+    let before = estimate_tokens(msgs, EST);
+    let s = failing_summarizer(Arc::new(AtomicUsize::new(0)));
+    let mut state = CompressState::new();
+    let out = run(msgs, before / 3, None, Some(&*s), &mut state).await;
+    out.messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("Summary generation was unavailable."))
+        .unwrap_or_else(|| panic!("no marker in {:#?}", out.messages))
+        .to_string()
+}
+
+/// `filler` rounds that push the earlier span out of the protected tail.
+fn push_filler(msgs: &mut Vec<Value>, n: usize) {
+    for i in 0..n {
+        msgs.push(user(&format!("filler {i} {}", "z".repeat(4_000))));
+        msgs.push(assistant_call("run_command", json!({"command": "ls"})));
+        msgs.push(tool_result(&"z".repeat(4_000)));
+    }
+}
+
+/// Red (#2875 r2 round 3, finding 1): prune pass 2 one-lines aged results over
+/// 200 chars as `[edit_file] edited '<p>' -> error, …` before the digest reads
+/// them, and a fence denial starts `capability denied:`. A denied write must
+/// not be listed under "Files touched".
+#[tokio::test]
+async fn fallback_marker_omits_write_denied_by_the_fence_after_prune() {
+    let denial = format!("capability denied: write to src/a.rs. {}", "x".repeat(300));
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call("edit_file", json!({"path": "src/a.rs"})),
+        tool_result(&denial),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        !marker.lines().any(|l| l.starts_with("Files touched")),
+        "denied write listed: {marker}"
+    );
+}
