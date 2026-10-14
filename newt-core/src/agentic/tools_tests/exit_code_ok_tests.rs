@@ -219,7 +219,7 @@ fn confined(cmd: &str, envelope: serde_json::Value) -> (String, ExecOutcome) {
 }
 
 fn host(envelope: serde_json::Value) -> (String, ExecOutcome) {
-    super::shell::host_result(&envelope, render)
+    super::shell::host_result(&envelope, render, Default::default())
 }
 
 fn envelope(exit_code: i64, stdout: &str, stderr: &str, timed_out: bool) -> serde_json::Value {
