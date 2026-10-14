@@ -134,35 +134,18 @@ fn resolve_returns_default_when_no_file() {
     // this lane for the same reason).
     let dir = tempfile::tempdir().unwrap();
 
-    // Save & clear environment to isolate the test. Pin `NEWT_CONFIG_DIR`
-    // to the temp dir in addition to `HOME`: `user_config_dir()` honors
-    // `NEWT_CONFIG_DIR` before `home_dir()`, so this makes the resolve
-    // ignore the real `$HOME` even if a sibling test left it pointing
-    // elsewhere mid-run.
-    let saved_config = std::env::var("NEWT_CONFIG").ok();
-    let saved_config_dir = std::env::var_os(NEWT_CONFIG_DIR_ENV);
-    let saved_home = std::env::var("HOME").ok();
-    std::env::remove_var("NEWT_CONFIG");
-    std::env::set_var(NEWT_CONFIG_DIR_ENV, dir.path());
-    std::env::set_var("HOME", dir.path());
-
-    // Run resolve from inside the temp dir so ./newt.toml won't exist.
-    let prev_dir = std::env::current_dir().unwrap();
-    std::env::set_current_dir(dir.path()).unwrap();
-
-    let cfg = Config::resolve(&mut |_| {}).unwrap();
-
-    // Restore environment.
-    std::env::set_current_dir(prev_dir).unwrap();
-    if let Some(v) = saved_config {
-        std::env::set_var("NEWT_CONFIG", v);
-    }
-    if let Some(v) = saved_config_dir {
-        std::env::set_var(NEWT_CONFIG_DIR_ENV, v);
-    }
-    if let Some(v) = saved_home {
-        std::env::set_var("HOME", v);
-    }
+    // HomeSandbox pins HOME, NEWT_CONFIG_DIR (which `user_config_dir()` honors
+    // before HOME, and which a newt session exports to its children) and the
+    // cwd, clears NEWT_CONFIG, and restores all of it on drop, including the
+    // originally-unset state and through a panic.
+    let before = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+    let cfg = {
+        let _sandbox = HomeSandbox::enter(dir.path());
+        Config::resolve(&mut |_| {}).unwrap()
+    };
+    // #2877 review: restore the original state, unset included, so a later
+    // test in the same process never resolves against the deleted temp dir.
+    assert_eq!(std::env::var_os(NEWT_CONFIG_DIR_ENV), before);
 
     assert_eq!(cfg.backends.len(), 1);
     assert_eq!(cfg.backends[0].name, "ollama");
