@@ -114,9 +114,12 @@ async fn deadline_returns_while_the_current_step_still_owns_admission() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let continued = Arc::new(AtomicBool::new(false));
     let worker_continued = continued.clone();
-    let first = tokio::spawn(run_generation(
+    let clock = super::idle_tests::FakeClock::new();
+    let reader = clock.clone();
+    let first = tokio::spawn(super::run_generation_with_clock(
         admission.clone(),
         Some(Duration::from_secs(60)),
+        move || reader.now(),
         move |checkpoint| {
             let _ = started_tx.send(());
             release_rx.recv_timeout(WATCHDOG)?;
@@ -129,11 +132,8 @@ async fn deadline_returns_while_the_current_step_still_owns_admission() {
         .await
         .unwrap()
         .unwrap();
-    // Advance the async clock only after real worker readiness; its startup is
-    // not required to beat a short timer on a contended test machine.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(61)).await;
-    tokio::time::resume();
+    // The worker is now silent; the fake clock moves past the 60s idle bound.
+    clock.advance(Duration::from_secs(61));
     let result = tokio::time::timeout(Duration::from_secs(1), first).await;
     let held = admission.available_permits() == 0;
     let _ = release_tx.send(());

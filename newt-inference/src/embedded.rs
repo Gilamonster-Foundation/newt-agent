@@ -513,7 +513,7 @@ mod lifecycle_tests;
 
 #[cfg(test)]
 #[path = "embedded_idle_tests.rs"]
-mod idle_tests;
+pub(super) mod idle_tests;
 
 #[cfg(test)]
 mod tests {

@@ -8,24 +8,24 @@ use std::time::{Duration, Instant};
 const IDLE_BOUND: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
-struct FakeClock {
+pub(super) struct FakeClock {
     base: Instant,
     elapsed: Arc<std::sync::Mutex<Duration>>,
 }
 
 impl FakeClock {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             base: Instant::now(),
             elapsed: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
         }
     }
 
-    fn now(&self) -> Instant {
+    pub(super) fn now(&self) -> Instant {
         self.base + *self.elapsed.lock().unwrap()
     }
 
-    fn advance(&self, by: Duration) {
+    pub(super) fn advance(&self, by: Duration) {
         *self.elapsed.lock().unwrap() += by;
     }
 }
