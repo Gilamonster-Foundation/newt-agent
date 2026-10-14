@@ -65,6 +65,67 @@ async fn host_completion_does_not_kill_the_group() {
     assert_eq!(super::shell::decode_shell_stream(&run.stdout), "done\n");
 }
 
+/// A reader whose first read fails, like a broken child pipe.
+struct FailingPipe;
+
+impl tokio::io::AsyncRead for FailingPipe {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::other("pipe broke")))
+    }
+}
+
+/// The user-interrupt exit: dispatch drops the tool future mid-run. The group
+/// must die with it, not survive as orphans of a killed `bash` (#2882).
+#[tokio::test(start_paused = true)]
+async fn dropping_the_supervisor_mid_run_kills_the_group() {
+    let killed = Arc::new(AtomicBool::new(false));
+    let (stdout, _out_writer) = hung_pipe(b"started\n").await;
+    let (stderr, _err_writer) = hung_pipe(b"").await;
+    let flag = killed.clone();
+    let run = super::shell::supervise_host_child(
+        std::future::pending::<std::io::Result<i64>>(),
+        move || flag.store(true, Ordering::SeqCst),
+        stdout,
+        stderr,
+        None,
+        Duration::from_secs(60),
+    );
+    // Interrupt well before the wall: the future is dropped unfinished.
+    let interrupted = tokio::time::timeout(Duration::from_secs(1), run).await;
+    assert!(interrupted.is_err(), "the run must still be in flight");
+    assert!(
+        killed.load(Ordering::SeqCst),
+        "dropping the supervisor must kill the child's process group"
+    );
+}
+
+/// The failed-pipe-read exit: the run errors out, and the group must not be
+/// left running behind the error.
+#[tokio::test(start_paused = true)]
+async fn a_failed_pipe_read_kills_the_group() {
+    let killed = Arc::new(AtomicBool::new(false));
+    let (stderr, _err_writer) = hung_pipe(b"").await;
+    let flag = killed.clone();
+    let run = super::shell::supervise_host_child(
+        std::future::pending::<std::io::Result<i64>>(),
+        move || flag.store(true, Ordering::SeqCst),
+        FailingPipe,
+        stderr,
+        None,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(run.is_err(), "a broken pipe is an error");
+    assert!(
+        killed.load(Ordering::SeqCst),
+        "an errored run must kill the child's process group"
+    );
+}
+
 #[test]
 fn host_timeout_result_carries_the_confined_timed_out_note() {
     let wall = Duration::from_secs(60);
