@@ -25,7 +25,7 @@ async fn expired_generation_does_not_start_the_loader() {
     let worker_started = started.clone();
     let result = run_generation(
         Arc::new(tokio::sync::Semaphore::new(1)),
-        Some(Instant::now()),
+        Some(Duration::ZERO),
         move |_checkpoint| {
             worker_started.store(true, Ordering::SeqCst);
             Ok("unexpected generation".into())
@@ -116,7 +116,7 @@ async fn deadline_returns_while_the_current_step_still_owns_admission() {
     let worker_continued = continued.clone();
     let first = tokio::spawn(run_generation(
         admission.clone(),
-        Some(Instant::now() + Duration::from_secs(60)),
+        Some(Duration::from_secs(60)),
         move |checkpoint| {
             let _ = started_tx.send(());
             release_rx.recv_timeout(WATCHDOG)?;

@@ -171,16 +171,13 @@ impl EmbeddedBackend {
         req: ChatRequest,
         timeout: std::time::Duration,
     ) -> anyhow::Result<ChatReply> {
-        let deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| anyhow::anyhow!("embedded inference deadline is out of range"))?;
-        self.complete_until(req, Some(deadline)).await
+        self.complete_until(req, Some(timeout)).await
     }
 
     async fn complete_until(
         &self,
         req: ChatRequest,
-        deadline: Option<std::time::Instant>,
+        idle: Option<std::time::Duration>,
     ) -> anyhow::Result<ChatReply> {
         let max_tokens = req.max_tokens.unwrap_or(512) as usize;
         let prompt = engine::format_chatml(&req.messages);
@@ -189,7 +186,7 @@ impl EmbeddedBackend {
         let model_id = self.model.name.to_string();
         let device = self.device.clone();
         // candle is synchronous + CPU/GPU-bound; keep it off the async runtime.
-        let content = run_generation(generation_admission(), deadline, move |checkpoint| {
+        let content = run_generation(generation_admission(), idle, move |checkpoint| {
             let device = device.map(Ok).unwrap_or_else(engine::device)?;
             engine::generate(&assets, arch, &prompt, max_tokens, &device, checkpoint)
         })
@@ -249,14 +246,38 @@ fn generation_admission() -> std::sync::Arc<tokio::sync::Semaphore> {
 /// rather than building an unbounded blocking-task queue.
 async fn run_generation<F>(
     admission: std::sync::Arc<tokio::sync::Semaphore>,
-    deadline: Option<std::time::Instant>,
+    idle: Option<std::time::Duration>,
     generate: F,
 ) -> anyhow::Result<String>
 where
     F: FnOnce(&dyn Fn() -> anyhow::Result<()>) -> anyhow::Result<String> + Send + 'static,
 {
+    run_generation_with_clock(admission, idle, std::time::Instant::now, generate).await
+}
+
+/// Idle means: no checkpoint for `bound`. `None` never expires; a zero bound
+/// admits nothing (the bound is exclusive).
+fn idle_within(last: std::time::Instant, now: std::time::Instant, bound: Option<std::time::Duration>) -> bool {
+    bound.is_none_or(|b| now.saturating_duration_since(last) < b)
+}
+
+/// How often the async side re-reads the shared progress clock.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+async fn run_generation_with_clock<F, N>(
+    admission: std::sync::Arc<tokio::sync::Semaphore>,
+    bound: Option<std::time::Duration>,
+    now: N,
+    generate: F,
+) -> anyhow::Result<String>
+where
+    F: FnOnce(&dyn Fn() -> anyhow::Result<()>) -> anyhow::Result<String> + Send + 'static,
+    N: Fn() -> std::time::Instant + Send + Sync + 'static,
+{
+    let now: std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync> = std::sync::Arc::new(now);
+    let start = (*now)();
     anyhow::ensure!(
-        deadline.is_none_or(|end| std::time::Instant::now() < end),
+        idle_within(start, start, bound),
         "embedded inference deadline exceeded"
     );
     let permit = admission.try_acquire_owned().map_err(|_| {
@@ -266,14 +287,20 @@ where
     // worker can observe that through the existing oneshot channel, without a
     // second cancellation protocol or an unsafe attempt to kill its thread.
     let (caller, _caller_lifetime) = tokio::sync::oneshot::channel::<()>();
-    let worker = tokio::task::spawn_blocking(move || {
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(start));
+    let worker_progress = progress.clone();
+    let worker_now = now.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let checkpoint = || {
             anyhow::ensure!(!caller.is_closed(), "embedded inference cancelled");
+            let at = (*worker_now)();
+            let mut last = worker_progress.lock().unwrap_or_else(|p| p.into_inner());
             anyhow::ensure!(
-                deadline.is_none_or(|end| std::time::Instant::now() < end),
+                idle_within(*last, at, bound),
                 "embedded inference deadline exceeded"
             );
+            *last = at;
             Ok(())
         };
         checkpoint()?;
@@ -281,13 +308,20 @@ where
         checkpoint()?;
         result
     });
-    let result = match deadline {
-        Some(end) => tokio::time::timeout_at(tokio::time::Instant::from_std(end), worker)
-            .await
-            .map_err(|_| anyhow::anyhow!(
-                "embedded inference deadline exceeded; the current synchronous step may still be finishing"
-            ))?,
-        None => worker.await,
+    // The async side polls the shared progress clock rather than waiting on one
+    // fixed end: a generation that keeps checkpointing never expires.
+    let result = loop {
+        tokio::select! {
+            joined = &mut worker => break joined,
+            () = tokio::time::sleep(IDLE_POLL) => {
+                let last = *progress.lock().unwrap_or_else(|p| p.into_inner());
+                if !idle_within(last, (*now)(), bound) {
+                    anyhow::bail!(
+                        "embedded inference deadline exceeded; the current synchronous step may still be finishing"
+                    );
+                }
+            }
+        }
     };
     result.map_err(|e| anyhow::anyhow!("embedded inference task panicked: {e}"))?
 }
@@ -476,6 +510,10 @@ pub(crate) mod engine {
 #[cfg(test)]
 #[path = "embedded_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "embedded_idle_tests.rs"]
+mod idle_tests;
 
 #[cfg(test)]
 mod tests {
