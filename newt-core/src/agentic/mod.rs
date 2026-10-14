@@ -2228,8 +2228,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 "stream": false,
                 "tools": tools.clone(),
             });
-            if let Some(options) = &ollama_options {
-                body_no_stream["options"] = options.clone();
+            // #2874: a raised retry cap rides `num_predict` from here on.
+            if let Some(options) =
+                self::ollama_options(num_ctx, output_recovery.allowance(output_allowance))
+            {
+                body_no_stream["options"] = options;
             }
             // Drop tools entirely for a model that rejects them (set below on a
             // "does not support tools" 400) — an empty array still trips strict
@@ -2665,13 +2668,19 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 message["tool_calls"]
                     .as_array()
                     .is_some_and(|calls| !calls.is_empty()),
+                &probe_content,
+                output_allowance,
+                output_limit_recovery::ceiling(),
                 &mut messages,
                 smart_harness,
             )? {
                 continue;
             }
             let text = finalize_final_text(
-                generation_bounds::output_limit_notice(probe_content, round_usage),
+                generation_bounds::output_limit_notice(
+                    output_recovery.stitch(probe_content),
+                    round_usage,
+                ),
                 workspace,
                 &caveats.fs_read,
                 &capability_evidence,
@@ -2687,6 +2696,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
+        let probe_content = output_recovery.stitch(probe_content);
 
         let native_calls = message["tool_calls"].as_array();
         // Recover tool calls a weak model emitted in CONTENT instead of the
@@ -7359,7 +7369,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let output_cap = generation_bounds::apply_chat(
                 &mut body,
                 &chat_url,
-                round_policy.output_allowance,
+                output_recovery.allowance(round_policy.output_allowance),
                 generation_window,
                 request_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
             )?;
@@ -7859,6 +7869,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 message["tool_calls"]
                     .as_array()
                     .is_some_and(|calls| !calls.is_empty()),
+                &oa_content,
+                round_policy.output_allowance,
+                output_limit_recovery::ceiling(),
                 &mut messages,
                 smart_harness,
             )? {
@@ -7893,7 +7906,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 }
             }
             let text = finalize_final_text(
-                generation_bounds::output_limit_notice(oa_content, round_usage),
+                generation_bounds::output_limit_notice(
+                    output_recovery.stitch(oa_content),
+                    round_usage,
+                ),
                 workspace,
                 &caveats.fs_read,
                 &capability_evidence,
@@ -8067,7 +8083,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     );
                 }
             }
-            let content = oa_content.clone();
+            let content = output_recovery.stitch(oa_content.clone());
             if !is_cancelled(cancel)
                 && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
             {
@@ -10142,7 +10158,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let use_tools = tools_supported && !tools_anthropic.is_empty();
             let body = anthropic_wire::build_messages_body(
                 model,
-                max_tokens,
+                output_recovery
+                    .allowance(Some(max_tokens))
+                    .unwrap_or(max_tokens),
                 system.as_deref(),
                 &wire_messages,
                 use_tools.then_some(tools_anthropic.as_slice()),
@@ -10483,15 +10501,103 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         }
 
         if model_reply.stop_reason.as_deref() == Some("max_tokens") {
+            // Mirrors the OpenAI path's `reasoning_overflow_signature`, with the
+            // condition adapted to this wire's length stop: `max_tokens` with no
+            // visible text but non-empty thinking and no executable call. It is
+            // checked here, before the terminal return, so it is reachable.
+            let reasoning_text = {
+                let t = model_reply.thinking.trim();
+                (!t.is_empty()).then_some(t)
+            };
+            let reasoning_overflow = model_reply.text.is_empty()
+                && reasoning_text.is_some()
+                && model_reply.tool_uses.is_empty()
+                && !model_reply.unfinished_tool_use;
+            if reasoning_overflow {
+                let has_round_budget = workflow_runtime.has_next_round(
+                    round,
+                    current_tool_round_limit,
+                    workflow_grace_rounds,
+                );
+                let can_continue = generation_policy.allows_reasoning_continuation(
+                    reasoning_continuation_attempted,
+                    has_round_budget,
+                );
+
+                let resolving_existing_continuation =
+                    reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
+                if !resolving_existing_continuation {
+                    if let Some(obs) = solve_obs.as_deref_mut() {
+                        let index = obs.behavior_signals.len();
+                        obs.behavior_signals.push(
+                            observability::BehaviorSignal::ReasoningOverflow {
+                                round,
+                                reasoning_overflow_detected: true,
+                                continuation_attempted: can_continue,
+                                continuation_succeeded: false,
+                                finish_reason: "max_tokens".into(),
+                                reasoning_tokens_estimate: estimation.tokens_for_chars(
+                                    reasoning_text
+                                        .map(|reasoning| reasoning.chars().count())
+                                        .unwrap_or(0),
+                                ),
+                            },
+                        );
+                        reasoning_overflow_signal_index = Some(index);
+                    }
+                }
+
+                if can_continue {
+                    print_newt(
+                        "reasoning reached the output limit before an answer — continuing once",
+                        color,
+                        false,
+                    );
+                    // Thinking replay onto this wire is a follow-up; the bounded
+                    // continuation replays the (empty) visible text only, which
+                    // the wire conversion drops — the re-dispatch is the same
+                    // history plus one more attempt (mirrors the OpenAI path's
+                    // structure).
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": model_reply.text.clone(),
+                    }));
+                    reasoning_continuation_attempted = true;
+                    continue 'round_loop;
+                }
+
+                let reason = if resolving_existing_continuation {
+                    "the bounded continuation also reached the output limit"
+                } else if reasoning_continuation_attempted {
+                    "the turn already used its bounded continuation"
+                } else if !generation_policy.one_bounded_reasoning_continuation {
+                    "the endpoint does not advertise bounded continuation"
+                } else if reasoning_replay_scope == crate::model_card::ReasoningReplayScope::Never {
+                    "the endpoint does not allow current-turn reasoning replay"
+                } else {
+                    "the turn has no remaining round budget"
+                };
+                print_newt(
+                    &format!("reasoning overflow detected — {reason}"),
+                    color,
+                    false,
+                );
+            }
             if output_recovery.retry(
                 !model_reply.tool_uses.is_empty() || model_reply.unfinished_tool_use,
+                &model_reply.text,
+                Some(max_tokens),
+                anthropic_wire::default_max_tokens().saturating_mul(2),
                 &mut messages,
                 smart_harness,
             )? {
                 continue;
             }
             let text = finalize_final_text(
-                generation_bounds::output_limit_notice(model_reply.text, round_usage),
+                generation_bounds::output_limit_notice(
+                    output_recovery.stitch(model_reply.text),
+                    round_usage,
+                ),
                 workspace,
                 &caveats.fs_read,
                 &capability_evidence,
@@ -10599,18 +10705,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     finish_reason: finish_reason.map(str::to_string),
                 });
         }
-        let reasoning_text = separate_reasoning;
-        // Mirrors the OpenAI path's `reasoning_overflow_signature`, with the
-        // condition adapted to this wire's length stop: `max_tokens` with no
-        // visible text but non-empty thinking and no executable call.
-        let reasoning_overflow = finish_reason == Some("max_tokens")
-            && oa_content.is_empty()
-            && reasoning_text.is_some()
-            && !has_tools;
-
         // Resolve the pending telemetry record on the first response after a
-        // continuation (mirrors the OpenAI path).
-        if reasoning_continuation_attempted && !reasoning_overflow {
+        // continuation (mirrors the OpenAI path). An overflow stop never gets
+        // here: it is a `max_tokens` stop, handled above.
+        if reasoning_continuation_attempted {
             if has_tools || !oa_content.is_empty() {
                 if let (Some(obs), Some(index)) =
                     (solve_obs.as_deref_mut(), reasoning_overflow_signal_index)
@@ -10623,73 +10721,6 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             reasoning_overflow_signal_index = None;
         }
 
-        if reasoning_overflow {
-            let has_round_budget = workflow_runtime.has_next_round(
-                round,
-                current_tool_round_limit,
-                workflow_grace_rounds,
-            );
-            let can_continue = generation_policy
-                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget);
-
-            let resolving_existing_continuation =
-                reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
-            if !resolving_existing_continuation {
-                if let Some(obs) = solve_obs.as_deref_mut() {
-                    let index = obs.behavior_signals.len();
-                    obs.behavior_signals
-                        .push(observability::BehaviorSignal::ReasoningOverflow {
-                            round,
-                            reasoning_overflow_detected: true,
-                            continuation_attempted: can_continue,
-                            continuation_succeeded: false,
-                            finish_reason: "max_tokens".into(),
-                            reasoning_tokens_estimate: estimation.tokens_for_chars(
-                                reasoning_text
-                                    .map(|reasoning| reasoning.chars().count())
-                                    .unwrap_or(0),
-                            ),
-                        });
-                    reasoning_overflow_signal_index = Some(index);
-                }
-            }
-
-            if can_continue {
-                print_newt(
-                    "reasoning reached the output limit before an answer — continuing once",
-                    color,
-                    false,
-                );
-                // Thinking replay onto this wire is a follow-up; the bounded
-                // continuation replays the (empty) visible text only, which
-                // the wire conversion drops — the re-dispatch is the same
-                // history plus one more attempt (mirrors the OpenAI path's
-                // structure).
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": oa_content,
-                }));
-                reasoning_continuation_attempted = true;
-                continue 'round_loop;
-            }
-
-            let reason = if resolving_existing_continuation {
-                "the bounded continuation also reached the output limit"
-            } else if reasoning_continuation_attempted {
-                "the turn already used its bounded continuation"
-            } else if !generation_policy.one_bounded_reasoning_continuation {
-                "the endpoint does not advertise bounded continuation"
-            } else if reasoning_replay_scope == crate::model_card::ReasoningReplayScope::Never {
-                "the endpoint does not allow current-turn reasoning replay"
-            } else {
-                "the turn has no remaining round budget"
-            };
-            print_newt(
-                &format!("reasoning overflow detected — {reason}"),
-                color,
-                false,
-            );
-        }
         // W0 (#1511): served-model + parse-status observation — mirrors the
         // OpenAI path.
         if let Some(obs) = solve_obs.as_deref_mut() {
@@ -10816,7 +10847,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     );
                 }
             }
-            let content = oa_content.clone();
+            let content = output_recovery.stitch(oa_content.clone());
             if !is_cancelled(cancel)
                 && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
             {
@@ -12576,7 +12607,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let mut body = build_body(&input, if tools_supported { &tools } else { &[] });
             let output_cap = generation_bounds::apply_responses(
                 &mut body,
-                generation_policy.output_allowance,
+                output_recovery.allowance(generation_policy.output_allowance),
                 generation_window,
                 estimate_responses_request_real_tokens(
                     instructions.as_deref(),
@@ -12833,20 +12864,21 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         if generation_bounds::output_limited(&json) {
             let usage = crate::responses_wire::decode_usage(&json["usage"]);
             accumulated_usage = merge_round_usage(accumulated_usage, usage);
+            let partial = generation_bounds::partial_responses_text(&json);
             if output_recovery.retry(
                 json["output"]
                     .as_array()
                     .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call")),
+                &partial,
+                generation_policy.output_allowance,
+                output_limit_recovery::ceiling(),
                 &mut input,
                 smart_harness,
             )? {
                 continue;
             }
             let text = finalize_final_text(
-                generation_bounds::output_limit_notice(
-                    generation_bounds::partial_responses_text(&json),
-                    usage,
-                ),
+                generation_bounds::output_limit_notice(output_recovery.stitch(partial), usage),
                 workspace,
                 &caveats.fs_read,
                 &capability_evidence,
@@ -12916,7 +12948,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             cal,
         ));
         accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
-        let (text, calls, echo) = (decoded.text, decoded.tool_calls, decoded.echo);
+        let (text, calls, echo) = (
+            output_recovery.stitch(decoded.text),
+            decoded.tool_calls,
+            decoded.echo,
+        );
 
         if debug {
             let excerpt: String = text.chars().take(80).collect();

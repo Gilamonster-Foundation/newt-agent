@@ -5,7 +5,13 @@ pub(super) fn reply(wire: &str, attempt: usize, limited: bool, tool: bool) -> Re
     reply_with(wire, attempt, limited, tool, "Finished.")
 }
 
-fn reply_with(wire: &str, attempt: usize, limited: bool, tool: bool, prose: &str) -> ResponseTemplate {
+fn reply_with(
+    wire: &str,
+    attempt: usize,
+    limited: bool,
+    tool: bool,
+    prose: &str,
+) -> ResponseTemplate {
     let args = if limited {
         "{\"path\":\"partial\",\"content\":\"cut".into()
     } else {
@@ -127,6 +133,17 @@ fn history(wire: &str, body: &serde_json::Value) -> String {
     .to_string()
 }
 
+/// The turn finished normally. The Responses loop records no end reason on an
+/// ordinary answer (pre-existing; it writes the slot only on failure and cap
+/// paths), so there "normal" means "not Failed".
+fn assert_completed(wire: &str, end: Option<crate::TurnEndReason>) {
+    if wire == "responses" {
+        assert_ne!(end, Some(crate::TurnEndReason::Failed), "{wire}");
+    } else {
+        assert_eq!(end, Some(crate::TurnEndReason::Completed), "{wire}");
+    }
+}
+
 async fn scenario(wire: &'static str, bounded: bool) {
     let (result, requests, end, dir) = run(wire, None, None, move |attempt, _| {
         // Three independent recoveries exceed a lifetime allowance of two.
@@ -157,16 +174,23 @@ async fn scenario(wire: &'static str, bounded: bool) {
                     .contains("your last reply was cut off at the output limit")
             })
             .collect();
-        assert_eq!(notes.len(), 1, "{wire} request {index}: one bounded note");
+        assert!(
+            !request[field].to_string().contains("partial"),
+            "discarded tool not replayed"
+        );
+        // A retry either raises the cap (G1) or, with no headroom, carries the
+        // one bounded note; never more than one.
+        let raised = sent_cap(wire, request) > sent_cap(wire, &requests[0]);
+        assert!(notes.len() <= 1, "{wire} request {index}: one bounded note");
+        if notes.is_empty() {
+            assert!(raised, "{wire} request {index}: no note needs a raised cap");
+            continue;
+        }
         assert_eq!(
             notes[0]["role"], "user",
             "host guidance is never assistant speech"
         );
         assert!(notes[0].to_string().contains("[loop-guidance] [harness]"));
-        assert!(
-            !request[field].to_string().contains("partial"),
-            "discarded tool not replayed"
-        );
     }
     assert_eq!(result.2.unwrap().output_tokens, requests.len() as u32 * 7);
     if bounded {
@@ -226,7 +250,7 @@ async fn raise_scenario(wire: &'static str) {
         "written"
     );
     assert!(!dir.path().join("partial").exists());
-    assert_eq!(end, Some(crate::TurnEndReason::Completed), "{wire}");
+    assert_completed(wire, end);
 }
 
 /// G2: a text-only truncation continues the turn; the partial text is kept
@@ -253,7 +277,7 @@ async fn text_scenario(wire: &'static str) {
         result.0
     );
     assert!(!result.0.contains("operator request"), "{wire}");
-    assert_eq!(end, Some(crate::TurnEndReason::Completed), "{wire}");
+    assert_completed(wire, end);
 }
 
 /// A cap already at the ceiling keeps today's note-only retry and still

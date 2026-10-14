@@ -71,7 +71,9 @@ async fn limited_reply(responses: bool, tools: bool, streamed: bool, summary: bo
     };
     let result = chat_complete(context, &mut NoMcp).await;
     let requests = server.received_requests().await.unwrap();
-    let attempts_expected = if tools && !summary { 3 } else { 1 };
+    // #2874: capped prose continues too, so both shapes use the bounded
+    // two-retry allowance; only the tool-less summary call has none.
+    let attempts_expected = if summary { 1 } else { 3 };
     assert_eq!(
         requests.len(),
         attempts_expected,
