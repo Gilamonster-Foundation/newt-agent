@@ -387,6 +387,69 @@ async fn fallback_marker_omits_write_denied_by_the_fence_after_prune() {
     );
 }
 
+/// Red (#2875 r2 round 5, item 1): prune one-lines an aged, long failure as
+/// `[run_command] ran 'cargo test' -> error, N lines output` and drops the exit
+/// code. The digest must still read `exit 101` through `run()`.
+#[tokio::test]
+async fn fallback_marker_keeps_exit_code_of_a_pruned_failing_command() {
+    let body = format!("error: command exited 101\n{}", "test failed\n".repeat(60));
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call("run_command", json!({"command": "cargo test"})),
+        tool_result(&body),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("cargo test (failed, exit 101)"),
+        "exit code lost after prune: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 5, item 1): the duplicate marker keeps the exit code too.
+#[tokio::test]
+async fn fallback_marker_keeps_exit_code_of_a_duplicate_failing_command() {
+    let body = format!("error: command exited 101\n{}", "test failed\n".repeat(60));
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    for _ in 0..2 {
+        msgs.push(assistant_call(
+            "run_command",
+            json!({"command": "cargo test"}),
+        ));
+        msgs.push(tool_result(&body));
+    }
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("cargo test (failed, exit 101)"),
+        "exit code lost in duplicate marker: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 5, item 2): a long `no command configured` result is a
+/// failure to the digest's classifier but `-> ok` to prune's old one. One
+/// classification: it must still be listed as failed after pruning.
+#[tokio::test]
+async fn fallback_marker_marks_a_pruned_unconfigured_command_failed() {
+    let body = format!(
+        "no command configured for lifecycle phase 'test'. {}",
+        "x".repeat(300)
+    );
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call("run_command", json!({"command": "just test"})),
+        tool_result(&body),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("just test (failed)"),
+        "unconfigured result counted as success: {marker}"
+    );
+}
+
 /// Red (#2875 r2 round 3, finding 3): collection keeps the NEWEST entries, so
 /// a commit made after more than DIGEST_CAP other commands still reaches the
 /// marker.
