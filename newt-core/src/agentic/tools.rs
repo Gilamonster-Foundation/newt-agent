@@ -6230,6 +6230,7 @@ mod path_alias_attacks;
 // #2882 — a host-shell timeout kills the whole process group and keeps output.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// The supervisor seam is the unix group-kill path; Windows has its own.
+#[cfg(all(test, not(windows)))]
 #[path = "tools_tests/host_timeout_tree_tests.rs"]
 mod host_timeout_tree_tests;

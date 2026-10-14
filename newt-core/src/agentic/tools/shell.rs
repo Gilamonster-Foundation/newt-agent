@@ -2151,9 +2151,10 @@ async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
 /// shell ran, so [`venv_cmd_prefix`]'s `export …;` prefix works unchanged.
 ///
 /// Hardened (#297) so a hung child can never wedge the turn:
-/// - `kill_on_drop(true)` + `process_group(0)` (own process group); on timeout
-///   [`supervise_host_child`] `killpg`s the whole group, because
-///   `kill_on_drop` alone reaps only the immediate `bash` (#2882).
+/// - `kill_on_drop(true)` + `process_group(0)` (own process group); on every
+///   exit but a normal finish [`supervise_host_child`] `killpg`s the whole
+///   group, because `kill_on_drop` alone kills only the immediate `bash`
+///   (#2882).
 /// - stdin redirected from `/dev/null` so a child that reads stdin sees EOF
 ///   instead of blocking forever waiting on a tty the agent can't feed.
 /// - a [`host_exec_timeout`] wall-clock ceiling: on expiry the child is killed
@@ -2220,8 +2221,11 @@ fn strip_child_authority_env(c: &mut tokio::process::Command) {
 /// none can flow into the child and re-assert authority the session did not
 /// grant it or leak newt's credentials (#8 / step-7.1a, invariant 9). The child
 /// inherits the rest of the environment (the Yolo lane's explicit ambient-
-/// authority grant). Own process group (setsid-equivalent) + `kill_on_drop` so a
-/// hung or tty-stealing child is reaped as a whole tree.
+/// authority grant). Own process group (setsid-equivalent) + `kill_on_drop`.
+/// `kill_on_drop` kills only the direct child: on unix the whole group is
+/// killed by [`supervise_host_child`]'s drop guard on every exit but a normal
+/// finish, and on Windows the ambient-Brush route's job object kills the tree
+/// (the cmd route kills only `cmd.exe`).
 pub(super) fn host_shell_command(
     route: ShellRoute,
     fallback: bool,
@@ -2303,11 +2307,36 @@ fn host_shell_command_at(
     Ok(c)
 }
 
+/// Kills the child's process group when dropped, unless [`Self::disarm`]ed by
+/// a normal finish. The one owner of every other exit — the wall, a failed
+/// pipe read, and the tool future being dropped on a user interrupt — so no
+/// exit can leave the group running (#2882).
+#[cfg(not(windows))]
+struct KillGroupOnDrop<K: FnOnce()>(Option<K>);
+
+#[cfg(not(windows))]
+impl<K: FnOnce()> KillGroupOnDrop<K> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(not(windows))]
+impl<K: FnOnce()> Drop for KillGroupOnDrop<K> {
+    fn drop(&mut self) {
+        if let Some(kill_tree) = self.0.take() {
+            kill_tree();
+        }
+    }
+}
+
 /// The host-shell supervisor, behind a seam the unit tier can drive without
 /// spawning (#2882): `wait` resolves to the child's exit code, `kill_tree`
-/// reaps the child's whole process group, and the two readers are its pipes.
-/// On the wall's expiry the tree is killed and the output already drained is
-/// KEPT, so the model sees what ran before the kill.
+/// kills the child's whole process group, and the two readers are its pipes.
+/// Every exit but a normal finish kills the group ([`KillGroupOnDrop`]). On
+/// the wall's expiry the output already drained is KEPT, so the model sees
+/// what ran before the kill.
+#[cfg(not(windows))]
 pub(super) async fn supervise_host_child<W, K, O, E>(
     wait: W,
     kill_tree: K,
@@ -2322,6 +2351,7 @@ where
     O: tokio::io::AsyncRead + Unpin,
     E: tokio::io::AsyncRead + Unpin,
 {
+    let guard = KillGroupOnDrop(Some(kill_tree));
     let mut out = Vec::new();
     let mut err = Vec::new();
     let completed = async {
@@ -2346,17 +2376,21 @@ where
     // read back, whether it finished or the wall fired.
     let result = tokio::time::timeout(timeout, completed).await;
     match result {
-        Ok(Ok(exit_code)) => Ok(HostShellRun {
-            exit_code,
-            stdout: out,
-            stderr: err,
-            timed_out: false,
-        }),
+        Ok(Ok(exit_code)) => {
+            guard.disarm();
+            Ok(HostShellRun {
+                exit_code,
+                stdout: out,
+                stderr: err,
+                timed_out: false,
+            })
+        }
+        // The guard kills the group as it drops on return.
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => {
-            // `kill_on_drop` reaps only the direct child; descendants in its
+            // `kill_on_drop` kills only the direct child; descendants in its
             // group would survive as orphans. Kill the whole group (#2882).
-            kill_tree();
+            drop(guard);
             err.extend_from_slice(
                 format!(
                     "command exceeded {}s host-shell timeout and was killed\n",
