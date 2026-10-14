@@ -29,7 +29,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// slow-but-progressing generation while still bounding a stream that never
 /// finishes. Diagnosed from a `newt` session stuck 5689s past its stated
 /// "120s idle timeout" against a DGX model-swap backend.
-const STREAM_TOTAL_TIMEOUT_MULTIPLIER: u32 = 5;
+pub const STREAM_TOTAL_TIMEOUT_MULTIPLIER: u32 = 5;
 
 #[derive(Debug)]
 struct ObservedProviderError(String);
@@ -130,7 +130,9 @@ async fn decode_http_reply(
     decoded
 }
 
-fn decode_ollama_stream(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+/// Decode an Ollama NDJSON chat stream into one chat-shaped reply. Shared with
+/// the compaction summarizer (#2875) so both paths read frames the same way.
+pub fn decode_ollama_stream(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
     let body = std::str::from_utf8(bytes)
         .map_err(|error| anyhow::anyhow!("invalid Ollama stream UTF-8: {error}"))?;
     let mut content = String::new();

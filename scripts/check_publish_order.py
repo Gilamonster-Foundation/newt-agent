@@ -9,6 +9,40 @@ import urllib.request
 
 import yaml
 
+# Release jobs that upload to a registry, and the jobs that can fail without
+# uploading. An upload cannot be taken back, so every publish job must reach
+# every gate through `needs:` (#2873: v0.8.0 half-published twice).
+PUBLISH_JOBS = ("publish-crates", "build-npm", "publish-npm-meta", "publish-pypi")
+RELEASE_GATES = (
+    "setup-acceptance",
+    "mcp-import-acceptance",
+    "build-binaries",
+    "build-wheels",
+    "build-sdist",
+    "check-publish-order",
+    "npm-preflight",
+)
+
+
+def gate_errors(jobs):
+    """Errors for publish jobs that can start before a release gate has passed."""
+    errors = []
+    for job in PUBLISH_JOBS:
+        if job not in jobs:
+            errors.append(f"publish job '{job}' is missing from release.yml")
+            continue
+        seen, todo = set(), [job]
+        while todo:
+            needs = jobs.get(todo.pop(), {}).get("needs", [])
+            for need in [needs] if isinstance(needs, str) else needs:
+                if need not in seen:
+                    seen.add(need)
+                    todo.append(need)
+        for gate in RELEASE_GATES:
+            if gate not in seen:
+                errors.append(f"'{job}' can publish before gate '{gate}' passes")
+    return errors
+
 
 def check(packages, matrix):
     """Return actionable errors without dropping renamed or optional dependencies."""
@@ -279,7 +313,7 @@ def main():
     )
     workflow = yaml.safe_load(Path(".github/workflows/release.yml").read_text())
     matrix = workflow["jobs"]["publish-crates"]["strategy"]["matrix"]["crate"]
-    errors = check(metadata["packages"], matrix)
+    errors = check(metadata["packages"], matrix) + gate_errors(workflow["jobs"])
     errors += registry_gaps(
         git_dependencies(metadata["packages"], matrix), crates_io_versions
     )

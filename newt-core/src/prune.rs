@@ -173,8 +173,12 @@ pub fn collapse_duplicate_tool_results(messages: &[Value], cfg: &PruneConfig) ->
             // so comparing against `out[first]` is comparing originals).
             Some(&first) if i < aged && out[first]["content"].as_str() == Some(content) => {
                 let n = content.chars().count();
+                // The marker keeps the failure status: a reader that sees only the
+                // pruned history (the compaction digest) must still know a
+                // repeated denial was a denial (#2875 r2 round 4).
+                let kind = failure_label(content).unwrap_or_else(|| "tool".to_string());
                 let line = format!(
-                    "[duplicate of message {first}: identical {n}-char tool result elided]"
+                    "[duplicate of message {first}: identical {n}-char {kind} result elided]"
                 );
                 if json_str_len(&line) < json_str_len(content) {
                     replacements.push((i, line));
@@ -267,22 +271,24 @@ pub fn shrink_tool_call_args(messages: &[Value], cfg: &PruneConfig) -> Vec<Value
 // internals
 // ---------------------------------------------------------------------------
 
-/// A tool call paired to its result message: the tool name plus its parsed
-/// arguments (string-encoded arguments are parsed; unparseable ones → Null).
-struct PairedCall {
-    name: String,
-    args: Value,
+/// A tool call: the tool name plus its parsed arguments (string-encoded
+/// arguments are parsed; unparseable ones -> Null).
+pub(crate) struct PairedCall {
+    pub(crate) name: String,
+    pub(crate) args: Value,
 }
 
-/// For each message index, the tool call that produced it (None for
-/// non-results and orphans). Results match their assistant's `tool_calls`
-/// by `tool_call_id` when present (OpenAI dialect) or positionally (Ollama
-/// dialect, which emits `role:"tool"` results without ids).
-fn pair_tool_results(messages: &[Value]) -> Vec<Option<PairedCall>> {
-    let mut paired = Vec::with_capacity(messages.len());
-    let mut pending: Vec<(String, PairedCall)> = Vec::new();
+/// Every tool call in `messages`, in call order, with the index of the result
+/// message that answered it (`None` for an unanswered call). Results match their
+/// assistant's `tool_calls` by `tool_call_id` when present (OpenAI dialect) or
+/// positionally (Ollama dialect, which emits `role:"tool"` results without ids).
+/// A non-tool message ends the window in which a call can still be answered.
+pub(crate) fn pair_calls(messages: &[Value]) -> Vec<(PairedCall, Option<usize>)> {
+    let mut calls: Vec<(PairedCall, Option<usize>)> = Vec::new();
+    // (tool_call_id, index into `calls`) of calls still awaiting a result.
+    let mut pending: Vec<(String, usize)> = Vec::new();
 
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         let role = msg["role"].as_str().unwrap_or("");
         if role == "tool" {
             let id = msg["tool_call_id"].as_str().unwrap_or("");
@@ -291,27 +297,39 @@ fn pair_tool_results(messages: &[Value]) -> Vec<Option<PairedCall>> {
             } else {
                 pending.iter().position(|(pid, _)| pid == id)
             };
-            paired.push(pos.map(|p| pending.remove(p).1));
+            if let Some(p) = pos {
+                calls[pending.remove(p).1].1 = Some(i);
+            }
             continue;
         }
         pending.clear();
         if role == "assistant" {
-            if let Some(tcs) = msg["tool_calls"].as_array() {
-                for tc in tcs {
-                    let id = tc["id"].as_str().unwrap_or("").to_string();
-                    let name = tc["function"]["name"]
-                        .as_str()
-                        .unwrap_or("tool")
-                        .to_string();
-                    let args = match &tc["function"]["arguments"] {
-                        Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
-                        v => v.clone(),
-                    };
-                    pending.push((id, PairedCall { name, args }));
-                }
+            for tc in msg["tool_calls"].as_array().into_iter().flatten() {
+                let id = tc["id"].as_str().unwrap_or("").to_string();
+                let name = tc["function"]["name"]
+                    .as_str()
+                    .unwrap_or("tool")
+                    .to_string();
+                let args = match &tc["function"]["arguments"] {
+                    Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+                    v => v.clone(),
+                };
+                pending.push((id, calls.len()));
+                calls.push((PairedCall { name, args }, None));
             }
         }
-        paired.push(None);
+    }
+    calls
+}
+
+/// For each message index, the tool call that produced it (None for
+/// non-results and orphans).
+fn pair_tool_results(messages: &[Value]) -> Vec<Option<PairedCall>> {
+    let mut paired: Vec<Option<PairedCall>> = messages.iter().map(|_| None).collect();
+    for (call, result) in pair_calls(messages) {
+        if let Some(i) = result {
+            paired[i] = Some(call);
+        }
     }
     paired
 }
@@ -331,11 +349,10 @@ fn already_pruned(content: &str, paired_name: &str) -> bool {
 fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
     let lines = content.lines().count();
     let chars = content.chars().count();
-    let status = if looks_like_error(content) {
-        "error"
-    } else {
-        "ok"
-    };
+    // One classification, shared with the digest reader (#2875 r2 round 5).
+    let failure = failure_label(content);
+    let failed = failure.is_some();
+    let status = failure.as_deref().unwrap_or("ok");
     let arg = |key: &str| -> String {
         args.and_then(|a| a.get(key))
             .and_then(Value::as_str)
@@ -367,7 +384,7 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
             // inventing a boundary that excludes it.
             let is_replay_disambiguated =
                 content.ends_with(crate::agentic::tools::output_budget::REPLAY_DISAMBIGUATOR);
-            if status == "ok" && !is_replay_disambiguated {
+            if !failed && !is_replay_disambiguated {
                 #[cfg(feature = "ast")]
                 if let Some(outline) = rust_outline_summary(&path, args, content) {
                     return outline;
@@ -718,7 +735,10 @@ pub fn is_one_line_summary(content: &str) -> bool {
     // filtered out by the single-line check above, and stays already-pruned
     // via its `[read_file] ` prefix (`already_pruned`) rather than folding.
     const PAGE_MAP_MARKER: &str = " (page map; re-read any span with offset/limit): ";
-    rest.contains(" -> ok, ") || rest.contains(" -> error, ") || rest.contains(PAGE_MAP_MARKER)
+    rest.contains(" -> ok, ")
+        || rest.contains(" -> error, ")
+        || rest.contains(" -> error (exit ")
+        || rest.contains(PAGE_MAP_MARKER)
 }
 
 /// First `max_chars` chars with newlines flattened, `…`-terminated if cut.
@@ -733,6 +753,83 @@ fn excerpt(s: &str, max_chars: usize) -> String {
         let head: String = cleaned.chars().take(max_chars).collect();
         format!("{head}…")
     }
+}
+
+/// What a tool result says about its own outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Outcome {
+    pub(crate) failed: bool,
+    pub(crate) exit: Option<i32>,
+}
+
+/// The ONE outcome parser, for all three shapes a result can have: the raw text,
+/// the pass-1 duplicate marker, and the pass-2 one-liner. A marker embeds the
+/// command, so its status is read only from the position the producer owns, never
+/// searched for: the one-liner's final ` -> <status>, N ...` suffix (read from the
+/// END, since the producer writes nothing after the status that contains ` -> `)
+/// and the duplicate marker's fixed `identical N-char <kind> result elided`
+/// clause. Command text quoting `error (exit 7)` or ` -> error (exit 7)` therefore
+/// cannot forge an outcome (#2875 r2 round 6). `None` is a marker with no readable
+/// status (the page map).
+pub(crate) fn marker_outcome(content: &str) -> Option<Outcome> {
+    if let Some(rest) = content.strip_prefix("[duplicate of message ") {
+        let kind = rest
+            .split_once(": identical ")?
+            .1
+            .split_once("-char ")?
+            .1
+            .strip_suffix(" result elided]")?;
+        return Some(status_outcome(kind));
+    }
+    if is_one_line_summary(content) {
+        // A page map has no status clause, and its body is source text that may
+        // contain ` -> error, 3`; only `read_file` emits one.
+        if content.starts_with("[read_file] ") && content.contains(" (page map; re-read any span") {
+            return None;
+        }
+        let tail = content.rsplit_once(" -> ")?.1;
+        let (status, count) = tail.split_once(", ")?;
+        // The producer's clause is `<status>, <N> <unit>`; anything else is not it.
+        if !count.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        return Some(status_outcome(status));
+    }
+    Some(Outcome {
+        failed: failure_label(content).is_some(),
+        exit: crate::agentic::compress::exit_code_of(content),
+    })
+}
+
+/// Parse a producer status word: `error`, `error (exit N)`, or anything else
+/// (`ok`, `tool`) as not failed.
+fn status_outcome(status: &str) -> Outcome {
+    let Some(rest) = status.strip_prefix("error") else {
+        return Outcome {
+            failed: false,
+            exit: None,
+        };
+    };
+    let exit = rest
+        .strip_prefix(" (exit ")
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|d| d.parse().ok());
+    Outcome { failed: true, exit }
+}
+
+/// `error` or `error (exit N)` when a raw tool result reports failure, else
+/// `None`. The ONE failure classification: pass 1 and pass 2 write it into
+/// their markers and [`marker_outcome`] reads it back, so producer and
+/// consumer cannot disagree (#2875 r2 round 5). The exit code survives pruning
+/// because it rides in the label.
+fn failure_label(content: &str) -> Option<String> {
+    if !(looks_like_error(content) || !crate::agentic::tools::tool_result_ok(content)) {
+        return None;
+    }
+    Some(match crate::agentic::compress::exit_code_of(content) {
+        Some(code) => format!("error (exit {code})"),
+        None => "error".to_string(),
+    })
 }
 
 /// Matches the error shapes `execute_tool` produces (`error…`,
@@ -2621,5 +2718,35 @@ fn third(z: u32) -> u32 {
                 "raw tool output was mistaken for a one-liner: {raw:?}"
             );
         }
+    }
+    /// #2875 r2 round 6: the status is the producer's final suffix, never a
+    /// substring of the embedded command.
+    #[test]
+    fn marker_outcome_reads_the_final_status_not_quoted_command_text() {
+        let o = |s: &str| marker_outcome(s).map(|o| (o.failed, o.exit));
+        assert_eq!(
+            o("[run_command] ran 'grep 'error (exit 7)' b' -> error (exit 2), 9 lines output"),
+            Some((true, Some(2)))
+        );
+        assert_eq!(
+            o("[run_command] ran 'grep ' -> error (exit 7)' b' -> ok, 9 lines output"),
+            Some((false, None))
+        );
+        assert_eq!(
+            o("[run_command] ran 'x' -> error, 9 lines output"),
+            Some((true, None))
+        );
+        assert_eq!(
+            o("[duplicate of message 3: identical 400-char error (exit 101) result elided]"),
+            Some((true, Some(101)))
+        );
+        assert_eq!(
+            o("[duplicate of message 3: identical 400-char tool result elided]"),
+            Some((false, None))
+        );
+        assert_eq!(
+            o("[read_file] a.rs lines 1-9 (page map; re-read any span with offset/limit): 1 -> error, 3"),
+            None
+        );
     }
 }

@@ -52,6 +52,7 @@
 //! Step 18.5 — the seam is the summary message this module inserts.
 
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -1163,7 +1164,7 @@ pub(crate) async fn compress(
         } else {
             CompressAction::StaticFallback
         };
-        let mut body = body.unwrap_or_else(|| static_fallback_text(middle.len()));
+        let mut body = body.unwrap_or_else(|| static_fallback_text(middle));
         // #319: the summary is prose and does NOT preserve verbatim file
         // contents. A coding model that recalls an API/signature from the
         // summary will hallucinate it. Name the files read in the compacted
@@ -1774,8 +1775,117 @@ fn reclaim_within_trailing_group(
 
 /// The static fallback marker body — the only surviving form of the old
 /// placeholder-discard.
-fn static_fallback_text(removed: usize) -> String {
-    format!("Summary generation was unavailable. {removed} message(s) were removed.")
+/// Cap on each digest list (#2875 part 2): enough to name the work, bounded so
+/// the marker stays small.
+const DIGEST_CAP: usize = 20;
+/// Per-entry character cap for the digest (#2875 r2).
+const DIGEST_ENTRY_CAP: usize = 160;
+/// Whole-digest character cap (#2875 r2).
+const DIGEST_TOTAL_CAP: usize = 2_000;
+
+/// The static marker, plus a short digest of the removed span: the files the
+/// file-writing tools touched and the `git commit` commands run. The summary is
+/// lost when the summarizer stalls; this keeps the handful of facts a model
+/// needs to resume without re-deriving them.
+///
+/// Calls are paired to their results by `prune::pair_calls`, and a result that
+/// reports failure (raw, or already rewritten by prune) marks its call failed,
+/// so a failed write is not reported as touched. When the rendered digest is
+/// over [`DIGEST_TOTAL_CAP`], the OLDEST entries are dropped, never the tail.
+fn static_fallback_text(removed: &[Value]) -> String {
+    let mut files: VecDeque<String> = VecDeque::new();
+    let mut commands: VecDeque<String> = VecDeque::new();
+    for (call, result) in crate::prune::pair_calls(removed) {
+        let result = result.and_then(|i| removed[i]["content"].as_str());
+        record_digest_call(&call.name, &call.args, result, &mut files, &mut commands);
+    }
+    let render = |files: &VecDeque<String>, commands: &VecDeque<String>| {
+        let mut out = format!(
+            "Summary generation was unavailable. {} message(s) were removed.",
+            removed.len()
+        );
+        if !files.is_empty() {
+            out.push_str(&format!("\nFiles touched: {}", join_deque(files, ", ")));
+        }
+        if !commands.is_empty() {
+            out.push_str(&format!("\nCommands: {}", join_deque(commands, "; ")));
+        }
+        out
+    };
+    let mut out = render(&files, &commands);
+    while out.chars().count() > DIGEST_TOTAL_CAP && !(files.is_empty() && commands.is_empty()) {
+        // Drop the oldest entry of whichever list is the longer rendering.
+        let longer = if join_deque(&files, ", ").len() > join_deque(&commands, "; ").len() {
+            &mut files
+        } else {
+            &mut commands
+        };
+        longer.pop_front();
+        out = render(&files, &commands);
+    }
+    out
+}
+
+fn join_deque(items: &VecDeque<String>, sep: &str) -> String {
+    items
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// Keep only the newest [`DIGEST_CAP`] entries: a re-touched entry moves to the
+/// back, and the oldest is evicted past the cap (#2875 r2 round 3).
+fn push_newest(list: &mut VecDeque<String>, entry: String) {
+    list.retain(|e| *e != entry);
+    list.push_back(entry);
+    if list.len() > DIGEST_CAP {
+        list.pop_front();
+    }
+}
+
+/// The `N` of the tool layer's `error: command exited N` (#2875 r2 round 3).
+pub(crate) fn exit_code_of(result: &str) -> Option<i32> {
+    let rest = result.trim_start().strip_prefix("error: command exited ")?;
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
+/// Record one digest call: a write (`edit_file`/`write_file`) that succeeded
+/// names its path as touched; a `run_command` is listed with ` (failed)` and the
+/// exit code AFTER its capped excerpt when its result reported failure. Every
+/// entry is redacted before it is capped (#2875 r2, findings 2-3 and 5).
+fn record_digest_call(
+    name: &str,
+    args: &Value,
+    result: Option<&str>,
+    files: &mut VecDeque<String>,
+    commands: &mut VecDeque<String>,
+) {
+    let outcome = result.and_then(crate::prune::marker_outcome);
+    let failed = outcome.is_some_and(|o| o.failed);
+    let entry = |text: &str| excerpt(&redact_secrets(text), DIGEST_ENTRY_CAP);
+    match name {
+        "edit_file" | "write_file" => {
+            if let (false, Some(p)) = (failed, args["path"].as_str()) {
+                push_newest(files, entry(p));
+            }
+        }
+        "run_command" => {
+            if let Some(c) = args["command"].as_str() {
+                let tag = match (failed, outcome.and_then(|o| o.exit)) {
+                    (true, Some(code)) => format!(" (failed, exit {code})"),
+                    (true, None) => " (failed)".to_string(),
+                    _ => String::new(),
+                };
+                push_newest(commands, format!("{}{tag}", entry(c)));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Wrap a summary body in the compaction markers as a `user` message.

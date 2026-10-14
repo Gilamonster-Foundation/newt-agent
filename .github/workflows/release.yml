@@ -1,7 +1,8 @@
 name: Release
 
-# HOOK PARITY: .githooks/pre-push checks publish coverage/order on manifest and
-# release-gate changes. Binary/wheel/npm assembly and publication are CI-only.
+# HOOK PARITY: .githooks/pre-push checks publish coverage/order and that every
+# publish job needs every gate (#2873) on manifest and release-gate changes.
+# Binary/wheel/npm assembly and publication are CI-only.
 
 # Patterned on agent-mesh's release.yml: a single PyO3 cdylib wheel
 # (`newt-agent-py`) for two OSes (Linux + macOS — Windows fails on
@@ -86,9 +87,10 @@ jobs:
 
   build-binaries:
     name: Build (${{ matrix.label }})
-    # npm-preflight gates only the npm lane (build-npm), not the binaries: a
-    # tag the npm version check rejects must not take the GitHub release,
-    # deb/rpm, brew, choco or crates lanes down with it.
+    # npm-preflight does not gate the binaries or the GitHub release. A tag
+    # the npm version check rejects only sets npm_release=false (it does not
+    # fail): the npm jobs are skipped, while crates.io and PyPI, which also
+    # need npm-preflight (#2873), still publish.
     needs: [mcp-import-acceptance]
     strategy:
       fail-fast: false
@@ -119,6 +121,27 @@ jobs:
       - name: Build binaries
         run: |
           cargo build --release --locked --target ${{ matrix.target }} -p newt-agent -p newt-mcp-server
+
+      # platforms.json declares the glibc floor the npm shim enforces; the
+      # binary is built on a moving `ubuntu-latest`. If the builder's glibc
+      # ever exceeds the declared floor, the shim would admit hosts that die
+      # in ld.so. This runs here, not in build-npm, because build-binaries is
+      # a release gate: a red floor check holds every registry (#2873),
+      # whereas a fail-fast: false build-npm leg would let the rest upload.
+      - name: Refuse a Linux binary newer than the declared glibc floor
+        if: matrix.label == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          floor=$(jq -r '.[] | select(.key == "linux-x64") | .glibcMin' npm/platforms.json)
+          for bin in newt newt-mcp-server; do
+            need=$(objdump -T "target/${{ matrix.target }}/release/${bin}" | grep -oE 'GLIBC_[0-9.]+' | sed 's/^GLIBC_//' | sort -V | tail -1)
+            echo "${bin}: needs glibc ${need}; declared floor ${floor}"
+            if [[ "$(printf '%s\n%s\n' "$need" "$floor" | sort -V | tail -1)" != "$floor" ]]; then
+              echo "::error::${bin} needs glibc ${need}, above the declared floor ${floor} — raise glibcMin in npm/platforms.json or build on an older image"
+              exit 1
+            fi
+          done
 
       - name: Stage release contents (Unix)
         if: matrix.platform != 'windows-latest'
@@ -347,7 +370,9 @@ jobs:
     # registry dep; the workspace [patch.crates-io] is removed after crates.io
     # indexes agent-bridle.
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries, check-publish-order]
+    # #2873: no crate uploads until every gate job has passed. A gate job
+    # going red holds this job; a registry-side failure elsewhere does not.
+    needs: [setup-acceptance, mcp-import-acceptance, build-binaries, build-wheels, build-sdist, check-publish-order, npm-preflight]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false   # leaves keep going if one fails
@@ -544,7 +569,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
-    needs: [build-wheels, build-sdist]
+    needs: [setup-acceptance, mcp-import-acceptance, build-binaries, build-wheels, build-sdist, check-publish-order, npm-preflight]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all wheels + sdist
@@ -595,7 +620,7 @@ jobs:
   build-npm:
     name: npm binary (${{ matrix.key }})
     if: startsWith(github.ref, 'refs/tags/v') && needs.npm-preflight.outputs.npm_release == 'true'
-    needs: [build-binaries, npm-preflight]
+    needs: [setup-acceptance, mcp-import-acceptance, build-binaries, build-wheels, build-sdist, check-publish-order, npm-preflight]
     permissions:
       contents: read
       id-token: write        # npm provenance + OIDC trusted publishing
@@ -637,25 +662,6 @@ jobs:
             tar -xzf "$archive" -C incoming/
           fi
 
-      # platforms.json declares the glibc floor the shim enforces; the binary
-      # is built on a moving `ubuntu-latest`. If the builder's glibc ever
-      # exceeds the declared floor, the shim would admit hosts that die in
-      # ld.so — the exact bug the floor exists to prevent. Fail here instead.
-      - name: Refuse a Linux binary newer than the declared glibc floor
-        if: matrix.key == 'linux-x64'
-        shell: bash
-        run: |
-          set -euo pipefail
-          floor=$(node -p 'require("./npm/platforms.json").find((p) => p.key === "linux-x64").glibcMin')
-          for bin in newt newt-mcp-server; do
-            need=$(objdump -T "incoming/newt-agent-${GITHUB_REF_NAME}-${{ matrix.label }}/${bin}" | grep -oE 'GLIBC_[0-9.]+' | sed 's/^GLIBC_//' | sort -V | tail -1)
-            echo "${bin}: needs glibc ${need}; declared floor ${floor}"
-            if [[ "$(printf '%s\n%s\n' "$need" "$floor" | sort -V | tail -1)" != "$floor" ]]; then
-              echo "::error::${bin} needs glibc ${need}, above the declared floor ${floor} — raise glibcMin in npm/platforms.json or build on an older image"
-              exit 1
-            fi
-          done
-
       - name: Wrap + publish platform packages
         shell: bash
         run: |
@@ -681,7 +687,8 @@ jobs:
   publish-npm-meta:
     name: npm shims + umbrella
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-npm]     # platform packages must be published first
+    # build-npm first: platform packages must be published before the shims.
+    needs: [build-npm, setup-acceptance, mcp-import-acceptance, build-binaries, build-wheels, build-sdist, check-publish-order, npm-preflight]
     permissions:
       contents: read
       id-token: write

@@ -658,7 +658,8 @@ async fn host_shell_127_wording_grounds_the_named_missing_rule() {
         .await
         .expect("host shell runs");
         assert_eq!(envelope["exit_code"], 127, "{envelope}");
-        let (_, class) = super::shell::host_result(&envelope, |_| String::new());
+        let (_, class) =
+            super::shell::host_result(&envelope, |_| String::new(), Default::default());
         assert_eq!(class, expected, "{cmd}: {envelope}");
     }
 }
