@@ -8764,6 +8764,10 @@ fn resolve_summarizer_backend(
 #[path = "lib_tests/summarizer_default_tests.rs"]
 mod summarizer_default_tests;
 
+#[cfg(test)]
+#[path = "lib_tests/summarizer_idle_timeout_tests.rs"]
+mod summarizer_idle_timeout_tests;
+
 /// Whether a SESSION-INHERITING summarizer — one that resolves onto the active
 /// inference backend, including the degraded fallback when the embedded engine
 /// is unavailable — must FOLLOW a live `/model` / `/backend` switch, as opposed
