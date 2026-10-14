@@ -257,7 +257,11 @@ where
 
 /// Idle means: no checkpoint for `bound`. `None` never expires; a zero bound
 /// admits nothing (the bound is exclusive).
-fn idle_within(last: std::time::Instant, now: std::time::Instant, bound: Option<std::time::Duration>) -> bool {
+fn idle_within(
+    last: std::time::Instant,
+    now: std::time::Instant,
+    bound: Option<std::time::Duration>,
+) -> bool {
     bound.is_none_or(|b| now.saturating_duration_since(last) < b)
 }
 
@@ -274,7 +278,8 @@ where
     F: FnOnce(&dyn Fn() -> anyhow::Result<()>) -> anyhow::Result<String> + Send + 'static,
     N: Fn() -> std::time::Instant + Send + Sync + 'static,
 {
-    let now: std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync> = std::sync::Arc::new(now);
+    let now: std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync> =
+        std::sync::Arc::new(now);
     let start = (*now)();
     anyhow::ensure!(
         idle_within(start, start, bound),

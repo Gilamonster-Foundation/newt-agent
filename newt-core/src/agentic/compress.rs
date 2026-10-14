@@ -1785,7 +1785,10 @@ const DIGEST_CAP: usize = 20;
 fn static_fallback_text(removed: &[Value]) -> String {
     let mut files: Vec<String> = Vec::new();
     let mut commits: Vec<String> = Vec::new();
-    for m in removed.iter().filter(|m| m["role"].as_str() == Some("assistant")) {
+    for m in removed
+        .iter()
+        .filter(|m| m["role"].as_str() == Some("assistant"))
+    {
         for call in m["tool_calls"].as_array().into_iter().flatten() {
             let func = &call["function"];
             // `arguments` may be a JSON object (Ollama) or a JSON string (OpenAI).
@@ -1802,7 +1805,10 @@ fn static_fallback_text(removed: &[Value]) -> String {
                     }
                 }
                 Some("run_command") => {
-                    if let Some(c) = args["command"].as_str().filter(|c| c.contains("git commit")) {
+                    if let Some(c) = args["command"]
+                        .as_str()
+                        .filter(|c| c.contains("git commit"))
+                    {
                         commits.push(c.to_string());
                     }
                 }
@@ -1819,7 +1825,11 @@ fn static_fallback_text(removed: &[Value]) -> String {
         out.push_str(&format!("\nFiles touched: {}", shown.join(", ")));
     }
     if !commits.is_empty() {
-        let shown: Vec<_> = commits.iter().take(DIGEST_CAP).map(String::as_str).collect();
+        let shown: Vec<_> = commits
+            .iter()
+            .take(DIGEST_CAP)
+            .map(String::as_str)
+            .collect();
         out.push_str(&format!("\nCommands: {}", shown.join("; ")));
     }
     out

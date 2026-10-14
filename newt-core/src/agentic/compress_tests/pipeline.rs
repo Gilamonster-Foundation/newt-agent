@@ -237,7 +237,12 @@ async fn fallback_marker_names_touched_files_and_commits() {
     let s = failing_summarizer(calls.clone());
     let mut state = CompressState::new();
     let out = run(&msgs, before / 3, None, Some(&*s), &mut state).await;
-    assert_eq!(out.action, CompressAction::StaticFallback, "{:?}", out.action);
+    assert_eq!(
+        out.action,
+        CompressAction::StaticFallback,
+        "{:?}",
+        out.action
+    );
     let summary = out
         .messages
         .iter()
@@ -245,5 +250,8 @@ async fn fallback_marker_names_touched_files_and_commits() {
         .find(|c| c.contains("Summary generation was unavailable."))
         .unwrap_or_else(|| panic!("no marker in {:#?}", out.messages));
     assert!(summary.contains("src/a.rs"), "names the file: {summary}");
-    assert!(summary.contains("git commit -m x"), "names the commit: {summary}");
+    assert!(
+        summary.contains("git commit -m x"),
+        "names the commit: {summary}"
+    );
 }
