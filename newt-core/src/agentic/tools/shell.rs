@@ -2150,7 +2150,7 @@ pub(super) async fn host_shell_output(
 }
 
 /// newt's control-plane env vars that must NEVER flow into a host-shell child
-/// (#8 / invariant 9). Two classes, both newt-internal:
+/// (#8 / invariant 9). Three classes, all newt-internal:
 ///
 /// - **authority switches** — an inherited `NEWT_DISABLE_OCAP` /
 ///   `NEWT_FULL_ACCESS` / `NEWT_UNSAFE_HOST_EXEC` / … would silently re-assert
@@ -2159,7 +2159,12 @@ pub(super) async fn host_shell_output(
 ///   authority-switch-survives-one-hop hole);
 /// - **newt's own secrets** — `NEWT_AGENT_KEY` (the capability envelope),
 ///   `NEWT_OPERATOR_KEY`, and `NEWT_TOKEN_PASSPHRASE` (the encrypted-token-store
-///   unlock) would let the child forge capabilities or decrypt the token store.
+///   unlock) would let the child forge capabilities or decrypt the token store;
+/// - **config redirects** (#2876) — `--config-dir` / `--config` publish
+///   `NEWT_CONFIG_DIR` / `NEWT_CONFIG` in newt's own env; inherited, they make
+///   the user's code under test read newt's configuration. The capture paths a
+///   nested newt records through (`NEWT_FLIGHT_RECORDER`, `NEWT_DENIAL_JOURNAL`)
+///   are deliberately NOT listed, so they still reach the child.
 ///
 /// Knowledge in data (three Cs): a new `NEWT_` control switch is added here. The
 /// child KEEPS the operator's *general* environment — the `--full-access` /
@@ -2182,6 +2187,8 @@ pub(super) const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
     "NEWT_AGENT_KEY",
     "NEWT_OPERATOR_KEY",
     "NEWT_TOKEN_PASSPHRASE",
+    crate::config::NEWT_CONFIG_DIR_ENV,
+    "NEWT_CONFIG",
 ];
 
 /// Excise newt's whole control plane ([`CHILD_STRIPPED_AUTHORITY_ENV`]) from a
@@ -2195,7 +2202,8 @@ fn strip_child_authority_env(c: &mut tokio::process::Command) {
 }
 
 /// Build the host-shell child command, stripping newt's whole control plane
-/// (authority switches + newt's own secrets, [`strip_child_authority_env`]) so
+/// (authority switches, newt's own secrets, config redirects —
+/// [`strip_child_authority_env`]) so
 /// none can flow into the child and re-assert authority the session did not
 /// grant it or leak newt's credentials (#8 / step-7.1a, invariant 9). The child
 /// inherits the rest of the environment (the Yolo lane's explicit ambient-
