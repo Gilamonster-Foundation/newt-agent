@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // A HANG-GUARD, never a latency bound. Every use below waits on a
 // `spawn_blocking` worker that holds the admission permit; the successor path
