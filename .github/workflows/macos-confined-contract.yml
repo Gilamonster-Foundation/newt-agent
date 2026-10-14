@@ -3,7 +3,7 @@
 name: confined command contract (macOS)
 on:
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
   push:
     branches: [main, "ci/macos-confined-contract"]
   workflow_dispatch: {}
