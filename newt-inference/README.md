@@ -16,8 +16,9 @@ Also provides the `BackendRegistry` and retry/backoff helpers used by the rest
 of the workspace.
 
 Embedded generation admits one worker per process; busy requests fail without
-queuing another model load. `complete_with_timeout` bounds the async request,
-including loading and generation. Timeout or caller cancellation signals the
+queuing another model load. `complete_with_timeout` is an idle bound: it limits
+the time since the last progress checkpoint (admission, loading or generation),
+not the total elapsed time. Timeout or caller cancellation signals the
 worker cooperatively, which retains its slot until it exits. A synchronous load
 or forward may still finish after the caller returns. Single-token prefill gives
 the pinned Candle Qwen2 engine cancellation checkpoints without an incompatible

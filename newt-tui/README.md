@@ -195,9 +195,15 @@ create valid records.
 ## Context summaries
 
 Context summarization uses the shared progress row and can be interrupted while
-a provider's compaction is pending. `timeout_secs` in `summarizer.toml` also applies to
-the embedded engine, including model loading. It is a per-summary-request limit,
-not a deadline for an entire multi-chunk compaction. Embedded cancellation is
+a provider's compaction is pending. The summarizer streams its reply, and
+`timeout_secs` in `summarizer.toml` is an idle bound: the longest it may go
+without a stream frame (or, for the embedded engine, without a progress
+checkpoint while loading or generating). A summary that keeps producing output
+may run longer than `timeout_secs`; one HTTP attempt is capped at 5x that value
+in total. It is not a deadline for an entire multi-chunk compaction. When
+summarization fails and the static fallback marker is used, the marker keeps a
+short digest of the removed span (files touched, and the commands run, with exit
+codes for failures) so the conversation can resume. Embedded cancellation is
 cooperative: the caller returns while a synchronous load or forward may still be
 finishing, and another embedded generation is refused until that worker exits.
 
