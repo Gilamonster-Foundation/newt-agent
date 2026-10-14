@@ -2,7 +2,13 @@
 
 import unittest
 
-from check_publish_order import check, topological_order
+from check_publish_order import (
+    PUBLISH_JOBS,
+    RELEASE_GATES,
+    check,
+    gate_errors,
+    topological_order,
+)
 
 
 def package(name, dependencies=(), publish=None):
@@ -82,6 +88,37 @@ class PublishOrder(unittest.TestCase):
             (["app", "unknown"], "'unknown' is not a workspace package"),
         ):
             self.assertIn(message, check(crates, matrix))
+
+
+class PublishGates(unittest.TestCase):
+    """#2873: v0.8.0 uploaded crates and npm packages before a gate went red."""
+
+    def jobs(self):
+        jobs = {gate: {} for gate in RELEASE_GATES}
+        jobs["mcp-import-acceptance"] = {"needs": ["setup-acceptance"]}
+        jobs["build-binaries"] = {"needs": "mcp-import-acceptance"}
+        jobs.update({job: {"needs": list(RELEASE_GATES)} for job in PUBLISH_JOBS})
+        return jobs
+
+    def test_every_publish_job_waiting_on_every_gate_passes(self):
+        self.assertEqual(gate_errors(self.jobs()), [])
+
+    def test_transitive_need_counts(self):
+        jobs = self.jobs()
+        jobs["publish-npm-meta"] = {"needs": ["build-npm"]}
+        self.assertEqual(gate_errors(jobs), [])
+
+    def test_publish_racing_a_preflight_fails(self):
+        jobs = self.jobs()
+        jobs["publish-crates"]["needs"] = ["build-binaries", "check-publish-order"]
+        errors = gate_errors(jobs)
+        self.assertIn("'publish-crates' can publish before gate 'npm-preflight' passes", errors)
+        self.assertNotIn("'publish-crates' can publish before gate 'setup-acceptance' passes", errors)
+
+    def test_missing_publish_job_fails(self):
+        jobs = self.jobs()
+        del jobs["publish-pypi"]
+        self.assertIn("publish job 'publish-pypi' is missing from release.yml", gate_errors(jobs))
 
 
 if __name__ == "__main__":
