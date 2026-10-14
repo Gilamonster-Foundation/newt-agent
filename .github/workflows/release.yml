@@ -311,12 +311,13 @@ jobs:
           if-no-files-found: error
 
   # SPDX 2.3 SBOM of the workspace's Rust dependency graph, read from
-  # Cargo.lock by Syft (no compile step), attested against the released
-  # archives' digests. Like the installers above it cannot sink the release
-  # (`continue-on-error`), and no publish job needs it.
+  # Cargo.lock by Syft (no compile step). It is generated and uploaded as a
+  # workflow artifact on EVERY run, so a workflow_dispatch or release/** dry
+  # run exercises it; only a v* tag attests it against the released archives'
+  # digests (and github-release attaches it). Like the installers above it
+  # cannot sink the release (`continue-on-error`), and no publish job needs it.
   sbom:
     name: SBOM (SPDX 2.3)
-    if: startsWith(github.ref, 'refs/tags/')
     needs: [build-binaries]
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -326,7 +327,18 @@ jobs:
       attestations: write  # store the attestation on this repository
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # A tag names the file after itself; any other run (a branch ref may
+      # contain `/`) uses the short commit, so the dry run is still unique.
+      - name: Name the SBOM
+        id: name
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "file=newt-agent-${GITHUB_REF_NAME}.spdx.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=newt-agent-dev-${GITHUB_SHA::12}.spdx.json" >> "$GITHUB_OUTPUT"
+          fi
       - name: Download release archives
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: newt-agent-*-*64  # the three build-binaries archives only
@@ -338,21 +350,22 @@ jobs:
           file: Cargo.lock
           format: spdx-json
           syft-version: v1.54.1
-          output-file: newt-agent-${{ github.ref_name }}.spdx.json
+          output-file: ${{ steps.name.outputs.file }}
           upload-artifact: false
           upload-release-assets: false
       - name: Attest the SBOM against the released archives
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: |
             incoming/*.tar.gz
             incoming/*.zip
-          sbom-path: newt-agent-${{ github.ref_name }}.spdx.json
+          sbom-path: ${{ steps.name.outputs.file }}
       - name: Upload SBOM
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: newt-agent-sbom
-          path: newt-agent-${{ github.ref_name }}.spdx.json
+          path: ${{ steps.name.outputs.file }}
           if-no-files-found: error
 
   # ── GitHub release (tag-only) ─────────────────────────────────────────
