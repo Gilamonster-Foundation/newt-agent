@@ -427,6 +427,78 @@ async fn fallback_marker_keeps_exit_code_of_a_duplicate_failing_command() {
     );
 }
 
+/// Red (#2875 r2 round 6, P2): the one-liner embeds the command, so a command
+/// that QUOTES `error (exit 7)` must not supply the status. The failed command
+/// exited 2.
+#[tokio::test]
+async fn fallback_marker_ignores_quoted_exit_text_in_a_failing_command() {
+    let body = format!("error: command exited 2\n{}", "no match\n".repeat(60));
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call(
+            "run_command",
+            json!({"command": "grep 'error (exit 7)' build.log"}),
+        ),
+        tool_result(&body),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("grep 'error (exit 7)' build.log (failed, exit 2)"),
+        "quoted command text read as the exit code: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 6, P2): a SUCCESSFUL command whose text contains
+/// ` -> error (exit 7)` is not a failure.
+#[tokio::test]
+async fn fallback_marker_ignores_quoted_status_text_in_a_successful_command() {
+    let body = format!("matches\n{}", "hit line\n".repeat(60));
+    let mut msgs = vec![
+        sys("you are newt"),
+        user("task"),
+        assistant_call(
+            "run_command",
+            json!({"command": "grep ' -> error (exit 7)' build.log"}),
+        ),
+        tool_result(&body),
+    ];
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        marker.contains("grep ' -> error (exit 7)' build.log"),
+        "command missing: {marker}"
+    );
+    assert!(
+        !marker.contains("(failed"),
+        "quoted text read as failure: {marker}"
+    );
+}
+
+/// Same shape through the duplicate marker (round 6): its structured clause
+/// carries the status, and result text quoting marker syntax must not alter it.
+#[tokio::test]
+async fn fallback_marker_duplicate_status_ignores_quoted_text_in_the_result() {
+    let failing = format!(
+        "error: command exited 2 (saw error (exit 7))\n{}",
+        "x\n".repeat(60)
+    );
+    let passing = format!("saw -> error (exit 7)\n{}", "y\n".repeat(60));
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    for (cmd, body) in [("make a", &failing), ("make b", &passing)] {
+        for _ in 0..2 {
+            msgs.push(assistant_call("run_command", json!({"command": cmd})));
+            msgs.push(tool_result(body));
+        }
+    }
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(marker.contains("make a (failed, exit 2)"), "{marker}");
+    assert!(marker.contains("make b"), "{marker}");
+    assert!(!marker.contains("make b (failed"), "{marker}");
+}
+
 /// Red (#2875 r2 round 5, item 2): a long `no command configured` result is a
 /// failure to the digest's classifier but `-> ok` to prune's old one. One
 /// classification: it must still be listed as failed after pruning.
