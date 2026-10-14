@@ -130,7 +130,9 @@ async fn decode_http_reply(
     decoded
 }
 
-fn decode_ollama_stream(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+/// Decode an Ollama NDJSON chat stream into one chat-shaped reply. Shared with
+/// the compaction summarizer (#2875) so both paths read frames the same way.
+pub fn decode_ollama_stream(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
     let body = std::str::from_utf8(bytes)
         .map_err(|error| anyhow::anyhow!("invalid Ollama stream UTF-8: {error}"))?;
     let mut content = String::new();

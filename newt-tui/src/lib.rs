@@ -2733,6 +2733,10 @@ fn summarizer_notice(msg: String) -> newt_core::tty::Notice<'static> {
     newt_core::tty::Notice::new(newt_core::tty::Level::Warn, "", msg)
 }
 
+/// Total attempt bound as a multiple of `timeout_secs` (mirrors the main
+/// stream path's `STREAM_TOTAL_TIMEOUT_MULTIPLIER`).
+const SUMMARY_TOTAL_TIMEOUT_MULTIPLIER: u32 = 5;
+
 /// One summary attempt: send, check status, parse the content.
 async fn summarize_attempt(
     client: &reqwest::Client,
@@ -2749,7 +2753,12 @@ async fn summarize_attempt(
     if !resp.status().is_success() {
         anyhow::bail!("summarizer endpoint {}", resp.status());
     }
-    let json: serde_json::Value = resp.json().await?;
+    let bytes = resp.bytes().await?;
+    let json = if openai {
+        newt_core::agentic::openai_sse::decode_response(&bytes)?
+    } else {
+        newt_inference::local::decode_ollama_stream(&bytes)?
+    };
     extract_summary(&json, openai)
 }
 
@@ -2831,7 +2840,8 @@ async fn summarize_one_model(
         serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": false,
+            "stream": true,
+            "stream_options": {"include_usage": true},
         })
     } else {
         // `think: false` — a summary is a direct extraction task, not a
@@ -2842,7 +2852,7 @@ async fn summarize_one_model(
         let mut b = serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": false,
+            "stream": true,
             "think": false,
             "keep_alive": opts.keep_alive,
         });
@@ -2853,9 +2863,9 @@ async fn summarize_one_model(
     };
     // Step 24.2 (#559): retry with backoff before giving up. The per-request
     // timeout is configurable (`summarizer.toml` `timeout_secs`).
-    // #2875: `timeout_secs` is an IDLE bound (gap between reads), not a total
-    // deadline — a summary still streaming past it must succeed. The connect
-    // timeout keeps its own bound.
+    // #2875: the request streams, so `timeout_secs` bounds the gap between
+    // frames (an IDLE bound), not the total — a summary still producing frames
+    // past it must succeed. The connect timeout keeps its own bound.
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(opts.timeout_secs))
         .read_timeout(std::time::Duration::from_secs(opts.timeout_secs))
@@ -2883,7 +2893,23 @@ async fn summarize_one_model(
         if let Some(allowance) = &opts.run_allowance {
             allowance.try_reserve()?;
         }
-        match summarize_attempt(&client, &chat_url, &body, api_key, openai).await {
+        // The idle bound above restarts on every frame, so a server drip-feeding
+        // keep-alives would hold compaction forever. Cap the attempt's total at
+        // a multiple of it, as the main stream path does (local.rs).
+        let total =
+            std::time::Duration::from_secs(opts.timeout_secs) * SUMMARY_TOTAL_TIMEOUT_MULTIPLIER;
+        let attempt_result = tokio::time::timeout(
+            total,
+            summarize_attempt(&client, &chat_url, &body, api_key, openai),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "summarizer stream exceeded its {}s total bound",
+                total.as_secs()
+            ))
+        });
+        match attempt_result {
             Ok(s) => return Ok(s),
             Err(e) => last_err = Some(e),
         }

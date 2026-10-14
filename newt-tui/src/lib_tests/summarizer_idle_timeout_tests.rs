@@ -169,6 +169,14 @@ async fn drive<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+/// Eleven frames 40 s apart: every gap is under the 60 s idle bound, but the
+/// 400 s total is over the 5 x 60 s backstop.
+static OLLAMA_DRIP: Reply = Reply {
+    frames: &["{\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"done\":false}\n"; 11],
+    whole: "",
+    stall: false,
+};
+
 fn opts() -> SummarizerOpts {
     SummarizerOpts {
         timeout_secs: 60,
@@ -180,7 +188,15 @@ fn opts() -> SummarizerOpts {
 #[tokio::test(start_paused = true)]
 async fn ollama_stream_running_past_timeout_secs_succeeds() {
     let url = spawn_stub(&OLLAMA_STREAM).await;
-    let result = drive(summarize_one_model(&url, "m", false, "prompt", &opts(), &None)).await;
+    let result = drive(summarize_one_model(
+        &url,
+        "m",
+        false,
+        "prompt",
+        &opts(),
+        &None,
+    ))
+    .await;
     let (summary, _) = result.unwrap_or_else(|e| {
         panic!("an Ollama stream that keeps producing frames was cut off: {e:#}")
     });
@@ -190,7 +206,15 @@ async fn ollama_stream_running_past_timeout_secs_succeeds() {
 #[tokio::test(start_paused = true)]
 async fn openai_stream_running_past_timeout_secs_succeeds() {
     let url = spawn_stub(&OPENAI_STREAM).await;
-    let result = drive(summarize_one_model(&url, "m", true, "prompt", &opts(), &None)).await;
+    let result = drive(summarize_one_model(
+        &url,
+        "m",
+        true,
+        "prompt",
+        &opts(),
+        &None,
+    ))
+    .await;
     let (summary, _) = result.unwrap_or_else(|e| {
         panic!("an OpenAI stream that keeps producing frames was cut off: {e:#}")
     });
@@ -200,9 +224,16 @@ async fn openai_stream_running_past_timeout_secs_succeeds() {
 #[tokio::test(start_paused = true)]
 async fn ollama_stream_stalled_mid_stream_fails_on_idle_bound() {
     let url = spawn_stub(&OLLAMA_STALL).await;
-    let err = drive(summarize_one_model(&url, "m", false, "prompt", &opts(), &None))
-        .await
-        .expect_err("a stream silent past the idle bound must fail");
+    let err = drive(summarize_one_model(
+        &url,
+        "m",
+        false,
+        "prompt",
+        &opts(),
+        &None,
+    ))
+    .await
+    .expect_err("a stream silent past the idle bound must fail");
     assert!(
         err.downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_timeout),
@@ -213,12 +244,38 @@ async fn ollama_stream_stalled_mid_stream_fails_on_idle_bound() {
 #[tokio::test(start_paused = true)]
 async fn openai_stream_stalled_mid_stream_fails_on_idle_bound() {
     let url = spawn_stub(&OPENAI_STALL).await;
-    let err = drive(summarize_one_model(&url, "m", true, "prompt", &opts(), &None))
-        .await
-        .expect_err("a stream silent past the idle bound must fail");
+    let err = drive(summarize_one_model(
+        &url,
+        "m",
+        true,
+        "prompt",
+        &opts(),
+        &None,
+    ))
+    .await
+    .expect_err("a stream silent past the idle bound must fail");
     assert!(
         err.downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_timeout),
         "expected an idle-bound timeout, got: {err:#}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn steady_stream_past_five_times_the_bound_hits_the_total_backstop() {
+    let url = spawn_stub(&OLLAMA_DRIP).await;
+    let err = drive(summarize_one_model(
+        &url,
+        "m",
+        false,
+        "prompt",
+        &opts(),
+        &None,
+    ))
+    .await
+    .expect_err("a stream that never finishes must hit the total bound");
+    assert!(
+        err.to_string().contains("total bound"),
+        "expected the total backstop, got: {err:#}"
     );
 }
