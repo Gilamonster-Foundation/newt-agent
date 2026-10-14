@@ -41,7 +41,8 @@ fn ollama_extractor(url: &str) -> newt_core::Summarizer {
 
 fn ollama_reply(content: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
-        "message": {"role": "assistant", "content": content}
+        "message": {"role": "assistant", "content": content},
+        "done": true
     }))
 }
 
