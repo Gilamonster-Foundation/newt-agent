@@ -1,9 +1,12 @@
 """Release regressions: omissions, renamed deps, unversioned paths and cycles."""
 
 import io
+import json
 import unittest
+from unittest import mock
 import urllib.error
 
+import check_publish_order
 from check_publish_order import (
     PUBLISH_JOBS,
     REGISTRY_TIMEOUT,
@@ -281,6 +284,46 @@ class PublishGates(unittest.TestCase):
         jobs = self.jobs()
         del jobs["publish-pypi"]
         self.assertIn("publish job 'publish-pypi' is missing from release.yml", gate_errors(jobs))
+
+
+
+class CombinedMain(unittest.TestCase):
+    """#2871 + #2891: main() must run BOTH the gate check and the registry
+    preflight. A merge that keeps either side's `errors =` hunk alone stays
+    green in every other test class and silently drops one gate."""
+
+    def run_main(self, jobs, versions):
+        metadata = {
+            "packages": [
+                package("newt-core", [dependency("newtui", "^0.1.0", source=GIT)])
+            ]
+        }
+        workflow = {"jobs": jobs}
+        workflow["jobs"]["publish-crates"]["strategy"] = {
+            "matrix": {"crate": ["newt-core"]}
+        }
+        fake_path = mock.Mock(return_value=mock.Mock(read_text=lambda: ""))
+        out = io.StringIO()
+        with mock.patch.object(check_publish_order, "Path", fake_path), \
+                mock.patch.object(check_publish_order.yaml, "safe_load", return_value=workflow), \
+                mock.patch.object(check_publish_order, "crates_io_versions", lambda _: versions), \
+                mock.patch("sys.argv", ["check_publish_order.py", "-"]), \
+                mock.patch("sys.stdin", io.StringIO(json.dumps(metadata))), \
+                mock.patch("sys.stdout", out):
+            code = check_publish_order.main()
+        return code, out.getvalue()
+
+    def test_main_reports_both_gate_and_registry_errors(self):
+        jobs = PublishGates().jobs()
+        jobs["publish-crates"]["needs"] = ["check-publish-order"]
+        code, out = self.run_main(jobs, [])
+        self.assertEqual(code, 1)
+        self.assertIn("'publish-crates' can publish before gate 'npm-preflight' passes", out)
+        self.assertIn("crates.io has no release matching it", out)
+
+    def test_main_passes_when_both_hold(self):
+        code, out = self.run_main(PublishGates().jobs(), ["0.1.0"])
+        self.assertEqual(code, 0, out)
 
 
 if __name__ == "__main__":
