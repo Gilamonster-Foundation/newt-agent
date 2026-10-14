@@ -386,3 +386,112 @@ async fn fallback_marker_omits_write_denied_by_the_fence_after_prune() {
         "denied write listed: {marker}"
     );
 }
+
+/// Red (#2875 r2 round 3, finding 3): collection keeps the NEWEST entries, so
+/// a commit made after more than DIGEST_CAP other commands still reaches the
+/// marker.
+#[test]
+fn fallback_marker_keeps_a_late_commit_after_many_commands() {
+    let mut removed = Vec::new();
+    for _ in 0..25 {
+        removed.push(assistant_call("run_command", json!({"command": "ls"})));
+        removed.push(tool_result("a b c"));
+    }
+    removed.push(assistant_call(
+        "run_command",
+        json!({"command": "git -C repo commit -m x"}),
+    ));
+    removed.push(tool_result("committed"));
+    let marker = static_fallback_text(&removed);
+    assert!(
+        marker.contains("git -C repo commit -m x"),
+        "late commit dropped: {marker}"
+    );
+}
+
+/// A re-touched path moves to the back, so it survives eviction of older paths.
+#[test]
+fn fallback_marker_keeps_a_retouched_file_among_the_newest() {
+    let mut removed = vec![assistant_call("edit_file", json!({"path": "src/first.rs"}))];
+    removed.push(tool_result("ok"));
+    for i in 0..19 {
+        removed.push(assistant_call(
+            "edit_file",
+            json!({"path": format!("src/f{i}.rs")}),
+        ));
+        removed.push(tool_result("ok"));
+    }
+    removed.push(assistant_call("edit_file", json!({"path": "src/first.rs"})));
+    removed.push(tool_result("ok"));
+    removed.push(assistant_call("edit_file", json!({"path": "src/last.rs"})));
+    removed.push(tool_result("ok"));
+    let marker = static_fallback_text(&removed);
+    assert!(marker.contains("src/first.rs"), "retouched dropped: {marker}");
+    assert!(!marker.contains("src/f0.rs"), "oldest kept: {marker}");
+}
+
+/// Guard (not red — the code already passes): a registered session secret in a
+/// command must be value-filtered out of the marker. Mirrors
+/// `redact_secrets_value_filters_a_registered_session_secret`.
+#[test]
+fn fallback_marker_value_filters_a_registered_secret() {
+    let canary = "NEWT-CANARY-9f3a2b7c1d4e";
+    let mut f = crate::ocap::DisclosureFilter::new();
+    f.register(canary);
+    let _g = crate::ocap::scoped_session_disclosure(f);
+    let removed = vec![
+        assistant_call(
+            "run_command",
+            json!({"command": format!("curl -H 'X: {canary}' https://example.test")}),
+        ),
+        tool_result("ok"),
+    ];
+    let marker = static_fallback_text(&removed);
+    assert!(marker.contains("curl"), "command missing: {marker}");
+    assert!(!marker.contains(canary), "registered secret leaked: {marker}");
+}
+
+/// Guard (#2875 r2 round 3): the whole digest is capped at DIGEST_TOTAL_CAP
+/// characters even when every entry sits at the per-entry cap.
+#[test]
+fn fallback_marker_total_digest_is_capped() {
+    let mut removed = Vec::new();
+    for i in 0..20 {
+        removed.push(assistant_call(
+            "run_command",
+            json!({"command": format!("cmd{i} {}", "q".repeat(400))}),
+        ));
+        removed.push(tool_result("ok"));
+        removed.push(assistant_call(
+            "edit_file",
+            json!({"path": format!("src/{i}/{}.rs", "p".repeat(400))}),
+        ));
+        removed.push(tool_result("ok"));
+    }
+    let marker = static_fallback_text(&removed);
+    let chars = marker.chars().count();
+    assert!(chars <= DIGEST_TOTAL_CAP + 1, "marker is {chars} chars");
+    assert!(marker.ends_with('…'), "total cap not applied: {marker}");
+}
+
+/// Red (#2875 r2 round 3): `(failed)` and the exit code come AFTER the excerpt,
+/// so a long command still shows its outcome. #2875 asks for exit codes; the
+/// result text carries `error: command exited N`.
+#[test]
+fn fallback_marker_shows_outcome_and_exit_code_after_a_long_command() {
+    let removed = vec![
+        assistant_call(
+            "run_command",
+            json!({"command": format!("cargo test {}", "x".repeat(300))}),
+        ),
+        tool_result("error: command exited 101\nerror[E0308]: mismatched types"),
+        assistant_call("run_command", json!({"command": "make"})),
+        tool_result("error: command exited 2"),
+    ];
+    let marker = static_fallback_text(&removed);
+    assert!(
+        marker.contains("… (failed, exit 101)"),
+        "long command outcome lost: {marker}"
+    );
+    assert!(marker.contains("make (failed, exit 2)"), "{marker}");
+}
