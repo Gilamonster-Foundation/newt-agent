@@ -1865,7 +1865,8 @@ fn record_digest_call(
     files: &mut VecDeque<String>,
     commands: &mut VecDeque<String>,
 ) {
-    let failed = result.is_some_and(crate::prune::tool_result_failed);
+    let outcome = result.and_then(crate::prune::marker_outcome);
+    let failed = outcome.is_some_and(|o| o.failed);
     let entry = |text: &str| excerpt(&redact_secrets(text), DIGEST_ENTRY_CAP);
     match name {
         "edit_file" | "write_file" => {
@@ -1875,7 +1876,7 @@ fn record_digest_call(
         }
         "run_command" => {
             if let Some(c) = args["command"].as_str() {
-                let tag = match (failed, result.and_then(crate::prune::failure_exit_code)) {
+                let tag = match (failed, outcome.and_then(|o| o.exit)) {
                     (true, Some(code)) => format!(" (failed, exit {code})"),
                     (true, None) => " (failed)".to_string(),
                     _ => String::new(),

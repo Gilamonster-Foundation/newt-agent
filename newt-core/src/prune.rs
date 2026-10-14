@@ -755,21 +755,74 @@ fn excerpt(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Whether a tool result reports failure, in either of its shapes: the raw
-/// text (`error...`, `capability denied:`, and the other failure prefixes of
-/// `tool_result_ok`) or the pass-2 one-liner this module rewrote it into
-/// (`... -> error, N lines ...`). One predicate, so a reader that sees results
-/// after pruning needs no third copy of either format (#2875 r2 round 3).
-#[must_use]
-pub(crate) fn tool_result_failed(content: &str) -> bool {
-    if content.starts_with("[duplicate of message ") {
-        return content.contains("-char error result elided]")
-            || content.contains("-char error (exit ");
+/// What a tool result says about its own outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Outcome {
+    pub(crate) failed: bool,
+    pub(crate) exit: Option<i32>,
+}
+
+/// The ONE outcome parser, for all three shapes a result can have: the raw text,
+/// the pass-1 duplicate marker, and the pass-2 one-liner. A marker embeds the
+/// command, so its status is read only from the position the producer owns, never
+/// searched for: the one-liner's final ` -> <status>, N ...` suffix (read from the
+/// END, since the producer writes nothing after the status that contains ` -> `)
+/// and the duplicate marker's fixed `identical N-char <kind> result elided`
+/// clause. Command text quoting `error (exit 7)` or ` -> error (exit 7)` therefore
+/// cannot forge an outcome (#2875 r2 round 6). `None` is a marker with no readable
+/// status (the page map).
+pub(crate) fn marker_outcome(content: &str) -> Option<Outcome> {
+    if let Some(rest) = content.strip_prefix("[duplicate of message ") {
+        let kind = rest
+            .split_once(": identical ")?
+            .1
+            .split_once("-char ")?
+            .1
+            .strip_suffix(" result elided]")?;
+        return Some(status_outcome(kind));
     }
     if is_one_line_summary(content) {
-        return content.contains(" -> error, ") || content.contains(" -> error (exit ");
+        // A page map has no status clause, and its body is source text that may
+        // contain ` -> error, 3`; only `read_file` emits one.
+        if content.starts_with("[read_file] ") && content.contains(" (page map; re-read any span") {
+            return None;
+        }
+        let tail = content.rsplit_once(" -> ")?.1;
+        let (status, count) = tail.split_once(", ")?;
+        // The producer's clause is `<status>, <N> <unit>`; anything else is not it.
+        if !count.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        return Some(status_outcome(status));
     }
-    failure_label(content).is_some()
+    Some(Outcome {
+        failed: failure_label(content).is_some(),
+        exit: crate::agentic::compress::exit_code_of(content),
+    })
+}
+
+/// Parse a producer status word: `error`, `error (exit N)`, or anything else
+/// (`ok`, `tool`) as not failed.
+fn status_outcome(status: &str) -> Outcome {
+    let Some(rest) = status.strip_prefix("error") else {
+        return Outcome {
+            failed: false,
+            exit: None,
+        };
+    };
+    let exit = rest
+        .strip_prefix(" (exit ")
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|d| d.parse().ok());
+    Outcome { failed: true, exit }
+}
+
+/// Whether a tool result reports failure, in any of its shapes. One predicate,
+/// so a reader that sees results after pruning needs no copy of either marker
+/// format (#2875 r2 round 3).
+#[must_use]
+pub(crate) fn tool_result_failed(content: &str) -> bool {
+    marker_outcome(content).is_some_and(|o| o.failed)
 }
 
 /// `error` or `error (exit N)` when a raw tool result reports failure, else
@@ -785,21 +838,6 @@ fn failure_label(content: &str) -> Option<String> {
         Some(code) => format!("error (exit {code})"),
         None => "error".to_string(),
     })
-}
-
-/// The exit code a pruned marker (one-liner or duplicate) or a raw result
-/// carries, if any.
-#[must_use]
-pub(crate) fn failure_exit_code(content: &str) -> Option<i32> {
-    if !content.starts_with("[duplicate of message ") && !is_one_line_summary(content) {
-        return crate::agentic::compress::exit_code_of(content);
-    }
-    let rest = content.split_once("error (exit ")?.1;
-    let digits: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-    digits.parse().ok()
 }
 
 /// Matches the error shapes `execute_tool` produces (`error…`,
@@ -2688,5 +2726,35 @@ fn third(z: u32) -> u32 {
                 "raw tool output was mistaken for a one-liner: {raw:?}"
             );
         }
+    }
+    /// #2875 r2 round 6: the status is the producer's final suffix, never a
+    /// substring of the embedded command.
+    #[test]
+    fn marker_outcome_reads_the_final_status_not_quoted_command_text() {
+        let o = |s: &str| marker_outcome(s).map(|o| (o.failed, o.exit));
+        assert_eq!(
+            o("[run_command] ran 'grep 'error (exit 7)' b' -> error (exit 2), 9 lines output"),
+            Some((true, Some(2)))
+        );
+        assert_eq!(
+            o("[run_command] ran 'grep ' -> error (exit 7)' b' -> ok, 9 lines output"),
+            Some((false, None))
+        );
+        assert_eq!(
+            o("[run_command] ran 'x' -> error, 9 lines output"),
+            Some((true, None))
+        );
+        assert_eq!(
+            o("[duplicate of message 3: identical 400-char error (exit 101) result elided]"),
+            Some((true, Some(101)))
+        );
+        assert_eq!(
+            o("[duplicate of message 3: identical 400-char tool result elided]"),
+            Some((false, None))
+        );
+        assert_eq!(
+            o("[read_file] a.rs lines 1-9 (page map; re-read any span with offset/limit): 1 -> error, 3"),
+            None
+        );
     }
 }
