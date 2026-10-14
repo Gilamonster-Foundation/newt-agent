@@ -1,9 +1,13 @@
 """Release regressions: omissions, renamed deps, unversioned paths and cycles."""
 
+import io
 import unittest
+import urllib.error
 
 from check_publish_order import (
+    REGISTRY_TIMEOUT,
     check,
+    crates_io_versions,
     git_dependencies,
     registry_gaps,
     req_matches,
@@ -189,6 +193,61 @@ class GitDependencies(unittest.TestCase):
         ok = [("newt-core", "newtui", "^0.1.0")]
         self.assertEqual(registry_gaps(ok, lambda _: ["garbage", "0.1.0"]), [])
         self.assertTrue(registry_gaps(ok, lambda _: ["garbage"]))
+
+class RegistryLookup(unittest.TestCase):
+    """The network half of the preflight is bounded and fails closed (P2-3)."""
+
+    def opener(self, body=b"", error=None):
+        calls = []
+
+        def urlopen(url, timeout=None):
+            calls.append((url, timeout))
+            if error:
+                raise error
+            return io.BytesIO(body)
+
+        return urlopen, calls
+
+    def test_requests_carry_a_finite_timeout(self):
+        body = b'{"vers":"0.1.0"}\n{"vers":"0.1.1","yanked":true}\n'
+        urlopen, calls = self.opener(body)
+        self.assertEqual(crates_io_versions("newtui", urlopen), ["0.1.0"])
+        self.assertEqual(calls, [("https://index.crates.io/ne/wt/newtui", REGISTRY_TIMEOUT)])
+        self.assertTrue(0 < REGISTRY_TIMEOUT < 120)
+
+    def test_missing_crate_is_an_empty_release_list(self):
+        error = urllib.error.HTTPError("u", 404, "Not Found", None, None)
+        urlopen, _ = self.opener(error=error)
+        self.assertEqual(crates_io_versions("newtui", urlopen), [])
+
+    def test_fetch_errors_fail_closed_with_a_gap(self):
+        deps = [("newt-core", "newtui", "^0.1.0")]
+        for error in (
+            urllib.error.HTTPError("u", 503, "Unavailable", None, None),
+            urllib.error.URLError(TimeoutError("timed out")),
+            TimeoutError("timed out"),
+        ):
+            urlopen, _ = self.opener(error=error)
+            gaps = registry_gaps(deps, lambda n, o=urlopen: crates_io_versions(n, o))
+            self.assertEqual(len(gaps), 1, error)
+            self.assertIn("could not query crates.io", gaps[0])
+
+    def test_malformed_index_fails_closed(self):
+        urlopen, _ = self.opener(b"not json\n")
+        deps = [("newt-core", "newtui", "^0.1.0")]
+        gaps = registry_gaps(deps, lambda n: crates_io_versions(n, urlopen))
+        self.assertIn("could not query crates.io", gaps[0])
+
+    def test_repeated_lookups_for_a_crate_are_cached_within_a_run(self):
+        seen = []
+        deps = [
+            ("newt-core", "newtui", "^0.1.0"),
+            ("newt-tui", "newtui", "^0.1.0"),
+            ("newt-tui", "precedence-ladder", "^0.1"),
+        ]
+        registry_gaps(deps, lambda n: seen.append(n) or ["0.1.0"])
+        self.assertEqual(seen, ["newtui", "precedence-ladder"])
+
 
 if __name__ == "__main__":
     unittest.main()

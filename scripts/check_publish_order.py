@@ -174,15 +174,30 @@ def req_matches(req, version):
 
 
 def registry_gaps(git_deps, versions_of):
-    """Errors for git dependencies whose `req` no crates.io release satisfies."""
+    """Errors for git dependencies whose `req` no crates.io release satisfies.
+
+    Each crate is looked up once per run; a failed lookup is a gap, never a pass.
+    """
     errors = []
+    seen = {}
     for crate, dep, req in git_deps:
         try:
             comparators = parse_req(req)
         except ValueError:
             errors.append(f"'{crate}' depends on '{dep}' with {req!r}: cannot parse it")
             continue
-        if not any(_matches_quietly(comparators, v) for v in versions_of(dep)):
+        if dep not in seen:
+            try:
+                seen[dep] = versions_of(dep)
+            except RegistryError as error:
+                seen[dep] = error
+        if isinstance(seen[dep], RegistryError):
+            errors.append(
+                f"'{crate}' depends on '{dep}' {req} from git, but could not query "
+                f"crates.io for it ({seen[dep]}); failing closed"
+            )
+            continue
+        if not any(_matches_quietly(comparators, v) for v in seen[dep]):
             errors.append(
                 f"'{crate}' depends on '{dep}' {req} from git, but crates.io has no "
                 f"release matching it; publish '{dep}' to crates.io first"
@@ -198,8 +213,19 @@ def _matches_quietly(comparators, version):
         return False
 
 
-def crates_io_versions(name):
-    """Non-yanked versions from the crates.io sparse index."""
+REGISTRY_TIMEOUT = 20  # seconds per request; the hook and CI must not hang.
+
+
+class RegistryError(RuntimeError):
+    """crates.io could not be queried; the preflight treats this as a gap."""
+
+
+def crates_io_versions(name, urlopen=urllib.request.urlopen):
+    """Non-yanked versions from the crates.io sparse index.
+
+    A 404 means "never published" and returns no versions; every other
+    failure raises RegistryError so the caller fails closed.
+    """
     lower = name.lower()
     if len(lower) <= 2:
         path = f"{len(lower)}/{lower}"
@@ -208,14 +234,18 @@ def crates_io_versions(name):
     else:
         path = f"{lower[:2]}/{lower[2:4]}/{lower}"
     try:
-        with urllib.request.urlopen(f"https://index.crates.io/{path}") as resp:
+        with urlopen(
+            f"https://index.crates.io/{path}", timeout=REGISTRY_TIMEOUT
+        ) as resp:
             lines = resp.read().decode().splitlines()
+        entries = [json.loads(line) for line in lines if line]
+        return [e["vers"] for e in entries if not e.get("yanked")]
     except urllib.error.HTTPError as error:
         if error.code == 404:
             return []
-        raise
-    entries = (json.loads(line) for line in lines if line)
-    return [e["vers"] for e in entries if not e.get("yanked")]
+        raise RegistryError(f"HTTP {error.code}") from error
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RegistryError(f"{type(error).__name__}: {error}") from error
 
 
 def topological_order(packages):
