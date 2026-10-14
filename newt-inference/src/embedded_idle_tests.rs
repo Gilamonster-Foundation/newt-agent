@@ -70,3 +70,51 @@ async fn idle_bound_fails_a_generation_silent_past_the_bound() {
     .await;
     assert!(result.is_err(), "silence past the bound must fail");
 }
+
+/// Red-first for #2875 r2 round 3, finding 4: the async poll must sample the
+/// clock BEFORE it reads the progress mark. The injected clock is the hook.
+/// Call 1 is `start`. On the poll's first sample (call 2, on the test thread)
+/// the worker is released through a std channel and the poll waits for it to
+/// checkpoint at fake 6 s and 12 s, then reads 13 s. Sampled first, idle time is
+/// 13 - 12 = 1 s and the run succeeds. Read progress first (the old order) and
+/// the poll sees `last = 0`, idle 13 s, and fails a generation that just
+/// progressed. Worker-thread reads return the current fake time without
+/// counting, so only the poll's samples advance the script.
+#[tokio::test]
+async fn idle_poll_samples_the_clock_before_the_progress_mark() {
+    let clock = FakeClock::new();
+    let test_thread = std::thread::current().id();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let done_rx = std::sync::Mutex::new(done_rx);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reader = clock.clone();
+    let now = move || {
+        if std::thread::current().id() != test_thread {
+            return reader.now();
+        }
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == 2 {
+            release_tx.send(()).unwrap();
+            done_rx.lock().unwrap().recv().unwrap();
+            return reader.now() + Duration::from_secs(1);
+        }
+        reader.now()
+    };
+    let stepper = clock.clone();
+    let result = run_generation_with_clock(
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        Some(IDLE_BOUND),
+        now,
+        move |checkpoint| {
+            release_rx.recv().unwrap();
+            stepper.advance(Duration::from_secs(6));
+            checkpoint()?;
+            stepper.advance(Duration::from_secs(6));
+            checkpoint()?;
+            done_tx.send(()).unwrap();
+            Ok("progressed".into())
+        },
+    )
+    .await;
+    assert_eq!(result.unwrap(), "progressed");
+}
