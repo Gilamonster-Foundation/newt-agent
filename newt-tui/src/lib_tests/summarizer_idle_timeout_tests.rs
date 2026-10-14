@@ -7,7 +7,10 @@
 //! apart, so every gap is under the 60 s bound while the total is over it. A
 //! `stream: false` request (the Ollama warm-up) gets one buffered reply after
 //! the same total wait. A stalled stream sends one frame, then goes silent with
-//! the socket open. Paused time auto-advances, so no real sleep happens.
+//! the socket open. No real sleep happens: [`drive`] advances the paused clock
+//! by hand, because tokio auto-advances paused time whenever the runtime is
+//! idle, and that includes waiting on real loopback socket I/O. Left to itself
+//! the 60 s read timer would fire while a frame is still in the kernel.
 
 use super::{summarize_one_model, SummarizerOpts};
 use std::time::Duration;
@@ -143,6 +146,29 @@ static OPENAI_STALL: Reply = Reply {
     stall: true,
 };
 
+/// Yields between clock advances, so the loopback socket can deliver and the
+/// client can read a frame before the paused clock moves again.
+const SETTLE_YIELDS: usize = 500;
+
+/// Poll `fut` while advancing the paused clock one `PIECE_GAP` at a time.
+/// The advancing branch yields rather than parking, so the runtime is never
+/// idle and never auto-advances time past a frame still in flight.
+async fn drive<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return out,
+            () = async {
+                for _ in 0..SETTLE_YIELDS {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(PIECE_GAP).await;
+            } => {}
+        }
+    }
+}
+
 fn opts() -> SummarizerOpts {
     SummarizerOpts {
         timeout_secs: 60,
@@ -154,7 +180,7 @@ fn opts() -> SummarizerOpts {
 #[tokio::test(start_paused = true)]
 async fn ollama_stream_running_past_timeout_secs_succeeds() {
     let url = spawn_stub(&OLLAMA_STREAM).await;
-    let result = summarize_one_model(&url, "m", false, "prompt", &opts(), &None).await;
+    let result = drive(summarize_one_model(&url, "m", false, "prompt", &opts(), &None)).await;
     let (summary, _) = result.unwrap_or_else(|e| {
         panic!("an Ollama stream that keeps producing frames was cut off: {e:#}")
     });
@@ -164,7 +190,7 @@ async fn ollama_stream_running_past_timeout_secs_succeeds() {
 #[tokio::test(start_paused = true)]
 async fn openai_stream_running_past_timeout_secs_succeeds() {
     let url = spawn_stub(&OPENAI_STREAM).await;
-    let result = summarize_one_model(&url, "m", true, "prompt", &opts(), &None).await;
+    let result = drive(summarize_one_model(&url, "m", true, "prompt", &opts(), &None)).await;
     let (summary, _) = result.unwrap_or_else(|e| {
         panic!("an OpenAI stream that keeps producing frames was cut off: {e:#}")
     });
@@ -174,7 +200,7 @@ async fn openai_stream_running_past_timeout_secs_succeeds() {
 #[tokio::test(start_paused = true)]
 async fn ollama_stream_stalled_mid_stream_fails_on_idle_bound() {
     let url = spawn_stub(&OLLAMA_STALL).await;
-    let err = summarize_one_model(&url, "m", false, "prompt", &opts(), &None)
+    let err = drive(summarize_one_model(&url, "m", false, "prompt", &opts(), &None))
         .await
         .expect_err("a stream silent past the idle bound must fail");
     assert!(
@@ -187,7 +213,7 @@ async fn ollama_stream_stalled_mid_stream_fails_on_idle_bound() {
 #[tokio::test(start_paused = true)]
 async fn openai_stream_stalled_mid_stream_fails_on_idle_bound() {
     let url = spawn_stub(&OPENAI_STALL).await;
-    let err = summarize_one_model(&url, "m", true, "prompt", &opts(), &None)
+    let err = drive(summarize_one_model(&url, "m", true, "prompt", &opts(), &None))
         .await
         .expect_err("a stream silent past the idle bound must fail");
     assert!(
