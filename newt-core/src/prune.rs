@@ -817,17 +817,9 @@ fn status_outcome(status: &str) -> Outcome {
     Outcome { failed: true, exit }
 }
 
-/// Whether a tool result reports failure, in any of its shapes. One predicate,
-/// so a reader that sees results after pruning needs no copy of either marker
-/// format (#2875 r2 round 3).
-#[must_use]
-pub(crate) fn tool_result_failed(content: &str) -> bool {
-    marker_outcome(content).is_some_and(|o| o.failed)
-}
-
 /// `error` or `error (exit N)` when a raw tool result reports failure, else
 /// `None`. The ONE failure classification: pass 1 and pass 2 write it into
-/// their markers and [`tool_result_failed`] reads it back, so producer and
+/// their markers and [`marker_outcome`] reads it back, so producer and
 /// consumer cannot disagree (#2875 r2 round 5). The exit code survives pruning
 /// because it rides in the label.
 fn failure_label(content: &str) -> Option<String> {
