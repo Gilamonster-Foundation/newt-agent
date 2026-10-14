@@ -70,7 +70,7 @@ pub(super) fn dismiss_completed_spill(
 /// human keypress and cheap enough to lose the race to any real I/O future.
 /// Never resolves when `cancel` is `None`, so a `select!` against it collapses
 /// to just the other arm (no behavior change for headless callers).
-pub(super) async fn cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) {
+async fn cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) {
     match cancel {
         None => std::future::pending().await,
         Some(flag) => {
