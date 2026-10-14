@@ -1875,7 +1875,7 @@ fn record_digest_call(
         }
         "run_command" => {
             if let Some(c) = args["command"].as_str() {
-                let tag = match (failed, result.and_then(exit_code_of)) {
+                let tag = match (failed, result.and_then(crate::prune::failure_exit_code)) {
                     (true, Some(code)) => format!(" (failed, exit {code})"),
                     (true, None) => " (failed)".to_string(),
                     _ => String::new(),

@@ -176,11 +176,7 @@ pub fn collapse_duplicate_tool_results(messages: &[Value], cfg: &PruneConfig) ->
                 // The marker keeps the failure status: a reader that sees only the
                 // pruned history (the compaction digest) must still know a
                 // repeated denial was a denial (#2875 r2 round 4).
-                let kind = if tool_result_failed(content) {
-                    "error"
-                } else {
-                    "tool"
-                };
+                let kind = failure_label(content).unwrap_or_else(|| "tool".to_string());
                 let line = format!(
                     "[duplicate of message {first}: identical {n}-char {kind} result elided]"
                 );
@@ -353,11 +349,10 @@ fn already_pruned(content: &str, paired_name: &str) -> bool {
 fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
     let lines = content.lines().count();
     let chars = content.chars().count();
-    let status = if looks_like_error(content) {
-        "error"
-    } else {
-        "ok"
-    };
+    // One classification, shared with the digest reader (#2875 r2 round 5).
+    let failure = failure_label(content);
+    let failed = failure.is_some();
+    let status = failure.as_deref().unwrap_or("ok");
     let arg = |key: &str| -> String {
         args.and_then(|a| a.get(key))
             .and_then(Value::as_str)
@@ -389,7 +384,7 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
             // inventing a boundary that excludes it.
             let is_replay_disambiguated =
                 content.ends_with(crate::agentic::tools::output_budget::REPLAY_DISAMBIGUATOR);
-            if status == "ok" && !is_replay_disambiguated {
+            if !failed && !is_replay_disambiguated {
                 #[cfg(feature = "ast")]
                 if let Some(outline) = rust_outline_summary(&path, args, content) {
                     return outline;
@@ -740,7 +735,10 @@ pub fn is_one_line_summary(content: &str) -> bool {
     // filtered out by the single-line check above, and stays already-pruned
     // via its `[read_file] ` prefix (`already_pruned`) rather than folding.
     const PAGE_MAP_MARKER: &str = " (page map; re-read any span with offset/limit): ";
-    rest.contains(" -> ok, ") || rest.contains(" -> error, ") || rest.contains(PAGE_MAP_MARKER)
+    rest.contains(" -> ok, ")
+        || rest.contains(" -> error, ")
+        || rest.contains(" -> error (exit ")
+        || rest.contains(PAGE_MAP_MARKER)
 }
 
 /// First `max_chars` chars with newlines flattened, `…`-terminated if cut.
@@ -765,12 +763,43 @@ fn excerpt(s: &str, max_chars: usize) -> String {
 #[must_use]
 pub(crate) fn tool_result_failed(content: &str) -> bool {
     if content.starts_with("[duplicate of message ") {
-        return content.contains("-char error result elided]");
+        return content.contains("-char error result elided]")
+            || content.contains("-char error (exit ");
     }
     if is_one_line_summary(content) {
-        return content.contains(" -> error, ");
+        return content.contains(" -> error, ") || content.contains(" -> error (exit ");
     }
-    looks_like_error(content) || !crate::agentic::tools::tool_result_ok(content)
+    failure_label(content).is_some()
+}
+
+/// `error` or `error (exit N)` when a raw tool result reports failure, else
+/// `None`. The ONE failure classification: pass 1 and pass 2 write it into
+/// their markers and [`tool_result_failed`] reads it back, so producer and
+/// consumer cannot disagree (#2875 r2 round 5). The exit code survives pruning
+/// because it rides in the label.
+fn failure_label(content: &str) -> Option<String> {
+    if !(looks_like_error(content) || !crate::agentic::tools::tool_result_ok(content)) {
+        return None;
+    }
+    Some(match crate::agentic::compress::exit_code_of(content) {
+        Some(code) => format!("error (exit {code})"),
+        None => "error".to_string(),
+    })
+}
+
+/// The exit code a pruned marker (one-liner or duplicate) or a raw result
+/// carries, if any.
+#[must_use]
+pub(crate) fn failure_exit_code(content: &str) -> Option<i32> {
+    if !content.starts_with("[duplicate of message ") && !is_one_line_summary(content) {
+        return crate::agentic::compress::exit_code_of(content);
+    }
+    let rest = content.split_once("error (exit ")?.1;
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
 }
 
 /// Matches the error shapes `execute_tool` produces (`error…`,

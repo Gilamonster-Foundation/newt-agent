@@ -71,7 +71,7 @@ async fn idle_bound_fails_a_generation_silent_past_the_bound() {
     assert!(result.is_err(), "silence past the bound must fail");
 }
 
-/// Red-first for #2875 r2 round 3, finding 4: the async poll must sample the
+/// Regression/mutation coverage for #2875 r2 round 3, finding 4: the async poll must sample the
 /// clock BEFORE it reads the progress mark. The injected clock is the hook.
 /// Call 1 is `start`. On the poll's first sample (call 2, on the test thread)
 /// the worker is released through a std channel and the poll waits for it to
