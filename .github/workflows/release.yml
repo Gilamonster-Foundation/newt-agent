@@ -310,12 +310,57 @@ jobs:
           path: dist/*.nupkg
           if-no-files-found: error
 
+  # SPDX 2.3 SBOM of the workspace's Rust dependency graph, read from
+  # Cargo.lock by Syft (no compile step), attested against the released
+  # archives' digests. Like the installers above it cannot sink the release
+  # (`continue-on-error`), and no publish job needs it.
+  sbom:
+    name: SBOM (SPDX 2.3)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-binaries]
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write      # Sigstore signing for the attestation
+      attestations: write  # store the attestation on this repository
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: newt-agent-*-*64  # the three build-binaries archives only
+          path: incoming/
+          merge-multiple: true
+      - name: Generate SPDX SBOM from Cargo.lock
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          file: Cargo.lock
+          format: spdx-json
+          syft-version: v1.54.1
+          output-file: newt-agent-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest the SBOM against the released archives
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: |
+            incoming/*.tar.gz
+            incoming/*.zip
+          sbom-path: newt-agent-${{ github.ref_name }}.spdx.json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: newt-agent-sbom
+          path: newt-agent-${{ github.ref_name }}.spdx.json
+          if-no-files-found: error
+
   # ── GitHub release (tag-only) ─────────────────────────────────────────
 
   github-release:
     name: GitHub release (${{ github.ref_name }})
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries, linux-packages, homebrew-formula, chocolatey-package]
+    needs: [build-binaries, linux-packages, homebrew-formula, chocolatey-package, sbom]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -328,7 +373,8 @@ jobs:
           mkdir -p dist
           find all-artifacts -type f \
             \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' \
-               -o -name '*.rpm' -o -name '*.nupkg' -o -name 'newt.rb' \) \
+               -o -name '*.rpm' -o -name '*.nupkg' -o -name 'newt.rb' \
+               -o -name '*.spdx.json' \) \
             -exec cp {} dist/ \;
           ls -la dist/
       - name: Create or update release
