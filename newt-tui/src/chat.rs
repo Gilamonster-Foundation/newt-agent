@@ -748,6 +748,23 @@ fn comprehend_accepted_prompt(
     (intake, mode)
 }
 
+/// #2881: a Plan clamp carried over from an earlier turn (plan-before-act or
+/// `enter_plan_mode`, never approved) narrows this prompt too. The operator set
+/// no mode, so the card must say a plan awaits approval, not that a session
+/// mode the operator chose did the narrowing. An operator `/mode plan` keeps
+/// the session-policy attribution.
+fn attribute_carried_plan_clamp(
+    intake: &mut newt_core::agentic::PromptIntake,
+    configured: OperatingMode,
+    plan_mode_active: bool,
+) {
+    // The operator chose a Plan clamp only via `/mode plan`; any other
+    // configured mode under an active clamp means the model armed it.
+    if plan_mode_active && configured != OperatingMode::Plan {
+        intake.attribute_narrowing_to_pending_plan();
+    }
+}
+
 /// What a clarification-reply classifier read a non-explicit reply as
 /// selecting — offered, never applied. See [`classify_clarification_reply`].
 struct ClassifiedProposal {
@@ -7573,6 +7590,11 @@ fn session_body(
                             };
                             (style, authority_mode)
                         },
+                    );
+                    attribute_carried_plan_clamp(
+                        &mut prompt_intake,
+                        active_operating_mode,
+                        conversation_mode_states.plan.is_active(),
                     );
                     // Plan-before-act: the implementing turn an approval
                     // seeded carries the operator's decision, so the

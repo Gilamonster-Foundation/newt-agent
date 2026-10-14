@@ -54,6 +54,10 @@ pub enum DispositionSource {
     /// Narrowed after classification by a session setting the operator chose
     /// earlier (an operating mode); the prompt's own words did not decide it.
     SessionPolicy,
+    /// Narrowed by a Plan clamp carried over from an earlier turn — armed by
+    /// plan-before-act or `enter_plan_mode` and not yet approved (#2881). The
+    /// operator set no mode; a plan is awaiting their approval.
+    PendingPlan,
 }
 
 /// The harness-selected mode for one accepted prompt receipt.
@@ -526,8 +530,20 @@ impl PromptIntake {
         debug_assert!(self.validate().is_ok());
     }
 
+    /// Re-attribute a Plan narrowing to a carried-over, unapproved plan clamp
+    /// rather than an operator mode (#2881). Only a turn already narrowed to
+    /// `Plan` by [`Self::enforce_read_only`] changes; the disposition itself
+    /// is untouched, so this can never widen authority.
+    pub fn attribute_narrowing_to_pending_plan(&mut self) {
+        if self.source == DispositionSource::SessionPolicy
+            && self.disposition == PromptDisposition::Plan
+        {
+            self.source = DispositionSource::PendingPlan;
+        }
+    }
+
     /// Whether the live disposition was inferred from the prompt or narrowed
-    /// by a session policy the operator set.
+    /// by a session policy the operator set, or by a pending plan.
     pub fn disposition_source(&self) -> DispositionSource {
         self.source
     }
