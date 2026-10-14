@@ -183,7 +183,13 @@ class PrePushTests(unittest.TestCase):
         for name in ("crate-b", "crate-c"):
             manifest = self.root / name / "Cargo.toml"
             manifest.write_text(manifest.read_text().replace('path = ', 'version = "=0.1.0", path = '))
-        workflow = "jobs:\n  publish-crates:\n    strategy:\n      matrix:\n        crate: [crate-a, crate-b]\n"
+        gates = "[setup-acceptance, mcp-import-acceptance, build-binaries, build-wheels, build-sdist, check-publish-order, npm-preflight]"
+        workflow = (
+            "jobs:\n"
+            + "".join(f"  {gate}: {{}}\n" for gate in gates[1:-1].split(", "))
+            + "".join(f"  {job}:\n    needs: {gates}\n" for job in ("build-npm", "publish-npm-meta", "publish-pypi"))
+            + f"  publish-crates:\n    needs: {gates}\n    strategy:\n      matrix:\n        crate: [crate-a, crate-b]\n"
+        )
         local = self.commit(".github/workflows/release.yml", workflow)
         result, calls = self.hook(local, base)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
