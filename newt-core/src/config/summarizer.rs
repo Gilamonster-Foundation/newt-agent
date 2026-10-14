@@ -57,8 +57,11 @@ pub struct SummarizerConfig {
     pub api_key_file: Option<String>,
     /// Bearer-token environment variable (checked before `api_key_file`).
     pub api_key_env: Option<String>,
-    /// Per-request timeout (seconds). Default 60 — cold-loading a big model can
-    /// legitimately exceed it; raise on a slow box that falls back to the marker.
+    /// Idle timeout (seconds): the longest the summary stream may go without a
+    /// frame (#2875). Default 60 — cold-loading a big model can legitimately
+    /// exceed it; raise on a slow box that falls back to the marker. It bounds the
+    /// gap between frames, not the whole generation, so a steadily streaming
+    /// summary may run longer; one attempt is capped at 5x this value in total.
     #[serde(default = "default_summarizer_timeout_secs")]
     pub timeout_secs: u64,
     /// Retry attempts before the static marker. Default 1 — each attempt can

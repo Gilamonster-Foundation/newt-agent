@@ -177,6 +177,13 @@ static OLLAMA_DRIP: Reply = Reply {
     stall: false,
 };
 
+/// The OpenAI-dialect twin of `OLLAMA_DRIP`: eleven SSE events 40 s apart.
+static OPENAI_DRIP: Reply = Reply {
+    frames: &["data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n"; 11],
+    whole: "",
+    stall: false,
+};
+
 fn opts() -> SummarizerOpts {
     SummarizerOpts {
         timeout_secs: 60,
@@ -268,6 +275,25 @@ async fn steady_stream_past_five_times_the_bound_hits_the_total_backstop() {
         &url,
         "m",
         false,
+        "prompt",
+        &opts(),
+        &None,
+    ))
+    .await
+    .expect_err("a stream that never finishes must hit the total bound");
+    assert!(
+        err.to_string().contains("total bound"),
+        "expected the total backstop, got: {err:#}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn openai_steady_stream_past_five_times_the_bound_hits_the_total_backstop() {
+    let url = spawn_stub(&OPENAI_DRIP).await;
+    let err = drive(summarize_one_model(
+        &url,
+        "m",
+        true,
         "prompt",
         &opts(),
         &None,
