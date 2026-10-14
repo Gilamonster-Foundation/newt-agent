@@ -126,6 +126,74 @@ async fn a_failed_pipe_read_kills_the_group() {
     );
 }
 
+/// The leader exits (its wait is ready at once) while an escaped descendant
+/// keeps a pipe open, then the wall fires. Reaping the leader frees its pgid
+/// for reuse, so the group kill must never run after the child was reaped: it
+/// could signal an unrelated group that took the number (#2882, PR #2892).
+#[tokio::test(start_paused = true)]
+async fn the_group_kill_never_runs_after_the_leader_was_reaped() {
+    let reaped = Arc::new(AtomicBool::new(false));
+    let killed = Arc::new(AtomicBool::new(false));
+    let killed_after_reap = Arc::new(AtomicBool::new(false));
+    let (stdout, _out_writer) = hung_pipe(b"started\n").await;
+    let (stderr, _err_writer) = hung_pipe(b"").await;
+    let wait_reaped = reaped.clone();
+    let (kill_reaped, kill_flag, kill_late) =
+        (reaped.clone(), killed.clone(), killed_after_reap.clone());
+    let run = super::shell::supervise_host_child(
+        async move {
+            wait_reaped.store(true, Ordering::SeqCst);
+            Ok(0)
+        },
+        move || {
+            kill_flag.store(true, Ordering::SeqCst);
+            if kill_reaped.load(Ordering::SeqCst) {
+                kill_late.store(true, Ordering::SeqCst);
+            }
+        },
+        stdout,
+        stderr,
+        None,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("a timeout is a result, not an error");
+
+    assert!(run.timed_out);
+    assert!(
+        killed.load(Ordering::SeqCst),
+        "the wall must still kill the group"
+    );
+    assert!(
+        !killed_after_reap.load(Ordering::SeqCst),
+        "the group kill ran after the leader was reaped; its pgid may be reused"
+    );
+    assert_eq!(super::shell::decode_shell_stream(&run.stdout), "started\n");
+}
+
+/// Partial stderr that does not end in a newline must not run into the
+/// timeout line.
+#[tokio::test(start_paused = true)]
+async fn the_timeout_line_starts_on_its_own_line() {
+    let (stdout, _out_writer) = hung_pipe(b"").await;
+    let (stderr, _err_writer) = hung_pipe(b"progress 40%").await;
+    let run = super::shell::supervise_host_child(
+        std::future::pending::<std::io::Result<i64>>(),
+        || {},
+        stdout,
+        stderr,
+        None,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let stderr = super::shell::decode_shell_stream(&run.stderr);
+    assert!(
+        stderr.starts_with("progress 40%\ncommand exceeded 5s"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn host_timeout_result_carries_the_confined_timed_out_note() {
     let wall = Duration::from_secs(60);
@@ -148,7 +216,7 @@ fn host_timeout_result_carries_the_confined_timed_out_note() {
 
 /// Grounds [`host_timeout_kills_the_group_and_keeps_partial_output`]: that
 /// mocked test believes the kill closure `run_one` hands the supervisor really
-/// reaps a backgrounded grandchild, and that output printed before the wall
+/// kills (SIGKILLs) a backgrounded grandchild, and that output printed before the wall
 /// survives. This spawns a real `sh` tree and checks both. It does not touch
 /// the process environment.
 #[cfg(unix)]
