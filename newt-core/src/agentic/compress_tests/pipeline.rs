@@ -393,8 +393,11 @@ async fn fallback_marker_omits_write_denied_by_the_fence_after_prune() {
 #[test]
 fn fallback_marker_keeps_a_late_commit_after_many_commands() {
     let mut removed = Vec::new();
-    for _ in 0..25 {
-        removed.push(assistant_call("run_command", json!({"command": "ls"})));
+    for i in 0..25 {
+        removed.push(assistant_call(
+            "run_command",
+            json!({"command": format!("ls {i}")}),
+        ));
         removed.push(tool_result("a b c"));
     }
     removed.push(assistant_call(
@@ -407,6 +410,9 @@ fn fallback_marker_keeps_a_late_commit_after_many_commands() {
         marker.contains("git -C repo commit -m x"),
         "late commit dropped: {marker}"
     );
+    // Distinct commands: the oldest were evicted, the newest kept.
+    assert!(!marker.contains("ls 0;"), "oldest not evicted: {marker}");
+    assert!(marker.contains("ls 24;"), "newest evicted: {marker}");
 }
 
 /// A re-touched path moves to the back, so it survives eviction of older paths.
@@ -500,4 +506,52 @@ fn fallback_marker_shows_outcome_and_exit_code_after_a_long_command() {
         "long command outcome lost: {marker}"
     );
     assert!(marker.contains("make (failed, exit 2)"), "{marker}");
+}
+
+/// Red (#2875 r2 round 4, finding 1): the whole-digest cap must drop the OLDEST
+/// entries, not truncate the tail. Twenty distinct ~110-char commands overflow
+/// the cap, and the commit — the newest — must survive.
+#[test]
+fn fallback_marker_total_cap_keeps_the_newest_command() {
+    let mut removed = Vec::new();
+    for i in 0..19 {
+        let cmd = format!(
+            "cargo test -p some-crate --features f{i} -- --test-threads=1 {}",
+            "p".repeat(50)
+        );
+        removed.push(assistant_call("run_command", json!({ "command": cmd })));
+        removed.push(tool_result("ok"));
+    }
+    let commit = format!("git -C repo commit -m {}", "m".repeat(85));
+    removed.push(assistant_call("run_command", json!({ "command": commit })));
+    removed.push(tool_result("committed"));
+    let marker = static_fallback_text(&removed);
+    assert!(marker.chars().count() <= 2_000 + 1, "marker over cap");
+    assert!(
+        marker.contains("git -C repo commit"),
+        "newest commit cut: {marker}"
+    );
+    assert!(
+        !marker.contains("--features f0 "),
+        "oldest command kept: {marker}"
+    );
+}
+
+/// Red (#2875 r2 round 4, finding 3): prune pass 1 rewrites an aged repeat of an
+/// identical long result to `[duplicate of message N: …]`. A retried, identical,
+/// long fence denial must not turn the write into a touched file.
+#[tokio::test]
+async fn fallback_marker_omits_a_retried_long_denial_collapsed_to_a_duplicate_marker() {
+    let denial = format!("capability denied: write to src/a.rs. {}", "x".repeat(300));
+    let mut msgs = vec![sys("you are newt"), user("task")];
+    for _ in 0..2 {
+        msgs.push(assistant_call("edit_file", json!({"path": "src/a.rs"})));
+        msgs.push(tool_result(&denial));
+    }
+    push_filler(&mut msgs, 10);
+    let marker = fallback_marker_of(&msgs).await;
+    assert!(
+        !marker.lines().any(|l| l.starts_with("Files touched")),
+        "retried denial listed: {marker}"
+    );
 }
