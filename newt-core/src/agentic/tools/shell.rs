@@ -1363,20 +1363,24 @@ pub(super) async fn exec_confined_command_with_broker(
             live.finish();
         }
         return match run {
-            Ok(envelope) => host_result(&envelope, |envelope| {
-                let mut text = shell_envelope_output(
-                    envelope,
-                    tool_output_lines,
-                    color,
-                    tool_offload,
-                    spill_store,
-                    Some(&mut *presentation),
-                );
-                if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope) {
-                    text.push_str(hint);
-                }
-                text
-            }),
+            Ok(envelope) => host_result(
+                &envelope,
+                |envelope| {
+                    let mut text = shell_envelope_output(
+                        envelope,
+                        tool_output_lines,
+                        color,
+                        tool_offload,
+                        spill_store,
+                        Some(&mut *presentation),
+                    );
+                    if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope) {
+                        text.push_str(hint);
+                    }
+                    text
+                },
+                command_budget,
+            ),
             Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
         };
     }
@@ -1936,7 +1940,9 @@ pub(super) fn timed_out_note(
 pub(super) fn host_result(
     envelope: &serde_json::Value,
     render: impl FnOnce(&serde_json::Value) -> String,
+    command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
+    let _ = command_budget;
     let outcome = match envelope_outcome(envelope) {
         ExecOutcome::Failed
             if envelope
@@ -2008,7 +2014,7 @@ pub(super) async fn host_shell_dispatch(
 pub(super) struct HostShellRun {
     pub(super) exit_code: i64,
     pub(super) stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
     pub(super) timed_out: bool,
 }
 
@@ -2105,19 +2111,21 @@ fn parse_cat_v_meta_byte(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
     }
 }
 
+/// Drain `reader` into `output` as it arrives, so a caller that abandons the
+/// drain (a timeout) still holds every byte read before it (#2882).
 async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
+    output: &mut Vec<u8>,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     stream: crate::agentic::ToolOutputStream,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt as _;
 
-    let mut output = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
-            return Ok(output);
+            return Ok(());
         }
         if let Some(live) = live.as_ref() {
             live.write(stream, &chunk[..read]);
@@ -2282,6 +2290,67 @@ fn host_shell_command_at(
     Ok(c)
 }
 
+/// The host-shell supervisor, behind a seam the unit tier can drive without
+/// spawning (#2882): `wait` resolves to the child's exit code, `kill_tree`
+/// reaps the child's whole process group, and the two readers are its pipes.
+/// On the wall's expiry the tree is killed and the output already drained is
+/// KEPT, so the model sees what ran before the kill.
+pub(super) async fn supervise_host_child<W, K, O, E>(
+    wait: W,
+    kill_tree: K,
+    stdout: O,
+    stderr: E,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout: std::time::Duration,
+) -> std::io::Result<HostShellRun>
+where
+    W: std::future::Future<Output = std::io::Result<i64>>,
+    K: FnOnce(),
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
+    let _ = kill_tree;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let completed = async {
+        let (code, (), ()) = tokio::try_join!(
+            wait,
+            drain_host_pipe(
+                stdout,
+                &mut out,
+                live.clone(),
+                crate::agentic::ToolOutputStream::Stdout
+            ),
+            drain_host_pipe(
+                stderr,
+                &mut err,
+                live,
+                crate::agentic::ToolOutputStream::Stderr
+            ),
+        )?;
+        Ok::<_, std::io::Error>(code)
+    };
+    match tokio::time::timeout(timeout, completed).await {
+        Ok(Ok(exit_code)) => Ok(HostShellRun {
+            exit_code,
+            stdout: out,
+            stderr: err,
+            timed_out: false,
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Ok(HostShellRun {
+            exit_code: 124,
+            stdout: Vec::new(),
+            stderr: format!(
+                "command exceeded {}s host-shell timeout and was killed\n",
+                timeout.as_secs()
+            )
+            .into_bytes(),
+            timed_out: true,
+        }),
+    }
+}
+
 #[cfg(not(windows))]
 pub(super) async fn host_shell_output_with_timeout(
     route: ShellRoute,
@@ -2303,37 +2372,22 @@ pub(super) async fn host_shell_output_with_timeout(
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
-        let completed = async {
-            let (status, stdout, stderr) = tokio::try_join!(
-                child.wait(),
-                drain_host_pipe(
-                    stdout,
-                    live.clone(),
-                    crate::agentic::ToolOutputStream::Stdout
-                ),
-                drain_host_pipe(stderr, live, crate::agentic::ToolOutputStream::Stderr),
-            )?;
-            Ok::<_, std::io::Error>((status, stdout, stderr))
+        // The child leads its own process group (`process_group(0)`), so its
+        // pid is the pgid every descendant inherits.
+        let pgid = child.id();
+        let wait = async {
+            let status = child.wait().await?;
+            Ok(status.code().unwrap_or(-1) as i64)
         };
-        match tokio::time::timeout(timeout, completed).await {
-            Ok(Ok((status, stdout, stderr))) => Ok(HostShellRun {
-                exit_code: status.code().unwrap_or(-1) as i64,
-                stdout,
-                stderr,
-                timed_out: false,
-            }),
-            Ok(Err(e)) => Err(e),
-            Err(_elapsed) => Ok(HostShellRun {
-                exit_code: 124,
-                stdout: Vec::new(),
-                stderr: format!(
-                    "command exceeded {}s host-shell timeout and was killed\n",
-                    timeout.as_secs()
-                )
-                .into_bytes(),
-                timed_out: true,
-            }),
-        }
+        let kill_tree = move || {
+            #[cfg(unix)]
+            if let Some(pgid) = pgid {
+                crate::confined_exec::kill_process_group(pgid);
+            }
+            #[cfg(not(unix))]
+            let _ = pgid;
+        };
+        supervise_host_child(wait, kill_tree, stdout, stderr, live, timeout).await
     }
 
     match host_shell_command(route, false, cmd, cwd)?.spawn() {
@@ -2414,6 +2468,8 @@ async fn supervise_windows_shell(
         .stderr
         .take()
         .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
     let completed = async {
         if let Some(script) = script {
             let mut input = stdin
@@ -2424,22 +2480,28 @@ async fn supervise_windows_shell(
             input.shutdown().await?;
             drop(input);
         }
-        let (status, stdout, stderr) = tokio::try_join!(
+        let (status, (), ()) = tokio::try_join!(
             child.wait(),
             drain_host_pipe(
                 stdout,
+                &mut out,
                 live.clone(),
                 crate::agentic::ToolOutputStream::Stdout
             ),
-            drain_host_pipe(stderr, live, crate::agentic::ToolOutputStream::Stderr),
+            drain_host_pipe(
+                stderr,
+                &mut err,
+                live,
+                crate::agentic::ToolOutputStream::Stderr
+            ),
         )?;
-        Ok::<_, std::io::Error>((status, stdout, stderr))
+        Ok::<_, std::io::Error>(status)
     };
     match tokio::time::timeout(timeout, completed).await {
-        Ok(Ok((status, stdout, stderr))) => Ok(HostShellRun {
+        Ok(Ok(status)) => Ok(HostShellRun {
             exit_code: status.code().unwrap_or(-1) as i64,
-            stdout,
-            stderr,
+            stdout: out,
+            stderr: err,
             timed_out: false,
         }),
         Ok(Err(e)) => Err(e),

@@ -6225,3 +6225,11 @@ mod path_aliases;
 #[cfg(all(test, unix))]
 #[path = "tools_tests/path_alias_attacks.rs"]
 mod path_alias_attacks;
+
+// ---------------------------------------------------------------------------
+// #2882 — a host-shell timeout kills the whole process group and keeps output.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tools_tests/host_timeout_tree_tests.rs"]
+mod host_timeout_tree_tests;
