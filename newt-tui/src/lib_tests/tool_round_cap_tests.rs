@@ -185,6 +185,7 @@ fn openai_loop_recovers_from_context_window_400() {
                     max_ok_input: None,
                     build_check_cmd: None,
                     safe_context: None,
+                    output_ceiling: None,
                     // Parse-only recovery reports the hard window through the
                     // same observation owner as the successful retry.
                     recover_cw_400: Some(recover_context_window_400),

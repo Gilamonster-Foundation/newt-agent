@@ -105,9 +105,23 @@ pub(super) fn ceiling() -> u32 {
     super::generation_bounds::output_cap(None, None, 0).unwrap_or(16_384)
 }
 
+/// Clamp a retry ceiling to the room a raised cap can actually occupy: the
+/// window left after the capped reply's actual input (#2874 C1, §1.6 item 2
+/// — a raised cap is sent WITHOUT admission, so on a small window an
+/// unclamped raise would overflow the request). Unknown window or input
+/// leaves the ceiling unchanged (today's behaviour); input at or past the
+/// window clamps to zero — no raise is admissible, the note-only retry
+/// stands. Recomputed each round from that round's actual input.
+pub(super) fn window_clamp(ceiling: u32, window: Option<u32>, input: Option<u32>) -> u32 {
+    // RED (C1): the real clamp lands with the green commit; the unit tests
+    // below pin its behavior first.
+    let _ = (window, input);
+    ceiling
+}
+
 #[cfg(test)]
 mod tests {
-    use super::next_cap;
+    use super::{next_cap, window_clamp};
 
     #[test]
     fn next_cap_doubles_within_the_ceiling() {
@@ -134,5 +148,35 @@ mod tests {
     #[test]
     fn next_cap_zero_cannot_move() {
         assert_eq!(next_cap(0, 16_384), None);
+    }
+
+    /// #2874 C1 §1.5 test 9: a probed ceiling larger than the window leaves
+    /// only the window minus this round's actual input.
+    #[test]
+    fn window_clamp_clamps_to_the_window_minus_input() {
+        assert_eq!(window_clamp(128_000, Some(12_424), Some(40)), 12_384);
+    }
+
+    /// #2874 C1's derived finding: a raise beyond the window would be sent
+    /// without admission — the clamp blocks it.
+    #[test]
+    fn window_clamp_blocks_raises_beyond_the_window() {
+        assert_eq!(window_clamp(16_384, Some(8_200), Some(40)), 8_160);
+    }
+
+    #[test]
+    fn window_clamp_leaves_a_ceiling_within_headroom_alone() {
+        assert_eq!(window_clamp(16_384, Some(16_424), Some(40)), 16_384);
+    }
+
+    #[test]
+    fn window_clamp_needs_both_window_and_input() {
+        assert_eq!(window_clamp(16_384, None, Some(40)), 16_384);
+        assert_eq!(window_clamp(16_384, Some(8_200), None), 16_384);
+    }
+
+    #[test]
+    fn window_clamp_saturates_to_zero_past_the_window() {
+        assert_eq!(window_clamp(16_384, Some(10), Some(40)), 0);
     }
 }

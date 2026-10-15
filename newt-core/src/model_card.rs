@@ -169,6 +169,13 @@ pub struct Tuning {
     /// The context-token budget the harness should plan against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+    /// The model's maximum output tokens (`max_tokens` on the Anthropic
+    /// wire), when declared. `None` = undeclared. A declaration wins over
+    /// the probed `/v1/models` ceiling (#2874 C1: card > probe > none) and
+    /// bounds what an output-limit recovery retry may raise the cap to;
+    /// first sends and the input reserve never consult it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ceiling_tokens: Option<u32>,
 }
 
 impl Tuning {
@@ -179,6 +186,7 @@ impl Tuning {
             top_p: o.top_p.or(self.top_p),
             top_k: o.top_k.or(self.top_k),
             context_tokens: o.context_tokens.or(self.context_tokens),
+            output_ceiling_tokens: o.output_ceiling_tokens.or(self.output_ceiling_tokens),
         }
     }
 }
@@ -1424,6 +1432,58 @@ reasoning_replay_scope = "current_user_turn"
         assert!(
             o.num_ctx.unwrap() < 262_144,
             "ollama num_ctx is capped below the native window (OOM guard)"
+        );
+    }
+
+    /// #2874 C1: the card's declared output ceiling parses beside
+    /// `context_tokens` and deep-merges with per-field overlay precedence.
+    #[test]
+    fn tuning_output_ceiling_tokens_parses_and_merges() {
+        let card = toml::from_str::<ModelCard>(
+            r#"
+name = "m"
+backend = "ollama"
+
+[tuning]
+context_tokens = 262144
+output_ceiling_tokens = 64000
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            card.tuning.as_ref().and_then(|t| t.output_ceiling_tokens),
+            Some(64_000)
+        );
+        // A card without the key keeps the base's declaration; one WITH it
+        // wins field-by-field (the existing merge law, nothing new).
+        let keep = card.clone().merge(
+            toml::from_str::<ModelCard>(
+                r#"
+name = "m"
+backend = "ollama"
+"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            keep.tuning.and_then(|t| t.output_ceiling_tokens),
+            Some(64_000)
+        );
+        let overlay = card.merge(
+            toml::from_str::<ModelCard>(
+                r#"
+name = "m"
+backend = "ollama"
+
+[tuning]
+output_ceiling_tokens = 32000
+"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            overlay.tuning.and_then(|t| t.output_ceiling_tokens),
+            Some(32_000)
         );
     }
 

@@ -117,6 +117,7 @@ fn hard_budget_ctx<'a>(
         max_ok_input: None,
         build_check_cmd: None,
         safe_context: Some(256),
+        output_ceiling: None,
         recover_cw_400: None,
         note_sink: None,
         note_nudge: None,

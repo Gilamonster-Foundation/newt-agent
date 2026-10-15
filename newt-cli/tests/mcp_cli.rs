@@ -507,6 +507,7 @@ mod composed_private_mcp_uat {
                 max_ok_input: None,
                 build_check_cmd: None,
                 safe_context: None,
+                output_ceiling: None,
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,

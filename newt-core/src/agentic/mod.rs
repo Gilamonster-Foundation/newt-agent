@@ -1026,6 +1026,11 @@ pub struct ChatCtx<'a> {
     /// Sourced from `model-capabilities.json` via `ensure_context_window`.
     /// `None` disables overflow detection.
     pub safe_context: Option<u32>,
+    /// The model card's declared output ceiling (`tuning.output_ceiling_tokens`),
+    /// resolved by the caller. `None` = undeclared. The output-limit recovery
+    /// retry prefers it over the probed ceiling (card > probe > none, #2874
+    /// C1); first sends and the input reserve never consult it.
+    pub output_ceiling: Option<u32>,
     /// Hook invoked when a dispatch fails, to recover a hard context-window
     /// 400: `(error, model, today) → parsed full context window`. The loop
     /// derives the effective input cap after reserving its configured maximum
@@ -1490,6 +1495,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
+        output_ceiling: _,
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
@@ -6659,6 +6665,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
+        output_ceiling: _,
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
@@ -9485,6 +9492,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
+        output_ceiling: _,
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
@@ -12089,6 +12097,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
+        output_ceiling: _,
         // #1528: activated — the Responses loop now recovers a hard cw-400 by
         // learning the window, tightening a monotone ceiling, compacting via the
         // shared `compress::compress`, and re-dispatching (bounded to 2).

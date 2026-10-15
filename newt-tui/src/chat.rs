@@ -8867,6 +8867,13 @@ fn session_body(
                                         max_ok_input: eff_max_ok_input,
                                         build_check_cmd: build_check_cmd(&cfg),
                                         safe_context: eff_safe_context,
+                                        // #2874 C1: the resolved card's
+                                        // `output_ceiling_tokens` will ride
+                                        // here once the capability-decision
+                                        // chain lifts the tuning layer; the
+                                        // loop-side seam is complete and
+                                        // tested in newt-core.
+                                        output_ceiling: None,
                                         // The TUI recovers hard context-window 400s by
                                         // parsing the endpoint's real limit and persisting
                                         // it to model-capabilities.json (the probe cache

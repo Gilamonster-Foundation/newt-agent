@@ -78,6 +78,24 @@ pub trait BackendApi: Send + Sync {
         api_key: Option<&str>,
     ) -> Option<u32>;
 
+    /// The token limits this API declares for `model` — ONE round trip, ONE
+    /// shape (#2874): callers ask `limits()` instead of a second probe method
+    /// per field, and [`BackendApi::context_window`] is a thin wrapper over
+    /// this. Unknown fields are `None`, never zero; an API that can't be
+    /// asked fails soft to the default shape.
+    async fn limits(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> BackendLimits {
+        BackendLimits {
+            input_window: self.context_window(client, endpoint, model, api_key).await,
+            ..BackendLimits::default()
+        }
+    }
+
     /// Derive the serving axis from how many models the endpoint reported.
     fn serving(&self, served_count: usize) -> Serving;
 
@@ -799,6 +817,86 @@ impl BackendApi for AnthropicApi {
         // picked per request.
         Serving::Multiplexer
     }
+
+    async fn limits(
+        &self,
+        _client: &reqwest::Client,
+        _endpoint: &str,
+        _model: &str,
+        _api_key: Option<&str>,
+    ) -> BackendLimits {
+        // RED (C1): the real one-round-trip read lands with the green
+        // commit; the parser tests below pin its behavior first.
+        BackendLimits::default()
+    }
+}
+
+/// Effort levels Anthropic's `/v1/models` may advertise under
+/// `capabilities.effort.<level>.supported` (#2874). Ordered increasing. The
+/// probe only CAPTURES the ladder; the cognition projection that consumes
+/// it is E1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AnthropicEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl AnthropicEffort {
+    /// The wire key under `capabilities.effort` — one table, no match arms
+    /// to drift (the vocabulary is data).
+    #[must_use]
+    pub const fn wire_key(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// The full advertised ladder, lowest first — the probe order, one source.
+const ANTHROPIC_EFFORT_ORDER: [AnthropicEffort; 5] = [
+    AnthropicEffort::Low,
+    AnthropicEffort::Medium,
+    AnthropicEffort::High,
+    AnthropicEffort::Xhigh,
+    AnthropicEffort::Max,
+];
+
+/// Everything one backend can declare about a model's token limits (#2874):
+/// one round trip, one shape, consumed via [`BackendApi::limits`]. Every
+/// field is `Option` — unknown is `None`, never zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackendLimits {
+    /// The declared context window (input tokens), exactly what
+    /// [`BackendApi::context_window`] returns today.
+    pub input_window: Option<u32>,
+    /// The model's maximum OUTPUT tokens (Anthropic `max_tokens`).
+    /// `0`, `null`, or absent → `None` = unknown, not a ceiling of zero
+    /// (the same rule [`served_context_window`] applies to `n_ctx`).
+    pub output_ceiling: Option<u32>,
+    /// The effort levels the model advertises (`capabilities.effort`).
+    /// Absent → `None` = unknown; a present-but-empty ladder is a real,
+    /// empty answer.
+    pub effort_ladder: Option<Vec<AnthropicEffort>>,
+}
+
+/// The limits one Anthropic `/v1/models` entry declares (#2874 C1). Pure —
+/// unit-tested without a server, mirroring [`served_context_window`].
+/// `max_tokens` of `0` or `null` is UNKNOWN (`None`): treating a non-positive
+/// declaration as a ceiling would clamp every request to nothing. A missing
+/// `capabilities.effort` level is unsupported, not an error.
+#[must_use]
+pub fn anthropic_entry_limits(entry: &serde_json::Value) -> BackendLimits {
+    // RED (C1): the real parse lands with the green commit; the parser
+    // tests below pin its behavior first.
+    let _ = entry;
+    BackendLimits::default()
 }
 
 /// How many `/v1/models` pages [`anthropic_models_entries`] will follow. A
