@@ -297,7 +297,7 @@ async fn missing_cwd_2773_dispatch_keeps_previous_directory() {
                 command_directory: Some(&directory),
                 execution: Some(&execution),
                 ..Default::default()
-    },
+            },
             false,
             PromptDisposition::Act,
             None,

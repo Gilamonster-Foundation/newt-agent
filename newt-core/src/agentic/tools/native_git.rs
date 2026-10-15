@@ -1448,7 +1448,7 @@ mod tests {
             ToolCollaborators {
                 permission_gate: gate,
                 ..Default::default()
-    },
+            },
             false,
             PromptDisposition::Act,
             None,
@@ -1560,7 +1560,7 @@ mod tests {
                 assert_eq!(gate.requests[0].kind, super::super::DenialKind::FsWrite);
                 assert_eq!(gate.requests[0].target, workspace);
             }
-    }
+        }
     }
 
     #[tokio::test]

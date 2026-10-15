@@ -295,7 +295,7 @@ async fn adoption_2750_full_access_creation_then_task_command() {
     )
     .await;
     assert!(out.contains("original routing marker"), "{out}");
-    }
+}
 
 /// #2750: ambient bypass stays unarmed; full authority with confinement still
 /// adopts and narrows. The dispatch-owned decision does not change policy roots.
@@ -501,7 +501,7 @@ async fn relative_task_root(bypass: bool) {
                 PromptDisposition::Act,
             )
             .await
-    }
+        }
     };
     let read = || serde_json::json!({"path":"probe.txt"});
     assert!(call("read_file", read()).await.contains("original marker"));

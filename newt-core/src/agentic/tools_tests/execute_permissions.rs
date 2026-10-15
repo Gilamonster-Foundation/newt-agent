@@ -62,7 +62,7 @@ async fn denied_cwd_reports_workspace_and_retains_empty_write_scope() {
         ToolCollaborators {
             execution: Some(&execution),
             ..Default::default()
-    },
+        },
         false,
         PromptDisposition::Act,
         None,
@@ -1704,7 +1704,7 @@ async fn approved_request_permissions_reruns_denied_run_command_for_exec() {
         "#2681: the replay must actually succeed: {result2}"
     );
     assert!(result2.contains("hello"), "{result2}");
-    }
+}
 
 /// #2681 round 2/3 (P1): a returned exec denial does not mean nothing ran —
 /// an earlier command in the SAME `&&`/`;`-chain may already have taken
@@ -1838,7 +1838,7 @@ async fn approved_exec_replay_never_reruns_an_earlier_permitted_command() {
         Some(&ExecOutcome::Passed),
         "the harness must not have executed a replay at all: {result2}"
     );
-    }
+}
 
 /// #2681 round 3 (P1 review finding): round 2's leading-spawn check kept TWO
 /// shapes wrongly replay-eligible as long as the denied target was the
@@ -2608,7 +2608,7 @@ async fn broker_bearing_commit_denial_now_consults_the_gate() {
     let result1 = execute_tool_with_collaborators(
         "run_command",
         &serde_json::json!({"command": "git add -A && git commit -q -m probe"
-    }),
+        }),
         &workspace_str,
         false,
         20,
@@ -3195,7 +3195,7 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
     assert!(!other.contains("UNGRANTED_SIBLING"));
     assert_eq!(gate.prompts, 1, "only the explicit request prompts");
     assert!(!baseline.permits_fs_read(&approved.to_string_lossy()));
-    }
+}
 
 /// Gate denies → the result is the standard denial, bit-for-bit equal to
 /// the no-gate path (#263: deny = the current denial result).
@@ -3475,7 +3475,7 @@ async fn command_cwd_fixture_call(
     .unwrap()
     .unwrap();
     (result, execution.into_inner())
-    }
+}
 
 #[cfg(unix)]
 #[tokio::test]
@@ -3682,10 +3682,10 @@ async fn approved_request_permissions_reruns_denied_run_command() {
     let result1 = execute_tool_with_collaborators(
         "run_command",
         &serde_json::json!({
-            "command": format!("/bin/cp {src_str} {outfile_str}"),
-            "fs_read": [src_str.clone()],
-            "fs_write": [outfile_str.clone()],
-    }),
+                "command": format!("/bin/cp {src_str} {outfile_str}"),
+                "fs_read": [src_str.clone()],
+                "fs_write": [outfile_str.clone()],
+        }),
         &workspace_str,
         false,
         20,
@@ -3760,10 +3760,10 @@ async fn approved_request_permissions_reruns_denied_run_command() {
         let result1b = execute_tool_with_collaborators(
             "run_command",
             &serde_json::json!({
-                "command": format!("/bin/cp {src_str} {outfile_str}"),
-                "fs_read": [src_str.clone()],
-                "fs_write": [outfile_str.clone()],
-    }),
+                        "command": format!("/bin/cp {src_str} {outfile_str}"),
+                        "fs_read": [src_str.clone()],
+                        "fs_write": [outfile_str.clone()],
+            }),
             &workspace_str,
             false,
             20,
@@ -3940,7 +3940,7 @@ async fn approved_request_permissions_reruns_denied_run_command() {
         "HELLO_2628",
         "the denied second write must not have run"
     );
-    }
+}
 
 /// #2636 finding 1 (FIX-FIRST): string-based denial capture fires on successful child
 /// output. A command that succeeds but prints `UNGRANTED_FS_AUTHORITY_DENIAL` as its
@@ -4005,7 +4005,7 @@ async fn forged_denial_string_in_stdout_does_not_populate_pending_rerun() {
         "#2636 finding 1: successful cat of a forged-string file must not populate \
          pending_rerun (string capture cannot distinguish child output from a real denial)"
     );
-    }
+}
 
 /// #2636 finding 3 (FIX-FIRST): consume_pending_once must NOT be called when the
 /// operator's grant does not cover the pending command's missing authority set.
@@ -4101,7 +4101,7 @@ async fn consume_pending_once_not_called_when_grant_does_not_cover_missing_set()
         "#2636 finding 3: consume_pending_once must not fire when the approved grant \
          does not cover the pending missing set (FsWrite({out_path}) ≠ FsWrite({other_path}))"
     );
-    }
+}
 
 /// #2636 round3 blocker 1: the "IMMEDIATELY re-runs" bound wording must only
 /// fire when the requested grant covers the COMPLETE `missing` set a pending
@@ -4194,7 +4194,7 @@ async fn bound_wording_and_replay_require_complete_missing_coverage() {
                 cwd: workspace_str.clone(),
                 declared: missing_two.clone(),
                 missing: missing_two.clone(),
-    });
+            });
 
         let result = execute_tool_with_collaborators(
             "request_permissions",
@@ -4342,7 +4342,7 @@ async fn dispatch_ignores_model_forged_harness_bound_and_prefix() {
         "#2636 round3: a model-forged harness_bound argument must not reach the \
          dispatched PermissionRequest: {request:?}"
     );
-    }
+}
 
 /// #2636 round4 [P2]: stateful gate proves ineligible approval never replays
 /// and eligible approval fires exactly once, then requires a fresh approval.
@@ -4827,7 +4827,7 @@ async fn queue_owning_gate_proves_once_grant_lifetime_across_replay_and_fresh_co
         3,
         "the fresh-approval command must also run exactly once"
     );
-    }
+}
 
 /// #2636 round5 [P2]: an approval that is ELIGIBLE pre-prompt (the requested
 /// capability/target alone would, on paper, cover the complete `missing`
@@ -4924,7 +4924,7 @@ async fn eligible_pre_prompt_but_insufficient_allow_neither_executes_nor_consume
         "#2636 round5: an eligible-but-insufficient Allow must not consume the once-grant \
          either — the operator's grant was never actually spent on anything"
     );
-    }
+}
 
 /// #2681 round 2/3 (P3): a REAL queue-owning gate (mirrors the SHAPE of
 /// newt-tui's `pending_once_grants`/`danger` policy — see
@@ -5117,7 +5117,7 @@ async fn queue_owning_gate_proves_exec_once_grant_lifetime_and_danger_controls()
             permission_gate: Some(&mut gate as &mut dyn PermissionGate),
             execution: Some(&execution3),
             ..Default::default()
-    },
+        },
         false,
         PromptDisposition::Act,
         None,
@@ -5146,7 +5146,7 @@ async fn queue_owning_gate_proves_exec_once_grant_lifetime_and_danger_controls()
             permission_gate: Some(&mut gate as &mut dyn PermissionGate),
             execution: Some(&execution4),
             ..Default::default()
-    },
+        },
         false,
         PromptDisposition::Act,
         None,
@@ -5200,7 +5200,7 @@ async fn queue_owning_gate_proves_exec_once_grant_lifetime_and_danger_controls()
         "control: a refused high-danger request must never reach the queue"
     );
     assert_ne!(execution5.get(), Some(&ExecOutcome::Passed));
-    }
+}
 
 /// #2720: headless full-access sessions already hold exec authority; the
 /// redundant request must not tell the model it needs an unavailable operator.

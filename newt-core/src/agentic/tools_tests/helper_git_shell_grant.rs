@@ -1056,7 +1056,7 @@ async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_fai
             git_tool: Some(&git_tool),
             execution: Some(&execution),
             ..Default::default()
-    },
+        },
         false,
         super::PromptDisposition::Act,
         None,

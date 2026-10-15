@@ -3607,7 +3607,7 @@ async fn execute_tool_unadopted(
         ToolCollaborators {
             permission_gate: gate.as_mut().map(|gate| gate as &mut dyn PermissionGate),
             ..collab
-    },
+        },
         tool_offload,
         disposition,
     )
@@ -6145,7 +6145,7 @@ async fn execute_authorized_tool(
 
         other => unknown_tool_message(other),
     }
-    }
+}
 
 /// Classify an [`execute_tool`] result string as success or failure for the
 /// turn's recorded tool events (Step 17.6, #246). Best-effort by necessity —

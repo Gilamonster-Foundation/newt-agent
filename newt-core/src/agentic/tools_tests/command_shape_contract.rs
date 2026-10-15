@@ -408,7 +408,7 @@ async fn check(row: Row) {
                 permission_gate: Some(&mut gate),
                 exec_floor: (row.setup == Setup::Restricted).then_some(&caveats.exec),
                 ..Default::default()
-    },
+            },
             false,
             PromptDisposition::Act,
             None,
@@ -592,7 +592,7 @@ async fn confined_setup(command: &str, root: &Path, caveats: &Caveats, session: 
         Some(&ExecOutcome::Passed),
         "{command}: {text}"
     );
-    }
+}
 
 macro_rules! rows {
     ($( $(#[$attr:meta])* $id:ident, $mode:ident, $setup:ident, $command:literal, $outcome:expr, $root:ident, $bound:literal, $refused:literal, $contains:literal, $gate:expr, $claim:literal; )*) => {$(

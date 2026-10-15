@@ -202,7 +202,7 @@ async fn call(
             worktree_session: Some(session),
             permission_gate: Some(&mut gate),
             ..Default::default()
-    },
+        },
         false,
         PromptDisposition::Act,
     )
@@ -320,7 +320,7 @@ async fn worktree_adoption_native_creation_and_interpreter_fence() {
         Some(&crate::ExecOutcome::Passed),
         "task Git metadata writes must remain usable: {output}"
     );
-    }
+}
 
 /// #2733: a same-invocation Python write cannot run before adoption takes effect.
 #[test]

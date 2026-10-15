@@ -112,7 +112,7 @@ async fn model_entered_plan_can_search_actual_files_without_widening_authority()
                 step_ledger: Some(&ledger),
                 plan_mode_control: Some(&control),
                 ..Default::default()
-    },
+            },
             false,
             PromptDisposition::Act,
             None,
@@ -318,7 +318,7 @@ async fn impact_does_not_read_coverage_through_an_escaping_link() {
         out.contains("denied"),
         "coverage refusal must remain visible: {out}"
     );
-    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]

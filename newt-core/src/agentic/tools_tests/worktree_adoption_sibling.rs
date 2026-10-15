@@ -139,7 +139,7 @@ async fn plan_release_preserves_worktree_adoption() {
                     permission_gate: Some(&mut failed_gate),
                     execution: Some(&outcome),
                     ..Default::default()
-    },
+                },
                 false,
                 PromptDisposition::Act,
             )
@@ -370,7 +370,7 @@ async fn plan_release_preserves_worktree_adoption() {
                 "original contents",
                 "{text}"
             );
-    }
+        }
 
         // A current gate ceiling must also apply to native file tools, which
         // do not enter the shell's own permission refresh.

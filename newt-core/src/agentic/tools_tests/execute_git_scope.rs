@@ -35,7 +35,7 @@ async fn scoped_act_git_discovery_does_not_advertise_legacy_operations() {
             ToolCollaborators {
                 git_tool: Some(&GitPresent),
                 ..Default::default()
-    },
+            },
             false,
             PromptDisposition::Act,
             None,
@@ -146,4 +146,4 @@ async fn run_git_gated_scope(op: &str, caveats: &Caveats, gate: &mut MockGate) -
     .await
     .expect("legacy fixture has no durable writer")
     .unwrap()
-    }
+}

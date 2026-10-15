@@ -2062,7 +2062,7 @@ async fn a_trimmed_build_retains_full_diagnostics_for_retrieval() {
         ToolCollaborators {
             spill_store: Some(&spill),
             ..Default::default()
-    },
+        },
         true,
         PromptDisposition::Act,
         None,

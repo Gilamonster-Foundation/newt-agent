@@ -3641,9 +3641,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 let tool_evidence = tool_events
                     .as_deref()
                     .map(|e| capability_check::Evidence::from_events(e));
-                crate::commit_review::set_default_reader_source(
-                    &crate::commit_review::HostReaders,
-                );
+                crate::commit_review::set_default_reader_source(&crate::commit_review::HostReaders);
                 let Some(result) = tools::execute_tool_with_collaborators(
                     name,
                     &args,
@@ -3701,7 +3699,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         command_directory: Some(&command_directory),
                         routed_to: Some(&routed_to),
                         pending_rerun: Some(&mut pending_rerun),
-    },
+                    },
                     tool_offload,
                     prompt_disposition,
                     cancel,
@@ -8723,9 +8721,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 let tool_evidence = tool_events
                     .as_deref()
                     .map(|e| capability_check::Evidence::from_events(e));
-                crate::commit_review::set_default_reader_source(
-                    &crate::commit_review::HostReaders,
-                );
+                crate::commit_review::set_default_reader_source(&crate::commit_review::HostReaders);
                 let Some(result) = tools::execute_tool_with_collaborators(
                     name,
                     &args,
@@ -8798,7 +8794,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     ));
                 };
                 result
-    };
+            };
             if debug {
                 // This line lands directly below the viewport `result` just
                 // painted — take the frame down first or its later rewind
@@ -11443,9 +11439,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 let tool_evidence = tool_events
                     .as_deref()
                     .map(|e| capability_check::Evidence::from_events(e));
-                crate::commit_review::set_default_reader_source(
-                    &crate::commit_review::HostReaders,
-                );
+                crate::commit_review::set_default_reader_source(&crate::commit_review::HostReaders);
                 let Some(result) = tools::execute_tool_with_collaborators(
                     name,
                     &args,
@@ -11514,7 +11508,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     ));
                 };
                 result
-    };
+            };
             if debug {
                 // This line lands directly below the viewport `result` just
                 // painted — take the frame down first or its later rewind
@@ -13373,9 +13367,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 let tool_evidence = tool_events
                     .as_deref()
                     .map(|e| capability_check::Evidence::from_events(e));
-                crate::commit_review::set_default_reader_source(
-                    &crate::commit_review::HostReaders,
-                );
+                crate::commit_review::set_default_reader_source(&crate::commit_review::HostReaders);
                 let Some(result) = tools::execute_tool_with_collaborators(
                     name,
                     &args,
@@ -13448,7 +13440,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     ));
                 };
                 result
-    };
+            };
             if debug {
                 // This line lands directly below the viewport `result` just
                 // painted — take the frame down first or its later rewind

@@ -91,7 +91,7 @@ async fn mac_tmp_alias_dispatch_and_adoption_persist() {
                     worktree_session: Some(&session),
                     execution: Some(&outcome),
                     ..Default::default()
-    },
+                },
                 false,
                 PromptDisposition::Act,
             )

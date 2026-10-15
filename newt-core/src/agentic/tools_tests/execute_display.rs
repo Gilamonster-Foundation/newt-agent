@@ -402,7 +402,7 @@ async fn run_tool_captured_with_context_and_live(
             live_tool_output,
             permission_gate: remote.then_some(&mut gate as &mut dyn PermissionGate),
             ..Default::default()
-    },
+        },
         false,
         PromptDisposition::Act,
         None,

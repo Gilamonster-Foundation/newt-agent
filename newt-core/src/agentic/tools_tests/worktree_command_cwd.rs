@@ -59,7 +59,7 @@ async fn call(
             worktree_session: Some(session),
             command_directory: Some(&directory),
             ..Default::default()
-    },
+        },
         false,
         PromptDisposition::Act,
     )
@@ -315,7 +315,7 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
                 &requested.fs_write,
                 original.to_str().unwrap()
             ));
-    }
+        }
     }
 }
 

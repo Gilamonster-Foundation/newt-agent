@@ -840,10 +840,7 @@ impl SmartHarness {
             );
             let remaining = Duration::from_millis(self.settings.review_total_timeout_ms)
                 .saturating_sub(s.review_elapsed);
-            anyhow::ensure!(
-                !remaining.is_zero(),
-                "review elapsed-time budget exhausted"
-            );
+            anyhow::ensure!(!remaining.is_zero(), "review elapsed-time budget exhausted");
             s.review_calls += 1;
             remaining.min(Duration::from_millis(self.settings.review_timeout_ms))
         };
@@ -861,9 +858,7 @@ impl SmartHarness {
     /// auxiliary call with its own budget. Any failure — budget, timeout,
     /// oversize, unparseable — yields no findings; a review never fabricates
     /// one and never blocks the turn.
-    pub(crate) async fn review_commit_content(&self,
-        prompt: String,
-    ) -> Vec<String> {
+    pub(crate) async fn review_commit_content(&self, prompt: String) -> Vec<String> {
         match self.complete_review_bounded(prompt).await {
             Ok(raw) if self.admit_output(&raw).is_ok() => {
                 crate::commit_review::parse_content_findings(&raw)

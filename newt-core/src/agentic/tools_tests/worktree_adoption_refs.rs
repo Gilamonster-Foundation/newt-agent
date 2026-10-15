@@ -36,7 +36,7 @@ pub(super) async fn run(
             git_tool: Some(&FixtureGitTool),
             execution: Some(&outcome),
             ..Default::default()
-    },
+        },
         false,
         PromptDisposition::Act,
     )

@@ -361,7 +361,7 @@ mod tests {
                     execution: Some(&outcome),
                     command_directory: Some(&directory),
                     ..Default::default()
-    },
+                },
                 false,
                 PromptDisposition::Act,
             )

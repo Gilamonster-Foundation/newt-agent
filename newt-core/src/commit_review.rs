@@ -125,9 +125,15 @@ pub(crate) trait ReaderSource: Send + Sync {
 /// No-op reader used when the dispatcher has no reader source (tests).
 pub(crate) struct NoOpRepo;
 impl CommitReader for NoOpRepo {
-    fn head(&self) -> Option<String> { None }
-    fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> { Vec::new() }
-    fn stat(&self, _: &str) -> String { String::new() }
+    fn head(&self) -> Option<String> {
+        None
+    }
+    fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn stat(&self, _: &str) -> String {
+        String::new()
+    }
 }
 
 /// Production reader source: honors the read scope via `metadata_git`.
@@ -149,11 +155,7 @@ impl ReaderSource for HostReaders {
 /// No-op reader source for tests that do not care about commit-message review.
 pub(crate) struct NoOpReaders;
 impl ReaderSource for NoOpReaders {
-    fn open(
-        &self,
-        _: &std::path::Path,
-        _: &crate::Scope<String>,
-    ) -> Option<SharedReader> {
+    fn open(&self, _: &std::path::Path, _: &crate::Scope<String>) -> Option<SharedReader> {
         None
     }
 }
@@ -184,10 +186,7 @@ pub(crate) fn default_reader_source() -> &'static dyn ReaderSource {
 /// it afterward. This keeps the dispatcher's default no-op while still letting
 /// commit-review tests inject fake readers.
 #[cfg(test)]
-pub(crate) fn with_reader_source<T>(
-    source: &'static dyn ReaderSource,
-    f: impl FnOnce() -> T,
-) -> T {
+pub(crate) fn with_reader_source<T>(source: &'static dyn ReaderSource, f: impl FnOnce() -> T) -> T {
     let mut guard = DEFAULT_READER_SOURCE.lock().unwrap();
     let prev = guard.replace(source);
     drop(guard);
@@ -229,7 +228,10 @@ pub(crate) struct Review {
 impl Review {
     /// `None` when the snapshot did not complete in time: reviewing against
     /// an unknown `before` would treat all history as newly landed.
-    pub(crate) async fn begin(reader: SharedReader, policy: Option<&dyn CommitPolicy>) -> Option<Self> {
+    pub(crate) async fn begin(
+        reader: SharedReader,
+        policy: Option<&dyn CommitPolicy>,
+    ) -> Option<Self> {
         Self::begin_within(reader, policy, SNAPSHOT_DEADLINE).await
     }
 
@@ -253,7 +255,10 @@ impl Review {
         self.conclude_within(FINISH_DEADLINE).await
     }
 
-    async fn conclude_within(self, deadline: std::time::Duration) -> (Option<String>, Vec<(String, String)>) {
+    async fn conclude_within(
+        self,
+        deadline: std::time::Duration,
+    ) -> (Option<String>, Vec<(String, String)>) {
         let Self { pending, reader } = self;
         off_executor(deadline, move || pending.finish(reader.as_ref()))
             .await
@@ -433,11 +438,8 @@ fn read_bounded(
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
-        let ok = std::io::Read::read_to_end(
-            &mut std::io::Read::take(source, limit),
-            &mut buf,
-        )
-        .is_ok();
+        let ok =
+            std::io::Read::read_to_end(&mut std::io::Read::take(source, limit), &mut buf).is_ok();
         let _ = tx.send(ok.then_some(buf));
     });
     rx.recv_timeout(deadline)
@@ -491,8 +493,8 @@ impl CommitReader for HostRepo {
             "--no-ext-diff",
             oid,
         ])
-            .map(|out| String::from_utf8_lossy(&out).into_owned())
-            .unwrap_or_default()
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .unwrap_or_default()
     }
 }
 
@@ -1026,7 +1028,9 @@ mod tests {
     async fn a_hanging_readback_concludes_empty() {
         let short = std::time::Duration::from_millis(50);
         let reader: SharedReader = std::sync::Arc::new(HangAfterHead(Default::default()));
-        let review = Review::begin_within(reader, None, short).await.expect("snapshot");
+        let review = Review::begin_within(reader, None, short)
+            .await
+            .expect("snapshot");
         let concluded = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             review.conclude_within(short),
@@ -1069,63 +1073,48 @@ mod tests {
         // With no production source configured, the dispatcher falls back to
         // a no-op reader so unit tests never spawn real git.
         clear_default_reader_source();
-        assert!(
-            default_reader_source()
-                .open(std::path::Path::new("."), &crate::Scope::All)
-                .is_none()
-        );
+        assert!(default_reader_source()
+            .open(std::path::Path::new("."), &crate::Scope::All)
+            .is_none());
 
         // Production sets HostReaders. We do not call into the reader, only
         // check that the source opens under an unrestricted scope.
         set_default_reader_source(&HostReaders);
-        assert!(
-            default_reader_source()
-                .open(std::path::Path::new("."), &crate::Scope::All)
-                .is_some()
-        );
+        assert!(default_reader_source()
+            .open(std::path::Path::new("."), &crate::Scope::All)
+            .is_some());
 
         // Clean up so later tests in the same process still see no-op.
         set_default_reader_source(&NoOpReaders);
-        assert!(
-            default_reader_source()
-                .open(std::path::Path::new("."), &crate::Scope::All)
-                .is_none()
-        );
+        assert!(default_reader_source()
+            .open(std::path::Path::new("."), &crate::Scope::All)
+            .is_none());
     }
 
     #[test]
     fn with_reader_source_overrides_production_source() {
         let _guard = READER_SOURCE_TEST_MUTEX.lock().unwrap();
-        use crate::commit_review::{with_reader_source};
+        use crate::commit_review::with_reader_source;
         struct RecordingSource(std::sync::atomic::AtomicUsize);
         impl ReaderSource for RecordingSource {
-            fn open(
-                &self,
-                _: &std::path::Path,
-                _: &crate::Scope<String>,
-            ) -> Option<SharedReader> {
+            fn open(&self, _: &std::path::Path, _: &crate::Scope<String>) -> Option<SharedReader> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 None
             }
         }
-        static RECORDING: RecordingSource =
-            RecordingSource(std::sync::atomic::AtomicUsize::new(0));
+        static RECORDING: RecordingSource = RecordingSource(std::sync::atomic::AtomicUsize::new(0));
         let before = RECORDING.0.load(std::sync::atomic::Ordering::SeqCst);
         with_reader_source(&RECORDING, || {
-            crate::commit_review::default_reader_source().open(
-                std::path::Path::new("."),
-                &crate::Scope::All,
-            );
+            crate::commit_review::default_reader_source()
+                .open(std::path::Path::new("."), &crate::Scope::All);
         });
         let after = RECORDING.0.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after - before, 1);
 
         // After the guard drops, the default is restored.
-        assert!(
-            default_reader_source()
-                .open(std::path::Path::new("."), &crate::Scope::All)
-                .is_none()
-        );
+        assert!(default_reader_source()
+            .open(std::path::Path::new("."), &crate::Scope::All)
+            .is_none());
     }
 
     /// Codex round 1 #2906 P1-1: a readable cwd is not enough. Git discovery
