@@ -4683,16 +4683,19 @@ async fn execute_authorized_tool(
             // #2905: commit-message review is route-independent and
             // detector-independent: HEAD is snapshotted around every
             // command, and whatever landed is read back and checked.
-            let commit_reader = crate::commit_review::HostRepo {
-                cwd: std::path::PathBuf::from(&run_cwd),
-                read_scope: caveats.fs_read.clone(),
-            };
+            // The snapshot is async and bounded so a hanging git config
+            // include can never strand the turn.
+            let commit_reader: crate::commit_review::SharedReader =
+                std::sync::Arc::new(crate::commit_review::HostRepo {
+                    cwd: std::path::PathBuf::from(&run_cwd),
+                    read_scope: caveats.fs_read.clone(),
+                });
             let commit_policy = git_tool.and_then(|tool| tool.native_commit_policy());
-            let commit_review = start_commit_review(
-                crate::caveats::permits_path(&caveats.fs_read, &run_cwd),
-                &commit_reader,
+            let commit_review = crate::commit_review::Review::begin(
+                commit_reader.clone(),
                 commit_policy.as_deref(),
-            );
+            )
+            .await;
             let (mut exec_text, mut exec_outcome) = shell::exec_confined_command_with_broker(
                 cmd,
                 &run_cwd,
@@ -4796,12 +4799,16 @@ async fn execute_authorized_tool(
                     guard.resolve();
                 }
             }
-            if let Some(report) = commit_review.as_ref().and_then(|review| review.finish(&commit_reader)) {
+            let (report, prompts) = match commit_review {
+                Some(review) => review.conclude().await,
+                None => (None, Vec::new()),
+            };
+            if let Some(report) = report {
                 presentation.preview(&report, 0);
                 exec_text = format!("{exec_text}\n{report}");
             }
-            if let (Some(review), Some(harness)) = (commit_review.as_ref(), smart_harness) {
-                for (oid, prompt) in review.content_prompts(&commit_reader) {
+            if let Some(harness) = smart_harness {
+                for (oid, prompt) in prompts {
                     let findings = harness.review_commit_content(prompt).await;
                     if let Some(report) = crate::commit_review::render_content(&oid, &findings) {
                         presentation.preview(&report, 0);
@@ -6169,6 +6176,7 @@ mod private_url_mcp_bat_tests;
 #[path = "tools_tests/tests.rs"]
 mod tests;
 
+#[cfg(test)]
 /// #2905: open the commit-message review for one `run_command`. Gated on
 /// read authority over the cwd ONLY. There is deliberately no command-text
 /// parameter: a script or alias that commits slips past any lexical

@@ -93,9 +93,11 @@ pub(crate) enum Finding {
     Unvouched(String),
 }
 
-/// Reads landed commits. Production is a fixed-argv hardened `git`; unit
-/// tests use an in-memory fake. Never runs hooks or the model's shell text.
-pub(crate) trait CommitReader {
+/// Reads landed commits. Production is a fixed-argv `metadata_git` under the
+/// turn's read scope; unit tests use an in-memory fake. Never runs hooks or
+/// the model's shell text. Implementations may block: callers run them off
+/// the async executor under a deadline ([`Review`]).
+pub(crate) trait CommitReader: Send + Sync {
     /// The current `HEAD` oid, or `None` (unborn branch / not a repository).
     fn head(&self) -> Option<String>;
     /// `(oid, full message)` for commits in `before..head`, newest first,
@@ -106,6 +108,70 @@ pub(crate) trait CommitReader {
     fn stat(&self, oid: &str) -> String;
 }
 
+/// A reader shared with the blocking task that runs it.
+pub(crate) type SharedReader = std::sync::Arc<dyn CommitReader>;
+
+/// Deadline for the pre-command `HEAD` snapshot.
+pub(crate) const SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Deadline for reading back and checking everything that landed.
+pub(crate) const FINISH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run a blocking read off the async executor. `None` on deadline or panic:
+/// the turn proceeds and the review is skipped (fail-open). A read that
+/// never returns strands only its blocking thread, never the turn.
+async fn off_executor<T: Send + 'static>(
+    deadline: std::time::Duration,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    tokio::time::timeout(deadline, tokio::task::spawn_blocking(read))
+        .await
+        .ok()?
+        .ok()
+}
+
+/// One invocation's review, bound to its reader. `begin` before the command,
+/// `conclude` after it; both are bounded and fail-open.
+pub(crate) struct Review {
+    pending: Pending,
+    reader: SharedReader,
+}
+
+impl Review {
+    /// `None` when the snapshot did not complete in time: reviewing against
+    /// an unknown `before` would treat all history as newly landed.
+    pub(crate) async fn begin(reader: SharedReader, policy: Option<&dyn CommitPolicy>) -> Option<Self> {
+        Self::begin_within(reader, policy, SNAPSHOT_DEADLINE).await
+    }
+
+    async fn begin_within(
+        reader: SharedReader,
+        policy: Option<&dyn CommitPolicy>,
+        deadline: std::time::Duration,
+    ) -> Option<Self> {
+        let expected = Expected::from_policy(policy);
+        let snapshot = reader.clone();
+        let before = off_executor(deadline, move || snapshot.head()).await?;
+        Some(Self {
+            pending: Pending { before, expected },
+            reader,
+        })
+    }
+
+    /// The deterministic report and the model content prompts, from ONE
+    /// read of what landed. Empty on deadline.
+    pub(crate) async fn conclude(self) -> (Option<String>, Vec<(String, String)>) {
+        self.conclude_within(FINISH_DEADLINE).await
+    }
+
+    async fn conclude_within(self, deadline: std::time::Duration) -> (Option<String>, Vec<(String, String)>) {
+        let Self { pending, reader } = self;
+        off_executor(deadline, move || pending.finish(reader.as_ref()))
+            .await
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
 /// #2905 seam: review every commit an invocation landed. Called with the
 /// `HEAD` read before the command and the expectation captured then. The
 /// signature carries no route — confined and `--full-access` runs share it.
@@ -119,10 +185,18 @@ pub(crate) fn review_landed(
     if before == Some(head.as_str()) {
         return None;
     }
+    review_commits(
+        &reader.landed(before, &head, MAX_REVIEWED_COMMITS),
+        expected,
+    )
+}
+
+/// Deterministic review of already-read `(oid, message)` pairs.
+fn review_commits(commits: &[(String, String)], expected: &Expected) -> Option<String> {
     let mut out = String::new();
-    for (oid, message) in reader.landed(before, &head, MAX_REVIEWED_COMMITS) {
-        let findings = check_trailers(&message, expected);
-        let leaks = leak_findings(&message);
+    for (oid, message) in commits {
+        let findings = check_trailers(message, expected);
+        let leaks = leak_findings(message);
         let short = &oid[..oid.len().min(12)];
         if !leaks.is_empty() {
             out.push_str(&format!("commit review: {short} message content\n"));
@@ -168,6 +242,7 @@ pub(crate) struct Pending {
 }
 
 impl Pending {
+    #[cfg(test)]
     pub(crate) fn start(reader: &dyn CommitReader, policy: Option<&dyn CommitPolicy>) -> Self {
         Self {
             before: reader.head(),
@@ -175,28 +250,26 @@ impl Pending {
         }
     }
 
-    pub(crate) fn finish(&self, reader: &dyn CommitReader) -> Option<String> {
-        review_landed(reader, self.before.as_deref(), &self.expected)
-    }
-
-    /// `(oid, prompt)` for the model content review of what landed, newest
-    /// first, at most [`MAX_CONTENT_REVIEWS`]. Empty when HEAD did not move.
-    pub(crate) fn content_prompts(&self, reader: &dyn CommitReader) -> Vec<(String, String)> {
+    /// One `HEAD` read, one walk of what landed: the deterministic report
+    /// over up to [`MAX_REVIEWED_COMMITS`], and `(oid, prompt)` content
+    /// prompts for the newest [`MAX_CONTENT_REVIEWS`] of them.
+    pub(crate) fn finish(
+        &self,
+        reader: &dyn CommitReader,
+    ) -> (Option<String>, Vec<(String, String)>) {
         let Some(head) = reader.head() else {
-            return Vec::new();
+            return Default::default();
         };
         if self.before.as_deref() == Some(head.as_str()) {
-            return Vec::new();
+            return Default::default();
         }
-        reader
-            .landed(self.before.as_deref(), &head, MAX_CONTENT_REVIEWS)
-            .into_iter()
+        let commits = reader.landed(self.before.as_deref(), &head, MAX_REVIEWED_COMMITS);
+        let prompts = commits
+            .iter()
             .take(MAX_CONTENT_REVIEWS)
-            .map(|(oid, message)| {
-                let prompt = content_prompt(&message, &reader.stat(&oid));
-                (oid, prompt)
-            })
-            .collect()
+            .map(|(oid, message)| (oid.clone(), content_prompt(message, &reader.stat(oid))))
+            .collect();
+        (review_commits(&commits, &self.expected), prompts)
     }
 }
 
@@ -224,15 +297,63 @@ pub(crate) struct HostRepo {
     pub(crate) read_scope: crate::Scope<String>,
 }
 
+/// Per-call deadline and output cap for one metadata read.
+const GIT_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+const GIT_OUTPUT_CAP: usize = 256 * 1024;
+
 impl HostRepo {
     fn run(&self, args: &[&str]) -> Option<Vec<u8>> {
-        let output = crate::git_hardening::metadata_git(&self.cwd, args, &self.read_scope)
+        let mut child = crate::git_hardening::metadata_git(&self.cwd, args, &self.read_scope)
             .ok()?
             .stdin(std::process::Stdio::null())
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .ok()?;
-        output.status.success().then_some(output.stdout)
+        let started = std::time::Instant::now();
+        let out = child
+            .stdout
+            .take()
+            .and_then(|stdout| read_bounded(stdout, GIT_OUTPUT_CAP, GIT_READ_DEADLINE));
+        loop {
+            match (&out, child.try_wait()) {
+                (Some(_), Ok(Some(status))) => return status.success().then_some(out?),
+                (Some(_), Ok(None)) if started.elapsed() < GIT_READ_DEADLINE => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
     }
+}
+
+/// Read `source` to EOF within `deadline` and at most `cap` bytes. `None`
+/// when either bound is exceeded; the reading thread is abandoned and the
+/// caller kills the producer, which closes the pipe.
+fn read_bounded(
+    source: impl std::io::Read + Send + 'static,
+    cap: usize,
+    deadline: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+        let ok = std::io::Read::read_to_end(
+            &mut std::io::Read::take(source, limit),
+            &mut buf,
+        )
+        .is_ok();
+        let _ = tx.send(ok.then_some(buf));
+    });
+    rx.recv_timeout(deadline)
+        .ok()
+        .flatten()
+        .filter(|buf| buf.len() <= cap)
 }
 
 /// `git rev-list` argv for the commits newly reachable in `before..head`.
@@ -271,7 +392,15 @@ impl CommitReader for HostRepo {
     }
 
     fn stat(&self, oid: &str) -> String {
-        self.run(&["show", "--stat", "--format=", "--no-color", oid])
+        self.run(&[
+            "show",
+            "--stat",
+            "--format=",
+            "--no-color",
+            "--no-textconv",
+            "--no-ext-diff",
+            oid,
+        ])
             .map(|out| String::from_utf8_lossy(&out).into_owned())
             .unwrap_or_default()
     }
@@ -593,7 +722,7 @@ mod tests {
             ),
             ("oid-base".into(), "base\n".into()),
         ]);
-        assert!(pending.finish(&after).unwrap().contains("oid-new"));
+        assert!(pending.finish(&after).0.unwrap().contains("oid-new"));
     }
 
     /// Second commit of `git commit … && git commit …`: the first consumed
@@ -738,7 +867,7 @@ mod tests {
             .map(|i| (format!("oid-{i}"), format!("msg {i}\n")))
             .collect();
         history.push(("oid-base".into(), "b\n".into()));
-        let prompts = pending.content_prompts(&FakeRepo(history));
+        let prompts = pending.finish(&FakeRepo(history)).1;
         assert_eq!(prompts.len(), MAX_CONTENT_REVIEWS);
         assert_eq!(prompts[0].0, "oid-0");
         assert!(
@@ -747,9 +876,90 @@ mod tests {
             prompts[0].1
         );
         assert!(
-            pending.content_prompts(&before).is_empty(),
+            pending.finish(&before) == (None, Vec::new()),
             "HEAD did not move"
         );
+    }
+
+    /// A reader whose every call blocks for longer than the review deadline.
+    struct HangingRepo;
+    impl CommitReader for HangingRepo {
+        fn head(&self) -> Option<String> {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            None
+        }
+        fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Vec::new()
+        }
+        fn stat(&self, _: &str) -> String {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            String::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hanging_snapshot_never_hangs_the_turn() {
+        let short = std::time::Duration::from_millis(50);
+        let reader: SharedReader = std::sync::Arc::new(HangingRepo);
+        let begun = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Review::begin_within(reader, None, short),
+        )
+        .await
+        .expect("begin returned within its deadline");
+        assert!(begun.is_none(), "an unknown `before` reviews nothing");
+    }
+
+    /// The pre-command snapshot succeeded but the post-command read hangs.
+    struct HangAfterHead(std::sync::atomic::AtomicBool);
+    impl CommitReader for HangAfterHead {
+        fn head(&self) -> Option<String> {
+            if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Some("oid-base".into())
+        }
+        fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn stat(&self, _: &str) -> String {
+            String::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hanging_readback_concludes_empty() {
+        let short = std::time::Duration::from_millis(50);
+        let reader: SharedReader = std::sync::Arc::new(HangAfterHead(Default::default()));
+        let review = Review::begin_within(reader, None, short).await.expect("snapshot");
+        let concluded = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            review.conclude_within(short),
+        )
+        .await
+        .expect("conclude returned within its deadline");
+        assert_eq!(concluded, (None, Vec::new()));
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_and_stalled_output() {
+        let long = std::time::Duration::from_secs(5);
+        assert_eq!(read_bounded(&b"abc"[..], 3, long), Some(b"abc".to_vec()));
+        assert_eq!(read_bounded(&b"abcd"[..], 3, long), None);
+        struct Stalled;
+        impl std::io::Read for Stalled {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                Ok(0)
+            }
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(
+            read_bounded(Stalled, 3, std::time::Duration::from_millis(50)),
+            None
+        );
+        assert!(started.elapsed() < long);
     }
 
     /// Codex round 1 #2906 P1-1: a readable cwd is not enough. Git discovery
