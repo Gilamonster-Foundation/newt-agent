@@ -7925,6 +7925,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
+        // Adjudicate, nudge and return the whole continued answer (#2874).
+        let oa_content = output_recovery.stitch(oa_content);
         let native_calls = message["tool_calls"].as_array();
         // Recover tool calls emitted as content instead of the native field —
         // the #1 weak-model failure (see `tool_recovery`). Mirror of the Ollama
@@ -8083,7 +8085,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     );
                 }
             }
-            let content = output_recovery.stitch(oa_content.clone());
+            let content = oa_content.clone();
             if !is_cancelled(cancel)
                 && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
             {
@@ -10665,7 +10667,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
 
         // This wire separates thinking natively — `text` arrives clean, so
         // the OpenAI path's `split_reasoning` has no work to do here.
-        let oa_content = model_reply.text.clone();
+        // Adjudicate, nudge and return the whole continued answer (#2874).
+        let oa_content = output_recovery.stitch(model_reply.text.clone());
         let separate_reasoning = {
             let t = model_reply.thinking.trim();
             (!t.is_empty()).then_some(t)
@@ -10847,7 +10850,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     );
                 }
             }
-            let content = output_recovery.stitch(oa_content.clone());
+            let content = oa_content.clone();
             if !is_cancelled(cancel)
                 && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
             {

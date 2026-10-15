@@ -76,13 +76,13 @@ impl Recovery {
         self.raised.or(base)
     }
 
-    /// Prefix continued prose onto this round's visible text.
-    pub fn stitch(&self, text: String) -> String {
-        if self.prefix.is_empty() {
-            text
-        } else {
-            format!("{}{text}", self.prefix)
-        }
+    /// Prefix continued prose onto this round's visible text, consuming the
+    /// prefix: the assembled answer is adjudicated and kept in history as one
+    /// reply, so a later answer must never be stitched to it again.
+    pub fn stitch(&mut self, text: String) -> String {
+        let mut whole = std::mem::take(&mut self.prefix);
+        whole.push_str(&text);
+        whole
     }
 
     pub fn completed_tool_round(&mut self) {
