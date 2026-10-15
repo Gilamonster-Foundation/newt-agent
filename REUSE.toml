@@ -1,0 +1,29 @@
+version = 1
+SPDX-PackageName = "newt-agent"
+SPDX-PackageSupplier = "Shawn Hartsock <hartsock@users.noreply.github.com>"
+SPDX-PackageDownloadLocation = "https://github.com/Gilamonster-Foundation/newt-agent"
+
+# SPDX coverage for every file without per-file headers (REUSE spec 3.x).
+# The repository is Apache-2.0 (LICENSE; `[workspace.package] license`).
+# Later annotations override earlier ones for the paths they match, so the
+# vendored crates below keep their own licenses.
+
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Shawn Hartsock"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Vendored agent-bridle crates: Apache-2.0, upstream copyright (see each NOTICE).
+[[annotations]]
+path = "vendor/agent-bridle-*/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Shawn Hartsock"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Patched crossterm 0.28.1: MIT, upstream copyright (vendor/crossterm-0.28.1-patched/LICENSE).
+[[annotations]]
+path = "vendor/crossterm-0.28.1-patched/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2019 Timon"
+SPDX-License-Identifier = "MIT"

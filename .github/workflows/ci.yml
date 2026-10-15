@@ -81,6 +81,11 @@ jobs:
       - name: fmt check
         if: always()
         run: cargo fmt --all -- --check
+      # HOOK PARITY: CI-only; named in .githooks/pre-push (needs the `reuse`
+      # Python tool, which a dev box does not carry). REUSE.toml + LICENSES/.
+      - name: REUSE / SPDX license coverage
+        if: always()
+        uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
       # HOOK PARITY: .githooks/pre-push runs this gate on release/manifest changes.
       - name: release matrix coverage and order regression
         run: |

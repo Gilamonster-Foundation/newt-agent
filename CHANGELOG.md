@@ -11,6 +11,15 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [0.8.1] — unreleased
 
+### Added
+
+- Each release now ships an SPDX 2.3 SBOM of the Rust dependency graph
+  (`newt-agent-<tag>.spdx.json`), attested to the release binaries and attached
+  to the GitHub Release. Every `release.yml` run, including a manual dry run,
+  builds it as a workflow artifact.
+- The repository is REUSE-compliant: `REUSE.toml` and `LICENSES/` declare the
+  SPDX license of every file, and CI runs `reuse lint`.
+
 ### Security
 
 - Bumps `rustls` to 0.23.46, which fixes RUSTSEC-2026-0346 through 0349. The
