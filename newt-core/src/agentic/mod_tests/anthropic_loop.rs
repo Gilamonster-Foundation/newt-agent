@@ -1440,7 +1440,7 @@ async fn refusal_with_empty_content_returns_the_honest_placeholder() {
 }
 
 // -----------------------------------------------------------------------
-// 13: max_tokens stop returns the truncated text
+// 13: max_tokens stop keeps the truncated text (#2874: continued, bounded)
 // -----------------------------------------------------------------------
 
 #[tokio::test]
@@ -1465,10 +1465,14 @@ async fn max_tokens_stop_returns_the_truncated_text() {
     let (reply, _, _, _) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
         .await
         .expect("a length stop with text is accepted");
+    // Every reply is capped: the text is continued twice (the two-retry
+    // allowance), each segment is kept, and the turn then stops honestly.
     assert_eq!(
         crate::agentic::model_explanation(&reply),
-        "The list has 3 entries."
+        "The list has 3 entries.".repeat(3)
     );
+    assert!(reply.contains("output limit"), "{reply}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
 // -----------------------------------------------------------------------

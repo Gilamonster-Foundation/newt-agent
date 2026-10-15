@@ -2,13 +2,23 @@
 use super::*;
 
 pub(super) fn reply(wire: &str, attempt: usize, limited: bool, tool: bool) -> ResponseTemplate {
+    reply_with(wire, attempt, limited, tool, "Finished.")
+}
+
+fn reply_with(
+    wire: &str,
+    attempt: usize,
+    limited: bool,
+    tool: bool,
+    prose: &str,
+) -> ResponseTemplate {
     let args = if limited {
         "{\"path\":\"partial\",\"content\":\"cut".into()
     } else {
         serde_json::json!({"path":format!("done{attempt}"),"content":"written"}).to_string()
     };
     let id = format!("call_{attempt}");
-    let text = if tool { "" } else { "Finished." };
+    let text = if tool { "" } else { prose };
     let calls = serde_json::json!([{"id":id,"type":"function","function":{"name":"write_file","arguments":args}}]);
     let body = match wire {
         "ollama" => {
@@ -49,7 +59,33 @@ pub(super) fn reply(wire: &str, attempt: usize, limited: bool, tool: bool) -> Re
     ResponseTemplate::new(200).set_body_json(body)
 }
 
-async fn scenario(wire: &'static str, bounded: bool) {
+type Reply = (String, bool, Option<crate::TokenUsage>, u32);
+type Run = (
+    Reply,
+    Vec<serde_json::Value>,
+    Option<crate::TurnEndReason>,
+    tempfile::TempDir,
+);
+
+/// One turn on `wire` with an optional explicit allowance; the responder sees
+/// the 1-based attempt and the request body.
+async fn run(
+    wire: &'static str,
+    allowance: Option<u32>,
+    obs: Option<&mut crate::agentic::SolveObservation>,
+    respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
+) -> Run {
+    run_on(wire, allowance, obs, None, respond).await
+}
+
+/// `run` with an optional smart harness adjudicating the answer.
+async fn run_on(
+    wire: &'static str,
+    allowance: Option<u32>,
+    obs: Option<&mut crate::agentic::SolveObservation>,
+    harness: Option<&crate::agentic::smart_harness::SmartHarness>,
+    respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
+) -> Run {
     let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -59,10 +95,7 @@ async fn scenario(wire: &'static str, bounded: bool) {
         .respond_with(move |request: &Request| {
             let mut requests = requests.lock().unwrap();
             requests.push(body_json(request));
-            let attempt = requests.len();
-            // Three independent recoveries exceed a lifetime allowance of two.
-            let limited = bounded || matches!(attempt, 1 | 3 | 5);
-            reply(wire, attempt, limited, bounded || attempt < 7)
+            respond(requests.len(), requests.last().unwrap())
         })
         .mount(&server)
         .await;
@@ -83,8 +116,53 @@ async fn scenario(wire: &'static str, bounded: bool) {
     context.action_nudges = false;
     context.end_reason = Some(&mut end);
     context.max_tool_rounds = 4;
+    context.output_allowance = allowance;
+    context.solve_obs = obs;
+    context.smart_harness = harness;
     let result = chat_complete(context, &mut NoMcp).await.unwrap();
-    let requests = captured.lock().unwrap();
+    let requests = captured.lock().unwrap().clone();
+    (result, requests, end, dir)
+}
+
+/// The output cap each wire sends: `num_predict`, `max_output_tokens`, or a
+/// Chat/Messages `max_tokens` (`max_completion_tokens` on first-party OpenAI).
+fn sent_cap(wire: &str, body: &serde_json::Value) -> Option<u64> {
+    match wire {
+        "ollama" => body["options"]["num_predict"].as_u64(),
+        "responses" => body["max_output_tokens"].as_u64(),
+        _ => body["max_tokens"]
+            .as_u64()
+            .or_else(|| body["max_completion_tokens"].as_u64()),
+    }
+}
+
+fn history(wire: &str, body: &serde_json::Value) -> String {
+    body[if wire == "responses" {
+        "input"
+    } else {
+        "messages"
+    }]
+    .to_string()
+}
+
+/// The turn finished normally. The Responses loop records no end reason on an
+/// ordinary answer (pre-existing; it writes the slot only on failure and cap
+/// paths), so there "normal" means "not Failed".
+fn assert_completed(wire: &str, end: Option<crate::TurnEndReason>) {
+    if wire == "responses" {
+        assert_ne!(end, Some(crate::TurnEndReason::Failed), "{wire}");
+    } else {
+        assert_eq!(end, Some(crate::TurnEndReason::Completed), "{wire}");
+    }
+}
+
+async fn scenario(wire: &'static str, bounded: bool) {
+    let (result, requests, end, dir) = run(wire, None, None, move |attempt, _| {
+        // Three independent recoveries exceed a lifetime allowance of two.
+        let limited = bounded || matches!(attempt, 1 | 3 | 5);
+        reply(wire, attempt, limited, bounded || attempt < 7)
+    })
+    .await;
     assert_eq!(
         requests.len(),
         if bounded { 3 } else { 7 },
@@ -108,16 +186,23 @@ async fn scenario(wire: &'static str, bounded: bool) {
                     .contains("your last reply was cut off at the output limit")
             })
             .collect();
-        assert_eq!(notes.len(), 1, "{wire} request {index}: one bounded note");
+        assert!(
+            !request[field].to_string().contains("partial"),
+            "discarded tool not replayed"
+        );
+        // A retry either raises the cap (G1) or, with no headroom, carries the
+        // one bounded note; never more than one.
+        let raised = sent_cap(wire, request) > sent_cap(wire, &requests[0]);
+        assert!(notes.len() <= 1, "{wire} request {index}: one bounded note");
+        if notes.is_empty() {
+            assert!(raised, "{wire} request {index}: no note needs a raised cap");
+            continue;
+        }
         assert_eq!(
             notes[0]["role"], "user",
             "host guidance is never assistant speech"
         );
         assert!(notes[0].to_string().contains("[loop-guidance] [harness]"));
-        assert!(
-            !request[field].to_string().contains("partial"),
-            "discarded tool not replayed"
-        );
     }
     assert_eq!(result.2.unwrap().output_tokens, requests.len() as u32 * 7);
     if bounded {
@@ -156,3 +241,282 @@ wire_test!(output_limit_recovery_chat, "openai");
 wire_test!(output_limit_recovery_responses, "responses");
 wire_test!(output_limit_recovery_ollama, "ollama");
 wire_test!(output_limit_recovery_anthropic, "anthropic");
+
+/// G1: a capped tool batch retries with a doubled cap (bounded by the
+/// ceiling), so the same call fits instead of failing twice and halting.
+async fn raise_scenario(wire: &'static str) {
+    let (result, requests, end, dir) = run(wire, Some(1000), None, move |attempt, body| {
+        let limited = sent_cap(wire, body).unwrap_or(0) < 2000;
+        reply(wire, attempt, limited, attempt < 3)
+    })
+    .await;
+    let caps: Vec<_> = requests.iter().map(|r| sent_cap(wire, r)).collect();
+    assert_eq!(requests.len(), 3, "{wire}: caps {caps:?} {result:?}");
+    assert_eq!(caps[0], Some(1000), "{wire}");
+    assert!(
+        caps[1] > caps[0] && caps[1] <= Some(16_384),
+        "{wire}: {caps:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("done2")).unwrap(),
+        "written"
+    );
+    assert!(!dir.path().join("partial").exists());
+    assert_completed(wire, end);
+}
+
+/// G2: a text-only truncation continues the turn; the partial text is kept
+/// in history and in the stitched answer, and the turn completes.
+async fn text_scenario(wire: &'static str) {
+    let (result, requests, end, _dir) = run(wire, None, None, move |attempt, _| {
+        if attempt == 1 {
+            reply_with(wire, attempt, true, false, "First half, ")
+        } else {
+            reply_with(wire, attempt, false, false, "second half.")
+        }
+    })
+    .await;
+    assert_eq!(requests.len(), 2, "{wire}: {result:?}");
+    let second = history(wire, &requests[1]);
+    assert!(second.contains("First half, "), "{wire}: {second}");
+    assert!(
+        second.contains("continue exactly where it stopped"),
+        "{wire}: {second}"
+    );
+    assert!(
+        result.0.contains("First half, second half."),
+        "{wire}: {}",
+        result.0
+    );
+    assert!(!result.0.contains("operator request"), "{wire}");
+    assert_completed(wire, end);
+}
+
+/// A smart harness answering from scripted `verdicts`, in order.
+fn scripted_harness(verdicts: &[&str]) -> crate::agentic::smart_harness::SmartHarness {
+    let verdicts = Arc::new(Mutex::new(
+        verdicts
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::VecDeque<_>>(),
+    ));
+    crate::agentic::smart_harness::SmartHarness::new(
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
+        Arc::new(move |_| {
+            let verdict = verdicts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("bounded auxiliary call");
+            Box::pin(async move { Ok((verdict, None)) })
+        }),
+        crate::agentic::smart_harness::AdjudicationSettings::default(),
+    )
+    .unwrap()
+}
+
+/// `reply_with` for prose, honouring a non-streamed Anthropic request (smart
+/// mode does not stream that wire).
+fn prose(
+    wire: &str,
+    body: &serde_json::Value,
+    attempt: usize,
+    limited: bool,
+    text: &str,
+) -> ResponseTemplate {
+    if wire == "anthropic" && body["stream"] != true {
+        return ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"msg_1","type":"message","role":"assistant","model":"test-model","stop_reason":if limited {"max_tokens"} else {"end_turn"},"content":[{"type":"text","text":text}],"usage":{"input_tokens":40,"output_tokens":7}}));
+    }
+    reply_with(wire, attempt, limited, false, text)
+}
+
+/// G2 under the smart harness: the adjudicated and returned answer is the
+/// whole continuation, not only its last segment (#2901 review, P2 a).
+async fn smart_text_scenario(wire: &'static str) {
+    let harness = scripted_harness(&["\"answer\""]);
+    let (result, requests, _end, _dir) =
+        run_on(wire, None, None, Some(&harness), move |attempt, body| {
+            if attempt == 1 {
+                prose(wire, body, attempt, true, "First half, ")
+            } else {
+                prose(wire, body, attempt, false, "second half.")
+            }
+        })
+        .await;
+    assert_eq!(requests.len(), 2, "{wire}: {result:?}");
+    assert_eq!(
+        crate::agentic::model_explanation(&result.0),
+        "First half, second half.",
+        "{wire}"
+    );
+}
+
+/// A completed continuation that draws a narration nudge must not leave its
+/// prefix behind for the next, fresh answer (#2901 review, P2 b).
+async fn smart_nudge_scenario(wire: &'static str) {
+    let harness = scripted_harness(&["\"narration\"", "\"answer\""]);
+    let (result, requests, _end, _dir) = run_on(
+        wire,
+        None,
+        None,
+        Some(&harness),
+        move |attempt, body| match attempt {
+            1 => prose(wire, body, attempt, true, "First half, "),
+            2 => prose(wire, body, attempt, false, "second half."),
+            _ => prose(wire, body, attempt, false, "Fresh complete answer."),
+        },
+    )
+    .await;
+    assert_eq!(requests.len(), 3, "{wire}: {result:?}");
+    assert_eq!(
+        crate::agentic::model_explanation(&result.0),
+        "Fresh complete answer.",
+        "{wire}"
+    );
+}
+
+macro_rules! smart_test {
+    ($answer:ident, $nudge:ident, $wire:literal) => {
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $answer() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            smart_text_scenario($wire).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $nudge() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            smart_nudge_scenario($wire).await;
+        }
+    };
+}
+smart_test!(
+    smart_continuation_answer_is_whole_chat,
+    smart_continuation_prefix_is_consumed_chat,
+    "openai"
+);
+smart_test!(
+    smart_continuation_answer_is_whole_responses,
+    smart_continuation_prefix_is_consumed_responses,
+    "responses"
+);
+smart_test!(
+    smart_continuation_answer_is_whole_ollama,
+    smart_continuation_prefix_is_consumed_ollama,
+    "ollama"
+);
+smart_test!(
+    smart_continuation_answer_is_whole_anthropic,
+    smart_continuation_prefix_is_consumed_anthropic,
+    "anthropic"
+);
+
+/// A cap already at the ceiling keeps today's note-only retry and still
+/// stops honestly after two consecutive retries.
+async fn ceiling_scenario(wire: &'static str) {
+    let (result, requests, end, _dir) = run(wire, Some(16_384), None, move |attempt, _| {
+        reply(wire, attempt, true, true)
+    })
+    .await;
+    assert_eq!(requests.len(), 3, "{wire}: {result:?}");
+    let caps: Vec<_> = requests.iter().map(|r| sent_cap(wire, r)).collect();
+    assert!(
+        caps.iter().all(|cap| *cap == Some(16_384)),
+        "{wire}: {caps:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed), "{wire}");
+}
+
+macro_rules! continue_test {
+    ($raise:ident, $text:ident, $ceiling:ident, $wire:literal) => {
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $raise() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            raise_scenario($wire).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $text() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            text_scenario($wire).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $ceiling() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            ceiling_scenario($wire).await;
+        }
+    };
+}
+continue_test!(
+    retry_raises_cap_then_succeeds_chat,
+    text_only_truncation_continues_chat,
+    cap_at_ceiling_falls_back_to_note_only_chat,
+    "openai"
+);
+continue_test!(
+    retry_raises_cap_then_succeeds_responses,
+    text_only_truncation_continues_responses,
+    cap_at_ceiling_falls_back_to_note_only_responses,
+    "responses"
+);
+continue_test!(
+    retry_raises_cap_then_succeeds_ollama,
+    text_only_truncation_continues_ollama,
+    cap_at_ceiling_falls_back_to_note_only_ollama,
+    "ollama"
+);
+continue_test!(
+    retry_raises_cap_then_succeeds_anthropic,
+    text_only_truncation_continues_anthropic,
+    cap_at_ceiling_falls_back_to_note_only_anthropic,
+    "anthropic"
+);
+
+/// G3: a thinking-only `max_tokens` stop reaches the Anthropic
+/// `reasoning_overflow` handler exactly once instead of the early return.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn anthropic_thinking_only_stop_reaches_reasoning_overflow() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let mut obs = crate::agentic::SolveObservation::default();
+    let (result, requests, end, _dir) = run("anthropic", None, Some(&mut obs), |_, _| {
+        let frames = [
+            serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":40,"output_tokens":0}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private unfinished plan"}}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":7}}),
+            serde_json::json!({"type":"message_stop"}),
+        ];
+        ResponseTemplate::new(200).set_body_raw(
+            frames
+                .iter()
+                .map(|v| format!("data: {v}\n\n"))
+                .collect::<String>(),
+            "text/event-stream",
+        )
+    })
+    .await;
+    let overflows = obs
+        .behavior_signals
+        .iter()
+        .filter(|signal| {
+            matches!(
+                signal,
+                crate::agentic::observability::BehaviorSignal::ReasoningOverflow { .. }
+            )
+        })
+        .count();
+    assert_eq!(overflows, 1, "{result:?}");
+    assert_eq!(requests.len(), 1, "no continuation is advertised");
+    assert!(!result.0.contains("private unfinished plan"));
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
