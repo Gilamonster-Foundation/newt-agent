@@ -415,6 +415,9 @@ mod loop_watch_tests {
             include_str!("agentic/mod.rs"),
             include_str!("agentic/send_budget.rs"),
             include_str!("agentic/display.rs"),
+            include_str!("agentic/attribution.rs"),
+            include_str!("agentic/diagnostics.rs"),
+            include_str!("agentic/output_stream.rs"),
         ]
         .join("\n");
         // Positive read assertion FIRST: an absence-check that silently read

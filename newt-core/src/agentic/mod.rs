@@ -41,10 +41,17 @@ pub use claim_check::{
 };
 #[cfg(test)]
 pub(crate) use observed_report::tests::model_explanation;
+mod attribution;
 pub(crate) mod compress;
 mod context_recovery;
 mod crew_attest;
 mod crew_tool;
+use attribution::AttributionEpoch;
+#[allow(unused_imports)]
+use attribution::{
+    append_clean_build_warning, ledger_note_attribution, ledger_note_write,
+    record_completed_tool_event, record_organic_note_use, record_phantom_reach,
+};
 pub(crate) mod cw_overflow;
 mod display;
 mod generation_bounds;
@@ -52,8 +59,13 @@ mod generation_policy;
 mod generation_repetition;
 mod output_budget;
 mod output_limit_recovery;
+mod output_stream;
 pub use generation_policy::{
     preview_chat_generation, projected_cognition, validate_output_allowance, ChatGenerationPreview,
+};
+use output_stream::CompletedSpillDismissGuard;
+pub use output_stream::{
+    CompletedSpillRenderer, LiveToolOutput, RoundObservation, ToolOutputStream,
 };
 mod git_tool;
 pub mod openai_sse;
@@ -86,6 +98,16 @@ pub(crate) mod tool_recovery;
 // `chat_complete` (driver), a renderer-agnostic transcript render (transcript),
 // and the redaction-gated ShellObservation seam (observation). All additive;
 // they wrap/precede `chat_complete` and never touch its internals.
+mod diagnostics;
+use diagnostics::{
+    announce_tool_activity, cancellable, dismiss_completed_spill, is_cancelled,
+    is_ollama_tool_xml_error, is_tools_unsupported_error, legacy_caps, ollama_tool_xml_retry_nudge,
+    print_synthetic_tool_result,
+};
+// `present_synthetic_tool_result` is used only by the `mod_tests` glob
+// (`use super::*`), which clippy's unused-import analysis doesn't trace.
+#[allow(unused_imports)]
+use diagnostics::present_synthetic_tool_result;
 mod driver;
 mod file_change_display;
 pub use file_change_display::{file_change_style, write_file_change_row, FileChangePresentation};
@@ -797,176 +819,6 @@ async fn compact_responses_input(
 /// [`ChatCtx::recover_cw_400`].
 pub type RecoverCw400 = fn(&anyhow::Error, &str, &str) -> Option<u32>;
 
-/// One per-round capability observation, reported through
-/// [`ChatCtx::on_round_usage`] at the moment it is observed (Phase 20,
-/// `docs/design/model-self-tuning.md` §2.2 — the `recover_cw_400` pattern,
-/// generalized to the success direction). Evidence must not wait for a turn
-/// epilogue an error can skip: the motivating failure discarded a backend-
-/// accepted 8,734-token prompt because the turn later ended in `Err`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoundObservation {
-    /// Backend evaluated `prompt_tokens` and the round produced a usable
-    /// response (tool calls or non-empty content). `estimated_tokens` is the
-    /// loop's chars/4 estimate of the same request, for calibration.
-    /// Quality-gated AND truncation-gated at the emission sites: never
-    /// emitted when the prompt was within 5% of the request's `num_ctx`
-    /// (Ollama may have silently dropped the head of the prompt).
-    Accepted {
-        prompt_tokens: u32,
-        estimated_tokens: usize,
-    },
-    /// Persistent empty responses at `prompt_tokens` after retries (the
-    /// 85%-of-safe-context silent-overflow exit).
-    SuspectedOverflow { prompt_tokens: u32 },
-    /// A hard HTTP error reported the endpoint's full context window. The TUI
-    /// applies this through the same in-memory capability entry as subsequent
-    /// accepted-round evidence, avoiding stale whole-cache overwrites.
-    ContextWindow400 { context_window: u32 },
-    /// Response carried only non-content fields (thinking/reasoning) with
-    /// empty content.
-    ThinkingOnly,
-}
-
-/// Source stream for one incremental shell-output chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolOutputStream {
-    /// Bytes captured from the tool's standard output stream.
-    Stdout,
-    /// Bytes captured from the tool's standard error stream.
-    Stderr,
-}
-
-/// Renderer-neutral, turn-scoped consumer for live tool output.
-///
-/// The interactive TUI supplies this only when both stdio handles are TTYs.
-/// Headless callers pass `None` and retain completion-only output exactly.
-/// Newt delivers accepted chunks serially on a bounded presentation worker;
-/// slow rendering cannot backpressure a child process or its timeout. Live-only
-/// chunks may be dropped when that queue is full. The independently captured
-/// result envelope remains authoritative and complete.
-pub trait LiveToolOutput: Send + Sync {
-    /// Begin a new active-tool frame. No terminal output is required until the
-    /// first chunk arrives. This runs on the bounded presentation worker, not
-    /// on the tool-execution task. An implementation must ignore a generation
-    /// that [`LiveToolOutput::abandon`] has already invalidated.
-    fn start(&self, generation: u64);
-
-    /// Consume one raw byte chunk. Display sanitization belongs to the sink;
-    /// the authoritative result envelope is captured independently. A
-    /// generation can be abandoned after a bounded completion wait, so a
-    /// post-finish, abandoned, or stale-generation write must be a no-op.
-    fn write(&self, generation: u64, stream: ToolOutputStream, chunk: &[u8]);
-
-    /// Erase/close the active frame before the canonical result is printed.
-    /// This is ordered after every accepted write on normal completion. Panics
-    /// are contained by the dispatcher; implementations should still leave the
-    /// terminal in a canonical state whenever possible.
-    fn finish(&self, generation: u64);
-
-    /// Invalidate a generation without producing terminal output.
-    ///
-    /// Cancellation and bounded teardown call this synchronously before the
-    /// canonical result may be rendered. It must be fast, idempotent, and must
-    /// make queued callbacks for `generation` no-ops. A later [`Self::start`]
-    /// must discard abandoned frame bookkeeping without trying to erase it
-    /// from the terminal's then-current cursor position.
-    fn abandon(&self, generation: u64);
-}
-
-/// Renderer-neutral, turn-scoped consumer for COMPLETED tool output spill view.
-///
-/// This is the Rich TUI's completed spill renderer — an interactive, scrollable
-/// viewport painted BELOW the committed `spill_view_lines` excerpt after a tool
-/// result. The excerpt stays the canonical transcript record on every tier; the
-/// viewport is a scroll affordance that lives only until the turn's next
-/// canonical write dismisses it (`dismiss_completed_spill` at round dispatch, or
-/// the next tool header). Only the Rich TUI (feature `rich-tui` + `live-spill`)
-/// implements this; the Lean TUI and headless callers pass `None`.
-///
-/// The dismissal discipline is load-bearing: the viewport holds rows the tty
-/// arbiter placed under the transcript and erases exactly those rows, so a
-/// committed line that landed on them would go with the frame. Dismissing
-/// first is what keeps the transcript whole. A viewport that must SURVIVE
-/// canonical output (scroll during the next thinking round, or at the prompt)
-/// is the #1303 step 6 retain-overlay, not this trait.
-///
-/// Key differences from `LiveToolOutput`:
-/// - Not incremental — renders a complete, finished tool result
-/// - Interactive — supports scrolling, expanding/collapsing, editor-mode nav
-/// - Bounded — max 50% of screen height so a single spill can't flood a tmux
-/// - Delimited — visual boundaries (⎵/⎶/⎴) mark scrollable region extents
-pub trait CompletedSpillRenderer: Send + Sync {
-    /// Retain a completed result for an on-demand, session-scoped viewer.
-    ///
-    /// Returns the stable session-local identifier that committed collapse
-    /// markers should name. The default preserves renderers that only provide
-    /// the transient inline viewport.
-    fn retain_completed(&self, _output: &str) -> Option<u64> {
-        None
-    }
-
-    /// Host-supported inspection affordance, with the command fallback.
-    fn recovery_hint(&self, id: u64) -> String {
-        format!("/spill open {id}")
-    }
-
-    /// Render a completed tool result as an interactive spill viewport.
-    ///
-    /// `output` is the complete (stdout+stderr) tool output. `width` is the
-    /// terminal column count. `max_height` is the maximum rows this viewport
-    /// may occupy (enforced at 50% of terminal height by the caller).
-    ///
-    /// Returns the number of physical rows painted — 0 when the viewport could
-    /// not take the screen (no TTY room, or a LIVE viewport is still up).
-    fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize;
-
-    /// Render a captured file change when the host supports safe styled cells.
-    /// Existing hosts retain the completed text fallback and its lifecycle.
-    fn render_file_change(
-        &self,
-        _raw_output: &str,
-        output: &str,
-        _change: std::sync::Arc<FileChangePresentation>,
-        width: usize,
-        max_height: usize,
-    ) -> usize {
-        self.render_completed(output, width, max_height)
-    }
-
-    /// Whether a COMPLETED viewport is currently on screen (a live viewport
-    /// does not count).
-    fn is_active(&self) -> bool;
-
-    /// Erase the completed spill viewport from the terminal — a pure rewind;
-    /// the committed excerpt above the frame is the durable record. No-op
-    /// when no completed viewport is up.
-    fn erase(&self);
-
-    /// Drop the viewport's bookkeeping WITHOUT touching the terminal — the
-    /// completed twin of the live path's `abandon`. Used at turn-exit
-    /// boundaries where canonical lines may already have landed below a
-    /// still-painted frame (an error `?`, a cancel return): rewinding from
-    /// there would destroy rows the frame does not own, so the frame is left
-    /// as inert residue instead, and — critically — no LATER erase can replay
-    /// a stale rewind over the next turn's prompt. No-op when nothing is up.
-    fn discard(&self) {}
-}
-
-/// Turn-scoped guard: discards any still-tracked completed viewport when the
-/// provider function exits by ANY path (normal return, `?`, cancel, panic).
-/// This makes the worst failure — a stale `MoveUp` rewind executing on a later
-/// turn, over the prompt and the user's typed input — unrepresentable: the
-/// bookkeeping cannot outlive the turn that painted the frame.
-struct CompletedSpillDismissGuard<'a>(&'a Option<std::sync::Arc<dyn CompletedSpillRenderer>>);
-
-impl Drop for CompletedSpillDismissGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(renderer) = self.0 {
-            renderer.discard();
-        }
-    }
-}
-
 /// Everything one agentic turn needs, resolved once by the caller (the TUI
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
@@ -1396,228 +1248,6 @@ pub struct ChatCtx<'a> {
     pub steering: Option<&'a dyn SteeringInbox>,
 }
 
-/// Record organic save_note use after repeat rejection and before dispatch.
-/// Reset even if the subsequent attempt fails or is cancelled; retain the
-/// optional sink/nudge gates.
-fn record_organic_note_use(
-    name: &str,
-    note_sink: &Option<&mut dyn NoteSink>,
-    note_nudge: &mut Option<&mut NoteNudge>,
-) {
-    if name == "save_note" && note_sink.is_some() {
-        if let Some(n) = note_nudge.as_deref_mut() {
-            n.note_saved();
-        }
-    }
-}
-
-/// #1948: observe completed calls and append at most one clean-build warning
-/// per turn. Keep this after repeat recording and before event timing.
-fn append_clean_build_warning(
-    messages: &mut Vec<serde_json::Value>,
-    clean_build: &mut crate::loop_watch::CleanBuildWatch,
-    args: &serde_json::Value,
-    harness: Option<&smart_harness::SmartHarness>,
-) -> anyhow::Result<()> {
-    if let Some(warning) = clean_build.observe(
-        args.get("command")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default(),
-    ) {
-        let text = format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX);
-        if let Some(harness) = harness {
-            harness.host_message(&text)?;
-        }
-        messages.push(serde_json::json!({"role":"user", "content":text}));
-    }
-    Ok(())
-}
-
-/// Record a completed call only when the event sink is present. Keep elapsed
-/// sampling here, after backend bookkeeping and before phantom classification.
-fn record_completed_tool_event(
-    tool_events: &mut Option<&mut Vec<crate::ToolEvent>>,
-    name: &str,
-    args: &serde_json::Value,
-    ok: bool,
-    // #2315: required, so no funnel can record a shell call without deciding
-    // what its execution slot holds.
-    execution: Option<crate::ExecOutcome>,
-    tool_t0: std::time::Instant,
-) {
-    if let Some(rec) = tool_events.as_deref_mut() {
-        rec.push(crate::ToolEvent {
-            execution,
-            ..crate::ToolEvent::from_call(
-                name,
-                args,
-                ok,
-                u64::try_from(tool_t0.elapsed().as_millis()).ok(),
-            )
-        });
-    }
-}
-
-/// #717 / #479 (G4): record alias, hallucination, and real-tool empty-miss
-/// reaches, falling back to gated-off crew/team reaches. Classify only when
-/// the phantom sink is present; preserve the primary classifier's precedence.
-fn record_phantom_reach(
-    phantom_reaches: &mut Option<&mut Vec<crate::PhantomReach>>,
-    name: &str,
-    args: &serde_json::Value,
-    result: &str,
-    ok: bool,
-    advertise_team: bool,
-) {
-    if let Some(pr) = phantom_reaches.as_deref_mut() {
-        if let Some(resolution) = tools::classify_phantom_reach(name, args, result, ok)
-            .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
-        {
-            pr.push(crate::PhantomReach {
-                name_as_called: name.to_string(),
-                resolution,
-                active_context_features: Vec::new(),
-            });
-        }
-    }
-}
-
-/// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
-/// capture the target's pre-write bytes into the turn ledger. Recorded at the loop's
-/// dispatch site (not inside `execute_tool`) so the seam stays narrow and only the
-/// two file-writing tools are ever tracked. [`WriteLedger::note_before_write`] is
-/// idempotent on the turn's first write of a path, so the *pre-turn* state is what
-/// is preserved. A no-op when no ledger is lent — every headless caller and any
-/// profile without `retry` — so behavior is bit-for-bit unchanged there.
-fn ledger_note_write(
-    write_ledger: Option<&std::cell::RefCell<crate::verify_gate::WriteLedger>>,
-    name: &str,
-    args: &serde_json::Value,
-    workspace: &str,
-) {
-    let Some(led) = write_ledger else {
-        return;
-    };
-    if name != "write_file" && name != "edit_file" {
-        return;
-    }
-    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-        // Key on the lexically-normalized path so a raw model path like
-        // `examples/../foo.py` matches the gate's filesystem-normalized `foo.py`
-        // and the revert lookup actually hits — otherwise a non-normalized path
-        // would silently evade revert (the fabrication persists, the gate is gamed).
-        let abs = lexical_normalize(&std::path::Path::new(workspace).join(p));
-        led.borrow_mut().note_before_write(abs);
-    }
-}
-
-/// #1707/#1709: record `model` as a contributor to the pending commit
-/// attribution ledger when this just-completed call `ok` and was not a
-/// read-only query — reusing [`is_read_only_call`], the SAME classifier that
-/// already decides `round_wrote` for read-only-round steering, rather than
-/// re-deriving a second "is this a write" predicate. Called AFTER dispatch
-/// (unlike [`ledger_note_write`], which snapshots BEFORE for revert
-/// purposes): a denied or failed call materially changed nothing and must
-/// not be credited.
-fn ledger_note_attribution(
-    attribution: Option<&std::cell::RefCell<crate::attribution::AttributionLedger>>,
-    model: &str,
-    name: &str,
-    args: &serde_json::Value,
-    ok: bool,
-) {
-    let Some(ledger) = attribution else {
-        return;
-    };
-    if !ok || is_read_only_call(name, args) {
-        return;
-    }
-    ledger.borrow_mut().record(
-        model,
-        crate::build_info::harness_name(),
-        crate::build_info::PACKAGE_VERSION,
-    );
-}
-
-/// Reconcile one tool call with the host's confirmed commit signal.
-///
-/// The TUI drains commit telemetry only after the entire agent run returns, so
-/// the counter cannot reset during this scope. Preparation, signing, output
-/// text, and a final shell exit status are not publication evidence. A native
-/// commit may land before a later command fails or the tool is cancelled.
-///
-/// Native shell calls may also write after committing. Consume the pre-call
-/// contributors but conservatively retain the active model for those possible
-/// effects, even after a failing tail. This may retain the active model after
-/// a commit-only shell call; it never carries earlier models forward or erases
-/// later tool-call contributions. The embedded tool has one operation per
-/// call and does not need that conservative retention.
-struct AttributionEpoch<'a> {
-    attribution: Option<&'a std::cell::RefCell<crate::attribution::AttributionLedger>>,
-    git_tool: Option<&'a dyn GitTool>,
-    confirmed_before: usize,
-    model: &'a str,
-    name: &'a str,
-    finished: bool,
-}
-
-impl<'a> AttributionEpoch<'a> {
-    fn new(
-        attribution: Option<&'a std::cell::RefCell<crate::attribution::AttributionLedger>>,
-        git_tool: Option<&'a dyn GitTool>,
-        model: &'a str,
-        name: &'a str,
-    ) -> Self {
-        Self {
-            attribution,
-            git_tool,
-            confirmed_before: git_tool.map_or(0, GitTool::confirmed_commit_count),
-            model,
-            name,
-            finished: false,
-        }
-    }
-
-    fn consume_confirmed(&self) -> bool {
-        let confirmed = self
-            .git_tool
-            .is_some_and(|tool| tool.confirmed_commit_count() > self.confirmed_before);
-        if confirmed {
-            if let Some(ledger) = self.attribution {
-                let mut ledger = ledger.borrow_mut();
-                ledger.clear();
-                if self.name != "git" {
-                    ledger.record(
-                        self.model,
-                        crate::build_info::harness_name(),
-                        crate::build_info::PACKAGE_VERSION,
-                    );
-                }
-            }
-        }
-        confirmed
-    }
-
-    fn finish(mut self, args: &serde_json::Value, ok: bool) {
-        if !self.consume_confirmed() {
-            ledger_note_attribution(self.attribution, self.model, self.name, args, ok);
-        }
-        self.finished = true;
-    }
-}
-
-impl Drop for AttributionEpoch<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            // Covers a confirmed publication before an error or cancellation
-            // skips normal result accounting. A confirmation arriving only
-            // after this scope has gone can conservatively leave old credit;
-            // it must never clear credit speculatively during preparation.
-            self.consume_confirmed();
-        }
-    }
-}
-
 /// Drain operator steering into `messages` as genuine user turns (#952/#1669).
 ///
 /// Called at the top of every tool round, after the cancel checkpoint and
@@ -1681,175 +1311,6 @@ fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 #[path = "mod_tests/retry_ledger_tests.rs"]
 mod retry_ledger_tests;
-
-/// True when a backend 400 says the model can't accept a `tools` field.
-/// Ollama phrases it `"<model> does not support tools"`; OpenAI-compatible
-/// servers vary, so we also accept the looser `"not support tools"`. Used to
-/// drop tools and retry once, then keep them off for the turn (deepseek-r1).
-fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string().to_lowercase();
-    s.contains("does not support tools") || s.contains("not support tools")
-}
-
-/// True when Ollama accepted the `tools` field but its internal XML tool-call
-/// parser rejected the model's generated `<function>/<parameter>` markup before
-/// returning an assistant message. This is a malformed generation, not proof
-/// that the model lacks tool support, so retry with tools still advertised and
-/// a corrective nudge instead of disabling tools for the whole turn.
-fn is_ollama_tool_xml_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string().to_lowercase();
-    s.contains("ollama") && s.contains("xml syntax error")
-}
-
-fn ollama_tool_xml_retry_nudge() -> &'static str {
-    "The previous assistant turn failed inside Ollama's XML tool-call parser. \
-     Keep using tools, but emit exactly one valid native tool call with well-formed \
-     arguments now. Do not answer in prose or wrap the call in explanatory XML."
-}
-
-/// Main agentic loop: call model → execute tool calls → feed results back → repeat.
-/// Returns `(reply_text, was_streamed, token_usage, hallucination_count)`.
-/// When `was_streamed` is true the text was already printed token-by-token.
-///
-/// Token-usage semantics (Step 18.1): `input_tokens` is the **largest single
-/// prompt** the backend evaluated across the turn's rounds — the truthful
-/// "how full did the context get" figure that feeds the capability ratchet —
-/// NOT the per-round sum, which double-counts history (every round's prompt
-/// re-includes all prior rounds; the B3 baseline measured 5.4× inflation).
-/// `output_tokens` is the sum across rounds (each completion is new).
-/// `true` once the caller's interrupt flag is set (Esc / Ctrl-C). Cheap relaxed
-/// load — the flag is a one-way latch, so no ordering guarantees are needed.
-fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
-    cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// Take down any completed-spill viewport before the turn writes anything new.
-///
-/// The viewport's erase rewinds relative to the cursor, so it MUST come down
-/// before the next canonical line (round dispatch → spinner detail / retry
-/// indicator / streamed text, or the next tool header) lands below it and
-/// breaks the rewind math. The committed excerpt above the frame is the
-/// durable record, so dismissal loses nothing. Idempotent — an inner
-/// recovery-loop retry re-calling this is a no-op.
-fn dismiss_completed_spill(renderer: &Option<std::sync::Arc<dyn CompletedSpillRenderer>>) {
-    if let Some(renderer) = renderer {
-        renderer.erase();
-    }
-}
-
-/// Resolve as soon as the interrupt flag is set, polling at ~50 ms — fine for a
-/// human keypress and cheap enough to lose the race to any real I/O future.
-/// Never resolves when `cancel` is `None`, so a `select!` against it collapses
-/// to just the other arm (no behavior change for headless callers).
-async fn cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) {
-    match cancel {
-        None => std::future::pending().await,
-        Some(flag) => {
-            // Poll briskly so an interrupt is felt promptly (well under the
-            // ~100 ms human threshold) — the cost is negligible next to a model
-            // round-trip.
-            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-            }
-        }
-    }
-}
-
-/// Race a model future against the interrupt flag: `Some(v)` if it finished,
-/// `None` if the user interrupted first (the future is dropped, cancelling any
-/// in-flight request).
-async fn cancellable<F: std::future::Future>(
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-    fut: F,
-) -> Option<F::Output> {
-    tokio::select! {
-        biased;
-        _ = cancelled(cancel) => None,
-        v = fut => Some(v),
-    }
-}
-
-fn present_synthetic_tool_result<W: std::io::Write>(
-    display: &mut display::ToolDisplay<W>,
-    name: &str,
-    args: &serde_json::Value,
-    workspace: &std::path::Path,
-    result: &str,
-) {
-    // Presentation-only (a completed result being re-rendered, not a live
-    // dispatch decision) — the real authority was already enforced when
-    // this call originally ran, so an unrestricted fence here costs
-    // nothing and avoids threading `Caveats` through a display-only path.
-    let (name, detail) =
-        tools::tool_presentation(name, args, workspace, &crate::caveats::Scope::All);
-    display.call(&name, &detail);
-    display.result(result);
-}
-
-fn print_synthetic_tool_result(
-    name: &str,
-    args: &serde_json::Value,
-    workspace: &str,
-    result: &str,
-    color: bool,
-    completed_spill_renderer: &Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
-) {
-    // A completed viewport from an earlier tool in the SAME batch may still
-    // be painted; this synthetic block's header must not land below it (the
-    // same erase-first discipline as the wired ToolDisplay::call). Dismissing
-    // here rather than wiring the renderer in keeps synthetic results
-    // static-only — an audit line does not need an interactive viewport.
-    dismiss_completed_spill(completed_spill_renderer);
-    let mut tool_display = display::ToolDisplay::new(
-        io::stdout(),
-        color,
-        display::term_cols(),
-        display::spill_lines(),
-        display::spill_summary(),
-    );
-    present_synthetic_tool_result(
-        &mut tool_display,
-        name,
-        args,
-        std::path::Path::new(workspace),
-        result,
-    );
-}
-
-/// The legacy `animate` / `show_thinking` gate expressed as a [`LineCaps`]
-/// override.
-///
-/// **Temporary, by design.** The real gate is `LineCaps::detect()`, which
-/// requires two real terminals; `animate` is `color && thinking_stream_enabled()`
-/// and never checked a TTY at all. Passing the legacy answer through the
-/// arbiter's override seam keeps *when* the spinner appears bit-for-bit
-/// identical while *how* it is drawn, ticked and erased moves onto the shared
-/// implementation. Protocol mode still vetoes absolutely, so the override can
-/// never re-open the JSON-RPC hazard.
-///
-/// Retiring this — so `thinking = "off"` informs the opt-out only and capability
-/// is decided in one place — is the final step of the migration.
-fn legacy_caps(animate: bool) -> crate::tty::LineCaps {
-    if animate {
-        crate::tty::LineCaps::Own
-    } else {
-        crate::tty::LineCaps::None
-    }
-}
-
-/// Announce that a validated tool call is about to run.
-///
-/// The one semantic tool-activity signal for every wire (chat-completions,
-/// OpenAI, Anthropic, Responses): integrations learn what the agent is doing
-/// from the agent, not by scraping rendered output. Free when nobody is
-/// listening — the name is only allocated for a live observer.
-fn announce_tool_activity(name: &str) {
-    if crate::lifecycle::observed() {
-        crate::lifecycle::emit(crate::lifecycle::LifecycleEvent::ToolActivity {
-            tool: name.to_string(),
-        });
-    }
-}
 
 /// U4b: the no-progress brake's start-of-round gate, shared by every loop arm
 /// that owns rounds (the SAME place the read-only nudge lives: the arm's

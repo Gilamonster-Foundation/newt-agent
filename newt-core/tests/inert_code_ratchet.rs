@@ -759,7 +759,7 @@ const SANCTIONS: &[Unit] = &[
         Sanction,
         "default completed-spill discard has no bookkeeping to clear.",
         [explained(
-            "newt-core/src/agentic/mod.rs",
+            "newt-core/src/agentic/output_stream.rs",
             "fn discard(&self) {}",
             "No-op when nothing is up"
         ),]
