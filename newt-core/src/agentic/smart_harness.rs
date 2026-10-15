@@ -789,6 +789,19 @@ impl SmartHarness {
         Ok(raw)
     }
 
+    /// #2905 content review of one landed commit: the same bounded, tool-less
+    /// auxiliary call (call count, per-call and total timeout, byte budgets).
+    /// Any failure — budget, timeout, oversize, unparseable — yields no
+    /// findings; a review never fabricates one and never blocks.
+    pub(crate) async fn review_commit_content(&self, prompt: String) -> Vec<String> {
+        match self.complete_bounded(prompt).await {
+            Ok(raw) if self.admit_output(&raw).is_ok() => {
+                crate::commit_review::parse_content_findings(&raw)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn admit_output(&self, raw: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
             raw.len() <= self.settings.max_output_bytes,
@@ -1507,7 +1520,31 @@ mod tests {
         .unwrap()
     }
 
-    /// Slice 1: real target/report producers remain required through navigation;
+    /// #2905: content review reuses the bounded auxiliary call. A parseable
+    /// reply yields findings; garbage and an exhausted budget yield none.
+    #[tokio::test]
+    async fn commit_review_content_uses_the_bounded_auxiliary_call() {
+        let settings = AdjudicationSettings {
+            max_calls: 2,
+            ..Default::default()
+        };
+        let h = harness(
+            &[
+                r#"{"findings":[{"kind":"overclaim","detail":"no tests in stat"}]}"#,
+                "not json",
+            ],
+            settings,
+        );
+        let p = || crate::commit_review::content_prompt("fix", " a.rs | 1 +");
+        assert_eq!(
+            h.review_commit_content(p()).await,
+            vec!["overclaim: no tests in stat".to_string()]
+        );
+        assert_eq!(h.review_commit_content(p()).await, Vec::<String>::new());
+        // Third call exceeds max_calls: no model call (the reply queue is
+        // empty and would panic), no finding.
+        assert_eq!(h.review_commit_content(p()).await, Vec::<String>::new());
+    }
     /// refreshing facts never turns unavailable evidence into a passing check.
     #[test]
     fn semantic_pins_adapt_host_producers_and_preserve_operator_anchor() {

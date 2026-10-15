@@ -28,7 +28,11 @@ impl Expected {
     pub(crate) fn from_policy(policy: Option<&dyn CommitPolicy>) -> Self {
         let mut newt_tags = vec![format!("<{}>", crate::agent_identity::DEFAULT_AGENT_EMAIL)];
         let Some(policy) = policy else {
-            return Self { lines: Vec::new(), newt_tags, vouched: false };
+            return Self {
+                lines: Vec::new(),
+                newt_tags,
+                vouched: false,
+            };
         };
         if let Some(email) = policy.agent_email() {
             let tag = format!("<{email}>");
@@ -47,13 +51,20 @@ impl Expected {
                 newt_tags,
                 vouched: true,
             },
-            Err(_) => Self { lines: Vec::new(), newt_tags, vouched: false },
+            Err(_) => Self {
+                lines: Vec::new(),
+                newt_tags,
+                vouched: false,
+            },
         }
     }
 
     fn claims_newt(&self, line: &str) -> bool {
         (line.starts_with("Co-authored-by: ")
-            && self.newt_tags.iter().any(|tag| line.ends_with(tag.as_str())))
+            && self
+                .newt_tags
+                .iter()
+                .any(|tag| line.ends_with(tag.as_str())))
             || crate::attribution::is_newt_provenance(line)
     }
 }
@@ -77,6 +88,8 @@ pub(crate) trait CommitReader {
     /// `(oid, full message)` for commits in `before..head`, newest first,
     /// at most `limit`. `before == None` means "only `head`".
     fn landed(&self, before: Option<&str>, head: &str, limit: usize) -> Vec<(String, String)>;
+    /// `git show --stat` summary for one commit (empty when unreadable).
+    fn stat(&self, oid: &str) -> String;
 }
 
 /// #2905 seam: review every commit an invocation landed. Called with the
@@ -95,11 +108,20 @@ pub(crate) fn review_landed(
     let mut out = String::new();
     for (oid, message) in reader.landed(before, &head, MAX_REVIEWED_COMMITS) {
         let findings = check_trailers(&message, expected);
+        let leaks = leak_findings(&message);
+        let short = &oid[..oid.len().min(12)];
+        if !leaks.is_empty() {
+            out.push_str(&format!("commit review: {short} message content\n"));
+            for leak in leaks {
+                out.push_str(&format!("  - {leak}\n"));
+            }
+        }
         if findings.is_empty() {
             continue;
         }
-        let short = &oid[..oid.len().min(12)];
-        out.push_str(&format!("commit review: {short} provenance does not match the attribution ledger\n"));
+        out.push_str(&format!(
+            "commit review: {short} provenance does not match the attribution ledger\n"
+        ));
         for finding in findings {
             let (label, line) = match finding {
                 Finding::Forged(l) => ("not rendered by the ledger", l),
@@ -112,10 +134,12 @@ pub(crate) fn review_landed(
     if out.is_empty() {
         return None;
     }
-    out.push_str(
-        "  Attribution is harness-owned: `/byline` shows the exact block; amend the \
-         message to match it or drop the newt-address lines.\n",
-    );
+    if out.contains("provenance does not match") {
+        out.push_str(
+            "  Attribution is harness-owned: `/byline` shows the exact block; amend the \
+             message to match it or drop the newt-address lines.\n",
+        );
+    }
     Some(out)
 }
 
@@ -143,6 +167,39 @@ impl Pending {
     pub(crate) fn finish(&self, reader: &dyn CommitReader) -> Option<String> {
         review_landed(reader, self.before.as_deref(), &self.expected)
     }
+
+    /// `(oid, prompt)` for the model content review of what landed, newest
+    /// first, at most [`MAX_CONTENT_REVIEWS`]. Empty when HEAD did not move.
+    pub(crate) fn content_prompts(&self, reader: &dyn CommitReader) -> Vec<(String, String)> {
+        let Some(head) = reader.head() else {
+            return Vec::new();
+        };
+        if self.before.as_deref() == Some(head.as_str()) {
+            return Vec::new();
+        }
+        reader
+            .landed(self.before.as_deref(), &head, MAX_CONTENT_REVIEWS)
+            .into_iter()
+            .take(MAX_CONTENT_REVIEWS)
+            .map(|(oid, message)| {
+                let prompt = content_prompt(&message, &reader.stat(&oid));
+                (oid, prompt)
+            })
+            .collect()
+    }
+}
+
+/// Render one commit's model findings, flag-only. `None` when clean.
+pub(crate) fn render_content(oid: &str, findings: &[String]) -> Option<String> {
+    if findings.is_empty() {
+        return None;
+    }
+    let short = &oid[..oid.len().min(12)];
+    let mut out = format!("commit review: {short} content (model, advisory)\n");
+    for finding in findings {
+        out.push_str(&format!("  - {finding}\n"));
+    }
+    Some(out)
 }
 
 /// Production reader: fixed-argv hardened `git` (no hooks, no config, empty
@@ -178,18 +235,124 @@ impl CommitReader for HostRepo {
             .filter_map(|oid| {
                 let raw = self.run(&["cat-file", "commit", oid])?;
                 let at = raw.windows(2).position(|w| w == b"\n\n")?;
-                Some((oid.to_owned(), String::from_utf8_lossy(&raw[at + 2..]).into_owned()))
+                Some((
+                    oid.to_owned(),
+                    String::from_utf8_lossy(&raw[at + 2..]).into_owned(),
+                ))
             })
             .collect()
     }
+
+    fn stat(&self, oid: &str) -> String {
+        self.run(&["show", "--stat", "--format=", "--no-color", oid])
+            .map(|out| String::from_utf8_lossy(&out).into_owned())
+            .unwrap_or_default()
+    }
+}
+
+/// Leaks a commit message must never carry (CLAUDE.md "What must never leave
+/// the machine"; `.githooks/commit-msg`). Data, not logic: `(needle, label)`,
+/// matched case-insensitively. A path needle must be followed by a name.
+const LEAK_PATTERNS: &[(&str, &str)] = &[
+    ("/home/", "absolute local path"),
+    ("/users/", "absolute local path"),
+    ("claude.ai/code/session", "harness session link"),
+    ("claude-session:", "harness session link"),
+];
+
+/// Deterministic leak scan. Runs with or without an auxiliary model.
+pub(crate) fn leak_findings(message: &str) -> Vec<String> {
+    let lower = message.to_ascii_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for (needle, label) in LEAK_PATTERNS {
+        let mut from = 0;
+        while let Some(at) = lower[from..].find(needle).map(|i| i + from) {
+            from = at + needle.len();
+            let token_end = message[at..]
+                .find(char::is_whitespace)
+                .map_or(message.len(), |i| at + i);
+            let token = &message[at..token_end];
+            // A path needle must name someone (`/home/<name>`), not stand alone.
+            if needle.ends_with('/') && token.len() <= needle.len() {
+                continue;
+            }
+            let finding = format!("leak ({label}): {token}");
+            if !out.contains(&finding) {
+                out.push(finding);
+            }
+        }
+    }
+    out
+}
+
+/// Commits per invocation that get a model content review.
+pub(crate) const MAX_CONTENT_REVIEWS: usize = 4;
+const CONTENT_INPUT_CAP: usize = 8 * 1024;
+const CONTENT_KINDS: &[&str] = &["overclaim", "inaccurate", "leak"];
+
+fn capped(text: &str) -> &str {
+    let mut end = text.len().min(CONTENT_INPUT_CAP);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The bounded, tool-less content-review prompt: message + diff stat only.
+pub(crate) fn content_prompt(message: &str, stat: &str) -> String {
+    let evidence =
+        serde_json::json!({"commit_message": capped(message), "diff_stat": capped(stat)});
+    format!(
+        "Review this commit message against its diff stat. Flag only: claims the \
+         stat cannot support (overclaim), statements contradicted by the stat \
+         (inaccurate), and private data such as local paths, hostnames or \
+         session links (leak). Attribution trailers are checked elsewhere; ignore \
+         them. Reply with JSON only: {{\"findings\":[{{\"kind\":\"overclaim|inaccurate|leak\",\
+         \"detail\":\"...\"}}]}} — an empty list when nothing is wrong.\n{evidence}"
+    )
+}
+
+/// Parse the reviewer's JSON. Malformed output yields nothing — a finding is
+/// never fabricated from an unparseable reply.
+pub(crate) fn parse_content_findings(raw: &str) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Item {
+        kind: String,
+        detail: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        findings: Vec<Item>,
+    }
+    let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) else {
+        return Vec::new();
+    };
+    let Ok(reply) = serde_json::from_str::<Reply>(raw.get(start..=end).unwrap_or_default()) else {
+        return Vec::new();
+    };
+    reply
+        .findings
+        .into_iter()
+        .filter(|item| {
+            CONTENT_KINDS.contains(&item.kind.as_str()) && !item.detail.trim().is_empty()
+        })
+        .map(|item| format!("{}: {}", item.kind, item.detail.trim()))
+        .collect()
 }
 
 /// Compare a landed commit message's newt-owned lines against the ledger.
 pub(crate) fn check_trailers(message: &str, expected: &Expected) -> Vec<Finding> {
     let lines: Vec<&str> = message.lines().map(str::trim_end).collect();
-    let claims: Vec<&str> = lines.iter().copied().filter(|l| expected.claims_newt(l)).collect();
+    let claims: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| expected.claims_newt(l))
+        .collect();
     if !expected.vouched {
-        return claims.into_iter().map(|l| Finding::Unvouched(l.into())).collect();
+        return claims
+            .into_iter()
+            .map(|l| Finding::Unvouched(l.into()))
+            .collect();
     }
     let mut findings: Vec<Finding> = claims
         .iter()
@@ -258,9 +421,8 @@ mod tests {
     /// place of the build, and no operator line. No broker ran.
     #[test]
     fn host_shell_route_wrong_build_trailer_is_flagged() {
-        let message = format!(
-            "fix: thing\n\nCo-authored-by: claude-opus-5-5 (v0.8.0 9ba3d8e3) <{NEWT}>\n"
-        );
+        let message =
+            format!("fix: thing\n\nCo-authored-by: claude-opus-5-5 (v0.8.0 9ba3d8e3) <{NEWT}>\n");
         let findings = check_trailers(&message, &expected(NEWT));
         assert!(
             findings.contains(&Finding::Forged(format!(
@@ -308,7 +470,9 @@ mod tests {
         let forged = canonical.replace("(cad38c1394ef)", "(9ba3d8e3)");
         let findings = check_trailers(&forged, &expected(NEWT));
         assert!(
-            findings.iter().any(|f| matches!(f, Finding::Forged(l) if l.starts_with("Harness: "))),
+            findings
+                .iter()
+                .any(|f| matches!(f, Finding::Forged(l) if l.starts_with("Harness: "))),
             "{findings:?}"
         );
     }
@@ -334,6 +498,9 @@ mod tests {
                 .cloned()
                 .collect()
         }
+        fn stat(&self, oid: &str) -> String {
+            format!(" {oid}.rs | 1 +")
+        }
     }
 
     #[test]
@@ -343,12 +510,21 @@ mod tests {
         let repo = FakeRepo(vec![
             ("oid-three".into(), bad),
             ("oid-two".into(), good),
-            ("oid-one".into(), "old\n\nCo-authored-by: x (v0) <".to_string() + NEWT + ">\n"),
+            (
+                "oid-one".into(),
+                "old\n\nCo-authored-by: x (v0) <".to_string() + NEWT + ">\n",
+            ),
         ]);
         let report = review_landed(&repo, Some("oid-one"), &expected(NEWT)).expect("flagged");
         assert!(report.contains("commit review: oid-three"), "{report}");
-        assert!(!report.contains("oid-two") && !report.contains("oid-one"), "{report}");
-        assert!(report.contains("9ba3d8e3") && report.contains("/byline"), "{report}");
+        assert!(
+            !report.contains("oid-two") && !report.contains("oid-one"),
+            "{report}"
+        );
+        assert!(
+            report.contains("9ba3d8e3") && report.contains("/byline"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -356,7 +532,10 @@ mod tests {
         let repo = FakeRepo(vec![("c1".into(), ledger(NEWT).finalize_message("x\n"))]);
         assert_eq!(review_landed(&repo, Some("c1"), &expected(NEWT)), None);
         assert_eq!(review_landed(&repo, None, &expected(NEWT)), None);
-        assert_eq!(review_landed(&FakeRepo(vec![]), None, &expected(NEWT)), None);
+        assert_eq!(
+            review_landed(&FakeRepo(vec![]), None, &expected(NEWT)),
+            None
+        );
     }
 
     #[test]
@@ -364,7 +543,10 @@ mod tests {
         let bad = format!("b\n\nCo-authored-by: m (v0 x) <{NEWT}>\n");
         let repo = FakeRepo((0..40).map(|i| (format!("c{i:02}"), bad.clone())).collect());
         let report = review_landed(&repo, None, &expected(NEWT)).unwrap();
-        assert_eq!(report.matches("commit review:").count(), MAX_REVIEWED_COMMITS);
+        assert_eq!(
+            report.matches("commit review:").count(),
+            MAX_REVIEWED_COMMITS
+        );
     }
 
     /// The seam both routes pass through: `start` captures HEAD + the
@@ -376,7 +558,10 @@ mod tests {
         let before = FakeRepo(vec![("oid-base".into(), "base\n".into())]);
         let pending = Pending::start(true, &before, Some(&policy)).expect("commit-producing");
         let after = FakeRepo(vec![
-            ("oid-new".into(), format!("x\n\nCo-authored-by: m (v0.8.0 9ba3d8e3) <{NEWT}>\n")),
+            (
+                "oid-new".into(),
+                format!("x\n\nCo-authored-by: m (v0.8.0 9ba3d8e3) <{NEWT}>\n"),
+            ),
             ("oid-base".into(), "base\n".into()),
         ]);
         assert!(pending.finish(&after).unwrap().contains("oid-new"));
@@ -389,10 +574,113 @@ mod tests {
     #[test]
     fn chained_commit_without_consumed_contributors_passes() {
         let mut with_history = ledger(NEWT);
-        with_history.contributors =
-            vec![crate::attribution::Attribution::new("older", "newt-agent", "0.7.9", NEWT)];
+        with_history.contributors = vec![crate::attribution::Attribution::new(
+            "older",
+            "newt-agent",
+            "0.7.9",
+            NEWT,
+        )];
         let second = ledger(NEWT).finalize_message("second\n");
         let expected = Expected::from_policy(Some(&LedgerPolicy(with_history)));
         assert_eq!(check_trailers(&second, &expected), Vec::new());
+    }
+
+    #[test]
+    fn leak_scan_flags_local_paths_and_session_links() {
+        let msg = "fix\n\nsee /home/alice/src/x.rs and https://claude.ai/code/session_abc\n\
+                   Claude-Session: https://claude.ai/code/session_abc\n";
+        let found = leak_findings(msg);
+        assert!(found.iter().any(|f| f.contains("/home/alice")), "{found:?}");
+        assert!(
+            found.iter().any(|f| f.contains("session link")),
+            "{found:?}"
+        );
+        assert!(leak_findings("fix /Users/bob/x")
+            .iter()
+            .any(|f| f.contains("/Users/bob")));
+    }
+
+    #[test]
+    fn leak_scan_passes_repo_relative_text() {
+        assert_eq!(
+            leak_findings("fix newt-core/src/x.rs; /home/ alone; Co-authored-by: a <b>"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn content_prompt_carries_message_and_stat_and_is_capped() {
+        let p = content_prompt("fix the parser", " src/a.rs | 2 +-");
+        assert!(
+            p.contains("fix the parser") && p.contains("src/a.rs | 2"),
+            "{p}"
+        );
+        assert!(p.contains("\"findings\""), "asks for the JSON shape: {p}");
+        let huge = "x".repeat(100_000);
+        assert!(content_prompt(&huge, &huge).len() < 3 * CONTENT_INPUT_CAP);
+    }
+
+    #[test]
+    fn parse_content_findings_accepts_json_and_drops_garbage() {
+        let raw = r#"noise {"findings":[{"kind":"overclaim","detail":"says tests added; stat shows none"}]} tail"#;
+        assert_eq!(
+            parse_content_findings(raw),
+            vec!["overclaim: says tests added; stat shows none".to_string()]
+        );
+        assert_eq!(
+            parse_content_findings(r#"{"findings":[]}"#),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_content_findings("looks fine to me"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_content_findings(r#"{"findings":[{"kind":"bogus","detail":"x"}]}"#),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn review_landed_reports_leaks_without_a_byline_hint() {
+        let repo = FakeRepo(vec![("oid-new".into(), "fix /home/alice/x\n".into())]);
+        let report = review_landed(&repo, None, &expected(NEWT)).expect("leak flagged");
+        assert!(
+            report.contains("oid-new message content") && report.contains("/home/alice/x"),
+            "{report}"
+        );
+        assert!(!report.contains("/byline"), "{report}");
+    }
+
+    #[test]
+    fn content_prompts_cover_landed_commits_bounded() {
+        let before = FakeRepo(vec![("oid-base".into(), "b\n".into())]);
+        let pending = Pending::start(true, &before, None).unwrap();
+        let mut history: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("oid-{i}"), format!("msg {i}\n")))
+            .collect();
+        history.push(("oid-base".into(), "b\n".into()));
+        let prompts = pending.content_prompts(&FakeRepo(history));
+        assert_eq!(prompts.len(), MAX_CONTENT_REVIEWS);
+        assert_eq!(prompts[0].0, "oid-0");
+        assert!(
+            prompts[0].1.contains("msg 0") && prompts[0].1.contains("oid-0.rs | 1 +"),
+            "{}",
+            prompts[0].1
+        );
+        assert!(
+            pending.content_prompts(&before).is_empty(),
+            "HEAD did not move"
+        );
+    }
+
+    #[test]
+    fn render_content_is_flag_only_and_silent_when_clean() {
+        assert_eq!(render_content("oid-x", &[]), None);
+        let r = render_content("oid-x", &["overclaim: no tests in stat".into()]).unwrap();
+        assert!(
+            r.contains("commit review: oid-x content (model, advisory)") && r.contains("overclaim"),
+            "{r}"
+        );
     }
 }

@@ -4799,6 +4799,15 @@ async fn execute_authorized_tool(
                 presentation.preview(&report, 0);
                 exec_text = format!("{exec_text}\n{report}");
             }
+            if let (Some(review), Some(harness)) = (commit_review.as_ref(), smart_harness) {
+                for (oid, prompt) in review.content_prompts(&commit_reader) {
+                    let findings = harness.review_commit_content(prompt).await;
+                    if let Some(report) = crate::commit_review::render_content(&oid, &findings) {
+                        presentation.preview(&report, 0);
+                        exec_text = format!("{exec_text}\n{report}");
+                    }
+                }
+            }
             let result = executed((exec_text, exec_outcome));
             // #2636 finding 1: use the typed out-param from the pre-exec denial
             // path — only a denial that fired BEFORE the child ran populates
