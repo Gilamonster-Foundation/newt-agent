@@ -75,6 +75,17 @@ async fn run(
     obs: Option<&mut crate::agentic::SolveObservation>,
     respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
 ) -> Run {
+    run_on(wire, allowance, obs, None, respond).await
+}
+
+/// `run` with an optional smart harness adjudicating the answer.
+async fn run_on(
+    wire: &'static str,
+    allowance: Option<u32>,
+    obs: Option<&mut crate::agentic::SolveObservation>,
+    harness: Option<&crate::agentic::smart_harness::SmartHarness>,
+    respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
+) -> Run {
     let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -107,6 +118,7 @@ async fn run(
     context.max_tool_rounds = 4;
     context.output_allowance = allowance;
     context.solve_obs = obs;
+    context.smart_harness = harness;
     let result = chat_complete(context, &mut NoMcp).await.unwrap();
     let requests = captured.lock().unwrap().clone();
     (result, requests, end, dir)
@@ -279,6 +291,128 @@ async fn text_scenario(wire: &'static str) {
     assert!(!result.0.contains("operator request"), "{wire}");
     assert_completed(wire, end);
 }
+
+/// A smart harness answering from scripted `verdicts`, in order.
+fn scripted_harness(verdicts: &[&str]) -> crate::agentic::smart_harness::SmartHarness {
+    let verdicts = Arc::new(Mutex::new(
+        verdicts
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::VecDeque<_>>(),
+    ));
+    crate::agentic::smart_harness::SmartHarness::new(
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
+        Arc::new(move |_| {
+            let verdict = verdicts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("bounded auxiliary call");
+            Box::pin(async move { Ok((verdict, None)) })
+        }),
+        crate::agentic::smart_harness::AdjudicationSettings::default(),
+    )
+    .unwrap()
+}
+
+/// `reply_with` for prose, honouring a non-streamed Anthropic request (smart
+/// mode does not stream that wire).
+fn prose(
+    wire: &str,
+    body: &serde_json::Value,
+    attempt: usize,
+    limited: bool,
+    text: &str,
+) -> ResponseTemplate {
+    if wire == "anthropic" && body["stream"] != true {
+        return ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"msg_1","type":"message","role":"assistant","model":"test-model","stop_reason":if limited {"max_tokens"} else {"end_turn"},"content":[{"type":"text","text":text}],"usage":{"input_tokens":40,"output_tokens":7}}));
+    }
+    reply_with(wire, attempt, limited, false, text)
+}
+
+/// G2 under the smart harness: the adjudicated and returned answer is the
+/// whole continuation, not only its last segment (#2901 review, P2 a).
+async fn smart_text_scenario(wire: &'static str) {
+    let harness = scripted_harness(&["\"answer\""]);
+    let (result, requests, _end, _dir) =
+        run_on(wire, None, None, Some(&harness), move |attempt, body| {
+            if attempt == 1 {
+                prose(wire, body, attempt, true, "First half, ")
+            } else {
+                prose(wire, body, attempt, false, "second half.")
+            }
+        })
+        .await;
+    assert_eq!(requests.len(), 2, "{wire}: {result:?}");
+    assert_eq!(
+        crate::agentic::model_explanation(&result.0),
+        "First half, second half.",
+        "{wire}"
+    );
+}
+
+/// A completed continuation that draws a narration nudge must not leave its
+/// prefix behind for the next, fresh answer (#2901 review, P2 b).
+async fn smart_nudge_scenario(wire: &'static str) {
+    let harness = scripted_harness(&["\"narration\"", "\"answer\""]);
+    let (result, requests, _end, _dir) = run_on(
+        wire,
+        None,
+        None,
+        Some(&harness),
+        move |attempt, body| match attempt {
+            1 => prose(wire, body, attempt, true, "First half, "),
+            2 => prose(wire, body, attempt, false, "second half."),
+            _ => prose(wire, body, attempt, false, "Fresh complete answer."),
+        },
+    )
+    .await;
+    assert_eq!(requests.len(), 3, "{wire}: {result:?}");
+    assert_eq!(
+        crate::agentic::model_explanation(&result.0),
+        "Fresh complete answer.",
+        "{wire}"
+    );
+}
+
+macro_rules! smart_test {
+    ($answer:ident, $nudge:ident, $wire:literal) => {
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $answer() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            smart_text_scenario($wire).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $nudge() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            smart_nudge_scenario($wire).await;
+        }
+    };
+}
+smart_test!(
+    smart_continuation_answer_is_whole_chat,
+    smart_continuation_prefix_is_consumed_chat,
+    "openai"
+);
+smart_test!(
+    smart_continuation_answer_is_whole_responses,
+    smart_continuation_prefix_is_consumed_responses,
+    "responses"
+);
+smart_test!(
+    smart_continuation_answer_is_whole_ollama,
+    smart_continuation_prefix_is_consumed_ollama,
+    "ollama"
+);
+smart_test!(
+    smart_continuation_answer_is_whole_anthropic,
+    smart_continuation_prefix_is_consumed_anthropic,
+    "anthropic"
+);
 
 /// A cap already at the ceiling keeps today's note-only retry and still
 /// stops honestly after two consecutive retries.
