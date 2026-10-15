@@ -389,3 +389,34 @@ fn is_hallucination_allows_git_network_ops() {
         &serde_json::json!({"command": "git status"})
     ));
 }
+
+/// #2905 round 2: the review must not hinge on the lexical commit detector.
+/// A script that commits (`./ship.sh`, a Makefile target, an alias) is
+/// invisible to it, yet the commit it lands is still reviewed.
+#[test]
+fn commit_review_covers_a_commit_the_detector_cannot_see() {
+    struct Moves(std::cell::Cell<bool>);
+    impl crate::commit_review::CommitReader for Moves {
+        fn head(&self) -> Option<String> {
+            Some(if self.0.get() { "oid-new" } else { "oid-base" }.into())
+        }
+        fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
+            vec![(
+                "oid-new".into(),
+                "x\n\nHi from /home/someone/secret\n".into(),
+            )]
+        }
+        fn stat(&self, _: &str) -> String {
+            String::new()
+        }
+    }
+    let script = "./scripts/ship.sh";
+    assert!(!run_command_creates_shell_git_commit(script));
+    let repo = Moves(std::cell::Cell::new(false));
+    let pending = start_commit_review(true, &repo, None).expect("snapshot taken");
+    repo.0.set(true);
+    let report = pending.finish(&repo).expect("landed commit reviewed");
+    assert!(report.contains("oid-new"), "{report}");
+    // No read authority over the cwd: no snapshot at all.
+    assert!(start_commit_review(false, &repo, None).is_none());
+}

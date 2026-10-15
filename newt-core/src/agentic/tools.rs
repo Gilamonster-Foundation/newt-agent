@@ -4680,15 +4680,13 @@ async fn execute_authorized_tool(
                 ));
             }
             let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
-            // #2905: commit-message review is route-independent. Same
-            // detectors, no `governed_git`/bypass input: confined and
-            // `--full-access` commits are both read back and checked.
+            // #2905: commit-message review is route-independent and
+            // detector-independent: HEAD is snapshotted around every
+            // command, and whatever landed is read back and checked.
             let commit_reader = crate::commit_review::HostRepo(std::path::PathBuf::from(&run_cwd));
             let commit_policy = git_tool.and_then(|tool| tool.native_commit_policy());
-            let commit_review = crate::commit_review::Pending::start(
-                crate::caveats::permits_path(&caveats.fs_read, &run_cwd)
-                    && (run_command_creates_shell_git_commit(cmd)
-                        || native_git::needs_commit_broker(cmd)),
+            let commit_review = start_commit_review(
+                crate::caveats::permits_path(&caveats.fs_read, &run_cwd),
                 &commit_reader,
                 commit_policy.as_deref(),
             );
@@ -6167,6 +6165,18 @@ mod private_url_mcp_bat_tests;
 #[cfg(test)]
 #[path = "tools_tests/tests.rs"]
 mod tests;
+
+/// #2905: open the commit-message review for one `run_command`. Gated on
+/// read authority over the cwd ONLY. There is deliberately no command-text
+/// parameter: a script or alias that commits slips past any lexical
+/// detector, so the HEAD snapshot is taken around every invocation.
+fn start_commit_review(
+    cwd_readable: bool,
+    reader: &dyn crate::commit_review::CommitReader,
+    policy: Option<&dyn agent_toolchain::native_git::CommitPolicy>,
+) -> Option<crate::commit_review::Pending> {
+    cwd_readable.then(|| crate::commit_review::Pending::start(reader, policy))
+}
 
 // ---------------------------------------------------------------------------
 // execute_tool branch tests — edit_file / shrink guard / denial paths

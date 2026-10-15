@@ -144,24 +144,21 @@ pub(crate) fn review_landed(
 }
 
 /// The review owed by one invocation: captured before the command runs,
-/// finished after it. Built only from the command text and the session's
-/// policy — no route, bypass, or broker parameter exists to depend on.
+/// finished after it. Taken around EVERY `run_command` (round 2 of #2905):
+/// a commit landed by a script, Makefile target or alias is invisible to any
+/// lexical detector, so none is consulted. Outside a repository both `HEAD`
+/// reads come back `None` and nothing is reviewed.
 pub(crate) struct Pending {
     before: Option<String>,
     expected: Expected,
 }
 
 impl Pending {
-    /// `commit_producing` is the existing lexical detector's verdict.
-    pub(crate) fn start(
-        commit_producing: bool,
-        reader: &dyn CommitReader,
-        policy: Option<&dyn CommitPolicy>,
-    ) -> Option<Self> {
-        commit_producing.then(|| Self {
+    pub(crate) fn start(reader: &dyn CommitReader, policy: Option<&dyn CommitPolicy>) -> Self {
+        Self {
             before: reader.head(),
             expected: Expected::from_policy(policy),
-        })
+        }
     }
 
     pub(crate) fn finish(&self, reader: &dyn CommitReader) -> Option<String> {
@@ -556,7 +553,7 @@ mod tests {
     fn pending_review_captures_before_and_flags_what_landed() {
         let policy = LedgerPolicy(ledger(NEWT));
         let before = FakeRepo(vec![("oid-base".into(), "base\n".into())]);
-        let pending = Pending::start(true, &before, Some(&policy)).expect("commit-producing");
+        let pending = Pending::start(&before, Some(&policy));
         let after = FakeRepo(vec![
             (
                 "oid-new".into(),
@@ -565,7 +562,6 @@ mod tests {
             ("oid-base".into(), "base\n".into()),
         ]);
         assert!(pending.finish(&after).unwrap().contains("oid-new"));
-        assert!(Pending::start(false, &before, Some(&policy)).is_none());
     }
 
     /// Second commit of `git commit … && git commit …`: the first consumed
@@ -655,7 +651,7 @@ mod tests {
     #[test]
     fn content_prompts_cover_landed_commits_bounded() {
         let before = FakeRepo(vec![("oid-base".into(), "b\n".into())]);
-        let pending = Pending::start(true, &before, None).unwrap();
+        let pending = Pending::start(&before, None);
         let mut history: Vec<(String, String)> = (0..10)
             .map(|i| (format!("oid-{i}"), format!("msg {i}\n")))
             .collect();
