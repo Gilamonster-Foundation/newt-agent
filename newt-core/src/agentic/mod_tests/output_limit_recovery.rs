@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn reply(wire: &str, attempt: usize, limited: bool, tool: bool) -> ResponseTemplate {
-    reply_with(wire, attempt, limited, tool, "Finished.")
+    reply_with(wire, attempt, limited, tool, "Finished.", 40)
 }
 
 fn reply_with(
@@ -11,6 +11,7 @@ fn reply_with(
     limited: bool,
     tool: bool,
     prose: &str,
+    input: u64,
 ) -> ResponseTemplate {
     let args = if limited {
         "{\"path\":\"partial\",\"content\":\"cut".into()
@@ -22,14 +23,14 @@ fn reply_with(
     let calls = serde_json::json!([{"id":id,"type":"function","function":{"name":"write_file","arguments":args}}]);
     let body = match wire {
         "ollama" => {
-            serde_json::json!({"message":{"role":"assistant","content":text,"tool_calls":if tool { calls } else { serde_json::json!([]) }},"done":true,"done_reason":if limited {"length"} else {"stop"},"prompt_eval_count":40,"eval_count":7})
+            serde_json::json!({"message":{"role":"assistant","content":text,"tool_calls":if tool { calls } else { serde_json::json!([]) }},"done":true,"done_reason":if limited {"length"} else {"stop"},"prompt_eval_count":input,"eval_count":7})
         }
         "responses" => {
-            serde_json::json!({"status":if limited {"incomplete"} else {"completed"},"incomplete_details":if limited {serde_json::json!({"reason":"max_output_tokens"})} else {serde_json::Value::Null},"output":if tool {serde_json::json!([{"type":"function_call","call_id":id,"name":"write_file","arguments":args}])} else {serde_json::json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}])},"usage":{"input_tokens":40,"output_tokens":7}})
+            serde_json::json!({"status":if limited {"incomplete"} else {"completed"},"incomplete_details":if limited {serde_json::json!({"reason":"max_output_tokens"})} else {serde_json::Value::Null},"output":if tool {serde_json::json!([{"type":"function_call","call_id":id,"name":"write_file","arguments":args}])} else {serde_json::json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}])},"usage":{"input_tokens":input,"output_tokens":7}})
         }
         "anthropic" => {
             let mut frames = vec![
-                serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":40,"output_tokens":0}}}),
+                serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":input,"output_tokens":0}}}),
             ];
             if tool {
                 frames.push(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":"write_file","input":{}}}));
@@ -53,7 +54,7 @@ fn reply_with(
             );
         }
         _ => {
-            serde_json::json!({"choices":[{"finish_reason":if limited {"length"} else if tool {"tool_calls"} else {"stop"},"message":{"role":"assistant","content":text,"tool_calls":if tool {calls} else {serde_json::json!([])}}}],"usage":{"prompt_tokens":40,"completion_tokens":7}})
+            serde_json::json!({"choices":[{"finish_reason":if limited {"length"} else if tool {"tool_calls"} else {"stop"},"message":{"role":"assistant","content":text,"tool_calls":if tool {calls} else {serde_json::json!([])}}}],"usage":{"prompt_tokens":input,"completion_tokens":7}})
         }
     };
     ResponseTemplate::new(200).set_body_json(body)
@@ -96,6 +97,21 @@ async fn run_on(
     let dir = tempfile::tempdir().unwrap();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let requests = captured.clone();
+    // No token-count API is mounted: every admission-preflight probe
+    // (`/v1/chat/completions/input_tokens`, `/render`, `/tokenize`) 404s
+    // soft-absent (#2907 P2 1 — a growing-input reply makes the Chat wire
+    // preflight), never answered with a chat-completion body.
+    for count_path in [
+        "/v1/chat/completions/input_tokens",
+        "/v1/chat/completions/render",
+        "/tokenize",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(count_path))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+    }
     Mock::given(method("POST"))
         .respond_with(move |request: &Request| {
             let mut requests = requests.lock().unwrap();
@@ -283,9 +299,9 @@ async fn raise_scenario(wire: &'static str) {
 async fn text_scenario(wire: &'static str) {
     let (result, requests, end, _dir) = run(wire, None, None, move |attempt, _| {
         if attempt == 1 {
-            reply_with(wire, attempt, true, false, "First half, ")
+            reply_with(wire, attempt, true, false, "First half, ", 40)
         } else {
-            reply_with(wire, attempt, false, false, "second half.")
+            reply_with(wire, attempt, false, false, "second half.", 40)
         }
     })
     .await;
@@ -340,7 +356,7 @@ fn prose(
     if wire == "anthropic" && body["stream"] != true {
         return ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"msg_1","type":"message","role":"assistant","model":"test-model","stop_reason":if limited {"max_tokens"} else {"end_turn"},"content":[{"type":"text","text":text}],"usage":{"input_tokens":40,"output_tokens":7}}));
     }
-    reply_with(wire, attempt, limited, false, text)
+    reply_with(wire, attempt, limited, false, text, 40)
 }
 
 /// G2 under the smart harness: the adjudicated and returned answer is the
@@ -773,3 +789,71 @@ async fn ollama_retry_clamps_to_the_window() {
     );
     assert_eq!(end, Some(crate::TurnEndReason::Completed));
 }
+
+/// #2907 P2 1: growing input, shrinking headroom. The first retry raises
+/// 5000 → 10000 inside round one's room; the second capped reply reports
+/// 12000 input of a 20000 window, so the RETAINED 10000 must be re-clamped
+/// to the 8000 that remain before it is sent — on every wire.
+async fn shrinking_headroom_scenario(wire: &'static str) {
+    let (result, requests, end, _dir) = run_on(
+        wire,
+        Some(5_000),
+        None,
+        None,
+        |ctx| ctx.safe_context = Some(20_000),
+        None,
+        move |attempt, _| {
+            reply_with(
+                wire,
+                attempt,
+                true,
+                true,
+                "",
+                if attempt == 2 { 12_000 } else { 40 },
+            )
+        },
+    )
+    .await;
+    let observed = caps(wire, &requests);
+    assert_eq!(requests.len(), 3, "{wire}: {result:?}: {observed:?}");
+    assert_eq!(
+        observed[1],
+        Some(10_000),
+        "{wire}: the first retry doubles inside round one's headroom: {observed:?}"
+    );
+    assert!(
+        observed[2] <= Some(8_000),
+        "{wire}: the retained cap is re-clamped to the recomputed headroom: {observed:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed), "{wire}");
+}
+
+macro_rules! shrinking_headroom_test {
+    ($name:ident, $wire:literal) => {
+        /// #2907 P2 1: a retained raised cap is re-clamped to the newest
+        /// round's headroom on this wire.
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $name() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            shrinking_headroom_scenario($wire).await;
+        }
+    };
+}
+shrinking_headroom_test!(
+    retained_cap_reclamps_to_shrinking_headroom_chat,
+    "openai"
+);
+shrinking_headroom_test!(
+    retained_cap_reclamps_to_shrinking_headroom_responses,
+    "responses"
+);
+shrinking_headroom_test!(
+    retained_cap_reclamps_to_shrinking_headroom_ollama,
+    "ollama"
+);
+shrinking_headroom_test!(
+    retained_cap_reclamps_to_shrinking_headroom_anthropic,
+    "anthropic"
+);

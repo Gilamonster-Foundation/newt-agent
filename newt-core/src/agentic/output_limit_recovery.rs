@@ -14,7 +14,9 @@ const CONTINUE: &str = "[loop-guidance] [harness] your last reply was cut off at
 pub(super) struct Recovery {
     consecutive: u8,
     pub skipped_rounds: usize,
-    /// Output cap raised by a retry; it only moves up and holds for the turn.
+    /// Output cap raised by a retry; it moves up and holds for the turn,
+    /// re-clamped down to each round's recomputed headroom (#2907 P2 1)
+    /// and dropped when no room remains.
     raised: Option<u32>,
     /// Visible prose from capped replies that were continued.
     prefix: String,
@@ -39,7 +41,15 @@ impl Recovery {
             return Ok(false);
         }
         let raised = self.allowance(base).and_then(|cap| next_cap(cap, ceiling));
-        self.raised = raised.or(self.raised);
+        // #2907 P2 1: the recomputed headroom bounds the cap actually SENT,
+        // not only proposed increases — a retained raise (`next_cap` could not
+        // raise it) is re-clamped DOWN to this round's room. Zero headroom
+        // drops the raise entirely: the note-only retry stands on the wire's
+        // own cap, never a zeroed one.
+        self.raised = raised
+            .or(self.raised)
+            .map(|cap| cap.min(ceiling))
+            .filter(|cap| *cap > 0);
         if has_tool {
             // Keep one current host note, never an assistant/partial-tool
             // exchange. Host history retains each intervention through its
@@ -121,7 +131,51 @@ pub(super) fn window_clamp(ceiling: u32, window: Option<u32>, input: Option<u32>
 
 #[cfg(test)]
 mod tests {
-    use super::{next_cap, window_clamp};
+    use super::{next_cap, window_clamp, Recovery};
+
+    /// #2907 P2 1: a retained raise is re-clamped to THIS round's
+    /// recomputed headroom — the cap actually sent can never exceed the
+    /// room the newest capped reply leaves, even when `next_cap` cannot
+    /// raise it and the old raise is retained.
+    #[test]
+    fn retained_raise_is_reclamped_to_the_recomputed_headroom() {
+        let mut recovery = Recovery::default();
+        let mut messages = Vec::new();
+        // Round 1: cap 5000 inside 16384 headroom → raise to 10000.
+        assert!(recovery
+            .retry(true, "", Some(5_000), 16_384, &mut messages, None)
+            .unwrap());
+        assert_eq!(recovery.allowance(Some(5_000)), Some(10_000));
+        // Round 2: the capped reply reports 12000 input of a 20000 window —
+        // only 8000 remains, so the RETAINED 10000 must come back down.
+        assert!(recovery
+            .retry(true, "", Some(5_000), 8_000, &mut messages, None)
+            .unwrap());
+        assert_eq!(
+            recovery.allowance(Some(5_000)),
+            Some(8_000),
+            "the cap actually sent is re-clamped to this round's headroom"
+        );
+    }
+
+    /// #2907 P2 1: zero headroom drops the raise entirely — the note-only
+    /// retry stands on the wire's own cap, never a zeroed one.
+    #[test]
+    fn zero_headroom_drops_the_retained_raise() {
+        let mut recovery = Recovery::default();
+        let mut messages = Vec::new();
+        assert!(recovery
+            .retry(true, "", Some(5_000), 16_384, &mut messages, None)
+            .unwrap());
+        assert!(recovery
+            .retry(true, "", Some(5_000), 0, &mut messages, None)
+            .unwrap());
+        assert_eq!(
+            recovery.allowance(Some(5_000)),
+            Some(5_000),
+            "no headroom means no admissible raise: the base cap stands"
+        );
+    }
 
     #[test]
     fn next_cap_doubles_within_the_ceiling() {
