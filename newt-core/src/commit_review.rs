@@ -99,7 +99,8 @@ pub(crate) trait CommitReader {
     /// The current `HEAD` oid, or `None` (unborn branch / not a repository).
     fn head(&self) -> Option<String>;
     /// `(oid, full message)` for commits in `before..head`, newest first,
-    /// at most `limit`. `before == None` means "only `head`".
+    /// at most `limit`. `before == None` means "all of `head`'s history"
+    /// (the command started on an unborn branch), still at most `limit`.
     fn landed(&self, before: Option<&str>, head: &str, limit: usize) -> Vec<(String, String)>;
     /// `git show --stat` summary for one commit (empty when unreadable).
     fn stat(&self, oid: &str) -> String;
@@ -227,6 +228,15 @@ impl HostRepo {
     }
 }
 
+/// `git rev-list` argv for the commits newly reachable in `before..head`.
+/// An absent `before` (unborn branch, or no repository when the command
+/// started) means ALL of `head`'s history is new, so it is walked from the
+/// root under the same `limit` — never collapsed to one commit.
+fn rev_list_args(before: Option<&str>, head: &str, limit: usize) -> Vec<String> {
+    let range = before.map_or_else(|| head.to_owned(), |b| format!("{b}..{head}"));
+    vec!["rev-list".into(), format!("--max-count={limit}"), range]
+}
+
 impl CommitReader for HostRepo {
     fn head(&self) -> Option<String> {
         let out = self.run(&["rev-parse", "--verify", "-q", "HEAD"])?;
@@ -235,9 +245,9 @@ impl CommitReader for HostRepo {
     }
 
     fn landed(&self, before: Option<&str>, head: &str, limit: usize) -> Vec<(String, String)> {
-        let max = format!("--max-count={}", if before.is_some() { limit } else { 1 });
-        let range = before.map_or_else(|| head.to_owned(), |b| format!("{b}..{head}"));
-        let Some(list) = self.run(&["rev-list", &max, &range]) else {
+        let args = rev_list_args(before, head, limit);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let Some(list) = self.run(&args) else {
             return Vec::new();
         };
         String::from_utf8_lossy(&list)
@@ -628,6 +638,21 @@ mod tests {
             vec![Finding::Missing(
                 "Co-authored-by: Op Erator <op@example.com>".into()
             )]
+        );
+    }
+
+    /// Codex round 1 (#2906 P2-7): a command creating the first three
+    /// commits of an unborn repository has all three newly landed; the
+    /// production reader walked only `--max-count=1`.
+    #[test]
+    fn unborn_start_walks_history_from_the_root_under_the_bound() {
+        assert_eq!(
+            rev_list_args(None, "h", MAX_REVIEWED_COMMITS),
+            vec!["rev-list", "--max-count=16", "h"]
+        );
+        assert_eq!(
+            rev_list_args(Some("b"), "h", 4),
+            vec!["rev-list", "--max-count=4", "b..h"]
         );
     }
 
