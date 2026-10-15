@@ -1,11 +1,9 @@
-//! Attribution ledger bookkeeping for the agentic turn loop.
+//! Attribution bookkeeping for the agentic turn loop.
 //!
-//! The per-turn attribution ledger records organic save-note use, build
-//! warnings, completed tool events, phantom reaches, and per tool-call
-//! attribution contributions. `AttributionEpoch` opens the ledger when the
-//! turn's first tool runs and closes it on scope exit, writing the final
-//! note. These helpers are pure record-keeping: the loop supplies the sink,
-//! the ledger, and the values; this module shapes them into notes.
+//! `AttributionEpoch` is created per tool call: it snapshots commit telemetry and
+//! consumes the accumulated contributors only after a confirmed commit. The other
+//! helpers here record notes, build warnings and phantom reaches into their own
+//! sinks; the loop supplies the sink, the ledger and the values.
 
 use super::is_read_only_call;
 use super::lexical_normalize;
