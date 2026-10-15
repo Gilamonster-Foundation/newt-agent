@@ -4683,7 +4683,10 @@ async fn execute_authorized_tool(
             // #2905: commit-message review is route-independent and
             // detector-independent: HEAD is snapshotted around every
             // command, and whatever landed is read back and checked.
-            let commit_reader = crate::commit_review::HostRepo(std::path::PathBuf::from(&run_cwd));
+            let commit_reader = crate::commit_review::HostRepo {
+                cwd: std::path::PathBuf::from(&run_cwd),
+                read_scope: caveats.fs_read.clone(),
+            };
             let commit_policy = git_tool.and_then(|tool| tool.native_commit_policy());
             let commit_review = start_commit_review(
                 crate::caveats::permits_path(&caveats.fs_read, &run_cwd),

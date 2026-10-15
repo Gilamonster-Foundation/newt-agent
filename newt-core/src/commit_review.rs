@@ -213,13 +213,20 @@ pub(crate) fn render_content(oid: &str, findings: &[String]) -> Option<String> {
     Some(out)
 }
 
-/// Production reader: fixed-argv hardened `git` (no hooks, no config, empty
-/// env) in the command's directory. Read-only; failures read as "nothing".
-pub(crate) struct HostRepo(pub(crate) std::path::PathBuf);
+/// Production reader: fixed-argv `metadata_git` (no hooks, scrubbed env,
+/// global/system config ignored) in the command's directory, under the turn's
+/// read scope. Repo-local config and its includes DO still load, which is why
+/// every read is bounded: an include naming a FIFO blocks Git indefinitely.
+/// Read-only; failures, permission denials, deadlines and oversized output all
+/// read as "nothing".
+pub(crate) struct HostRepo {
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) read_scope: crate::Scope<String>,
+}
 
 impl HostRepo {
     fn run(&self, args: &[&str]) -> Option<Vec<u8>> {
-        let output = crate::git_hardening::hardened_git(&self.0, args)
+        let output = crate::git_hardening::metadata_git(&self.cwd, args, &self.read_scope)
             .ok()?
             .stdin(std::process::Stdio::null())
             .output()
@@ -743,6 +750,28 @@ mod tests {
             pending.content_prompts(&before).is_empty(),
             "HEAD did not move"
         );
+    }
+
+    /// Codex round 1 #2906 P1-1: a readable cwd is not enough. Git discovery
+    /// reaches parent repositories, includes and alternates, so the metadata
+    /// contract requires unrestricted read authority before any reader spawns.
+    #[test]
+    fn host_repo_requires_unrestricted_read_authority() {
+        let repo = HostRepo {
+            cwd: std::path::PathBuf::from("repo/child"),
+            read_scope: crate::Scope::only(["repo/child".to_string()]),
+        };
+        assert_eq!(repo.head(), None);
+        assert!(repo.landed(None, "h", 4).is_empty());
+        assert!(repo.stat("abc").is_empty());
+
+        let unrestricted = HostRepo {
+            cwd: std::path::PathBuf::from("repo/child"),
+            read_scope: crate::Scope::All,
+        };
+        // No git executable or repository in this mocked path: still empty,
+        // but the constructor did not reject the scope.
+        assert_eq!(unrestricted.head(), None);
     }
 
     #[test]
