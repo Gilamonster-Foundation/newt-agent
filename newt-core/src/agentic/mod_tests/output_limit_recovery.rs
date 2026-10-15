@@ -861,18 +861,12 @@ macro_rules! shrinking_headroom_test {
         }
     };
 }
-shrinking_headroom_test!(
-    retained_cap_reclamps_to_shrinking_headroom_chat,
-    "openai"
-);
+shrinking_headroom_test!(retained_cap_reclamps_to_shrinking_headroom_chat, "openai");
 shrinking_headroom_test!(
     retained_cap_reclamps_to_shrinking_headroom_responses,
     "responses"
 );
-shrinking_headroom_test!(
-    retained_cap_reclamps_to_shrinking_headroom_ollama,
-    "ollama"
-);
+shrinking_headroom_test!(retained_cap_reclamps_to_shrinking_headroom_ollama, "ollama");
 shrinking_headroom_test!(
     retained_cap_reclamps_to_shrinking_headroom_anthropic,
     "anthropic"

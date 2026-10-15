@@ -27,6 +27,10 @@ const REQUIRED: &[&str] = &[
     "decision.chat_completions()",
     "decision.reasoning_replay_scope()",
     "decision.emits_leading_reasoning()",
+    // #2907 P2 3: the card's tuning ceiling rides the same decision —
+    // it must reach the driver config's output_ceiling or the advertised
+    // card key silently does nothing on this lane.
+    "decision.output_ceiling()",
 ];
 
 /// Shapes that must NOT appear in headless: raw inline-only accessors (the

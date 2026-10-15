@@ -645,6 +645,10 @@ impl SplashScreenGuard {
 mod splash_guard_tests;
 
 #[cfg(test)]
+#[path = "lib_tests/card_ceiling_wiring.rs"]
+mod card_ceiling_wiring;
+
+#[cfg(test)]
 #[path = "lib_tests/slash_ask_seam_tests.rs"]
 mod slash_ask_seam_tests;
 

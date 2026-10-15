@@ -359,6 +359,119 @@ nemotron = "relentless"
     );
 }
 
+/// #2907 P2 3 caller-level regression: a card's `tuning.output_ceiling_tokens`
+/// must reach `ctx.output_ceiling` on the HEADLESS path — the same lane the
+/// verdict found unwired. Grounds the shared seam end-to-end with a real
+/// `newt headless` subprocess: an exact catalog card bound to this backend's
+/// declared model, a capped Anthropic reply batch, and the retry caps the
+/// requests actually carried. First send stays at the wire default; the
+/// retries are bounded by the CARD's 9000, not the default doubled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tuning_card_output_ceiling_bounds_the_headless_retry() {
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    struct CappedThenAnswer {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+    impl Respond for CappedThenAnswer {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            self.requests.lock().expect("capture lock").push(body);
+            let attempt = self.requests.lock().expect("capture lock").len();
+            let frames = if attempt <= 2 {
+                // A genuinely cut tool batch: no content_block_stop.
+                vec![
+                    serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":40,"output_tokens":0}}}),
+                    serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"write_file","input":{}}}),
+                    serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"partial\",\"content\":\"cut"}}),
+                    serde_json::json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":7}}),
+                    serde_json::json!({"type":"message_stop"}),
+                ]
+            } else {
+                vec![
+                    serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":40,"output_tokens":0}}}),
+                    serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                    serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}),
+                    serde_json::json!({"type":"content_block_stop","index":0}),
+                    serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}),
+                    serde_json::json!({"type":"message_stop"}),
+                ]
+            };
+            ResponseTemplate::new(200).set_body_raw(
+                frames
+                    .iter()
+                    .map(|v| format!("data: {v}\n\n"))
+                    .collect::<String>(),
+                "text/event-stream",
+            )
+        }
+    }
+
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(CappedThenAnswer {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
+    let config_path = workspace.path().join("headless.toml");
+    let instruction_path = workspace.path().join("instruction.md");
+    let models_dir = workspace.path().join("models");
+    std::fs::create_dir_all(&models_dir).expect("models dir");
+    std::fs::write(
+        models_dir.join("ceiling.toml"),
+        "name = \"ceiling\"\nbackend = \"vllm\"\n\n[vllm]\nserved_name = \"bound-model\"\n\n[tuning]\noutput_ceiling_tokens = 9000\n",
+    )
+    .expect("write ceiling card");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "acard"
+
+[[backends]]
+name = "acard"
+endpoint = "{}"
+model = "bound-model"
+kind = "anthropic"
+card = "ceiling"
+"#,
+            server.uri()
+        ),
+    )
+    .expect("write headless config");
+    std::fs::write(&instruction_path, "Answer the question.\n")
+        .expect("write headless instruction");
+
+    common::newt()
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .args(["--max-rounds", "4"])
+        .assert()
+        .success();
+
+    let requests = requests.lock().expect("request capture lock");
+    let caps: Vec<u64> = requests
+        .iter()
+        .filter_map(|body| body["max_tokens"].as_u64())
+        .collect();
+    assert_eq!(
+        caps,
+        vec![8_192, 9_000, 9_000],
+        "first send keeps the wire default; both retries are bounded by the \
+         card's declared 9000 (the default*2 16384 would exceed it)"
+    );
+}
+
 /// The anti-substring negative: the SAME nemotron-looking model alias with
 /// NO card gets NO family attribution — the `[initiative.families]` default
 /// must not engage from the model NAME, so the contract records the
