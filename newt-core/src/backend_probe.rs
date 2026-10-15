@@ -799,17 +799,9 @@ impl BackendApi for AnthropicApi {
         model: &str,
         api_key: Option<&str>,
     ) -> Option<u32> {
-        // Newer API responses declare `max_input_tokens` per model entry;
-        // absent → None (the caller keeps its default). Fail-soft like the
-        // other impls.
-        let entries = anthropic_models_entries(client, endpoint, api_key)
+        self.limits(client, endpoint, model, api_key)
             .await
-            .ok()?;
-        entries
-            .iter()
-            .find(|m| m["id"].as_str() == Some(model))
-            .and_then(|m| m["max_input_tokens"].as_u64())
-            .and_then(|w| u32::try_from(w).ok())
+            .input_window
     }
 
     fn serving(&self, _served_count: usize) -> Serving {
@@ -820,14 +812,22 @@ impl BackendApi for AnthropicApi {
 
     async fn limits(
         &self,
-        _client: &reqwest::Client,
-        _endpoint: &str,
-        _model: &str,
-        _api_key: Option<&str>,
+        client: &reqwest::Client,
+        endpoint: &str,
+        model: &str,
+        api_key: Option<&str>,
     ) -> BackendLimits {
-        // RED (C1): the real one-round-trip read lands with the green
-        // commit; the parser tests below pin its behavior first.
-        BackendLimits::default()
+        // ONE round trip yields window AND ceiling (and, when declared, the
+        // effort ladder); `context_window` below is a thin wrapper over this,
+        // so a caller asking both never pays twice.
+        let entries = anthropic_models_entries(client, endpoint, api_key)
+            .await
+            .unwrap_or_default();
+        entries
+            .iter()
+            .find(|m| m["id"].as_str() == Some(model))
+            .map(anthropic_entry_limits)
+            .unwrap_or_default()
     }
 }
 
@@ -893,10 +893,25 @@ pub struct BackendLimits {
 /// `capabilities.effort` level is unsupported, not an error.
 #[must_use]
 pub fn anthropic_entry_limits(entry: &serde_json::Value) -> BackendLimits {
-    // RED (C1): the real parse lands with the green commit; the parser
-    // tests below pin its behavior first.
-    let _ = entry;
-    BackendLimits::default()
+    BackendLimits {
+        input_window: entry["max_input_tokens"]
+            .as_u64()
+            .and_then(|w| u32::try_from(w).ok()),
+        output_ceiling: entry["max_tokens"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .and_then(|n| u32::try_from(n).ok()),
+        effort_ladder: entry["capabilities"]["effort"].as_object().map(|effort| {
+            ANTHROPIC_EFFORT_ORDER
+                .into_iter()
+                .filter(|level| {
+                    effort
+                        .get(level.wire_key())
+                        .is_some_and(|value| value["supported"] == true)
+                })
+                .collect()
+        }),
+    }
 }
 
 /// How many `/v1/models` pages [`anthropic_models_entries`] will follow. A

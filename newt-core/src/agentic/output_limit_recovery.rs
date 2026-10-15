@@ -113,10 +113,10 @@ pub(super) fn ceiling() -> u32 {
 /// window clamps to zero — no raise is admissible, the note-only retry
 /// stands. Recomputed each round from that round's actual input.
 pub(super) fn window_clamp(ceiling: u32, window: Option<u32>, input: Option<u32>) -> u32 {
-    // RED (C1): the real clamp lands with the green commit; the unit tests
-    // below pin its behavior first.
-    let _ = (window, input);
-    ceiling
+    match (window, input) {
+        (Some(window), Some(input)) => ceiling.min(window.saturating_sub(input)),
+        _ => ceiling,
+    }
 }
 
 #[cfg(test)]

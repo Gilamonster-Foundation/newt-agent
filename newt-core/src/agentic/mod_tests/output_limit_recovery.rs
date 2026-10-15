@@ -730,34 +730,43 @@ async fn non_streaming_retry_keeps_the_default_floor() {
     assert_eq!(end, Some(crate::TurnEndReason::Failed));
 }
 
-/// §1.6 item 2 applies to EVERY wire: a raised retry cap on the Chat wire is
-/// clamped to the window the capped reply left (prompt tokens 40).
+/// §1.6 item 2 applies to EVERY wire: a raised retry cap on the Ollama wire
+/// is clamped to the window the capped reply left (`prompt_eval_count` 40).
+/// The window must still admit the request itself, so the clamp binds by
+/// sitting between the doubling steps.
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
-async fn chat_retry_clamps_to_the_window() {
+async fn ollama_retry_clamps_to_the_window() {
     let _settings = default_loop_settings();
     let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
     let (result, requests, end, dir) = run_on(
-        "openai",
-        Some(1_500),
+        "ollama",
+        Some(5_000),
         None,
         None,
-        |ctx| ctx.safe_context = Some(1_640),
+        |ctx| ctx.safe_context = Some(9_000),
         None,
         move |attempt, body| {
-            let limited = sent_cap("openai", body).unwrap_or(0) < 1_600;
-            reply("openai", attempt, limited, attempt < 3)
+            // 9_000 − 40 input tokens reported by the capped reply.
+            let limited = sent_cap("ollama", body).unwrap_or(0) < 8_960;
+            reply("ollama", attempt, limited, attempt < 3)
         },
     )
     .await;
-    let observed = caps("openai", &requests);
-    assert_eq!(requests.len(), 2, "{result:?}: {observed:?}");
+    let observed = caps("ollama", &requests);
+    // Capped tool round → raised, clamped retry that executes the tool →
+    // final answer round (the raised cap holds for the turn).
+    assert_eq!(requests.len(), 3, "{result:?}: {observed:?}");
     // The retry raised above the first cap but never past window − input.
     assert!(
         observed[1] > observed[0],
         "the retry must still raise: {observed:?}"
     );
-    assert_eq!(observed[1], Some(1_600), "{result:?}: {observed:?}");
+    assert_eq!(observed[1], Some(8_960), "{result:?}: {observed:?}");
+    assert!(
+        observed.iter().all(|cap| *cap <= Some(8_960)),
+        "no request may exceed the window's room: {observed:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("done2")).unwrap(),
         "written"

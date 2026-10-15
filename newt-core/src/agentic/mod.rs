@@ -2676,7 +2676,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     .is_some_and(|calls| !calls.is_empty()),
                 &probe_content,
                 output_allowance,
-                output_limit_recovery::ceiling(),
+                // #2874 C1: a raised cap is sent without admission — clamp it
+                // to the window the capped reply's actual input leaves.
+                output_limit_recovery::window_clamp(
+                    output_limit_recovery::ceiling(),
+                    safe_context,
+                    json["prompt_eval_count"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok()),
+                ),
                 &mut messages,
                 smart_harness,
             )? {
@@ -7878,7 +7886,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     .is_some_and(|calls| !calls.is_empty()),
                 &oa_content,
                 round_policy.output_allowance,
-                output_limit_recovery::ceiling(),
+                // #2874 C1: a raised cap is sent without admission — clamp it
+                // to the window the capped reply's actual input leaves.
+                output_limit_recovery::window_clamp(
+                    output_limit_recovery::ceiling(),
+                    safe_context,
+                    json["usage"]["prompt_tokens"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok()),
+                ),
                 &mut messages,
                 smart_harness,
             )? {
@@ -9492,7 +9508,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
-        output_ceiling: _,
+        output_ceiling,
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
@@ -9733,6 +9749,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // Consecutive context-window recoveries (parse limit → trim → retry).
     let mut cw_retries: u32 = 0;
     let mut output_recovery = output_limit_recovery::Recovery::default();
+    // #2874 C1: this endpoint+model's probed output ceiling, probed lazily
+    // (one /v1/models round trip per turn, only once a reply has capped).
+    // Outer `None` = not yet probed; inner `None` = probed, nothing declared.
+    let mut probed_ceiling: Option<Option<u32>> = None;
     // No-tools recovery (mirrors the OpenAI path): real Anthropic never
     // rejects `tools`, but façades might; drop tools and retry, notice once.
     let mut tools_supported = true;
@@ -10593,11 +10613,44 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     false,
                 );
             }
+            // #2874 C1: the retry ceiling is the model's declared maximum —
+            // card `output_ceiling_tokens` > probed `/v1/models` `max_tokens`
+            // > the wire default doubled — clamped to the room the capped
+            // reply's actual input leaves in the window (a raised cap is sent
+            // WITHOUT admission, so the window is the only bound on it).
+            // The probe is lazy: at most one round trip per turn, only once a
+            // reply has capped. Non-streaming keeps the default*2 floor — a
+            // large non-streamed `max_tokens` risks HTTP timeouts (§1.6
+            // item 3), so the probed ceiling is not applied there.
+            let default_retry_ceiling = anthropic_wire::default_max_tokens().saturating_mul(2);
+            let reply_input = model_reply.usage.map(|usage| usage.input_tokens);
+            let declared_ceiling = if streaming_enabled {
+                match output_ceiling {
+                    Some(card) => Some(card),
+                    None => {
+                        if probed_ceiling.is_none() {
+                            probed_ceiling = Some(
+                                crate::backend_probe::api_for(crate::BackendKind::Anthropic)
+                                    .limits(&client, url, model, api_key)
+                                    .await
+                                    .output_ceiling,
+                            );
+                        }
+                        probed_ceiling.flatten()
+                    }
+                }
+            } else {
+                None
+            };
             if output_recovery.retry(
                 !model_reply.tool_uses.is_empty() || model_reply.unfinished_tool_use,
                 &model_reply.text,
                 Some(max_tokens),
-                anthropic_wire::default_max_tokens().saturating_mul(2),
+                output_limit_recovery::window_clamp(
+                    declared_ceiling.unwrap_or(default_retry_ceiling),
+                    safe_context,
+                    reply_input,
+                ),
                 &mut messages,
                 smart_harness,
             )? {
@@ -12883,7 +12936,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call")),
                 &partial,
                 generation_policy.output_allowance,
-                output_limit_recovery::ceiling(),
+                // #2874 C1: a raised cap is sent without admission — clamp it
+                // to the window the capped reply's actual input leaves.
+                output_limit_recovery::window_clamp(
+                    output_limit_recovery::ceiling(),
+                    safe_context,
+                    json["usage"]["input_tokens"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok()),
+                ),
                 &mut input,
                 smart_harness,
             )? {
