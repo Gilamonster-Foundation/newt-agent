@@ -10660,8 +10660,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 )
                                 .await
                                 .and_then(|bounded| bounded.ok())
-                                .map(|limits| limits.output_ceiling)
-                                .flatten(),
+                                .and_then(|limits| limits.output_ceiling),
                             );
                         }
                         probed_ceiling.flatten()
