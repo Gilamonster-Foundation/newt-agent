@@ -819,9 +819,7 @@ async fn compact_responses_input(
 /// [`ChatCtx::recover_cw_400`].
 pub type RecoverCw400 = fn(&anyhow::Error, &str, &str) -> Option<u32>;
 
-/// One per-round capability observation, reported through
-/// [`ChatCtx::on_round_usage`] at the moment it is observed (Phase 20, last:
-/// [`ChatCtx::recover_cw_400`]).
+/// Everything one agentic turn needs, resolved once by the caller (the TUI
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
 pub struct ChatCtx<'a> {
@@ -1314,6 +1312,11 @@ fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
 #[path = "mod_tests/retry_ledger_tests.rs"]
 mod retry_ledger_tests;
 
+/// U4b: the no-progress brake's start-of-round gate, shared by every loop arm
+/// that owns rounds (the SAME place the read-only nudge lives: the arm's
+/// `WorkflowRuntimeState`). A steer is one user message, allowed only when nudges
+/// are (`$steer_allowed`); the STOP is a cost bound and always applies. A stop
+/// ends the turn as a typed `NoProgress` with a harness-written notice and NO
 /// model summary call (a summary before the round cap would break BHV-ROUND-002).
 /// Under the smart harness the stop is recorded like a cap exit (`$record`, then
 /// `outcome`), so the frame stays consistent.
