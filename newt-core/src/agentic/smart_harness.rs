@@ -37,6 +37,14 @@ pub struct AdjudicationSettings {
     pub max_output_bytes: usize,
     pub max_output_tokens: u32,
     pub initial_tool_bytes: usize,
+    /// #2905: optional commit-message content review gets its own bounded
+    /// budget so it cannot consume the auxiliary calls needed for mandatory
+    /// adjudication.
+    pub review_timeout_ms: u64,
+    pub review_max_calls: usize,
+    pub review_total_timeout_ms: u64,
+    pub review_max_input_bytes: usize,
+    pub review_max_output_bytes: usize,
     /// Optional shared system-role guidance for both auxiliary tasks.
     pub system_instruction: String,
     pub instruction: String,
@@ -72,6 +80,14 @@ impl AdjudicationSettings {
             "auxiliary bounds must be positive"
         );
         anyhow::ensure!(
+            self.review_timeout_ms > 0
+                && self.review_max_calls > 0
+                && self.review_total_timeout_ms > 0
+                && self.review_max_input_bytes > 0
+                && self.review_max_output_bytes > 0,
+            "review bounds must be positive"
+        );
+        anyhow::ensure!(
             !self.instruction.trim().is_empty()
                 && !self.navigation_instruction.trim().is_empty()
                 && !self.nudge.trim().is_empty(),
@@ -92,6 +108,11 @@ impl Default for AdjudicationSettings {
             max_output_bytes: usize,
             max_output_tokens: u32,
             initial_tool_bytes: usize,
+            review_timeout_ms: u64,
+            review_max_calls: usize,
+            review_total_timeout_ms: u64,
+            review_max_input_bytes: usize,
+            review_max_output_bytes: usize,
             #[serde(default)]
             system_instruction: String,
             instruction: String,
@@ -110,6 +131,11 @@ impl Default for AdjudicationSettings {
             max_output_bytes: d.max_output_bytes,
             max_output_tokens: d.max_output_tokens,
             initial_tool_bytes: d.initial_tool_bytes,
+            review_timeout_ms: d.review_timeout_ms,
+            review_max_calls: d.review_max_calls,
+            review_total_timeout_ms: d.review_total_timeout_ms,
+            review_max_input_bytes: d.review_max_input_bytes,
+            review_max_output_bytes: d.review_max_output_bytes,
             system_instruction: d.system_instruction,
             instruction: d.instruction,
             navigation_instruction: d.navigation_instruction,
@@ -132,6 +158,9 @@ struct State {
     /// #2315: result-aware verification nudges spent this turn.
     verify_repairs: usize,
     auxiliary_elapsed: Duration,
+    /// #2905: commit-message content review spends its own time budget.
+    review_elapsed: Duration,
+    review_calls: usize,
     initial: Option<Vec<Value>>,
     deferred_failure: Option<String>,
 }
@@ -321,6 +350,8 @@ impl SmartHarness {
                 verified: false,
                 verify_repairs: 0,
                 auxiliary_elapsed: Duration::ZERO,
+                review_elapsed: Duration::ZERO,
+                review_calls: 0,
                 initial,
                 deferred_failure: None,
             }),
@@ -789,12 +820,51 @@ impl SmartHarness {
         Ok(raw)
     }
 
-    /// #2905 content review of one landed commit: the same bounded, tool-less
-    /// auxiliary call (call count, per-call and total timeout, byte budgets).
-    /// Any failure — budget, timeout, oversize, unparseable — yields no
-    /// findings; a review never fabricates one and never blocks.
-    pub(crate) async fn review_commit_content(&self, prompt: String) -> Vec<String> {
-        match self.complete_bounded(prompt).await {
+    /// #2905: bounded content-review auxiliary call. Uses separate counters
+    /// and timeouts from mandatory adjudication so a long or misbehaving
+    /// review cannot starve the answer/continue/finish decision.
+    async fn complete_review_bounded(&self, prompt: String) -> anyhow::Result<String> {
+        let timeout = {
+            let mut s = self.state()?;
+            anyhow::ensure!(
+                s.review_calls < self.settings.review_max_calls,
+                "review call budget exhausted"
+            );
+            anyhow::ensure!(
+                self.settings
+                    .system_instruction
+                    .len()
+                    .checked_add(prompt.len())
+                    .is_some_and(|bytes| bytes <= self.settings.review_max_input_bytes),
+                "review input exceeds its byte budget"
+            );
+            let remaining = Duration::from_millis(self.settings.review_total_timeout_ms)
+                .saturating_sub(s.review_elapsed);
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "review elapsed-time budget exhausted"
+            );
+            s.review_calls += 1;
+            remaining.min(Duration::from_millis(self.settings.review_timeout_ms))
+        };
+        let _elapsed = ReviewTimer {
+            harness: self,
+            started: Instant::now(),
+        };
+        let (raw, _usage) = tokio::time::timeout(timeout, (self.complete)(prompt))
+            .await
+            .map_err(|_| anyhow::anyhow!("review timeout"))??;
+        Ok(raw)
+    }
+
+    /// #2905 content review of one landed commit: a bounded, tool-less
+    /// auxiliary call with its own budget. Any failure — budget, timeout,
+    /// oversize, unparseable — yields no findings; a review never fabricates
+    /// one and never blocks the turn.
+    pub(crate) async fn review_commit_content(&self,
+        prompt: String,
+    ) -> Vec<String> {
+        match self.complete_review_bounded(prompt).await {
             Ok(raw) if self.admit_output(&raw).is_ok() => {
                 crate::commit_review::parse_content_findings(&raw)
             }
@@ -1109,6 +1179,11 @@ struct AuxiliaryTimer<'a> {
     started: Instant,
 }
 
+struct ReviewTimer<'a> {
+    harness: &'a SmartHarness,
+    started: Instant,
+}
+
 struct NavigationTimer<'a> {
     harness: &'a SmartHarness,
     started: Instant,
@@ -1137,6 +1212,13 @@ impl Drop for AuxiliaryTimer<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.harness.state() {
             state.auxiliary_elapsed += self.started.elapsed();
+        }
+    }
+}
+impl Drop for ReviewTimer<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.harness.state() {
+            state.review_elapsed += self.started.elapsed();
         }
     }
 }
@@ -1520,12 +1602,14 @@ mod tests {
         .unwrap()
     }
 
-    /// #2905: content review reuses the bounded auxiliary call. A parseable
-    /// reply yields findings; garbage and an exhausted budget yield none.
+    /// #2905: content review uses a SEPARATE bounded budget from mandatory
+    /// adjudication. A parseable reply yields findings; garbage and an
+    /// exhausted review budget yield none, without touching the auxiliary
+    /// call counters needed for classification.
     #[tokio::test]
     async fn commit_review_content_uses_the_bounded_auxiliary_call() {
         let settings = AdjudicationSettings {
-            max_calls: 2,
+            review_max_calls: 2,
             ..Default::default()
         };
         let h = harness(
@@ -1541,11 +1625,35 @@ mod tests {
             vec!["overclaim: no tests in stat".to_string()]
         );
         assert_eq!(h.review_commit_content(p()).await, Vec::<String>::new());
-        // Third call exceeds max_calls: no model call (the reply queue is
-        // empty and would panic), no finding.
+        // Third call exceeds review_max_calls: no model call, no finding.
         assert_eq!(h.review_commit_content(p()).await, Vec::<String>::new());
     }
-    /// refreshing facts never turns unavailable evidence into a passing check.
+    #[tokio::test]
+    async fn commit_review_budget_is_isolated_from_mandatory_adjudication() {
+        // #2905 round 1 P2-4: optional reviews must not starve mandatory
+        // `complete_bounded` adjudication. We have budget for exactly one
+        // review call and one auxiliary call; the review exhausts its own
+        // counter, then the auxiliary call still succeeds.
+        let settings = AdjudicationSettings {
+            review_max_calls: 1,
+            max_calls: 1,
+            ..Default::default()
+        };
+        let h = harness(
+            &[
+                r#"{"findings":[{"kind":"leak","detail":"session link"}]}"#,
+                "classification reply",
+            ],
+            settings,
+        );
+        let prompt = || crate::commit_review::content_prompt("fix", " a.rs | 1 +");
+        assert!(!h.review_commit_content(prompt()).await.is_empty());
+        // Exhaust the review budget.
+        assert!(h.review_commit_content(prompt()).await.is_empty());
+        // The mandatory auxiliary call must still be available.
+        let classified = h.complete_bounded("classify".to_string()).await.unwrap();
+        assert_eq!(classified, "classification reply");
+    }
     #[test]
     fn semantic_pins_adapt_host_producers_and_preserve_operator_anchor() {
         let mut projection = crate::agentic::semantic_pins::Projection::default();
