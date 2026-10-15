@@ -76,7 +76,16 @@ async fn run(
     obs: Option<&mut crate::agentic::SolveObservation>,
     respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
 ) -> Run {
-    run_on(wire, allowance, obs, None, |_| {}, None::<ResponseTemplate>, respond).await
+    run_on(
+        wire,
+        allowance,
+        obs,
+        None,
+        |_| {},
+        None::<ResponseTemplate>,
+        respond,
+    )
+    .await
 }
 
 /// `run` with an optional smart harness adjudicating the answer, a one-shot
@@ -921,10 +930,7 @@ async fn cancelled_probe_ends_the_turn_promptly() {
         interrupt: &'static std::sync::atomic::AtomicBool,
     }
     impl wiremock::Respond for ProbeThatInterrupts {
-        fn respond(
-            &self,
-            _request: &wiremock::Request,
-        ) -> ResponseTemplate {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
             self.interrupt
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60))
