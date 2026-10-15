@@ -38,7 +38,7 @@ async fn run_scheduled_tool_with_disposition(
             step_ledger: Some(ledger as &dyn crate::agentic::scheduled::StepLedger),
             plan_mode_control: Some(plan_mode_control),
             ..Default::default()
-        },
+    },
         false,
         disposition,
         None,
@@ -215,7 +215,7 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
         control.take_exit_requested(),
         "the request must be recorded for the turn-end hook to see"
     );
-}
+    }
 
 /// Explicit Plan is an executor boundary, not just a reduced tool schema.
 #[tokio::test]
@@ -762,7 +762,7 @@ async fn auto_mode_selector_dispatches_through_session_control_without_current_w
     .expect("legacy fixture has no durable writer")
     .unwrap();
     assert!(unavailable.contains("/mode auto"), "{unavailable}");
-}
+    }
 
 /// Explicit Plan forbids new grants; inferred style preserves the operator's
 /// permission decision. A denied network request cannot be silently widened.
@@ -881,4 +881,4 @@ async fn render_report_dispatch_drafts_under_plan_and_renders_under_act() {
         1,
         "an Act-disposition report must never touch the draft slot"
     );
-}
+    }

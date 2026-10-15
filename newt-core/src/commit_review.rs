@@ -111,6 +111,96 @@ pub(crate) trait CommitReader: Send + Sync {
 /// A reader shared with the blocking task that runs it.
 pub(crate) type SharedReader = std::sync::Arc<dyn CommitReader>;
 
+/// Something that can vend a reader for the command directory under the
+/// turn's read scope. Production is `HostReaders`; tests default to `NoOpReaders`
+/// so they never spawn real git.
+pub(crate) trait ReaderSource: Send + Sync {
+    fn open(
+        &self,
+        cwd: &std::path::Path,
+        read_scope: &crate::Scope<String>,
+    ) -> Option<SharedReader>;
+}
+
+/// No-op reader used when the dispatcher has no reader source (tests).
+pub(crate) struct NoOpRepo;
+impl CommitReader for NoOpRepo {
+    fn head(&self) -> Option<String> { None }
+    fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> { Vec::new() }
+    fn stat(&self, _: &str) -> String { String::new() }
+}
+
+/// Production reader source: honors the read scope via `metadata_git`.
+pub(crate) struct HostReaders;
+impl ReaderSource for HostReaders {
+    fn open(
+        &self,
+        cwd: &std::path::Path,
+        read_scope: &crate::Scope<String>,
+    ) -> Option<SharedReader> {
+        crate::agentic::check_git_read_scope("metadata", read_scope).ok()?;
+        Some(std::sync::Arc::new(HostRepo {
+            cwd: cwd.to_path_buf(),
+            read_scope: read_scope.clone(),
+        }))
+    }
+}
+
+/// No-op reader source for tests that do not care about commit-message review.
+pub(crate) struct NoOpReaders;
+impl ReaderSource for NoOpReaders {
+    fn open(
+        &self,
+        _: &std::path::Path,
+        _: &crate::Scope<String>,
+    ) -> Option<SharedReader> {
+        None
+    }
+}
+
+static NO_OP_READERS: NoOpReaders = NoOpReaders;
+static DEFAULT_READER_SOURCE: std::sync::Mutex<Option<&'static dyn ReaderSource>> =
+    std::sync::Mutex::new(None);
+
+/// Set the production reader source. Tests leave this unset, so
+/// `default_reader_source` returns a no-op source.
+pub(crate) fn set_default_reader_source(source: &'static dyn ReaderSource) {
+    *DEFAULT_READER_SOURCE.lock().unwrap() = Some(source);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_default_reader_source() {
+    *DEFAULT_READER_SOURCE.lock().unwrap() = None;
+}
+
+pub(crate) fn default_reader_source() -> &'static dyn ReaderSource {
+    DEFAULT_READER_SOURCE
+        .lock()
+        .unwrap()
+        .unwrap_or(&NO_OP_READERS)
+}
+
+/// #2905: allow tests to temporarily override the default source and restore
+/// it afterward. This keeps the dispatcher's default no-op while still letting
+/// commit-review tests inject fake readers.
+#[cfg(test)]
+pub(crate) fn with_reader_source<T>(
+    source: &'static dyn ReaderSource,
+    f: impl FnOnce() -> T,
+) -> T {
+    let mut guard = DEFAULT_READER_SOURCE.lock().unwrap();
+    let prev = guard.replace(source);
+    drop(guard);
+    struct Guard(Option<&'static dyn ReaderSource>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *DEFAULT_READER_SOURCE.lock().unwrap() = self.0;
+        }
+    }
+    let _guard = Guard(prev);
+    f()
+}
+
 /// Deadline for the pre-command `HEAD` snapshot.
 pub(crate) const SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Deadline for reading back and checking everything that landed.
@@ -536,6 +626,10 @@ mod tests {
 
     const NEWT: &str = crate::agent_identity::DEFAULT_AGENT_EMAIL;
 
+    /// Serialises the two tests that mutate the process-wide default reader
+    /// source so they do not race with each other under parallel test run.
+    static READER_SOURCE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A fixed policy: the canonical finalizer of one `CommitAttribution`.
     struct LedgerPolicy(crate::attribution::CommitAttribution);
     impl CommitPolicy for LedgerPolicy {
@@ -960,6 +1054,78 @@ mod tests {
             None
         );
         assert!(started.elapsed() < long);
+    }
+
+    /// #2905 round 1 P2-5: the dispatcher's default reader source is no-op
+    /// so unit tests never launch real git. Production can set a real source
+    /// once; tests can override it locally.
+    #[test]
+    fn default_reader_source_is_no_op_until_production_sets_one() {
+        let _guard = READER_SOURCE_TEST_MUTEX.lock().unwrap();
+        use crate::commit_review::{
+            clear_default_reader_source, default_reader_source, set_default_reader_source,
+            HostReaders, NoOpReaders,
+        };
+        // With no production source configured, the dispatcher falls back to
+        // a no-op reader so unit tests never spawn real git.
+        clear_default_reader_source();
+        assert!(
+            default_reader_source()
+                .open(std::path::Path::new("."), &crate::Scope::All)
+                .is_none()
+        );
+
+        // Production sets HostReaders. We do not call into the reader, only
+        // check that the source opens under an unrestricted scope.
+        set_default_reader_source(&HostReaders);
+        assert!(
+            default_reader_source()
+                .open(std::path::Path::new("."), &crate::Scope::All)
+                .is_some()
+        );
+
+        // Clean up so later tests in the same process still see no-op.
+        set_default_reader_source(&NoOpReaders);
+        assert!(
+            default_reader_source()
+                .open(std::path::Path::new("."), &crate::Scope::All)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn with_reader_source_overrides_production_source() {
+        let _guard = READER_SOURCE_TEST_MUTEX.lock().unwrap();
+        use crate::commit_review::{with_reader_source};
+        struct RecordingSource(std::sync::atomic::AtomicUsize);
+        impl ReaderSource for RecordingSource {
+            fn open(
+                &self,
+                _: &std::path::Path,
+                _: &crate::Scope<String>,
+            ) -> Option<SharedReader> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            }
+        }
+        static RECORDING: RecordingSource =
+            RecordingSource(std::sync::atomic::AtomicUsize::new(0));
+        let before = RECORDING.0.load(std::sync::atomic::Ordering::SeqCst);
+        with_reader_source(&RECORDING, || {
+            crate::commit_review::default_reader_source().open(
+                std::path::Path::new("."),
+                &crate::Scope::All,
+            );
+        });
+        let after = RECORDING.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after - before, 1);
+
+        // After the guard drops, the default is restored.
+        assert!(
+            default_reader_source()
+                .open(std::path::Path::new("."), &crate::Scope::All)
+                .is_none()
+        );
     }
 
     /// Codex round 1 #2906 P1-1: a readable cwd is not enough. Git discovery

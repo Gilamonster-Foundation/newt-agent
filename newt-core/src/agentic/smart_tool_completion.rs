@@ -379,7 +379,7 @@ mod tests {
                     invocation: Some(&invocation),
                     execution: collect_execution.then_some(&execution),
                     ..Default::default()
-                },
+    },
                 false,
                 PromptDisposition::Act,
                 None,

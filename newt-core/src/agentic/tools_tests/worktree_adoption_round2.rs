@@ -56,7 +56,7 @@ pub(super) async fn dispatch(
             permission_gate: gate,
             execution: Some(&outcome),
             ..Default::default()
-        },
+    },
         false,
         PromptDisposition::Act,
     )

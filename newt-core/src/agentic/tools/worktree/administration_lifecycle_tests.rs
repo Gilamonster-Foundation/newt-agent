@@ -80,7 +80,7 @@ async fn lifecycle_retains_source_when_configuration_changes_after_resolution() 
                 worktree_session: Some(&session),
                 execution: Some(&outcome),
                 ..Default::default()
-            },
+    },
             false,
             PromptDisposition::Act,
         )

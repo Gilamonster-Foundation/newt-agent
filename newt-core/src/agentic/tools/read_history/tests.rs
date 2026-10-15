@@ -222,7 +222,7 @@ async fn native_dispatch_maps_only_authorized_reads() {
             ToolCollaborators {
                 read_history: Some(&mut history),
                 ..Default::default()
-            },
+    },
             false,
             crate::agentic::prompt_intake::PromptDisposition::Act,
             None,

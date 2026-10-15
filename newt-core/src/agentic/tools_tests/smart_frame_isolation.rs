@@ -67,7 +67,7 @@ async fn dispatch_with_worktree_session(
             permission_gate,
             worktree_session,
             ..Default::default()
-        },
+    },
         false,
         PromptDisposition::Act,
         None,
@@ -526,7 +526,7 @@ async fn dispatch_with_execution(
     .unwrap()
     .unwrap();
     (output, execution.get().copied())
-}
+    }
 
 /// #2561 review (a): a smart-harness refusal is a real failure, and must
 /// ledger `ok=false` via a RECORDED `ExecOutcome`, not by the text
@@ -589,7 +589,7 @@ async fn smart_harness_refusals_ledger_as_failures() {
         !tool_ok(&output2, execution2.get().copied()),
         "re_read-outside-smart-harness must ledger ok=false: {output2}"
     );
-}
+    }
 
 struct UnconfinedDelegate(std::path::PathBuf);
 

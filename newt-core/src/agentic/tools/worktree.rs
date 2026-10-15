@@ -687,7 +687,7 @@ pub(super) async fn execute(
             ToolCollaborators {
                 permission_gate: Some(&mut gate),
                 ..collab
-            },
+    },
             tool_offload,
             disposition,
         ))

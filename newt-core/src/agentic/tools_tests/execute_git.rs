@@ -20,7 +20,7 @@ async fn git_discovery_keeps_the_native_command_surface() {
         ToolCollaborators {
             git_tool: Some(&StubGit),
             ..Default::default()
-        },
+    },
         false,
         PromptDisposition::Explain,
         None,
@@ -209,7 +209,7 @@ async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
                 gate.asks.is_empty(),
                 "read-only calls never request an authority grant"
             );
-        }
+    }
     }
 }
 
@@ -248,7 +248,7 @@ async fn native_git_error_is_not_masked_or_replaced_by_an_embedded_result() {
         !super::super::tool_result_ok(&out),
         "a failed native command must not read as ok:true: {out}"
     );
-}
+    }
 
 async fn run_git(op: &str, caveats: &Caveats, git: Option<&dyn crate::agentic::GitTool>) -> String {
     let ws = tempfile::TempDir::new().unwrap();

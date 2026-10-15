@@ -150,7 +150,7 @@ mod tests {
                     execution: Some(&outcome),
                     governed_pr: Some(&receipt),
                     ..Default::default()
-                },
+    },
                 false,
                 crate::agentic::PromptDisposition::Act,
             )

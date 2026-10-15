@@ -24,7 +24,7 @@ async fn missing_gate_mcp_refusal_records_not_ok_and_never_reaches_connector() {
         ToolCollaborators {
             execution: Some(&execution),
             ..Default::default()
-        },
+    },
         false,
         PromptDisposition::Act,
         None,
@@ -85,7 +85,7 @@ async fn denied_gate_mcp_refusal_records_not_ok_and_never_reaches_connector() {
     );
     assert_eq!(execution.get(), Some(&ExecOutcome::Denied));
     assert!(!tool_ok(&out, execution.get().copied()));
-}
+    }
 
 #[tokio::test]
 async fn approved_gate_mcp_call_reaches_connector_once_and_records_ok() {
@@ -120,7 +120,7 @@ async fn approved_gate_mcp_call_reaches_connector_once_and_records_ok() {
     );
     assert_eq!(out, "remote-tool-ran");
     assert!(tool_ok(&out, execution.get().copied()));
-}
+    }
 
 #[tokio::test]
 async fn persona_preferences_research_discovers_and_requests_remote_permission() {

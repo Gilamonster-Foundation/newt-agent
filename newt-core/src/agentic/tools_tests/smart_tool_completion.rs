@@ -54,7 +54,7 @@ async fn failed_return<W: std::io::Write + Send>(writer: W) -> (anyhow::Error, W
             invocation: Some(&invocation),
             permission_gate: Some(&mut permission),
             ..Default::default()
-        },
+    },
         false,
         PromptDisposition::Act,
         None,

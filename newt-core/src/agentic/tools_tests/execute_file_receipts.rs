@@ -382,7 +382,7 @@ async fn a_write_captures_its_preimage_after_confirmation() {
         ToolCollaborators {
             permission_gate: Some(&mut gate),
             ..ToolCollaborators::default()
-        },
+    },
     )
     .await;
     assert!(model.contains("Modified (+1 -1)"), "{model}");
@@ -472,7 +472,7 @@ async fn a_failed_build_check_keeps_the_verified_tool_change() {
         std::fs::read_to_string(ws.path().join("state.txt")).unwrap(),
         "build bytes\n"
     );
-}
+    }
 
 #[tokio::test]
 async fn unavailable_preimages_do_not_become_added_file_receipts() {
