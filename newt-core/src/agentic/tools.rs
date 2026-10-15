@@ -4680,6 +4680,18 @@ async fn execute_authorized_tool(
                 ));
             }
             let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
+            // #2905: commit-message review is route-independent. Same
+            // detectors, no `governed_git`/bypass input: confined and
+            // `--full-access` commits are both read back and checked.
+            let commit_reader = crate::commit_review::HostRepo(std::path::PathBuf::from(&run_cwd));
+            let commit_policy = git_tool.and_then(|tool| tool.native_commit_policy());
+            let commit_review = crate::commit_review::Pending::start(
+                crate::caveats::permits_path(&caveats.fs_read, &run_cwd)
+                    && (run_command_creates_shell_git_commit(cmd)
+                        || native_git::needs_commit_broker(cmd)),
+                &commit_reader,
+                commit_policy.as_deref(),
+            );
             let (mut exec_text, mut exec_outcome) = shell::exec_confined_command_with_broker(
                 cmd,
                 &run_cwd,
@@ -4782,6 +4794,10 @@ async fn execute_authorized_tool(
                 if let Some(guard) = detach_guard.as_mut() {
                     guard.resolve();
                 }
+            }
+            if let Some(report) = commit_review.as_ref().and_then(|review| review.finish(&commit_reader)) {
+                presentation.preview(&report, 0);
+                exec_text = format!("{exec_text}\n{report}");
             }
             let result = executed((exec_text, exec_outcome));
             // #2636 finding 1: use the typed out-param from the pre-exec denial

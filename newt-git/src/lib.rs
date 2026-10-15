@@ -1558,6 +1558,10 @@ impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
         Ok(finalize_commit_message(&self.attribution, &cursor, message))
     }
 
+    fn agent_email(&self) -> Option<String> {
+        self.attribution.as_ref().map(|a| a.agent_email.clone())
+    }
+
     fn signing_required(&self) -> bool {
         self.signer.is_some()
     }

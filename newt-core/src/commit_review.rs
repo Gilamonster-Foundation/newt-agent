@@ -119,6 +119,71 @@ pub(crate) fn review_landed(
     Some(out)
 }
 
+/// The review owed by one invocation: captured before the command runs,
+/// finished after it. Built only from the command text and the session's
+/// policy — no route, bypass, or broker parameter exists to depend on.
+pub(crate) struct Pending {
+    before: Option<String>,
+    expected: Expected,
+}
+
+impl Pending {
+    /// `commit_producing` is the existing lexical detector's verdict.
+    pub(crate) fn start(
+        commit_producing: bool,
+        reader: &dyn CommitReader,
+        policy: Option<&dyn CommitPolicy>,
+    ) -> Option<Self> {
+        commit_producing.then(|| Self {
+            before: reader.head(),
+            expected: Expected::from_policy(policy),
+        })
+    }
+
+    pub(crate) fn finish(&self, reader: &dyn CommitReader) -> Option<String> {
+        review_landed(reader, self.before.as_deref(), &self.expected)
+    }
+}
+
+/// Production reader: fixed-argv hardened `git` (no hooks, no config, empty
+/// env) in the command's directory. Read-only; failures read as "nothing".
+pub(crate) struct HostRepo(pub(crate) std::path::PathBuf);
+
+impl HostRepo {
+    fn run(&self, args: &[&str]) -> Option<Vec<u8>> {
+        let output = crate::git_hardening::hardened_git(&self.0, args)
+            .ok()?
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        output.status.success().then_some(output.stdout)
+    }
+}
+
+impl CommitReader for HostRepo {
+    fn head(&self) -> Option<String> {
+        let out = self.run(&["rev-parse", "--verify", "-q", "HEAD"])?;
+        let oid = String::from_utf8(out).ok()?.trim().to_owned();
+        (!oid.is_empty()).then_some(oid)
+    }
+
+    fn landed(&self, before: Option<&str>, head: &str, limit: usize) -> Vec<(String, String)> {
+        let max = format!("--max-count={}", if before.is_some() { limit } else { 1 });
+        let range = before.map_or_else(|| head.to_owned(), |b| format!("{b}..{head}"));
+        let Some(list) = self.run(&["rev-list", &max, &range]) else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&list)
+            .lines()
+            .filter_map(|oid| {
+                let raw = self.run(&["cat-file", "commit", oid])?;
+                let at = raw.windows(2).position(|w| w == b"\n\n")?;
+                Some((oid.to_owned(), String::from_utf8_lossy(&raw[at + 2..]).into_owned()))
+            })
+            .collect()
+    }
+}
+
 /// Compare a landed commit message's newt-owned lines against the ledger.
 pub(crate) fn check_trailers(message: &str, expected: &Expected) -> Vec<Finding> {
     let lines: Vec<&str> = message.lines().map(str::trim_end).collect();
@@ -132,10 +197,14 @@ pub(crate) fn check_trailers(message: &str, expected: &Expected) -> Vec<Finding>
         .map(|l| Finding::Forged((*l).into()))
         .collect();
     if !claims.is_empty() {
+        // Model trailers are not required: a later commit in one chained
+        // invocation legitimately carries only the unconsumed contributor
+        // tail. Operator by-line and provenance are owed by every one.
         findings.extend(
             expected
                 .lines
                 .iter()
+                .filter(|e| !expected.claims_newt(e) || crate::attribution::is_newt_provenance(e))
                 .filter(|e| !lines.contains(&e.as_str()))
                 .map(|e| Finding::Missing(e.clone())),
         );
@@ -296,5 +365,34 @@ mod tests {
         let repo = FakeRepo((0..40).map(|i| (format!("c{i:02}"), bad.clone())).collect());
         let report = review_landed(&repo, None, &expected(NEWT)).unwrap();
         assert_eq!(report.matches("commit review:").count(), MAX_REVIEWED_COMMITS);
+    }
+
+    /// The seam both routes pass through: `start` captures HEAD + the
+    /// ledger before the command, `finish` reads what landed. The host-shell
+    /// (`--full-access`) commit and the brokered one are the same call.
+    #[test]
+    fn pending_review_captures_before_and_flags_what_landed() {
+        let policy = LedgerPolicy(ledger(NEWT));
+        let before = FakeRepo(vec![("oid-base".into(), "base\n".into())]);
+        let pending = Pending::start(true, &before, Some(&policy)).expect("commit-producing");
+        let after = FakeRepo(vec![
+            ("oid-new".into(), format!("x\n\nCo-authored-by: m (v0.8.0 9ba3d8e3) <{NEWT}>\n")),
+            ("oid-base".into(), "base\n".into()),
+        ]);
+        assert!(pending.finish(&after).unwrap().contains("oid-new"));
+        assert!(Pending::start(false, &before, Some(&policy)).is_none());
+    }
+
+    /// Second commit of `git commit … && git commit …`: the first consumed
+    /// the accumulated contributors, so only the active model renders. Not
+    /// a provenance defect.
+    #[test]
+    fn chained_commit_without_consumed_contributors_passes() {
+        let mut with_history = ledger(NEWT);
+        with_history.contributors =
+            vec![crate::attribution::Attribution::new("older", "newt-agent", "0.7.9", NEWT)];
+        let second = ledger(NEWT).finalize_message("second\n");
+        let expected = Expected::from_policy(Some(&LedgerPolicy(with_history)));
+        assert_eq!(check_trailers(&second, &expected), Vec::new());
     }
 }
