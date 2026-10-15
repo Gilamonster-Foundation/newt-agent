@@ -98,8 +98,11 @@ pub(crate) enum Finding {
 /// the model's shell text. Implementations may block: callers run them off
 /// the async executor under a deadline ([`Review`]).
 pub(crate) trait CommitReader: Send + Sync {
-    /// The current `HEAD` oid, or `None` (unborn branch / not a repository).
-    fn head(&self) -> Option<String>;
+    /// The current `HEAD` oid, or `Ok(None)` (unborn branch / not a repository).
+    /// `Err(())` means the read itself failed, which is distinct from a
+    /// confirmed absent HEAD and must skip review instead of reviewing all
+    /// history as newly landed.
+    fn head(&self) -> std::result::Result<Option<String>, ()>;
     /// `(oid, full message)` for commits in `before..head`, newest first,
     /// at most `limit`. `before == None` means "all of `head`'s history"
     /// (the command started on an unborn branch), still at most `limit`.
@@ -125,8 +128,8 @@ pub(crate) trait ReaderSource: Send + Sync {
 /// No-op reader used when the dispatcher has no reader source (tests).
 pub(crate) struct NoOpRepo;
 impl CommitReader for NoOpRepo {
-    fn head(&self) -> Option<String> {
-        None
+    fn head(&self) -> std::result::Result<Option<String>, ()> {
+        Ok(None)
     }
     fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
         Vec::new()
@@ -242,7 +245,13 @@ impl Review {
     ) -> Option<Self> {
         let expected = Expected::from_policy(policy);
         let snapshot = reader.clone();
-        let before = off_executor(deadline, move || snapshot.head()).await?;
+        let before = match off_executor(deadline, move || snapshot.head()).await {
+            Some(Ok(before)) => before,
+            // A failed read or a timed-out snapshot is unsafe to review against:
+            // an unknown `before` would treat all reachable history as newly
+            // landed, and a confirmed read failure must skip review entirely.
+            Some(Err(())) | None => return None,
+        };
         Some(Self {
             pending: Pending { before, expected },
             reader,
@@ -276,7 +285,9 @@ pub(crate) fn review_landed(
     before: Option<&str>,
     expected: &Expected,
 ) -> Option<String> {
-    let head = reader.head()?;
+    let Ok(Some(head)) = reader.head() else {
+        return None;
+    };
     if before == Some(head.as_str()) {
         return None;
     }
@@ -340,7 +351,7 @@ impl Pending {
     #[cfg(test)]
     pub(crate) fn start(reader: &dyn CommitReader, policy: Option<&dyn CommitPolicy>) -> Self {
         Self {
-            before: reader.head(),
+            before: reader.head().unwrap_or_default(),
             expected: Expected::from_policy(policy),
         }
     }
@@ -352,7 +363,7 @@ impl Pending {
         &self,
         reader: &dyn CommitReader,
     ) -> (Option<String>, Vec<(String, String)>) {
-        let Some(head) = reader.head() else {
+        let Ok(Some(head)) = reader.head() else {
             return Default::default();
         };
         if self.before.as_deref() == Some(head.as_str()) {
@@ -397,29 +408,51 @@ const GIT_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3)
 const GIT_OUTPUT_CAP: usize = 256 * 1024;
 
 impl HostRepo {
-    fn run(&self, args: &[&str]) -> Option<Vec<u8>> {
-        let mut child = crate::git_hardening::metadata_git(&self.cwd, args, &self.read_scope)
-            .ok()?
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok()?;
+    /// Run one metadata git command. `Ok(Some(_))` is successful output;
+    /// `Ok(None)` is a clean git absence (e.g. no HEAD, no commits in range);
+    /// `Err(())` is a spawn/read/timeout/oversize failure and must skip review.
+    fn run(
+        &self,
+        args: &[&str],
+    ) -> std::result::Result<Option<Vec<u8>>, ()> {
+        let mut child = crate::git_hardening::metadata_git(&self.cwd,
+            args,
+            &self.read_scope,
+        )
+        .map_err(|_| ())?
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| ())?;
         let started = std::time::Instant::now();
         let out = child
             .stdout
             .take()
             .and_then(|stdout| read_bounded(stdout, GIT_OUTPUT_CAP, GIT_READ_DEADLINE));
         loop {
-            match (&out, child.try_wait()) {
-                (Some(_), Ok(Some(status))) => return status.success().then_some(out?),
-                (Some(_), Ok(None)) if started.elapsed() < GIT_READ_DEADLINE => {
+            match (&out,
+                child
+                    .try_wait()
+                    .map_err(|_| ())?,
+                started.elapsed() < GIT_READ_DEADLINE,
+            ) {
+                (Some(out), Some(status), _) if status.success() => {
+                    return Ok(Some(out.clone()));
+                }
+                (Some(_), Some(_), _) => {
+                    // Git ran to completion but reported no result (e.g. no
+                    // HEAD in an unborn repository). This is a clean absence,
+                    // not a read failure.
+                    return Ok(None);
+                }
+                (Some(_), None, true) => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(());
                 }
             }
         }
@@ -458,22 +491,27 @@ fn rev_list_args(before: Option<&str>, head: &str, limit: usize) -> Vec<String> 
 }
 
 impl CommitReader for HostRepo {
-    fn head(&self) -> Option<String> {
+    fn head(&self,
+    ) -> std::result::Result<Option<String>, ()> {
         let out = self.run(&["rev-parse", "--verify", "-q", "HEAD"])?;
-        let oid = String::from_utf8(out).ok()?.trim().to_owned();
-        (!oid.is_empty()).then_some(oid)
+        let Some(out) = out else {
+            return Ok(None);
+        };
+        let oid = String::from_utf8(out).ok().ok_or(())?.trim().to_owned();
+        Ok((!oid.is_empty()).then_some(oid))
     }
 
     fn landed(&self, before: Option<&str>, head: &str, limit: usize) -> Vec<(String, String)> {
         let args = rev_list_args(before, head, limit);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let Some(list) = self.run(&args) else {
-            return Vec::new();
+        let list = match self.run(&args) {
+            Ok(Some(list)) => list,
+            _ => return Vec::new(),
         };
         String::from_utf8_lossy(&list)
             .lines()
             .filter_map(|oid| {
-                let raw = self.run(&["cat-file", "commit", oid])?;
+                let raw = self.run(&["cat-file", "commit", oid]).ok().flatten()?;
                 let at = raw.windows(2).position(|w| w == b"\n\n")?;
                 Some((
                     oid.to_owned(),
@@ -493,6 +531,8 @@ impl CommitReader for HostRepo {
             "--no-ext-diff",
             oid,
         ])
+        .ok()
+        .flatten()
         .map(|out| String::from_utf8_lossy(&out).into_owned())
         .unwrap_or_default()
     }
@@ -738,11 +778,11 @@ mod tests {
         assert_eq!(findings, vec![Finding::Unvouched(line)]);
     }
 
-    /// In-memory history: newest-first `(oid, message)` pairs.
     struct FakeRepo(Vec<(String, String)>);
     impl CommitReader for FakeRepo {
-        fn head(&self) -> Option<String> {
-            self.0.first().map(|(oid, _)| oid.clone())
+        fn head(&self,
+        ) -> std::result::Result<Option<String>, ()> {
+            Ok(self.0.first().map(|(oid, _)| oid.clone()))
         }
         fn landed(&self, before: Option<&str>, _: &str, limit: usize) -> Vec<(String, String)> {
             self.0
@@ -980,9 +1020,11 @@ mod tests {
     /// A reader whose every call blocks for longer than the review deadline.
     struct HangingRepo;
     impl CommitReader for HangingRepo {
-        fn head(&self) -> Option<String> {
+        fn head(
+            &self,
+        ) -> std::result::Result<Option<String>, ()> {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            None
+            Ok(None)
         }
         fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1007,14 +1049,99 @@ mod tests {
         assert!(begun.is_none(), "an unknown `before` reviews nothing");
     }
 
+    /// #2905 round 2 P2: a failed HEAD read must skip review, not be treated
+    /// as an unborn repository that reviews all of history.
+    #[tokio::test]
+    async fn a_failed_head_read_skips_review() {
+        struct ErrorThenOk(std::sync::atomic::AtomicBool);
+        impl CommitReader for ErrorThenOk {
+            fn head(
+                &self,
+            ) -> std::result::Result<Option<String>, ()> {
+                if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    Ok(Some("oid-head".into()))
+                } else {
+                    Err(())
+                }
+            }
+            fn landed(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: usize,
+            ) -> Vec<(String, String)> {
+                vec![("oid-old".into(), "old\n".into())]
+            }
+            fn stat(&self, _: &str) -> String {
+                String::new()
+            }
+        }
+        let reader: SharedReader = std::sync::Arc::new(ErrorThenOk(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        assert!(
+            Review::begin(reader, None).await.is_none(),
+            "a failed initial HEAD snapshot must skip review"
+        );
+    }
+
+    /// A genuinely unborn repository (Ok(None)) is still reviewed: there is no
+    /// `before`, and a failed read is not confused with this case.
+    #[tokio::test]
+    async fn an_unborn_repository_still_reviews_landed_commits() {
+        struct EmptyThenFull(std::sync::Mutex<Vec<(String, String)>>);
+        impl CommitReader for EmptyThenFull {
+            fn head(
+                &self,
+            ) -> std::result::Result<Option<String>, ()> {
+                Ok(self.0.lock().unwrap().first().map(|(oid, _)| oid.clone()))
+            }
+            fn landed(
+                &self,
+                before: Option<&str>,
+                _: &str,
+                limit: usize,
+            ) -> Vec<(String, String)> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .take_while(|(oid, _)| Some(oid.as_str()) != before)
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            }
+            fn stat(&self, oid: &str) -> String {
+                format!(" {oid}.rs | 1 +")
+            }
+        }
+        let repo = std::sync::Arc::new(EmptyThenFull(std::sync::Mutex::new(Vec::new())));
+        let reader: SharedReader = repo.clone();
+        let review = Review::begin(reader, None)
+            .await
+            .expect("unborn branch starts a review");
+        // After the snapshot, a commit lands. The same reader now reports it.
+        repo.0.lock().unwrap().push((
+            "oid-new".into(),
+            format!("x\n\nCo-authored-by: m (v0.8.0 9ba3d8e3) <{NEWT}>\n"),
+        ));
+        let (report, _) = review.conclude().await;
+        assert!(
+            report.as_ref().is_some_and(|r| r.contains("oid-new")),
+            "unborn start should still review what landed: {report:?}"
+        );
+    }
+
     /// The pre-command snapshot succeeded but the post-command read hangs.
     struct HangAfterHead(std::sync::atomic::AtomicBool);
     impl CommitReader for HangAfterHead {
-        fn head(&self) -> Option<String> {
+        fn head(
+            &self,
+        ) -> std::result::Result<Option<String>, ()> {
             if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            Some("oid-base".into())
+            Ok(Some("oid-base".into()))
         }
         fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
             Vec::new()
@@ -1126,17 +1253,22 @@ mod tests {
             cwd: std::path::PathBuf::from("repo/child"),
             read_scope: crate::Scope::only(["repo/child".to_string()]),
         };
-        assert_eq!(repo.head(), None);
+        // A narrow read scope rejects the metadata read before git is spawned.
+        assert_eq!(repo.head(), Err(()));
         assert!(repo.landed(None, "h", 4).is_empty());
         assert!(repo.stat("abc").is_empty());
 
         let unrestricted = HostRepo {
-            cwd: std::path::PathBuf::from("repo/child"),
+            cwd: std::env::current_dir().unwrap(),
             read_scope: crate::Scope::All,
         };
-        // No git executable or repository in this mocked path: still empty,
-        // but the constructor did not reject the scope.
-        assert_eq!(unrestricted.head(), None);
+        // The unit-test cwd is a real git worktree: the unrestricted scope
+        // lets the read proceed and returns either a real HEAD or a clean
+        // Ok(None) for an unborn branch, never an error.
+        assert!(
+            unrestricted.head().is_ok(),
+            "unrestricted read scope must allow metadata git to run"
+        );
     }
 
     #[test]

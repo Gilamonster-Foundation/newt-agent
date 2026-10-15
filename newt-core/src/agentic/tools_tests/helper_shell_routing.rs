@@ -397,15 +397,17 @@ fn is_hallucination_allows_git_network_ops() {
 fn commit_review_covers_a_commit_the_detector_cannot_see() {
     struct Moves(std::sync::atomic::AtomicBool);
     impl crate::commit_review::CommitReader for Moves {
-        fn head(&self) -> Option<String> {
-            Some(
+        fn head(
+            &self,
+        ) -> std::result::Result<Option<String>, ()> {
+            Ok(Some(
                 if self.0.load(std::sync::atomic::Ordering::SeqCst) {
                     "oid-new"
                 } else {
                     "oid-base"
                 }
                 .into(),
-            )
+            ))
         }
         fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
             vec![(
