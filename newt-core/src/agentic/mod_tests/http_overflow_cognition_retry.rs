@@ -40,17 +40,21 @@ async fn cognition_preferences_cannot_purchase_a_capped_generation_retry() {
 }
 
 /// A new operator turn may continue, retaining the original cognition policy.
+/// Capped prose gets #2874's bounded in-turn continuation (the first request
+/// plus two), so the turn that exhausts that allowance is the one that hands
+/// off; only the next operator turn continues.
 #[tokio::test]
 async fn only_a_new_operator_turn_continues_after_output_exhaustion() {
+    const EXHAUSTED: usize = 3;
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
     Mock::given(method("POST"))
         .respond_with(move |_: &Request| {
-            let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+            let capped = seen.fetch_add(1, Ordering::SeqCst) < EXHAUSTED;
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices":[{"finish_reason":if first {"length"} else {"stop"},
-                    "message":{"content":if first {"partial"} else {"finished"}}}]
+                "choices":[{"finish_reason":if capped {"length"} else {"stop"},
+                    "message":{"content":if capped {"partial"} else {"finished"}}}]
             }))
         })
         .mount(&server)
@@ -66,7 +70,7 @@ async fn only_a_new_operator_turn_continues_after_output_exhaustion() {
         c.chat_completions_capability.cognition = Some(true);
         c.chat_completions_capability.chat_template_kwargs = Some(true);
         let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), turn + 1);
+        assert_eq!(calls.load(Ordering::SeqCst), EXHAUSTED + turn);
         if turn == 0 {
             assert!(reply.contains("truncated"));
         } else {
