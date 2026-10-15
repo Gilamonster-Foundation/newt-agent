@@ -860,7 +860,7 @@ impl SmartHarness {
     /// one and never blocks the turn.
     pub(crate) async fn review_commit_content(&self, prompt: String) -> Vec<String> {
         match self.complete_review_bounded(prompt).await {
-            Ok(raw) if self.admit_output(&raw).is_ok() => {
+            Ok(raw) if raw.len() <= self.settings.review_max_output_bytes => {
                 crate::commit_review::parse_content_findings(&raw)
             }
             _ => Vec::new(),
@@ -1595,6 +1595,23 @@ mod tests {
             settings,
         )
         .unwrap()
+    }
+
+    /// #2905 round 2 P3 (red): review output must be admitted against the
+    /// review-specific byte budget, not the mandatory adjudication budget.
+    #[tokio::test]
+    async fn commit_review_output_uses_review_max_output_bytes() {
+        let oversized = r#"{"findings":[{"kind":"leak","detail":"x"}]}"#;
+        // The reply is larger than review_max_output_bytes but smaller than
+        // max_output_bytes: the old code admits it, the fixed code rejects it.
+        let settings = AdjudicationSettings {
+            max_output_bytes: oversized.len() * 2,
+            review_max_output_bytes: oversized.len() - 1,
+            ..Default::default()
+        };
+        let h = harness(&[oversized], settings);
+        let prompt = crate::commit_review::content_prompt("fix", " a.rs | 1 +");
+        assert_eq!(h.review_commit_content(prompt).await, Vec::<String>::new());
     }
 
     /// #2905: content review uses a SEPARATE bounded budget from mandatory
