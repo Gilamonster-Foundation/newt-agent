@@ -76,22 +76,25 @@ async fn run(
     obs: Option<&mut crate::agentic::SolveObservation>,
     respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
 ) -> Run {
-    run_on(wire, allowance, obs, None, |_| {}, None, respond).await
+    run_on(wire, allowance, obs, None, |_| {}, None::<ResponseTemplate>, respond).await
 }
 
 /// `run` with an optional smart harness adjudicating the answer, a one-shot
 /// ctx tuner (#2874 C1: `safe_context`, `output_ceiling`, …), and an optional
 /// `GET /v1/models` probe body to mount (`None` = no probe answers, so a
 /// probed loop fails soft).
-async fn run_on(
+async fn run_on<P>(
     wire: &'static str,
     allowance: Option<u32>,
     obs: Option<&mut crate::agentic::SolveObservation>,
     harness: Option<&crate::agentic::smart_harness::SmartHarness>,
     tune: impl FnOnce(&mut ChatCtx),
-    probe: Option<serde_json::Value>,
+    probe: Option<P>,
     respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
-) -> Run {
+) -> Run
+where
+    P: wiremock::Respond + Send + Sync + 'static,
+{
     let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -120,10 +123,10 @@ async fn run_on(
         })
         .mount(&server)
         .await;
-    if let Some(body) = probe {
+    if let Some(responder) = probe {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .respond_with(responder)
             .mount(&server)
             .await;
     }
@@ -369,7 +372,7 @@ async fn smart_text_scenario(wire: &'static str) {
         None,
         Some(&harness),
         |_| {},
-        None,
+        None::<ResponseTemplate>,
         move |attempt, body| {
             if attempt == 1 {
                 prose(wire, body, attempt, true, "First half, ")
@@ -397,7 +400,7 @@ async fn smart_nudge_scenario(wire: &'static str) {
         None,
         Some(&harness),
         |_| {},
-        None,
+        None::<ResponseTemplate>,
         move |attempt, body| match attempt {
             1 => prose(wire, body, attempt, true, "First half, "),
             2 => prose(wire, body, attempt, false, "second half."),
@@ -562,13 +565,13 @@ async fn anthropic_thinking_only_stop_reaches_reasoning_overflow() {
 // ── #2874 C1: the probed/card ceiling feeds the retry (§1.5 tests 8-9) ────
 
 /// `GET /v1/models` answering one `test-model` entry with `max_tokens`.
-fn models_probe(max_tokens: u64) -> serde_json::Value {
-    serde_json::json!({
+fn models_probe(max_tokens: u64) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "data": [
             {"id": "test-model", "max_input_tokens": 200_000, "max_tokens": max_tokens}
         ],
         "has_more": false
-    })
+    }))
 }
 
 /// The caps every request on this wire carried, in order.
@@ -616,7 +619,7 @@ async fn absent_probe_keeps_the_default_retry_ceiling() {
         None,
         None,
         |_| {},
-        None,
+        None::<ResponseTemplate>,
         move |attempt, _| reply("anthropic", attempt, true, true),
     )
     .await;
@@ -781,7 +784,7 @@ async fn ollama_retry_clamps_to_the_window() {
         None,
         None,
         |ctx| ctx.safe_context = Some(9_000),
-        None,
+        None::<ResponseTemplate>,
         move |attempt, body| {
             // 9_000 − 40 input tokens reported by the capped reply.
             let limited = sent_cap("ollama", body).unwrap_or(0) < 8_960;
@@ -821,7 +824,7 @@ async fn shrinking_headroom_scenario(wire: &'static str) {
         None,
         None,
         |ctx| ctx.safe_context = Some(20_000),
-        None,
+        None::<ResponseTemplate>,
         move |attempt, _| {
             reply_with(
                 wire,
@@ -871,3 +874,88 @@ shrinking_headroom_test!(
     retained_cap_reclamps_to_shrinking_headroom_anthropic,
     "anthropic"
 );
+
+/// #2907 P2 4: a stalled /v1/models must not wedge the recovery turn. The
+/// probe is a metadata request, not a generation: it carries its own short
+/// overall deadline, so the turn completes with UNKNOWN limits — the
+/// default*2 ceiling on every retry — instead of waiting out the
+/// inference client's generation timeout.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn stalled_probe_deadline_yields_unknown_limits() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let stalled = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        run_on(
+            "anthropic",
+            None,
+            None,
+            None,
+            |_| {},
+            Some(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60))),
+            move |attempt, _| reply("anthropic", attempt, true, true),
+        ),
+    )
+    .await
+    .expect("the stalled metadata probe is bounded by its own short deadline");
+    let (result, requests, end, _dir) = stalled;
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(16_384), Some(16_384)],
+        "{result:?}: a timed-out probe means unknown limits — the default doubled"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+/// #2907 P2 4: an operator interrupt must abort the optional probe. The
+/// flag flips AS the probe request arrives — with it still unanswered — so
+/// only probe-side cancellation can end the turn; the streaming dispatch's
+/// own cancel path has already passed. The whole probe rides the turn's
+/// cancellation wrapper, so the turn ends at the interrupt instead of
+/// waiting out the inference client's generation timeout.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn cancelled_probe_ends_the_turn_promptly() {
+    struct ProbeThatInterrupts {
+        interrupt: &'static std::sync::atomic::AtomicBool,
+    }
+    impl wiremock::Respond for ProbeThatInterrupts {
+        fn respond(
+            &self,
+            _request: &wiremock::Request,
+        ) -> ResponseTemplate {
+            self.interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60))
+        }
+    }
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    // Leaked for the turn's 'static ChatCtx borrow — a test-process flag.
+    let interrupted: &'static std::sync::atomic::AtomicBool =
+        Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+    let (result, requests, end, _dir) = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        run_on(
+            "anthropic",
+            None,
+            None,
+            None,
+            // The interrupt flag the loop's own round-top checks consume.
+            |ctx| ctx.cancel = Some(interrupted),
+            Some(ProbeThatInterrupts {
+                interrupt: interrupted,
+            }),
+            move |attempt, _| reply("anthropic", attempt, true, true),
+        ),
+    )
+    .await
+    .expect("a cancelled turn must not wait for the probe");
+    assert_eq!(
+        requests.len(),
+        1,
+        "{result:?}: the turn ends at the interrupt, before a retry is sent"
+    );
+    assert_ne!(end, Some(crate::TurnEndReason::Failed), "{result:?}");
+}

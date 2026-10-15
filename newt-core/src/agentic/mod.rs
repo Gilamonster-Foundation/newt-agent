@@ -9440,6 +9440,15 @@ async fn final_summary_anthropic(
     .await
 }
 
+/// #2907 P2 4: overall budget for the lazy output-ceiling probe — a
+/// metadata probe, not a generation. The inference client it borrows
+/// carries the generation timeout (120 s by default); without its own
+/// short deadline a stalled /v1/models wedged the recovery turn for that
+/// whole timeout, after the turn was already interrupted. Generous for up
+/// to [`backend_probe`]'s five paginated GETs on a slow proxy, a fraction
+/// of any generation budget.
+const METADATA_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn anthropic_chat_complete_with_prompt_and_artifacts(
     ctx: ChatCtx<'_>,
     turn_prompt_context: Option<&crate::TurnPromptContext>,
@@ -10618,9 +10627,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // > the wire default doubled — clamped to the room the capped
             // reply's actual input leaves in the window (a raised cap is sent
             // WITHOUT admission, so the window is the only bound on it).
-            // The probe is lazy: at most one round trip per turn, only once a
-            // reply has capped. Non-streaming keeps the default*2 floor — a
-            // large non-streamed `max_tokens` risks HTTP timeouts (§1.6
+            // The probe is lazy: at most one probe per turn, only once a
+            // reply has capped (the probe itself can paginate up to five
+            // /v1/models requests). Non-streaming keeps the default*2 floor —
+            // a large non-streamed `max_tokens` risks HTTP timeouts (§1.6
             // item 3), so the probed ceiling is not applied there; a KNOWN
             // card ceiling below that floor still bounds it (#2907 P2 2).
             let default_retry_ceiling = anthropic_wire::default_max_tokens().saturating_mul(2);
@@ -10630,11 +10640,28 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     Some(card) => Some(card),
                     None => {
                         if probed_ceiling.is_none() {
+                            // #2907 P2 4: a metadata probe, not a generation.
+                            // The whole optional probe is bounded by the
+                            // turn's cancellation wrapper AND a short overall
+                            // deadline — never the inference client's
+                            // generation timeout. Cancelled or timed out
+                            // means UNKNOWN limits, cached like any other
+                            // probe failure — never a failed turn.
                             probed_ceiling = Some(
-                                crate::backend_probe::api_for(crate::BackendKind::Anthropic)
-                                    .limits(&client, url, model, api_key)
-                                    .await
-                                    .output_ceiling,
+                                cancellable(
+                                    cancel,
+                                    tokio::time::timeout(
+                                        METADATA_PROBE_DEADLINE,
+                                        crate::backend_probe::api_for(
+                                            crate::BackendKind::Anthropic,
+                                        )
+                                        .limits(&client, url, model, api_key),
+                                    ),
+                                )
+                                .await
+                                .and_then(|bounded| bounded.ok())
+                                .map(|limits| limits.output_ceiling)
+                                .flatten(),
                             );
                         }
                         probed_ceiling.flatten()
