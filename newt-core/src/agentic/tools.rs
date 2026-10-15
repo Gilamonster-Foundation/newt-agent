@@ -4586,11 +4586,10 @@ async fn execute_authorized_tool(
                 // #2905: the build_shell route is still a run_command that
                 // may land commits, so it gets the same async HEAD snapshot
                 // and post-execution review as the confined shell route.
-                let commit_reader: crate::commit_review::SharedReader =
-                    std::sync::Arc::new(crate::commit_review::HostRepo {
-                        cwd: std::path::PathBuf::from(&run_cwd),
-                        read_scope: caveats.fs_read.clone(),
-                    });
+                let reader_source = crate::commit_review::default_reader_source();
+                let commit_reader = reader_source
+                    .open(std::path::Path::new(&run_cwd), &caveats.fs_read)
+                    .unwrap_or_else(|| std::sync::Arc::new(crate::commit_review::NoOpRepo));
                 let commit_policy = git_tool.and_then(|tool| tool.native_commit_policy());
                 let commit_review = crate::commit_review::Review::begin(
                     commit_reader.clone(),
