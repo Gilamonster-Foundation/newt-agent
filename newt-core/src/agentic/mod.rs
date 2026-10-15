@@ -10621,7 +10621,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // The probe is lazy: at most one round trip per turn, only once a
             // reply has capped. Non-streaming keeps the default*2 floor — a
             // large non-streamed `max_tokens` risks HTTP timeouts (§1.6
-            // item 3), so the probed ceiling is not applied there.
+            // item 3), so the probed ceiling is not applied there; a KNOWN
+            // card ceiling below that floor still bounds it (#2907 P2 2).
             let default_retry_ceiling = anthropic_wire::default_max_tokens().saturating_mul(2);
             let reply_input = model_reply.usage.map(|usage| usage.input_tokens);
             let declared_ceiling = if streaming_enabled {
@@ -10640,7 +10641,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     }
                 }
             } else {
-                None
+                // The smaller of the declared maximum and the conservative
+                // fallback: a provider enforcing the declared ceiling would
+                // reject a default*2 retry above it.
+                output_ceiling.map(|card| card.min(default_retry_ceiling))
             };
             if output_recovery.retry(
                 !model_reply.tool_uses.is_empty() || model_reply.unfinished_tool_use,

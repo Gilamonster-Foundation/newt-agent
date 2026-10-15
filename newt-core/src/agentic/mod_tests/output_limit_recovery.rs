@@ -722,7 +722,9 @@ async fn card_ceiling_wins_over_the_probed_ceiling() {
 
 /// §1.6 item 3: non-streaming requests keep the default*2 floor — a large
 /// non-streamed `max_tokens` risks HTTP timeouts, so the probed ceiling
-/// must NOT raise the retry there.
+/// must NOT raise the retry there. #2907 P2 2 extends it beyond the
+/// 64000-token declaration: a KNOWN card ceiling BELOW the fallback still
+/// bounds the conservative floor — the smaller of the two.
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn non_streaming_retry_keeps_the_default_floor() {
@@ -741,6 +743,24 @@ async fn non_streaming_retry_keeps_the_default_floor() {
     assert_eq!(
         caps("anthropic", &requests),
         vec![Some(8_192), Some(16_384), Some(16_384)],
+        "{result:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+    // A declared ceiling below the fallback wins over it: a provider
+    // enforcing the declared 9000 would reject the old default*2 retry.
+    let (result, requests, end, _dir) = run_on(
+        "anthropic",
+        None,
+        None,
+        None,
+        |ctx| ctx.output_ceiling = Some(9_000),
+        Some(models_probe(64_000)),
+        move |attempt, body| prose("anthropic", body, attempt, true, "First half, "),
+    )
+    .await;
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(9_000), Some(9_000)],
         "{result:?}"
     );
     assert_eq!(end, Some(crate::TurnEndReason::Failed));
