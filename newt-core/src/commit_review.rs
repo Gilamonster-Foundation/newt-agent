@@ -19,6 +19,11 @@ pub(crate) struct Expected {
     lines: Vec<String>,
     /// Address tags (`<…>`) that belong to newt's own machinery.
     newt_tags: Vec<String>,
+    /// Lines EVERY commit claiming newt provenance owes: the policy's
+    /// explicit operator by-line plus the provenance line. Model trailers
+    /// (newt's or a foreign harness's) are consumed after the first commit
+    /// of a chain, so they are never required.
+    required: Vec<String>,
     vouched: bool,
 }
 
@@ -29,9 +34,8 @@ impl Expected {
         let mut newt_tags = vec![format!("<{}>", crate::agent_identity::DEFAULT_AGENT_EMAIL)];
         let Some(policy) = policy else {
             return Self {
-                lines: Vec::new(),
                 newt_tags,
-                vouched: false,
+                ..Self::default()
             };
         };
         if let Some(email) = policy.agent_email() {
@@ -40,22 +44,31 @@ impl Expected {
                 newt_tags.push(tag);
             }
         }
-        match policy.finalize_message("") {
-            Ok(rendered) => Self {
-                lines: rendered
-                    .lines()
-                    .map(str::trim_end)
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
+        let Ok(rendered) = policy.finalize_message("") else {
+            return Self {
                 newt_tags,
-                vouched: true,
-            },
-            Err(_) => Self {
-                lines: Vec::new(),
-                newt_tags,
-                vouched: false,
-            },
+                ..Self::default()
+            };
+        };
+        let lines: Vec<String> = rendered
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let operator = policy.operator_line();
+        let required = lines
+            .iter()
+            .filter(|l| {
+                crate::attribution::is_newt_provenance(l) || operator.as_deref() == Some(l.as_str())
+            })
+            .cloned()
+            .collect();
+        Self {
+            lines,
+            newt_tags,
+            required,
+            vouched: true,
         }
     }
 
@@ -362,9 +375,8 @@ pub(crate) fn check_trailers(message: &str, expected: &Expected) -> Vec<Finding>
         // tail. Operator by-line and provenance are owed by every one.
         findings.extend(
             expected
-                .lines
+                .required
                 .iter()
-                .filter(|e| !expected.claims_newt(e) || crate::attribution::is_newt_provenance(e))
                 .filter(|e| !lines.contains(&e.as_str()))
                 .map(|e| Finding::Missing(e.clone())),
         );
@@ -386,6 +398,9 @@ mod tests {
         }
         fn agent_email(&self) -> Option<String> {
             Some(self.0.agent_email.clone())
+        }
+        fn operator_line(&self) -> Option<String> {
+            self.0.operator_trailer()
         }
         fn signing_required(&self) -> bool {
             false
@@ -579,6 +594,41 @@ mod tests {
         let second = ledger(NEWT).finalize_message("second\n");
         let expected = Expected::from_policy(Some(&LedgerPolicy(with_history)));
         assert_eq!(check_trailers(&second, &expected), Vec::new());
+    }
+
+    /// Codex round 1 (#2906 P2-4): a chained second commit after a session
+    /// with a foreign-harness contributor. The native policy consumed that
+    /// contributor on the first commit, so the second legitimately lacks
+    /// its `noreply@anthropic.com` trailer. Only operator + provenance are
+    /// owed by every commit.
+    #[test]
+    fn chained_commit_with_consumed_foreign_contributor_passes() {
+        let mut with_history = ledger(NEWT);
+        with_history.contributors = vec![
+            crate::attribution::Attribution::new(
+                "previous-model",
+                "Claude Code",
+                "2.1",
+                "noreply@anthropic.com",
+            ),
+            crate::attribution::Attribution::new(
+                "codex",
+                "Codex CLI",
+                "0.47.0",
+                "codex@openai.com",
+            ),
+        ];
+        let expected = Expected::from_policy(Some(&LedgerPolicy(with_history.clone())));
+        let second = with_history.finalize_message_with("second commit", &[]);
+        assert_eq!(check_trailers(&second, &expected), Vec::new());
+        // The operator line is still owed, by name, not inferred by address.
+        let no_operator = second.replace("Co-authored-by: Op Erator <op@example.com>\n", "");
+        assert_eq!(
+            check_trailers(&no_operator, &expected),
+            vec![Finding::Missing(
+                "Co-authored-by: Op Erator <op@example.com>".into()
+            )]
+        );
     }
 
     #[test]

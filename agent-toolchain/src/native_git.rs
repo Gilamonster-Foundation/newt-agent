@@ -28,6 +28,14 @@ pub trait CommitPolicy: Send + Sync {
         None
     }
 
+    /// The operator by-line every commit owes, when a real operator email is
+    /// known. Named explicitly so a review never infers which rendered lines
+    /// are mandatory from their address (foreign-harness contributors are
+    /// consumed after the first commit; the operator line is not).
+    fn operator_line(&self) -> Option<String> {
+        None
+    }
+
     /// Whether the operator requires a signature for this invocation.
     fn signing_required(&self) -> bool;
 
