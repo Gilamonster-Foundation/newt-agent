@@ -755,7 +755,9 @@ mod tests {
         );
         // Step 2 (#2913): a `${...}` reference literal is unresolved at rest —
         // configured, but no usable credential. Only a `SecretValue::Ref`
-        // (env/file/cmd secret reference) counts as authenticated.
+        // (env/file/cmd secret reference) counts as authenticated — and only
+        // when the referenced value actually resolves (an unset `${VAR}` is a
+        // missing credential → Configured).
         let ref_entry = McpServerEntry {
             name: "h".into(),
             enabled: true,
@@ -778,7 +780,11 @@ mod tests {
             trust: McpTrust::Trusted,
             origin: None,
         };
+        // TOKEN is unset → missing credential → Configured, not Authenticated.
+        assert_eq!(classify_readiness(&ref_entry), McpReadiness::Configured);
+        unsafe { std::env::set_var("TOKEN", "resolved-secret") };
         assert_eq!(classify_readiness(&ref_entry), McpReadiness::Authenticated);
+        unsafe { std::env::remove_var("TOKEN") };
         assert_eq!(
             classify_readiness(&entry(TransportKind::Http, true)),
             McpReadiness::Configured
@@ -882,11 +888,19 @@ mod tests {
             classify_readiness(&entry(header("${TOKEN}"))),
             McpReadiness::Configured
         );
-        // Structured secret reference: counts as configured credential.
+        // Structured secret reference: counts as configured credential only
+        // when the referenced value actually resolves. TOKEN unset → missing
+        // credential → Configured; TOKEN set → Authenticated.
+        assert_eq!(
+            classify_readiness(&entry(ref_header())),
+            McpReadiness::Configured
+        );
+        unsafe { std::env::set_var("TOKEN", "resolved-secret") };
         assert_eq!(
             classify_readiness(&entry(ref_header())),
             McpReadiness::Authenticated
         );
+        unsafe { std::env::remove_var("TOKEN") };
         // No header at all: admitted but no credential.
         assert_eq!(
             classify_readiness(&entry(Default::default())),

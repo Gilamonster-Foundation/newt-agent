@@ -257,12 +257,15 @@ pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
     // A plaintext bearer header is rejected (as `newt auth` already does) — it
     // is not a usable credential. A `${...}` reference literal is unresolved at
     // rest, so it is "configured but missing credential", not authenticated.
-    // Only a `SecretValue::Ref` (env/file/cmd secret reference) counts as a
-    // configured credential; token freshness and OAuth validity are layered on
-    // top by the interactive surfaces — doctor makes no connection.
+    // Only a `SecretValue::Ref` (env/file/cmd secret reference) that actually
+    // resolves to a non-empty secret counts as configured; an unset `${VAR}`,
+    // empty file, or failing command is "missing credential" → Configured.
+    // Token freshness and OAuth validity are layered on top by the interactive
+    // surfaces — doctor makes no connection.
     if entry.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("authorization")
             && matches!(value, newt_core::mcp::SecretValue::Ref(_))
+            && value.resolve().is_ok()
     }) {
         return McpReadiness::Authenticated;
     }
