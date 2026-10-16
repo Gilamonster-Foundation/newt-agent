@@ -512,6 +512,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         .find_model_tuning(&model)
         .and_then(|t| t.overflow_retry)
         .unwrap_or_default();
+    // #2907 P2 3: the resolved card's tuning ceiling rides the SAME sidecar
+    // decision as the capabilities above — without this, setting the card
+    // key output_ceiling_tokens silently does nothing on the headless lane.
+    dc.output_ceiling = decision.output_ceiling();
     dc.run_allowance = run_allowance;
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;

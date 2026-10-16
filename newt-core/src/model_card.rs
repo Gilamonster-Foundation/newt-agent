@@ -169,6 +169,13 @@ pub struct Tuning {
     /// The context-token budget the harness should plan against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+    /// The model's maximum output tokens (`max_tokens` on the Anthropic
+    /// wire), when declared. `None` = undeclared. A declaration wins over
+    /// the probed `/v1/models` ceiling (#2874 C1: card > probe > none) and
+    /// bounds what an output-limit recovery retry may raise the cap to;
+    /// first sends and the input reserve never consult it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ceiling_tokens: Option<u32>,
 }
 
 impl Tuning {
@@ -179,6 +186,7 @@ impl Tuning {
             top_p: o.top_p.or(self.top_p),
             top_k: o.top_k.or(self.top_k),
             context_tokens: o.context_tokens.or(self.context_tokens),
+            output_ceiling_tokens: o.output_ceiling_tokens.or(self.output_ceiling_tokens),
         }
     }
 }
@@ -552,12 +560,13 @@ pub fn builtin_card_entries() -> Vec<(String, ModelCard)> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedCapabilities {
     inline: Option<Capability>,
-    /// ONE association per resolved card: capability AND family ride the
-    /// same binding (both optional), so the typed applicability the display
-    /// owner renders and the family policy the initiative seam consumes can
-    /// never diverge — a family-only card's transitions are exactly as
-    /// VISIBLE as a capability card's. A card carrying NEITHER contributes
-    /// nothing and mints no binding (serving/tuning-only cards stay
+    /// ONE association per resolved card: capability, family AND tuning ride
+    /// the same binding (each optional), so the typed applicability the display
+    /// owner renders, the family policy the initiative seam consumes, and the
+    /// tuning ceiling the TUI/headless lanes feed to the loop can never
+    /// diverge — a family-only or tuning-only card's transitions are exactly
+    /// as VISIBLE as a capability card's. A card carrying NONE of the three
+    /// contributes nothing and mints no binding (serving-only cards stay
     /// silent). Family identity is DECOUPLED from serving-default
     /// availability (a `family` with no `cards/families/<name>.toml`
     /// profile is still an identity).
@@ -598,8 +607,8 @@ impl CardBindingSeed {
     }
 }
 
-/// An operator's card binding: the card's declared capability plus the model
-/// the operator bound the card against.
+/// An operator's card binding: the card's declared capability, family, and
+/// tuning layers, plus the model the operator bound the card against.
 #[derive(Debug, Clone, PartialEq)]
 struct CardBinding {
     name: String,
@@ -607,6 +616,10 @@ struct CardBinding {
     capability: Option<Capability>,
     /// The card's declared family identity, when it names one.
     family: Option<String>,
+    /// The card's `[tuning]` layer, when it declares one — rides the same
+    /// binding and the same association gates as the capability (#2907
+    /// P2 3), so the TUI/headless callers read it from the one decision.
+    tuning: Option<Tuning>,
     /// From [`CardBindingSeed::bound_model`] — `None` when the backend
     /// declared no model.
     bound_model: Option<String>,
@@ -679,6 +692,10 @@ pub enum CardApplicability {
 pub struct CapabilityDecision {
     effective: Option<Capability>,
     applicability: CardApplicability,
+    /// The bound card's `[tuning]` layer, when the binding ACTIVELY
+    /// applies — the same route gates as `effective` (#2907 P2 3), so a
+    /// card bound to another destination or model never leaks its tuning.
+    tuning: Option<Tuning>,
 }
 
 impl CapabilityDecision {
@@ -730,6 +747,16 @@ impl CapabilityDecision {
             .and_then(|c| c.emits_leading_reasoning)
             .unwrap_or(false)
     }
+
+    /// #2907 P2 3: the bound card's declared output ceiling
+    /// (`tuning.output_ceiling_tokens`) for this route — `None` without an
+    /// active card binding or when the card declares none. The TUI and
+    /// headless lanes both read this into `ChatCtx.output_ceiling`, where
+    /// it bounds output-limit recovery retries (never the first send).
+    #[must_use]
+    pub fn output_ceiling(&self) -> Option<u32> {
+        self.tuning.as_ref().and_then(|t| t.output_ceiling_tokens)
+    }
 }
 
 /// Does this principal EXACTLY associate with the bound model? Instance
@@ -762,8 +789,8 @@ impl ResolvedCapabilities {
     /// A seed that NAMES a card which does not resolve is a hard error naming
     /// the backend, the card, and the typed catalog diagnosis (not found /
     /// malformed file / name mismatch / duplicate / invalid card). A resolved
-    /// card that merely lacks a `[capability]` block is valid — serving/
-    /// tuning-only — and contributes NO layer: `binding` stays `None`, so
+    /// card that declares none of the three layers is valid — serving-only —
+    /// and contributes NO layer: `binding` stays `None`, so
     /// nothing downstream reports an inactive binding for declarations that
     /// never existed.
     pub fn resolve(
@@ -794,18 +821,23 @@ impl ResolvedCapabilities {
             .map_err(|e| format!("backend `{}` names model card `{name}` — {e}", backend.name))?;
         let capability = card.capability;
         let family = card.family.clone().filter(|f| !f.trim().is_empty());
+        let tuning = card.tuning.clone();
         Ok(Self {
             // ONE binding whenever the card CONTRIBUTES anything —
-            // capability, family, or both. A card with neither contributes
-            // nothing: no binding, no applicability chatter downstream.
-            binding: (capability.is_some() || family.is_some()).then(|| CardBinding {
-                name: name.to_string(),
-                capability,
-                family,
-                // The effective-model rule, defensively: an empty/whitespace
-                // bound model in a hand-built seed is no identity.
-                bound_model: seed.bound_model.clone().filter(|m| !m.trim().is_empty()),
-                bound_destination: seed.bound_destination.clone(),
+            // capability, family, or tuning. A card declaring none of the
+            // three contributes nothing: no binding, no applicability
+            // chatter downstream.
+            binding: (capability.is_some() || family.is_some() || tuning.is_some()).then(|| {
+                CardBinding {
+                    name: name.to_string(),
+                    capability,
+                    family,
+                    tuning,
+                    // The effective-model rule, defensively: an empty/whitespace
+                    // bound model in a hand-built seed is no identity.
+                    bound_model: seed.bound_model.clone().filter(|m| !m.trim().is_empty()),
+                    bound_destination: seed.bound_destination.clone(),
+                }
             }),
             inline,
         })
@@ -880,6 +912,7 @@ impl ResolvedCapabilities {
             return CapabilityDecision {
                 effective: self.inline.clone(),
                 applicability: CardApplicability::None,
+                tuning: None,
             };
         };
         // Association needs a CONCRETE destination on BOTH sides (exactly
@@ -892,6 +925,7 @@ impl ResolvedCapabilities {
                 applicability: CardApplicability::Undecided {
                     card: b.name.clone(),
                 },
+                tuning: None,
             };
         }
         if b.bound_destination != *active_destination {
@@ -902,6 +936,7 @@ impl ResolvedCapabilities {
                     bound_destination: b.bound_destination.clone(),
                     active_destination: active_destination.clone(),
                 },
+                tuning: None,
             };
         }
         let applies = principal_associates(b.bound_model.as_deref(), principal);
@@ -920,6 +955,9 @@ impl ResolvedCapabilities {
                 applicability: CardApplicability::Active {
                     card: b.name.clone(),
                 },
+                // #2907 P2 3: the tuning layer rides ONLY the active arm —
+                // an inactive binding never leaks its declarations.
+                tuning: b.tuning.clone(),
             };
         }
         let applicability = match principal {
@@ -940,6 +978,7 @@ impl ResolvedCapabilities {
         CapabilityDecision {
             effective: self.inline.clone(),
             applicability,
+            tuning: None,
         }
     }
 }
@@ -1424,6 +1463,137 @@ reasoning_replay_scope = "current_user_turn"
         assert!(
             o.num_ctx.unwrap() < 262_144,
             "ollama num_ctx is capped below the native window (OOM guard)"
+        );
+    }
+
+    /// #2874 C1: the card's declared output ceiling parses beside
+    /// `context_tokens` and deep-merges with per-field overlay precedence.
+    #[test]
+    fn tuning_output_ceiling_tokens_parses_and_merges() {
+        let card = toml::from_str::<ModelCard>(
+            r#"
+name = "m"
+backend = "ollama"
+
+[tuning]
+context_tokens = 262144
+output_ceiling_tokens = 64000
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            card.tuning.as_ref().and_then(|t| t.output_ceiling_tokens),
+            Some(64_000)
+        );
+        // A card without the key keeps the base's declaration; one WITH it
+        // wins field-by-field (the existing merge law, nothing new).
+        let keep = card.clone().merge(
+            toml::from_str::<ModelCard>(
+                r#"
+name = "m"
+backend = "ollama"
+"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            keep.tuning.and_then(|t| t.output_ceiling_tokens),
+            Some(64_000)
+        );
+        let overlay = card.merge(
+            toml::from_str::<ModelCard>(
+                r#"
+name = "m"
+backend = "ollama"
+
+[tuning]
+output_ceiling_tokens = 32000
+"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            overlay.tuning.and_then(|t| t.output_ceiling_tokens),
+            Some(32_000)
+        );
+    }
+
+    /// #2907 P2 3: a resolved card's tuning layer rides the SAME binding
+    /// and the SAME route gates as its capability — an exact association
+    /// carries `output_ceiling_tokens` into the decision; a retargeted
+    /// principal or a tuning-less card carries none.
+    #[test]
+    fn decision_carries_the_card_output_ceiling_through_the_route_gates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path().join("profile.toml");
+        std::fs::write(&profile, "# profile\n").expect("write profile");
+        std::fs::create_dir_all(dir.path().join("models")).expect("models dir");
+        std::fs::write(
+            dir.path().join("models/ceiling.toml"),
+            "name = \"ceiling\"\nbackend = \"vllm\"\n\n[vllm]\nserved_name = \"bound-model\"\n\n[tuning]\noutput_ceiling_tokens = 20000\n",
+        )
+        .expect("write tuning card");
+        let backend = crate::BackendConfig {
+            name: "carded".into(),
+            endpoint: "http://local:8000".into(),
+            model: Some("bound-model".into()),
+            card: Some("ceiling".into()),
+            ..Default::default()
+        };
+        let seed = CardBindingSeed {
+            card: backend.card.clone(),
+            bound_model: backend.model.clone(),
+            bound_destination: crate::BackendDestination::of(&backend),
+        };
+        let caps =
+            ResolvedCapabilities::resolve(&backend, &seed, Some(&profile)).expect("card resolves");
+        let destination = crate::BackendDestination::of(&backend);
+        // Exact principal: the declared ceiling reaches the decision.
+        let active = caps.for_route(
+            &destination,
+            ServingPrincipal::MultiplexerModel("bound-model"),
+        );
+        assert_eq!(
+            active.output_ceiling(),
+            Some(20_000),
+            "an exactly associated card contributes its tuning ceiling"
+        );
+        // Retargeted principal: no association, no ceiling.
+        let retargeted = caps.for_route(
+            &destination,
+            ServingPrincipal::MultiplexerModel("other-model"),
+        );
+        assert_eq!(
+            retargeted.output_ceiling(),
+            None,
+            "a card bound to another model must not leak its ceiling"
+        );
+        // A card without the key declares none, exactly as an absent card.
+        std::fs::write(
+            dir.path().join("models/tuneless.toml"),
+            "name = \"tuneless\"\nbackend = \"vllm\"\n\n[vllm]\nserved_name = \"bound-model\"\n\n[capability]\nemits_leading_reasoning = true\n",
+        )
+        .expect("write tuning-less card");
+        let tuneless = crate::BackendConfig {
+            name: "tuneless".into(),
+            card: Some("tuneless".into()),
+            ..backend.clone()
+        };
+        let seed = CardBindingSeed {
+            card: tuneless.card.clone(),
+            bound_model: tuneless.model.clone(),
+            bound_destination: crate::BackendDestination::of(&tuneless),
+        };
+        let caps = ResolvedCapabilities::resolve(&tuneless, &seed, Some(&profile))
+            .expect("tuning-less card resolves");
+        let decided = caps.for_route(
+            &destination,
+            ServingPrincipal::MultiplexerModel("bound-model"),
+        );
+        assert_eq!(
+            decided.output_ceiling(),
+            None,
+            "a card declaring no ceiling contributes none"
         );
     }
 

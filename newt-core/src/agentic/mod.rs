@@ -1026,6 +1026,11 @@ pub struct ChatCtx<'a> {
     /// Sourced from `model-capabilities.json` via `ensure_context_window`.
     /// `None` disables overflow detection.
     pub safe_context: Option<u32>,
+    /// The model card's declared output ceiling (`tuning.output_ceiling_tokens`),
+    /// resolved by the caller. `None` = undeclared. The output-limit recovery
+    /// retry prefers it over the probed ceiling (card > probe > none, #2874
+    /// C1); first sends and the input reserve never consult it.
+    pub output_ceiling: Option<u32>,
     /// Hook invoked when a dispatch fails, to recover a hard context-window
     /// 400: `(error, model, today) → parsed full context window`. The loop
     /// derives the effective input cap after reserving its configured maximum
@@ -1490,6 +1495,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
+        output_ceiling: _,
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
@@ -2670,7 +2676,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     .is_some_and(|calls| !calls.is_empty()),
                 &probe_content,
                 output_allowance,
-                output_limit_recovery::ceiling(),
+                // #2874 C1: a raised cap is sent without admission — clamp it
+                // to the window the capped reply's actual input leaves.
+                output_limit_recovery::window_clamp(
+                    output_limit_recovery::ceiling(),
+                    safe_context,
+                    json["prompt_eval_count"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok()),
+                ),
                 &mut messages,
                 smart_harness,
             )? {
@@ -6659,6 +6673,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
+        output_ceiling: _,
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
@@ -7871,7 +7886,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     .is_some_and(|calls| !calls.is_empty()),
                 &oa_content,
                 round_policy.output_allowance,
-                output_limit_recovery::ceiling(),
+                // #2874 C1: a raised cap is sent without admission — clamp it
+                // to the window the capped reply's actual input leaves.
+                output_limit_recovery::window_clamp(
+                    output_limit_recovery::ceiling(),
+                    safe_context,
+                    json["usage"]["prompt_tokens"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok()),
+                ),
                 &mut messages,
                 smart_harness,
             )? {
@@ -9417,6 +9440,15 @@ async fn final_summary_anthropic(
     .await
 }
 
+/// #2907 P2 4: overall budget for the lazy output-ceiling probe — a
+/// metadata probe, not a generation. The inference client it borrows
+/// carries the generation timeout (120 s by default); without its own
+/// short deadline a stalled /v1/models wedged the recovery turn for that
+/// whole timeout, after the turn was already interrupted. Generous for up
+/// to [`backend_probe`]'s five paginated GETs on a slow proxy, a fraction
+/// of any generation budget.
+const METADATA_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn anthropic_chat_complete_with_prompt_and_artifacts(
     ctx: ChatCtx<'_>,
     turn_prompt_context: Option<&crate::TurnPromptContext>,
@@ -9485,6 +9517,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
+        output_ceiling,
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
@@ -9725,6 +9758,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // Consecutive context-window recoveries (parse limit → trim → retry).
     let mut cw_retries: u32 = 0;
     let mut output_recovery = output_limit_recovery::Recovery::default();
+    // #2874 C1: this endpoint+model's probed output ceiling, probed lazily
+    // (one /v1/models round trip per turn, only once a reply has capped).
+    // Outer `None` = not yet probed; inner `None` = probed, nothing declared.
+    let mut probed_ceiling: Option<Option<u32>> = None;
     // No-tools recovery (mirrors the OpenAI path): real Anthropic never
     // rejects `tools`, but façades might; drop tools and retry, notice once.
     let mut tools_supported = true;
@@ -10585,11 +10622,65 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     false,
                 );
             }
+            // #2874 C1: the retry ceiling is the model's declared maximum —
+            // card `output_ceiling_tokens` > probed `/v1/models` `max_tokens`
+            // > the wire default doubled — clamped to the room the capped
+            // reply's actual input leaves in the window (a raised cap is sent
+            // WITHOUT admission, so the window is the only bound on it).
+            // The probe is lazy: at most one probe per turn, only once a
+            // reply has capped (the probe itself can paginate up to five
+            // /v1/models requests). Non-streaming keeps the default*2 floor —
+            // a large non-streamed `max_tokens` risks HTTP timeouts (§1.6
+            // item 3), so the probed ceiling is not applied there; a KNOWN
+            // card ceiling below that floor still bounds it (#2907 P2 2).
+            let default_retry_ceiling = anthropic_wire::default_max_tokens().saturating_mul(2);
+            let reply_input = model_reply.usage.map(|usage| usage.input_tokens);
+            let declared_ceiling = if streaming_enabled {
+                match output_ceiling {
+                    Some(card) => Some(card),
+                    None => {
+                        if probed_ceiling.is_none() {
+                            // #2907 P2 4: a metadata probe, not a generation.
+                            // The whole optional probe is bounded by the
+                            // turn's cancellation wrapper AND a short overall
+                            // deadline — never the inference client's
+                            // generation timeout. Cancelled or timed out
+                            // means UNKNOWN limits, cached like any other
+                            // probe failure — never a failed turn.
+                            probed_ceiling = Some(
+                                cancellable(
+                                    cancel,
+                                    tokio::time::timeout(
+                                        METADATA_PROBE_DEADLINE,
+                                        crate::backend_probe::api_for(
+                                            crate::BackendKind::Anthropic,
+                                        )
+                                        .limits(&client, url, model, api_key),
+                                    ),
+                                )
+                                .await
+                                .and_then(|bounded| bounded.ok())
+                                .and_then(|limits| limits.output_ceiling),
+                            );
+                        }
+                        probed_ceiling.flatten()
+                    }
+                }
+            } else {
+                // The smaller of the declared maximum and the conservative
+                // fallback: a provider enforcing the declared ceiling would
+                // reject a default*2 retry above it.
+                output_ceiling.map(|card| card.min(default_retry_ceiling))
+            };
             if output_recovery.retry(
                 !model_reply.tool_uses.is_empty() || model_reply.unfinished_tool_use,
                 &model_reply.text,
                 Some(max_tokens),
-                anthropic_wire::default_max_tokens().saturating_mul(2),
+                output_limit_recovery::window_clamp(
+                    declared_ceiling.unwrap_or(default_retry_ceiling),
+                    safe_context,
+                    reply_input,
+                ),
                 &mut messages,
                 smart_harness,
             )? {
@@ -12089,6 +12180,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         max_ok_input,
         build_check_cmd,
         safe_context,
+        output_ceiling: _,
         // #1528: activated — the Responses loop now recovers a hard cw-400 by
         // learning the window, tightening a monotone ceiling, compacting via the
         // shared `compress::compress`, and re-dispatching (bounded to 2).
@@ -12874,7 +12966,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call")),
                 &partial,
                 generation_policy.output_allowance,
-                output_limit_recovery::ceiling(),
+                // #2874 C1: a raised cap is sent without admission — clamp it
+                // to the window the capped reply's actual input leaves.
+                output_limit_recovery::window_clamp(
+                    output_limit_recovery::ceiling(),
+                    safe_context,
+                    json["usage"]["input_tokens"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok()),
+                ),
                 &mut input,
                 smart_harness,
             )? {

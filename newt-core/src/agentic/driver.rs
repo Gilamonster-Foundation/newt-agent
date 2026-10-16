@@ -165,6 +165,9 @@ pub struct TurnDriverConfig {
     pub build_check_cmd: Option<String>,
     /// Empirically safe context size used to detect likely overflow.
     pub safe_context: Option<u32>,
+    /// The model card's declared output ceiling (`tuning.output_ceiling_tokens`);
+    /// feeds the output-limit recovery retry (card > probe > none, #2874 C1).
+    pub output_ceiling: Option<u32>,
     /// #727: percent of `num_ctx` used as the input-token ceiling (default 80).
     pub input_ceiling_pct: u32,
     /// #727: remaining-budget percent below which the loop nudges (default 15).
@@ -235,6 +238,7 @@ impl TurnDriverConfig {
             max_ok_input: None,
             build_check_cmd: None,
             safe_context: None,
+            output_ceiling: None,
             input_ceiling_pct: 80,
             low_budget_pct: 15,
             estimation: crate::tokens::TokenEstimation::default(),
@@ -804,6 +808,7 @@ async fn run_one_turn(
         max_ok_input: config.max_ok_input,
         build_check_cmd: config.build_check_cmd.clone(),
         safe_context: config.safe_context,
+        output_ceiling: config.output_ceiling,
         // Numbered context recovery is stateless and shared with the TUI.
         recover_cw_400: Some(super::recover_context_window_400),
         note_sink: None,

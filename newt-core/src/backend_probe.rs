@@ -78,6 +78,24 @@ pub trait BackendApi: Send + Sync {
         api_key: Option<&str>,
     ) -> Option<u32>;
 
+    /// The token limits this API declares for `model` — ONE round trip, ONE
+    /// shape (#2874): callers ask `limits()` instead of a second probe method
+    /// per field, and [`BackendApi::context_window`] is a thin wrapper over
+    /// this. Unknown fields are `None`, never zero; an API that can't be
+    /// asked fails soft to the default shape.
+    async fn limits(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> BackendLimits {
+        BackendLimits {
+            input_window: self.context_window(client, endpoint, model, api_key).await,
+            ..BackendLimits::default()
+        }
+    }
+
     /// Derive the serving axis from how many models the endpoint reported.
     fn serving(&self, served_count: usize) -> Serving;
 
@@ -781,23 +799,118 @@ impl BackendApi for AnthropicApi {
         model: &str,
         api_key: Option<&str>,
     ) -> Option<u32> {
-        // Newer API responses declare `max_input_tokens` per model entry;
-        // absent → None (the caller keeps its default). Fail-soft like the
-        // other impls.
-        let entries = anthropic_models_entries(client, endpoint, api_key)
+        self.limits(client, endpoint, model, api_key)
             .await
-            .ok()?;
-        entries
-            .iter()
-            .find(|m| m["id"].as_str() == Some(model))
-            .and_then(|m| m["max_input_tokens"].as_u64())
-            .and_then(|w| u32::try_from(w).ok())
+            .input_window
     }
 
     fn serving(&self, _served_count: usize) -> Serving {
         // The hosted API fronts the whole Claude family — always many models,
         // picked per request.
         Serving::Multiplexer
+    }
+
+    async fn limits(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> BackendLimits {
+        // ONE round trip yields window AND ceiling (and, when declared, the
+        // effort ladder); `context_window` below is a thin wrapper over this,
+        // so a caller asking both never pays twice.
+        let entries = anthropic_models_entries(client, endpoint, api_key)
+            .await
+            .unwrap_or_default();
+        entries
+            .iter()
+            .find(|m| m["id"].as_str() == Some(model))
+            .map(anthropic_entry_limits)
+            .unwrap_or_default()
+    }
+}
+
+/// Effort levels Anthropic's `/v1/models` may advertise under
+/// `capabilities.effort.<level>.supported` (#2874). Ordered increasing. The
+/// probe only CAPTURES the ladder; the cognition projection that consumes
+/// it is E1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AnthropicEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl AnthropicEffort {
+    /// The wire key under `capabilities.effort` — one table, no match arms
+    /// to drift (the vocabulary is data).
+    #[must_use]
+    pub const fn wire_key(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// The full advertised ladder, lowest first — the probe order, one source.
+const ANTHROPIC_EFFORT_ORDER: [AnthropicEffort; 5] = [
+    AnthropicEffort::Low,
+    AnthropicEffort::Medium,
+    AnthropicEffort::High,
+    AnthropicEffort::Xhigh,
+    AnthropicEffort::Max,
+];
+
+/// Everything one backend can declare about a model's token limits (#2874):
+/// one round trip, one shape, consumed via [`BackendApi::limits`]. Every
+/// field is `Option` — unknown is `None`, never zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackendLimits {
+    /// The declared context window (input tokens), exactly what
+    /// [`BackendApi::context_window`] returns today.
+    pub input_window: Option<u32>,
+    /// The model's maximum OUTPUT tokens (Anthropic `max_tokens`).
+    /// `0`, `null`, or absent → `None` = unknown, not a ceiling of zero
+    /// (the same rule [`served_context_window`] applies to `n_ctx`).
+    pub output_ceiling: Option<u32>,
+    /// The effort levels the model advertises (`capabilities.effort`).
+    /// Absent → `None` = unknown; a present-but-empty ladder is a real,
+    /// empty answer.
+    pub effort_ladder: Option<Vec<AnthropicEffort>>,
+}
+
+/// The limits one Anthropic `/v1/models` entry declares (#2874 C1). Pure —
+/// unit-tested without a server, mirroring [`served_context_window`].
+/// `max_tokens` of `0` or `null` is UNKNOWN (`None`): treating a non-positive
+/// declaration as a ceiling would clamp every request to nothing. A missing
+/// `capabilities.effort` level is unsupported, not an error.
+#[must_use]
+pub fn anthropic_entry_limits(entry: &serde_json::Value) -> BackendLimits {
+    BackendLimits {
+        input_window: entry["max_input_tokens"]
+            .as_u64()
+            .and_then(|w| u32::try_from(w).ok()),
+        output_ceiling: entry["max_tokens"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .and_then(|n| u32::try_from(n).ok()),
+        effort_ladder: entry["capabilities"]["effort"].as_object().map(|effort| {
+            ANTHROPIC_EFFORT_ORDER
+                .into_iter()
+                .filter(|level| {
+                    effort
+                        .get(level.wire_key())
+                        .is_some_and(|value| value["supported"] == true)
+                })
+                .collect()
+        }),
     }
 }
 

@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn reply(wire: &str, attempt: usize, limited: bool, tool: bool) -> ResponseTemplate {
-    reply_with(wire, attempt, limited, tool, "Finished.")
+    reply_with(wire, attempt, limited, tool, "Finished.", 40)
 }
 
 fn reply_with(
@@ -11,6 +11,7 @@ fn reply_with(
     limited: bool,
     tool: bool,
     prose: &str,
+    input: u64,
 ) -> ResponseTemplate {
     let args = if limited {
         "{\"path\":\"partial\",\"content\":\"cut".into()
@@ -22,14 +23,14 @@ fn reply_with(
     let calls = serde_json::json!([{"id":id,"type":"function","function":{"name":"write_file","arguments":args}}]);
     let body = match wire {
         "ollama" => {
-            serde_json::json!({"message":{"role":"assistant","content":text,"tool_calls":if tool { calls } else { serde_json::json!([]) }},"done":true,"done_reason":if limited {"length"} else {"stop"},"prompt_eval_count":40,"eval_count":7})
+            serde_json::json!({"message":{"role":"assistant","content":text,"tool_calls":if tool { calls } else { serde_json::json!([]) }},"done":true,"done_reason":if limited {"length"} else {"stop"},"prompt_eval_count":input,"eval_count":7})
         }
         "responses" => {
-            serde_json::json!({"status":if limited {"incomplete"} else {"completed"},"incomplete_details":if limited {serde_json::json!({"reason":"max_output_tokens"})} else {serde_json::Value::Null},"output":if tool {serde_json::json!([{"type":"function_call","call_id":id,"name":"write_file","arguments":args}])} else {serde_json::json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}])},"usage":{"input_tokens":40,"output_tokens":7}})
+            serde_json::json!({"status":if limited {"incomplete"} else {"completed"},"incomplete_details":if limited {serde_json::json!({"reason":"max_output_tokens"})} else {serde_json::Value::Null},"output":if tool {serde_json::json!([{"type":"function_call","call_id":id,"name":"write_file","arguments":args}])} else {serde_json::json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}])},"usage":{"input_tokens":input,"output_tokens":7}})
         }
         "anthropic" => {
             let mut frames = vec![
-                serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":40,"output_tokens":0}}}),
+                serde_json::json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":input,"output_tokens":0}}}),
             ];
             if tool {
                 frames.push(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":"write_file","input":{}}}));
@@ -53,7 +54,7 @@ fn reply_with(
             );
         }
         _ => {
-            serde_json::json!({"choices":[{"finish_reason":if limited {"length"} else if tool {"tool_calls"} else {"stop"},"message":{"role":"assistant","content":text,"tool_calls":if tool {calls} else {serde_json::json!([])}}}],"usage":{"prompt_tokens":40,"completion_tokens":7}})
+            serde_json::json!({"choices":[{"finish_reason":if limited {"length"} else if tool {"tool_calls"} else {"stop"},"message":{"role":"assistant","content":text,"tool_calls":if tool {calls} else {serde_json::json!([])}}}],"usage":{"prompt_tokens":input,"completion_tokens":7}})
         }
     };
     ResponseTemplate::new(200).set_body_json(body)
@@ -75,22 +76,54 @@ async fn run(
     obs: Option<&mut crate::agentic::SolveObservation>,
     respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
 ) -> Run {
-    run_on(wire, allowance, obs, None, respond).await
+    run_on(
+        wire,
+        allowance,
+        obs,
+        None,
+        |_| {},
+        None::<ResponseTemplate>,
+        respond,
+    )
+    .await
 }
 
-/// `run` with an optional smart harness adjudicating the answer.
-async fn run_on(
+/// `run` with an optional smart harness adjudicating the answer, a one-shot
+/// ctx tuner (#2874 C1: `safe_context`, `output_ceiling`, …), and an optional
+/// `GET /v1/models` probe body to mount (`None` = no probe answers, so a
+/// probed loop fails soft).
+async fn run_on<P>(
     wire: &'static str,
     allowance: Option<u32>,
     obs: Option<&mut crate::agentic::SolveObservation>,
     harness: Option<&crate::agentic::smart_harness::SmartHarness>,
+    tune: impl FnOnce(&mut ChatCtx),
+    probe: Option<P>,
     respond: impl Fn(usize, &serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
-) -> Run {
+) -> Run
+where
+    P: wiremock::Respond + Send + Sync + 'static,
+{
     let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let requests = captured.clone();
+    // No token-count API is mounted: every admission-preflight probe
+    // (`/v1/chat/completions/input_tokens`, `/render`, `/tokenize`) 404s
+    // soft-absent (#2907 P2 1 — a growing-input reply makes the Chat wire
+    // preflight), never answered with a chat-completion body.
+    for count_path in [
+        "/v1/chat/completions/input_tokens",
+        "/v1/chat/completions/render",
+        "/tokenize",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(count_path))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+    }
     Mock::given(method("POST"))
         .respond_with(move |request: &Request| {
             let mut requests = requests.lock().unwrap();
@@ -99,6 +132,13 @@ async fn run_on(
         })
         .mount(&server)
         .await;
+    if let Some(responder) = probe {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+    }
     let uri = server.uri();
     let messages = msgs();
     let caveats = crate::confined_exec::workspace_confined_caveats(dir.path());
@@ -119,6 +159,7 @@ async fn run_on(
     context.output_allowance = allowance;
     context.solve_obs = obs;
     context.smart_harness = harness;
+    tune(&mut context);
     let result = chat_complete(context, &mut NoMcp).await.unwrap();
     let requests = captured.lock().unwrap().clone();
     (result, requests, end, dir)
@@ -270,9 +311,9 @@ async fn raise_scenario(wire: &'static str) {
 async fn text_scenario(wire: &'static str) {
     let (result, requests, end, _dir) = run(wire, None, None, move |attempt, _| {
         if attempt == 1 {
-            reply_with(wire, attempt, true, false, "First half, ")
+            reply_with(wire, attempt, true, false, "First half, ", 40)
         } else {
-            reply_with(wire, attempt, false, false, "second half.")
+            reply_with(wire, attempt, false, false, "second half.", 40)
         }
     })
     .await;
@@ -327,22 +368,29 @@ fn prose(
     if wire == "anthropic" && body["stream"] != true {
         return ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"msg_1","type":"message","role":"assistant","model":"test-model","stop_reason":if limited {"max_tokens"} else {"end_turn"},"content":[{"type":"text","text":text}],"usage":{"input_tokens":40,"output_tokens":7}}));
     }
-    reply_with(wire, attempt, limited, false, text)
+    reply_with(wire, attempt, limited, false, text, 40)
 }
 
 /// G2 under the smart harness: the adjudicated and returned answer is the
 /// whole continuation, not only its last segment (#2901 review, P2 a).
 async fn smart_text_scenario(wire: &'static str) {
     let harness = scripted_harness(&["\"answer\""]);
-    let (result, requests, _end, _dir) =
-        run_on(wire, None, None, Some(&harness), move |attempt, body| {
+    let (result, requests, _end, _dir) = run_on(
+        wire,
+        None,
+        None,
+        Some(&harness),
+        |_| {},
+        None::<ResponseTemplate>,
+        move |attempt, body| {
             if attempt == 1 {
                 prose(wire, body, attempt, true, "First half, ")
             } else {
                 prose(wire, body, attempt, false, "second half.")
             }
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(requests.len(), 2, "{wire}: {result:?}");
     assert_eq!(
         crate::agentic::model_explanation(&result.0),
@@ -360,6 +408,8 @@ async fn smart_nudge_scenario(wire: &'static str) {
         None,
         None,
         Some(&harness),
+        |_| {},
+        None::<ResponseTemplate>,
         move |attempt, body| match attempt {
             1 => prose(wire, body, attempt, true, "First half, "),
             2 => prose(wire, body, attempt, false, "second half."),
@@ -519,4 +569,399 @@ async fn anthropic_thinking_only_stop_reaches_reasoning_overflow() {
     assert_eq!(requests.len(), 1, "no continuation is advertised");
     assert!(!result.0.contains("private unfinished plan"));
     assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+// ── #2874 C1: the probed/card ceiling feeds the retry (§1.5 tests 8-9) ────
+
+/// `GET /v1/models` answering one `test-model` entry with `max_tokens`.
+fn models_probe(max_tokens: u64) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "data": [
+            {"id": "test-model", "max_input_tokens": 200_000, "max_tokens": max_tokens}
+        ],
+        "has_more": false
+    }))
+}
+
+/// The caps every request on this wire carried, in order.
+fn caps(wire: &str, requests: &[serde_json::Value]) -> Vec<Option<u64>> {
+    requests.iter().map(|r| sent_cap(wire, r)).collect()
+}
+
+/// §1.5 test 8: a probed 64000 ceiling bounds the retry instead of the wire
+/// default doubled — the FIRST send keeps the unchanged 8192 default (C1
+/// feeds only the retry), the first retry doubles, and the second retry
+/// raises again, which the old default*2 ceiling made impossible.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn probed_ceiling_raises_the_retry_cap() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let (result, requests, end, _dir) = run_on(
+        "anthropic",
+        None,
+        None,
+        None,
+        |_| {},
+        Some(models_probe(64_000)),
+        move |attempt, _| reply("anthropic", attempt, true, true),
+    )
+    .await;
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(16_384), Some(32_768)],
+        "{result:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+/// §1.5 test 8: with no probe to answer (or one that fails), the ceiling is
+/// unchanged — the default doubled — and the second retry is note-only.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn absent_probe_keeps_the_default_retry_ceiling() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let (result, requests, end, _dir) = run_on(
+        "anthropic",
+        None,
+        None,
+        None,
+        |_| {},
+        None::<ResponseTemplate>,
+        move |attempt, _| reply("anthropic", attempt, true, true),
+    )
+    .await;
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(16_384), Some(16_384)],
+        "{result:?}"
+    );
+    // No headroom at the ceiling: the second retry carries ONE bounded note.
+    assert!(
+        requests[2]["messages"]
+            .to_string()
+            .contains("your last reply was cut off at the output limit"),
+        "{requests:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+/// §1.5 test 9: a probed ceiling larger than the window clamps to the room
+/// the capped reply left — the retry asks for exactly `window - input`.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn probed_ceiling_clamps_to_the_window() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let (result, requests, end, _dir) = run_on(
+        "anthropic",
+        None,
+        None,
+        None,
+        |ctx| ctx.safe_context = Some(12_424),
+        Some(models_probe(128_000)),
+        move |attempt, _| reply("anthropic", attempt, true, true),
+    )
+    .await;
+    // 12_424 window − 40 input tokens reported by the capped reply.
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(12_384), Some(12_384)],
+        "{result:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+/// The derived finding (§1.6 item 2): a raised cap is sent WITHOUT
+/// admission, so on a window with no room for even the doubled cap the
+/// clamp must block the raise entirely — the note-only retry stands.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn small_window_blocks_the_retry_raise() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let (result, requests, end, _dir) = run_on(
+        "anthropic",
+        None,
+        None,
+        None,
+        |ctx| ctx.safe_context = Some(8_200),
+        Some(models_probe(128_000)),
+        move |attempt, _| reply("anthropic", attempt, true, true),
+    )
+    .await;
+    // 8_200 − 40 leaves 8_160 < the 8_192 first cap: nothing is admissible.
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(8_192), Some(8_192)],
+        "{result:?}"
+    );
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("your last reply was cut off at the output limit"),
+        "the inadmissible raise is replaced by the bounded note: {requests:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+/// §1.5 test 3 (card row): the card's declared `output_ceiling_tokens`
+/// wins over the probed value — the second retry raises to the CARD's
+/// 20000, not the probe's next doubling step.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn card_ceiling_wins_over_the_probed_ceiling() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let (result, requests, end, _dir) = run_on(
+        "anthropic",
+        None,
+        None,
+        None,
+        |ctx| ctx.output_ceiling = Some(20_000),
+        Some(models_probe(64_000)),
+        move |attempt, _| reply("anthropic", attempt, true, true),
+    )
+    .await;
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(16_384), Some(20_000)],
+        "{result:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+/// §1.6 item 3: non-streaming requests keep the default*2 floor — a large
+/// non-streamed `max_tokens` risks HTTP timeouts, so the probed ceiling
+/// must NOT raise the retry there. #2907 P2 2 extends it beyond the
+/// 64000-token declaration: a KNOWN card ceiling BELOW the fallback still
+/// bounds the conservative floor — the smaller of the two.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn non_streaming_retry_keeps_the_default_floor() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(false);
+    let (result, requests, end, _dir) = run_on(
+        "anthropic",
+        None,
+        None,
+        None,
+        |_| {},
+        Some(models_probe(64_000)),
+        move |attempt, body| prose("anthropic", body, attempt, true, "First half, "),
+    )
+    .await;
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(16_384), Some(16_384)],
+        "{result:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+    // A declared ceiling below the fallback wins over it: a provider
+    // enforcing the declared 9000 would reject the old default*2 retry.
+    let (result, requests, end, _dir) = run_on(
+        "anthropic",
+        None,
+        None,
+        None,
+        |ctx| ctx.output_ceiling = Some(9_000),
+        Some(models_probe(64_000)),
+        move |attempt, body| prose("anthropic", body, attempt, true, "First half, "),
+    )
+    .await;
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(9_000), Some(9_000)],
+        "{result:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+/// §1.6 item 2 applies to EVERY wire: a raised retry cap on the Ollama wire
+/// is clamped to the window the capped reply left (`prompt_eval_count` 40).
+/// The window must still admit the request itself, so the clamp binds by
+/// sitting between the doubling steps.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn ollama_retry_clamps_to_the_window() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let (result, requests, end, dir) = run_on(
+        "ollama",
+        Some(5_000),
+        None,
+        None,
+        |ctx| ctx.safe_context = Some(9_000),
+        None::<ResponseTemplate>,
+        move |attempt, body| {
+            // 9_000 − 40 input tokens reported by the capped reply.
+            let limited = sent_cap("ollama", body).unwrap_or(0) < 8_960;
+            reply("ollama", attempt, limited, attempt < 3)
+        },
+    )
+    .await;
+    let observed = caps("ollama", &requests);
+    // Capped tool round → raised, clamped retry that executes the tool →
+    // final answer round (the raised cap holds for the turn).
+    assert_eq!(requests.len(), 3, "{result:?}: {observed:?}");
+    // The retry raised above the first cap but never past window − input.
+    assert!(
+        observed[1] > observed[0],
+        "the retry must still raise: {observed:?}"
+    );
+    assert_eq!(observed[1], Some(8_960), "{result:?}: {observed:?}");
+    assert!(
+        observed.iter().all(|cap| *cap <= Some(8_960)),
+        "no request may exceed the window's room: {observed:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("done2")).unwrap(),
+        "written"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Completed));
+}
+
+/// #2907 P2 1: growing input, shrinking headroom. The first retry raises
+/// 5000 → 10000 inside round one's room; the second capped reply reports
+/// 12000 input of a 20000 window, so the RETAINED 10000 must be re-clamped
+/// to the 8000 that remain before it is sent — on every wire.
+async fn shrinking_headroom_scenario(wire: &'static str) {
+    let (result, requests, end, _dir) = run_on(
+        wire,
+        Some(5_000),
+        None,
+        None,
+        |ctx| ctx.safe_context = Some(20_000),
+        None::<ResponseTemplate>,
+        move |attempt, _| {
+            reply_with(
+                wire,
+                attempt,
+                true,
+                true,
+                "",
+                if attempt == 2 { 12_000 } else { 40 },
+            )
+        },
+    )
+    .await;
+    let observed = caps(wire, &requests);
+    assert_eq!(requests.len(), 3, "{wire}: {result:?}: {observed:?}");
+    assert_eq!(
+        observed[1],
+        Some(10_000),
+        "{wire}: the first retry doubles inside round one's headroom: {observed:?}"
+    );
+    assert!(
+        observed[2] <= Some(8_000),
+        "{wire}: the retained cap is re-clamped to the recomputed headroom: {observed:?}"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed), "{wire}");
+}
+
+macro_rules! shrinking_headroom_test {
+    ($name:ident, $wire:literal) => {
+        /// #2907 P2 1: a retained raised cap is re-clamped to the newest
+        /// round's headroom on this wire.
+        #[tokio::test]
+        #[serial_test::serial(anthropic_loop_env)]
+        async fn $name() {
+            let _settings = default_loop_settings();
+            let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+            shrinking_headroom_scenario($wire).await;
+        }
+    };
+}
+shrinking_headroom_test!(retained_cap_reclamps_to_shrinking_headroom_chat, "openai");
+shrinking_headroom_test!(
+    retained_cap_reclamps_to_shrinking_headroom_responses,
+    "responses"
+);
+shrinking_headroom_test!(retained_cap_reclamps_to_shrinking_headroom_ollama, "ollama");
+shrinking_headroom_test!(
+    retained_cap_reclamps_to_shrinking_headroom_anthropic,
+    "anthropic"
+);
+
+/// #2907 P2 4: a stalled /v1/models must not wedge the recovery turn. The
+/// probe is a metadata request, not a generation: it carries its own short
+/// overall deadline, so the turn completes with UNKNOWN limits — the
+/// default*2 ceiling on every retry — instead of waiting out the
+/// inference client's generation timeout.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn stalled_probe_deadline_yields_unknown_limits() {
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    let stalled = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        run_on(
+            "anthropic",
+            None,
+            None,
+            None,
+            |_| {},
+            Some(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60))),
+            move |attempt, _| reply("anthropic", attempt, true, true),
+        ),
+    )
+    .await
+    .expect("the stalled metadata probe is bounded by its own short deadline");
+    let (result, requests, end, _dir) = stalled;
+    assert_eq!(
+        caps("anthropic", &requests),
+        vec![Some(8_192), Some(16_384), Some(16_384)],
+        "{result:?}: a timed-out probe means unknown limits — the default doubled"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::Failed));
+}
+
+/// #2907 P2 4: an operator interrupt must abort the optional probe. The
+/// flag flips AS the probe request arrives — with it still unanswered — so
+/// only probe-side cancellation can end the turn; the streaming dispatch's
+/// own cancel path has already passed. The whole probe rides the turn's
+/// cancellation wrapper, so the turn ends at the interrupt instead of
+/// waiting out the inference client's generation timeout.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn cancelled_probe_ends_the_turn_promptly() {
+    struct ProbeThatInterrupts {
+        interrupt: &'static std::sync::atomic::AtomicBool,
+    }
+    impl wiremock::Respond for ProbeThatInterrupts {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            self.interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60))
+        }
+    }
+    let _settings = default_loop_settings();
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
+    // Leaked for the turn's 'static ChatCtx borrow — a test-process flag.
+    let interrupted: &'static std::sync::atomic::AtomicBool =
+        Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+    let (result, requests, end, _dir) = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        run_on(
+            "anthropic",
+            None,
+            None,
+            None,
+            // The interrupt flag the loop's own round-top checks consume.
+            |ctx| ctx.cancel = Some(interrupted),
+            Some(ProbeThatInterrupts {
+                interrupt: interrupted,
+            }),
+            move |attempt, _| reply("anthropic", attempt, true, true),
+        ),
+    )
+    .await
+    .expect("a cancelled turn must not wait for the probe");
+    assert_eq!(
+        requests.len(),
+        1,
+        "{result:?}: the turn ends at the interrupt, before a retry is sent"
+    );
+    assert_ne!(end, Some(crate::TurnEndReason::Failed), "{result:?}");
 }
