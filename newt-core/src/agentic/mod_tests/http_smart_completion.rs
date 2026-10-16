@@ -1316,3 +1316,66 @@ async fn run_command_shell_writes_do_not_trip_the_no_progress_brake() {
         assert_eq!(content, format!("{n}\n"), "{} content", path.display());
     }
 }
+
+/// #2905 round 2 F6: the loop must thread its reader source through the
+/// dispatch context, not install a process-global source. A counting no-op
+/// source proves the loop consults the context-provided source for every
+/// `run_command` without spawning real git.
+#[tokio::test]
+async fn loop_uses_chat_ctx_reader_source_for_run_command() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static OPEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+    struct CountingNoOpSource;
+    impl crate::commit_review::ReaderSource for CountingNoOpSource {
+        fn open(
+            &self,
+            _cwd: &std::path::Path,
+            _read_scope: &crate::Scope<String>,
+        ) -> Option<crate::commit_review::SharedReader> {
+            OPEN_COUNT.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+    static SOURCE: CountingNoOpSource = CountingNoOpSource;
+
+    let _settings = default_loop_settings();
+    OPEN_COUNT.store(0, Ordering::SeqCst);
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let round = std::sync::Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedOpenAi {
+            round: round.clone(),
+            script: vec![
+                serde_json::json!({
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": serde_json::json!({"command": "echo x"}).to_string()
+                        }
+                    }]
+                }),
+                serde_json::json!({"content": "done"}),
+            ],
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.kind = BackendKind::Openai;
+    context.workspace = workspace.path().to_str().unwrap();
+    context.reader_source = Some(&SOURCE);
+    let result = chat_complete(context, &mut NoMcp).await;
+    assert!(result.is_ok(), "turn must complete: {:?}", result.err());
+    assert_eq!(
+        OPEN_COUNT.load(Ordering::SeqCst),
+        1,
+        "the loop must consult the ChatCtx reader source for run_command"
+    );
+}

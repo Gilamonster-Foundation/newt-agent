@@ -844,6 +844,7 @@ async fn run_one_turn(
         plan_mode_control: None,
         plan_draft_sink: None,
         steering: None,
+        reader_source: Some(&crate::commit_review::HostReaders),
     };
     let features = InstantiatedFeatures::of(&ctx);
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer

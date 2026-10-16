@@ -1,5 +1,6 @@
 use newt_core::{
     agentic::{openai_chat_complete, ChatCtx},
+    commit_review::NoOpReaders,
     BackendKind, Caveats, MemMessage, NoMcp, PermissionGate,
 };
 use std::sync::atomic::AtomicBool;
@@ -76,6 +77,7 @@ pub async fn run(
             compaction_trigger_policy: newt_core::CompactionTriggerPolicy::HeadroomAware,
             mid_loop_trim_tokens: None,
             max_ok_input: None,
+            reader_source: Some(&NoOpReaders),
             build_check_cmd: None,
             safe_context: None,
             output_ceiling: None,

@@ -47,6 +47,9 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// ledger; conflating them would refute every report in those tiers for
     /// a reason that has nothing to do with the report.
     pub(crate) tool_evidence: Option<&'a agentic::capability_check::Evidence>,
+    /// #2905: source used to create the commit-message review reader. `None`
+    /// resolves to the no-op source so unit tests never spawn git.
+    pub(crate) reader_source: Option<&'static dyn crate::commit_review::ReaderSource>,
     pub(crate) note_sink: Option<&'a mut dyn NoteSink>,
     pub(crate) recall_source: Option<&'a dyn RecallSource>,
     pub(crate) memory_source: Option<&'a dyn MemorySource>,

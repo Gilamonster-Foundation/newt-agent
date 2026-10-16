@@ -267,6 +267,7 @@ pub(super) async fn run_scenario_for(
         plan_draft_sink: None,
         steering: None,
         completed_spill_renderer: None,
+        reader_source: None,
     };
     c.end_reason = Some(&mut end_reason);
     let (reply, _streamed, _usage, hallucinations) = chat_complete(c, &mut NoMcp)

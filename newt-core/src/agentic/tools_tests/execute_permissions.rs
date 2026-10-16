@@ -2607,7 +2607,8 @@ async fn broker_bearing_commit_denial_now_consults_the_gate() {
     let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
     let result1 = execute_tool_with_collaborators(
         "run_command",
-        &serde_json::json!({"command": "git add -A && git commit -q -m probe"}),
+        &serde_json::json!({"command": "git add -A && git commit -q -m probe"
+        }),
         &workspace_str,
         false,
         20,
@@ -3681,9 +3682,9 @@ async fn approved_request_permissions_reruns_denied_run_command() {
     let result1 = execute_tool_with_collaborators(
         "run_command",
         &serde_json::json!({
-            "command": format!("/bin/cp {src_str} {outfile_str}"),
-            "fs_read": [src_str.clone()],
-            "fs_write": [outfile_str.clone()],
+                "command": format!("/bin/cp {src_str} {outfile_str}"),
+                "fs_read": [src_str.clone()],
+                "fs_write": [outfile_str.clone()],
         }),
         &workspace_str,
         false,
@@ -3759,9 +3760,9 @@ async fn approved_request_permissions_reruns_denied_run_command() {
         let result1b = execute_tool_with_collaborators(
             "run_command",
             &serde_json::json!({
-                "command": format!("/bin/cp {src_str} {outfile_str}"),
-                "fs_read": [src_str.clone()],
-                "fs_write": [outfile_str.clone()],
+                        "command": format!("/bin/cp {src_str} {outfile_str}"),
+                        "fs_read": [src_str.clone()],
+                        "fs_write": [outfile_str.clone()],
             }),
             &workspace_str,
             false,

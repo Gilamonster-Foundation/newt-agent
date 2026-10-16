@@ -175,6 +175,7 @@ async fn a_set_cancel_flag_abandons_the_turn_before_any_network_call() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )
@@ -525,6 +526,7 @@ async fn read_only_nudge_injected_after_three_rounds() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )

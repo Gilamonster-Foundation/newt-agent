@@ -126,7 +126,7 @@ async fn adoption_2750_full_access_creation_then_task_command() {
                 worktree_session: Some(&session),
                 execution: Some(&outcome),
                 ..Default::default()
-            },
+    },
             false,
             PromptDisposition::Act,
         )

@@ -595,7 +595,7 @@ fn is_newt_operator_trailer(line: &str, operator_email_tag: &str) -> bool {
 /// tighten Newt-owned `Harness:` detection so unrelated user `Harness:`
 /// trailers are preserved). Replaced wholesale on re-finalization so a stale
 /// revision/version does not linger (requirement 9).
-fn is_newt_provenance(line: &str) -> bool {
+pub(crate) fn is_newt_provenance(line: &str) -> bool {
     line.starts_with("Harness: ") && line.contains(" | Model: ") && line.contains(" | Operator: ")
 }
 

@@ -398,6 +398,7 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )
@@ -830,6 +831,7 @@ async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )
@@ -996,6 +998,7 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )
@@ -1141,6 +1144,7 @@ async fn cap_exit_fallback_when_final_summary_errors() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )
@@ -1285,6 +1289,7 @@ async fn accumulated_usage_survives_summary_failure() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )

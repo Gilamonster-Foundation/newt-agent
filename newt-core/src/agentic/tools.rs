@@ -3652,6 +3652,7 @@ async fn execute_authorized_tool(
         invocation,
         build_check_cmd,
         tool_evidence,
+        reader_source: _reader_source,
         note_sink,
         recall_source,
         memory_source,
@@ -4583,28 +4584,59 @@ async fn execute_authorized_tool(
                 // that already happened. `pending_rerun` is left untouched
                 // here (already cleared above), so no build denial can ever
                 // populate it.
-                return executed(
-                    build_shell::execute(
-                        cmd,
-                        &program,
-                        &run_cwd,
-                        build_workspace,
-                        caveats,
-                        &filesystem_requests,
-                        &mut permission_gate,
-                        smart_harness,
-                        tool_output_lines,
-                        color,
-                        tool_offload,
-                        spill_store,
-                        live_tool_output.clone(),
-                        presentation,
-                        commit_broker,
-                        args.get("timeout_secs").and_then(serde_json::Value::as_u64),
-                        command_budget,
-                    )
-                    .await,
-                );
+                // #2905: the build_shell route is still a run_command that
+                // may land commits, so it gets the same async HEAD snapshot
+                // and post-execution review as the confined shell route.
+                let reader_source = collab
+                    .reader_source
+                    .unwrap_or(&crate::commit_review::NoOpReaders);
+                let commit_reader = reader_source
+                    .open(std::path::Path::new(&run_cwd), &caveats.fs_read)
+                    .unwrap_or_else(|| std::sync::Arc::new(crate::commit_review::NoOpRepo));
+                let commit_policy = git_tool.and_then(|tool| tool.native_commit_policy());
+                let commit_review = crate::commit_review::Review::begin(
+                    commit_reader.clone(),
+                    commit_policy.as_deref(),
+                )
+                .await;
+                let (mut exec_text, exec_outcome) = build_shell::execute(
+                    cmd,
+                    &program,
+                    &run_cwd,
+                    build_workspace,
+                    caveats,
+                    &filesystem_requests,
+                    &mut permission_gate,
+                    smart_harness,
+                    tool_output_lines,
+                    color,
+                    tool_offload,
+                    spill_store,
+                    live_tool_output.clone(),
+                    presentation,
+                    commit_broker,
+                    args.get("timeout_secs").and_then(serde_json::Value::as_u64),
+                    command_budget,
+                )
+                .await;
+                let (report, prompts) = match commit_review {
+                    Some(review) => review.conclude().await,
+                    None => (None, Vec::new()),
+                };
+                if let Some(report) = report {
+                    presentation.preview(&report, 0);
+                    exec_text = format!("{exec_text}\n{report}");
+                }
+                if let Some(harness) = smart_harness {
+                    for (oid, prompt) in prompts {
+                        let findings = harness.review_commit_content(prompt).await;
+                        if let Some(report) = crate::commit_review::render_content(&oid, &findings) {
+                            presentation.preview(&report, 0);
+                            exec_text = format!("{exec_text}\n{report}");
+                        }
+                    }
+                }
+                return executed((exec_text, exec_outcome));
             }
             // F32/#2537 round 3: a bare `git …` in this session's own repo, on
             // a non-default branch, gets kernel WRITE on its own gitdir +
@@ -4680,6 +4712,23 @@ async fn execute_authorized_tool(
                 ));
             }
             let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
+            // #2905: commit-message review is route-independent and
+            // detector-independent: HEAD is snapshotted around every
+            // command, and whatever landed is read back and checked.
+            // The snapshot is async and bounded so a hanging git config
+            // include can never strand the turn.
+            let reader_source = collab
+                .reader_source
+                .unwrap_or(&crate::commit_review::NoOpReaders);
+            let commit_reader = reader_source
+                .open(std::path::Path::new(&run_cwd), &caveats.fs_read)
+                .unwrap_or_else(|| std::sync::Arc::new(crate::commit_review::NoOpRepo));
+            let commit_policy = git_tool.and_then(|tool| tool.native_commit_policy());
+            let commit_review = crate::commit_review::Review::begin(
+                commit_reader.clone(),
+                commit_policy.as_deref(),
+            )
+            .await;
             let (mut exec_text, mut exec_outcome) = shell::exec_confined_command_with_broker(
                 cmd,
                 &run_cwd,
@@ -4781,6 +4830,23 @@ async fn execute_authorized_tool(
                 }
                 if let Some(guard) = detach_guard.as_mut() {
                     guard.resolve();
+                }
+            }
+            let (report, prompts) = match commit_review {
+                Some(review) => review.conclude().await,
+                None => (None, Vec::new()),
+            };
+            if let Some(report) = report {
+                presentation.preview(&report, 0);
+                exec_text = format!("{exec_text}\n{report}");
+            }
+            if let Some(harness) = smart_harness {
+                for (oid, prompt) in prompts {
+                    let findings = harness.review_commit_content(prompt).await;
+                    if let Some(report) = crate::commit_review::render_content(&oid, &findings) {
+                        presentation.preview(&report, 0);
+                        exec_text = format!("{exec_text}\n{report}");
+                    }
                 }
             }
             let result = executed((exec_text, exec_outcome));
@@ -6142,6 +6208,19 @@ mod private_url_mcp_bat_tests;
 #[cfg(test)]
 #[path = "tools_tests/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+/// #2905: open the commit-message review for one `run_command`. Gated on
+/// read authority over the cwd ONLY. There is deliberately no command-text
+/// parameter: a script or alias that commits slips past any lexical
+/// detector, so the HEAD snapshot is taken around every invocation.
+fn start_commit_review(
+    cwd_readable: bool,
+    reader: &dyn crate::commit_review::CommitReader,
+    policy: Option<&dyn agent_toolchain::native_git::CommitPolicy>,
+) -> Option<crate::commit_review::Pending> {
+    cwd_readable.then(|| crate::commit_review::Pending::start(reader, policy))
+}
 
 // ---------------------------------------------------------------------------
 // execute_tool branch tests — edit_file / shrink guard / denial paths

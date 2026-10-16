@@ -1017,6 +1017,10 @@ pub struct ChatCtx<'a> {
     /// estimated to exceed it are trimmed *before* dispatch. `None` falls back
     /// to `safe_context`. See issue #223.
     pub max_ok_input: Option<u32>,
+    /// #2905: source for the commit-message review reader. Production loops
+    /// set HostReaders; tests default to None, which the loop resolves to the
+    /// no-op source so unit tests never spawn real git.
+    pub reader_source: Option<&'static dyn crate::commit_review::ReaderSource>,
     /// Shell command run after every successful file write to give the model
     /// immediate ground-truth feedback (e.g. "cargo check -q --workspace").
     /// `None` disables auto-checking. Set per-workspace in `.newt/config.toml`.
@@ -1493,6 +1497,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         compaction_trigger_policy,
         mid_loop_trim_tokens,
         max_ok_input,
+        reader_source,
         build_check_cmd,
         safe_context,
         output_ceiling: _,
@@ -3672,6 +3677,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
+                        reader_source,
                         // Reborrow + re-coerce: shortens the trait-object
                         // lifetime to this call (Option<&mut dyn _> is
                         // invariant, so the longer ChatCtx lifetime can't
@@ -6671,6 +6677,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         compaction_trigger_policy,
         mid_loop_trim_tokens,
         max_ok_input,
+        reader_source,
         build_check_cmd,
         safe_context,
         output_ceiling: _,
@@ -8760,6 +8767,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
+                        reader_source,
                         // Reborrow + re-coerce: shortens the trait-object
                         // lifetime to this call (Option<&mut dyn _> is
                         // invariant, so the longer ChatCtx lifetime can't
@@ -9515,6 +9523,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         compaction_trigger_policy,
         mid_loop_trim_tokens,
         max_ok_input,
+        reader_source,
         build_check_cmd,
         safe_context,
         output_ceiling,
@@ -11545,6 +11554,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
+                        reader_source,
                         // Reborrow + re-coerce — see the OpenAI path.
                         note_sink: note_sink
                             .as_deref_mut()
@@ -12178,6 +12188,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         compaction_trigger_policy: _,
         mid_loop_trim_tokens,
         max_ok_input,
+        reader_source,
         build_check_cmd,
         safe_context,
         output_ceiling: _,
@@ -13481,6 +13492,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
+                        reader_source,
                         // Reborrow + re-coerce: shortens the trait-object
                         // lifetime to this call (Option<&mut dyn _> is
                         // invariant, so the longer ChatCtx lifetime can't

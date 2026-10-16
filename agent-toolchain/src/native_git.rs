@@ -21,6 +21,21 @@ pub trait CommitPolicy: Send + Sync {
     /// Canonical, idempotent attribution applied to Git's message.
     fn finalize_message(&self, message: &str) -> Result<String, String>;
 
+    /// The harness's own attribution address, when it differs from or adds to
+    /// the default. Lets a post-commit review recognize trailers that claim
+    /// this harness's provenance. `None` means only the default address.
+    fn agent_email(&self) -> Option<String> {
+        None
+    }
+
+    /// The operator by-line every commit owes, when a real operator email is
+    /// known. Named explicitly so a review never infers which rendered lines
+    /// are mandatory from their address (foreign-harness contributors are
+    /// consumed after the first commit; the operator line is not).
+    fn operator_line(&self) -> Option<String> {
+        None
+    }
+
     /// Whether the operator requires a signature for this invocation.
     fn signing_required(&self) -> bool;
 

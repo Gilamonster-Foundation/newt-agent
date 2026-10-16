@@ -95,7 +95,8 @@ async fn worktree_detect_2791_compound_routes_tools() {
         &mut NullPresentation, "run_command",
         &serde_json::json!({"command":"git worktree add -b detected ../detected 2>&1 | git hash-object --stdin && git worktree list"}),
         root.to_str().unwrap(), false, 40, &Caveats::top(), &mut crate::agentic::NoMcp,
-        ToolCollaborators { worktree_session: Some(&session), execution: Some(&outcome), ..Default::default() }, false, PromptDisposition::Act,
+        ToolCollaborators { worktree_session: Some(&session), execution: Some(&outcome), ..Default::default()
+    }, false, PromptDisposition::Act,
     ).await;
     assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Passed), "{text}");
     let task = temp.path().join("detected").canonicalize().unwrap();
