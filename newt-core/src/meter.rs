@@ -232,6 +232,9 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // Injected deadline for tests — never waits on wall clock.
+    const TEST_DEADLINE: Duration = Duration::from_millis(1);
+
     async fn server() -> MockServer {
         MockServer::start().await
     }
@@ -261,7 +264,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let status = poll_openrouter_key(&client, &server.uri(), "test-key").await;
+        let status = poll_openrouter_key(&client, &server.uri(), "test-key", TEST_DEADLINE).await;
         assert!(
             matches!(status, SpendStatus::Known { remaining_usd, limit_usd, .. } if (remaining_usd - 49.80).abs() < 1e-6 && (limit_usd - 50.0).abs() < 1e-6),
             "{status:?}"
@@ -282,7 +285,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let status = poll_openrouter_key(&client, &server.uri(), "test-key").await;
+        let status = poll_openrouter_key(&client, &server.uri(), "test-key", TEST_DEADLINE).await;
         assert_eq!(status, SpendStatus::Unknown);
     }
 
@@ -295,7 +298,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let status = poll_openrouter_key(&client, &server.uri(), "wrong-key").await;
+        let status = poll_openrouter_key(&client, &server.uri(), "wrong-key", TEST_DEADLINE).await;
         assert_eq!(status, SpendStatus::Unknown);
     }
 
@@ -308,7 +311,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let status = poll_openrouter_key(&client, &server.uri(), "test-key").await;
+        let status = poll_openrouter_key(&client, &server.uri(), "test-key", TEST_DEADLINE).await;
         assert_eq!(status, SpendStatus::Unknown);
     }
 
@@ -335,7 +338,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let status = poll_openrouter_key(&client, &server.uri(), "test-key").await;
+        let status = poll_openrouter_key(&client, &server.uri(), "test-key", TEST_DEADLINE).await;
         assert!(
             matches!(status, SpendStatus::Known { remaining_usd, limit_usd, ref resets_at } if (remaining_usd - 12.5).abs() < 1e-6 && (limit_usd - 100.0).abs() < 1e-6 && resets_at.as_deref() == Some("monthly")),
             "{status:?}"
@@ -391,5 +394,36 @@ mod tests {
         cache.record("a".to_string(), now, SpendStatus::Unknown);
         assert!(!cache.is_poll_due(now, "a", false));
         assert!(cache.is_poll_due(now, "b", false));
+    }
+
+    #[tokio::test]
+    async fn poll_if_due_uses_injected_deadline() {
+        let server = server().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json_body(
+                49.80,
+                50.0,
+                "2026-11-01T00:00:00.000Z",
+            )))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let mut cache = SpendCache::new();
+        let now = Instant::now();
+        let params = PollParams {
+            client: &client,
+            backend: "openrouter",
+            source: "openrouter-key",
+            endpoint: &server.uri(),
+            api_key: Some("test-key"),
+            now,
+            turn_in_flight: false,
+        };
+        let status = cache.poll_if_due(params).await;
+        assert!(
+            matches!(status, SpendStatus::Known { remaining_usd, .. } if (remaining_usd - 49.80).abs() < 1e-6),
+            "{status:?}"
+        );
     }
 }
