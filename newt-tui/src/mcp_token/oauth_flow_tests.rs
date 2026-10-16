@@ -39,7 +39,10 @@ async fn host_denied_oauth_hop_surfaces_as_typed_grant_cause() {
         required.is_some(),
         "expected typed HttpNetGrantRequired, got: {error:#}"
     );
-    assert_eq!(required.map(|r| r.host.as_str()), Some("denied.example.test"));
+    assert_eq!(
+        required.map(|r| r.host.as_str()),
+        Some("denied.example.test")
+    );
     assert!(!required.map(|r| r.private).unwrap_or(false));
 }
 
@@ -59,13 +62,8 @@ async fn missing_login_stays_distinct_from_host_denial() {
 
     // ... but an invalid-endpoint (missing-login-class) error stays a plain
     // string — it must not be confused with the typed host-denial cause.
-    let error = validate_discovery_hop_with_policy(
-        "not-a-url",
-        "token endpoint",
-        false,
-        &policy,
-    )
-    .unwrap_err();
+    let error = validate_discovery_hop_with_policy("not-a-url", "token endpoint", false, &policy)
+        .unwrap_err();
     assert!(
         error.downcast_ref::<HttpNetGrantRequired>().is_none(),
         "a plain invalid-URL error must not be the host-denial typed cause: {error:#}"
@@ -127,12 +125,14 @@ fn oauth_hops_consume_the_complete_network_scope() {
         false,
         &denied,
     )
-    .unwrap_err()
-    .to_string();
+    .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
     assert!(
-        error.contains("outside the session network capability"),
-        "{error}"
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
     );
+    assert_eq!(required.map(|r| r.host.as_str()), Some("auth.example.test"));
+    assert!(!required.map(|r| r.private).unwrap_or(false));
 
     let allowed = OAuthHopPolicy::new(&newt_core::Scope::only(["auth.example.test".to_string()]));
     assert!(validate_discovery_hop_with_policy(
@@ -186,12 +186,14 @@ fn oauth_hops_do_not_restore_durable_hosts_removed_from_the_active_scope() {
     assert!(!exact_host_is_approved(&issuer, &policy));
     let error =
         validate_discovery_hop_with_policy(issuer.as_str(), "token endpoint", false, &policy)
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
     assert!(
-        error.contains("outside the session network capability"),
-        "{error}"
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
     );
+    assert_eq!(required.map(|r| r.host.as_str()), Some("auth.example.test"));
+    assert!(!required.map(|r| r.private).unwrap_or(false));
 }
 
 #[test]

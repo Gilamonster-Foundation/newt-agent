@@ -99,15 +99,21 @@ pub(super) fn validate_discovery_hop_with_policy(
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("OAuth {kind} URL has no host: {endpoint}"))?;
     if !(policy.permits_host(host) || cfg!(test) && allow_test_loopback_http) {
-        anyhow::bail!("OAuth {kind} host `{host}` is outside the session network capability");
+        return Err(newt_mcp_client::HttpNetGrantRequired {
+            host: host.to_string(),
+            private: false,
+        }
+        .into());
     }
     if !allow_test_loopback_http
         && !exact_host_is_approved(&url, policy)
         && (newt_mcp_client::host_is_loopback(host) || is_internal_literal_host(host))
     {
-        anyhow::bail!(
-            "OAuth {kind} resolves to a forbidden loopback/private literal host: {endpoint}"
-        );
+        return Err(newt_mcp_client::HttpNetGrantRequired {
+            host: host.to_string(),
+            private: true,
+        }
+        .into());
     }
     Ok(url)
 }
