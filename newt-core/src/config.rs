@@ -23,7 +23,8 @@ pub(crate) use backend::resolve_api_key_common;
 pub use backend::{
     derive_serving, set_cli_backend_override, BackendConfig, BackendDestination, BackendKind,
     BackendOverride, BackendProvenance, BackendRef, BackendRequest, BackendResolutionReceipt,
-    BackendSlots, DeclaredBackend, Engine, ManagedMode, OpenAiApi, RequestMode, Serving,
+    BackendSlots, BudgetMeter, DeclaredBackend, Engine, ManagedMode, MeterConfig, OpenAiApi,
+    RequestMeter, RequestMode, Serving,
 };
 pub use context::{
     compaction_trigger_is_session_pinned, input_percentage_ceiling, normalize_input_ceiling_pct,
