@@ -1829,3 +1829,30 @@ async fn dcr_rejects_a_response_that_omits_redirect_uris() {
     .to_string();
     assert!(error.contains("omitted redirect_uris"), "{error}");
 }
+
+/// A host-denied OAuth hop surfaced during *metadata aggregation* must keep its
+/// typed `HttpNetGrantRequired` cause instead of being flattened into a
+/// plain-string aggregate error, so the /mcp panel can still offer the
+/// exact-host prompt (`mcp_management.rs` downcasts on this type).
+#[tokio::test]
+async fn host_denied_oauth_hop_survives_metadata_aggregation() {
+    // `fetch_authorization_server_meta` is the aggregation function called for
+    // each advertised issuer during discovery. It validates the issuer hop
+    // first (before any network call), so a host denial returns the typed
+    // cause without a mock server.
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
+    let error = fetch_authorization_server_meta("https://denied.example.test", false, &policy)
+        .await
+        .unwrap_err();
+
+    let required = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>();
+    assert!(
+        required.is_some(),
+        "expected typed HttpNetGrantRequired to survive aggregation, got: {error:#}"
+    );
+    assert_eq!(
+        required.map(|r| r.host.as_str()),
+        Some("denied.example.test")
+    );
+    assert!(!required.map(|r| r.private).unwrap_or(false));
+}

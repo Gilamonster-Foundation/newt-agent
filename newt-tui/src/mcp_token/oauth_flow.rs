@@ -853,7 +853,19 @@ async fn discover_oauth_meta_within_budget_for_client(
                 selected = Some((issuer, metadata));
                 break;
             }
-            Err(error) => errors.push(format!("{issuer}: {error:#}")),
+            Err(error) => {
+                // Host denial is terminal under this session's net policy — no
+                // other issuer candidate will pass it — so preserve the typed
+                // HttpNetGrantRequired cause all the way to the /mcp panel,
+                // which downcasts it to offer the exact-host prompt.
+                if error
+                    .downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()
+                    .is_some()
+                {
+                    return Err(error);
+                }
+                errors.push(format!("{issuer}: {error:#}"));
+            }
         }
     }
     let (issuer, metadata) = selected.ok_or_else(|| {
