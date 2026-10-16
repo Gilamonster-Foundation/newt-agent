@@ -383,40 +383,48 @@ const GIT_OUTPUT_CAP: usize = 256 * 1024;
 
 impl HostRepo {
     /// Run one metadata git command. `Ok(Some(_))` is successful output;
-    /// `Ok(None)` is a clean git absence (e.g. no HEAD, no commits in range);
-    /// `Err(HeadError::ReadFailed)` is a spawn/read/timeout/oversize failure and must skip review.
+    /// `Ok(None)` is a clean git absence (only `rev-parse --verify -q HEAD`
+    /// exiting 1 with empty stderr, i.e. an unborn branch); any other nonzero
+    /// exit, timeout, oversize, or spawn failure is `Err(HeadError::ReadFailed)`
+    /// and must skip review instead of reviewing all history.
     fn run(&self, args: &[&str]) -> std::result::Result<Option<Vec<u8>>, HeadError> {
         let mut child = crate::git_hardening::metadata_git(&self.cwd, args, &self.read_scope)
             .map_err(|_| HeadError::ReadFailed)?
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|_| HeadError::ReadFailed)?;
         let started = std::time::Instant::now();
-        let out = child
+        let stdout_rx = child
             .stdout
             .take()
-            .and_then(|stdout| read_bounded(stdout, GIT_OUTPUT_CAP, GIT_READ_DEADLINE));
+            .map(|stdout| read_bounded(stdout, GIT_OUTPUT_CAP, GIT_READ_DEADLINE));
+        let stderr_rx = child
+            .stderr
+            .take()
+            .map(|stderr| read_bounded(stderr, GIT_OUTPUT_CAP, GIT_READ_DEADLINE));
         loop {
             match (
-                &out,
                 child.try_wait().map_err(|_| HeadError::ReadFailed)?,
                 started.elapsed() < GIT_READ_DEADLINE,
             ) {
-                (Some(out), Some(status), _) if status.success() => {
-                    return Ok(Some(out.clone()));
+                (Some(status), _) => {
+                    let remaining = GIT_READ_DEADLINE.saturating_sub(started.elapsed());
+                    let stdout = stdout_rx
+                        .as_ref()
+                        .and_then(|rx| rx.recv_timeout(remaining).ok().flatten())
+                        .unwrap_or_default();
+                    let stderr = stderr_rx
+                        .as_ref()
+                        .and_then(|rx| rx.recv_timeout(remaining).ok().flatten())
+                        .unwrap_or_default();
+                    return classify(args, status.code(), stdout, stderr);
                 }
-                (Some(_), Some(_), _) => {
-                    // Git ran to completion but reported no result (e.g. no
-                    // HEAD in an unborn repository). This is a clean absence,
-                    // not a read failure.
-                    return Ok(None);
-                }
-                (Some(_), None, true) => {
+                (None, true) => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                _ => {
+                (None, false) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(HeadError::ReadFailed);
@@ -426,26 +434,44 @@ impl HostRepo {
     }
 }
 
-/// Read `source` to EOF within `deadline` and at most `cap` bytes. `None`
-/// when either bound is exceeded; the reading thread is abandoned and the
-/// caller kills the producer, which closes the pipe.
+/// Classify the bounded result of one metadata git invocation.
+/// `Some(0)` is success; for `rev-parse --verify -q HEAD` only, `Some(1)`
+/// with empty stderr is the clean "no HEAD" absence. Everything else is a
+/// read failure and must cause the review to be skipped.
+fn classify(
+    args: &[&str],
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> std::result::Result<Option<Vec<u8>>, HeadError> {
+    if exit_code == Some(0) {
+        return Ok(Some(stdout));
+    }
+    if args == ["rev-parse", "--verify", "-q", "HEAD"] && exit_code == Some(1) && stderr.is_empty()
+    {
+        return Ok(None);
+    }
+    Err(HeadError::ReadFailed)
+}
+
+/// Read `source` to EOF within `deadline` and at most `cap` bytes. Returns a
+/// receiver so the caller can decide when to collect the result. The resolved
+/// value is `None` when either bound is exceeded; the reading thread is
+/// abandoned and the caller kills the producer, which closes the pipe.
 fn read_bounded(
     source: impl std::io::Read + Send + 'static,
     cap: usize,
-    deadline: std::time::Duration,
-) -> Option<Vec<u8>> {
+    _deadline: std::time::Duration,
+) -> std::sync::mpsc::Receiver<Option<Vec<u8>>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
         let ok =
             std::io::Read::read_to_end(&mut std::io::Read::take(source, limit), &mut buf).is_ok();
-        let _ = tx.send(ok.then_some(buf));
+        let _ = tx.send(ok.then_some(buf).filter(|buf| buf.len() <= cap));
     });
-    rx.recv_timeout(deadline)
-        .ok()
-        .flatten()
-        .filter(|buf| buf.len() <= cap)
+    rx
 }
 
 /// `git rev-list` argv for the commits newly reachable in `before..head`.
@@ -1116,8 +1142,20 @@ mod tests {
     #[test]
     fn bounded_read_rejects_oversized_and_stalled_output() {
         let long = std::time::Duration::from_secs(5);
-        assert_eq!(read_bounded(&b"abc"[..], 3, long), Some(b"abc".to_vec()));
-        assert_eq!(read_bounded(&b"abcd"[..], 3, long), None);
+        assert_eq!(
+            read_bounded(std::io::Cursor::new(b"abc".to_vec()), 3, long)
+                .recv_timeout(long)
+                .ok()
+                .flatten(),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(
+            read_bounded(std::io::Cursor::new(b"abcd".to_vec()), 3, long)
+                .recv_timeout(long)
+                .ok()
+                .flatten(),
+            None
+        );
         struct Stalled;
         impl std::io::Read for Stalled {
             fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
@@ -1127,10 +1165,50 @@ mod tests {
         }
         let started = std::time::Instant::now();
         assert_eq!(
-            read_bounded(Stalled, 3, std::time::Duration::from_millis(50)),
+            read_bounded(Stalled, 3, std::time::Duration::from_millis(50))
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .ok()
+                .flatten(),
             None
         );
         assert!(started.elapsed() < long);
+    }
+
+    /// Codex round 3 #2906 P2: only `rev-parse --verify -q HEAD` exiting 1
+    /// with empty stderr means "no HEAD". A fatal exit (e.g. 128) or any
+    /// stderr must be classified as a read failure so the review is skipped.
+    #[test]
+    fn fatal_git_exit_is_a_read_failure_not_unborn() {
+        // The clean unborn case still resolves to None.
+        assert_eq!(
+            classify(
+                &["rev-parse", "--verify", "-q", "HEAD"],
+                Some(1),
+                vec![],
+                vec![]
+            ),
+            Ok(None)
+        );
+        // A malformed-config / fatal git error must not be mistaken for unborn.
+        assert_eq!(
+            classify(
+                &["rev-parse", "--verify", "-q", "HEAD"],
+                Some(128),
+                vec![],
+                b"fatal: not a git repository".to_vec()
+            ),
+            Err(HeadError::ReadFailed)
+        );
+        // stderr on exit 1 is also a read failure, not a clean absence.
+        assert_eq!(
+            classify(
+                &["rev-parse", "--verify", "-q", "HEAD"],
+                Some(1),
+                vec![],
+                b"error: bogus".to_vec()
+            ),
+            Err(HeadError::ReadFailed)
+        );
     }
 
     /// Codex round 1 #2906 P1-1: a readable cwd is not enough. Git discovery
