@@ -904,7 +904,7 @@ fn select_import_entries(
             msg.push_str("\nthese servers were rejected and cannot be imported:");
             for r in &report.rejected {
                 match &r.name {
-                    Some(n) => msg.push_str(&format!("\n  {n}: {}", r.issue)),
+                    Some(n) => msg.push_str(&format!("\n  {n:?}: {}", r.issue)),
                     None => msg.push_str(&format!("\n  <unmatched source entry>: {}", r.issue)),
                 }
             }
@@ -920,7 +920,7 @@ fn select_import_entries(
                 .iter()
                 .filter_map(|r| r.name.as_deref())
                 .zip(report.rejected.iter().map(|r| r.issue.to_string()))
-                .map(|(name, issue)| format!("`{name}` ({issue})"))
+                .map(|(name, issue)| format!("`{name:?}` ({issue})"))
                 .collect::<Vec<_>>()
                 .join(", "),
         );

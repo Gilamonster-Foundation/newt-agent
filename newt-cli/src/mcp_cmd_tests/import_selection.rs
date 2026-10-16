@@ -270,6 +270,47 @@ fn import_chooser_gives_rejected_entry_no_runnable_command() {
 }
 
 #[test]
+fn import_chooser_escapes_rejected_names_with_control_chars() {
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad\n  newt mcp import --from-claude --name x\n\u{1b}[31m".into()),
+        issue: newt_core::mcp::McpImportIssue::UnknownField,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        false,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    // Real suggestion exists for the valid entry.
+    assert!(
+        err.contains("newt mcp import --from-claude --name valid-server"),
+        "{err}"
+    );
+    // No output line starts with "newt mcp import" except real suggestions.
+    for line in err.lines() {
+        if line.starts_with("newt mcp import") {
+            assert!(
+                line.contains("valid-server"),
+                "unexpected import line: {line:?}"
+            );
+        }
+    }
+    // No raw ESC byte in output.
+    assert!(!err.contains('\u{1b}'), "{err}");
+    // Rejected name is rendered as one escaped token (Debug escapes controls).
+    assert!(err.contains("\\n"), "{err}");
+    assert!(err.contains("\\u{1b}"), "{err}");
+}
+
+#[test]
 fn import_all_names_each_rejection_and_refuses() {
     let valid = stdio_entry("valid-server", Some("mcp-server"));
     let rejected = newt_core::mcp::McpImportRejection {
