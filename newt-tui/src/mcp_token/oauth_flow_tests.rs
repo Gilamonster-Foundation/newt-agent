@@ -4,6 +4,7 @@
 //! and its `mcp_token` ancestors' too — no re-export is needed for either.
 
 use super::*;
+use newt_mcp_client::HttpNetGrantRequired;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -16,6 +17,59 @@ async fn management_cancelled_oauth_stops_before_configuration_or_network() {
             .await
             .unwrap_err();
     assert_eq!(error.to_string(), "MCP login cancelled");
+}
+
+/// A host-denied OAuth hop must surface as the *typed* grant cause
+/// (`HttpNetGrantRequired`), not a flattened string, so the /mcp panel can
+/// offer the exact-host prompt. `login_http` downcasts on this error; a
+/// plain-string bail in `validate_discovery_hop_with_policy` would let it
+/// pass through untyped.
+#[tokio::test]
+async fn host_denied_oauth_hop_surfaces_as_typed_grant_cause() {
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
+    let error = validate_discovery_hop_with_policy(
+        "https://denied.example.test/token",
+        "token endpoint",
+        false,
+        &policy,
+    )
+    .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
+    assert!(
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
+    );
+    assert_eq!(required.map(|r| r.host.as_str()), Some("denied.example.test"));
+    assert!(!required.map(|r| r.private).unwrap_or(false));
+}
+
+/// A missing login stays a distinct typed cause from a host denial.
+#[tokio::test]
+async fn missing_login_stays_distinct_from_host_denial() {
+    // A host denial produces the typed grant cause ...
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
+    let error = validate_discovery_hop_with_policy(
+        "https://denied.example.test/token",
+        "token endpoint",
+        false,
+        &policy,
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<HttpNetGrantRequired>().is_some());
+
+    // ... but an invalid-endpoint (missing-login-class) error stays a plain
+    // string — it must not be confused with the typed host-denial cause.
+    let error = validate_discovery_hop_with_policy(
+        "not-a-url",
+        "token endpoint",
+        false,
+        &policy,
+    )
+    .unwrap_err();
+    assert!(
+        error.downcast_ref::<HttpNetGrantRequired>().is_none(),
+        "a plain invalid-URL error must not be the host-denial typed cause: {error:#}"
+    );
 }
 
 /// Grounds the UI cancellation flag against the real callback listener: cancelling
