@@ -336,6 +336,65 @@ pub struct BackendConfig {
     /// [`BackendProvenance`]. Written by `newt setup`; never read at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<BackendProvenance>,
+    /// Optional metering declaration — see [`MeterConfig`]. Unset (the
+    /// default) means "no meter": the TUI renders nothing for this backend.
+    /// This is *declarative* display config (a daily request cap and/or a
+    /// spend-budget source), never an admission gate — the meter shows, it
+    /// does not block. #2909.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meter: Option<MeterConfig>,
+}
+
+/// Optional per-backend metering declaration (#2909). Pure data — nothing in
+/// [`BackendConfig`] branches on the backend *name*; a provider's metering is
+/// declared here so a new provider is a config value, not a `match` arm.
+///
+/// Both halves are optional and independently declared: a backend may cap
+/// requests without a spend budget, or report spend without a request cap.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeterConfig {
+    /// The daily request-cap declaration — see [`RequestMeter`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<RequestMeter>,
+    /// The spend-budget source declaration — see [`BudgetMeter`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetMeter>,
+}
+
+/// A daily request cap for a metered backend (#2909). The cap and its reset
+/// instant are data, not code: `per` and `reset_utc` are declared by the
+/// operator, so a provider that resets on a different cadence is config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestMeter {
+    /// The request count allowed per `per` period before the provider caps.
+    pub cap: u64,
+    /// The reset cadence for `cap`. Defaults to `"day"` — the only value the
+    /// meter understands today; kept as a string (not an enum) so a future
+    /// cadence is a new value, not a new variant.
+    #[serde(default = "default_request_period")]
+    pub per: String,
+    /// The UTC instant the cap resets, as an `HH:MM` clock time. Optional:
+    /// unset means "unknown reset time" — the meter falls back to a daily
+    /// boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_utc: Option<String>,
+}
+
+/// The declared spend-budget source for a metered backend (#2909). `source`
+/// names a poll adapter; `"openrouter-key"` is the first (it maps to
+/// OpenRouter `GET /api/v1/key`). The name is DATA, not a backend-name match:
+/// a second provider is a new source string plus one adapter. An unknown
+/// source is therefore KEPT as data (never rejected at parse), so a config
+/// written against a newer newt still loads under an older one — the adapter
+/// that understands it simply reports "unknown" until it exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetMeter {
+    /// The named budget source to poll (e.g. `"openrouter-key"`).
+    pub source: String,
+}
+
+fn default_request_period() -> String {
+    "day".to_string()
 }
 
 /// A positive backend concurrency limit. The wrapper keeps both Serde input

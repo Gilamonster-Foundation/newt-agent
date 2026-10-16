@@ -307,3 +307,83 @@ fn resolve_api_key_none_for_missing_file() {
     let cfg = openai_backend(Some("/no/such/newt/token/file".into()), None);
     assert_eq!(cfg.resolve_api_key(), None);
 }
+
+#[test]
+fn backend_meter_parses_both_requests_and_budget() {
+    // #2909 step 1: a `[meter]` block declares a daily request cap AND a
+    // spend-budget source. Both halves parse together.
+    let b: BackendConfig = toml::from_str(
+        "endpoint=\"https://openrouter.ai/api\"\nmodel=\"m\"\n\
+             [meter.requests]\ncap=1000\nper=\"day\"\nreset_utc=\"00:00\"\n\
+             [meter.budget]\nsource=\"openrouter-key\"\n",
+    )
+    .unwrap();
+    let meter = b.meter.expect("meter declared");
+    let req = meter.requests.expect("requests declared");
+    assert_eq!(req.cap, 1000);
+    assert_eq!(req.per, "day");
+    assert_eq!(req.reset_utc.as_deref(), Some("00:00"));
+    let budget = meter.budget.expect("budget declared");
+    assert_eq!(budget.source, "openrouter-key");
+}
+
+#[test]
+fn backend_meter_each_half_parses_alone() {
+    // A backend may cap requests without a spend source, and vice versa.
+    let req_only: BackendConfig = toml::from_str(
+        "endpoint=\"http://h:1\"\nmodel=\"m\"\n\
+             [meter.requests]\ncap=50\n",
+    )
+    .unwrap();
+    let m = req_only.meter.expect("meter declared");
+    assert_eq!(m.requests.as_ref().map(|r| r.cap), Some(50));
+    assert_eq!(m.requests.as_ref().map(|r| r.per.as_str()), Some("day"));
+    assert_eq!(m.requests.as_ref().and_then(|r| r.reset_utc.as_ref()), None);
+    assert!(m.budget.is_none(), "no budget declared");
+
+    let budget_only: BackendConfig = toml::from_str(
+        "endpoint=\"http://h:1\"\nmodel=\"m\"\n\
+             [meter.budget]\nsource=\"openrouter-key\"\n",
+    )
+    .unwrap();
+    let m = budget_only.meter.expect("meter declared");
+    assert!(m.requests.is_none(), "no requests declared");
+    assert_eq!(
+        m.budget.as_ref().map(|b| b.source.as_str()),
+        Some("openrouter-key")
+    );
+}
+
+#[test]
+fn backend_meter_is_none_without_a_block() {
+    // Default off: no [meter] block means no meter.
+    let b: BackendConfig = toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\n").unwrap();
+    assert!(b.meter.is_none());
+}
+
+#[test]
+fn backend_meter_is_skipped_in_a_minimal_dropin() {
+    // A minimal drop-in round-trips WITHOUT a `meter` key — skip_serializing_if
+    // keeps an unset meter from bloating generated backends/<name>.toml.
+    let legacy: BackendConfig = toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\n").unwrap();
+    let out = toml::to_string(&legacy).unwrap();
+    assert!(!out.contains("meter"), "unset meter is skipped: {out}");
+}
+
+#[test]
+fn backend_meter_unknown_budget_source_is_kept_as_data() {
+    // An unknown budget source is NOT a parse error: the source name is data,
+    // so a config written against a newer newt (with a source an older newt
+    // has no adapter for) still loads — the adapter just reports "unknown".
+    let b: BackendConfig = toml::from_str(
+        "endpoint=\"http://h:1\"\nmodel=\"m\"\n\
+             [meter.budget]\nsource=\"some-future-provider-key\"\n",
+    )
+    .unwrap();
+    let budget = b
+        .meter
+        .expect("meter declared")
+        .budget
+        .expect("budget declared");
+    assert_eq!(budget.source, "some-future-provider-key");
+}
