@@ -129,6 +129,7 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )
@@ -292,6 +293,7 @@ async fn openai_loop_records_tool_events_with_digested_args() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         &mut NoMcp,
     )

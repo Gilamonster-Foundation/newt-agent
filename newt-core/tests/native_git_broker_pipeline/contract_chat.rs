@@ -166,5 +166,6 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         plan_draft_sink: None,
         steering: None,
         completed_spill_renderer: None,
+        reader_source: None,
     }
 }

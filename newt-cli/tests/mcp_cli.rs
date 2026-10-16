@@ -529,6 +529,7 @@ mod composed_private_mcp_uat {
                 cancel: None,
                 live_tool_output: None,
                 completed_spill_renderer: None,
+                reader_source: None,
                 git_tool: None,
                 crew_runner: None,
                 operating_mode_control: None,

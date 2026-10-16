@@ -8991,6 +8991,9 @@ fn session_body(
                                         // dead plumbing; it is wired when the
                                         // editor stays live (the cockpit slice).
                                         steering: None,
+                                        reader_source: Some(
+                                            &newt_core::commit_review::HostReaders,
+                                        ),
                                     },
                                     active_prompt_context.as_ref(),
                                     prompt_source,

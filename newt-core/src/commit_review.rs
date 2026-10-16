@@ -93,16 +93,30 @@ pub(crate) enum Finding {
     Unvouched(String),
 }
 
+/// Failure to read the current HEAD, distinct from a confirmed absent HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadError {
+    ReadFailed,
+}
+
+impl std::fmt::Display for HeadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HEAD read failed")
+    }
+}
+
+impl std::error::Error for HeadError {}
+
 /// Reads landed commits. Production is a fixed-argv `metadata_git` under the
 /// turn's read scope; unit tests use an in-memory fake. Never runs hooks or
 /// the model's shell text. Implementations may block: callers run them off
 /// the async executor under a deadline ([`Review`]).
-pub(crate) trait CommitReader: Send + Sync {
+pub trait CommitReader: Send + Sync {
     /// The current `HEAD` oid, or `Ok(None)` (unborn branch / not a repository).
-    /// `Err(())` means the read itself failed, which is distinct from a
+    /// `Err(HeadError::ReadFailed)` means the read itself failed, which is distinct from a
     /// confirmed absent HEAD and must skip review instead of reviewing all
     /// history as newly landed.
-    fn head(&self) -> std::result::Result<Option<String>, ()>;
+    fn head(&self) -> std::result::Result<Option<String>, HeadError>;
     /// `(oid, full message)` for commits in `before..head`, newest first,
     /// at most `limit`. `before == None` means "all of `head`'s history"
     /// (the command started on an unborn branch), still at most `limit`.
@@ -117,7 +131,7 @@ pub(crate) type SharedReader = std::sync::Arc<dyn CommitReader>;
 /// Something that can vend a reader for the command directory under the
 /// turn's read scope. Production is `HostReaders`; tests default to `NoOpReaders`
 /// so they never spawn real git.
-pub(crate) trait ReaderSource: Send + Sync {
+pub trait ReaderSource: Send + Sync {
     fn open(
         &self,
         cwd: &std::path::Path,
@@ -128,7 +142,7 @@ pub(crate) trait ReaderSource: Send + Sync {
 /// No-op reader used when the dispatcher has no reader source (tests).
 pub(crate) struct NoOpRepo;
 impl CommitReader for NoOpRepo {
-    fn head(&self) -> std::result::Result<Option<String>, ()> {
+    fn head(&self) -> std::result::Result<Option<String>, HeadError> {
         Ok(None)
     }
     fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
@@ -140,7 +154,7 @@ impl CommitReader for NoOpRepo {
 }
 
 /// Production reader source: honors the read scope via `metadata_git`.
-pub(crate) struct HostReaders;
+pub struct HostReaders;
 impl ReaderSource for HostReaders {
     fn open(
         &self,
@@ -156,51 +170,11 @@ impl ReaderSource for HostReaders {
 }
 
 /// No-op reader source for tests that do not care about commit-message review.
-pub(crate) struct NoOpReaders;
+pub struct NoOpReaders;
 impl ReaderSource for NoOpReaders {
     fn open(&self, _: &std::path::Path, _: &crate::Scope<String>) -> Option<SharedReader> {
         None
     }
-}
-
-static NO_OP_READERS: NoOpReaders = NoOpReaders;
-static DEFAULT_READER_SOURCE: std::sync::Mutex<Option<&'static dyn ReaderSource>> =
-    std::sync::Mutex::new(None);
-
-/// Set the production reader source. Tests leave this unset, so
-/// `default_reader_source` returns a no-op source.
-pub(crate) fn set_default_reader_source(source: &'static dyn ReaderSource) {
-    *DEFAULT_READER_SOURCE.lock().unwrap() = Some(source);
-}
-
-#[cfg(test)]
-pub(crate) fn clear_default_reader_source() {
-    *DEFAULT_READER_SOURCE.lock().unwrap() = None;
-}
-
-pub(crate) fn default_reader_source() -> &'static dyn ReaderSource {
-    DEFAULT_READER_SOURCE
-        .lock()
-        .unwrap()
-        .unwrap_or(&NO_OP_READERS)
-}
-
-/// #2905: allow tests to temporarily override the default source and restore
-/// it afterward. This keeps the dispatcher's default no-op while still letting
-/// commit-review tests inject fake readers.
-#[cfg(test)]
-pub(crate) fn with_reader_source<T>(source: &'static dyn ReaderSource, f: impl FnOnce() -> T) -> T {
-    let mut guard = DEFAULT_READER_SOURCE.lock().unwrap();
-    let prev = guard.replace(source);
-    drop(guard);
-    struct Guard(Option<&'static dyn ReaderSource>);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            *DEFAULT_READER_SOURCE.lock().unwrap() = self.0;
-        }
-    }
-    let _guard = Guard(prev);
-    f()
 }
 
 /// Deadline for the pre-command `HEAD` snapshot.
@@ -250,7 +224,7 @@ impl Review {
             // A failed read or a timed-out snapshot is unsafe to review against:
             // an unknown `before` would treat all reachable history as newly
             // landed, and a confirmed read failure must skip review entirely.
-            Some(Err(())) | None => return None,
+            Some(Err(HeadError::ReadFailed)) | None => return None,
         };
         Some(Self {
             pending: Pending { before, expected },
@@ -398,7 +372,7 @@ pub(crate) fn render_content(oid: &str, findings: &[String]) -> Option<String> {
 /// every read is bounded: an include naming a FIFO blocks Git indefinitely.
 /// Read-only; failures, permission denials, deadlines and oversized output all
 /// read as "nothing".
-pub(crate) struct HostRepo {
+pub struct HostRepo {
     pub(crate) cwd: std::path::PathBuf,
     pub(crate) read_scope: crate::Scope<String>,
 }
@@ -410,31 +384,24 @@ const GIT_OUTPUT_CAP: usize = 256 * 1024;
 impl HostRepo {
     /// Run one metadata git command. `Ok(Some(_))` is successful output;
     /// `Ok(None)` is a clean git absence (e.g. no HEAD, no commits in range);
-    /// `Err(())` is a spawn/read/timeout/oversize failure and must skip review.
-    fn run(
-        &self,
-        args: &[&str],
-    ) -> std::result::Result<Option<Vec<u8>>, ()> {
-        let mut child = crate::git_hardening::metadata_git(&self.cwd,
-            args,
-            &self.read_scope,
-        )
-        .map_err(|_| ())?
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|_| ())?;
+    /// `Err(HeadError::ReadFailed)` is a spawn/read/timeout/oversize failure and must skip review.
+    fn run(&self, args: &[&str]) -> std::result::Result<Option<Vec<u8>>, HeadError> {
+        let mut child = crate::git_hardening::metadata_git(&self.cwd, args, &self.read_scope)
+            .map_err(|_| HeadError::ReadFailed)?
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|_| HeadError::ReadFailed)?;
         let started = std::time::Instant::now();
         let out = child
             .stdout
             .take()
             .and_then(|stdout| read_bounded(stdout, GIT_OUTPUT_CAP, GIT_READ_DEADLINE));
         loop {
-            match (&out,
-                child
-                    .try_wait()
-                    .map_err(|_| ())?,
+            match (
+                &out,
+                child.try_wait().map_err(|_| HeadError::ReadFailed)?,
                 started.elapsed() < GIT_READ_DEADLINE,
             ) {
                 (Some(out), Some(status), _) if status.success() => {
@@ -452,7 +419,7 @@ impl HostRepo {
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(());
+                    return Err(HeadError::ReadFailed);
                 }
             }
         }
@@ -491,13 +458,16 @@ fn rev_list_args(before: Option<&str>, head: &str, limit: usize) -> Vec<String> 
 }
 
 impl CommitReader for HostRepo {
-    fn head(&self,
-    ) -> std::result::Result<Option<String>, ()> {
+    fn head(&self) -> std::result::Result<Option<String>, HeadError> {
         let out = self.run(&["rev-parse", "--verify", "-q", "HEAD"])?;
         let Some(out) = out else {
             return Ok(None);
         };
-        let oid = String::from_utf8(out).ok().ok_or(())?.trim().to_owned();
+        let oid = String::from_utf8(out)
+            .ok()
+            .ok_or(HeadError::ReadFailed)?
+            .trim()
+            .to_owned();
         Ok((!oid.is_empty()).then_some(oid))
     }
 
@@ -668,10 +638,6 @@ mod tests {
 
     const NEWT: &str = crate::agent_identity::DEFAULT_AGENT_EMAIL;
 
-    /// Serialises the two tests that mutate the process-wide default reader
-    /// source so they do not race with each other under parallel test run.
-    static READER_SOURCE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A fixed policy: the canonical finalizer of one `CommitAttribution`.
     struct LedgerPolicy(crate::attribution::CommitAttribution);
     impl CommitPolicy for LedgerPolicy {
@@ -780,8 +746,7 @@ mod tests {
 
     struct FakeRepo(Vec<(String, String)>);
     impl CommitReader for FakeRepo {
-        fn head(&self,
-        ) -> std::result::Result<Option<String>, ()> {
+        fn head(&self) -> std::result::Result<Option<String>, HeadError> {
             Ok(self.0.first().map(|(oid, _)| oid.clone()))
         }
         fn landed(&self, before: Option<&str>, _: &str, limit: usize) -> Vec<(String, String)> {
@@ -1020,9 +985,7 @@ mod tests {
     /// A reader whose every call blocks for longer than the review deadline.
     struct HangingRepo;
     impl CommitReader for HangingRepo {
-        fn head(
-            &self,
-        ) -> std::result::Result<Option<String>, ()> {
+        fn head(&self) -> std::result::Result<Option<String>, HeadError> {
             std::thread::sleep(std::time::Duration::from_secs(1));
             Ok(None)
         }
@@ -1055,30 +1018,22 @@ mod tests {
     async fn a_failed_head_read_skips_review() {
         struct ErrorThenOk(std::sync::atomic::AtomicBool);
         impl CommitReader for ErrorThenOk {
-            fn head(
-                &self,
-            ) -> std::result::Result<Option<String>, ()> {
+            fn head(&self) -> std::result::Result<Option<String>, HeadError> {
                 if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     Ok(Some("oid-head".into()))
                 } else {
-                    Err(())
+                    Err(HeadError::ReadFailed)
                 }
             }
-            fn landed(
-                &self,
-                _: Option<&str>,
-                _: &str,
-                _: usize,
-            ) -> Vec<(String, String)> {
+            fn landed(&self, _: Option<&str>, _: &str, _: usize) -> Vec<(String, String)> {
                 vec![("oid-old".into(), "old\n".into())]
             }
             fn stat(&self, _: &str) -> String {
                 String::new()
             }
         }
-        let reader: SharedReader = std::sync::Arc::new(ErrorThenOk(
-            std::sync::atomic::AtomicBool::new(false),
-        ));
+        let reader: SharedReader =
+            std::sync::Arc::new(ErrorThenOk(std::sync::atomic::AtomicBool::new(false)));
         assert!(
             Review::begin(reader, None).await.is_none(),
             "a failed initial HEAD snapshot must skip review"
@@ -1091,17 +1046,10 @@ mod tests {
     async fn an_unborn_repository_still_reviews_landed_commits() {
         struct EmptyThenFull(std::sync::Mutex<Vec<(String, String)>>);
         impl CommitReader for EmptyThenFull {
-            fn head(
-                &self,
-            ) -> std::result::Result<Option<String>, ()> {
+            fn head(&self) -> std::result::Result<Option<String>, HeadError> {
                 Ok(self.0.lock().unwrap().first().map(|(oid, _)| oid.clone()))
             }
-            fn landed(
-                &self,
-                before: Option<&str>,
-                _: &str,
-                limit: usize,
-            ) -> Vec<(String, String)> {
+            fn landed(&self, before: Option<&str>, _: &str, limit: usize) -> Vec<(String, String)> {
                 self.0
                     .lock()
                     .unwrap()
@@ -1135,9 +1083,7 @@ mod tests {
     /// The pre-command snapshot succeeded but the post-command read hangs.
     struct HangAfterHead(std::sync::atomic::AtomicBool);
     impl CommitReader for HangAfterHead {
-        fn head(
-            &self,
-        ) -> std::result::Result<Option<String>, ()> {
+        fn head(&self) -> std::result::Result<Option<String>, HeadError> {
             if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
@@ -1187,64 +1133,9 @@ mod tests {
         assert!(started.elapsed() < long);
     }
 
-    /// #2905 round 1 P2-5: the dispatcher's default reader source is no-op
-    /// so unit tests never launch real git. Production can set a real source
-    /// once; tests can override it locally.
-    #[test]
-    fn default_reader_source_is_no_op_until_production_sets_one() {
-        let _guard = READER_SOURCE_TEST_MUTEX.lock().unwrap();
-        use crate::commit_review::{
-            clear_default_reader_source, default_reader_source, set_default_reader_source,
-            HostReaders, NoOpReaders,
-        };
-        // With no production source configured, the dispatcher falls back to
-        // a no-op reader so unit tests never spawn real git.
-        clear_default_reader_source();
-        assert!(default_reader_source()
-            .open(std::path::Path::new("."), &crate::Scope::All)
-            .is_none());
-
-        // Production sets HostReaders. We do not call into the reader, only
-        // check that the source opens under an unrestricted scope.
-        set_default_reader_source(&HostReaders);
-        assert!(default_reader_source()
-            .open(std::path::Path::new("."), &crate::Scope::All)
-            .is_some());
-
-        // Clean up so later tests in the same process still see no-op.
-        set_default_reader_source(&NoOpReaders);
-        assert!(default_reader_source()
-            .open(std::path::Path::new("."), &crate::Scope::All)
-            .is_none());
-    }
-
-    #[test]
-    fn with_reader_source_overrides_production_source() {
-        let _guard = READER_SOURCE_TEST_MUTEX.lock().unwrap();
-        use crate::commit_review::with_reader_source;
-        struct RecordingSource(std::sync::atomic::AtomicUsize);
-        impl ReaderSource for RecordingSource {
-            fn open(&self, _: &std::path::Path, _: &crate::Scope<String>) -> Option<SharedReader> {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                None
-            }
-        }
-        static RECORDING: RecordingSource = RecordingSource(std::sync::atomic::AtomicUsize::new(0));
-        let before = RECORDING.0.load(std::sync::atomic::Ordering::SeqCst);
-        with_reader_source(&RECORDING, || {
-            crate::commit_review::default_reader_source()
-                .open(std::path::Path::new("."), &crate::Scope::All);
-        });
-        let after = RECORDING.0.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(after - before, 1);
-
-        // After the guard drops, the default is restored.
-        assert!(default_reader_source()
-            .open(std::path::Path::new("."), &crate::Scope::All)
-            .is_none());
-    }
-
     /// Codex round 1 #2906 P1-1: a readable cwd is not enough. Git discovery
+    /// reaches parent repositories, includes and alternates, so the metadata
+    /// contract requires unrestricted read authority before any reader spawns.
     /// reaches parent repositories, includes and alternates, so the metadata
     /// contract requires unrestricted read authority before any reader spawns.
     #[test]
@@ -1254,7 +1145,7 @@ mod tests {
             read_scope: crate::Scope::only(["repo/child".to_string()]),
         };
         // A narrow read scope rejects the metadata read before git is spawned.
-        assert_eq!(repo.head(), Err(()));
+        assert_eq!(repo.head(), Err(HeadError::ReadFailed));
         assert!(repo.landed(None, "h", 4).is_empty());
         assert!(repo.stat("abc").is_empty());
 

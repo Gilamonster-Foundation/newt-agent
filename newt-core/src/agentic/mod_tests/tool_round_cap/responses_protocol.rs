@@ -476,6 +476,7 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
             plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
+            reader_source: None,
         },
         Some(&turn_prompt),
         Some(&prompt_source),

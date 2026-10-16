@@ -146,6 +146,7 @@ fn hard_budget_ctx<'a>(
         plan_draft_sink: None,
         steering: None,
         completed_spill_renderer: None,
+        reader_source: None,
     }
 }
 

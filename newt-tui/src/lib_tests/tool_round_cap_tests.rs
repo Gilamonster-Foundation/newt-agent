@@ -215,6 +215,7 @@ fn openai_loop_recovers_from_context_window_400() {
                     plan_draft_sink: None,
                     steering: None,
                     completed_spill_renderer: None,
+                    reader_source: None,
                 },
                 &mut Mcp::empty(),
             )

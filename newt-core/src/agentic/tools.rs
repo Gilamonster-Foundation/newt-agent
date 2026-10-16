@@ -3652,6 +3652,7 @@ async fn execute_authorized_tool(
         invocation,
         build_check_cmd,
         tool_evidence,
+        reader_source: _reader_source,
         note_sink,
         recall_source,
         memory_source,
@@ -4586,7 +4587,9 @@ async fn execute_authorized_tool(
                 // #2905: the build_shell route is still a run_command that
                 // may land commits, so it gets the same async HEAD snapshot
                 // and post-execution review as the confined shell route.
-                let reader_source = crate::commit_review::default_reader_source();
+                let reader_source = collab
+                    .reader_source
+                    .unwrap_or(&crate::commit_review::NoOpReaders);
                 let commit_reader = reader_source
                     .open(std::path::Path::new(&run_cwd), &caveats.fs_read)
                     .unwrap_or_else(|| std::sync::Arc::new(crate::commit_review::NoOpRepo));
@@ -4714,7 +4717,9 @@ async fn execute_authorized_tool(
             // command, and whatever landed is read back and checked.
             // The snapshot is async and bounded so a hanging git config
             // include can never strand the turn.
-            let reader_source = crate::commit_review::default_reader_source();
+            let reader_source = collab
+                .reader_source
+                .unwrap_or(&crate::commit_review::NoOpReaders);
             let commit_reader = reader_source
                 .open(std::path::Path::new(&run_cwd), &caveats.fs_read)
                 .unwrap_or_else(|| std::sync::Arc::new(crate::commit_review::NoOpRepo));

@@ -397,9 +397,7 @@ fn is_hallucination_allows_git_network_ops() {
 fn commit_review_covers_a_commit_the_detector_cannot_see() {
     struct Moves(std::sync::atomic::AtomicBool);
     impl crate::commit_review::CommitReader for Moves {
-        fn head(
-            &self,
-        ) -> std::result::Result<Option<String>, ()> {
+        fn head(&self) -> std::result::Result<Option<String>, crate::commit_review::HeadError> {
             Ok(Some(
                 if self.0.load(std::sync::atomic::Ordering::SeqCst) {
                     "oid-new"
