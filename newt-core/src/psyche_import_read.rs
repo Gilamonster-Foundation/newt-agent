@@ -65,28 +65,36 @@ pub fn read_config_file(
             ))
         })?;
     let mut lock_failure: Option<String> = None;
-    let locked = if let Some(destination) = &destination {
+    // `locked` is the resolved destination we will read/migrate/write through.
+    // It is `Some` for both a lock we acquired and a lock the caller already
+    // holds, so migration writes under the right lock.
+    let mut locked: Option<crate::atomic_fs::ResolvedPath> = None;
+    // A guard we acquired ourselves must stay alive for the whole migration —
+    // binding it here keeps it alive until after `read_migrating` returns.
+    // The caller's own held lock (passed in `held_locks`) needs no extra guard.
+    let mut _own_guard: Option<crate::atomic_fs::LockGuard> = None;
+    if let Some(destination) = &destination {
         let held = held_locks
             .iter()
             .any(|guard| guard.lock_path() == destination.lock_path());
-        if held {
-            Some(destination.clone())
-        } else {
+        if !held {
             match crate::atomic_fs::acquire_lock(&destination.lock_path()) {
-                Ok(_guard) => Some(destination.clone()),
+                Ok(guard) => {
+                    _own_guard = Some(guard);
+                    locked = Some(destination.clone());
+                }
                 Err(error) if !LOCK_CONTENTION_REPORTED.swap(true, Ordering::Relaxed) => {
                     lock_failure = Some(format!(
                         "cannot lock config {} for migration: {error:#}",
                         path.display()
                     ));
-                    None
                 }
-                Err(_) => None,
+                Err(_) => {}
             }
+        } else {
+            locked = Some(destination.clone());
         }
-    } else {
-        None
-    };
+    }
     let operated = locked
         .as_ref()
         .map_or(path, crate::atomic_fs::ResolvedPath::as_path);
@@ -101,7 +109,9 @@ pub fn read_config_file(
         locked.is_some(),
         |p| std::fs::read_to_string(p),
         |_, text| {
-            let destination = locked.as_ref().expect("rewrite holds the config lock");
+            let destination = locked
+                .as_ref()
+                .expect("rewrite holds the config lock");
             destination.atomic_write(text.as_bytes())
         },
         &mut |notice| {

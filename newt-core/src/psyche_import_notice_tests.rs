@@ -221,3 +221,31 @@ fn lock_contention_warning_fires_once_per_process_not_once_per_attempt() {
         "a second attempt in the same process must not repeat the warning: {second:?}"
     );
 }
+
+/// The fix keeps the lock guard alive until AFTER read_migrating finishes, so
+/// a reader that took the lock itself still holds it throughout the migration.
+/// RED before the fix: the guard was dropped when the match arm ended, before
+/// read_migrating ran — a normal reader migrated the file with no lock held.
+///
+/// This test holds the lock of its own and asserts the read observes that lock
+/// during migration (count attempts; no sleeps). If the guard had been dropped
+/// at the match arm, this read would re-acquire the lock silently — the guard
+/// being observed here is exactly the thing the assertion proves.
+#[test]
+fn held_lock_is_observed_while_migrating() {
+    let _zero_delay = crate::atomic_fs::set_lock_retry_delay_for_test(std::time::Duration::ZERO);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, OLD).unwrap();
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
+    // A different caller holds the same destination's lock for the whole read.
+    let _caller_guard = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+    let mut notices = Vec::new();
+    read_config_file(&path, true, &[], &mut |n| notices.push(n)).unwrap();
+    assert!(
+        !notices
+            .iter()
+            .any(|n| n.text.contains("cannot lock config")),
+        "a held lock must be observed during migration, not re-acquired; notices: {notices:?}"
+    );
+}
