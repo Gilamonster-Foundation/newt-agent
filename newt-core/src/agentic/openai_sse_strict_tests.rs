@@ -621,3 +621,73 @@ fn stream_still_rejects_a_blank_id_after_a_real_one() {
     ];
     assert!(decode_response(&sse(&frames, true)).is_err());
 }
+
+/// #2908: OpenRouter repeats the finish chunk to attach `usage`. The repeated
+/// chunk adds nothing — blank text, still an assistant, the same finish
+/// reason — so the tail decodes with its text intact and the second chunk's
+/// usage kept.
+#[test]
+fn stream_accepts_openrouters_repeated_finish_chunk_and_keeps_its_usage() {
+    let bytes = sse(
+        &[
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"The answer."}}]}),
+            json!({"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}),
+            json!({"choices":[{"index":0,"delta":{"content":"","role":"assistant"},
+            "finish_reason":"stop"}],
+            "usage":{"prompt_tokens":128,"completion_tokens":9,"cost":0.000312}}),
+        ],
+        true,
+    );
+    let parsed = decode_response(&bytes).unwrap();
+    assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    assert_eq!(parsed["choices"][0]["message"]["content"], "The answer.");
+    assert_eq!(
+        parsed["usage"],
+        json!({"prompt_tokens":128,"completion_tokens":9,"cost":0.000312})
+    );
+}
+
+/// #2908: only a repeat that adds nothing is accepted. Text after the
+/// recorded finish still changes the choice.
+#[test]
+fn stream_still_rejects_text_after_the_finish() {
+    let bytes = sse(
+        &[
+            json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
+            json!({"choices":[{"index":0,"delta":{"content":"after the finish"}}]}),
+        ],
+        true,
+    );
+    assert!(decode_response(&bytes).is_err());
+}
+
+/// #2908: a repeated finish chunk must repeat the same finish reason, even
+/// when it carries usage like OpenRouter's.
+#[test]
+fn stream_still_rejects_a_changed_finish_reason_after_the_finish() {
+    let bytes = sse(
+        &[
+            json!({"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}),
+            json!({"choices":[{"index":0,"delta":{"content":"","role":"assistant"},
+            "finish_reason":"length"}],
+            "usage":{"prompt_tokens":128,"completion_tokens":9,"cost":0.000312}}),
+        ],
+        true,
+    );
+    assert!(decode_response(&bytes).is_err());
+}
+
+/// #2908: tool calls after the recorded finish still change the choice.
+#[test]
+fn stream_still_rejects_tool_calls_after_the_finish() {
+    let bytes = sse(
+        &[
+            json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+                {"index":0,"id":"call-late","type":"function",
+                "function":{"name":"read_file","arguments":"{}"}}]}}]}),
+        ],
+        true,
+    );
+    assert!(decode_response(&bytes).is_err());
+}
