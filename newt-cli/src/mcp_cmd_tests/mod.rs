@@ -52,5 +52,8 @@ mod invocation;
 #[path = "listing.rs"]
 mod listing;
 #[cfg(test)]
+#[path = "next_steps.rs"]
+mod next_steps;
+#[cfg(test)]
 #[path = "registration_entry.rs"]
 mod registration_entry;
