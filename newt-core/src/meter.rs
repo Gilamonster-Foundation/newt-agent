@@ -75,7 +75,8 @@ struct EffectiveBudget {
 }
 
 /// Poll OpenRouter `GET /api/v1/key` for this backend's spend, using the
-/// backend's already-resolved API key.
+/// backend's already-resolved API key. `deadline` is injected so tests never
+/// wait on wall clock.
 ///
 /// Never returns an error: timeout, connect failure, HTTP error (including
 /// 401), or parse failure all degrade to [`SpendStatus::Unknown`].
@@ -83,12 +84,11 @@ pub async fn poll_openrouter_key(
     client: &reqwest::Client,
     endpoint: &str,
     api_key: &str,
+    deadline: Duration,
 ) -> SpendStatus {
     let url = format!("{}/v1/key", endpoint.trim_end_matches('/'));
     let response =
-        match tokio::time::timeout(POLL_DEADLINE, client.get(&url).bearer_auth(api_key).send())
-            .await
-        {
+        match tokio::time::timeout(deadline, client.get(&url).bearer_auth(api_key).send()).await {
             Ok(Ok(response)) => response,
             // Timeout, connect failure, DNS, TLS — all mean unknown.
             Ok(Err(_)) | Err(_) => return SpendStatus::Unknown,
@@ -141,9 +141,10 @@ pub async fn poll_budget_source(
     client: &reqwest::Client,
     endpoint: &str,
     api_key: &str,
+    deadline: Duration,
 ) -> SpendStatus {
     match source {
-        "openrouter-key" => poll_openrouter_key(client, endpoint, api_key).await,
+        "openrouter-key" => poll_openrouter_key(client, endpoint, api_key, deadline).await,
         _ => SpendStatus::Unknown,
     }
 }
@@ -195,33 +196,46 @@ impl SpendCache {
             Some(entry) => now.duration_since(entry.last_polled) >= SPEND_CADENCE,
         }
     }
+}
 
+/// Parameters for [`SpendCache::poll_if_due`] — grouped so clippy's
+/// `too_many_arguments` stays silent without an `#[allow]`.
+pub struct PollParams<'a> {
+    pub client: &'a reqwest::Client,
+    pub backend: &'a str,
+    pub source: &'a str,
+    pub endpoint: &'a str,
+    pub api_key: Option<&'a str>,
+    pub now: Instant,
+    pub turn_in_flight: bool,
+}
+
+impl SpendCache {
     /// Poll the spend for `backend` if the cadence allows, caching the result.
     ///
     /// Returns the current (cached or freshly polled) spend status. `api_key` is
     /// `None` when the backend resolves no key — that degrades to `Unknown`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn poll_if_due(
-        &mut self,
-        client: &reqwest::Client,
-        backend: &str,
-        source: &str,
-        endpoint: &str,
-        api_key: Option<&str>,
-        now: Instant,
-        turn_in_flight: bool,
-    ) -> SpendStatus {
-        if !self.is_poll_due(now, backend, turn_in_flight) {
+    pub async fn poll_if_due(&mut self, params: PollParams<'_>) -> SpendStatus {
+        if !self.is_poll_due(params.now, params.backend, params.turn_in_flight) {
             return self
-                .cached(backend)
+                .cached(params.backend)
                 .cloned()
                 .unwrap_or(SpendStatus::Unknown);
         }
-        let status = match api_key {
-            Some(key) => poll_budget_source(source, client, endpoint, key).await,
+        let status = match params.api_key {
+            Some(key) => {
+                poll_budget_source(
+                    params.source,
+                    params.client,
+                    params.endpoint,
+                    key,
+                    POLL_DEADLINE,
+                )
+                .await
+            }
             None => SpendStatus::Unknown,
         };
-        self.record(backend.to_string(), now, status.clone());
+        self.record(params.backend.to_string(), params.now, status.clone());
         status
     }
 }
@@ -319,7 +333,14 @@ mod tests {
     async fn unknown_source_gives_unknown() {
         let server = server().await;
         let client = reqwest::Client::new();
-        let status = poll_budget_source("no-such-source", &client, &server.uri(), "test-key").await;
+        let status = poll_budget_source(
+            "no-such-source",
+            &client,
+            &server.uri(),
+            "test-key",
+            TEST_DEADLINE,
+        )
+        .await;
         assert_eq!(status, SpendStatus::Unknown);
     }
 
