@@ -36,6 +36,7 @@ use newt_core::mcp_catalog::{
     builtin_catalog, merge_catalog_layers, parse_catalog, McpCatalogEntry,
 };
 use newt_core::Config;
+use newt_tui::{classify_readiness, McpReadiness};
 
 #[derive(Subcommand, Debug)]
 pub enum McpCmd {
@@ -270,16 +271,19 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
 
 /// The post-add pointer to the verification surfaces.
 ///
-/// When any adopted/registered server is HTTP, point at `newt auth` (HTTP MCP
-/// is supported; a credential-free probe cannot validate a saved login).
+/// Each adopted HTTP server is classified once through [`classify_readiness`] —
+/// the same admission/auth check `newt doctor` and `newt auth` use (#2913) —
+/// so import, doctor, auth and `/mcp` all report the same state for the same
+/// server. HTTP MCP is supported; never suggest a credential-free probe as a
+/// substitute for `newt auth`.
 pub(crate) fn print_next_steps(
     out: &mut dyn Write,
     adopted: &[McpServerEntry],
 ) -> anyhow::Result<()> {
-    let http = adopted
+    let any_http = adopted
         .iter()
         .any(|e| matches!(e.transport, TransportKind::Http));
-    if http {
+    if any_http {
         writeln!(
             out,
             "HTTP servers imported — run `newt auth <name>` to authenticate each one, \
@@ -290,6 +294,34 @@ pub(crate) fn print_next_steps(
             out,
             "Verify with `newt doctor`; in the TUI, `/mcp` shows live status."
         )?;
+    }
+    // Per-server, same classification every surface agrees on.
+    for entry in adopted {
+        match classify_readiness(entry) {
+            McpReadiness::NotAdmitted => {
+                let denied = newt_core::mcp::admit(entry)
+                    .expect_err("classified NotAdmitted implies admission denied");
+                writeln!(
+                    out,
+                    "  !  {} — not admitted ({denied}); import/approve it before `newt auth`.",
+                    entry.name
+                )?;
+            }
+            McpReadiness::Configured => {
+                writeln!(
+                    out,
+                    "  ✓  {} — admitted, no credential yet: `newt auth {}` then `newt doctor`.",
+                    entry.name, entry.name
+                )?;
+            }
+            McpReadiness::Authenticated => {
+                writeln!(
+                    out,
+                    "  ✓  {} — admitted and credentialed: confirm with `newt doctor`.",
+                    entry.name
+                )?;
+            }
+        }
     }
     Ok(())
 }

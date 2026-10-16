@@ -225,12 +225,16 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
                     Err(e) => println!("  {} [stdio] — ERROR: {e:#}", s.name),
                 }
             }
-            newt_core::mcp::TransportKind::Sse | newt_core::mcp::TransportKind::Http => {
-                let kind = if matches!(s.transport, newt_core::mcp::TransportKind::Sse) {
-                    "sse"
-                } else {
-                    "http"
-                };
+            newt_core::mcp::TransportKind::Sse => {
+                // Legacy SSE is rejected by the runtime (mcp_management.rs) —
+                // never suggest `newt auth` for it; point at streamable-HTTP.
+                println!(
+                    "  {} [sse] — unsupported transport (legacy SSE); switch \
+                     this server to a streamable-HTTP endpoint.",
+                    s.name
+                );
+            }
+            newt_core::mcp::TransportKind::Http => {
                 let url = s.url.clone().unwrap_or_default();
                 let readiness = classify_readiness(s);
                 let auth_note = match readiness {
@@ -248,7 +252,7 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
                         s.name
                     ),
                 };
-                println!("  {} [{kind}] — {url}{auth_note}", s.name);
+                println!("  {} [http] — {url}{auth_note}", s.name);
             }
         }
     }
@@ -749,9 +753,63 @@ mod tests {
             classify_readiness(&entry(TransportKind::Http, false)),
             McpReadiness::Configured
         );
+        // Step 2 (#2913): a `${...}` reference literal is unresolved at rest —
+        // configured, but no usable credential. Only a `SecretValue::Ref`
+        // (env/file/cmd secret reference) counts as authenticated.
+        let ref_entry = McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: [(
+                "Authorization".into(),
+                newt_core::mcp::SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    env: Some("TOKEN".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+        assert_eq!(classify_readiness(&ref_entry), McpReadiness::Authenticated);
         assert_eq!(
             classify_readiness(&entry(TransportKind::Http, true)),
-            McpReadiness::Authenticated
+            McpReadiness::Configured
+        );
+        // Step 2 (#2913): a plaintext bearer header is rejected — it is not a
+        // usable credential. A `${...}` reference header counts as configured,
+        // but a literal bearer does not.
+        fn plaintext_entry() -> McpServerEntry {
+            McpServerEntry {
+                name: "h".into(),
+                enabled: true,
+                transport: TransportKind::Http,
+                command: None,
+                args: vec![],
+                env: Default::default(),
+                url: Some("https://example.test/mcp".into()),
+                headers: [(
+                    "Authorization".into(),
+                    newt_core::mcp::SecretValue::literal("Bearer deadbeef"),
+                )]
+                .into_iter()
+                .collect(),
+                login_argv: Vec::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Trusted,
+                origin: None,
+            }
+        }
+        assert_eq!(
+            classify_readiness(&plaintext_entry()),
+            McpReadiness::Configured
         );
         let mut disabled = entry(TransportKind::Http, true);
         disabled.enabled = false;
@@ -770,5 +828,102 @@ mod tests {
             "authenticated"
         );
         assert_eq!(readiness_label(McpReadiness::NotAdmitted), "not admitted");
+    }
+
+    // Step 1 (#2913): one classifier, shared. doctor and `newt auth` must
+    // classify the same server identically — admission, header presence, and
+    // reference-versus-plaintext all agree on a single fixture.
+    #[test]
+    fn mcp_readiness_agrees_between_doctor_and_auth() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let header = |value| {
+            [(
+                "Authorization".into(),
+                newt_core::mcp::SecretValue::literal(value),
+            )]
+            .into_iter()
+            .collect()
+        };
+        let ref_header = || {
+            [(
+                "Authorization".into(),
+                newt_core::mcp::SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    env: Some("TOKEN".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect()
+        };
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // Plaintext bearer: rejected by both doctor and auth.
+        assert_eq!(
+            classify_readiness(&entry(header("Bearer deadbeef"))),
+            McpReadiness::Configured
+        );
+        // `${...}` reference literal: unresolved at rest, not authenticated.
+        assert_eq!(
+            classify_readiness(&entry(header("${TOKEN}"))),
+            McpReadiness::Configured
+        );
+        // Structured secret reference: counts as configured credential.
+        assert_eq!(
+            classify_readiness(&entry(ref_header())),
+            McpReadiness::Authenticated
+        );
+        // No header at all: admitted but no credential.
+        assert_eq!(
+            classify_readiness(&entry(Default::default())),
+            McpReadiness::Configured
+        );
+    }
+
+    // Step 3 (#2913): legacy SSE keeps its own unsupported-transport diagnosis
+    // and never suggests `newt auth`. (Doctor itself never connects, so this is
+    // a pure output check against the read-only SSE arm.)
+    #[test]
+    fn mcp_readiness_sse_never_suggests_auth() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, readiness_label, McpReadiness};
+
+        let entry = McpServerEntry {
+            name: "sse-server".into(),
+            enabled: true,
+            transport: TransportKind::Sse,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: Default::default(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+        // SSE is admitted (trusted + enabled) but reports Configured — never
+        // Authenticated, and never "callable". Doctor's SSE arm renders the
+        // unsupported-transport line with no `newt auth` advice.
+        assert_eq!(classify_readiness(&entry), McpReadiness::Configured);
+        assert_ne!(
+            readiness_label(classify_readiness(&entry)),
+            "authenticated",
+            "legacy SSE must never be presented as authenticated"
+        );
     }
 }
