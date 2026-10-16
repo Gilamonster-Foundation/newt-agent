@@ -193,7 +193,7 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                 entry.name,
                 path.display()
             )?;
-            print_next_steps(&mut out)
+            print_next_steps(&mut out, &[entry])
         }
         McpCmd::Remove { name, project } => {
             let path = remove_server(&name, config_path, project)?;
@@ -233,7 +233,7 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                     writeln!(out, "Resolved command to {cmd}")?;
                 }
             }
-            print_next_steps(&mut out)
+            print_next_steps(&mut out, &[server])
         }
         // `serve` runs newt-as-a-server, which needs the persona (a global
         // flag) and the stdio_guard redirect that only `run_mcp` in lib.rs
@@ -269,11 +269,28 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
 }
 
 /// The post-add pointer to the verification surfaces.
-pub(crate) fn print_next_steps(out: &mut dyn Write) -> anyhow::Result<()> {
-    writeln!(
-        out,
-        "Verify with `newt doctor`; in the TUI, `/mcp` shows live status."
-    )?;
+///
+/// When any adopted/registered server is HTTP, point at `newt auth` (HTTP MCP
+/// is supported; a credential-free probe cannot validate a saved login).
+pub(crate) fn print_next_steps(
+    out: &mut dyn Write,
+    adopted: &[McpServerEntry],
+) -> anyhow::Result<()> {
+    let http = adopted
+        .iter()
+        .any(|e| matches!(e.transport, TransportKind::Http));
+    if http {
+        writeln!(
+            out,
+            "HTTP servers imported — run `newt auth <name>` to authenticate each one, \
+             then `newt doctor` to confirm readiness."
+        )?;
+    } else {
+        writeln!(
+            out,
+            "Verify with `newt doctor`; in the TUI, `/mcp` shows live status."
+        )?;
+    }
     Ok(())
 }
 
@@ -1770,7 +1787,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             hosts.join(", ")
         )?;
     }
-    print_next_steps(out)
+    print_next_steps(out, &adopted)
 }
 
 // ---------------------------------------------------------------------------

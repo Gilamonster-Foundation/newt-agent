@@ -32,6 +32,9 @@ pub(crate) use session_capability::SessionCapability;
 // `newt auth`'s driver. Re-exported, not moved out of the public API:
 // newt-cli calls `newt_tui::run_auth`, so the path must not change.
 pub use auth_command::run_auth;
+// #2913: one admission/auth readiness classification shared by import,
+// doctor, `newt auth` and the /mcp panel.
+pub use mcp::{classify_readiness, readiness_label, McpReadiness};
 // Only `lib.rs` itself calls these (`resolve_backend_choice`); nothing else in
 // the crate does, so this is a private import rather than a re-export.
 use codex_env::{codex_env_allowed, codex_env_backend};

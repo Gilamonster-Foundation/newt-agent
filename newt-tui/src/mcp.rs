@@ -228,6 +228,47 @@ fn authorization_is_reference(value: &newt_core::mcp::SecretValue) -> bool {
     }
 }
 
+/// A single admission/auth readiness classification shared by import, doctor,
+/// `newt auth` and the /mcp panel. Every surface reports the same level for
+/// the same server (#2913).
+///
+/// Only local, decidable state is classified here — admission (enabled +
+/// trust) and whether a credential is configured in the entry. Token
+/// freshness and a live dial are layered on top by the interactive surfaces
+/// that can afford them; the baseline below is what every surface agrees on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpReadiness {
+    /// Admission refused (disabled or untrusted) — not ready at all.
+    NotAdmitted,
+    /// Admitted to run, but no credential is configured in the entry.
+    #[default]
+    Configured,
+    /// Admitted and a credential is configured (an Authorization header is
+    /// present at rest).
+    Authenticated,
+}
+
+/// Classify one server's admission + configured-credential state. Pure over
+/// the entry, so import, doctor, `newt auth` and the /mcp panel all agree.
+pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
+    if newt_core::mcp::admit(entry).is_err() {
+        return McpReadiness::NotAdmitted;
+    }
+    if has_configured_authorization_header(entry) {
+        return McpReadiness::Authenticated;
+    }
+    McpReadiness::Configured
+}
+
+#[must_use]
+pub fn readiness_label(readiness: McpReadiness) -> &'static str {
+    match readiness {
+        McpReadiness::NotAdmitted => "not admitted",
+        McpReadiness::Configured => "configured (no credential)",
+        McpReadiness::Authenticated => "authenticated",
+    }
+}
+
 fn is_http_unauthorized(error: &anyhow::Error) -> bool {
     is_http_status(error, 401)
 }

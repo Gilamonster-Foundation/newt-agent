@@ -7,6 +7,7 @@ use newt_core::dgx::{DgxConfig, EndpointKind};
 use newt_core::ocap::SecurityReport;
 use newt_core::Config;
 use newt_inference::local::LocalOllamaBackend;
+use newt_tui::{classify_readiness, readiness_label, McpReadiness};
 use std::path::Path;
 
 /// Render the achieved-security report as `doctor` posture lines. Pure over the
@@ -231,10 +232,23 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
                     "http"
                 };
                 let url = s.url.clone().unwrap_or_default();
-                println!(
-                    "  {} [{kind}] — {url} (skipped: only stdio is supported in this build)",
-                    s.name
-                );
+                let readiness = classify_readiness(s);
+                let auth_note = match readiness {
+                    McpReadiness::NotAdmitted => {
+                        format!(" ({} — cannot connect)", readiness_label(readiness))
+                    }
+                    McpReadiness::Configured => format!(
+                        " ({} — grant net for `{url}`, then `newt auth {}`)",
+                        readiness_label(readiness),
+                        s.name
+                    ),
+                    McpReadiness::Authenticated => format!(
+                        " ({} — credential present; connect via `/mcp` or `newt auth {}`)",
+                        readiness_label(readiness),
+                        s.name
+                    ),
+                };
+                println!("  {} [{kind}] — {url}{auth_note}", s.name);
             }
         }
     }
@@ -698,5 +712,63 @@ mod tests {
             .any(|l| l == "process-confinement: unsupported on macos"));
         // No line may claim a kernel guarantee is "enforced" on macOS.
         assert!(!lines.iter().any(|l| l == "fs-confinement: enforced"));
+    }
+
+    #[test]
+    fn mcp_readiness_classifies_http_server_configured_authenticated_and_not_admitted() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        fn entry(transport: TransportKind, header: bool) -> McpServerEntry {
+            McpServerEntry {
+                name: "h".into(),
+                enabled: true,
+                transport,
+                command: None,
+                args: vec![],
+                env: Default::default(),
+                url: Some("https://example.test/mcp".into()),
+                headers: if header {
+                    [(
+                        "Authorization".into(),
+                        newt_core::mcp::SecretValue::literal("${TOKEN}"),
+                    )]
+                    .into_iter()
+                    .collect()
+                } else {
+                    Default::default()
+                },
+                login_argv: Vec::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Trusted,
+                origin: None,
+            }
+        }
+
+        assert_eq!(
+            classify_readiness(&entry(TransportKind::Http, false)),
+            McpReadiness::Configured
+        );
+        assert_eq!(
+            classify_readiness(&entry(TransportKind::Http, true)),
+            McpReadiness::Authenticated
+        );
+        let mut disabled = entry(TransportKind::Http, true);
+        disabled.enabled = false;
+        assert_eq!(classify_readiness(&disabled), McpReadiness::NotAdmitted);
+    }
+
+    #[test]
+    fn mcp_readiness_labels_are_stable_across_surfaces() {
+        use newt_tui::{readiness_label, McpReadiness};
+        assert_eq!(
+            readiness_label(McpReadiness::Configured),
+            "configured (no credential)"
+        );
+        assert_eq!(
+            readiness_label(McpReadiness::Authenticated),
+            "authenticated"
+        );
+        assert_eq!(readiness_label(McpReadiness::NotAdmitted), "not admitted");
     }
 }
