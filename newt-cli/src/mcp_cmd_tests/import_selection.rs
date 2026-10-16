@@ -214,6 +214,89 @@ fn import_listing_never_renders_untrusted_names_as_commands() {
 }
 
 #[test]
+fn import_chooser_names_each_rejection_with_safe_reason_and_no_value() {
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad-server".into()),
+        issue: newt_core::mcp::McpImportIssue::UnknownField,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        false,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    // Every rejection is named with a safe reason.
+    assert!(err.contains("bad-server"), "{err}");
+    assert!(err.contains("unsupported fields"), "{err}");
+    // No source values or secrets are echoed.
+    assert!(!err.contains("plaintext"), "{err}");
+    assert!(!err.contains("secret"), "{err}");
+}
+
+#[test]
+fn import_chooser_gives_rejected_entry_no_runnable_command() {
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad-server".into()),
+        issue: newt_core::mcp::McpImportIssue::InvalidShape,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        false,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("newt mcp import --from-claude --name valid-server"),
+        "{err}"
+    );
+    // The rejected entry gets no runnable command.
+    assert!(!err.contains("--name bad-server"), "{err}");
+}
+
+#[test]
+fn import_all_names_each_rejection_and_refuses() {
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad-server".into()),
+        issue: newt_core::mcp::McpImportIssue::UnsupportedSemantics,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        true,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("bad-server"), "{err}");
+    assert!(
+        err.contains("unsupported or ambiguous transport semantics"),
+        "{err}"
+    );
+}
+
+#[test]
 fn import_flags_stdio_command_that_resolves_to_nothing() {
     let dirs = [PathBuf::from("/bin")];
     let has = |p: &Path| {
