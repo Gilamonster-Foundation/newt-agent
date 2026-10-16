@@ -1211,11 +1211,12 @@ mod tests {
         );
     }
 
-    /// Codex round 1 #2906 P1-1: a readable cwd is not enough. Git discovery
-    /// reaches parent repositories, includes and alternates, so the metadata
-    /// contract requires unrestricted read authority before any reader spawns.
-    /// reaches parent repositories, includes and alternates, so the metadata
-    /// contract requires unrestricted read authority before any reader spawns.
+    /// Codex round 1 #2906 P1-1 / round 3 P2: a readable cwd is not enough. Git
+    /// discovery reaches parent repositories, includes and alternates, so the
+    /// metadata contract requires unrestricted read authority before any reader
+    /// spawns. This unit test asserts the authority gate refuses the read; it
+    /// never launches a real git subprocess. Real-repo behavior is covered by
+    /// the integration / real-resource suite.
     #[test]
     fn host_repo_requires_unrestricted_read_authority() {
         let repo = HostRepo {
@@ -1226,18 +1227,6 @@ mod tests {
         assert_eq!(repo.head(), Err(HeadError::ReadFailed));
         assert!(repo.landed(None, "h", 4).is_empty());
         assert!(repo.stat("abc").is_empty());
-
-        let unrestricted = HostRepo {
-            cwd: std::env::current_dir().unwrap(),
-            read_scope: crate::Scope::All,
-        };
-        // The unit-test cwd is a real git worktree: the unrestricted scope
-        // lets the read proceed and returns either a real HEAD or a clean
-        // Ok(None) for an unborn branch, never an error.
-        assert!(
-            unrestricted.head().is_ok(),
-            "unrestricted read scope must allow metadata git to run"
-        );
     }
 
     #[test]
