@@ -93,7 +93,13 @@ impl StrictResponse {
             .as_object()
             .ok_or_else(|| Unsupported("streamed choice has no delta object".into()))?;
         anyhow::ensure!(
-            self.finish_reason.is_none() || delta.is_empty(),
+            self.finish_reason.is_none()
+                || delta.is_empty()
+                || repeated_finish_adds_nothing(
+                    &choice["delta"],
+                    &choice["finish_reason"],
+                    self.finish_reason.as_deref(),
+                ),
             "stream changed a choice after its finish reason"
         );
         for key in ["content", "reasoning_content", "reasoning"] {
@@ -267,6 +273,21 @@ fn stable_string(target: &mut Option<String>, value: &Value, field: &str) -> any
     );
     *target = Some(value.to_owned());
     Ok(())
+}
+
+/// #2908: OpenRouter repeats the finish chunk to attach `usage`. The repeated
+/// chunk is accepted only when it adds nothing: every text field is null or
+/// blank, the role is null or still `assistant`, there are no tool calls, and
+/// its finish reason is absent or the one already recorded. Anything that adds
+/// text, calls, or a different reason still changes the choice.
+fn repeated_finish_adds_nothing(delta: &Value, finish: &Value, recorded: Option<&str>) -> bool {
+    let blank = |key: &str| delta[key].is_null() || delta[key].as_str() == Some("");
+    ["content", "reasoning_content", "reasoning"]
+        .into_iter()
+        .all(blank)
+        && (delta["role"].is_null() || delta["role"].as_str() == Some("assistant"))
+        && delta["tool_calls"].is_null()
+        && (finish.is_null() || finish.as_str() == recorded)
 }
 
 pub(super) fn is_error(frame: &Value) -> bool {
