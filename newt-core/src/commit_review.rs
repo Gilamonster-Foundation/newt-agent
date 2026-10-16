@@ -411,14 +411,8 @@ impl HostRepo {
             ) {
                 (Some(status), _) => {
                     let remaining = GIT_READ_DEADLINE.saturating_sub(started.elapsed());
-                    let stdout = stdout_rx
-                        .as_ref()
-                        .and_then(|rx| rx.recv_timeout(remaining).ok().flatten())
-                        .unwrap_or_default();
-                    let stderr = stderr_rx
-                        .as_ref()
-                        .and_then(|rx| rx.recv_timeout(remaining).ok().flatten())
-                        .unwrap_or_default();
+                    let stdout = collect_output(stdout_rx, remaining)?;
+                    let stderr = collect_output(stderr_rx, remaining)?;
                     return classify(args, status.code(), stdout, stderr);
                 }
                 (None, true) => {
@@ -472,6 +466,23 @@ fn read_bounded(
         let _ = tx.send(ok.then_some(buf).filter(|buf| buf.len() <= cap));
     });
     rx
+}
+
+/// Collect the bounded result for one pipe. A missing pipe is treated as
+/// empty; any timeout, disconnect, read error, or oversize output becomes
+/// `HeadError::ReadFailed` so the classifier never mistakes a failed read
+/// for confirmed empty output.
+fn collect_output(
+    rx: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
+    remaining: std::time::Duration,
+) -> std::result::Result<Vec<u8>, HeadError> {
+    match rx {
+        Some(rx) => rx
+            .recv_timeout(remaining)
+            .map_err(|_| HeadError::ReadFailed)?
+            .ok_or(HeadError::ReadFailed),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// `git rev-list` argv for the commits newly reachable in `before..head`.
@@ -1227,6 +1238,34 @@ mod tests {
         assert_eq!(repo.head(), Err(HeadError::ReadFailed));
         assert!(repo.landed(None, "h", 4).is_empty());
         assert!(repo.stat("abc").is_empty());
+    }
+
+    /// Codex round 4 #2906 P2: a failed or oversized bounded pipe read must
+    /// not be flattened to empty output. A collector that returns oversized
+    /// or disconnected output with exit 1 must be classified as a read
+    /// failure, not as a clean "no HEAD" absence.
+    #[test]
+    fn oversized_collector_is_read_failure_not_unborn() {
+        let oversized = vec![b'x'; GIT_OUTPUT_CAP + 1];
+        let rx = read_bounded(
+            std::io::Cursor::new(oversized),
+            GIT_OUTPUT_CAP,
+            GIT_READ_DEADLINE,
+        );
+        assert_eq!(
+            collect_output(Some(rx), GIT_READ_DEADLINE),
+            Err(HeadError::ReadFailed)
+        );
+    }
+
+    #[test]
+    fn disconnected_collector_is_read_failure() {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+        drop(tx);
+        assert_eq!(
+            collect_output(Some(rx), GIT_READ_DEADLINE),
+            Err(HeadError::ReadFailed)
+        );
     }
 
     #[test]
