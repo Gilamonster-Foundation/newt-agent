@@ -940,4 +940,80 @@ mod tests {
             "legacy SSE must never be presented as authenticated"
         );
     }
+
+    // NEW: a valid saved OAuth login (resource- and issuer-bound, unexpired,
+    // in the token store) counts as Authenticated even with no Authorization
+    // header. Uses an in-memory store fixture via HOME override.
+    #[test]
+    fn mcp_readiness_counts_valid_saved_oauth_login_as_authenticated() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", temp.path()) };
+
+        let token_dir = temp.path().join(".hermes").join("mcp-tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+
+        let resource = "https://mcp.example.test/mcp";
+        let issuer = "https://auth.example.test";
+
+        let token = serde_json::json!({
+            "access_token": "saved-oauth-token",
+            "refresh_token": "refresh-token",
+            "expires_at": 2_000_000_000.0,
+            "resource": resource,
+            "issuer": issuer,
+            "token_type": "Bearer"
+        });
+        let meta = serde_json::json!({
+            "resource": resource,
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "code_challenge_methods_supported": ["S256"],
+            "authorization_response_iss_parameter_supported": true
+        });
+        let client = serde_json::json!({
+            "client_id": "client-id",
+            "redirect_uris": ["http://127.0.0.1:0/callback"],
+            "issuer": issuer
+        });
+
+        std::fs::write(
+            token_dir.join("example-server.json"),
+            serde_json::to_string(&token).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            token_dir.join("example-server.meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            token_dir.join("example-server.client.json"),
+            serde_json::to_string(&client).unwrap(),
+        )
+        .unwrap();
+
+        let entry = McpServerEntry {
+            name: "example-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some(resource.to_string()),
+            headers: Default::default(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // No Authorization header, but a valid saved OAuth login → Authenticated.
+        assert_eq!(classify_readiness(&entry), McpReadiness::Authenticated);
+
+        unsafe { std::env::remove_var("HOME") };
+    }
 }

@@ -262,11 +262,23 @@ pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
     // empty file, or failing command is "missing credential" → Configured.
     // Token freshness and OAuth validity are layered on top by the interactive
     // surfaces — doctor makes no connection.
-    if entry.headers.iter().any(|(name, value)| {
+    let header_credential = entry.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("authorization")
             && matches!(value, newt_core::mcp::SecretValue::Ref(_))
             && value.resolve().is_ok()
-    }) {
+    });
+
+    // A valid saved OAuth login (resource- and issuer-bound, unexpired,
+    // in the token store) also counts as Authenticated — reusing
+    // mcp_token's existing binding/expiry eligibility check.
+    let oauth_credential = entry.transport == TransportKind::Http
+        && entry.url.as_deref().is_some_and(|url| {
+            crate::mcp_token::auth_status(&[(entry.name.clone(), url.to_string())])
+                .iter()
+                .any(|s| matches!(s.state, crate::mcp_token::AuthState::Valid))
+        });
+
+    if header_credential || oauth_credential {
         return McpReadiness::Authenticated;
     }
     McpReadiness::Configured
