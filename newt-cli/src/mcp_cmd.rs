@@ -1252,6 +1252,7 @@ fn authoritative_import_target(
 fn outranking_import_sources(
     mcp_target: &Path,
     strong_explicit_target: bool,
+    held_locks: &[&newt_core::atomic_fs::LockGuard],
 ) -> anyhow::Result<Vec<(PathBuf, std::collections::BTreeSet<String>)>> {
     if strong_explicit_target {
         return Ok(Vec::new());
@@ -1273,11 +1274,13 @@ fn outranking_import_sources(
     if user_config.is_file() {
         sources.push((
             user_config.clone(),
-            crate::migration_notices::read(|report| Config::load(&user_config, report))?
-                .mcp_servers
-                .into_iter()
-                .map(|entry| entry.name)
-                .collect(),
+            crate::migration_notices::read(|report| {
+                Config::load_with_held_locks(&user_config, held_locks, report)
+            })?
+            .mcp_servers
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
         ));
     }
     for source in [ambient_newt_toml()?, Config::project_config_path()]
@@ -1287,11 +1290,13 @@ fn outranking_import_sources(
         if source.is_file() {
             sources.push((
                 source.clone(),
-                crate::migration_notices::read(|report| Config::load(&source, report))?
-                    .mcp_servers
-                    .into_iter()
-                    .map(|entry| entry.name)
-                    .collect(),
+                crate::migration_notices::read(|report| {
+                    Config::load_with_held_locks(&source, held_locks, report)
+                })?
+                .mcp_servers
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect(),
             ));
         }
     }
@@ -1572,6 +1577,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         request.grant_net,
     )?;
     let _transaction_locks = acquire_import_target_locks(lock_targets)?;
+    let held_locks: Vec<&LockGuard> = _transaction_locks.iter().collect();
     target_destination
         .cleanup_abandoned_stages()
         .with_context(|| format!("cleaning abandoned stages for {}", target.display()))?;
@@ -1619,7 +1625,11 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         project_path
             .as_ref()
             .map(ResolvedPath::as_path)
-            .map(|path| crate::migration_notices::read(|report| Config::load(path, report)))
+            .map(|path| {
+                crate::migration_notices::read(|report| {
+                    Config::load_with_held_locks(path, &held_locks, report)
+                })
+            })
             .transpose()?
             .map(|config| {
                 config
@@ -1632,21 +1642,22 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     } else {
         std::collections::BTreeSet::new()
     };
-    let outranking = outranking_import_sources(&breakout_target, strong_explicit_target)?
-        .into_iter()
-        .filter(|(path, _)| {
-            ResolvedPath::resolve(path)
-                .map(|source| source != target_destination)
-                .unwrap_or(true)
-        })
-        .filter(|(path, _)| {
-            let is_appended_project = project_appends
-                && project_path.as_ref().is_some_and(|project| {
-                    ResolvedPath::resolve(path).ok().as_ref() == Some(project)
-                });
-            !is_appended_project
-        })
-        .collect::<Vec<_>>();
+    let outranking =
+        outranking_import_sources(&breakout_target, strong_explicit_target, &held_locks)?
+            .into_iter()
+            .filter(|(path, _)| {
+                ResolvedPath::resolve(path)
+                    .map(|source| source != target_destination)
+                    .unwrap_or(true)
+            })
+            .filter(|(path, _)| {
+                let is_appended_project = project_appends
+                    && project_path.as_ref().is_some_and(|project| {
+                        ResolvedPath::resolve(path).ok().as_ref() == Some(project)
+                    });
+                !is_appended_project
+            })
+            .collect::<Vec<_>>();
     let mut existing_names = existing.clone();
     existing_names.extend(breakout_existing.iter().cloned());
     for (_, names) in &outranking {

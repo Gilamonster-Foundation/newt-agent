@@ -1406,7 +1406,20 @@ impl Default for Config {
 impl Config {
     /// Load configuration from an explicit file path.
     pub fn load(path: &Path, report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Result<Self> {
-        let text = Self::read_text(path, report)?;
+        Self::load_with_held_locks(path, &[], report)
+    }
+
+    /// Load configuration while respecting locks the caller already holds.
+    ///
+    /// This is the path for multi-file transactions (for example, MCP import)
+    /// that have already locked the consulted configs and must re-read them
+    /// without self-contention.
+    pub fn load_with_held_locks(
+        path: &Path,
+        held_locks: &[&crate::atomic_fs::LockGuard],
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<Self> {
+        let text = Self::read_text_with_held_locks(path, held_locks, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
@@ -1421,8 +1434,18 @@ impl Config {
         path: &Path,
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<String> {
+        Self::read_text_with_held_locks(path, &[], report)
+    }
+
+    fn read_text_with_held_locks(
+        path: &Path,
+        held_locks: &[&crate::atomic_fs::LockGuard],
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<String> {
         let own = Self::user_config_dir().is_some_and(|dir| path.starts_with(dir));
-        Ok(crate::psyche_import::read_config_file(path, own, report)?)
+        Ok(crate::psyche_import::read_config_file(
+            path, own, held_locks, report,
+        )?)
     }
 
     /// Resolve configuration by searching well-known locations, then layering a

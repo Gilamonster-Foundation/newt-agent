@@ -44,43 +44,53 @@ pub fn read_persona_file(
 }
 
 /// Read config under the same resolved-destination lock as Config::save.
-/// A lock failure and the resulting in-memory load form one report. The lock
-/// remains held through revalidation and replacement, exactly as before.
+///
+/// `held_locks` lets a caller that already holds a config lock (for example,
+/// `newt mcp import`'s transaction locks) re-read the same target without
+/// self-contention. The lock is matched by resolved lock path, not by PID,
+/// so same-process exclusion stays honest for unrelated locks.
 pub fn read_config_file(
     path: &Path,
     rewrite: bool,
+    held_locks: &[&crate::atomic_fs::LockGuard],
     report: &mut dyn FnMut(Notice<'static>),
 ) -> std::io::Result<String> {
-    let locked = rewrite.then(|| {
-        let destination = crate::atomic_fs::ResolvedPath::resolve(path)?;
-        let lock = crate::atomic_fs::acquire_lock(&destination.lock_path())?;
-        anyhow::Ok((destination, lock))
-    });
-    let (locked, lock_failure) = match locked.transpose() {
-        Ok(locked) => (locked, None),
-        // Surface the lock-contention text at most once per process: a
-        // single command that re-reads the same already-locked config more
-        // than once (e.g. `mcp import`'s namespace-sanitization pass
-        // re-loading a target it already holds the transaction lock on)
-        // would otherwise repeat the identical sentence per attempt,
-        // whether it lands in the fallback notice below or merged into a
-        // migration notice above.
-        Err(error) if !LOCK_CONTENTION_REPORTED.swap(true, Ordering::Relaxed) => (
-            None,
-            Some(format!(
-                "cannot lock config {} for migration: {error:#}",
+    let destination = rewrite
+        .then(|| crate::atomic_fs::ResolvedPath::resolve(path))
+        .transpose()
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "resolving config destination {}: {error:#}",
                 path.display()
-            )),
-        ),
-        Err(_) => (None, None),
+            ))
+        })?;
+    let mut lock_failure: Option<String> = None;
+    let locked = if let Some(destination) = &destination {
+        let held = held_locks
+            .iter()
+            .any(|guard| guard.lock_path() == destination.lock_path());
+        if held {
+            Some(destination.clone())
+        } else {
+            match crate::atomic_fs::acquire_lock(&destination.lock_path()) {
+                Ok(_guard) => Some(destination.clone()),
+                Err(error) if !LOCK_CONTENTION_REPORTED.swap(true, Ordering::Relaxed) => {
+                    lock_failure = Some(format!(
+                        "cannot lock config {} for migration: {error:#}",
+                        path.display()
+                    ));
+                    None
+                }
+                Err(_) => None,
+            }
+        }
+    } else {
+        None
     };
-    let destination = locked.as_ref().map(|(destination, _)| destination);
-    // Display the caller's path; operate on the resolved one. Canonicalization
-    // can add a verbatim `\\?\` prefix (Windows), expand 8.3 short names, or
-    // follow a symlinked directory, and the operator should be shown the path
-    // they actually named.
-    let operated = destination.map_or(path, crate::atomic_fs::ResolvedPath::as_path);
-    let mut reported = false;
+    let operated = locked
+        .as_ref()
+        .map_or(path, crate::atomic_fs::ResolvedPath::as_path);
+    let mut migration_reported = false;
     let result = read_migrating(
         MigratingPath {
             shown: path,
@@ -88,36 +98,36 @@ pub fn read_config_file(
         },
         "config",
         migrate_config_text,
-        destination.is_some(),
+        locked.is_some(),
         |p| std::fs::read_to_string(p),
         |_, text| {
-            destination
-                .expect("rewrite holds the config lock")
-                .atomic_write(text.as_bytes())
+            let destination = locked.as_ref().expect("rewrite holds the config lock");
+            destination.atomic_write(text.as_bytes())
         },
-        &mut |mut notice| {
+        &mut |notice| {
+            if notice.text.contains("translated original text")
+                || notice.text.contains("migrated config")
+                || notice.text.contains("migration")
+            {
+                migration_reported = true;
+            }
+            let mut notice = notice;
             if let Some(error) = &lock_failure {
                 notice.text = format!("{}; {error}", notice.text).into();
             }
-            reported = true;
             report(notice);
         },
     );
-    if let Some(error) = lock_failure.filter(|_| !reported) {
-        let loaded = match &result {
-            Ok(_) => {
-                "loaded original text in memory; config changes from this command were not saved"
-                    .to_string()
-            }
-            Err(read_error) => format!(
-                "could not read original text: {read_error}; config changes from this command were not saved"
-            ),
-        };
-        report(Notice::new(
-            Level::Warn,
-            "",
-            format!("newt: warning: {error}; {loaded}"),
-        ));
+    if !migration_reported {
+        if let Some(lock_failure) = lock_failure.as_ref() {
+            let message = match &result {
+                Ok(_) => format!("newt: warning: {lock_failure}; loaded original text in memory"),
+                Err(read_error) => format!(
+                    "newt: warning: {lock_failure}; could not read original text: {read_error}"
+                ),
+            };
+            report(Notice::new(Level::Warn, "", message));
+        }
     }
     result
 }
@@ -201,7 +211,8 @@ pub(super) fn read_migrating(
             "",
             format!(
                 "newt: warning: {kind} {shown} uses old psyche labels ({changes}); \
-             loading translated original text, but migration write did not complete: {error:#}"
+             loading translated original text, but migration write did not complete: {error:#}; \
+             config changes from this command were not saved"
             ),
         ),
     };
