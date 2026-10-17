@@ -236,7 +236,8 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
             }
             newt_core::mcp::TransportKind::Http => {
                 let url = s.url.clone().unwrap_or_default();
-                let readiness = classify_readiness(s, &|v| std::env::var(v).ok());
+                let readiness =
+                    classify_readiness(s, &|v| std::env::var(v).ok(), &newt_tui::saved_oauth_valid);
                 let auth_note = match readiness {
                     McpReadiness::NotAdmitted => {
                         format!(" ({} — cannot connect)", readiness_label(readiness))
@@ -750,7 +751,9 @@ mod tests {
         }
 
         assert_eq!(
-            classify_readiness(&entry(TransportKind::Http, false), &|_: &str| None),
+            classify_readiness(&entry(TransportKind::Http, false), &|_: &str| None, &|_| {
+                false
+            }),
             McpReadiness::Configured
         );
         // Step 2 (#2913): a `${...}` reference literal is unresolved at rest —
@@ -782,21 +785,25 @@ mod tests {
         };
         // TOKEN is unset → missing credential → Configured, not Authenticated.
         assert_eq!(
-            classify_readiness(&ref_entry, &|_: &str| None),
+            classify_readiness(&ref_entry, &|_: &str| None, &|_| false),
             McpReadiness::Configured
         );
-        unsafe { std::env::set_var("TOKEN", "resolved-secret") };
         assert_eq!(
-            classify_readiness(&ref_entry, &|v| if v == "TOKEN" {
-                Some("resolved-secret".into())
-            } else {
-                None
-            }),
+            classify_readiness(
+                &ref_entry,
+                &|v| if v == "TOKEN" {
+                    Some("resolved-secret".into())
+                } else {
+                    None
+                },
+                &|_| false
+            ),
             McpReadiness::Authenticated
         );
-        unsafe { std::env::remove_var("TOKEN") };
         assert_eq!(
-            classify_readiness(&entry(TransportKind::Http, true), &|_: &str| None),
+            classify_readiness(&entry(TransportKind::Http, true), &|_: &str| None, &|_| {
+                false
+            }),
             McpReadiness::Configured
         );
         // Step 2 (#2913): a plaintext bearer header is rejected — it is not a
@@ -824,13 +831,13 @@ mod tests {
             }
         }
         assert_eq!(
-            classify_readiness(&plaintext_entry(), &|_: &str| None),
+            classify_readiness(&plaintext_entry(), &|_: &str| None, &|_| false),
             McpReadiness::Configured
         );
         let mut disabled = entry(TransportKind::Http, true);
         disabled.enabled = false;
         assert_eq!(
-            classify_readiness(&disabled, &|_: &str| None),
+            classify_readiness(&disabled, &|_: &str| None, &|_| false),
             McpReadiness::NotAdmitted
         );
     }
@@ -893,34 +900,38 @@ mod tests {
 
         // Plaintext bearer: rejected by both doctor and auth.
         assert_eq!(
-            classify_readiness(&entry(header("Bearer deadbeef")), &|_: &str| None),
+            classify_readiness(&entry(header("Bearer deadbeef")), &|_: &str| None, &|_| {
+                false
+            }),
             McpReadiness::Configured
         );
         // `${...}` reference literal: unresolved at rest, not authenticated.
         assert_eq!(
-            classify_readiness(&entry(header("${TOKEN}")), &|_: &str| None),
+            classify_readiness(&entry(header("${TOKEN}")), &|_: &str| None, &|_| false),
             McpReadiness::Configured
         );
         // Structured secret reference: counts as configured credential only
         // when the referenced value actually resolves. TOKEN unset → missing
         // credential → Configured; TOKEN set → Authenticated.
         assert_eq!(
-            classify_readiness(&entry(ref_header()), &|_: &str| None),
+            classify_readiness(&entry(ref_header()), &|_: &str| None, &|_| false),
             McpReadiness::Configured
         );
-        unsafe { std::env::set_var("TOKEN", "resolved-secret") };
         assert_eq!(
-            classify_readiness(&entry(ref_header()), &|v| if v == "TOKEN" {
-                Some("resolved-secret".into())
-            } else {
-                None
-            }),
+            classify_readiness(
+                &entry(ref_header()),
+                &|v| if v == "TOKEN" {
+                    Some("resolved-secret".into())
+                } else {
+                    None
+                },
+                &|_| false
+            ),
             McpReadiness::Authenticated
         );
-        unsafe { std::env::remove_var("TOKEN") };
         // No header at all: admitted but no credential.
         assert_eq!(
-            classify_readiness(&entry(Default::default()), &|_: &str| None),
+            classify_readiness(&entry(Default::default()), &|_: &str| None, &|_| false),
             McpReadiness::Configured
         );
     }
@@ -951,70 +962,26 @@ mod tests {
         // Authenticated, and never "callable". Doctor's SSE arm renders the
         // unsupported-transport line with no `newt auth` advice.
         assert_eq!(
-            classify_readiness(&entry, &|_: &str| None),
+            classify_readiness(&entry, &|_: &str| None, &|_| false),
             McpReadiness::Configured
         );
         assert_ne!(
-            readiness_label(classify_readiness(&entry, &|_: &str| None)),
+            readiness_label(classify_readiness(&entry, &|_: &str| None, &|_| false)),
             "authenticated",
             "legacy SSE must never be presented as authenticated"
         );
     }
 
-    // NEW: a valid saved OAuth login (resource- and issuer-bound, unexpired,
-    // in the token store) counts as Authenticated even with no Authorization
-    // header. Uses an in-memory store fixture via HOME override.
+    // Step 3 (#2913): a valid saved OAuth login (resource- and issuer-bound,
+    // unexpired, in the token store) counts as Authenticated even with no
+    // Authorization header. The store status is injected — no real token
+    // files, no HOME change.
     #[test]
     fn mcp_readiness_counts_valid_saved_oauth_login_as_authenticated() {
         use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
         use newt_tui::{classify_readiness, McpReadiness};
 
-        let temp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("HOME", temp.path()) };
-
-        let token_dir = temp.path().join(".hermes").join("mcp-tokens");
-        std::fs::create_dir_all(&token_dir).unwrap();
-
         let resource = "https://mcp.example.test/mcp";
-        let issuer = "https://auth.example.test";
-
-        let token = serde_json::json!({
-            "access_token": "saved-oauth-token",
-            "refresh_token": "refresh-token",
-            "expires_at": 2_000_000_000.0,
-            "resource": resource,
-            "issuer": issuer,
-            "token_type": "Bearer"
-        });
-        let meta = serde_json::json!({
-            "resource": resource,
-            "issuer": issuer,
-            "authorization_endpoint": format!("{issuer}/authorize"),
-            "token_endpoint": format!("{issuer}/token"),
-            "code_challenge_methods_supported": ["S256"],
-            "authorization_response_iss_parameter_supported": true
-        });
-        let client = serde_json::json!({
-            "client_id": "client-id",
-            "redirect_uris": ["http://127.0.0.1:0/callback"],
-            "issuer": issuer
-        });
-
-        std::fs::write(
-            token_dir.join("example-server.json"),
-            serde_json::to_string(&token).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            token_dir.join("example-server.meta.json"),
-            serde_json::to_string(&meta).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            token_dir.join("example-server.client.json"),
-            serde_json::to_string(&client).unwrap(),
-        )
-        .unwrap();
 
         let entry = McpServerEntry {
             name: "example-server".into(),
@@ -1031,13 +998,19 @@ mod tests {
             origin: None,
         };
 
-        // No Authorization header, but a valid saved OAuth login → Authenticated.
+        // No Authorization header, and the injected store reports a valid
+        // saved OAuth login → Authenticated.
         assert_eq!(
-            classify_readiness(&entry, &|_: &str| None),
+            classify_readiness(&entry, &|_: &str| None, &|_| true),
             McpReadiness::Authenticated
         );
 
-        unsafe { std::env::remove_var("HOME") };
+        // No Authorization header and the injected store reports no saved
+        // login → Configured (nothing else supplies a credential).
+        assert_eq!(
+            classify_readiness(&entry, &|_: &str| None, &|_| false),
+            McpReadiness::Configured
+        );
     }
 
     // P1 (#2913): classify_readiness must NEVER resolve a secret or run a
@@ -1147,7 +1120,7 @@ mod tests {
         ] {
             *executions.lock().unwrap() = 0;
             assert_eq!(
-                classify_readiness(entry, counting_lookup),
+                classify_readiness(entry, counting_lookup, &|_| false),
                 McpReadiness::Configured,
                 "a `{:?}` reference must stay Configured — not resolved",
                 entry
@@ -1201,7 +1174,8 @@ mod tests {
                     Some("   ".into())
                 } else {
                     None
-                }
+                },
+                &|_| false
             ),
             McpReadiness::Configured
         );
@@ -1242,7 +1216,8 @@ mod tests {
                     Some("token".into())
                 } else {
                     None
-                }
+                },
+                &|_| false
             ),
             McpReadiness::Authenticated
         );
@@ -1283,7 +1258,8 @@ mod tests {
                     Some("token".into())
                 } else {
                     None
-                }
+                },
+                &|_| false
             ),
             McpReadiness::Authenticated
         );
@@ -1322,7 +1298,8 @@ mod tests {
                         .into_iter()
                         .collect()
                 ),
-                &|_: &str| None
+                &|_: &str| None,
+                &|_| false
             ),
             McpReadiness::Configured
         );
@@ -1339,7 +1316,8 @@ mod tests {
                     Some("token-value".into())
                 } else {
                     None
-                }
+                },
+                &|_| false
             ),
             McpReadiness::Authenticated
         );
@@ -1347,58 +1325,14 @@ mod tests {
 
     // Step 2 (#2913): an explicit Authorization header decides; a valid saved
     // OAuth login applies only when there is no explicit header — they are not
-    // OR'd together. Mirrors the existing OAuth test's tempfile+HOME setup.
+    // OR'd together. The store status is injected — no real token files, no
+    // HOME change.
     #[test]
     fn mcp_readiness_explicit_header_ignores_saved_oauth() {
         use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
         use newt_tui::{classify_readiness, McpReadiness};
 
-        let temp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("HOME", temp.path()) };
-
-        let token_dir = temp.path().join(".hermes").join("mcp-tokens");
-        std::fs::create_dir_all(&token_dir).unwrap();
-
         let resource = "https://mcp.example.test/mcp";
-        let issuer = "https://auth.example.test";
-
-        let token = serde_json::json!({
-            "access_token": "saved-oauth-token",
-            "refresh_token": "refresh-token",
-            "expires_at": 2_000_000_000.0,
-            "resource": resource,
-            "issuer": issuer,
-            "token_type": "Bearer"
-        });
-        let meta = serde_json::json!({
-            "resource": resource,
-            "issuer": issuer,
-            "authorization_endpoint": format!("{issuer}/authorize"),
-            "token_endpoint": format!("{issuer}/token"),
-            "code_challenge_methods_supported": ["S256"],
-            "authorization_response_iss_parameter_supported": true
-        });
-        let client = serde_json::json!({
-            "client_id": "client-id",
-            "redirect_uris": ["http://127.0.0.1:0/callback"],
-            "issuer": issuer
-        });
-
-        std::fs::write(
-            token_dir.join("example-server.json"),
-            serde_json::to_string(&token).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            token_dir.join("example-server.meta.json"),
-            serde_json::to_string(&meta).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            token_dir.join("example-server.client.json"),
-            serde_json::to_string(&client).unwrap(),
-        )
-        .unwrap();
 
         let entry = |headers| McpServerEntry {
             name: "example-server".into(),
@@ -1417,7 +1351,7 @@ mod tests {
 
         // No Authorization header → valid saved OAuth counts as Authenticated.
         assert_eq!(
-            classify_readiness(&entry(Default::default()), &|_: &str| None),
+            classify_readiness(&entry(Default::default()), &|_: &str| None, &|_| true),
             McpReadiness::Authenticated
         );
 
@@ -1433,11 +1367,10 @@ mod tests {
                     .into_iter()
                     .collect()
                 ),
-                &|_: &str| None
+                &|_: &str| None,
+                &|_| true
             ),
             McpReadiness::Configured
         );
-
-        unsafe { std::env::remove_var("HOME") };
     }
 }

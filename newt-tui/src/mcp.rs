@@ -258,6 +258,7 @@ pub enum McpReadiness {
 pub fn classify_readiness(
     entry: &McpServerEntry,
     env_lookup: &dyn Fn(&str) -> Option<String>,
+    saved_oauth_valid: &dyn Fn(&McpServerEntry) -> bool,
 ) -> McpReadiness {
     if newt_core::mcp::admit(entry).is_err() {
         return McpReadiness::NotAdmitted;
@@ -288,22 +289,28 @@ pub fn classify_readiness(
             name.eq_ignore_ascii_case("authorization") && header_is_credential(value, env_lookup)
         });
 
-    // A valid saved OAuth login (resource- and issuer-bound, unexpired,
-    // in the token store) also counts as Authenticated — reusing
-    // mcp_token's existing binding/expiry eligibility check — but only when
-    // no explicit Authorization header is present.
-    let oauth_credential = !has_auth_header
-        && entry.transport == TransportKind::Http
-        && entry.url.as_deref().is_some_and(|url| {
-            crate::mcp_token::auth_status(&[(entry.name.clone(), url.to_string())])
-                .iter()
-                .any(|s| matches!(s.state, crate::mcp_token::AuthState::Valid))
-        });
+    // A valid saved OAuth login also counts as Authenticated, but only when
+    // no explicit Authorization header is present. The store check is
+    // injected; production passes [`saved_oauth_valid`].
+    let oauth_credential =
+        !has_auth_header && entry.transport == TransportKind::Http && saved_oauth_valid(entry);
 
     if header_credential || oauth_credential {
         return McpReadiness::Authenticated;
     }
     McpReadiness::Configured
+}
+
+/// Whether the token store holds a valid saved OAuth login for `entry`:
+/// resource- and issuer-bound and unexpired, through `mcp_token`'s existing
+/// eligibility check. The production `saved_oauth_valid` argument to
+/// [`classify_readiness`].
+pub fn saved_oauth_valid(entry: &McpServerEntry) -> bool {
+    entry.url.as_deref().is_some_and(|url| {
+        crate::mcp_token::auth_status(&[(entry.name.clone(), url.to_string())])
+            .iter()
+            .any(|s| matches!(s.state, crate::mcp_token::AuthState::Valid))
+    })
 }
 
 /// Whether an Authorization header value is a usable credential at
