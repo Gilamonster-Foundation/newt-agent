@@ -353,7 +353,8 @@ fn render_text_report(o: &ProbeOutcome) -> anyhow::Result<String> {
     out.push('\n');
     if o.auth_required {
         out.push_str(&format!(
-            "\nSave it (--save), then authenticate: `newt auth {}` and re-probe.\n",
+            "\nSave it (--save), then authenticate: `newt auth {}` — a credential-free probe \
+             cannot validate a saved login; confirm with `newt doctor`.\n",
             o.entry.name
         ));
     }
@@ -563,7 +564,8 @@ pub async fn run(args: ProbeArgs, config_path: Option<&Path>) -> anyhow::Result<
             outcome.entry.name,
             written.display()
         );
-        crate::mcp_cmd::print_next_steps(&mut io::stderr())?;
+        let entry = outcome.entry.clone();
+        crate::mcp_cmd::print_next_steps(&mut io::stderr(), &[entry])?;
     }
     if args.to_catalog {
         let path = catalog_write_target(args.project)?;
@@ -1108,11 +1110,13 @@ mod tests {
             "honest posture, never over-claimed: {text}"
         );
         assert!(text.contains("1.2.3"), "{text}");
-        // The auth-required variant points at `newt auth`.
+        // The auth-required variant points at `newt auth` and does not claim
+        // a credential-free re-probe can validate a saved login (#2913).
         let mut auth = sample_outcome();
         auth.auth_required = true;
         let text = render_text_report(&auth).unwrap();
         assert!(text.contains("newt auth"), "{text}");
+        assert!(!text.contains("re-probe"), "{text}");
     }
 
     #[test]

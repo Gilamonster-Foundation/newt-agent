@@ -36,6 +36,7 @@ use newt_core::mcp_catalog::{
     builtin_catalog, merge_catalog_layers, parse_catalog, McpCatalogEntry,
 };
 use newt_core::Config;
+use newt_tui::{classify_readiness, McpReadiness};
 
 #[derive(Subcommand, Debug)]
 pub enum McpCmd {
@@ -193,7 +194,7 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                 entry.name,
                 path.display()
             )?;
-            print_next_steps(&mut out)
+            print_next_steps(&mut out, &[entry])
         }
         McpCmd::Remove { name, project } => {
             let path = remove_server(&name, config_path, project)?;
@@ -233,7 +234,7 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                     writeln!(out, "Resolved command to {cmd}")?;
                 }
             }
-            print_next_steps(&mut out)
+            print_next_steps(&mut out, &[server])
         }
         // `serve` runs newt-as-a-server, which needs the persona (a global
         // flag) and the stdio_guard redirect that only `run_mcp` in lib.rs
@@ -269,11 +270,79 @@ pub async fn run(cmd: McpCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
 }
 
 /// The post-add pointer to the verification surfaces.
-pub(crate) fn print_next_steps(out: &mut dyn Write) -> anyhow::Result<()> {
-    writeln!(
-        out,
-        "Verify with `newt doctor`; in the TUI, `/mcp` shows live status."
-    )?;
+///
+/// Each adopted HTTP server is classified once through [`classify_readiness`] —
+/// the same admission/auth check `newt doctor` and `newt auth` use (#2913) —
+/// so import, doctor, auth and `/mcp` all report the same state for the same
+/// server. HTTP MCP is supported; never suggest a credential-free probe as a
+/// substitute for `newt auth`.
+pub(crate) fn print_next_steps(
+    out: &mut dyn Write,
+    adopted: &[McpServerEntry],
+) -> anyhow::Result<()> {
+    let any_http = adopted
+        .iter()
+        .any(|e| matches!(e.transport, TransportKind::Http));
+    if any_http {
+        writeln!(
+            out,
+            "HTTP servers imported — run `newt auth <name>` to authenticate each one, \
+             then `newt doctor` to confirm readiness."
+        )?;
+    } else {
+        writeln!(
+            out,
+            "Verify with `newt doctor`; in the TUI, `/mcp` shows live status."
+        )?;
+    }
+    // Per-server, same classification every surface agrees on.
+    for entry in adopted {
+        match classify_readiness(
+            entry,
+            &|v| std::env::var(v).ok(),
+            &newt_tui::saved_oauth_valid,
+        ) {
+            McpReadiness::NotAdmitted => {
+                let denied = newt_core::mcp::admit(entry)
+                    .expect_err("classified NotAdmitted implies admission denied");
+                // Only an HTTP server has a credential to obtain afterwards.
+                let then = if matches!(entry.transport, TransportKind::Http) {
+                    "`newt auth`"
+                } else {
+                    "`newt doctor`"
+                };
+                writeln!(
+                    out,
+                    "  !  {} — not admitted ({denied}); import/approve it before {then}.",
+                    entry.name
+                )?;
+            }
+            // Only an HTTP server has a credential to obtain; a stdio server
+            // is ready once admitted, so `newt auth` would be advice it
+            // cannot follow.
+            McpReadiness::Configured if matches!(entry.transport, TransportKind::Http) => {
+                writeln!(
+                    out,
+                    "  ✓  {} — admitted, no credential yet: `newt auth {}` then `newt doctor`.",
+                    entry.name, entry.name
+                )?;
+            }
+            McpReadiness::Configured => {
+                writeln!(
+                    out,
+                    "  ✓  {} — admitted: confirm with `newt doctor`.",
+                    entry.name
+                )?;
+            }
+            McpReadiness::Authenticated => {
+                writeln!(
+                    out,
+                    "  ✓  {} — admitted and credentialed: confirm with `newt doctor`.",
+                    entry.name
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1826,7 +1895,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             hosts.join(", ")
         )?;
     }
-    print_next_steps(out)
+    print_next_steps(out, &adopted)
 }
 
 // ---------------------------------------------------------------------------

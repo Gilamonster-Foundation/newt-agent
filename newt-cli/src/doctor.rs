@@ -7,6 +7,7 @@ use newt_core::dgx::{DgxConfig, EndpointKind};
 use newt_core::ocap::SecurityReport;
 use newt_core::Config;
 use newt_inference::local::LocalOllamaBackend;
+use newt_tui::{classify_readiness, readiness_label, McpReadiness};
 use std::path::Path;
 
 /// Render the achieved-security report as `doctor` posture lines. Pure over the
@@ -224,17 +225,35 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
                     Err(e) => println!("  {} [stdio] — ERROR: {e:#}", s.name),
                 }
             }
-            newt_core::mcp::TransportKind::Sse | newt_core::mcp::TransportKind::Http => {
-                let kind = if matches!(s.transport, newt_core::mcp::TransportKind::Sse) {
-                    "sse"
-                } else {
-                    "http"
-                };
-                let url = s.url.clone().unwrap_or_default();
+            newt_core::mcp::TransportKind::Sse => {
+                // Legacy SSE is rejected by the runtime (mcp_management.rs) —
+                // never suggest `newt auth` for it; point at streamable-HTTP.
                 println!(
-                    "  {} [{kind}] — {url} (skipped: only stdio is supported in this build)",
+                    "  {} [sse] — unsupported transport (legacy SSE); switch \
+                     this server to a streamable-HTTP endpoint.",
                     s.name
                 );
+            }
+            newt_core::mcp::TransportKind::Http => {
+                let url = s.url.clone().unwrap_or_default();
+                let readiness =
+                    classify_readiness(s, &|v| std::env::var(v).ok(), &newt_tui::saved_oauth_valid);
+                let auth_note = match readiness {
+                    McpReadiness::NotAdmitted => {
+                        format!(" ({} — cannot connect)", readiness_label(readiness))
+                    }
+                    McpReadiness::Configured => format!(
+                        " ({} — grant net for `{url}`, then `newt auth {}`)",
+                        readiness_label(readiness),
+                        s.name
+                    ),
+                    McpReadiness::Authenticated => format!(
+                        " ({} — credential present; connect via `/mcp` or `newt auth {}`)",
+                        readiness_label(readiness),
+                        s.name
+                    ),
+                };
+                println!("  {} [http] — {url}{auth_note}", s.name);
             }
         }
     }
@@ -728,5 +747,660 @@ mod tests {
             .any(|l| l == "process-confinement: unsupported on macos"));
         // No line may claim a kernel guarantee is "enforced" on macOS.
         assert!(!lines.iter().any(|l| l == "fs-confinement: enforced"));
+    }
+
+    #[test]
+    fn mcp_readiness_classifies_http_server_configured_authenticated_and_not_admitted() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        fn entry(transport: TransportKind, header: bool) -> McpServerEntry {
+            McpServerEntry {
+                name: "h".into(),
+                enabled: true,
+                transport,
+                command: None,
+                args: vec![],
+                env: Default::default(),
+                url: Some("https://example.test/mcp".into()),
+                headers: if header {
+                    [(
+                        "Authorization".into(),
+                        newt_core::mcp::SecretValue::literal("${TOKEN}"),
+                    )]
+                    .into_iter()
+                    .collect()
+                } else {
+                    Default::default()
+                },
+                login_argv: Vec::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Trusted,
+                origin: None,
+            }
+        }
+
+        assert_eq!(
+            classify_readiness(&entry(TransportKind::Http, false), &|_: &str| None, &|_| {
+                false
+            }),
+            McpReadiness::Configured
+        );
+        // Step 2 (#2913): a `${...}` reference literal is unresolved at rest —
+        // configured, but no usable credential. Only a `SecretValue::Ref`
+        // (env/file/cmd secret reference) counts as authenticated — and only
+        // when the referenced value actually resolves (an unset `${VAR}` is a
+        // missing credential → Configured).
+        let ref_entry = McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: [(
+                "Authorization".into(),
+                newt_core::mcp::SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    env: Some("TOKEN".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+        // TOKEN is unset → missing credential → Configured, not Authenticated.
+        assert_eq!(
+            classify_readiness(&ref_entry, &|_: &str| None, &|_| false),
+            McpReadiness::Configured
+        );
+        assert_eq!(
+            classify_readiness(
+                &ref_entry,
+                &|v| if v == "TOKEN" {
+                    Some("resolved-secret".into())
+                } else {
+                    None
+                },
+                &|_| false
+            ),
+            McpReadiness::Authenticated
+        );
+        assert_eq!(
+            classify_readiness(&entry(TransportKind::Http, true), &|_: &str| None, &|_| {
+                false
+            }),
+            McpReadiness::Configured
+        );
+        // Step 2 (#2913): a plaintext bearer header is rejected — it is not a
+        // usable credential. A `${...}` reference header counts as configured,
+        // but a literal bearer does not.
+        fn plaintext_entry() -> McpServerEntry {
+            McpServerEntry {
+                name: "h".into(),
+                enabled: true,
+                transport: TransportKind::Http,
+                command: None,
+                args: vec![],
+                env: Default::default(),
+                url: Some("https://example.test/mcp".into()),
+                headers: [(
+                    "Authorization".into(),
+                    newt_core::mcp::SecretValue::literal("Bearer deadbeef"),
+                )]
+                .into_iter()
+                .collect(),
+                login_argv: Vec::new(),
+                request_timeout_secs: None,
+                trust: McpTrust::Trusted,
+                origin: None,
+            }
+        }
+        assert_eq!(
+            classify_readiness(&plaintext_entry(), &|_: &str| None, &|_| false),
+            McpReadiness::Configured
+        );
+        let mut disabled = entry(TransportKind::Http, true);
+        disabled.enabled = false;
+        assert_eq!(
+            classify_readiness(&disabled, &|_: &str| None, &|_| false),
+            McpReadiness::NotAdmitted
+        );
+    }
+
+    #[test]
+    fn mcp_readiness_labels_are_stable_across_surfaces() {
+        use newt_tui::{readiness_label, McpReadiness};
+        assert_eq!(
+            readiness_label(McpReadiness::Configured),
+            "configured (no credential)"
+        );
+        assert_eq!(
+            readiness_label(McpReadiness::Authenticated),
+            "authenticated"
+        );
+        assert_eq!(readiness_label(McpReadiness::NotAdmitted), "not admitted");
+    }
+
+    // Step 1 (#2913): one classifier, shared. doctor and `newt auth` must
+    // classify the same server identically — admission, header presence, and
+    // reference-versus-plaintext all agree on a single fixture.
+    #[test]
+    fn mcp_readiness_agrees_between_doctor_and_auth() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let header = |value| {
+            [(
+                "Authorization".into(),
+                newt_core::mcp::SecretValue::literal(value),
+            )]
+            .into_iter()
+            .collect()
+        };
+        let ref_header = || {
+            [(
+                "Authorization".into(),
+                newt_core::mcp::SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    env: Some("TOKEN".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect()
+        };
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // Plaintext bearer: rejected by both doctor and auth.
+        assert_eq!(
+            classify_readiness(&entry(header("Bearer deadbeef")), &|_: &str| None, &|_| {
+                false
+            }),
+            McpReadiness::Configured
+        );
+        // `${...}` reference literal: unresolved at rest, not authenticated.
+        assert_eq!(
+            classify_readiness(&entry(header("${TOKEN}")), &|_: &str| None, &|_| false),
+            McpReadiness::Configured
+        );
+        // Structured secret reference: counts as configured credential only
+        // when the referenced value actually resolves. TOKEN unset → missing
+        // credential → Configured; TOKEN set → Authenticated.
+        assert_eq!(
+            classify_readiness(&entry(ref_header()), &|_: &str| None, &|_| false),
+            McpReadiness::Configured
+        );
+        assert_eq!(
+            classify_readiness(
+                &entry(ref_header()),
+                &|v| if v == "TOKEN" {
+                    Some("resolved-secret".into())
+                } else {
+                    None
+                },
+                &|_| false
+            ),
+            McpReadiness::Authenticated
+        );
+        // No header at all: admitted but no credential.
+        assert_eq!(
+            classify_readiness(&entry(Default::default()), &|_: &str| None, &|_| false),
+            McpReadiness::Configured
+        );
+    }
+
+    // Step 3 (#2913): legacy SSE keeps its own unsupported-transport diagnosis
+    // and never suggests `newt auth`. (Doctor itself never connects, so this is
+    // a pure output check against the read-only SSE arm.)
+    #[test]
+    fn mcp_readiness_sse_never_suggests_auth() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, readiness_label, McpReadiness};
+
+        let entry = McpServerEntry {
+            name: "sse-server".into(),
+            enabled: true,
+            transport: TransportKind::Sse,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: Default::default(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+        // SSE is admitted (trusted + enabled) but reports Configured — never
+        // Authenticated, and never "callable". Doctor's SSE arm renders the
+        // unsupported-transport line with no `newt auth` advice.
+        assert_eq!(
+            classify_readiness(&entry, &|_: &str| None, &|_| false),
+            McpReadiness::Configured
+        );
+        assert_ne!(
+            readiness_label(classify_readiness(&entry, &|_: &str| None, &|_| false)),
+            "authenticated",
+            "legacy SSE must never be presented as authenticated"
+        );
+    }
+
+    // Step 3 (#2913): a valid saved OAuth login (resource- and issuer-bound,
+    // unexpired, in the token store) counts as Authenticated even with no
+    // Authorization header. The store status is injected — no real token
+    // files, no HOME change.
+    #[test]
+    fn mcp_readiness_counts_valid_saved_oauth_login_as_authenticated() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let resource = "https://mcp.example.test/mcp";
+
+        let entry = McpServerEntry {
+            name: "example-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some(resource.to_string()),
+            headers: Default::default(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // No Authorization header, and the injected store reports a valid
+        // saved OAuth login → Authenticated.
+        assert_eq!(
+            classify_readiness(&entry, &|_: &str| None, &|_| true),
+            McpReadiness::Authenticated
+        );
+
+        // No Authorization header and the injected store reports no saved
+        // login → Configured (nothing else supplies a credential).
+        assert_eq!(
+            classify_readiness(&entry, &|_: &str| None, &|_| false),
+            McpReadiness::Configured
+        );
+    }
+
+    // P1 (#2913): classify_readiness must NEVER resolve a secret or run a
+    // command. The injected lookup seam counts resolution attempts — count must
+    // stay 0 for env, file, and cmd references. If the old classifier resolved
+    // the secret (or ran the command), the count would be non-zero.
+    #[test]
+    fn mcp_readiness_never_resolves_a_secret_or_runs_a_command() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, SecretValue, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let executions: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+        // Counting env lookup seam: every call increments the counter, but it
+        // never RESOLVES a secret (no file read, no command run). Production
+        // passes `std::env::var`; tests inject this seam so no process-global
+        // env is touched. It returns None for every var, so the new classifier
+        // (which uses the injected lookup) sees every reference as missing
+        // → Configured. The old classifier bypasses this seam entirely and
+        // reads real env via std::env::var — HOME is set in this environment,
+        // so the old classifier resolves this secret → Authenticated — red.
+        let counting_lookup = &|_var: &str| {
+            *executions.lock().unwrap() += 1;
+            None
+        };
+
+        // env reference — classifier must only LOOK UP, not resolve (no file
+        // read, no command). The lookup returns None for HOME under the new
+        // classifier → missing → Configured, with zero resolutions through the
+        // seam. The old classifier ignores the seam and reads real env (HOME is
+        // set) → Authenticated — red against old.
+        let env_entry = McpServerEntry {
+            name: "env-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: [(
+                "Authorization".into(),
+                SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    env: Some("HOME".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // file reference — classifier must never read the file.
+        let file_entry = McpServerEntry {
+            name: "file-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: [(
+                "Authorization".into(),
+                SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    file: Some("/nonexistent/secret.txt".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // cmd reference — classifier must never run the command.
+        let cmd_entry = McpServerEntry {
+            name: "cmd-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: [(
+                "Authorization".into(),
+                SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    cmd: Some("echo token".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        for (entry, expect_calls) in [
+            (&env_entry, 1usize),  // env ref: one env lookup, no resolution
+            (&file_entry, 0usize), // file ref: nothing touched
+            (&cmd_entry, 0usize),  // cmd ref: nothing run
+        ] {
+            *executions.lock().unwrap() = 0;
+            assert_eq!(
+                classify_readiness(entry, counting_lookup, &|_| false),
+                McpReadiness::Configured,
+                "a `{:?}` reference must stay Configured — not resolved",
+                entry
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v)
+            );
+            assert_eq!(
+                *executions.lock().unwrap(),
+                expect_calls,
+                "classification must not resolve env/file/cmd secrets — count stayed 0 for file/cmd, one lookup only for env"
+            );
+        }
+    }
+
+    // Step 1 (#2913): an env var set to whitespace-only is missing → Configured,
+    // via the injected lookup only (no process-global env).
+    #[test]
+    fn mcp_readiness_whitespace_env_value_is_configured_not_authenticated() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, SecretValue, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // WHITESPACE_VAR is set to spaces → missing → Configured.
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [(
+                        "Authorization".into(),
+                        SecretValue::literal("Bearer ${WHITESPACE_VAR}".to_string())
+                    )]
+                    .into_iter()
+                    .collect()
+                ),
+                &|v| if v == "WHITESPACE_VAR" {
+                    Some("   ".into())
+                } else {
+                    None
+                },
+                &|_| false
+            ),
+            McpReadiness::Configured
+        );
+    }
+
+    // Step 1 (#2913): a `Bearer ${env:VAR}` literal whose var is set → Authenticated.
+    #[test]
+    fn mcp_readiness_env_var_reference_authenticates_when_set() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        let bearer_env =
+            |var: &str| newt_core::mcp::SecretValue::literal(format!("Bearer ${{env:{var}}}"));
+
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [("Authorization".into(), bearer_env("ENV_VAR"))]
+                        .into_iter()
+                        .collect()
+                ),
+                &|v| if v == "ENV_VAR" {
+                    Some("token".into())
+                } else {
+                    None
+                },
+                &|_| false
+            ),
+            McpReadiness::Authenticated
+        );
+    }
+
+    // Step 1 (#2913): a bare `${VAR}` literal whose whole value is the
+    // reference and whose var is set → Authenticated.
+    #[test]
+    fn mcp_readiness_bare_env_var_authenticates_when_set() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        let bearer_bare = |var: &str| newt_core::mcp::SecretValue::literal(format!("${{{var}}}"));
+
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [("Authorization".into(), bearer_bare("BARE_VAR"))]
+                        .into_iter()
+                        .collect()
+                ),
+                &|v| if v == "BARE_VAR" {
+                    Some("token".into())
+                } else {
+                    None
+                },
+                &|_| false
+            ),
+            McpReadiness::Authenticated
+        );
+    }
+
+    // Step 2 (#2913): a literal "Bearer ${VAR}" header counts as Authenticated
+    // when VAR is set and non-empty; otherwise it is Configured (unresolved).
+    #[test]
+    fn mcp_readiness_literal_bearer_env_var_authenticates_when_var_set() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        let bearer_ref =
+            |var: &str| newt_core::mcp::SecretValue::literal(format!("Bearer ${{{var}}}"));
+
+        // VAR unset → unresolved literal → Configured.
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [("Authorization".into(), bearer_ref("BEARER_VAR_UNSET"),)]
+                        .into_iter()
+                        .collect()
+                ),
+                &|_: &str| None,
+                &|_| false
+            ),
+            McpReadiness::Configured
+        );
+
+        // VAR set and non-empty → Authenticated.
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [("Authorization".into(), bearer_ref("BEARER_VAR_SET"),)]
+                        .into_iter()
+                        .collect()
+                ),
+                &|v| if v == "BEARER_VAR_SET" {
+                    Some("token-value".into())
+                } else {
+                    None
+                },
+                &|_| false
+            ),
+            McpReadiness::Authenticated
+        );
+    }
+
+    // Step 2 (#2913): an explicit Authorization header decides; a valid saved
+    // OAuth login applies only when there is no explicit header — they are not
+    // OR'd together. The store status is injected — no real token files, no
+    // HOME change.
+    #[test]
+    fn mcp_readiness_explicit_header_ignores_saved_oauth() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let resource = "https://mcp.example.test/mcp";
+
+        let entry = |headers| McpServerEntry {
+            name: "example-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some(resource.to_string()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // No Authorization header → valid saved OAuth counts as Authenticated.
+        assert_eq!(
+            classify_readiness(&entry(Default::default()), &|_: &str| None, &|_| true),
+            McpReadiness::Authenticated
+        );
+
+        // An explicit Authorization header is present → saved OAuth is ignored,
+        // not OR'd → Configured.
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [(
+                        "Authorization".into(),
+                        newt_core::mcp::SecretValue::literal("Bearer deadbeef"),
+                    )]
+                    .into_iter()
+                    .collect()
+                ),
+                &|_: &str| None,
+                &|_| true
+            ),
+            McpReadiness::Configured
+        );
     }
 }

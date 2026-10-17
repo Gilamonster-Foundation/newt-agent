@@ -59,20 +59,22 @@ pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
             // List mode — print a table.
             println!("\nMCP server auth status:\n");
             for entry in &http_servers {
-                if let Err(denied) = newt_core::mcp::admit(entry) {
-                    println!("  !  {:<30}  not admitted: {denied}", entry.name);
-                    continue;
-                }
-                if mcp::has_plaintext_authorization_header(entry) {
-                    println!(
-                        "  !  {:<30}  invalid plaintext Authorization; use an environment/file reference",
-                        entry.name
-                    );
-                    continue;
-                }
-                if mcp::has_configured_authorization_header(entry) {
-                    println!("  ✓  {:<30}  configured credential", entry.name);
-                    continue;
+                match classify_readiness(
+                    entry,
+                    &|v| std::env::var(v).ok(),
+                    &crate::mcp::saved_oauth_valid,
+                ) {
+                    McpReadiness::NotAdmitted => {
+                        let denied = newt_core::mcp::admit(entry)
+                            .expect_err("classified NotAdmitted implies admission denied");
+                        println!("  !  {:<30}  not admitted: {denied}", entry.name);
+                        continue;
+                    }
+                    McpReadiness::Authenticated => {
+                        println!("  ✓  {:<30}  configured credential", entry.name);
+                        continue;
+                    }
+                    McpReadiness::Configured => {}
                 }
                 let url = entry.url.clone().expect("HTTP entries were URL-filtered");
                 let mut statuses = mcp_token::auth_status(&[(entry.name.clone(), url)]);

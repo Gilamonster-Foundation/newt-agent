@@ -368,7 +368,8 @@ url = "http://127.0.0.1:1/mcp"
         .stdout(predicate::str::contains("code_read"))
         .stdout(predicate::str::contains("dead [stdio] — ERROR:"))
         .stdout(predicate::str::contains(
-            "remote [http] — http://127.0.0.1:1/mcp (skipped: only stdio is supported in this build)",
+            "remote [http] — http://127.0.0.1:1/mcp (configured (no credential) — \
+             grant net for `http://127.0.0.1:1/mcp`, then `newt auth remote`)",
         ));
 }
 

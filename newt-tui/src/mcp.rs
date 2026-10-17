@@ -228,6 +228,149 @@ fn authorization_is_reference(value: &newt_core::mcp::SecretValue) -> bool {
     }
 }
 
+/// A single admission/auth readiness classification shared by import, doctor,
+/// `newt auth` and the /mcp panel. Every surface reports the same level for
+/// the same server (#2913).
+///
+/// Only local, decidable state is classified here — admission (enabled +
+/// trust) and whether a credential is configured in the entry. Token
+/// freshness and a live dial are layered on top by the interactive surfaces
+/// that can afford them; the baseline below is what every surface agrees on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpReadiness {
+    /// Admission refused (disabled or untrusted) — not ready at all.
+    NotAdmitted,
+    /// Admitted to run, but no credential is configured in the entry.
+    #[default]
+    Configured,
+    /// Admitted and a credential is configured (an Authorization header is
+    /// present at rest).
+    Authenticated,
+}
+
+/// Classify one server's admission + configured-credential state. Pure over
+/// the entry, so import, doctor, `newt auth` and the /mcp panel all agree.
+///
+/// `env_lookup` resolves env var names to values — production passes
+/// `std::env::var`; tests inject a seam so no process-global env is touched.
+/// Classification is configuration-only: never resolve a secret here (no file
+// reads, no command execution).
+pub fn classify_readiness(
+    entry: &McpServerEntry,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    saved_oauth_valid: &dyn Fn(&McpServerEntry) -> bool,
+) -> McpReadiness {
+    if newt_core::mcp::admit(entry).is_err() {
+        return McpReadiness::NotAdmitted;
+    }
+    // Classification is configuration-only: never resolve a secret here (no
+    // file reads, no command execution). An `env` reference whose variable is
+    // set and non-empty counts as a configured credential — confirmed from the
+    // injected env lookup alone. `file`/`cmd` references and plaintext/literal
+    // headers stay "configured" — never authenticated here, because confirming
+    // them would require resolving the secret.
+    //
+    // A literal `Bearer ${VAR}`, `Bearer ${env:VAR}`, or a bare `${VAR}` /
+    // `${env:VAR}` whose value is the whole header counts as a usable
+    // credential when the referenced env var is set and non-empty (after
+    // trimming). The interpolation `${...}` is resolved host-side at spawn,
+    // not here.
+    //
+    // Runtime precedence: an explicit Authorization header decides by itself;
+    // saved OAuth applies only when there is NO explicit header — they are not
+    // OR'd together.
+    let has_auth_header = entry
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+
+    let header_credential = has_auth_header
+        && entry.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && header_is_credential(value, env_lookup)
+        });
+
+    // A valid saved OAuth login also counts as Authenticated, but only when
+    // no explicit Authorization header is present. The store check is
+    // injected; production passes [`saved_oauth_valid`].
+    let oauth_credential =
+        !has_auth_header && entry.transport == TransportKind::Http && saved_oauth_valid(entry);
+
+    if header_credential || oauth_credential {
+        return McpReadiness::Authenticated;
+    }
+    McpReadiness::Configured
+}
+
+/// Whether the token store holds a valid saved OAuth login for `entry`:
+/// resource- and issuer-bound and unexpired, through `mcp_token`'s existing
+/// eligibility check. The production `saved_oauth_valid` argument to
+/// [`classify_readiness`].
+pub fn saved_oauth_valid(entry: &McpServerEntry) -> bool {
+    entry.url.as_deref().is_some_and(|url| {
+        crate::mcp_token::auth_status(&[(entry.name.clone(), url.to_string())])
+            .iter()
+            .any(|s| matches!(s.state, crate::mcp_token::AuthState::Valid))
+    })
+}
+
+/// Whether an Authorization header value is a usable credential at
+/// classification time:
+/// - a literal `Bearer ${VAR}` / `Bearer ${env:VAR}` whose var is set and
+///   non-empty → credential
+/// - a bare `${VAR}` / `${env:VAR}` whose value is the whole header → credential
+/// - an `env` SecretRef whose variable is set and non-empty → credential
+/// - everything else (plaintext bearer, `file`/`cmd` refs, unset or
+///   whitespace-only `${VAR}`) → not a usable credential here.
+fn header_is_credential(
+    value: &newt_core::mcp::SecretValue,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    match value {
+        newt_core::mcp::SecretValue::Literal(s) => {
+            let candidate = s.trim().strip_prefix("Bearer ").unwrap_or_else(|| s.trim());
+            let var_name = env_var_name_from_reference(candidate);
+            var_name.is_some_and(|var| env_lookup(var).is_some_and(|v| !v.trim().is_empty()))
+        }
+        newt_core::mcp::SecretValue::Ref(r) => r
+            .env
+            .as_deref()
+            .is_some_and(|var| env_lookup(var).is_some_and(|v| !v.trim().is_empty())),
+    }
+}
+
+/// Extract the env var name from a value that is entirely an env reference:
+/// `${VAR}` (bare identifier) or `${env:VAR}`. Returns None for file/cmd
+/// references, unrecognized tokens, or anything with literal text around it.
+/// Mirrors `newt_core::mcp::classify_token`'s env recognition.
+fn env_var_name_from_reference(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix("${")?.strip_suffix('}')?;
+    match inner.split_once(':') {
+        Some(("env", name)) => Some(name),
+        None if is_env_identifier(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// Whether `s` is a valid bare env-var identifier for `${NAME}`:
+/// `^[A-Za-z_][A-Za-z0-9_]*$`. Same rule as `newt_core::mcp::is_env_identifier`.
+fn is_env_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[must_use]
+pub fn readiness_label(readiness: McpReadiness) -> &'static str {
+    match readiness {
+        McpReadiness::NotAdmitted => "not admitted",
+        McpReadiness::Configured => "configured (no credential)",
+        McpReadiness::Authenticated => "authenticated",
+    }
+}
+
 fn is_http_unauthorized(error: &anyhow::Error) -> bool {
     is_http_status(error, 401)
 }
