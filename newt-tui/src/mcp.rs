@@ -260,21 +260,30 @@ pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
     // environment alone. `file`/`cmd` references and plaintext/literal headers
     // stay "configured" — never authenticated here, because confirming them
     // would require resolving the secret.
-    let header_credential = entry.headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("authorization")
-            && matches!(
-                value,
-                newt_core::mcp::SecretValue::Ref(r)
-                    if r.env
-                        .as_deref()
-                        .is_some_and(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()))
-            )
-    });
+    //
+    // A literal "Bearer ${VAR}" header: when VAR is set and non-empty it is a
+    // usable credential; otherwise it is unresolved at rest → Configured. The
+    // interpolation `${...}` is resolved host-side at spawn, not here.
+    //
+    // Runtime precedence: an explicit Authorization header decides by itself;
+    // saved OAuth applies only when there is NO explicit header — they are not
+    // OR'd together.
+    let has_auth_header = entry
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+
+    let header_credential = has_auth_header
+        && entry.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && header_is_credential(value)
+        });
 
     // A valid saved OAuth login (resource- and issuer-bound, unexpired,
     // in the token store) also counts as Authenticated — reusing
-    // mcp_token's existing binding/expiry eligibility check.
-    let oauth_credential = entry.transport == TransportKind::Http
+    // mcp_token's existing binding/expiry eligibility check — but only when
+    // no explicit Authorization header is present.
+    let oauth_credential = !has_auth_header
+        && entry.transport == TransportKind::Http
         && entry.url.as_deref().is_some_and(|url| {
             crate::mcp_token::auth_status(&[(entry.name.clone(), url.to_string())])
                 .iter()
@@ -285,6 +294,36 @@ pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
         return McpReadiness::Authenticated;
     }
     McpReadiness::Configured
+}
+
+/// Whether an Authorization header value is a usable credential at
+/// classification time:
+/// - a literal `Bearer ${VAR}` whose `VAR` is set and non-empty → credential
+/// - an `env` SecretRef whose variable is set and non-empty → credential
+/// - everything else (plaintext bearer, `file`/`cmd` refs, unset `${VAR}`) →
+///   not a usable credential here (resolving it would require I/O).
+fn header_is_credential(value: &newt_core::mcp::SecretValue) -> bool {
+    match value {
+        newt_core::mcp::SecretValue::Literal(s) => {
+            // Only a `Bearer ${VAR}` literal counts as a usable credential — a
+            // bare `${TOKEN}` (no Bearer prefix) is just an interpolation token,
+            // not a bearer credential.
+            let Some(candidate) = s.trim().strip_prefix("Bearer ") else {
+                return false;
+            };
+            let candidate = candidate.trim();
+            candidate.starts_with("${")
+                && candidate.ends_with('}')
+                && candidate[2..candidate.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && std::env::var(&candidate[2..candidate.len() - 1]).is_ok_and(|v| !v.is_empty())
+        }
+        newt_core::mcp::SecretValue::Ref(r) => r
+            .env
+            .as_deref()
+            .is_some_and(|var| std::env::var(var).is_ok_and(|v| !v.is_empty())),
+    }
 }
 
 #[must_use]

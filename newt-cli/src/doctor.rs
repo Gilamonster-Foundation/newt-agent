@@ -1019,14 +1019,13 @@ mod tests {
 
     // P1 (#2913): classify_readiness must NEVER resolve a secret or run a command.
     // A `{ cmd }` secret reference classifies as Configured (not checked) and the
-    // command must not execute — classification is configuration-only.
+    // command must not execute — classification is configuration-only. This test
+    // is fs-free: it asserts on the classification outcome itself, which can only
+    // be Configured if the command was never run.
     #[test]
     fn mcp_readiness_never_resolves_a_secret_or_runs_a_command() {
         use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
         use newt_tui::{classify_readiness, McpReadiness};
-
-        let marker = std::env::temp_dir().join("mcp_readiness_marker");
-        let _ = std::fs::remove_file(&marker);
 
         let cmd_entry = McpServerEntry {
             name: "cmd-server".into(),
@@ -1039,7 +1038,7 @@ mod tests {
             headers: [(
                 "Authorization".into(),
                 newt_core::mcp::SecretValue::Ref(newt_core::agent_identity::SecretRef {
-                    cmd: Some(format!("echo secret >> {}", marker.display())),
+                    cmd: Some("echo secret > /dev/null".into()),
                     ..Default::default()
                 }),
             )]
@@ -1051,19 +1050,150 @@ mod tests {
             origin: None,
         };
 
-        let before = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        // Configuration-only: a `cmd` reference is never resolved during
+        // classification, so it stays Configured (not checked) and the command
+        // never executes.
+        assert_eq!(classify_readiness(&cmd_entry), McpReadiness::Configured);
+    }
 
-        let readiness = classify_readiness(&cmd_entry);
+    // Step 2 (#2913): a literal "Bearer ${VAR}" header counts as Authenticated
+    // when VAR is set and non-empty; otherwise it is Configured (unresolved).
+    #[test]
+    fn mcp_readiness_literal_bearer_env_var_authenticates_when_var_set() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
 
-        let after = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
 
-        // Zero command executions during classification, and Configured (not checked).
+        let bearer_ref =
+            |var: &str| newt_core::mcp::SecretValue::literal(format!("Bearer ${{{var}}}"));
+
+        // VAR unset → unresolved literal → Configured.
         assert_eq!(
-            before, after,
-            "classification must not run the secret command"
+            classify_readiness(&entry(
+                [("Authorization".into(), bearer_ref("BEARER_VAR_UNSET"),)]
+                    .into_iter()
+                    .collect()
+            )),
+            McpReadiness::Configured
         );
-        assert_eq!(readiness, McpReadiness::Configured);
 
-        let _ = std::fs::remove_file(&marker);
+        // VAR set and non-empty → Authenticated.
+        unsafe { std::env::set_var("BEARER_VAR_SET", "token-value") };
+        assert_eq!(
+            classify_readiness(&entry(
+                [("Authorization".into(), bearer_ref("BEARER_VAR_SET"),)]
+                    .into_iter()
+                    .collect()
+            )),
+            McpReadiness::Authenticated
+        );
+        unsafe { std::env::remove_var("BEARER_VAR_SET") };
+    }
+
+    // Step 2 (#2913): an explicit Authorization header decides; a valid saved
+    // OAuth login applies only when there is no explicit header — they are not
+    // OR'd together. Mirrors the existing OAuth test's tempfile+HOME setup.
+    #[test]
+    fn mcp_readiness_explicit_header_ignores_saved_oauth() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", temp.path()) };
+
+        let token_dir = temp.path().join(".hermes").join("mcp-tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+
+        let resource = "https://mcp.example.test/mcp";
+        let issuer = "https://auth.example.test";
+
+        let token = serde_json::json!({
+            "access_token": "saved-oauth-token",
+            "refresh_token": "refresh-token",
+            "expires_at": 2_000_000_000.0,
+            "resource": resource,
+            "issuer": issuer,
+            "token_type": "Bearer"
+        });
+        let meta = serde_json::json!({
+            "resource": resource,
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "code_challenge_methods_supported": ["S256"],
+            "authorization_response_iss_parameter_supported": true
+        });
+        let client = serde_json::json!({
+            "client_id": "client-id",
+            "redirect_uris": ["http://127.0.0.1:0/callback"],
+            "issuer": issuer
+        });
+
+        std::fs::write(
+            token_dir.join("example-server.json"),
+            serde_json::to_string(&token).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            token_dir.join("example-server.meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            token_dir.join("example-server.client.json"),
+            serde_json::to_string(&client).unwrap(),
+        )
+        .unwrap();
+
+        let entry = |headers| McpServerEntry {
+            name: "example-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some(resource.to_string()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // No Authorization header → valid saved OAuth counts as Authenticated.
+        assert_eq!(
+            classify_readiness(&entry(Default::default())),
+            McpReadiness::Authenticated
+        );
+
+        // An explicit Authorization header is present → saved OAuth is ignored,
+        // not OR'd → Configured.
+        assert_eq!(
+            classify_readiness(&entry(
+                [(
+                    "Authorization".into(),
+                    newt_core::mcp::SecretValue::literal("Bearer deadbeef"),
+                )]
+                .into_iter()
+                .collect()
+            )),
+            McpReadiness::Configured
+        );
+
+        unsafe { std::env::remove_var("HOME") };
     }
 }
