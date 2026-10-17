@@ -32,7 +32,7 @@ const KNOWN_PUBLISHING_RESOLVES: &[(&str, usize)] = &[
     ("newt-cli/src/dgx.rs", 2),
     ("newt-cli/src/doctor.rs", 1),
     ("newt-cli/src/lib.rs", 3),
-    ("newt-cli/src/mcp_cmd.rs", 2),
+    ("newt-cli/src/mcp_cmd.rs", 1),
     ("newt-cli/src/mcp_probe_cmd.rs", 1),
     ("newt-cli/src/skills.rs", 1),
     ("newt-core/src/pyo3_module.rs", 1),
