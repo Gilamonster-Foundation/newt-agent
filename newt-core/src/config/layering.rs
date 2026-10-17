@@ -316,21 +316,28 @@ pub(crate) fn find_project_entry_from(
     file: &str,
     exists: fn(&Path) -> bool,
 ) -> Option<PathBuf> {
+    project_dirs_from(start, home)
+        .into_iter()
+        .map(|dir| dir.join(".newt").join(file))
+        .find(|candidate| exists(candidate))
+}
+
+/// Every directory from `start` up to the root that may hold a project
+/// `.newt/`, innermost first, stopping before `$HOME` (compared resolved).
+pub(crate) fn project_dirs_from(start: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let home = home.map(resolve);
+    let mut dirs = Vec::new();
     let mut dir = Some(start);
     while let Some(current) = dir {
         // Never treat the home directory's `.newt` as a project override.
         if home.is_some() && home == Some(resolve(current)) {
             break;
         }
-        let candidate = current.join(".newt").join(file);
-        if exists(&candidate) {
-            return Some(candidate);
-        }
+        dirs.push(current.to_path_buf());
         dir = current.parent();
     }
-    None
+    dirs
 }
 
 /// Expand a leading `~/` (or a bare `~`) to the home directory. Paths
