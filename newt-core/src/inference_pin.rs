@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::config::{project_dirs_from, Config};
+use crate::config::{project_dirs_from, resolve_or_self, Config};
 
 /// The class of inference a pin requires. `Sovereign` is the only value: any
 /// other string in `[inference] pin` is a config problem, and fails closed.
@@ -61,6 +61,7 @@ struct InferenceTable {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InferenceSection {
     pin: Option<PinClass>,
 }
@@ -103,20 +104,36 @@ impl InferencePolicy {
     /// The policy for a session started in `cwd`: the user config plus every
     /// `.newt/config.toml` from `cwd` up to (not including) `$HOME`. The
     /// innermost project config is the repo scope; outer ones are workspace.
-    /// Reads through `read` so tests need no filesystem; `NotFound` means "no
-    /// file here", any other error fails closed.
+    /// Reads through `read` and resolves symlinks through `resolve`, so tests
+    /// touch no filesystem; `NotFound` means "no file here", any other error
+    /// fails closed. A misspelled key inside `[inference]` fails closed too.
     pub fn discover(
-        cwd: &Path,
+        cwd: std::io::Result<&Path>,
         home: Option<&Path>,
         user_config: Option<&Path>,
         read: &dyn Fn(&Path) -> std::io::Result<String>,
+        resolve: &dyn Fn(&Path) -> PathBuf,
     ) -> Self {
         let mut policy = Self::unpinned();
         if let Some(path) = user_config {
             policy.read_scope(path, PinScope::User, read);
         }
+        // Without a working directory the project pins cannot be found:
+        // that is a pin of its own, not an absence.
+        let cwd = match cwd {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                policy.pins.push(Pin {
+                    class: PinClass::Sovereign,
+                    scope: PinScope::Repo,
+                    source: None,
+                    problem: Some(format!("working directory unknown: {e}")),
+                });
+                return policy;
+            }
+        };
         let mut repo_seen = false;
-        for dir in project_dirs_from(cwd, home) {
+        for dir in project_dirs_from(cwd, home, resolve) {
             let path = dir.join(".newt").join("config.toml");
             let scope = if repo_seen {
                 PinScope::Workspace
@@ -134,12 +151,17 @@ impl InferencePolicy {
     /// environment.
     #[must_use]
     pub fn discover_here() -> Self {
-        let cwd = std::env::current_dir().unwrap_or_default();
         let home = crate::config::home_dir();
         let user = Config::user_config_path();
-        Self::discover(&cwd, home.as_deref(), user.as_deref(), &|p| {
-            std::fs::read_to_string(p)
-        })
+        let cwd = std::env::current_dir();
+        Self::discover(
+            cwd.as_deref()
+                .map_err(|e| std::io::Error::new(e.kind(), e.to_string())),
+            home.as_deref(),
+            user.as_deref(),
+            &|p| std::fs::read_to_string(p),
+            &resolve_or_self,
+        )
     }
 
     /// Read one candidate file; returns whether a file existed there.
@@ -196,11 +218,17 @@ mod tests {
 
     fn discover(files: &[(&str, &str)]) -> InferencePolicy {
         InferencePolicy::discover(
-            Path::new("/w/org/repo"),
+            Ok(Path::new("/w/org/repo")),
             Some(Path::new("/home/op")),
             Some(Path::new("/home/op/.newt/config.toml")),
             &reader(files),
+            &same,
         )
+    }
+
+    /// The resolver for tests: no symlinks, no filesystem.
+    fn same(p: &Path) -> PathBuf {
+        p.to_path_buf()
     }
 
     const PINNED: &str = "[inference]\npin = \"sovereign\"\n";
@@ -264,10 +292,11 @@ mod tests {
         let p = discover(&[("/w/org/repo/.newt/config.toml", "[inference\n")]);
         assert!(p.is_pinned());
         let denied = InferencePolicy::discover(
-            Path::new("/w/org/repo"),
+            Ok(Path::new("/w/org/repo")),
             Some(Path::new("/home/op")),
             None,
             &|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            &same,
         );
         assert!(denied.is_pinned());
     }
@@ -277,10 +306,11 @@ mod tests {
     #[test]
     fn the_home_dir_is_not_a_workspace() {
         let p = InferencePolicy::discover(
-            Path::new("/home/op/src/repo"),
+            Ok(Path::new("/home/op/src/repo")),
             Some(Path::new("/home/op")),
             Some(Path::new("/home/op/.newt/config.toml")),
             &reader(&[("/home/op/.newt/config.toml", PINNED)]),
+            &same,
         );
         assert_eq!(p.pins().len(), 1);
         assert_eq!(p.pins()[0].scope, PinScope::User);
@@ -299,5 +329,34 @@ mod tests {
     #[test]
     fn inference_is_not_a_control_plane_key() {
         assert!(!crate::config::CONTROL_PLANE_KEYS.contains(&"inference"));
+    }
+
+    /// #2931 review: a misspelled key inside `[inference]` decoded as "no pin".
+    #[test]
+    fn a_misspelled_inference_key_fails_closed() {
+        for text in [
+            "[inference]\npinn = \"sovereign\"\n",
+            "[inference]\nsovereign = true\n",
+            "[inference]\nPIN = \"sovereign\"\n",
+        ] {
+            let p = discover(&[("/w/org/repo/.newt/config.toml", text)]);
+            assert!(p.is_pinned(), "{text}");
+            assert!(p.pins()[0].problem.is_some(), "{text}");
+        }
+    }
+
+    /// #2931 review: an unknown working directory used to discover nothing.
+    #[test]
+    fn an_unknown_working_directory_fails_closed() {
+        let p = InferencePolicy::discover(
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            Some(Path::new("/home/op")),
+            None,
+            &reader(&[]),
+            &same,
+        );
+        assert!(p.is_pinned());
+        let problem = p.pins()[0].problem.as_deref().unwrap();
+        assert!(problem.contains("working directory"), "{problem}");
     }
 }

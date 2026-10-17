@@ -316,28 +316,28 @@ pub(crate) fn find_project_entry_from(
     file: &str,
     exists: fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    project_dirs_from(start, home)
-        .into_iter()
+    project_dirs_from(start, home, &resolve_or_self)
         .map(|dir| dir.join(".newt").join(file))
         .find(|candidate| exists(candidate))
 }
 
+/// A path resolved through symlinks, or itself when it cannot be.
+pub(crate) fn resolve_or_self(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Every directory from `start` up to the root that may hold a project
-/// `.newt/`, innermost first, stopping before `$HOME` (compared resolved).
-pub(crate) fn project_dirs_from(start: &Path, home: Option<&Path>) -> Vec<PathBuf> {
-    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+/// `.newt/`, innermost first, lazily, stopping before `$HOME`. Both sides of
+/// the stop are compared through `resolve`: `$HOME` may name a symlink
+/// (macOS `/var` → `/private/var`) while `start` is already resolved.
+pub(crate) fn project_dirs_from<'a>(
+    start: &'a Path,
+    home: Option<&Path>,
+    resolve: &'a dyn Fn(&Path) -> PathBuf,
+) -> impl Iterator<Item = &'a Path> + 'a {
     let home = home.map(resolve);
-    let mut dirs = Vec::new();
-    let mut dir = Some(start);
-    while let Some(current) = dir {
-        // Never treat the home directory's `.newt` as a project override.
-        if home.is_some() && home == Some(resolve(current)) {
-            break;
-        }
-        dirs.push(current.to_path_buf());
-        dir = current.parent();
-    }
-    dirs
+    std::iter::successors(Some(start), |dir| dir.parent())
+        .take_while(move |dir| home.as_deref().is_none_or(|h| h != resolve(dir)))
 }
 
 /// Expand a leading `~/` (or a bare `~`) to the home directory. Paths
