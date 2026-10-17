@@ -311,11 +311,21 @@ pub(crate) fn print_next_steps(
                     entry.name
                 )?;
             }
-            McpReadiness::Configured => {
+            // Only an HTTP server has a credential to obtain; a stdio server
+            // is ready once admitted, so `newt auth` would be advice it
+            // cannot follow.
+            McpReadiness::Configured if matches!(entry.transport, TransportKind::Http) => {
                 writeln!(
                     out,
                     "  ✓  {} — admitted, no credential yet: `newt auth {}` then `newt doctor`.",
                     entry.name, entry.name
+                )?;
+            }
+            McpReadiness::Configured => {
+                writeln!(
+                    out,
+                    "  ✓  {} — admitted: confirm with `newt doctor`.",
+                    entry.name
                 )?;
             }
             McpReadiness::Authenticated => {

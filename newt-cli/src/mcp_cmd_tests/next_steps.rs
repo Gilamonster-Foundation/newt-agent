@@ -49,3 +49,14 @@ fn print_next_steps_mixed_entry_points_at_auth() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("newt auth"), "{text}");
 }
+
+/// #2923 review: a stdio server has no OAuth, so its per-server line must not
+/// tell the operator to run `newt auth <name>`. RED before: the Configured
+/// arm advised `newt auth s` for the stdio entry.
+#[test]
+fn print_next_steps_never_offers_auth_to_a_stdio_server() {
+    let mut out = Vec::new();
+    print_next_steps(&mut out, &[stdio_entry("s", Some("scrybe-mcp-server"))]).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("newt auth"), "{text}");
+}
