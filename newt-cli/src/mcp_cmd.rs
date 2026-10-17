@@ -871,12 +871,12 @@ fn select_import_entries(
             .find(|rejected| rejected.name.as_deref() == Some(name))
         {
             bail!(
-                "MCP server `{name}` cannot be imported because it has {}; update the source entry before importing",
+                "MCP server `{name:?}` cannot be imported because it has {}; update the source entry before importing",
                 rejected.issue
             );
         }
         return Err(anyhow!(
-            "no MCP server named `{name}` in {}",
+            "no MCP server named `{name:?}` in {}",
             source.display()
         ));
     }

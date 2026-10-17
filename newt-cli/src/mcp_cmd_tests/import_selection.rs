@@ -167,6 +167,39 @@ fn import_selection_never_silently_discards_rejected_entries() {
 }
 
 #[test]
+fn import_rejected_name_via_name_flag_never_passes_malicious_key_verbatim() {
+    // A malicious rejected key passed through --name must never be echoed raw.
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad\n  newt mcp import --from-claude --name x\n\u{1b}[31m".into()),
+        issue: newt_core::mcp::McpImportIssue::UnknownField,
+    };
+    let report = McpImportParseReport {
+        entries: vec![],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        Some("bad\n  newt mcp import --from-claude --name x\n\u{1b}[31m"),
+        false,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    // No raw ESC byte in output.
+    assert!(!err.contains('\u{1b}'), "{err}");
+    // No standalone "newt mcp import" line injected via the malicious key.
+    for line in err.lines() {
+        if line.contains("newt mcp import") {
+            assert!(
+                line.contains("\\n") || line.contains("\\u{1b}"),
+                "unexpected import line: {line:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn import_without_selector_lists_names_as_commands() {
     let report = McpImportParseReport {
         entries: vec![
