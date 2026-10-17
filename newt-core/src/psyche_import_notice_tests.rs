@@ -238,10 +238,12 @@ fn held_lock_is_observed_while_migrating() {
     let path = dir.path().join("config.toml");
     std::fs::write(&path, OLD).unwrap();
     let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
-    // A different caller holds the same destination's lock for the whole read.
-    let _caller_guard = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+    // A different caller holds the same destination's lock for the whole read;
+    // pass that guard through `held_locks` so the read observes it instead of
+    // re-acquiring and reporting spurious lock contention.
+    let caller_guard = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
     let mut notices = Vec::new();
-    read_config_file(&path, true, &[], &mut |n| notices.push(n)).unwrap();
+    read_config_file(&path, true, &[&caller_guard], &mut |n| notices.push(n)).unwrap();
     assert!(
         !notices
             .iter()
