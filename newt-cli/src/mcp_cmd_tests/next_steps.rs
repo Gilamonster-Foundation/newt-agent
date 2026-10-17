@@ -60,3 +60,17 @@ fn print_next_steps_never_offers_auth_to_a_stdio_server() {
     let text = String::from_utf8(out).unwrap();
     assert!(!text.contains("newt auth"), "{text}");
 }
+
+/// #2923 review round 5: a disabled stdio server is not admitted, and its
+/// line must not send the operator to `newt auth` either. RED before: "not
+/// admitted (…); import/approve it before `newt auth`".
+#[test]
+fn print_next_steps_never_offers_auth_to_a_disabled_stdio_server() {
+    let mut entry = stdio_entry("s", Some("scrybe-mcp-server"));
+    entry.enabled = false;
+    let mut out = Vec::new();
+    print_next_steps(&mut out, &[entry]).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("not admitted"), "{text}");
+    assert!(!text.contains("newt auth"), "{text}");
+}

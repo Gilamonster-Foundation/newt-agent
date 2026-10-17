@@ -305,9 +305,15 @@ pub(crate) fn print_next_steps(
             McpReadiness::NotAdmitted => {
                 let denied = newt_core::mcp::admit(entry)
                     .expect_err("classified NotAdmitted implies admission denied");
+                // Only an HTTP server has a credential to obtain afterwards.
+                let then = if matches!(entry.transport, TransportKind::Http) {
+                    "`newt auth`"
+                } else {
+                    "`newt doctor`"
+                };
                 writeln!(
                     out,
-                    "  !  {} — not admitted ({denied}); import/approve it before `newt auth`.",
+                    "  !  {} — not admitted ({denied}); import/approve it before {then}.",
                     entry.name
                 )?;
             }
