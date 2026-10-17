@@ -254,18 +254,21 @@ pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
     if newt_core::mcp::admit(entry).is_err() {
         return McpReadiness::NotAdmitted;
     }
-    // A plaintext bearer header is rejected (as `newt auth` already does) — it
-    // is not a usable credential. A `${...}` reference literal is unresolved at
-    // rest, so it is "configured but missing credential", not authenticated.
-    // Only a `SecretValue::Ref` (env/file/cmd secret reference) that actually
-    // resolves to a non-empty secret counts as configured; an unset `${VAR}`,
-    // empty file, or failing command is "missing credential" → Configured.
-    // Token freshness and OAuth validity are layered on top by the interactive
-    // surfaces — doctor makes no connection.
+    // Classification is configuration-only: never resolve a secret here (no
+    // file reads, no command execution). An `env` reference whose variable is
+    // set and non-empty counts as a configured credential — confirmed from the
+    // environment alone. `file`/`cmd` references and plaintext/literal headers
+    // stay "configured" — never authenticated here, because confirming them
+    // would require resolving the secret.
     let header_credential = entry.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("authorization")
-            && matches!(value, newt_core::mcp::SecretValue::Ref(_))
-            && value.resolve().is_ok()
+            && matches!(
+                value,
+                newt_core::mcp::SecretValue::Ref(r)
+                    if r.env
+                        .as_deref()
+                        .is_some_and(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()))
+            )
     });
 
     // A valid saved OAuth login (resource- and issuer-bound, unexpired,

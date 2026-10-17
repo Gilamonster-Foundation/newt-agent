@@ -1016,4 +1016,54 @@ mod tests {
 
         unsafe { std::env::remove_var("HOME") };
     }
+
+    // P1 (#2913): classify_readiness must NEVER resolve a secret or run a command.
+    // A `{ cmd }` secret reference classifies as Configured (not checked) and the
+    // command must not execute — classification is configuration-only.
+    #[test]
+    fn mcp_readiness_never_resolves_a_secret_or_runs_a_command() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let marker = std::env::temp_dir().join("mcp_readiness_marker");
+        let _ = std::fs::remove_file(&marker);
+
+        let cmd_entry = McpServerEntry {
+            name: "cmd-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: [(
+                "Authorization".into(),
+                newt_core::mcp::SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    cmd: Some(format!("echo secret >> {}", marker.display())),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        let before = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+
+        let readiness = classify_readiness(&cmd_entry);
+
+        let after = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+
+        // Zero command executions during classification, and Configured (not checked).
+        assert_eq!(
+            before, after,
+            "classification must not run the secret command"
+        );
+        assert_eq!(readiness, McpReadiness::Configured);
+
+        let _ = std::fs::remove_file(&marker);
+    }
 }
