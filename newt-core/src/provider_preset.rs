@@ -37,8 +37,8 @@
 //!
 //! Three-Cs mechanics copied from [`crate::api_surface`] (LanguagePack):
 //! built-ins in code as data, tolerant drop-in dir loader, merge-by-name
-//! with later-layers-win, fixed precedence builtin < `~/.newt/providers/`
-//! < `<workspace>/.newt/providers/`.
+//! with later-layers-win, fixed precedence builtin < `~/.newt/providers/`.
+//! A project's `.newt/providers/` is never merged (it could redirect a provider).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -806,19 +806,14 @@ pub fn merge_presets(layers: Vec<Vec<ProviderPreset>>) -> Vec<ProviderPreset> {
         .collect()
 }
 
-/// The resolved roster: builtin < `~/.newt/providers/` < project
-/// `.newt/providers/`.
-pub fn resolve_presets(workspace: Option<&Path>) -> Vec<ProviderPreset> {
+/// The resolved roster: builtin < `~/.newt/providers/`. A project's
+/// `.newt/providers/` is not merged: a preset names `base_url`, `models_url`
+/// and the credential variable, so a repo could redirect an operator's
+/// provider (and its key) by name.
+pub fn resolve_presets() -> Vec<ProviderPreset> {
     let mut layers = vec![builtin_presets()];
     if let Some(dir) = Config::user_config_dir() {
         layers.push(load_presets_from_dir(&dir.join("providers")));
-    }
-    if let Some(ws) = workspace {
-        layers.push(load_presets_from_dir(&ws.join(".newt").join("providers")));
-    } else if let Some(proj) = Config::project_config_path() {
-        if let Some(parent) = proj.parent() {
-            layers.push(load_presets_from_dir(&parent.join("providers")));
-        }
     }
     merge_presets(layers)
 }

@@ -268,6 +268,17 @@ pub(crate) fn find_project_file_from(
     home: Option<&Path>,
     file: &str,
 ) -> Option<PathBuf> {
+    find_project_entry_from(start, home, file, Path::is_file)
+}
+
+/// The walk behind [`find_project_file_from`], for any `.newt/<entry>` that
+/// satisfies `exists`, under the same `$HOME` stop rule.
+pub(crate) fn find_project_entry_from(
+    start: &Path,
+    home: Option<&Path>,
+    file: &str,
+    exists: fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let home = home.map(resolve);
     let mut dir = Some(start);
@@ -277,7 +288,7 @@ pub(crate) fn find_project_file_from(
             break;
         }
         let candidate = current.join(".newt").join(file);
-        if candidate.is_file() {
+        if exists(&candidate) {
             return Some(candidate);
         }
         dir = current.parent();

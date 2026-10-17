@@ -242,23 +242,15 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every `<dir>/backends/` directory [`Config::resolve`]'s merge reads, home
-/// before project (the same precedence), returned once each even if the
-/// project config happens to resolve to the same directory as home.
+/// The `backends/` directory [`Config::resolve`]'s merge reads: the
+/// operator's only. A project's `.newt/backends/` is never merged, so doctor
+/// must not parse or probe it either (it would authenticate to a
+/// repo-chosen endpoint with the operator's credentials).
 fn backend_dropin_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) = Config::user_config_dir() {
-        dirs.push(dir.join("backends"));
-    }
-    if let Some(proj) = Config::project_config_path() {
-        if let Some(parent) = proj.parent() {
-            let dir = parent.join("backends");
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
-        }
-    }
-    dirs
+    Config::user_config_dir()
+        .map(|dir| dir.join("backends"))
+        .into_iter()
+        .collect()
 }
 
 /// `newt doctor`'s file-level backend drop-in diagnostics (#1951): parseable,
@@ -625,6 +617,44 @@ fn brush_engine_description(worker_available: bool) -> &'static str {
 mod tests {
     use super::*;
     use newt_core::ocap::{Guarantee, RuntimeEvidence, LINUX_CEILING, MACOS_CEILING};
+
+    /// #2929 review: `doctor` parsed a project's `.newt/backends/` drop-ins and
+    /// probed them with the operator's credentials when config resolution
+    /// failed. RED before the fix: the project dir was listed after the
+    /// operator's. Real fs and serial: the walk reads cwd, HOME and
+    /// NEWT_CONFIG_DIR, all saved and restored here.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn doctor_reads_only_the_operator_backend_dropins() {
+        let root = tempfile::tempdir().unwrap();
+        let operator = root.path().join("home/.newt");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(operator.join("backends")).unwrap();
+        std::fs::create_dir_all(repo.join(".newt/backends")).unwrap();
+        std::fs::write(repo.join(".newt/config.toml"), "").unwrap();
+        std::fs::write(
+            repo.join(".newt/backends/gpu.toml"),
+            "endpoint = \"http://attacker.invalid:9999\"\n",
+        )
+        .unwrap();
+        let saved_dir = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
+        let saved_home = std::env::var_os("HOME");
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, &operator);
+        std::env::set_var("HOME", root.path().join("home"));
+        std::env::set_current_dir(&repo).unwrap();
+        let dirs = backend_dropin_dirs();
+        std::env::set_current_dir(prev).unwrap();
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_dir {
+            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+        }
+        assert_eq!(dirs, vec![operator.join("backends")]);
+    }
 
     #[test]
     fn brush_description_reports_transport_limit_without_parity_claims() {
