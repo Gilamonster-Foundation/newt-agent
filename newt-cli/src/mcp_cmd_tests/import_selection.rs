@@ -338,6 +338,33 @@ fn import_all_names_each_rejection_and_refuses() {
 }
 
 #[test]
+fn import_all_reports_unnamed_rejection_without_empty_name() {
+    // {"mcpServers":5} -> top-level container malformed -> unnamed InvalidShape rejection.
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: None,
+        issue: newt_core::mcp::McpImportIssue::InvalidShape,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        true,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    // The shape rejection is named; never an empty name before the reason.
+    assert!(err.contains("the MCP server list"), "{err}");
+    assert!(err.contains("an invalid entry shape"), "{err}");
+    assert!(!err.contains(r#""""#), "{err}");
+}
+
+#[test]
 fn import_flags_stdio_command_that_resolves_to_nothing() {
     let dirs = [PathBuf::from("/bin")];
     let has = |p: &Path| {

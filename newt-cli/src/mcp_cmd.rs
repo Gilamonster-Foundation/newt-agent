@@ -918,7 +918,7 @@ fn select_import_entries(
             report
                 .rejected
                 .iter()
-                .filter_map(|r| r.name.as_deref())
+                .map(|r| r.name.as_deref().unwrap_or("the MCP server list"))
                 .zip(report.rejected.iter().map(|r| r.issue.to_string()))
                 .map(|(name, issue)| format!("`{name:?}` ({issue})"))
                 .collect::<Vec<_>>()
