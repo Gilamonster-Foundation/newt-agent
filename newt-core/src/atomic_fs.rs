@@ -230,7 +230,7 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
     let encoded = owner.encode();
     let mut denied = false;
     for _ in 0..LOCK_RETRIES {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         LOCK_ATTEMPTS.with(|count| count.set(count.get() + 1));
         match publish_lock(lock_path, &encoded) {
             Ok(()) => {

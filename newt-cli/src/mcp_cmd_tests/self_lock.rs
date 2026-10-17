@@ -9,19 +9,51 @@
 
 use super::*;
 
+/// Pins every input the import's target selection reads: `NEWT_CONFIG`,
+/// `NEWT_CONFIG_DIR`, `HOME` and the working directory. Restores them on
+/// drop, so a failing assertion cannot leak them into a later test.
+struct Sandbox {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    cwd: std::path::PathBuf,
+}
+
+impl Sandbox {
+    fn new(home: &std::path::Path) -> Self {
+        let keys = ["NEWT_CONFIG", "NEWT_CONFIG_DIR", "HOME"];
+        let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::remove_var("NEWT_CONFIG");
+        std::env::set_var("NEWT_CONFIG_DIR", home);
+        std::env::set_var("HOME", home);
+        std::env::set_current_dir(home).unwrap();
+        Self { saved, cwd }
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.cwd);
+        for (key, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// Count `acquire_lock` attempts around the consult path. Import takes two
 /// transaction locks (`mcp.toml` + `config.toml`) then must NOT attempt to
 /// re-acquire either one while resolving namespace sanitization or the net
 /// grant.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(real_fs)]
 fn import_consults_configs_without_reacquiring_held_locks() {
     // A real config with an inline backend so resolve() does not synthesize
     // the localhost fallback and actually read the file.
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
-    // Point NEWT_CONFIG_DIR at our temp dir so user_config_dir() resolves here.
-    std::env::set_var("NEWT_CONFIG_DIR", home);
+    let _sandbox = Sandbox::new(home);
 
     std::fs::create_dir_all(home.join("backends")).unwrap();
     std::fs::write(
@@ -69,10 +101,12 @@ fn import_consults_configs_without_reacquiring_held_locks() {
     let output = String::from_utf8_lossy(sink.get_ref()).to_string();
 
     result.expect("import must succeed");
-    // The fix means the consult path never tried to re-acquire a held lock.
+    // The whole import takes exactly its two transaction locks (`mcp.toml`
+    // and `config.toml`), each on the first attempt. A consult that re-locked
+    // a held config would add its full retry budget on top.
     assert_eq!(
         newt_core::atomic_fs::lock_attempts_for_test(),
-        0,
+        2,
         "import consulted configs without re-acquiring held locks"
     );
     assert!(
@@ -90,11 +124,11 @@ fn import_consults_configs_without_reacquiring_held_locks() {
 /// importing into a config that still carried old `[tenacity]` labels committed
 /// them verbatim.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(real_fs)]
 fn import_snapshot_migrates_old_psyche_labels_under_held_lock() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
-    std::env::set_var("NEWT_CONFIG_DIR", home);
+    let _sandbox = Sandbox::new(home);
 
     std::fs::create_dir_all(home.join("backends")).unwrap();
     std::fs::write(

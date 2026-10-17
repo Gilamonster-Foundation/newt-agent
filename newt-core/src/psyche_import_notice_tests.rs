@@ -222,32 +222,34 @@ fn lock_contention_warning_fires_once_per_process_not_once_per_attempt() {
     );
 }
 
-/// The fix keeps the lock guard alive until AFTER read_migrating finishes, so
-/// a reader that took the lock itself still holds it throughout the migration.
-/// RED before the fix: the guard was dropped when the match arm ended, before
-/// read_migrating ran — a normal reader migrated the file with no lock held.
+/// The fix keeps the reader's OWN lock guard alive until AFTER
+/// read_migrating finishes, so the migration runs under the lock the reader
+/// took. RED before the fix: the guard dropped when its match arm ended, so
+/// the lock sidecar was already gone when the migration notice fired.
 ///
-/// This test holds the lock of its own and asserts the read observes that lock
-/// during migration (count attempts; no sleeps). If the guard had been dropped
-/// at the match arm, this read would re-acquire the lock silently — the guard
-/// being observed here is exactly the thing the assertion proves.
+/// No external guard is passed (`&[]`): the reader must take its own lock,
+/// which is the branch the fix changed. The report callback runs during the
+/// migration, so it observes whether the sidecar still exists then.
 #[test]
-fn held_lock_is_observed_while_migrating() {
+fn reader_owned_lock_is_held_while_migrating() {
     let _zero_delay = crate::atomic_fs::set_lock_retry_delay_for_test(std::time::Duration::ZERO);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     std::fs::write(&path, OLD).unwrap();
-    let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
-    // This caller holds the destination's lock for the whole read (the test's
-    // doc above): it passes that guard as `held_locks`, so the read observes
-    // it instead of re-acquiring and reporting contention.
-    let caller_guard = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
-    let mut notices = Vec::new();
-    read_config_file(&path, true, &[&caller_guard], &mut |n| notices.push(n)).unwrap();
-    assert!(
-        !notices
-            .iter()
-            .any(|n| n.text.contains("cannot lock config")),
-        "a held lock must be observed during migration, not re-acquired; notices: {notices:?}"
+    let lock = crate::atomic_fs::ResolvedPath::resolve(&path)
+        .unwrap()
+        .lock_path();
+    let mut held_during_migration = None;
+    read_config_file(&path, true, &[], &mut |n| {
+        if n.text.contains("migrat") || n.text.contains("translated") {
+            held_during_migration = Some(lock.exists());
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        held_during_migration,
+        Some(true),
+        "the migration notice must fire while the reader's lock is held"
     );
+    assert!(!lock.exists(), "the lock is released after the read");
 }
