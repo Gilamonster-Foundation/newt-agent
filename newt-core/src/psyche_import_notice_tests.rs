@@ -79,6 +79,10 @@ fn migration_notice_values_cover_read_revalidation_and_write_outcomes() {
             "write" => {
                 assert!(message.contains("write sentinel"), "{message}");
                 assert!(message.contains("write did not complete"), "{message}");
+                assert!(
+                    message.contains("config changes from this command were not saved"),
+                    "{message}"
+                );
                 assert!(!message.contains("migrated config"), "{message}");
             }
             _ => unreachable!(),
@@ -139,12 +143,15 @@ fn migration_notice_initial_read_error_never_runs_the_writer() {
 
 /// Grounds the lock-only warning fallback when there is no translation to
 /// supply a report. Real destination locks preserve both current bytes and the
-/// primary read error; neither outcome may silently disappear.
+/// primary read error; neither outcome may silently disappear. The warning no
+/// longer claims "changes were not saved" when no migration was pending.
 #[test]
 #[serial_test::serial(lock_contention_notice)]
 fn migration_lock_failure_reports_nonmigrating_and_unreadable_originals() {
     for missing in [false, true] {
         crate::psyche_import::reset_lock_contention_warned_for_test();
+        let _zero_delay =
+            crate::atomic_fs::set_lock_retry_delay_for_test(std::time::Duration::ZERO);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let current = "# current operator bytes\n";
@@ -154,7 +161,7 @@ fn migration_lock_failure_reports_nonmigrating_and_unreadable_originals() {
         let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
         let _lock = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
         let mut notices = Vec::new();
-        let result = read_config_file(&path, true, &mut |notice| notices.push(notice));
+        let result = read_config_file(&path, true, &[], &mut |notice| notices.push(notice));
         if missing {
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
             assert!(!path.exists(), "a failed read must not create the file");
@@ -168,8 +175,8 @@ fn migration_lock_failure_reports_nonmigrating_and_unreadable_originals() {
         assert!(message.contains("cannot lock config"), "{message}");
         assert!(message.contains(path.to_str().unwrap()), "{message}");
         assert!(
-            message.contains("config changes from this command were not saved"),
-            "{message}"
+            !message.contains("config changes from this command were not saved"),
+            "no migration means no unsaved-change claim: {message}"
         );
         assert!(!message.contains("migrated config"), "{message}");
         assert!(
@@ -192,6 +199,7 @@ fn migration_lock_failure_reports_nonmigrating_and_unreadable_originals() {
 #[serial_test::serial(lock_contention_notice)]
 fn lock_contention_warning_fires_once_per_process_not_once_per_attempt() {
     crate::psyche_import::reset_lock_contention_warned_for_test();
+    let _zero_delay = crate::atomic_fs::set_lock_retry_delay_for_test(std::time::Duration::ZERO);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     // No old psyche labels here — the ONLY notice either read can produce is
@@ -203,13 +211,45 @@ fn lock_contention_warning_fires_once_per_process_not_once_per_attempt() {
     let _lock = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
 
     let mut first = Vec::new();
-    read_config_file(&path, true, &mut |n| first.push(n)).unwrap();
+    read_config_file(&path, true, &[], &mut |n| first.push(n)).unwrap();
     assert_eq!(first.len(), 1, "first attempt reports the contention");
 
     let mut second = Vec::new();
-    read_config_file(&path, true, &mut |n| second.push(n)).unwrap();
+    read_config_file(&path, true, &[], &mut |n| second.push(n)).unwrap();
     assert!(
         second.is_empty(),
         "a second attempt in the same process must not repeat the warning: {second:?}"
     );
+}
+
+/// The fix keeps the reader's OWN lock guard alive until AFTER
+/// read_migrating finishes, so the migration runs under the lock the reader
+/// took. RED before the fix: the guard dropped when its match arm ended, so
+/// the lock sidecar was already gone when the migration notice fired.
+///
+/// No external guard is passed (`&[]`): the reader must take its own lock,
+/// which is the branch the fix changed. The report callback runs during the
+/// migration, so it observes whether the sidecar still exists then.
+#[test]
+fn reader_owned_lock_is_held_while_migrating() {
+    let _zero_delay = crate::atomic_fs::set_lock_retry_delay_for_test(std::time::Duration::ZERO);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, OLD).unwrap();
+    let lock = crate::atomic_fs::ResolvedPath::resolve(&path)
+        .unwrap()
+        .lock_path();
+    let mut held_during_migration = None;
+    read_config_file(&path, true, &[], &mut |n| {
+        if n.text.contains("migrat") || n.text.contains("translated") {
+            held_during_migration = Some(lock.exists());
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        held_during_migration,
+        Some(true),
+        "the migration notice must fire while the reader's lock is held"
+    );
+    assert!(!lock.exists(), "the lock is released after the read");
 }

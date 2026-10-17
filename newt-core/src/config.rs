@@ -1409,23 +1409,39 @@ impl Default for Config {
 impl Config {
     /// Load configuration from an explicit file path.
     pub fn load(path: &Path, report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Result<Self> {
-        let text = Self::read_text(path, report)?;
+        Self::load_with_held_locks(path, &[], report)
+    }
+
+    /// Load configuration while respecting locks the caller already holds.
+    ///
+    /// This is the path for multi-file transactions (for example, MCP import)
+    /// that have already locked the consulted configs and must re-read them
+    /// without self-contention.
+    pub fn load_with_held_locks(
+        path: &Path,
+        held_locks: &[&crate::atomic_fs::LockGuard],
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<Self> {
+        let text = Self::read_text_with_held_locks(path, held_locks, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
     /// Read a config file's text for decoding: the ONE file-read chokepoint
-    /// ([`Self::load`] and every layered path through `load_value`). It runs
-    /// the psyche importer first, so a pre-split `[tenacity]` table reaches
+    /// ([`Self::load`] and every layered path through `load_value_with_held_locks`).
+    /// It runs the psyche importer first, so a pre-split `[tenacity]` table reaches
     /// the typed decode as `[initiative]`. Only the operator's own config
     /// (under [`Self::user_config_dir`]) is rewritten on disk; a project,
     /// ambient, `/etc` or explicitly named file is shared or untrusted, so it
     /// is translated in memory with a warning.
-    fn read_text(
+    fn read_text_with_held_locks(
         path: &Path,
+        held_locks: &[&crate::atomic_fs::LockGuard],
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<String> {
         let own = Self::user_config_dir().is_some_and(|dir| path.starts_with(dir));
-        Ok(crate::psyche_import::read_config_file(path, own, report)?)
+        Ok(crate::psyche_import::read_config_file(
+            path, own, held_locks, report,
+        )?)
     }
 
     /// Resolve configuration by searching well-known locations, then layering a
@@ -1506,6 +1522,19 @@ impl Config {
     pub fn resolve_runtime_unpublished(
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<ResolvedConfig> {
+        Self::resolve_runtime_unpublished_with_held_locks(report, &[])
+    }
+
+    /// [`Self::resolve_runtime_unpublished`] while respecting locks the caller
+    /// already holds, so re-reading a held base or project config does not
+    /// self-contend. Used by multi-file transactions such as MCP import.
+    ///
+    /// # Errors
+    /// Any config-load error `resolve` itself would surface.
+    pub fn resolve_runtime_unpublished_with_held_locks(
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+        held_locks: &[&crate::atomic_fs::LockGuard],
+    ) -> Result<ResolvedConfig> {
         let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
@@ -1532,13 +1561,13 @@ impl Config {
                     // the base vector the convergence audit surfaced. A
                     // `$NEWT_CONFIG`-pinned / user-home / `/etc` base is
                     // operator-explicit (Trusted) and loaded verbatim.
-                    let mut base_val = Self::load_value(p, report)?;
+                    let mut base_val = Self::load_value_with_held_locks(p, held_locks, report)?;
                     strip_control_plane(&mut base_val);
                     base_val
                         .try_into()
                         .map_err(|e| NewtError::Config(e.to_string()))?
                 } else {
-                    Self::load(p, report)?
+                    Self::load_with_held_locks(p, held_locks, report)?
                 }
             }
             (None, None) => Self::default(),
@@ -1546,7 +1575,7 @@ impl Config {
             // config when there is no base file).
             (base, Some(proj)) => {
                 let mut merged = match base {
-                    Some(p) => Self::load_value(p, report)?,
+                    Some(p) => Self::load_value_with_held_locks(p, held_locks, report)?,
                     None => toml::Value::try_from(Self::default())
                         .map_err(|e| NewtError::Config(e.to_string()))?,
                 };
@@ -1556,7 +1585,7 @@ impl Config {
                 if base_ambient {
                     strip_control_plane(&mut merged);
                 }
-                let project_val = Self::load_value(proj, report)?;
+                let project_val = Self::load_value_with_held_locks(proj, held_locks, report)?;
                 // The merge strategy is itself config: the project declares how
                 // it wants to be merged (`[merge] arrays = ...`), else the global
                 // config's setting, else the built-in default (Replace).
@@ -1877,12 +1906,14 @@ impl Config {
         }
     }
 
-    /// Load a config file as a raw `toml::Value` (for layered merging).
-    fn load_value(
+    /// Load a config file as a raw `toml::Value`, respecting locks the caller
+    /// already holds so re-reading a held config does not self-contend.
+    fn load_value_with_held_locks(
         path: &Path,
+        held_locks: &[&crate::atomic_fs::LockGuard],
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<toml::Value> {
-        let text = Self::read_text(path, report)?;
+        let text = Self::read_text_with_held_locks(path, held_locks, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
