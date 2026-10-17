@@ -2311,27 +2311,32 @@ const PROJECT_ENDPOINT_DROPIN_DIRS: &[&str] = &["backends", "dgx"];
 
 /// Warn when the project's `.newt/` carries endpoint drop-ins, so a repo that
 /// relied on them learns they are ignored instead of silently losing them.
+/// Each dir is found on its own walk, so a repo cannot dodge the warning by
+/// omitting `.newt/config.toml`; the path is neutralised before display, since
+/// a repo controls the directory names in it.
 fn report_ignored_project_endpoint_dropins(report: &mut dyn FnMut(crate::tty::Notice<'static>)) {
-    let Some(newt_dir) =
-        Config::project_config_path().and_then(|p| p.parent().map(Path::to_path_buf))
-    else {
+    let Ok(cwd) = std::env::current_dir() else {
         return;
     };
+    let home = home_dir();
     for kind in PROJECT_ENDPOINT_DROPIN_DIRS {
-        let dir = newt_dir.join(kind);
+        let Some(dir) = layering::find_project_dir_from(&cwd, home.as_deref(), kind) else {
+            continue;
+        };
         let has_toml = std::fs::read_dir(&dir).is_ok_and(|entries| {
             entries
                 .flatten()
                 .any(|e| e.path().extension().is_some_and(|x| x == "toml"))
         });
         if has_toml {
+            let shown = dir.display().to_string();
             report(crate::tty::Notice::new(
                 crate::tty::Level::Warn,
                 "",
                 format!(
                     "newt: warning: ignoring {}: a project cannot supply inference endpoints; \
                      move a file you trust to ~/.newt/{kind}/",
-                    dir.display()
+                    crate::notes_scan::neutralize_for_display(&shown)
                 ),
             ));
         }

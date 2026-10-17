@@ -242,23 +242,15 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every `<dir>/backends/` directory [`Config::resolve`]'s merge reads, home
-/// before project (the same precedence), returned once each even if the
-/// project config happens to resolve to the same directory as home.
+/// The `backends/` directory [`Config::resolve`]'s merge reads: the
+/// operator's only. A project's `.newt/backends/` is never merged, so doctor
+/// must not parse or probe it either (it would authenticate to a
+/// repo-chosen endpoint with the operator's credentials).
 fn backend_dropin_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) = Config::user_config_dir() {
-        dirs.push(dir.join("backends"));
-    }
-    if let Some(proj) = Config::project_config_path() {
-        if let Some(parent) = proj.parent() {
-            let dir = parent.join("backends");
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
-        }
-    }
-    dirs
+    Config::user_config_dir()
+        .map(|dir| dir.join("backends"))
+        .into_iter()
+        .collect()
 }
 
 /// `newt doctor`'s file-level backend drop-in diagnostics (#1951): parseable,

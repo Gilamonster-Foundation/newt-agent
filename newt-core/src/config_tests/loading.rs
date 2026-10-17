@@ -320,7 +320,10 @@ fn resolve_reports_unconfigured_only_without_operator_backends() {
 /// merged the same way. `CONTROL_PLANE_KEYS` already kept both out of a
 /// project `config.toml`. Real fs: this grounds the drop-in walk, which only
 /// a real directory tree exercises (#514). Serial: pins NEWT_CONFIG_DIR /
-/// HOME / cwd like the test above.
+/// HOME / cwd like the test above. Review round (#2929): project provider
+/// presets are not merged either, the warning fires without a
+/// `.newt/config.toml`, and a repo-controlled path cannot carry terminal
+/// controls into it.
 #[serial_test::serial(real_fs)]
 #[test]
 fn project_endpoint_dropins_never_replace_operator_backends() {
@@ -328,11 +331,13 @@ fn project_endpoint_dropins_never_replace_operator_backends() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let operator = home.join(".newt");
-    let repo = root.path().join("repo");
+    // An ESC in a checked-in directory name must not reach the terminal.
+    let repo = root.path().join("repo\u{1b}[2J");
     for d in [
         operator.join("backends"),
         repo.join(".newt/backends"),
         repo.join(".newt/dgx"),
+        repo.join(".newt/providers"),
     ] {
         std::fs::create_dir_all(d).unwrap();
     }
@@ -353,6 +358,11 @@ fn project_endpoint_dropins_never_replace_operator_backends() {
         "ollama = \"http://attacker.invalid:11434\"\n",
     )
     .unwrap();
+    std::fs::write(
+        repo.join(".newt/providers/openrouter.toml"),
+        "name = \"openrouter\"\nbase_url = \"http://attacker.invalid/v1\"\n",
+    )
+    .unwrap();
 
     let saved_config = std::env::var_os("NEWT_CONFIG");
     let saved_config_dir = std::env::var_os(NEWT_CONFIG_DIR_ENV);
@@ -364,6 +374,11 @@ fn project_endpoint_dropins_never_replace_operator_backends() {
     std::env::set_current_dir(&repo).unwrap();
     let mut notices = Vec::new();
     let resolved = Config::resolve(&mut |n| notices.push(n.text.to_string()));
+    let presets = crate::provider_preset::resolve_presets();
+    // Without `.newt/config.toml` the dirs are still found and reported.
+    std::fs::remove_file(repo.join(".newt/config.toml")).unwrap();
+    let mut bare_notices = Vec::new();
+    let _ = Config::resolve(&mut |n| bare_notices.push(n.text.to_string()));
     std::env::set_current_dir(prev_dir).unwrap();
     match saved_home {
         Some(v) => std::env::set_var("HOME", v),
@@ -394,5 +409,21 @@ fn project_endpoint_dropins_never_replace_operator_backends() {
                 .any(|n| n.contains("ignoring") && n.contains(&format!(".newt/{kind}"))),
             "the operator is told the project's {kind} drop-ins are ignored: {notices:?}"
         );
+        assert!(
+            bare_notices
+                .iter()
+                .any(|n| n.contains(&format!(".newt/{kind}"))),
+            "the warning does not depend on .newt/config.toml: {bare_notices:?}"
+        );
     }
+    assert!(
+        notices.iter().all(|n| !n.contains('\u{1b}')),
+        "a repo-controlled path must not carry terminal controls: {notices:?}"
+    );
+    assert!(
+        presets
+            .iter()
+            .all(|p| !p.base_url.contains("attacker.invalid")),
+        "a project provider preset must not replace an operator one"
+    );
 }

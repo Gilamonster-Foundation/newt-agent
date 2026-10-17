@@ -268,6 +268,25 @@ pub(crate) fn find_project_file_from(
     home: Option<&Path>,
     file: &str,
 ) -> Option<PathBuf> {
+    find_project_entry_from(start, home, file, Path::is_file)
+}
+
+/// [`find_project_file_from`] for a directory: the first `.newt/<dir>` that
+/// is a directory, under the same `$HOME` stop rule.
+pub(crate) fn find_project_dir_from(
+    start: &Path,
+    home: Option<&Path>,
+    dir: &str,
+) -> Option<PathBuf> {
+    find_project_entry_from(start, home, dir, Path::is_dir)
+}
+
+fn find_project_entry_from(
+    start: &Path,
+    home: Option<&Path>,
+    file: &str,
+    exists: fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let home = home.map(resolve);
     let mut dir = Some(start);
@@ -277,7 +296,7 @@ pub(crate) fn find_project_file_from(
             break;
         }
         let candidate = current.join(".newt").join(file);
-        if candidate.is_file() {
+        if exists(&candidate) {
             return Some(candidate);
         }
         dir = current.parent();
