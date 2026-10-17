@@ -177,6 +177,17 @@ pub(super) struct AttributionEpoch<'a> {
     finished: bool,
 }
 
+/// The model to credit for a round: the one the backend says served it, or
+/// the requested model when the reply names none. A router (for example
+/// `openrouter/auto`) answers with a different model than was asked for, and
+/// a commit byline must name the model that did the work.
+pub(super) fn served_or_requested<'a>(served: Option<&'a str>, requested: &'a str) -> &'a str {
+    served
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(requested)
+}
+
 impl<'a> AttributionEpoch<'a> {
     pub(super) fn new(
         attribution: Option<&'a std::cell::RefCell<crate::attribution::AttributionLedger>>,

@@ -2615,6 +2615,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // single prompt, output = sum — Step 18.1) and anchor the context-size
         // tracker on the backend-reported prompt size of this dispatch.
         let round_usage = ollama_usage(&json);
+        // The model that actually answered this round, so commit credit names it
+        // (a router such as `openrouter/auto` serves a different one).
+        let round_model =
+            attribution::served_or_requested(json["model"].as_str(), model).to_owned();
         if let Some(prompt_tokens) = json["prompt_eval_count"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -3614,7 +3618,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             let governed_pr = std::sync::OnceLock::new();
             let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
-            let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
+            let attribution_epoch =
+                AttributionEpoch::new(attribution, git_tool, &round_model, name);
             // #727: intercept the read-only budget self-read here. Its answer is
             // dynamic per-turn loop state — the num_ctx input ceiling and the
             // conversation's token estimate — which are in scope in the loop, not
@@ -7808,6 +7813,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // Merge per-round token usage (input = max single prompt, output =
         // sum — Step 18.1) and anchor the context-size tracker.
         let round_usage = openai_usage(&json["usage"]);
+        // The model that actually answered this round, so commit credit names it
+        // (a router such as `openrouter/auto` serves a different one).
+        let round_model =
+            attribution::served_or_requested(json["model"].as_str(), model).to_owned();
         if let Some(prompt_tokens) = json["usage"]["prompt_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -8716,7 +8725,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let governed_pr = std::sync::OnceLock::new();
             let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
-            let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
+            let attribution_epoch =
+                AttributionEpoch::new(attribution, git_tool, &round_model, name);
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // OpenAI-compatible endpoints do not receive `num_ctx`, but a local
             // endpoint's operator-declared window still provides the displayed
@@ -10518,6 +10528,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // Merge per-round token usage (input = max single prompt, output =
         // sum — Step 18.1) and anchor the context-size tracker.
         let round_usage = model_reply.usage;
+        // The model that actually answered this round, so commit credit names it
+        // (a router such as `openrouter/auto` serves a different one).
+        let round_model =
+            attribution::served_or_requested(model_reply.model.as_deref(), model).to_owned();
         if let Some(u) = round_usage {
             compress_state
                 .calibration
@@ -11505,7 +11519,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let governed_pr = std::sync::OnceLock::new();
             let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
-            let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
+            let attribution_epoch =
+                AttributionEpoch::new(attribution, git_tool, &round_model, name);
             // #727: intercept the read-only budget self-read (mirrors the
             // OpenAI path — `num_ctx` never rides this wire either).
             let result = if tools::is_context_remaining_call(name) {
@@ -12966,6 +12981,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // failed / incomplete / non-terminal status, malformed/empty body) is
         // surfaced — never mistaken for a benign empty reply.
         let decoded = crate::responses_wire::decode_response(&json);
+        // The model that actually answered this round, so commit credit names it
+        // (a router such as `openrouter/auto` serves a different one).
+        let round_model =
+            attribution::served_or_requested(json["model"].as_str(), model).to_owned();
         complete_responses_attempt(attempt.as_ref(), &json, &decoded);
         if generation_bounds::output_limited(&json) {
             let usage = crate::responses_wire::decode_usage(&json["usage"]);
@@ -13427,7 +13446,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let governed_pr = std::sync::OnceLock::new();
             let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
-            let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
+            let attribution_epoch =
+                AttributionEpoch::new(attribution, git_tool, &round_model, name);
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // The Responses loop has no PromptTracker, so `used` is the chars/4
             // estimate of the ACTUAL Responses request; num_ctx is normally unset
