@@ -15,9 +15,10 @@ use super::{migrate_config_text, migrate_persona_text, Migration};
 /// sentence per attempt.
 static LOCK_CONTENTION_REPORTED: AtomicBool = AtomicBool::new(false);
 
-/// Reset the once-per-process dedupe. Test-only: the real "once per process"
-/// promise needs a fresh process to observe, but the unit suite runs many
-/// scenarios in one process and each must see its own first occurrence.
+/// Test-only: reset the once-per-process dedupe... gated behind `cfg(test)`
+/// or the `test-util` feature so downstream tests can use it without
+/// shipping it in production builds.
+#[cfg(any(test, feature = "test-util"))]
 pub fn reset_lock_contention_warned_for_test() {
     LOCK_CONTENTION_REPORTED.store(false, Ordering::Relaxed);
 }

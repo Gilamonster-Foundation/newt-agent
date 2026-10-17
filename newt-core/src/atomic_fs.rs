@@ -176,10 +176,15 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Test-only: the lock attempt counter. Gated behind `cfg(test)` or the
+/// `test-util` feature so downstream crates' tests can observe it without
+/// shipping it in production builds.
+#[cfg(any(test, feature = "test-util"))]
 pub fn reset_lock_attempts_for_test() {
     LOCK_ATTEMPTS.with(|count| count.set(0));
 }
 
+#[cfg(any(test, feature = "test-util"))]
 pub fn lock_attempts_for_test() -> usize {
     LOCK_ATTEMPTS.with(std::cell::Cell::get)
 }
