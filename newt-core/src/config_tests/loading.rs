@@ -332,7 +332,10 @@ fn project_endpoint_dropins_never_replace_operator_backends() {
     let home = root.path().join("home");
     let operator = home.join(".newt");
     // An ESC in a checked-in directory name must not reach the terminal.
-    let repo = root.path().join("repo\u{1b}[2J");
+    // Windows forbids control characters in names, so it gets a plain one.
+    let repo = root
+        .path()
+        .join(if cfg!(unix) { "repo\u{1b}[2J" } else { "repo" });
     for d in [
         operator.join("backends"),
         repo.join(".newt/backends"),
@@ -375,8 +378,13 @@ fn project_endpoint_dropins_never_replace_operator_backends() {
     let mut notices = Vec::new();
     let resolved = Config::resolve(&mut |n| notices.push(n.text.to_string()));
     let presets = crate::provider_preset::resolve_presets();
-    // Without `.newt/config.toml` the dirs are still found and reported.
+    // Without `.newt/config.toml` the dirs are still found and reported, and
+    // an empty nested `.newt/<kind>/` does not hide the ancestor's.
     std::fs::remove_file(repo.join(".newt/config.toml")).unwrap();
+    for kind in ["backends", "dgx"] {
+        std::fs::create_dir_all(repo.join("nested/.newt").join(kind)).unwrap();
+    }
+    std::env::set_current_dir(repo.join("nested")).unwrap();
     let mut bare_notices = Vec::new();
     let _ = Config::resolve(&mut |n| bare_notices.push(n.text.to_string()));
     std::env::set_current_dir(prev_dir).unwrap();

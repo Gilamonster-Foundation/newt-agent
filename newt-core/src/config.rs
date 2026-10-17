@@ -2320,25 +2320,30 @@ fn report_ignored_project_endpoint_dropins(report: &mut dyn FnMut(crate::tty::No
     };
     let home = home_dir();
     for kind in PROJECT_ENDPOINT_DROPIN_DIRS {
-        let Some(dir) = layering::find_project_dir_from(&cwd, home.as_deref(), kind) else {
+        // The first ancestor dir that actually holds a drop-in, so an empty
+        // nested `.newt/<kind>/` cannot hide an ancestor's.
+        let Some(dir) =
+            layering::find_project_entry_from(&cwd, home.as_deref(), kind, dir_has_toml)
+        else {
             continue;
         };
-        let has_toml = std::fs::read_dir(&dir).is_ok_and(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.path().extension().is_some_and(|x| x == "toml"))
-        });
-        if has_toml {
-            let shown = dir.display().to_string();
-            report(crate::tty::Notice::new(
-                crate::tty::Level::Warn,
-                "",
-                format!(
-                    "newt: warning: ignoring {}: a project cannot supply inference endpoints; \
-                     move a file you trust to ~/.newt/{kind}/",
-                    crate::notes_scan::neutralize_for_display(&shown)
-                ),
-            ));
-        }
+        let shown = dir.display().to_string();
+        report(crate::tty::Notice::new(
+            crate::tty::Level::Warn,
+            "",
+            format!(
+                "newt: warning: ignoring {}: a project cannot supply inference endpoints; \
+                 move a file you trust to ~/.newt/{kind}/",
+                crate::notes_scan::neutralize_for_display(&shown)
+            ),
+        ));
     }
+}
+
+fn dir_has_toml(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "toml"))
+    })
 }
