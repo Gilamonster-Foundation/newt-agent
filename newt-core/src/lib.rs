@@ -58,6 +58,8 @@ pub mod git_hardening;
 pub mod git_staging;
 pub mod grant_tree;
 pub mod grounding;
+/// Pinned inference (#2927): the sovereign-only policy and its discovery.
+pub mod inference_pin;
 /// The initiative dial: how much the agent looks before acting (split from
 /// [`tenacity`]), with the per-model-family defaults.
 pub mod initiative;
