@@ -21,7 +21,7 @@ fn import_consults_configs_without_reacquiring_held_locks() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     // Point NEWT_CONFIG_DIR at our temp dir so user_config_dir() resolves here.
-    let _home = std::env::set_var("NEWT_CONFIG_DIR", home);
+    std::env::set_var("NEWT_CONFIG_DIR", home);
 
     std::fs::create_dir_all(home.join("backends")).unwrap();
     std::fs::write(
@@ -66,7 +66,7 @@ fn import_consults_configs_without_reacquiring_held_locks() {
         project: false,
     };
     let result = cmd_import(request, &mut sink);
-    let output = String::from_utf8_lossy(&sink.get_ref()).to_string();
+    let output = String::from_utf8_lossy(sink.get_ref()).to_string();
 
     result.expect("import must succeed");
     // The fix means the consult path never tried to re-acquire a held lock.
@@ -74,6 +74,80 @@ fn import_consults_configs_without_reacquiring_held_locks() {
         newt_core::atomic_fs::lock_attempts_for_test(),
         0,
         "import consulted configs without re-acquiring held locks"
+    );
+    assert!(
+        !output.contains("not saved"),
+        "import reported a lock-contention warning: {output}"
+    );
+}
+
+/// `newt mcp import` snapshots the target config under its held lock AND
+/// migrates it, so an imported result never carries un-migrated psyche labels
+/// that the strict parsers would later refuse.
+///
+/// Regression for #2911 step 3: the snapshot read (`target_original`) used raw
+/// `std::fs::read_to_string` — no psyche migration, no held-lock respect — so
+/// importing into a config that still carried old `[tenacity]` labels committed
+/// them verbatim.
+#[test]
+#[serial_test::serial]
+fn import_snapshot_migrates_old_psyche_labels_under_held_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::env::set_var("NEWT_CONFIG_DIR", home);
+
+    std::fs::create_dir_all(home.join("backends")).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "[[backends]]\nname = \"test\"\nendpoint = \"http://127.0.0.1:11434\"\n",
+    )
+    .unwrap();
+
+    // Target mcp.toml carries old psyche labels; the snapshot read must migrate.
+    let mcp_toml = home.join("mcp.toml");
+    std::fs::write(
+        &mcp_toml,
+        "[tenacity]\ndefault = \"standard\"\n[[mcp_servers]]\nname = \"existing\"\n",
+    )
+    .unwrap();
+
+    newt_core::atomic_fs::reset_lock_attempts_for_test();
+    newt_core::psyche_import::reset_lock_contention_warned_for_test();
+
+    let source = dir.path().join("source.json");
+    std::fs::write(
+        &source,
+        "{\n  \"mcpServers\": {\n    \"testsrc\": {\n         \"command\": \"test-cmd\"\n        }\n  }\n}\n",
+    )
+    .unwrap();
+
+    let out = std::io::Cursor::new(Vec::new());
+    let mut sink = out;
+    let request = ImportRequest {
+        path: Some(&source),
+        from_claude: false,
+        from_codex: false,
+        name: Some("testsrc"),
+        all: false,
+        grant_net: false,
+        force: false,
+        merge: false,
+        config_path: None,
+        project: false,
+    };
+    let result = cmd_import(request, &mut sink);
+    let output = String::from_utf8_lossy(sink.get_ref()).to_string();
+
+    result.expect("import must succeed");
+
+    let final_text = std::fs::read_to_string(&mcp_toml).unwrap();
+    assert!(
+        final_text.contains("initiative"),
+        "snapshot read must migrate old psyche labels under the held lock: {final_text}"
+    );
+    assert!(
+        !final_text.contains("tenacity"),
+        "snapshot read must not leave old tenacity labels: {final_text}"
     );
     assert!(
         !output.contains("not saved"),

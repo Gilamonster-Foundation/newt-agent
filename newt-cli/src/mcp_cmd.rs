@@ -1621,6 +1621,14 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
 
     let target_original = read_optional(target_destination.as_path())?;
     let mut doc = target_original.clone().unwrap_or_default();
+    // Step 3 (#2911 review): migrate the snapshot under the held lock BEFORE it
+    // is used, so an imported config carrying old [tenacity] psyche labels is
+    // rewritten to [initiative] and the transaction's own migration isn't later
+    // seen as a concurrent edit that rejects the import. In memory only — the
+    // transaction's final write-back persists the migrated `doc`.
+    if let Some(migration) = newt_core::psyche_import::migrate_config_text(&doc) {
+        doc = migration.text;
+    }
     let existing: std::collections::BTreeSet<String> = newt_core::mcp::parse_newt_mcp_toml(&doc)
         .into_iter()
         .map(|e| e.name)
