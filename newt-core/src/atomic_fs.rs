@@ -165,7 +165,6 @@ impl Drop for LockGuard {
     }
 }
 
-#[cfg(test)]
 thread_local! {
     /// Counts how many times the current `acquire_lock` loop has tried to
     /// publish the lock, so tests can assert retry behavior without timing it.
@@ -177,13 +176,11 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_lock_attempts_for_test() {
+pub fn reset_lock_attempts_for_test() {
     LOCK_ATTEMPTS.with(|count| count.set(0));
 }
 
-#[cfg(test)]
-pub(crate) fn lock_attempts_for_test() -> usize {
+pub fn lock_attempts_for_test() -> usize {
     LOCK_ATTEMPTS.with(std::cell::Cell::get)
 }
 

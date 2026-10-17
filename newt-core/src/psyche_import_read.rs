@@ -18,8 +18,7 @@ static LOCK_CONTENTION_REPORTED: AtomicBool = AtomicBool::new(false);
 /// Reset the once-per-process dedupe. Test-only: the real "once per process"
 /// promise needs a fresh process to observe, but the unit suite runs many
 /// scenarios in one process and each must see its own first occurrence.
-#[cfg(test)]
-pub(crate) fn reset_lock_contention_warned_for_test() {
+pub fn reset_lock_contention_warned_for_test() {
     LOCK_CONTENTION_REPORTED.store(false, Ordering::Relaxed);
 }
 
@@ -109,9 +108,7 @@ pub fn read_config_file(
         locked.is_some(),
         |p| std::fs::read_to_string(p),
         |_, text| {
-            let destination = locked
-                .as_ref()
-                .expect("rewrite holds the config lock");
+            let destination = locked.as_ref().expect("rewrite holds the config lock");
             destination.atomic_write(text.as_bytes())
         },
         &mut |notice| {

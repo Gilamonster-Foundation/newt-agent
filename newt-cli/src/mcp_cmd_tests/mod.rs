@@ -54,3 +54,6 @@ mod listing;
 #[cfg(test)]
 #[path = "registration_entry.rs"]
 mod registration_entry;
+#[cfg(test)]
+#[path = "self_lock.rs"]
+mod self_lock;

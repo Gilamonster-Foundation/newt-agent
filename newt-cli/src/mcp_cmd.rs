@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
 use newt_core::atomic_fs::{LockGuard, ResolvedPath};
-use newt_core::config::ArrayMergeStrategy;
+use newt_core::config::{ArrayMergeStrategy, ResolvedConfig};
 use newt_core::mcp::{McpImportParseReport, McpServerEntry, McpTrust, SecretValue, TransportKind};
 use newt_core::mcp_catalog::{
     builtin_catalog, merge_catalog_layers, parse_catalog, McpCatalogEntry,
@@ -964,12 +964,18 @@ fn reject_namespace_collisions<'a>(
 fn import_namespace_sanitization(
     target: &Path,
     strong_explicit_target: bool,
+    held_locks: &[&newt_core::atomic_fs::LockGuard],
 ) -> anyhow::Result<bool> {
     let user_mcp = Config::user_config_dir().map(|dir| dir.join("mcp.toml"));
     let cfg = if user_mcp.as_deref() == Some(target) && !strong_explicit_target {
-        crate::migration_notices::read(|report| Config::resolve(report))?
+        crate::migration_notices::read(|report| {
+            Config::resolve_runtime_unpublished_with_held_locks(report, held_locks)
+                .map(ResolvedConfig::into_config)
+        })?
     } else if target.is_file() {
-        crate::migration_notices::read(|report| Config::load(target, report))?
+        crate::migration_notices::read(|report| {
+            Config::load_with_held_locks(target, held_locks, report)
+        })?
     } else {
         Config::default()
     };
@@ -1142,7 +1148,10 @@ fn imported_http_hosts(entries: &[McpServerEntry]) -> anyhow::Result<Vec<String>
 /// Whether an active walked-up project config structurally replaces the base
 /// MCP array. In that mode no connector written to the user/explicit base can
 /// become effective, regardless of names, so a grant import must fail closed.
-fn project_replaces_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<Option<PathBuf>> {
+fn project_replaces_base_mcp_servers(
+    base: &ResolvedPath,
+    held_locks: &[&newt_core::atomic_fs::LockGuard],
+) -> anyhow::Result<Option<PathBuf>> {
     let Some(project) = Config::project_config_path() else {
         return Ok(None);
     };
@@ -1164,7 +1173,11 @@ fn project_replaces_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<Opti
     let base_strategy = base
         .as_path()
         .is_file()
-        .then(|| crate::migration_notices::read(|report| Config::load(base.as_path(), report)))
+        .then(|| {
+            crate::migration_notices::read(|report| {
+                Config::load_with_held_locks(base.as_path(), held_locks, report)
+            })
+        })
         .transpose()?
         .and_then(|config| config.merge)
         .map(|merge| merge.arrays);
@@ -1177,7 +1190,10 @@ fn project_replaces_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<Opti
     Ok((has_project_mcp_array && replaces).then_some(project))
 }
 
-fn project_appends_to_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<bool> {
+fn project_appends_to_base_mcp_servers(
+    base: &ResolvedPath,
+    held_locks: &[&newt_core::atomic_fs::LockGuard],
+) -> anyhow::Result<bool> {
     let Some(project) = Config::project_config_path() else {
         return Ok(false);
     };
@@ -1202,7 +1218,11 @@ fn project_appends_to_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<bo
     let base_strategy = base
         .as_path()
         .is_file()
-        .then(|| crate::migration_notices::read(|report| Config::load(base.as_path(), report)))
+        .then(|| {
+            crate::migration_notices::read(|report| {
+                Config::load_with_held_locks(base.as_path(), held_locks, report)
+            })
+        })
         .transpose()?
         .and_then(|config| config.merge)
         .map(|merge| merge.arrays);
@@ -1582,7 +1602,8 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         .cleanup_abandoned_stages()
         .with_context(|| format!("cleaning abandoned stages for {}", target.display()))?;
     if request.grant_net {
-        if let Some(project) = project_replaces_base_mcp_servers(&target_destination)? {
+        if let Some(project) = project_replaces_base_mcp_servers(&target_destination, &held_locks)?
+        {
             bail!(
                 "cannot grant MCP network access while project config {} replaces the base mcp_servers array; set [merge] arrays = \"append\", remove the project mcp_servers array, or run outside that project",
                 project.display()
@@ -1590,12 +1611,14 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         }
     }
 
-    let sanitize_names = import_namespace_sanitization(&breakout_target, strong_explicit_target)?;
+    let sanitize_names =
+        import_namespace_sanitization(&breakout_target, strong_explicit_target, &held_locks)?;
     reject_namespace_collisions(
         imported.iter().map(|entry| entry.name.as_str()),
         sanitize_names,
     )?;
     import_target_permissions(&target_destination)?;
+
     let target_original = read_optional(target_destination.as_path())?;
     let mut doc = target_original.clone().unwrap_or_default();
     let existing: std::collections::BTreeSet<String> = newt_core::mcp::parse_newt_mcp_toml(&doc)
@@ -1617,7 +1640,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         };
 
     let project_appends =
-        request.grant_net && project_appends_to_base_mcp_servers(&target_destination)?;
+        request.grant_net && project_appends_to_base_mcp_servers(&target_destination, &held_locks)?;
     let project_path = Config::project_config_path()
         .map(|path| ResolvedPath::resolve(&path))
         .transpose()?;
