@@ -236,7 +236,7 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
             }
             newt_core::mcp::TransportKind::Http => {
                 let url = s.url.clone().unwrap_or_default();
-                let readiness = classify_readiness(s);
+                let readiness = classify_readiness(s, &|v| std::env::var(v).ok());
                 let auth_note = match readiness {
                     McpReadiness::NotAdmitted => {
                         format!(" ({} — cannot connect)", readiness_label(readiness))
@@ -750,7 +750,7 @@ mod tests {
         }
 
         assert_eq!(
-            classify_readiness(&entry(TransportKind::Http, false)),
+            classify_readiness(&entry(TransportKind::Http, false), &|_: &str| None),
             McpReadiness::Configured
         );
         // Step 2 (#2913): a `${...}` reference literal is unresolved at rest —
@@ -781,12 +781,22 @@ mod tests {
             origin: None,
         };
         // TOKEN is unset → missing credential → Configured, not Authenticated.
-        assert_eq!(classify_readiness(&ref_entry), McpReadiness::Configured);
+        assert_eq!(
+            classify_readiness(&ref_entry, &|_: &str| None),
+            McpReadiness::Configured
+        );
         unsafe { std::env::set_var("TOKEN", "resolved-secret") };
-        assert_eq!(classify_readiness(&ref_entry), McpReadiness::Authenticated);
+        assert_eq!(
+            classify_readiness(&ref_entry, &|v| if v == "TOKEN" {
+                Some("resolved-secret".into())
+            } else {
+                None
+            }),
+            McpReadiness::Authenticated
+        );
         unsafe { std::env::remove_var("TOKEN") };
         assert_eq!(
-            classify_readiness(&entry(TransportKind::Http, true)),
+            classify_readiness(&entry(TransportKind::Http, true), &|_: &str| None),
             McpReadiness::Configured
         );
         // Step 2 (#2913): a plaintext bearer header is rejected — it is not a
@@ -814,12 +824,15 @@ mod tests {
             }
         }
         assert_eq!(
-            classify_readiness(&plaintext_entry()),
+            classify_readiness(&plaintext_entry(), &|_: &str| None),
             McpReadiness::Configured
         );
         let mut disabled = entry(TransportKind::Http, true);
         disabled.enabled = false;
-        assert_eq!(classify_readiness(&disabled), McpReadiness::NotAdmitted);
+        assert_eq!(
+            classify_readiness(&disabled, &|_: &str| None),
+            McpReadiness::NotAdmitted
+        );
     }
 
     #[test]
@@ -880,30 +893,34 @@ mod tests {
 
         // Plaintext bearer: rejected by both doctor and auth.
         assert_eq!(
-            classify_readiness(&entry(header("Bearer deadbeef"))),
+            classify_readiness(&entry(header("Bearer deadbeef")), &|_: &str| None),
             McpReadiness::Configured
         );
         // `${...}` reference literal: unresolved at rest, not authenticated.
         assert_eq!(
-            classify_readiness(&entry(header("${TOKEN}"))),
+            classify_readiness(&entry(header("${TOKEN}")), &|_: &str| None),
             McpReadiness::Configured
         );
         // Structured secret reference: counts as configured credential only
         // when the referenced value actually resolves. TOKEN unset → missing
         // credential → Configured; TOKEN set → Authenticated.
         assert_eq!(
-            classify_readiness(&entry(ref_header())),
+            classify_readiness(&entry(ref_header()), &|_: &str| None),
             McpReadiness::Configured
         );
         unsafe { std::env::set_var("TOKEN", "resolved-secret") };
         assert_eq!(
-            classify_readiness(&entry(ref_header())),
+            classify_readiness(&entry(ref_header()), &|v| if v == "TOKEN" {
+                Some("resolved-secret".into())
+            } else {
+                None
+            }),
             McpReadiness::Authenticated
         );
         unsafe { std::env::remove_var("TOKEN") };
         // No header at all: admitted but no credential.
         assert_eq!(
-            classify_readiness(&entry(Default::default())),
+            classify_readiness(&entry(Default::default()), &|_: &str| None),
             McpReadiness::Configured
         );
     }
@@ -933,9 +950,12 @@ mod tests {
         // SSE is admitted (trusted + enabled) but reports Configured — never
         // Authenticated, and never "callable". Doctor's SSE arm renders the
         // unsupported-transport line with no `newt auth` advice.
-        assert_eq!(classify_readiness(&entry), McpReadiness::Configured);
+        assert_eq!(
+            classify_readiness(&entry, &|_: &str| None),
+            McpReadiness::Configured
+        );
         assert_ne!(
-            readiness_label(classify_readiness(&entry)),
+            readiness_label(classify_readiness(&entry, &|_: &str| None)),
             "authenticated",
             "legacy SSE must never be presented as authenticated"
         );
@@ -1012,7 +1032,10 @@ mod tests {
         };
 
         // No Authorization header, but a valid saved OAuth login → Authenticated.
-        assert_eq!(classify_readiness(&entry), McpReadiness::Authenticated);
+        assert_eq!(
+            classify_readiness(&entry, &|_: &str| None),
+            McpReadiness::Authenticated
+        );
 
         unsafe { std::env::remove_var("HOME") };
     }
@@ -1053,7 +1076,135 @@ mod tests {
         // Configuration-only: a `cmd` reference is never resolved during
         // classification, so it stays Configured (not checked) and the command
         // never executes.
-        assert_eq!(classify_readiness(&cmd_entry), McpReadiness::Configured);
+        assert_eq!(
+            classify_readiness(&cmd_entry, &|_: &str| None),
+            McpReadiness::Configured
+        );
+    }
+
+    // Step 1 (#2913): an env var set to whitespace-only is missing → Configured,
+    // via the injected lookup only (no process-global env).
+    #[test]
+    fn mcp_readiness_whitespace_env_value_is_configured_not_authenticated() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, SecretValue, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // WHITESPACE_VAR is set to spaces → missing → Configured.
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [(
+                        "Authorization".into(),
+                        SecretValue::literal("Bearer ${WHITESPACE_VAR}".to_string())
+                    )]
+                    .into_iter()
+                    .collect()
+                ),
+                &|v| if v == "WHITESPACE_VAR" {
+                    Some("   ".into())
+                } else {
+                    None
+                }
+            ),
+            McpReadiness::Configured
+        );
+    }
+
+    // Step 1 (#2913): a `Bearer ${env:VAR}` literal whose var is set → Authenticated.
+    #[test]
+    fn mcp_readiness_env_var_reference_authenticates_when_set() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        let bearer_env =
+            |var: &str| newt_core::mcp::SecretValue::literal(format!("Bearer ${{env:{var}}}"));
+
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [("Authorization".into(), bearer_env("ENV_VAR"))]
+                        .into_iter()
+                        .collect()
+                ),
+                &|v| if v == "ENV_VAR" {
+                    Some("token".into())
+                } else {
+                    None
+                }
+            ),
+            McpReadiness::Authenticated
+        );
+    }
+
+    // Step 1 (#2913): a bare `${VAR}` literal whose whole value is the
+    // reference and whose var is set → Authenticated.
+    #[test]
+    fn mcp_readiness_bare_env_var_authenticates_when_set() {
+        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_tui::{classify_readiness, McpReadiness};
+
+        let entry = |headers| McpServerEntry {
+            name: "h".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers,
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        let bearer_bare = |var: &str| newt_core::mcp::SecretValue::literal(format!("${{{var}}}"));
+
+        assert_eq!(
+            classify_readiness(
+                &entry(
+                    [("Authorization".into(), bearer_bare("BARE_VAR"))]
+                        .into_iter()
+                        .collect()
+                ),
+                &|v| if v == "BARE_VAR" {
+                    Some("token".into())
+                } else {
+                    None
+                }
+            ),
+            McpReadiness::Authenticated
+        );
     }
 
     // Step 2 (#2913): a literal "Bearer ${VAR}" header counts as Authenticated
@@ -1083,25 +1234,33 @@ mod tests {
 
         // VAR unset → unresolved literal → Configured.
         assert_eq!(
-            classify_readiness(&entry(
-                [("Authorization".into(), bearer_ref("BEARER_VAR_UNSET"),)]
-                    .into_iter()
-                    .collect()
-            )),
+            classify_readiness(
+                &entry(
+                    [("Authorization".into(), bearer_ref("BEARER_VAR_UNSET"),)]
+                        .into_iter()
+                        .collect()
+                ),
+                &|_: &str| None
+            ),
             McpReadiness::Configured
         );
 
         // VAR set and non-empty → Authenticated.
-        unsafe { std::env::set_var("BEARER_VAR_SET", "token-value") };
         assert_eq!(
-            classify_readiness(&entry(
-                [("Authorization".into(), bearer_ref("BEARER_VAR_SET"),)]
-                    .into_iter()
-                    .collect()
-            )),
+            classify_readiness(
+                &entry(
+                    [("Authorization".into(), bearer_ref("BEARER_VAR_SET"),)]
+                        .into_iter()
+                        .collect()
+                ),
+                &|v| if v == "BEARER_VAR_SET" {
+                    Some("token-value".into())
+                } else {
+                    None
+                }
+            ),
             McpReadiness::Authenticated
         );
-        unsafe { std::env::remove_var("BEARER_VAR_SET") };
     }
 
     // Step 2 (#2913): an explicit Authorization header decides; a valid saved
@@ -1176,21 +1335,24 @@ mod tests {
 
         // No Authorization header → valid saved OAuth counts as Authenticated.
         assert_eq!(
-            classify_readiness(&entry(Default::default())),
+            classify_readiness(&entry(Default::default()), &|_: &str| None),
             McpReadiness::Authenticated
         );
 
         // An explicit Authorization header is present → saved OAuth is ignored,
         // not OR'd → Configured.
         assert_eq!(
-            classify_readiness(&entry(
-                [(
-                    "Authorization".into(),
-                    newt_core::mcp::SecretValue::literal("Bearer deadbeef"),
-                )]
-                .into_iter()
-                .collect()
-            )),
+            classify_readiness(
+                &entry(
+                    [(
+                        "Authorization".into(),
+                        newt_core::mcp::SecretValue::literal("Bearer deadbeef"),
+                    )]
+                    .into_iter()
+                    .collect()
+                ),
+                &|_: &str| None
+            ),
             McpReadiness::Configured
         );
 

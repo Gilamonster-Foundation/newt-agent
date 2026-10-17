@@ -250,20 +250,30 @@ pub enum McpReadiness {
 
 /// Classify one server's admission + configured-credential state. Pure over
 /// the entry, so import, doctor, `newt auth` and the /mcp panel all agree.
-pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
+///
+/// `env_lookup` resolves env var names to values — production passes
+/// `std::env::var`; tests inject a seam so no process-global env is touched.
+/// Classification is configuration-only: never resolve a secret here (no file
+// reads, no command execution).
+pub fn classify_readiness(
+    entry: &McpServerEntry,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> McpReadiness {
     if newt_core::mcp::admit(entry).is_err() {
         return McpReadiness::NotAdmitted;
     }
     // Classification is configuration-only: never resolve a secret here (no
     // file reads, no command execution). An `env` reference whose variable is
     // set and non-empty counts as a configured credential — confirmed from the
-    // environment alone. `file`/`cmd` references and plaintext/literal headers
-    // stay "configured" — never authenticated here, because confirming them
-    // would require resolving the secret.
+    // injected env lookup alone. `file`/`cmd` references and plaintext/literal
+    // headers stay "configured" — never authenticated here, because confirming
+    // them would require resolving the secret.
     //
-    // A literal "Bearer ${VAR}" header: when VAR is set and non-empty it is a
-    // usable credential; otherwise it is unresolved at rest → Configured. The
-    // interpolation `${...}` is resolved host-side at spawn, not here.
+    // A literal `Bearer ${VAR}`, `Bearer ${env:VAR}`, or a bare `${VAR}` /
+    // `${env:VAR}` whose value is the whole header counts as a usable
+    // credential when the referenced env var is set and non-empty (after
+    // trimming). The interpolation `${...}` is resolved host-side at spawn,
+    // not here.
     //
     // Runtime precedence: an explicit Authorization header decides by itself;
     // saved OAuth applies only when there is NO explicit header — they are not
@@ -275,7 +285,7 @@ pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
 
     let header_credential = has_auth_header
         && entry.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("authorization") && header_is_credential(value)
+            name.eq_ignore_ascii_case("authorization") && header_is_credential(value, env_lookup)
         });
 
     // A valid saved OAuth login (resource- and issuer-bound, unexpired,
@@ -298,32 +308,51 @@ pub fn classify_readiness(entry: &McpServerEntry) -> McpReadiness {
 
 /// Whether an Authorization header value is a usable credential at
 /// classification time:
-/// - a literal `Bearer ${VAR}` whose `VAR` is set and non-empty → credential
+/// - a literal `Bearer ${VAR}` / `Bearer ${env:VAR}` whose var is set and
+///   non-empty → credential
+/// - a bare `${VAR}` / `${env:VAR}` whose value is the whole header → credential
 /// - an `env` SecretRef whose variable is set and non-empty → credential
-/// - everything else (plaintext bearer, `file`/`cmd` refs, unset `${VAR}`) →
-///   not a usable credential here (resolving it would require I/O).
-fn header_is_credential(value: &newt_core::mcp::SecretValue) -> bool {
+/// - everything else (plaintext bearer, `file`/`cmd` refs, unset or
+///   whitespace-only `${VAR}`) → not a usable credential here.
+fn header_is_credential(
+    value: &newt_core::mcp::SecretValue,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> bool {
     match value {
         newt_core::mcp::SecretValue::Literal(s) => {
-            // Only a `Bearer ${VAR}` literal counts as a usable credential — a
-            // bare `${TOKEN}` (no Bearer prefix) is just an interpolation token,
-            // not a bearer credential.
-            let Some(candidate) = s.trim().strip_prefix("Bearer ") else {
-                return false;
-            };
-            let candidate = candidate.trim();
-            candidate.starts_with("${")
-                && candidate.ends_with('}')
-                && candidate[2..candidate.len() - 1]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && std::env::var(&candidate[2..candidate.len() - 1]).is_ok_and(|v| !v.is_empty())
+            let candidate = s.trim().strip_prefix("Bearer ").unwrap_or_else(|| s.trim());
+            let var_name = env_var_name_from_reference(candidate);
+            var_name.is_some_and(|var| env_lookup(var).is_some_and(|v| !v.trim().is_empty()))
         }
         newt_core::mcp::SecretValue::Ref(r) => r
             .env
             .as_deref()
-            .is_some_and(|var| std::env::var(var).is_ok_and(|v| !v.is_empty())),
+            .is_some_and(|var| env_lookup(var).is_some_and(|v| !v.trim().is_empty())),
     }
+}
+
+/// Extract the env var name from a value that is entirely an env reference:
+/// `${VAR}` (bare identifier) or `${env:VAR}`. Returns None for file/cmd
+/// references, unrecognized tokens, or anything with literal text around it.
+/// Mirrors `newt_core::mcp::classify_token`'s env recognition.
+fn env_var_name_from_reference(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix("${")?.strip_suffix('}')?;
+    match inner.split_once(':') {
+        Some(("env", name)) => Some(name),
+        None if is_env_identifier(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// Whether `s` is a valid bare env-var identifier for `${NAME}`:
+/// `^[A-Za-z_][A-Za-z0-9_]*$`. Same rule as `newt_core::mcp::is_env_identifier`.
+fn is_env_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[must_use]

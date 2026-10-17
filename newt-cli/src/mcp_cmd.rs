@@ -297,7 +297,7 @@ pub(crate) fn print_next_steps(
     }
     // Per-server, same classification every surface agrees on.
     for entry in adopted {
-        match classify_readiness(entry) {
+        match classify_readiness(entry, &|v| std::env::var(v).ok()) {
             McpReadiness::NotAdmitted => {
                 let denied = newt_core::mcp::admit(entry)
                     .expect_err("classified NotAdmitted implies admission denied");
