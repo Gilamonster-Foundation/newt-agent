@@ -167,6 +167,39 @@ fn import_selection_never_silently_discards_rejected_entries() {
 }
 
 #[test]
+fn import_rejected_name_via_name_flag_never_passes_malicious_key_verbatim() {
+    // A malicious rejected key passed through --name must never be echoed raw.
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad\n  newt mcp import --from-claude --name x\n\u{1b}[31m".into()),
+        issue: newt_core::mcp::McpImportIssue::UnknownField,
+    };
+    let report = McpImportParseReport {
+        entries: vec![],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        Some("bad\n  newt mcp import --from-claude --name x\n\u{1b}[31m"),
+        false,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    // No raw ESC byte in output.
+    assert!(!err.contains('\u{1b}'), "{err}");
+    // No standalone "newt mcp import" line injected via the malicious key.
+    for line in err.lines() {
+        if line.contains("newt mcp import") {
+            assert!(
+                line.contains("\\n") || line.contains("\\u{1b}"),
+                "unexpected import line: {line:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn import_without_selector_lists_names_as_commands() {
     let report = McpImportParseReport {
         entries: vec![
@@ -211,6 +244,157 @@ fn import_listing_never_renders_untrusted_names_as_commands() {
         err.contains(r#""x; rm -rf ~""#) && err.contains(r#""\u{1b}[31m""#),
         "{err}"
     );
+}
+
+#[test]
+fn import_chooser_names_each_rejection_with_safe_reason_and_no_value() {
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad-server".into()),
+        issue: newt_core::mcp::McpImportIssue::UnknownField,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        false,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    // Every rejection is named with a safe reason.
+    assert!(err.contains("bad-server"), "{err}");
+    assert!(err.contains("unsupported fields"), "{err}");
+    // No source values or secrets are echoed.
+    assert!(!err.contains("plaintext"), "{err}");
+    assert!(!err.contains("secret"), "{err}");
+}
+
+#[test]
+fn import_chooser_gives_rejected_entry_no_runnable_command() {
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad-server".into()),
+        issue: newt_core::mcp::McpImportIssue::InvalidShape,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        false,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("newt mcp import --from-claude --name valid-server"),
+        "{err}"
+    );
+    // The rejected entry gets no runnable command.
+    assert!(!err.contains("--name bad-server"), "{err}");
+}
+
+#[test]
+fn import_chooser_escapes_rejected_names_with_control_chars() {
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad\n  newt mcp import --from-claude --name x\n\u{1b}[31m".into()),
+        issue: newt_core::mcp::McpImportIssue::UnknownField,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        false,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    // Real suggestion exists for the valid entry.
+    assert!(
+        err.contains("newt mcp import --from-claude --name valid-server"),
+        "{err}"
+    );
+    // No output line starts with "newt mcp import" except real suggestions.
+    for line in err.lines() {
+        if line.starts_with("newt mcp import") {
+            assert!(
+                line.contains("valid-server"),
+                "unexpected import line: {line:?}"
+            );
+        }
+    }
+    // No raw ESC byte in output.
+    assert!(!err.contains('\u{1b}'), "{err}");
+    // Rejected name is rendered as one escaped token (Debug escapes controls).
+    assert!(err.contains("\\n"), "{err}");
+    assert!(err.contains("\\u{1b}"), "{err}");
+}
+
+#[test]
+fn import_all_names_each_rejection_and_refuses() {
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: Some("bad-server".into()),
+        issue: newt_core::mcp::McpImportIssue::UnsupportedSemantics,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        true,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("bad-server"), "{err}");
+    assert!(
+        err.contains("unsupported or ambiguous transport semantics"),
+        "{err}"
+    );
+}
+
+#[test]
+fn import_all_reports_unnamed_rejection_without_empty_name() {
+    // {"mcpServers":5} -> top-level container malformed -> unnamed InvalidShape rejection.
+    let valid = stdio_entry("valid-server", Some("mcp-server"));
+    let rejected = newt_core::mcp::McpImportRejection {
+        name: None,
+        issue: newt_core::mcp::McpImportIssue::InvalidShape,
+    };
+    let report = McpImportParseReport {
+        entries: vec![valid],
+        rejected: vec![rejected],
+    };
+    let err = select_import_entries(
+        report,
+        None,
+        true,
+        Path::new("source.json"),
+        "--from-claude",
+    )
+    .unwrap_err()
+    .to_string();
+    // The shape rejection is named; never an empty name before the reason.
+    assert!(err.contains("the MCP server list"), "{err}");
+    assert!(err.contains("an invalid entry shape"), "{err}");
+    assert!(!err.contains(r#""""#), "{err}");
 }
 
 #[test]

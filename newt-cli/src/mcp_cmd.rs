@@ -871,20 +871,19 @@ fn select_import_entries(
             .find(|rejected| rejected.name.as_deref() == Some(name))
         {
             bail!(
-                "MCP server `{name}` cannot be imported because it has {}; update the source entry before importing",
+                "MCP server `{name:?}` cannot be imported because it has {}; update the source entry before importing",
                 rejected.issue
             );
         }
         return Err(anyhow!(
-            "no MCP server named `{name}` in {}",
+            "no MCP server named `{name:?}` in {}",
             source.display()
         ));
     }
     if !all {
         let mut names: Vec<&str> = report.entries.iter().map(|e| e.name.as_str()).collect();
-        names.extend(report.rejected.iter().filter_map(|r| r.name.as_deref()));
         names.sort_unstable();
-        if names.is_empty() {
+        if names.is_empty() && report.rejected.is_empty() {
             bail!("no MCP servers found in {}", source.display());
         }
         let (good, bad): (Vec<&str>, Vec<&str>) = names
@@ -901,14 +900,29 @@ fn select_import_entries(
                 msg.push_str(&format!("\n  {n:?}"));
             }
         }
+        if !report.rejected.is_empty() {
+            msg.push_str("\nthese servers were rejected and cannot be imported:");
+            for r in &report.rejected {
+                match &r.name {
+                    Some(n) => msg.push_str(&format!("\n  {n:?}: {}", r.issue)),
+                    None => msg.push_str(&format!("\n  <unmatched source entry>: {}", r.issue)),
+                }
+            }
+        }
         msg.push_str("\nor import every server with --all");
         bail!("{msg}");
     }
     if !report.rejected.is_empty() {
-        let count = report.rejected.len();
         bail!(
-            "cannot import all MCP servers: {count} source {} cannot be preserved safely; fix the source or select one valid entry with --name",
-            if count == 1 { "entry" } else { "entries" }
+            "cannot import all MCP servers: {} cannot be preserved safely; fix the source or select one valid entry with --name",
+            report
+                .rejected
+                .iter()
+                .map(|r| r.name.as_deref().unwrap_or("the MCP server list"))
+                .zip(report.rejected.iter().map(|r| r.issue.to_string()))
+                .map(|(name, issue)| format!("`{name:?}` ({issue})"))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
     }
     Ok(report.entries)
