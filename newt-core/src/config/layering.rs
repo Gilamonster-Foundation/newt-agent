@@ -136,14 +136,36 @@ pub(crate) const CONTROL_PLANE_KEYS: &[&str] = &[
     "tui",
 ];
 
-/// Remove every [`CONTROL_PLANE_KEYS`] entry from an untrusted config table in
-/// place, at the `toml::Value` layer — *before* `try_into::<Config>()`, so a
-/// stripped key fails closed to the trusted base's value (or the built-in
-/// default), never the attacker's. A no-op on a non-table value.
+/// Control-plane keys nested inside an otherwise benign table, as key paths.
+/// `[context]` stays project-tunable, but `embeddings_endpoint` is a URL that
+/// receives indexed source text and search queries (exfil, like `backends`).
+pub(crate) const CONTROL_PLANE_PATHS: &[&[&str]] =
+    &[&["context", "semantic", "embeddings_endpoint"]];
+
+/// Remove every [`CONTROL_PLANE_KEYS`] and [`CONTROL_PLANE_PATHS`] entry from
+/// an untrusted config table in place, at the `toml::Value` layer — *before*
+/// `try_into::<Config>()`, so a stripped key fails closed to the trusted
+/// base's value (or the built-in default), never the attacker's. A no-op on a
+/// non-table value.
 pub(crate) fn strip_control_plane(value: &mut toml::Value) {
-    if let Some(table) = value.as_table_mut() {
-        for key in CONTROL_PLANE_KEYS {
-            table.remove(*key);
+    let Some(table) = value.as_table_mut() else {
+        return;
+    };
+    for key in CONTROL_PLANE_KEYS {
+        table.remove(*key);
+    }
+    for path in CONTROL_PLANE_PATHS {
+        let Some((leaf, parents)) = path.split_last() else {
+            continue;
+        };
+        let mut node = Some(&mut *table);
+        for key in parents {
+            node = node
+                .and_then(|t| t.get_mut(*key))
+                .and_then(toml::Value::as_table_mut);
+        }
+        if let Some(t) = node {
+            t.remove(*leaf);
         }
     }
 }
