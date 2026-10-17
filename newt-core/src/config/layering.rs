@@ -136,15 +136,52 @@ pub(crate) const CONTROL_PLANE_KEYS: &[&str] = &[
     "tui",
 ];
 
-/// Remove every [`CONTROL_PLANE_KEYS`] entry from an untrusted config table in
-/// place, at the `toml::Value` layer — *before* `try_into::<Config>()`, so a
-/// stripped key fails closed to the trusted base's value (or the built-in
-/// default), never the attacker's. A no-op on a non-table value.
+/// Control-plane keys nested inside an otherwise benign table, as key paths.
+/// `[context]`, `[intake]` and `[smart_harness]` stay project-tunable, but
+/// each of these names an endpoint: `embeddings_endpoint` receives indexed
+/// source text and search queries, and the two `BackendRef`s carry an
+/// endpoint plus a credential reference (exfil, like `backends`).
+pub(crate) const CONTROL_PLANE_PATHS: &[&[&str]] = &[
+    &["context", "semantic", "embeddings_endpoint"],
+    &["intake", "adjudicator"],
+    &["smart_harness", "backend"],
+];
+
+/// Remove every [`CONTROL_PLANE_KEYS`] and [`CONTROL_PLANE_PATHS`] entry from
+/// an untrusted config table in place, at the `toml::Value` layer — *before*
+/// `try_into::<Config>()`, so a stripped key fails closed to the trusted
+/// base's value (or the built-in default), never the attacker's. A no-op on a
+/// non-table value.
+///
+/// Serde also accepts a struct as a positional array, so a path's ancestor
+/// that is present but not a table could still carry the leaf. That ancestor
+/// is removed whole: fail closed rather than parse an untrusted shape.
 pub(crate) fn strip_control_plane(value: &mut toml::Value) {
-    if let Some(table) = value.as_table_mut() {
-        for key in CONTROL_PLANE_KEYS {
-            table.remove(*key);
+    let Some(table) = value.as_table_mut() else {
+        return;
+    };
+    for key in CONTROL_PLANE_KEYS {
+        table.remove(*key);
+    }
+    for path in CONTROL_PLANE_PATHS {
+        strip_path(table, path);
+    }
+}
+
+fn strip_path(table: &mut toml::map::Map<String, toml::Value>, path: &[&str]) {
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        table.remove(*first);
+        return;
+    }
+    match table.get_mut(*first) {
+        Some(toml::Value::Table(child)) => strip_path(child, rest),
+        Some(_) => {
+            table.remove(*first);
         }
+        None => {}
     }
 }
 
