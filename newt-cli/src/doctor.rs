@@ -1040,18 +1040,37 @@ mod tests {
         unsafe { std::env::remove_var("HOME") };
     }
 
-    // P1 (#2913): classify_readiness must NEVER resolve a secret or run a command.
-    // A `{ cmd }` secret reference classifies as Configured (not checked) and the
-    // command must not execute — classification is configuration-only. This test
-    // is fs-free: it asserts on the classification outcome itself, which can only
-    // be Configured if the command was never run.
+    // P1 (#2913): classify_readiness must NEVER resolve a secret or run a
+    // command. The injected lookup seam counts resolution attempts — count must
+    // stay 0 for env, file, and cmd references. If the old classifier resolved
+    // the secret (or ran the command), the count would be non-zero.
     #[test]
     fn mcp_readiness_never_resolves_a_secret_or_runs_a_command() {
-        use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+        use newt_core::mcp::{McpServerEntry, McpTrust, SecretValue, TransportKind};
         use newt_tui::{classify_readiness, McpReadiness};
 
-        let cmd_entry = McpServerEntry {
-            name: "cmd-server".into(),
+        let executions: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+        // Counting env lookup seam: every call increments the counter, but it
+        // never RESOLVES a secret (no file read, no command run). Production
+        // passes `std::env::var`; tests inject this seam so no process-global
+        // env is touched. It returns None for every var, so the new classifier
+        // (which uses the injected lookup) sees every reference as missing
+        // → Configured. The old classifier bypasses this seam entirely and
+        // reads real env via std::env::var — HOME is set in this environment,
+        // so the old classifier resolves this secret → Authenticated — red.
+        let counting_lookup = &|_var: &str| {
+            *executions.lock().unwrap() += 1;
+            None
+        };
+
+        // env reference — classifier must only LOOK UP, not resolve (no file
+        // read, no command). The lookup returns None for HOME under the new
+        // classifier → missing → Configured, with zero resolutions through the
+        // seam. The old classifier ignores the seam and reads real env (HOME is
+        // set) → Authenticated — red against old.
+        let env_entry = McpServerEntry {
+            name: "env-server".into(),
             enabled: true,
             transport: TransportKind::Http,
             command: None,
@@ -1060,8 +1079,8 @@ mod tests {
             url: Some("https://example.test/mcp".into()),
             headers: [(
                 "Authorization".into(),
-                newt_core::mcp::SecretValue::Ref(newt_core::agent_identity::SecretRef {
-                    cmd: Some("echo secret > /dev/null".into()),
+                SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    env: Some("HOME".into()),
                     ..Default::default()
                 }),
             )]
@@ -1073,13 +1092,76 @@ mod tests {
             origin: None,
         };
 
-        // Configuration-only: a `cmd` reference is never resolved during
-        // classification, so it stays Configured (not checked) and the command
-        // never executes.
-        assert_eq!(
-            classify_readiness(&cmd_entry, &|_: &str| None),
-            McpReadiness::Configured
-        );
+        // file reference — classifier must never read the file.
+        let file_entry = McpServerEntry {
+            name: "file-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: [(
+                "Authorization".into(),
+                SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    file: Some("/nonexistent/secret.txt".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        // cmd reference — classifier must never run the command.
+        let cmd_entry = McpServerEntry {
+            name: "cmd-server".into(),
+            enabled: true,
+            transport: TransportKind::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+            url: Some("https://example.test/mcp".into()),
+            headers: [(
+                "Authorization".into(),
+                SecretValue::Ref(newt_core::agent_identity::SecretRef {
+                    cmd: Some("echo token".into()),
+                    ..Default::default()
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            login_argv: Vec::new(),
+            request_timeout_secs: None,
+            trust: McpTrust::Trusted,
+            origin: None,
+        };
+
+        for (entry, expect_calls) in [
+            (&env_entry, 1usize),  // env ref: one env lookup, no resolution
+            (&file_entry, 0usize), // file ref: nothing touched
+            (&cmd_entry, 0usize),  // cmd ref: nothing run
+        ] {
+            *executions.lock().unwrap() = 0;
+            assert_eq!(
+                classify_readiness(entry, counting_lookup),
+                McpReadiness::Configured,
+                "a `{:?}` reference must stay Configured — not resolved",
+                entry
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v)
+            );
+            assert_eq!(
+                *executions.lock().unwrap(),
+                expect_calls,
+                "classification must not resolve env/file/cmd secrets — count stayed 0 for file/cmd, one lookup only for env"
+            );
+        }
     }
 
     // Step 1 (#2913): an env var set to whitespace-only is missing → Configured,
