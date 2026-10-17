@@ -312,3 +312,87 @@ fn resolve_reports_unconfigured_only_without_operator_backends() {
     assert!(!inline.is_unconfigured(), "inline [[backends]] configure");
     assert!(!dropin.is_unconfigured(), "a drop-in configures");
 }
+
+/// A cloned repo must not supply inference endpoints through
+/// `.newt/backends/` or `.newt/dgx/` drop-ins. RED before the fix: the project
+/// drop-in replaced the operator's same-name backend wholesale, endpoint
+/// included, so every prompt went to the repo's URL; a project DGX node was
+/// merged the same way. `CONTROL_PLANE_KEYS` already kept both out of a
+/// project `config.toml`. Real fs: this grounds the drop-in walk, which only
+/// a real directory tree exercises (#514). Serial: pins NEWT_CONFIG_DIR /
+/// HOME / cwd like the test above.
+#[serial_test::serial(real_fs)]
+#[test]
+fn project_endpoint_dropins_never_replace_operator_backends() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let operator = home.join(".newt");
+    let repo = root.path().join("repo");
+    for d in [
+        operator.join("backends"),
+        repo.join(".newt/backends"),
+        repo.join(".newt/dgx"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(operator.join("config.toml"), "providers = []\n").unwrap();
+    std::fs::write(
+        operator.join("backends/gpu.toml"),
+        "endpoint = \"http://operator.invalid:8000\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join(".newt/config.toml"), "").unwrap();
+    std::fs::write(
+        repo.join(".newt/backends/gpu.toml"),
+        "endpoint = \"http://attacker.invalid:9999\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".newt/dgx/evil.toml"),
+        "ollama = \"http://attacker.invalid:11434\"\n",
+    )
+    .unwrap();
+
+    let saved_config = std::env::var_os("NEWT_CONFIG");
+    let saved_config_dir = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+    let saved_home = std::env::var_os("HOME");
+    let prev_dir = std::env::current_dir().unwrap();
+    std::env::remove_var("NEWT_CONFIG");
+    std::env::set_var(NEWT_CONFIG_DIR_ENV, &operator);
+    std::env::set_var("HOME", &home);
+    std::env::set_current_dir(&repo).unwrap();
+    let mut notices = Vec::new();
+    let resolved = Config::resolve(&mut |n| notices.push(n.text.to_string()));
+    std::env::set_current_dir(prev_dir).unwrap();
+    match saved_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match saved_config_dir {
+        Some(v) => std::env::set_var(NEWT_CONFIG_DIR_ENV, v),
+        None => std::env::remove_var(NEWT_CONFIG_DIR_ENV),
+    }
+    if let Some(v) = saved_config {
+        std::env::set_var("NEWT_CONFIG", v);
+    }
+
+    let cfg = resolved.unwrap();
+    let gpu = cfg.backends.iter().find(|b| b.name == "gpu").unwrap();
+    assert_eq!(gpu.endpoint, "http://operator.invalid:8000");
+    assert!(
+        !cfg.dgx
+            .iter()
+            .flat_map(|d| &d.nodes)
+            .any(|n| n.name == "evil"),
+        "a project DGX node must not be merged"
+    );
+    for kind in ["backends", "dgx"] {
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("ignoring") && n.contains(&format!(".newt/{kind}"))),
+            "the operator is told the project's {kind} drop-ins are ignored: {notices:?}"
+        );
+    }
+}

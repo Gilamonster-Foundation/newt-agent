@@ -1613,11 +1613,12 @@ impl Config {
         // hand-deconflict. Runs first so disk loadouts/crews can name a disk
         // backend's provider.
         // The backend assembly: identity validation FIRST (name-keyed
-        // machinery is unsound on duplicate/empty names), then per-file
-        // drop-ins from the `backends/` dirs next to the config —
-        // `~/.newt/backends/*.toml` first, then the project
-        // `.newt/backends/` (so project overrides home overrides inline
-        // `[[backends]]`).
+        // machinery is unsound on duplicate/empty names), then the operator's
+        // per-file drop-ins in `~/.newt/backends/` (home overrides inline
+        // `[[backends]]`). A project's `.newt/backends/` is NOT merged: an
+        // endpoint is control plane (`CONTROL_PLANE_KEYS` strips `backends`
+        // from a project config for the same reason), and a drop-in there
+        // could replace an operator backend by name and receive every prompt.
         let mut assembly =
             BackendAssembly::new(std::mem::take(&mut cfg.backends)).map_err(NewtError::Config)?;
         validate_provider_names(&cfg.providers).map_err(NewtError::Config)?;
@@ -1626,13 +1627,7 @@ impl Config {
                 .merge_dir(&dir.join("backends"))
                 .map_err(NewtError::Config)?;
         }
-        if let Some(proj) = Self::project_config_path() {
-            if let Some(parent) = proj.parent() {
-                assembly
-                    .merge_dir(&parent.join("backends"))
-                    .map_err(NewtError::Config)?;
-            }
-        }
+        report_ignored_project_endpoint_dropins(report);
         // A successfully merged operator drop-in is operator-supplied
         // configuration — the resolved backend list is no longer the bare
         // compiled-in fallback (see `is_unconfigured`).
@@ -1830,19 +1825,14 @@ impl Config {
         validate_backend_names(self.backends.iter())
     }
 
-    /// Merge per-file DGX nodes from the `dgx/` dirs next to the config:
-    /// `~/.newt/dgx/*.toml` first, then the project `.newt/dgx/` (so project
-    /// overrides home overrides inline `[[dgx.nodes]]`). Filename stem = node
-    /// name. A malformed drop-in is skipped with a warning; it must not break
-    /// startup.
+    /// Merge the operator's per-file DGX nodes from `~/.newt/dgx/*.toml` (home
+    /// overrides inline `[[dgx.nodes]]`). A project's `.newt/dgx/` is not
+    /// merged: a node is an endpoint plus ssh, which `CONTROL_PLANE_KEYS`
+    /// keeps out of a project config. Filename stem = node name. A malformed
+    /// drop-in is skipped with a warning; it must not break startup.
     fn merge_disk_dgx_nodes(&mut self) {
         if let Some(dir) = Self::user_config_dir() {
             self.merge_dgx_nodes_from_dir(&dir.join("dgx"));
-        }
-        if let Some(proj) = Self::project_config_path() {
-            if let Some(parent) = proj.parent() {
-                self.merge_dgx_nodes_from_dir(&parent.join("dgx"));
-            }
         }
     }
 
@@ -2314,3 +2304,36 @@ mod tests;
 mod select_backend_tests;
 
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 21:30 EDT | Date: 2026-08-12
+
+/// Endpoint drop-in dirs a project may ship but newt never merges: each one
+/// names an inference endpoint or a DGX host, which is control plane.
+const PROJECT_ENDPOINT_DROPIN_DIRS: &[&str] = &["backends", "dgx"];
+
+/// Warn when the project's `.newt/` carries endpoint drop-ins, so a repo that
+/// relied on them learns they are ignored instead of silently losing them.
+fn report_ignored_project_endpoint_dropins(report: &mut dyn FnMut(crate::tty::Notice<'static>)) {
+    let Some(newt_dir) =
+        Config::project_config_path().and_then(|p| p.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    for kind in PROJECT_ENDPOINT_DROPIN_DIRS {
+        let dir = newt_dir.join(kind);
+        let has_toml = std::fs::read_dir(&dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "toml"))
+        });
+        if has_toml {
+            report(crate::tty::Notice::new(
+                crate::tty::Level::Warn,
+                "",
+                format!(
+                    "newt: warning: ignoring {}: a project cannot supply inference endpoints; \
+                     move a file you trust to ~/.newt/{kind}/",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+}
