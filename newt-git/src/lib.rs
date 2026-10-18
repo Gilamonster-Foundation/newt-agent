@@ -1457,12 +1457,16 @@ pub struct LocalGitTool {
 /// The served state shared between the tool and its native commit policies.
 pub type ServedModel = std::sync::Arc<std::sync::Mutex<ServedState>>;
 
-/// What a router served: the active model and the models that did material
-/// work since the last commit, in first-contribution order.
+/// What a router served: the active model and each material contribution
+/// since the last commit, numbered so a landed commit consumes exactly the
+/// contributions it credited and none recorded after it was prepared.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServedState {
     pub active: Option<String>,
-    pub contributors: Vec<String>,
+    /// `(sequence, model)` per contribution, oldest first.
+    pub contributors: Vec<(u64, String)>,
+    /// The sequence the next contribution gets.
+    pub next: u64,
 }
 
 impl LocalGitTool {
@@ -1504,8 +1508,7 @@ impl LocalGitTool {
             self.contributors_consumed
                 .store(a.contributors.len(), std::sync::atomic::Ordering::Relaxed);
         }
-        let credited = served_now(&self.served_model).contributors;
-        forget_credited(&self.served_model, &credited);
+        forget_credited(&self.served_model, served_now(&self.served_model).next);
     }
 
     /// Drain the explicit commit-success counter — returns the number of
@@ -1524,11 +1527,12 @@ fn served_now(served: &ServedModel) -> ServedState {
     served.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
-/// Drop the served contributors a landed commit credited; any noted after
-/// the commit was prepared stay for the next one.
-fn forget_credited(served: &ServedModel, credited: &[String]) {
+/// Drop the contributions a landed commit credited: every one numbered below
+/// `upto` (the state's `next` when the commit was rendered). Later ones stay
+/// for the next commit, even from the same model.
+fn forget_credited(served: &ServedModel, upto: u64) {
     if let Ok(mut s) = served.lock() {
-        s.contributors.retain(|m| !credited.contains(m));
+        s.contributors.retain(|(seq, _)| *seq >= upto);
     }
 }
 
@@ -1555,7 +1559,7 @@ fn finalize_commit_message(
             let cursor = consumed.load(std::sync::atomic::Ordering::Relaxed);
             let start = cursor.min(a.contributors.len());
             let mut contributors = a.contributors[start..].to_vec();
-            for model in &served.contributors {
+            for (_, model) in &served.contributors {
                 let mut entry = a.active_attribution();
                 entry.model = model.clone();
                 contributors.push(entry);
@@ -1644,7 +1648,7 @@ impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
     }
 
     fn committed(&self) {
-        forget_credited(&self.served_model, &self.served().contributors);
+        forget_credited(&self.served_model, self.served().next);
         if let Some(attribution) = &self.attribution {
             self.contributors_consumed.fetch_max(
                 attribution.contributors.len(),
@@ -1680,9 +1684,9 @@ impl newt_core::agentic::GitTool for LocalGitTool {
 
     fn note_contribution(&self, model: &str) {
         if let Ok(mut served) = self.served_model.lock() {
-            if !served.contributors.iter().any(|m| m == model) {
-                served.contributors.push(model.to_owned());
-            }
+            let seq = served.next;
+            served.contributors.push((seq, model.to_owned()));
+            served.next += 1;
         }
     }
 

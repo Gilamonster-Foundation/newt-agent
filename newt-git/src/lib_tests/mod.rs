@@ -398,3 +398,23 @@ fn a_landed_commit_consumes_served_contributors() {
     assert!(!message.contains("routed/a"), "{message}");
     assert!(message.contains("routed/b"), "{message}");
 }
+
+/// #2936 review round 3: work a model does after a native commit was prepared
+/// is credited to the next commit, even when the same model's earlier work
+/// was in the prepared one. RED before: consumption matched by model name and
+/// erased the later work too.
+#[test]
+fn later_work_by_the_same_model_survives_an_earlier_commit() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/b");
+    tool.note_contribution("routed/a");
+    let snapshot = tool
+        .native_commit_policy()
+        .unwrap()
+        .snapshot_for_commit()
+        .unwrap();
+    tool.note_contribution("routed/a");
+    snapshot.committed();
+    let next = tool.finalize_commit_message("subject");
+    assert!(next.contains("routed/a"), "{next}");
+}
