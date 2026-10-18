@@ -509,14 +509,16 @@ else
 
     if [ "$_have_nextest" = 1 ]; then
         # A changed scope can hold no tests at all (a lockfile or README in a
-        # crate with no test targets). Count the scope's tests ignoring every
-        # filter but the scope itself (no CI-only exclusions, no profile
-        # default-filter): zero means there is nothing to run, so skip. Any
-        # other empty selection still fails, as nextest's default does. A
+        # crate with no test targets). List the run's own selection with the
+        # profile default-filter ignored: empty means there is nothing to run,
+        # so skip. A selection the default-filter empties still fails, as
+        # nextest's default does. The listing must carry $NEXTEST_EXCLUDE: the
+        # binaries it names run their real body when merely listed. A
         # listing that fails (a test binary that panics when listed) is not
         # "no tests": fall through to the run, which reports the failure.
         if _scope_list=$(cargo nextest list --ignore-default-filter -T oneline \
-                -E "$_rdeps_expr" 2>/dev/null) && [ -z "$_scope_list" ]; then
+                -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)" 2>/dev/null) \
+                && [ -z "$_scope_list" ]; then
             echo "[pre-push] changed scope has no tests; skipping nextest"
         else
             echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
