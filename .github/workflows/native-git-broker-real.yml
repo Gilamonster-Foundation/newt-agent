@@ -13,9 +13,12 @@ name: Native Git broker real tier (#2693)
 #
 # Tiering (CLAUDE.md "Testing strategy"): a real kernel-fence + real-git
 # real-resource test is OUT of the per-PR unit run. It runs here in the
-# WEEKLY tier (schedule) and the RELEASE tier (on v* tags), never as a push
-# gate. Linux-only: the binary's own `main()` panics on any other OS (no
-# Landlock), so there is no matrix.
+# WEEKLY tier (schedule), the RELEASE tier (on v* tags), and on any PR that
+# touches newt-core or agent-toolchain (#2947): #2906 broke it on main and
+# only the next weekly run saw it. A healthy run takes a few minutes; the job
+# timeout is what fails a deadlock, since a blocked single-thread runtime can
+# signal nothing from inside. Never a push gate. Linux-only: the binary's own
+# `main()` panics on any other OS (no Landlock), so there is no matrix.
 #
 # HOOK PARITY EXCEPTION: like output-oracle-real.yml / mcp-import-real.yml,
 # this workflow is intentionally OUTSIDE .githooks/pre-push parity — a real
@@ -30,6 +33,13 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    branches: [main]
+    paths:
+      - "newt-core/**"
+      - "agent-toolchain/**"
+      - "Cargo.lock"
+      - ".github/workflows/native-git-broker-real.yml"
   workflow_dispatch: {}
 
 permissions:
@@ -48,6 +58,7 @@ jobs:
   real-tier:
     name: native_git_broker_pipeline real Landlock + git tier
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
