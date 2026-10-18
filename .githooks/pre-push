@@ -512,10 +512,11 @@ else
         # crate with no test targets). Count the scope's tests ignoring every
         # filter but the scope itself (no CI-only exclusions, no profile
         # default-filter): zero means there is nothing to run, so skip. Any
-        # other empty selection still fails, as nextest's default does.
-        _scope_tests=$(cargo nextest list --ignore-default-filter -T oneline \
-            -E "$_rdeps_expr" 2>/dev/null | grep -c . || true)
-        if [ "${_scope_tests:-0}" = 0 ]; then
+        # other empty selection still fails, as nextest's default does. A
+        # listing that fails (a test binary that panics when listed) is not
+        # "no tests": fall through to the run, which reports the failure.
+        if _scope_list=$(cargo nextest list --ignore-default-filter -T oneline \
+                -E "$_rdeps_expr" 2>/dev/null) && [ -z "$_scope_list" ]; then
             echo "[pre-push] changed scope has no tests; skipping nextest"
         else
             echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."

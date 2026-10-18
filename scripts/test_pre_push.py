@@ -82,8 +82,10 @@ cargo() {
     # test can force the no-nextest fallback on a box that has nextest.
     if [ "$1" = "nextest" ] && [ "$2" = "--version" ]; then return "${PRE_PUSH_TEST_NO_NEXTEST:-0}"; fi
     # `cargo nextest list` is the hook's does-the-scope-have-tests probe, not
-    # a gate: one test by default, none when PRE_PUSH_TEST_NO_SCOPE_TESTS=1.
+    # a gate: one test by default, none when PRE_PUSH_TEST_NO_SCOPE_TESTS=1,
+    # a failed listing when PRE_PUSH_TEST_SCOPE_LIST_FAILS=1.
     if [ "$1" = "nextest" ] && [ "$2" = "list" ]; then
+        [ "${PRE_PUSH_TEST_SCOPE_LIST_FAILS:-0}" = 1 ] && return 101
         [ "${PRE_PUSH_TEST_NO_SCOPE_TESTS:-0}" = 1 ] || echo "crate-a tests::t"
         return 0
     fi
@@ -358,6 +360,17 @@ class PrePushTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("nextest", calls)
         self.assertNotIn("--no-tests", self.gate_argv("nextest"))
+
+    def test_a_failed_scope_listing_still_runs_nextest(self):
+        # A test binary that panics while nextest lists it made the probe
+        # count zero tests, so the hook skipped the run and passed. A failed
+        # listing must fall through to the run, which reports it.
+        base = self.cargo_chain()
+        local = self.commit("crate-a/src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        result, calls = self.hook(local, base, setup="export PRE_PUSH_TEST_SCOPE_LIST_FAILS=1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("nextest", calls)
+        self.assertNotIn("changed scope has no tests", result.stdout)
 
     def test_leaf_change_gates_every_transitive_reverse_dependent(self):
         # #1098 fix-first finding #1: a change in crate-a must reach clippy
