@@ -219,6 +219,9 @@ impl<'a> AttributionEpoch<'a> {
                         crate::build_info::harness_name(),
                         crate::build_info::PACKAGE_VERSION,
                     );
+                    if let Some(tool) = self.git_tool {
+                        tool.note_contribution(self.model);
+                    }
                 }
             }
         }
@@ -228,6 +231,11 @@ impl<'a> AttributionEpoch<'a> {
     pub(super) fn finish(mut self, args: &serde_json::Value, ok: bool) {
         if !self.consume_confirmed() {
             ledger_note_attribution(self.attribution, self.model, self.name, args, ok);
+            if ok && !is_read_only_call(self.name, args) {
+                if let Some(tool) = self.git_tool {
+                    tool.note_contribution(self.model);
+                }
+            }
         }
         self.finished = true;
     }

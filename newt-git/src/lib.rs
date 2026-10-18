@@ -1446,16 +1446,24 @@ pub struct LocalGitTool {
     /// Signs the commits this tool writes, per the operator's
     /// `[agent-identity.git] signing` (`newt_core::commit_signing::signer_for`).
     pub signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
-    /// The model that served the latest round (see
-    /// `GitTool::note_served_model`). When set, it is the active model a
-    /// commit credits, in place of the requested one captured at turn start.
-    /// Shared with every native commit policy this tool hands out.
+    /// What the routed backend actually served this turn (see
+    /// `GitTool::note_served_model` / `note_contribution`): the active model
+    /// a commit credits in place of the requested one captured at turn start,
+    /// and the served models that did material work since the last commit.
+    /// Shared with the native commit policies this tool hands out.
     pub served_model: ServedModel,
 }
 
-/// The latest served model, shared between the tool and its native commit
-/// policies.
-pub type ServedModel = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+/// The served state shared between the tool and its native commit policies.
+pub type ServedModel = std::sync::Arc<std::sync::Mutex<ServedState>>;
+
+/// What a router served: the active model and the models that did material
+/// work since the last commit, in first-contribution order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServedState {
+    pub active: Option<String>,
+    pub contributors: Vec<String>,
+}
 
 impl LocalGitTool {
     /// Capability-governed, O(HEAD) repository identity for harness
@@ -1481,7 +1489,7 @@ impl LocalGitTool {
     fn finalize_commit_message(&self, message: &str) -> String {
         finalize_commit_message(
             &self.attribution,
-            &self.served_model,
+            &served_now(&self.served_model),
             &self.contributors_consumed,
             message,
         )
@@ -1496,6 +1504,8 @@ impl LocalGitTool {
             self.contributors_consumed
                 .store(a.contributors.len(), std::sync::atomic::Ordering::Relaxed);
         }
+        let credited = served_now(&self.served_model).contributors;
+        forget_credited(&self.served_model, &credited);
     }
 
     /// Drain the explicit commit-success counter — returns the number of
@@ -1509,38 +1519,48 @@ impl LocalGitTool {
     }
 }
 
+/// The served state right now (empty if the lock is poisoned).
+fn served_now(served: &ServedModel) -> ServedState {
+    served.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// Drop the served contributors a landed commit credited; any noted after
+/// the commit was prepared stay for the next one.
+fn forget_credited(served: &ServedModel, credited: &[String]) {
+    if let Ok(mut s) = served.lock() {
+        s.contributors.retain(|m| !credited.contains(m));
+    }
+}
+
 fn finalize_commit_message(
     attribution: &Option<newt_core::attribution::CommitAttribution>,
-    served: &ServedModel,
+    served: &ServedState,
     consumed: &std::sync::atomic::AtomicUsize,
     message: &str,
 ) -> String {
-    let served = served.lock().ok().and_then(|s| s.clone());
-    let attribution = attribution.clone().map(|mut a| {
-        if let Some(model) = served {
-            a.model = model;
-        }
-        a
-    });
-    match &attribution {
+    match attribution {
         // Semantic B: the envelope's `contributors` snapshot (the
-        // accumulated ledger, captured at the latest refresh) is merged
-        // with the active model by `finalize_message` →
-        // `finalize_message_with`, so every contributing model is
-        // credited. An empty snapshot yields the single active-model
-        // floor (semantic A).
+        // accumulated ledger, captured at the latest refresh) is merged with
+        // the active model by `finalize_message_with`. The served state adds
+        // what the router served since that refresh: the active model it is
+        // serving now, and the served models that did material work this turn.
         //
-        // #1709 family: the snapshot is CONSUMED at the commit boundary,
-        // not the end-of-turn boundary. `contributors_consumed` is a
-        // cursor into the frozen `contributors` Vec — render only the
-        // UNCONSUMED tail `contributors[cursor..]`. A prior successful
-        // commit in this same lifecycle advanced the cursor past the
-        // contributors it already credited, so this commit re-credits
-        // none of them (C1 → more work → C2: C2's slice is empty).
+        // #1709 family: the snapshot is CONSUMED at the commit boundary;
+        // `consumed` is the cursor into the frozen `contributors`.
         Some(a) => {
+            let mut a = a.clone();
+            if let Some(model) = &served.active {
+                a.model = model.clone();
+            }
             let cursor = consumed.load(std::sync::atomic::Ordering::Relaxed);
             let start = cursor.min(a.contributors.len());
-            a.finalize_message_with(message, &a.contributors[start..])
+            let mut contributors = a.contributors[start..].to_vec();
+            for model in &served.contributors {
+                let mut entry = a.active_attribution();
+                entry.model = model.clone();
+                contributors.push(entry);
+            }
+            a.finalize_message_with(message, &contributors)
         }
         None => message.to_string(),
     }
@@ -1550,11 +1570,23 @@ fn finalize_commit_message(
 /// Shared counters retain the existing explicit-success ledger lifecycle.
 struct NativeCommitPolicy {
     attribution: Option<newt_core::attribution::CommitAttribution>,
+    /// The tool's live served state, cleared of what a landed commit credited.
     served_model: ServedModel,
+    /// The served state frozen when a native command was prepared, so a
+    /// later round cannot change what that commit credits.
+    served_frozen: Option<ServedState>,
     signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
     commit_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     contributors_consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     frozen_cursor: Option<usize>,
+}
+
+impl NativeCommitPolicy {
+    fn served(&self) -> ServedState {
+        self.served_frozen
+            .clone()
+            .unwrap_or_else(|| served_now(&self.served_model))
+    }
 }
 
 impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
@@ -1564,6 +1596,11 @@ impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
         Some(std::sync::Arc::new(Self {
             attribution: self.attribution.clone(),
             served_model: self.served_model.clone(),
+            served_frozen: Some(
+                self.served_frozen
+                    .clone()
+                    .unwrap_or_else(|| served_now(&self.served_model)),
+            ),
             signer: self.signer.clone(),
             commit_succeeded: self.commit_succeeded.clone(),
             contributors_consumed: self.contributors_consumed.clone(),
@@ -1581,7 +1618,7 @@ impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
         }));
         Ok(finalize_commit_message(
             &self.attribution,
-            &self.served_model,
+            &self.served(),
             &cursor,
             message,
         ))
@@ -1607,6 +1644,7 @@ impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
     }
 
     fn committed(&self) {
+        forget_credited(&self.served_model, &self.served().contributors);
         if let Some(attribution) = &self.attribution {
             self.contributors_consumed.fetch_max(
                 attribution.contributors.len(),
@@ -1636,7 +1674,15 @@ impl newt_core::agentic::GitTool for LocalGitTool {
 
     fn note_served_model(&self, model: &str) {
         if let Ok(mut served) = self.served_model.lock() {
-            *served = Some(model.to_owned());
+            served.active = Some(model.to_owned());
+        }
+    }
+
+    fn note_contribution(&self, model: &str) {
+        if let Ok(mut served) = self.served_model.lock() {
+            if !served.contributors.iter().any(|m| m == model) {
+                served.contributors.push(model.to_owned());
+            }
         }
     }
 
@@ -1646,6 +1692,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         Some(std::sync::Arc::new(NativeCommitPolicy {
             attribution: self.attribution.clone(),
             served_model: self.served_model.clone(),
+            served_frozen: None,
             signer: self.signer.clone(),
             commit_succeeded: self.commit_succeeded.clone(),
             contributors_consumed: self.contributors_consumed.clone(),

@@ -94,6 +94,11 @@ pub trait GitTool: Send + Sync {
     /// one that did the work. Default: ignored.
     fn note_served_model(&self, _model: &str) {}
 
+    /// A served model did material work this turn (a successful, non-read-only
+    /// tool call). A commit later in the same turn credits it alongside the
+    /// active model. Default: ignored.
+    fn note_contribution(&self, _model: &str) {}
+
     fn dispatch(
         &self,
         op: &str,

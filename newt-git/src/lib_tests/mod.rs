@@ -353,3 +353,48 @@ fn commit_trailer_credits_the_served_model() {
         assert!(!message.contains("qwen3:30b"), "{message}");
     }
 }
+
+/// #2936 review round 2: a router can serve model A for an edit and model B
+/// for the round that commits, in one turn. The commit credits both. RED
+/// before: only the active model B (and the turn-start snapshot) appeared.
+#[test]
+fn commit_credits_every_served_model_that_did_work_this_turn() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/a");
+    tool.note_contribution("routed/a");
+    tool.note_served_model("routed/b");
+    let message = tool.finalize_commit_message("subject");
+    assert!(message.contains("routed/a"), "{message}");
+    assert!(message.contains("routed/b"), "{message}");
+}
+
+/// #2936 review round 2: a native commit snapshot freezes the served model at
+/// preparation, like the rest of the policy. RED before: a later round's
+/// model leaked into the commit prepared under the earlier one.
+#[test]
+fn a_native_commit_snapshot_freezes_the_served_model() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/a");
+    let snapshot = tool
+        .native_commit_policy()
+        .unwrap()
+        .snapshot_for_commit()
+        .unwrap();
+    tool.note_served_model("routed/b");
+    let message = snapshot.finalize_message("subject").unwrap();
+    assert!(message.contains("routed/a"), "{message}");
+    assert!(!message.contains("routed/b"), "{message}");
+}
+
+/// A landed commit consumes the served contributors it credited, so the next
+/// commit does not credit them again.
+#[test]
+fn a_landed_commit_consumes_served_contributors() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/b");
+    tool.note_contribution("routed/a");
+    tool.native_commit_policy().unwrap().committed();
+    let message = tool.finalize_commit_message("subject");
+    assert!(!message.contains("routed/a"), "{message}");
+    assert!(message.contains("routed/b"), "{message}");
+}
