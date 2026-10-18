@@ -6,7 +6,8 @@ The router is the NeMoCode inheritance: it classifies an incoming turn into a
 `Tier` (FAST / STANDARD / COMPLEX / REVIEW) and asks the configured backends
 which can serve that tier. The crate also carries the shared configuration
 model (`~/.newt/config.toml`; a project `.newt/config.toml` cannot set
-endpoints, credentials or other control-plane keys), session and memory types, MCP server
+inference endpoints, credentials or other control-plane keys, and the MCP
+servers it declares are admitted as untrusted), session and memory types, MCP server
 resolution, metrics, and capability caveat extensions used across the
 workspace.
 
