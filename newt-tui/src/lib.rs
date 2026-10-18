@@ -5828,7 +5828,7 @@ fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String>
 }
 
 fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>, plan_path: &str) -> String {
-    build_system_prompt_with_persona(workspace, soul, None, plan_path)
+    build_system_prompt_with_persona(workspace, soul, None, None, plan_path)
 }
 
 /// FR-5 (#999): the minimal persona that carries ONLY an altitude, used when
@@ -5862,9 +5862,15 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
     enabled.then_some(NARRATION_INTENT_LINE)
 }
 
+/// `context` carries the non-soul provider blocks (AGENTS.md/CLAUDE.md,
+/// notes, memory index, project map).  It is appended unconditionally after
+/// the identity and workspace sections so that coach altitude, which replaces
+/// the soul/identity with `COACH_SOUL`, never silently drops project-specific
+/// instructions (#2934).
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: Option<&str>,
+    context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
 ) -> String {
@@ -5980,6 +5986,17 @@ fn build_system_prompt_with_persona(
         }
     }
 
+    // #2934: project-context blocks (AGENTS.md/CLAUDE.md, notes, memory
+    // index, project map) are always appended, independent of altitude.
+    // Coach altitude replaces the soul/identity above but must not drop
+    // project-specific instructions.
+    if let Some(ctx_str) = context {
+        if !ctx_str.is_empty() {
+            ctx.push_str("\n\n");
+            ctx.push_str(ctx_str);
+        }
+    }
+
     ctx
 }
 
@@ -5993,15 +6010,25 @@ fn rebuild_system_prompt(
     persona: Option<&Persona>,
     conversation_id: &str,
 ) -> String {
-    let soul_additions = memory.build_system_prompt_additions();
-    let soul_text = if soul_additions.is_empty() {
+    // #2934: separate the soul/identity from the project-context additions so
+    // that coach altitude can replace the soul with COACH_SOUL without
+    // silently dropping AGENTS.md, notes, and the project map.
+    let soul_text = memory.soul_block();
+    let context = memory.context_additions();
+    let context_ref = if context.is_empty() {
         None
     } else {
-        Some(soul_additions.as_str())
+        Some(context.as_str())
     };
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
-    build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy())
+    build_system_prompt_with_persona(
+        workspace,
+        soul_text.as_deref(),
+        context_ref,
+        persona,
+        &plan_path.to_string_lossy(),
+    )
 }
 
 fn handle_operating_mode_command(
