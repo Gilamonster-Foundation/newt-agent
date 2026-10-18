@@ -140,6 +140,7 @@ fn tool(dir: &Path) -> LocalGitTool {
         commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         signer: None,
+        served_model: Default::default(),
     }
 }
 
@@ -327,3 +328,28 @@ mod tool_dispatch;
 mod tool_surface;
 #[path = "worktree_cwd.rs"]
 mod worktree_cwd;
+
+/// #2936 review: the trailer a commit carries must name the model that served
+/// the round, not the requested one captured at turn start. A router such as
+/// `openrouter/auto` serves a different model. RED before: both the git tool
+/// and its native commit policy finalized with the requested `qwen3:30b`.
+#[test]
+fn commit_trailer_credits_the_served_model() {
+    // Finalizing touches no repository, so no directory is needed.
+    let tool = tool(Path::new("unused"));
+    assert!(tool
+        .finalize_commit_message("subject")
+        .contains("qwen3:30b"));
+
+    tool.note_served_model("routed/model-x");
+    let direct = tool.finalize_commit_message("subject");
+    let native = tool
+        .native_commit_policy()
+        .unwrap()
+        .finalize_message("subject")
+        .unwrap();
+    for message in [direct, native] {
+        assert!(message.contains("routed/model-x"), "{message}");
+        assert!(!message.contains("qwen3:30b"), "{message}");
+    }
+}

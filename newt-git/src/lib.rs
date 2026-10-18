@@ -1446,7 +1446,16 @@ pub struct LocalGitTool {
     /// Signs the commits this tool writes, per the operator's
     /// `[agent-identity.git] signing` (`newt_core::commit_signing::signer_for`).
     pub signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
+    /// The model that served the latest round (see
+    /// `GitTool::note_served_model`). When set, it is the active model a
+    /// commit credits, in place of the requested one captured at turn start.
+    /// Shared with every native commit policy this tool hands out.
+    pub served_model: ServedModel,
 }
+
+/// The latest served model, shared between the tool and its native commit
+/// policies.
+pub type ServedModel = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
 impl LocalGitTool {
     /// Capability-governed, O(HEAD) repository identity for harness
@@ -1470,7 +1479,12 @@ impl LocalGitTool {
     ///
     /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
     fn finalize_commit_message(&self, message: &str) -> String {
-        finalize_commit_message(&self.attribution, &self.contributors_consumed, message)
+        finalize_commit_message(
+            &self.attribution,
+            &self.served_model,
+            &self.contributors_consumed,
+            message,
+        )
     }
 
     /// Consume the contributor snapshot at the confirmed-successful commit
@@ -1497,10 +1511,18 @@ impl LocalGitTool {
 
 fn finalize_commit_message(
     attribution: &Option<newt_core::attribution::CommitAttribution>,
+    served: &ServedModel,
     consumed: &std::sync::atomic::AtomicUsize,
     message: &str,
 ) -> String {
-    match attribution {
+    let served = served.lock().ok().and_then(|s| s.clone());
+    let attribution = attribution.clone().map(|mut a| {
+        if let Some(model) = served {
+            a.model = model;
+        }
+        a
+    });
+    match &attribution {
         // Semantic B: the envelope's `contributors` snapshot (the
         // accumulated ledger, captured at the latest refresh) is merged
         // with the active model by `finalize_message` →
@@ -1528,6 +1550,7 @@ fn finalize_commit_message(
 /// Shared counters retain the existing explicit-success ledger lifecycle.
 struct NativeCommitPolicy {
     attribution: Option<newt_core::attribution::CommitAttribution>,
+    served_model: ServedModel,
     signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
     commit_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     contributors_consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1540,6 +1563,7 @@ impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
     ) -> Option<std::sync::Arc<dyn agent_toolchain::native_git::CommitPolicy>> {
         Some(std::sync::Arc::new(Self {
             attribution: self.attribution.clone(),
+            served_model: self.served_model.clone(),
             signer: self.signer.clone(),
             commit_succeeded: self.commit_succeeded.clone(),
             contributors_consumed: self.contributors_consumed.clone(),
@@ -1555,7 +1579,12 @@ impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
             self.contributors_consumed
                 .load(std::sync::atomic::Ordering::Relaxed)
         }));
-        Ok(finalize_commit_message(&self.attribution, &cursor, message))
+        Ok(finalize_commit_message(
+            &self.attribution,
+            &self.served_model,
+            &cursor,
+            message,
+        ))
     }
 
     fn agent_email(&self) -> Option<String> {
@@ -1605,11 +1634,18 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn note_served_model(&self, model: &str) {
+        if let Ok(mut served) = self.served_model.lock() {
+            *served = Some(model.to_owned());
+        }
+    }
+
     fn native_commit_policy(
         &self,
     ) -> Option<std::sync::Arc<dyn agent_toolchain::native_git::CommitPolicy>> {
         Some(std::sync::Arc::new(NativeCommitPolicy {
             attribution: self.attribution.clone(),
+            served_model: self.served_model.clone(),
             signer: self.signer.clone(),
             commit_succeeded: self.commit_succeeded.clone(),
             contributors_consumed: self.contributors_consumed.clone(),

@@ -2619,6 +2619,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // (a router such as `openrouter/auto` serves a different one).
         let round_model =
             attribution::served_or_requested(json["model"].as_str(), model).to_owned();
+        if let Some(tool) = git_tool {
+            tool.note_served_model(&round_model);
+        }
         if let Some(prompt_tokens) = json["prompt_eval_count"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -7817,6 +7820,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // (a router such as `openrouter/auto` serves a different one).
         let round_model =
             attribution::served_or_requested(json["model"].as_str(), model).to_owned();
+        if let Some(tool) = git_tool {
+            tool.note_served_model(&round_model);
+        }
         if let Some(prompt_tokens) = json["usage"]["prompt_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -10532,6 +10538,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // (a router such as `openrouter/auto` serves a different one).
         let round_model =
             attribution::served_or_requested(model_reply.model.as_deref(), model).to_owned();
+        if let Some(tool) = git_tool {
+            tool.note_served_model(&round_model);
+        }
         if let Some(u) = round_usage {
             compress_state
                 .calibration
@@ -12985,6 +12994,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // (a router such as `openrouter/auto` serves a different one).
         let round_model =
             attribution::served_or_requested(json["model"].as_str(), model).to_owned();
+        if let Some(tool) = git_tool {
+            tool.note_served_model(&round_model);
+        }
         complete_responses_attempt(attempt.as_ref(), &json, &decoded);
         if generation_bounds::output_limited(&json) {
             let usage = crate::responses_wire::decode_usage(&json["usage"]);
