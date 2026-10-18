@@ -92,6 +92,7 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
         commit_succeeded: Arc::new(AtomicUsize::new(0)),
         contributors_consumed: Arc::new(AtomicUsize::new(0)),
         signer: Some(Arc::new(HarnessSshSigner::load(&key).unwrap())),
+        served_model: Default::default(),
     };
     let before = git(&repo, &["rev-parse", "HEAD"]).stdout;
     // #2691 round 3 (P3): exec is restricted (not the implicit `Scope::All`

@@ -3207,6 +3207,7 @@ fn session_body(
             // Refreshed each turn below, so a `/settings git-signing` change
             // applies to the next commit.
             signer: newt_core::commit_signing::session_signer(&session_identity),
+            served_model: Default::default(),
         })
     };
 

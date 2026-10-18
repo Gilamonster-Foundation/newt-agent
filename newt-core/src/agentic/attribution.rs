@@ -177,6 +177,17 @@ pub(super) struct AttributionEpoch<'a> {
     finished: bool,
 }
 
+/// The model to credit for a round: the one the backend says served it, or
+/// the requested model when the reply names none. A router (for example
+/// `openrouter/auto`) answers with a different model than was asked for, and
+/// a commit byline must name the model that did the work.
+pub(super) fn served_or_requested<'a>(served: Option<&'a str>, requested: &'a str) -> &'a str {
+    served
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(requested)
+}
+
 impl<'a> AttributionEpoch<'a> {
     pub(super) fn new(
         attribution: Option<&'a std::cell::RefCell<crate::attribution::AttributionLedger>>,
@@ -208,6 +219,9 @@ impl<'a> AttributionEpoch<'a> {
                         crate::build_info::harness_name(),
                         crate::build_info::PACKAGE_VERSION,
                     );
+                    if let Some(tool) = self.git_tool {
+                        tool.note_contribution(self.model);
+                    }
                 }
             }
         }
@@ -217,6 +231,11 @@ impl<'a> AttributionEpoch<'a> {
     pub(super) fn finish(mut self, args: &serde_json::Value, ok: bool) {
         if !self.consume_confirmed() {
             ledger_note_attribution(self.attribution, self.model, self.name, args, ok);
+            if ok && !is_read_only_call(self.name, args) {
+                if let Some(tool) = self.git_tool {
+                    tool.note_contribution(self.model);
+                }
+            }
         }
         self.finished = true;
     }
