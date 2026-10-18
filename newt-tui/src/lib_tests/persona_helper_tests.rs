@@ -41,6 +41,46 @@ fn normalize_persona_name_lowercases_and_validates() {
     assert!(normalize_persona_name("näme").is_err());
 }
 
+/// Regression test for #2935: the seeded `coder` persona body used to be a copy
+/// of `DEFAULT_SOUL`, so `--persona coder` sent the soul twice in the system
+/// prompt (once from the identity block, once from the persona overlay).
+///
+/// Red: on origin/main the seeded body IS DEFAULT_SOUL → soul appears twice.
+/// Green: after fix the seeded body is a short placeholder → soul appears once.
+#[serial_test::serial(real_fs)]
+#[test]
+fn coder_persona_does_not_send_soul_twice_2935() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = PersonaStore::new(tmp.path().join("personas"));
+    let coder = store.load("coder").unwrap();
+
+    let first_line = newt_core::DEFAULT_SOUL
+        .lines()
+        .find(|l| !l.is_empty())
+        .expect("DEFAULT_SOUL has at least one non-empty line");
+
+    // Coder body must no longer be a copy of DEFAULT_SOUL (#2935).
+    assert!(
+        !coder.prompt.contains(first_line),
+        "seeded coder body must not be DEFAULT_SOUL; got: {:.200}",
+        coder.prompt
+    );
+
+    // With the real seeded body, soul must appear exactly once in the prompt.
+    let prompt = build_system_prompt_with_persona(
+        "/ws",
+        Some(newt_core::DEFAULT_SOUL),
+        Some(&coder),
+        "plan.md",
+    );
+    let count = prompt.matches(first_line).count();
+    assert_eq!(
+        count, 1,
+        "DEFAULT_SOUL text must appear exactly once; got {count} occurrences of {:?}",
+        first_line
+    );
+}
+
 /// Real persona files ground the named-preset picker: seeding, loading and
 /// repeated startup use the same store as the TUI, never a demo-only catalog.
 #[test]

@@ -143,7 +143,9 @@ fn persona_store_writes_coder_default_only_when_loaded() {
 
     assert_eq!(persona.name, "coder");
     assert_eq!(persona.path, dir.join("coder.md"));
-    assert!(persona.prompt.contains(newt_core::DEFAULT_SOUL));
+    // #2935: coder body is no longer DEFAULT_SOUL (that caused the soul to
+    // appear twice when --persona coder was active).
+    assert!(!persona.prompt.is_empty(), "coder has a non-empty body");
     assert!(
         dir.join("coder.md").is_file(),
         "first persona load should materialize the default coder file"

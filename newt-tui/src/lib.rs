@@ -5392,7 +5392,9 @@ impl PersonaStore {
     /// Shipped default personas, seeded per-file-idempotently (FR-16, #1000):
     /// each MISSING one is written on any store access, so an upgrade that
     /// predates a new default still receives it (the old empty-dir gate would
-    /// strand it forever). `coder` is the doer identity (DEFAULT_SOUL); `coach`
+    /// strand it forever). `coder` is a short editable placeholder (#2935 — it
+    /// used to seed DEFAULT_SOUL, which doubled the soul in the system prompt);
+    /// `coach`
     /// prefers advising first; its `altitude = "coach"` selects COACH_SOUL.
     /// `personal-assistant` specializes in routine automation. Its `skills:`
     /// binding preloads `gila-personal-assistant`, and its `tools:` preferences
@@ -5402,7 +5404,7 @@ impl PersonaStore {
     /// not capability or action-policy settings. A user who deletes a default
     /// gets it back next launch; empty the file to suppress it.
     const DEFAULT_PERSONAS: &'static [(&'static str, &'static str)] = &[
-        (Self::DEFAULT_NAME, newt_core::DEFAULT_SOUL),
+        (Self::DEFAULT_NAME, CODER_PERSONA),
         ("coach", COACH_PERSONA),
         ("personal-assistant", PERSONAL_ASSISTANT_PERSONA),
         ("steady", include_str!("../../personas/steady.md")),
@@ -5421,6 +5423,11 @@ impl PersonaStore {
         Ok(())
     }
 }
+
+/// The default coder persona (#2935): a short placeholder the user can edit.
+/// Using DEFAULT_SOUL here would send the soul twice when `--persona coder` is
+/// active (once from the identity block, once from the persona overlay).
+const CODER_PERSONA: &str = include_str!("../../personas/coder.md");
 
 /// The read-only coach persona shipped as a repo template (FR-16, #1000), so
 /// `shipped_role_templates_parse` type-checks its front-matter beside the others.
