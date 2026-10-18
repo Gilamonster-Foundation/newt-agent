@@ -331,6 +331,17 @@ class PrePushTests(unittest.TestCase):
         self.assertTrue(result.returncode != 0 or calls == CODE_GATE, result.stdout + result.stderr)
         self.assertNotIn("no code-affecting change", result.stdout)
 
+    def test_scoped_nextest_passes_when_the_scope_has_no_tests(self):
+        # A push whose changed scope holds no test targets (a lockfile or a
+        # README in such a crate) must pass, not fail: nextest's default
+        # treats "no tests to run" as an error. RED before: the scoped run
+        # had no --no-tests action and the 0.8.2 version-bump push failed.
+        base = self.cargo_chain()
+        local = self.commit("crate-a/src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        result, _ = self.hook(local, base)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--no-tests=pass", self.gate_argv("nextest"))
+
     def test_leaf_change_gates_every_transitive_reverse_dependent(self):
         # #1098 fix-first finding #1: a change in crate-a must reach clippy
         # for crate-b AND crate-c (the transitive closure), not just the crate

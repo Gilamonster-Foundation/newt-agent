@@ -509,7 +509,9 @@ else
 
     if [ "$_have_nextest" = 1 ]; then
         echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
-        cargo nextest run --retries 2 -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
+        # A changed scope can hold no tests at all (a lockfile or README in a
+        # crate with no test targets); that is a pass, not a failure.
+        cargo nextest run --retries 2 --no-tests=pass -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
     else
         echo "[pre-push] cargo-nextest not found; falling back to cargo test -p <crate> per crate"
         cargo test "${_pkg_args[@]}"
