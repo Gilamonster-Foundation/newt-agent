@@ -508,8 +508,22 @@ else
     cargo clippy "${_pkg_args[@]}" --all-targets -- -D warnings
 
     if [ "$_have_nextest" = 1 ]; then
-        echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
-        cargo nextest run --retries 2 -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
+        # A changed scope can hold no tests at all (a lockfile or README in a
+        # crate with no test targets). List the run's own selection with the
+        # profile default-filter ignored: empty means there is nothing to run,
+        # so skip. A selection the default-filter empties still fails, as
+        # nextest's default does. The listing must carry $NEXTEST_EXCLUDE: the
+        # binaries it names run their real body when merely listed. A
+        # listing that fails (a test binary that panics when listed) is not
+        # "no tests": fall through to the run, which reports the failure.
+        if _scope_list=$(cargo nextest list --ignore-default-filter -T oneline \
+                -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)" 2>/dev/null) \
+                && [ -z "$_scope_list" ]; then
+            echo "[pre-push] changed scope has no tests; skipping nextest"
+        else
+            echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
+            cargo nextest run --retries 2 -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
+        fi
     else
         echo "[pre-push] cargo-nextest not found; falling back to cargo test -p <crate> per crate"
         cargo test "${_pkg_args[@]}"
