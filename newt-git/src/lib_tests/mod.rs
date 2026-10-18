@@ -418,3 +418,19 @@ fn later_work_by_the_same_model_survives_an_earlier_commit() {
     let next = tool.finalize_commit_message("subject");
     assert!(next.contains("routed/a"), "{next}");
 }
+
+/// #2936 review round 4: on the embedded route, a contribution recorded
+/// between rendering a commit message and consuming after the commit landed
+/// is kept for the next commit. RED before: consumption used the live cutoff.
+#[test]
+fn embedded_consumption_uses_the_rendered_cutoff() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/b");
+    tool.note_contribution("routed/a");
+    let _ = tool.finalize_commit_message("subject");
+    tool.note_contribution("routed/c");
+    tool.consume_contributors();
+    let next = tool.finalize_commit_message("subject");
+    assert!(next.contains("routed/c"), "{next}");
+    assert!(!next.contains("routed/a"), "{next}");
+}

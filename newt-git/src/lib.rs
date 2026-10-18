@@ -1467,6 +1467,9 @@ pub struct ServedState {
     pub contributors: Vec<(u64, String)>,
     /// The sequence the next contribution gets.
     pub next: u64,
+    /// `next` as of the embedded tool's latest render: the cutoff its commit
+    /// consumes up to, so work recorded after rendering is kept.
+    pub rendered_upto: Option<u64>,
 }
 
 impl LocalGitTool {
@@ -1491,9 +1494,16 @@ impl LocalGitTool {
     ///
     /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
     fn finalize_commit_message(&self, message: &str) -> String {
+        let served = match self.served_model.lock() {
+            Ok(mut s) => {
+                s.rendered_upto = Some(s.next);
+                s.clone()
+            }
+            Err(_) => ServedState::default(),
+        };
         finalize_commit_message(
             &self.attribution,
-            &served_now(&self.served_model),
+            &served,
             &self.contributors_consumed,
             message,
         )
@@ -1508,7 +1518,14 @@ impl LocalGitTool {
             self.contributors_consumed
                 .store(a.contributors.len(), std::sync::atomic::Ordering::Relaxed);
         }
-        forget_credited(&self.served_model, served_now(&self.served_model).next);
+        let upto = self
+            .served_model
+            .lock()
+            .ok()
+            .and_then(|mut s| s.rendered_upto.take());
+        if let Some(upto) = upto {
+            forget_credited(&self.served_model, upto);
+        }
     }
 
     /// Drain the explicit commit-success counter — returns the number of
