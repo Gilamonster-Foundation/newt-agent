@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-frame"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "content-addressable",
  "serde",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "agent-harness-py"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "agent-frame",
  "content-addressable",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "newt-harness"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "agent-frame",
  "content-addressable",

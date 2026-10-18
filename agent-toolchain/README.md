@@ -28,7 +28,8 @@ Git mutation or platform parity.
 The default model tool surface should remain small: read, write, edit, and
 command execution. Specialized adapters are optional extensions and must
 not intercept commands they cannot faithfully execute. Newt owns operator
-permissions, session audit, and contribution attribution; platform
+permissions, session audit, and contribution attribution (a `GitTool` is told
+which model served each round and which did material work); platform
 confinement continues to enforce the actual effects of child processes.
 
 See [the extraction plan](../docs/design/agent-toolchain.md) for migration

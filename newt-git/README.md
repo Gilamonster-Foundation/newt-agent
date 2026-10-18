@@ -38,7 +38,9 @@ and later calls retain their own targets. Absolute paths, parent traversal,
 escaping symlinks and directories that would discover a parent repository are
 refused. Selected worktrees and shared Git metadata retain their read/write
 grant checks. Admitted commits use the same attribution finalizer and success
-accounting as the session root. This does not enable commits under bounded
+accounting as the session root. Attribution credits the model that served each
+round, so a router such as `openrouter/auto` is credited as the model it routed
+to, and every served model that did work since the last commit. This does not enable commits under bounded
 reads; that remaining boundary is tracked in
 [#2288](https://github.com/Gilamonster-Foundation/newt-agent/issues/2288).
 
