@@ -9,6 +9,63 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+## [0.8.2] — UNRELEASED
+
+### Security
+
+- A cloned repository can no longer supply inference endpoints. A project's
+  `.newt/backends/*.toml` and `.newt/dgx/*.toml` drop-ins are no longer merged
+  (before, one could replace an operator backend of the same name, endpoint
+  included); newt warns that they are ignored. `newt doctor` no longer parses
+  or probes them with the operator's credentials, and a project's
+  `.newt/providers/` presets no longer replace built-in or operator ones
+  (#2929).
+- A project config can no longer set `[context.semantic].embeddings_endpoint`,
+  `intake.adjudicator` or `smart_harness.backend`, in any shape TOML accepts.
+  Each names an endpoint that receives source text or a credential (#2930).
+
+### Fixed
+
+- Commit attribution credits the model that actually served each round, not
+  the model the request named. With a router such as `openrouter/auto`, commits
+  now name the routed model (#2936).
+- `newt mcp import` respects the config locks it already holds instead of
+  contending with itself, and migrates an old config before taking its
+  snapshot (#2911).
+- `newt mcp import` names each rejected server and never offers it a runnable
+  command (#2912).
+- Import, `newt doctor`, `newt auth` and `/mcp` share one readiness
+  classification. It never resolves a secret or runs a command, follows the
+  runtime's precedence between an explicit Authorization header and a saved
+  OAuth login, and never tells a stdio server to run `newt auth` (#2913).
+- A reply cut off at the output limit is recovered up to twice in a row
+  instead of stopping the turn. A capped tool batch is never partly run: it is
+  retried with a raised cap, or with guidance when no headroom is left, and
+  truncated text is continued. A reasoning-only stop still ends the turn
+  (#2874). On Anthropic the raised cap is bounded by the model card's new
+  `output_ceiling_tokens` or the probed `max_tokens`, else the existing
+  default; on every wire it is clamped to the context window when the window
+  and input size are known (#2907).
+- OpenAI-compatible streams accept a repeated finish chunk that only adds
+  usage, as OpenRouter sends for some providers (#2908).
+
+### Added
+
+- Commits that land through `run_command` are reviewed when newt can read the
+  repository's Git metadata: a deterministic check of newt's trailers and a
+  leak scan, plus a model content review when the smart harness and its review
+  budget are available. Up to 16 commits are checked per command, with model
+  review for up to four. Findings are flagged in the tool result, never
+  rejected (#2905).
+- Groundwork, read but not yet acted on: an optional `[meter]` block on
+  backends (#2909) and the `[inference] pin` policy for sovereign inference
+  (#2927).
+
+### Release/CI
+
+- `cargo audit` accepts three `zip` advisories reached only through
+  `candle-core`, which never calls the affected `extract()` (#656).
+
 ## [0.8.1] — 2026-10-14
 
 ### Added
