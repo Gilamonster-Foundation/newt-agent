@@ -81,6 +81,14 @@ cargo() {
     # gate: answer it from PRE_PUSH_TEST_NO_NEXTEST (unset = present) so a
     # test can force the no-nextest fallback on a box that has nextest.
     if [ "$1" = "nextest" ] && [ "$2" = "--version" ]; then return "${PRE_PUSH_TEST_NO_NEXTEST:-0}"; fi
+    # `cargo nextest list` is the hook's does-the-scope-have-tests probe, not
+    # a gate: one test by default, none when PRE_PUSH_TEST_NO_SCOPE_TESTS=1,
+    # a failed listing when PRE_PUSH_TEST_SCOPE_LIST_FAILS=1.
+    if [ "$1" = "nextest" ] && [ "$2" = "list" ]; then
+        [ "${PRE_PUSH_TEST_SCOPE_LIST_FAILS:-0}" = 1 ] && return 101
+        [ "${PRE_PUSH_TEST_NO_SCOPE_TESTS:-0}" = 1 ] || echo "crate-a tests::t"
+        return 0
+    fi
     printf '%s\n' "$1" >> "$PRE_PUSH_TEST_LOG"
     printf '%s\0' "$*" >> "$PRE_PUSH_TEST_ARGV"
 }
@@ -330,6 +338,39 @@ class PrePushTests(unittest.TestCase):
         # Refusal is safe too; a successful hook must execute the full gate.
         self.assertTrue(result.returncode != 0 or calls == CODE_GATE, result.stdout + result.stderr)
         self.assertNotIn("no code-affecting change", result.stdout)
+
+    def test_a_scope_with_no_tests_skips_nextest_and_passes(self):
+        # A push whose changed scope holds no tests at all (a lockfile or a
+        # README in a crate with no tests) must pass: nextest's default treats
+        # "no tests to run" as an error. RED before: the hook ran nextest on
+        # the empty scope and the 0.8.2 version-bump push failed.
+        base = self.cargo_chain()
+        local = self.commit("crate-a/src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        result, calls = self.hook(local, base, setup="export PRE_PUSH_TEST_NO_SCOPE_TESTS=1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("changed scope has no tests", result.stdout)
+        self.assertNotIn("nextest", calls)
+
+    def test_a_scope_with_tests_still_fails_on_an_empty_selection(self):
+        # When the scope does have tests, the run keeps nextest's default, so a
+        # filter that hides them all is still an error rather than a pass.
+        base = self.cargo_chain()
+        local = self.commit("crate-a/src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        result, calls = self.hook(local, base)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("nextest", calls)
+        self.assertNotIn("--no-tests", self.gate_argv("nextest"))
+
+    def test_a_failed_scope_listing_still_runs_nextest(self):
+        # A test binary that panics while nextest lists it made the probe
+        # count zero tests, so the hook skipped the run and passed. A failed
+        # listing must fall through to the run, which reports it.
+        base = self.cargo_chain()
+        local = self.commit("crate-a/src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        result, calls = self.hook(local, base, setup="export PRE_PUSH_TEST_SCOPE_LIST_FAILS=1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("nextest", calls)
+        self.assertNotIn("changed scope has no tests", result.stdout)
 
     def test_leaf_change_gates_every_transitive_reverse_dependent(self):
         # #1098 fix-first finding #1: a change in crate-a must reach clippy
