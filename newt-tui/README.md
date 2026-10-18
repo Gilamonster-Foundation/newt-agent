@@ -7,7 +7,10 @@ deliberately scoped to chat and agentic coding — not feature-rich. Splash +
 chat REPL + slash commands + ocap-gated tool use. Durable configuration lives
 in plain `~/.newt/config.toml` (see `newt config`), and the
 setup wizards (`newt init` / `newt setup`) probe for local or remote models and
-write that file plus one `backends/*.toml` drop-in per endpoint.
+write that file plus one `backends/*.toml` drop-in per endpoint. Only the
+operator's `~/.newt/backends/` is read: a project's `.newt/backends/`,
+`.newt/dgx/` and `.newt/providers/` are ignored with a warning, so a cloned
+repository cannot supply an inference endpoint.
 
 ## Settings and communication style
 
