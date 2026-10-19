@@ -76,8 +76,7 @@ fn coder_persona_does_not_send_soul_twice_2935() {
     let count = prompt.matches(first_line).count();
     assert_eq!(
         count, 1,
-        "DEFAULT_SOUL text must appear exactly once; got {count} occurrences of {:?}",
-        first_line
+        "DEFAULT_SOUL text must appear exactly once; got {count} occurrences of {first_line:?}"
     );
 }
 
