@@ -57,18 +57,28 @@ fn system_prompt_index_unions_search_path_first_dir_wins() {
     assert!(block.contains("judge: scoring"));
 }
 
+/// #2935: the identity comes from the `SoulProvider` the runtime always
+/// installs (`chat.rs`), so the prompt builder no longer carries its own
+/// `DEFAULT_SOUL` fallback. A memory manager with no soul provider yields a
+/// prompt with no soul — the builder never invents one.
+///
+/// Red before the removal: the `None` soul arm injected DEFAULT_SOUL.
 #[serial_test::serial(real_fs)]
 #[test]
-fn system_prompt_fallback_uses_canonical_default_soul() {
-    // Regression: the no-soul fallback used to be a private copy of the
-    // identity string that drifted from newt-core's DEFAULT_SOUL. It must
-    // now embed the canonical constant verbatim so the two can't diverge.
+fn no_soul_provider_means_no_default_soul_2935() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
-    let prompt = build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None, "test-plan.md");
+    let memory = newt_core::MemoryManager::new();
+    let prompt = rebuild_system_prompt(tmp.path().to_str().unwrap(), &memory, None, "s");
+    let first_line = newt_core::DEFAULT_SOUL
+        .lines()
+        .find(|l| !l.is_empty())
+        .unwrap();
     assert!(
-        prompt.contains(newt_core::DEFAULT_SOUL),
-        "fallback must embed newt_core::DEFAULT_SOUL verbatim"
+        !prompt.contains(first_line),
+        "the builder must not inject DEFAULT_SOUL on its own; got: {prompt:.200}"
     );
+    assert!(prompt.contains("Workspace: "), "the rest of the prompt is intact");
 }
 
 #[serial_test::serial(real_fs)]

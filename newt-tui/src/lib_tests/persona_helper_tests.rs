@@ -80,6 +80,39 @@ fn coder_persona_does_not_send_soul_twice_2935() {
     );
 }
 
+/// #2935 (review round 1): an installed `coder.md` seeded by a release up to
+/// v0.8.2 holds DEFAULT_SOUL verbatim, and `ensure_defaults` skips existing
+/// files, so upgrading alone left the soul doubled. The exact old seed is
+/// replaced with the shipped placeholder; an operator-edited file is never
+/// touched, even one that merely appends to the old seed.
+///
+/// Red before the migration: the untouched old seed loads as DEFAULT_SOUL.
+#[serial_test::serial(real_fs)]
+#[test]
+fn legacy_coder_seed_is_migrated_but_edits_are_kept_2935() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("personas");
+    std::fs::create_dir_all(&dir).unwrap();
+    let coder_md = dir.join("coder.md");
+    std::fs::write(&coder_md, newt_core::DEFAULT_SOUL).unwrap();
+    let store = PersonaStore::new(dir.clone());
+
+    let coder = store.load("coder").unwrap();
+    assert_eq!(
+        coder.prompt.trim(),
+        CODER_PERSONA.trim(),
+        "the exact v0.8.2 seed must be replaced by the shipped placeholder"
+    );
+    assert_eq!(std::fs::read_to_string(&coder_md).unwrap(), CODER_PERSONA);
+
+    // An edit on top of the old seed is operator data: left byte-for-byte.
+    let edited = format!("{}\n\nAlways run just check.\n", newt_core::DEFAULT_SOUL);
+    std::fs::write(&coder_md, &edited).unwrap();
+    let coder = store.load("coder").unwrap();
+    assert_eq!(std::fs::read_to_string(&coder_md).unwrap(), edited);
+    assert!(coder.prompt.contains("Always run just check."));
+}
+
 /// Real persona files ground the named-preset picker: seeding, loading and
 /// repeated startup use the same store as the TUI, never a demo-only catalog.
 #[test]
