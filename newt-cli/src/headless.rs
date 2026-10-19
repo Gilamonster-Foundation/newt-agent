@@ -134,10 +134,15 @@ pub struct HeadlessArgs {
 /// driver's transcript with one system message naming the real root, the
 /// same fact `newt-tui`'s interactive loop already states via its
 /// `Workspace: {path}` line (`newt-tui/src/lib.rs`).
-fn workspace_root_system_message(workspace: &str) -> newt_core::MemMessage {
-    // #2937: annotation is session-owned; the piece shows as (unattributed)
-    // in the report until report_sink threading reaches this function.
-    newt_core::MemMessage::system(format!("Workspace root: {workspace}"))
+fn workspace_root_system_message(
+    workspace: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> newt_core::MemMessage {
+    let text = format!("Workspace root: {workspace}");
+    if let Some(s) = sink {
+        s.annotate("workspace root", "headless::workspace_root_system_message", &text);
+    }
+    newt_core::MemMessage::system(text)
 }
 
 fn seed_scratchpad(json: &str) -> Result<(Arc<newt_core::SessionScratchpadStore>, String)> {
@@ -659,8 +664,12 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         ));
     }
     let read_scope = dc.caveats.fs_read.clone();
+    let sys_msg = {
+        let sink_ref = dc.report_sink.as_deref();
+        workspace_root_system_message(&workspace, sink_ref)
+    };
     let mut driver =
-        TurnDriver::with_transcript(dc, vec![workspace_root_system_message(&workspace)])
+        TurnDriver::with_transcript(dc, vec![sys_msg])
             .with_cognition(runtime.cognition)
             .with_tenacity(runtime.tenacity)
             .with_initiative(runtime.initiative);
@@ -1814,7 +1823,7 @@ mod tests {
     /// exactly like newt-tui's `Workspace: {path}` line.
     #[test]
     fn workspace_root_system_message_names_the_real_root() {
-        let msg = workspace_root_system_message("/home/dev/proj");
+        let msg = workspace_root_system_message("/home/dev/proj", None);
         assert_eq!(msg.role, newt_core::memory::Role::System);
         assert!(
             msg.content.contains("/home/dev/proj"),

@@ -5169,7 +5169,7 @@ mod resumed_preference_tests;
 // build_system_prompt_with_soul is used directly now; this wrapper kept for tests.
 #[allow(dead_code)]
 fn build_system_prompt(workspace: &str, plan_path: &str) -> String {
-    build_system_prompt_with_soul(workspace, None, plan_path)
+    build_system_prompt_with_soul(workspace, None, plan_path, None)
 }
 
 /// Seat `persona`'s declared dials (cognition and initiative) as the persona
@@ -5827,8 +5827,13 @@ fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String>
     newt_skills::index_block(&newt_skills::discover_paths(skills_dirs))
 }
 
-fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>, plan_path: &str) -> String {
-    build_system_prompt_with_persona(workspace, soul, None, plan_path)
+fn build_system_prompt_with_soul(
+    workspace: &str,
+    soul: Option<&str>,
+    plan_path: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    build_system_prompt_with_persona(workspace, soul, None, plan_path, sink)
 }
 
 /// FR-5 (#999): the minimal persona that carries ONLY an altitude, used when
@@ -5867,6 +5872,7 @@ fn build_system_prompt_with_persona(
     soul: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     // FR-5 (#999): the active persona's ALTITUDE selects the base identity. A
     // `Coach` altitude REPLACES the identity with COACH_SOUL (and overrides a
@@ -5888,11 +5894,13 @@ fn build_system_prompt_with_persona(
          Other requested paths remain governed by the session's permissions. \
          Historical notes do not redefine this root.\n"
     );
-    // #2937: attribution is threaded per-turn from chat.rs via the session's
-    // ReportSink. Pieces annotated here show as (unattributed) until
-    // report_sink threading reaches rebuild_system_prompt callers.
-    #[allow(unused_variables)]
-    let note = |_label: &str, _text: &str| {};
+    // #2937: annotate each named piece through the session's ReportSink so
+    // /context request can attribute components in the system message.
+    let note = |label: &str, text: &str| {
+        if let Some(s) = sink {
+            s.annotate(label, "build_system_prompt_with_persona", text);
+        }
+    };
     if let Some(persona) = persona {
         ctx.push_str(&format!(
             "\nActive persona: {}\n{}\n",
@@ -6008,6 +6016,7 @@ fn rebuild_system_prompt(
     memory: &newt_core::MemoryManager,
     persona: Option<&Persona>,
     conversation_id: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     let soul_additions = memory.build_system_prompt_additions();
     let soul_text = if soul_additions.is_empty() {
@@ -6017,7 +6026,7 @@ fn rebuild_system_prompt(
     };
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
-    build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy())
+    build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy(), sink)
 }
 
 fn handle_operating_mode_command(
@@ -6252,7 +6261,7 @@ fn reset_conversation(
     // survive any of those paths.
     ctx.mode_states.clear();
     ctx.memory.reset_all();
-    *ctx.system = rebuild_system_prompt(workspace, ctx.memory, active_persona, ctx.conversation_id);
+    *ctx.system = rebuild_system_prompt(workspace, ctx.memory, active_persona, ctx.conversation_id, None);
 }
 
 fn new_conversation_message(active_persona: Option<&Persona>) -> String {
@@ -7167,6 +7176,7 @@ fn commit_prepared(
         ctx.memory,
         ctx.active_persona.as_ref(),
         ctx.active_conversation_id,
+        None,
     );
     (record, warning)
 }
@@ -7797,6 +7807,7 @@ fn handle_persona_command(
                     ctx.memory,
                     active_persona.as_ref(),
                     ctx.conversation_id,
+                    None,
                 );
                 Ok(persona_swap_kept_context_message(active_persona.as_ref()))
             } else {

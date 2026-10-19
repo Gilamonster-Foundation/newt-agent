@@ -350,6 +350,7 @@ impl TabSwitchCtx<'_> {
                     self.memory,
                     self.active_persona.as_ref(),
                     self.active_conversation_id,
+                    None,
                 );
             }
         }

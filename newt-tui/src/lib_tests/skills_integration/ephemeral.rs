@@ -140,7 +140,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
     let mut memory2 = newt_core::MemoryManager::new();
     memory2.add_provider(newt_core::Summarizing::new(512));
     let workspace_str = workspace.to_str().unwrap();
-    let mut system = rebuild_system_prompt(workspace_str, &memory2, None, "test-session");
+    let mut system = rebuild_system_prompt(workspace_str, &memory2, None, "test-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = newt_core::new_conversation_id();
     let mut compress_state = newt_core::CompressState::new();

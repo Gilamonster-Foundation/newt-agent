@@ -50,8 +50,13 @@ pub struct RequestReport {
     pub system: Vec<SystemMessage>,
     pub tools: Vec<ToolSize>,
     /// Length of the serialized `tools` array; exceeds the sum of `tools` by
-    /// the array's brackets and commas.
+    /// the array's brackets and commas. Zero when the provider omitted the
+    /// tools key entirely (distinguished from `Some(&[])` which serialises as
+    /// `[]`, 2 chars).
     pub tools_array_chars: usize,
+    /// True when the provider sent no tools field at all (distinct from an
+    /// empty `[]` array).
+    pub tools_omitted: bool,
 }
 
 const UNATTRIBUTED: &str = "(unattributed)";
@@ -104,7 +109,15 @@ fn components_of(text: &str, notes: &[Annotation]) -> Vec<Component> {
 impl RequestReport {
     /// Build from raw system texts and tools (provider format). Preferred over
     /// `build` when the caller already has provider-specific values.
-    pub fn build_from_parts(system_texts: &[&str], tools: &[Value], notes: &[Annotation]) -> Self {
+    ///
+    /// `tools = None` means the provider omitted the tools field entirely
+    /// (e.g. a cap-exit summary); `tools = Some(&[])` means an explicit empty
+    /// array was sent.
+    pub fn build_from_parts(
+        system_texts: &[&str],
+        tools: Option<&[Value]>,
+        notes: &[Annotation],
+    ) -> Self {
         let card = Annotation {
             label: "active-prompt card".into(),
             source: "agentic::prompt_read::active_prompt_card".into(),
@@ -135,15 +148,24 @@ impl RequestReport {
             chars: chars(&t.to_string()),
             schema: t.clone(),
         };
+        let (tool_sizes, tools_array_chars, tools_omitted) = match tools {
+            None => (vec![], 0, true),
+            Some(arr) => (
+                arr.iter().map(sized).collect(),
+                chars(&Value::Array(arr.to_vec()).to_string()),
+                false,
+            ),
+        };
         Self {
             system,
-            tools: tools.iter().map(sized).collect(),
-            tools_array_chars: chars(&Value::Array(tools.to_vec()).to_string()),
+            tools: tool_sizes,
+            tools_array_chars,
+            tools_omitted,
         }
     }
 
     /// Convenience: extract system messages from an OpenAI-format message list.
-    pub fn build(messages: &[Value], tools: &[Value], notes: &[Annotation]) -> Self {
+    pub fn build(messages: &[Value], tools: Option<&[Value]>, notes: &[Annotation]) -> Self {
         let texts: Vec<&str> = messages
             .iter()
             .filter(|m| m["role"] == "system")
@@ -168,13 +190,19 @@ impl RequestReport {
                 out.push_str(&format!("| {} | {} | {} |\n", c.label, c.source, c.chars));
             }
         }
-        out.push_str(&format!(
-            "\n## Tools ({} tools, {} chars as sent)\n\n| tool | chars |\n|---|---:|\n",
-            self.tools.len(),
-            self.tools_array_chars
-        ));
-        for t in &self.tools {
-            out.push_str(&format!("| {} | {} |\n", t.name, t.chars));
+        if self.tools_omitted {
+            out.push_str("\n## Tools (omitted by provider — no tools field sent)\n\n");
+        } else {
+            out.push_str(&format!(
+                "\n## Tools ({} tools, {} chars as sent)\n\n| tool | chars |\n|---|---:|\n",
+                self.tools.len(),
+                self.tools_array_chars
+            ));
+        }
+        if !self.tools_omitted {
+            for t in &self.tools {
+                out.push_str(&format!("| {} | {} |\n", t.name, t.chars));
+            }
         }
         out.push_str(&format!(
             "\nTotal: system {} + tools {} = {} chars\n",
@@ -303,13 +331,25 @@ impl ReportSink {
         self.s().last.clone()
     }
 
+    /// Snapshot of current annotations — lets the TUI command handler build a
+    /// fresh report without submitting a turn.
+    pub fn snapshot_notes(&self) -> Vec<Annotation> {
+        self.s().notes.clone()
+    }
+
     /// Called at the final body-construction boundary of each provider, every
     /// round and summary send. Builds and stores the report from the exact
-    /// provider-format values dispatched. Returns `Err(RequestDumped)` when
-    /// the dump-and-stop mode is armed and the write succeeded; propagates
+    /// provider-format values dispatched. `tools = None` means the provider
+    /// omitted the tools field (e.g. cap-exit summary); `tools = Some(arr)`
+    /// means an explicit array (possibly empty). Returns `Err(RequestDumped)`
+    /// when dump-and-stop mode is armed and the write succeeded; propagates
     /// write errors as-is (a failed write is never silently reported as
     /// success).
-    pub fn observe_request(&self, system_texts: &[&str], tools: &[Value]) -> anyhow::Result<()> {
+    pub fn observe_request(
+        &self,
+        system_texts: &[&str],
+        tools: Option<&[Value]>,
+    ) -> anyhow::Result<()> {
         let notes = self.s().notes.clone();
         let report = RequestReport::build_from_parts(system_texts, tools, &notes);
         let mut s = self.s();
@@ -362,7 +402,7 @@ mod tests {
             note("inner", "Workspace"), // overlaps "workspace": dropped
             note("ghost", "not in the text"),
         ];
-        let r = RequestReport::build(&messages, &tools, &notes);
+        let r = RequestReport::build(&messages, Some(&tools), &notes);
         assert_eq!(r.system.len(), 2);
         for m in &r.system {
             let sum: usize = m.components.iter().map(|c| c.chars).sum();
@@ -388,8 +428,10 @@ mod tests {
 
     #[test]
     fn empty_request_reports_zero() {
-        let r = RequestReport::build(&[], &[], &[]);
+        // Some(&[]) = explicit empty array sent => 2 chars for `[]`
+        let r = RequestReport::build(&[], Some(&[]), &[]);
         assert_eq!((r.system_chars(), r.tools_array_chars), (0, 2));
+        assert!(!r.tools_omitted);
     }
 
     /// Two independent ReportSink instances cannot cross-contaminate: separate
@@ -410,7 +452,7 @@ mod tests {
 
         // observe on A populates A's last but not B's.
         sink_a
-            .observe_request(&["hello"], &[json!({"name": "t1"})])
+            .observe_request(&["hello"], Some(&[json!({"name": "t1"})]))
             .unwrap();
         assert!(sink_a.last_report().is_some());
         assert!(sink_b.last_report().is_none());
@@ -421,7 +463,7 @@ mod tests {
     fn schema_in_markdown() {
         let sink = ReportSink::new();
         let tool = json!({"type": "function", "function": {"name": "my_tool", "description": "does stuff", "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}});
-        sink.observe_request(&["sys text"], &[tool]).unwrap();
+        sink.observe_request(&["sys text"], Some(&[tool])).unwrap();
         let md = sink.last_report().unwrap().to_markdown();
         // Should contain the description from the schema
         assert!(
@@ -439,7 +481,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let sink = ReportSink::prepare_and_dump(dir.clone());
         let err = sink
-            .observe_request(&["sys"], &[])
+            .observe_request(&["sys"], Some(&[]))
             .expect_err("should fail writing to a directory");
         // The error is NOT a RequestDumped (write failed before we could stop).
         assert!(
@@ -448,5 +490,44 @@ mod tests {
         );
         // last_report is None — we never stored a stale report.
         assert!(sink.last_report().is_none());
+    }
+
+    /// None tools (omitted) vs Some(&[]) (empty array) are distinguishable.
+    #[test]
+    fn tools_omitted_vs_empty() {
+        let r_omitted = RequestReport::build_from_parts(&["sys"], None, &[]);
+        assert!(r_omitted.tools_omitted);
+        assert_eq!(r_omitted.tools_array_chars, 0);
+        assert!(r_omitted.to_markdown().contains("omitted by provider"));
+
+        let r_empty = RequestReport::build_from_parts(&["sys"], Some(&[]), &[]);
+        assert!(!r_empty.tools_omitted);
+        assert_eq!(r_empty.tools_array_chars, 2);
+        assert!(r_empty.to_markdown().contains("0 tools, 2 chars"));
+    }
+
+    /// arm_show_next is consumed exactly once by take_show_flag.
+    #[test]
+    fn show_flag_consumed_once() {
+        let sink = ReportSink::new();
+        sink.arm_show_next();
+        sink.observe_request(&["sys"], Some(&[])).unwrap();
+        assert!(sink.take_show_flag(), "flag should be set after arm_show_next");
+        assert!(
+            !sink.take_show_flag(),
+            "flag should be clear after first consumption"
+        );
+    }
+
+    /// snapshot_notes returns annotations without draining them.
+    #[test]
+    fn snapshot_notes_independent() {
+        let sink = ReportSink::new();
+        sink.annotate("k1", "s1", "v1");
+        sink.annotate("k2", "s2", "v2");
+        let snap = sink.snapshot_notes();
+        assert_eq!(snap.len(), 2);
+        // Notes still in sink after snapshot.
+        assert_eq!(sink.snapshot_notes().len(), 2);
     }
 }

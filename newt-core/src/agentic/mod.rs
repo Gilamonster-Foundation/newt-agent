@@ -2264,13 +2264,17 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     .filter(|m| m["role"] == "system")
                     .filter_map(|m| m["content"].as_str())
                     .collect();
-                let empty: Vec<serde_json::Value> = vec![];
-                let send_tools: &[serde_json::Value] = if tools_supported {
-                    tools.as_array().map(|a| a.as_slice()).unwrap_or(&empty)
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    Some(tools.as_array().map(|a| a.as_slice()).unwrap_or(&[]))
                 } else {
-                    &empty
+                    None
                 };
                 sink.observe_request(&sys_texts, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        display::print_newt(&r.to_markdown(), color, false);
+                    }
+                }
             }
 
             // Retry the send+status+parse as one unit — a connection drop at any
@@ -3972,7 +3976,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         prompt_measurement: Default::default(),
         fell_back: Default::default(),
     };
-    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts).await;
+    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts, report_sink).await;
     let (text, streamed, usage) = cap.recover_rejection(
         result,
         &mut solve_obs,
@@ -6389,6 +6393,7 @@ async fn final_summary_ollama(
     mut messages: Vec<serde_json::Value>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     if !cap.fits(&messages, model) {
@@ -6400,6 +6405,14 @@ async fn final_summary_ollama(
         "messages": &messages,
         "stream": false,
     });
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(s) = sink {
+        let sys_texts: Vec<&str> = messages.iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        s.observe_request(&sys_texts, None)?;
+    }
     if let Some(options) = &cap.ollama_options {
         body["options"] = options.clone();
     }
@@ -6544,12 +6557,21 @@ async fn final_summary_openai(
     context_window: Option<u32>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     let (count_client, stream_client) = clients;
     cap.push_nudge(&mut messages);
     let messages = openai_chat_wire_messages(&messages)?;
     if !cap.fits(&messages, model) {
         return Ok(cap.fallback());
+    }
+    // #2937: capture summary send (no tools field).
+    if let Some(s) = sink {
+        let sys_texts: Vec<&str> = messages.iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        s.observe_request(&sys_texts, None)?;
     }
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
     let mut body = serde_json::json!({
@@ -7414,13 +7436,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     .filter(|m| m["role"] == "system")
                     .filter_map(|m| m["content"].as_str())
                     .collect();
-                let empty: Vec<serde_json::Value> = vec![];
-                let send_tools: &[serde_json::Value] = if tools_supported {
-                    tools.as_array().map(|a| a.as_slice()).unwrap_or(&empty)
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    Some(tools.as_array().map(|a| a.as_slice()).unwrap_or(&[]))
                 } else {
-                    &empty
+                    None
                 };
                 sink.observe_request(&sys_texts, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        display::print_newt(&r.to_markdown(), color, false);
+                    }
+                }
             }
             // OpenAI-compatible endpoints do not accept a `num_ctx` request field,
             // but the operator-declared local window still bounds Newt's pre-send
@@ -9100,6 +9126,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         generation_window,
         &cap,
         attempts,
+        report_sink,
     );
     let Some(result) = cancellable(cancel, summary).await else {
         cap.learn_measurement(compress_state)?;
@@ -9466,11 +9493,17 @@ async fn final_summary_anthropic(
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
     if !cap.fits(&wire_messages, model) {
         return Ok(cap.fallback());
+    }
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(s) = sink {
+        let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
+        s.observe_request(&sys_arr, None)?;
     }
     // Omit `tools` => the model cannot emit tool_use blocks (mirrors the
     // OpenAI path's tools-disabled summary).
@@ -10269,9 +10302,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // #2937: capture per-round final body after tools gate.
             if let Some(sink) = report_sink {
                 let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
-                let send_tools: &[serde_json::Value] =
-                    if use_tools { &tools_anthropic } else { &[] };
+                let send_tools: Option<&[serde_json::Value]> =
+                    if use_tools { Some(&tools_anthropic) } else { None };
                 sink.observe_request(&sys_arr, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        display::print_newt(&r.to_markdown(), color, false);
+                    }
+                }
             }
             let dispatch = anthropic_dispatch_round(
                 &dispatcher,
@@ -11898,6 +11936,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         generation_policy,
         &cap,
         attempts,
+        report_sink,
     )
     .await;
     let (text, streamed, usage) = cap.recover_rejection(
@@ -12787,12 +12826,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 } else {
                     std::slice::from_ref(&ins_str)
                 };
-                let empty: Vec<serde_json::Value> = vec![];
-                let send_tools: &[serde_json::Value] = body["tools"]
-                    .as_array()
-                    .map(|a| a.as_slice())
-                    .unwrap_or(empty.as_slice());
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    Some(body["tools"].as_array().map(|a| a.as_slice()).unwrap_or(&[]))
+                } else {
+                    None
+                };
                 sink.observe_request(sys_arr, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        display::print_newt(&r.to_markdown(), color, false);
+                    }
+                }
             }
             let output_cap = generation_bounds::apply_responses(
                 &mut body,
@@ -13894,6 +13938,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // final summary can carry NO tools; a proactive-compaction reason (if any) rides
     // its error chain. Only a `ValidatedResponsesRequest` reaches the dispatcher.
     let mut body = build_body(&input, &[]);
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(sink) = report_sink {
+        let sys_arr: Vec<&str> = instructions.as_deref().into_iter().collect();
+        let _ = sink.observe_request(&sys_arr, None);
+        if sink.take_show_flag() {
+            if let Some(r) = sink.last_report() {
+                display::print_newt(&r.to_markdown(), color, false);
+            }
+        }
+    }
     let output_cap = generation_bounds::apply_responses(
         &mut body,
         generation_policy.output_allowance,

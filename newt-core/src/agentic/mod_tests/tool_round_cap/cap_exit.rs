@@ -452,8 +452,10 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_options: ollama_options(Some(4_096), None),
             prompt_measurement: Default::default(),
+
             fell_back: Default::default(),
         },
+        None,
         None,
     )
     .await
@@ -531,6 +533,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
             prompt_measurement: Default::default(),
             fell_back: Default::default(),
         },
+        None,
         None,
     )
     .await
@@ -613,6 +616,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             fell_back: Default::default(),
         },
         None,
+        None,
     )
     .await
     .expect("oversized cap exit returns deterministic fallback");
@@ -676,6 +680,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             prompt_measurement: Default::default(),
             fell_back: Default::default(),
         },
+        None,
         None,
     )
     .await

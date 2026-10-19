@@ -2795,6 +2795,7 @@ fn session_body(
         &memory,
         active_persona.as_ref(),
         &active_conversation_id,
+        Some(&*report_sink),
     );
 
     // 17.7: `/new` opts the SESSION out of auto-resume. Every auto-resume
@@ -5262,20 +5263,33 @@ fn session_body(
                                 print_newt(&line, color, verbose);
                             }
                         } else if rest == "request" {
-                            // #2937: the final system message(s) and tools array,
-                            // sized per component. Read off the request the loop
-                            // built; before any request exists, arm it to print
-                            // just before the first send.
-                            match report_sink.last_report() {
-                                Some(report) => print_newt(&report.to_markdown(), color, verbose),
-                                None => {
-                                    report_sink.arm_show_next();
-                                    print_newt(
-                                        "no request built yet; the report prints just before your next message is sent",
-                                        color,
-                                        verbose,
-                                    );
-                                }
+                            // #2937: rebuild the system prompt to pick up fresh
+                            // annotations (persona, plan, workspace), then build
+                            // the report immediately without submitting a turn.
+                            // Tools come from the last captured round so the
+                            // report is always current; they show empty until
+                            // after the first send.
+                            let fresh_system = rebuild_system_prompt(
+                                workspace,
+                                &memory,
+                                active_persona.as_ref(),
+                                &active_conversation_id,
+                                Some(&*report_sink),
+                            );
+                            let last_tools: Vec<serde_json::Value> = report_sink
+                                .last_report()
+                                .map(|r| r.tools.iter().map(|t| t.schema.clone()).collect())
+                                .unwrap_or_default();
+                            let notes = report_sink.snapshot_notes();
+                            let report =
+                                newt_core::agentic::request_report::RequestReport::build_from_parts(
+                                    &[fresh_system.as_str()],
+                                    Some(&last_tools),
+                                    &notes,
+                                );
+                            let md = report.to_markdown();
+                            for line in md.lines() {
+                                print_newt(line, color, verbose);
                             }
                         } else if rest == "show" {
                             // Build the outbound message set fresh and render a

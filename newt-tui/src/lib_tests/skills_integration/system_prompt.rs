@@ -64,7 +64,7 @@ fn system_prompt_fallback_uses_canonical_default_soul() {
     // identity string that drifted from newt-core's DEFAULT_SOUL. It must
     // now embed the canonical constant verbatim so the two can't diverge.
     let tmp = tempfile::TempDir::new().unwrap();
-    let prompt = build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None, "test-plan.md");
+    let prompt = build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None, "test-plan.md", None);
     assert!(
         prompt.contains(newt_core::DEFAULT_SOUL),
         "fallback must embed newt_core::DEFAULT_SOUL verbatim"
@@ -80,7 +80,7 @@ fn system_prompt_names_the_per_session_plan_path() {
     let ws = tmp.path().to_str().unwrap();
     let path_a = newt_core::session_plan_path("sess-aaaa");
     let path_a = path_a.to_string_lossy();
-    let prompt_a = build_system_prompt_with_soul(ws, None, &path_a);
+    let prompt_a = build_system_prompt_with_soul(ws, None, &path_a, None);
     assert!(
         prompt_a.contains(path_a.as_ref()),
         "prompt must name the session plan path"
@@ -92,7 +92,7 @@ fn system_prompt_names_the_per_session_plan_path() {
 
     // Two different sessions get two different plan paths — the collision fix.
     let path_b = newt_core::session_plan_path("sess-bbbb");
-    let prompt_b = build_system_prompt_with_soul(ws, None, &path_b.to_string_lossy());
+    let prompt_b = build_system_prompt_with_soul(ws, None, &path_b.to_string_lossy(), None);
     assert!(prompt_b.contains(&*path_b.to_string_lossy()));
     assert!(
         !prompt_b.contains(path_a.as_ref()),
@@ -112,6 +112,7 @@ fn default_soul_no_longer_hardcodes_a_plan_path() {
         tmp.path().to_str().unwrap(),
         Some("You are a custom agent."),
         ".scratch/sessions/xyz/plan.md",
+        None,
     );
     assert!(prompt.contains("You are a custom agent."));
     assert!(prompt.contains(".scratch/sessions/xyz/plan.md"));
@@ -142,6 +143,7 @@ async fn registered_agents_provider_block_reaches_prompt() {
         &memory,
         None,
         "test-conversation",
+        None,
     );
     assert!(prompt.contains("# Project instructions"));
     assert!(prompt.contains("Run just check before PRs."));
@@ -171,7 +173,7 @@ async fn historical_notes_preserve_content_without_redefining_the_live_workspace
         session_id: "current-session".into(),
     };
     memory.initialize_all(&ctx).await;
-    let prompt = rebuild_system_prompt(&ctx.workspace, &memory, None, &ctx.session_id);
+    let prompt = rebuild_system_prompt(&ctx.workspace, &memory, None, &ctx.session_id, None);
 
     assert_eq!(fs::read_to_string(&notes_path).unwrap(), original_notes);
     assert_eq!(prompt.matches(&note).count(), 1, "retain the note verbatim");
@@ -267,7 +269,7 @@ async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
     let _sandbox = SkillRootSandbox::enter(&config_dir, &nested);
     let ws = nested.to_str().unwrap();
 
-    let prompt = build_system_prompt_with_soul(ws, None, "plan.md");
+    let prompt = build_system_prompt_with_soul(ws, None, "plan.md", None);
     assert!(
         prompt.contains("grounding-skill: Only in the bundled dir"),
         "the prompt index must list the bundled-only skill"
