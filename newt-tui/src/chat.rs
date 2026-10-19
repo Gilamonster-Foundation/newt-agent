@@ -5258,6 +5258,22 @@ fn session_body(
                             ) {
                                 print_newt(&line, color, verbose);
                             }
+                        } else if rest == "request" {
+                            // #2937: the final system message(s) and tools array,
+                            // sized per component. Read off the request the loop
+                            // built; before any request exists, arm it to print
+                            // just before the first send.
+                            match newt_core::agentic::request_report::last_report() {
+                                Some(report) => println!("{}", report.to_markdown()),
+                                None => {
+                                    newt_core::agentic::request_report::show_next();
+                                    print_newt(
+                                        "no request built yet; the report prints just before your next message is sent",
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                            }
                         } else if rest == "show" {
                             // Build the outbound message set fresh and render a
                             // compact per-message breakdown so the operator can
@@ -8103,20 +8119,37 @@ fn session_body(
                             active_persona.as_ref(),
                         ),
                     );
+                    // #2937: name each piece so `/context request` can attribute it.
+                    use newt_core::agentic::request_report::annotate;
+                    let ws_state = workspace_state_block(workspace, &turn_caveats.fs_read);
+                    let runtime_ctx = runtime_context_block(
+                        &inf_model,
+                        &inf_url,
+                        inf_kind,
+                        &session_identity,
+                        turn_disposition,
+                    );
+                    annotate(
+                        "workspace state",
+                        "newt-tui workspace_state_block",
+                        &ws_state,
+                    );
+                    annotate(
+                        "runtime context",
+                        "newt-tui runtime_context_block",
+                        &runtime_ctx,
+                    );
+                    annotate(
+                        "session controls",
+                        "newt-tui session_control_prompt",
+                        &session_controls,
+                    );
                     let mut turn_system = format!(
-                        "{}\n\nCurrent command working directory: {}. \
+                        "{ws_state}\n\nCurrent command working directory: {}. \
                          run_command without cwd starts here. Explicit relative cwd and \
                          relative file-tool paths resolve from the workspace root. \
-                         This does not change granted access.\n\n{}\n\n{system}\n\n{session_controls}",
-                        workspace_state_block(workspace, &turn_caveats.fs_read),
+                         This does not change granted access.\n\n{runtime_ctx}\n\n{system}\n\n{session_controls}",
                         serde_json::json!(session_cwd),
-                        runtime_context_block(
-                            &inf_model,
-                            &inf_url,
-                            inf_kind,
-                            &session_identity,
-                            turn_disposition
-                        )
                     );
                     // Resolve current tab overrides against the current persona
                     // on every accepted turn. Never bake style into the frozen
@@ -8129,6 +8162,11 @@ fn session_body(
                         .resolve(active_persona.as_ref().and_then(|p| p.profile.personality))
                         .prompt_block();
                     if !communication_style.is_empty() {
+                        annotate(
+                            "communication style",
+                            "newt-tui personality prompt_block",
+                            &communication_style,
+                        );
                         turn_system.push_str("\n\n");
                         turn_system.push_str(&communication_style);
                     }
@@ -8147,6 +8185,11 @@ fn session_body(
                             .then_some(&scratchpad_store as &dyn newt_core::ScratchpadStore),
                         turn_features.scheduled,
                     ) {
+                        annotate(
+                            "working-memory head",
+                            "newt_core::agentic::working_memory_head",
+                            &head,
+                        );
                         turn_system = format!("{head}\n\n{turn_system}");
                     }
                     // Step 26.5.4 (#582): semantic RAG — index the repo's code once
@@ -8271,6 +8314,11 @@ fn session_body(
                                     &ctx_hash,
                                 );
                                 nav_session.last_semantic = Some(result);
+                                annotate(
+                                    "code evidence",
+                                    "newt_core::render_code_evidence",
+                                    &block,
+                                );
                                 turn_system = format!("{block}\n\n{turn_system}");
                             }
                         }
@@ -8285,6 +8333,7 @@ fn session_body(
                             &task,
                             newt_core::EXPERIENCE_TOP_K,
                         ) {
+                            annotate("experience", "newt_core::experience_block", &block);
                             turn_system = format!("{block}\n\n{turn_system}");
                         }
                     }

@@ -5862,6 +5862,8 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
     enabled.then_some(NARRATION_INTENT_LINE)
 }
 
+const SYSTEM_PROMPT_SRC: &str = "newt-tui build_system_prompt_with_persona";
+
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: Option<&str>,
@@ -5888,6 +5890,11 @@ fn build_system_prompt_with_persona(
          Other requested paths remain governed by the session's permissions. \
          Historical notes do not redefine this root.\n"
     );
+    // #2937: name each piece so `/context request` can attribute it.
+    let note = |label: &str, text: &str| {
+        newt_core::agentic::request_report::annotate(label, SYSTEM_PROMPT_SRC, text);
+    };
+    note("identity (soul) + workspace root", &ctx);
     if let Some(persona) = persona {
         ctx.push_str(&format!(
             "\nActive persona: {}\n{}\n",
@@ -5911,6 +5918,7 @@ fn build_system_prompt_with_persona(
     // path is dynamic AND custom soul.md users still get the guidance. The path
     // is unique to this conversation, so concurrent newt instances in the same
     // repo never clobber each other's plan.
+    let plan_start = ctx.len();
     ctx.push_str(&format!(
         "\n**Plan before coding.** For any task requiring more than one file \
          change, write a plan to `{plan_path}` first (create it if it does not \
@@ -5920,6 +5928,11 @@ fn build_system_prompt_with_persona(
          re-reading the whole codebase.\n"
     ));
 
+    note("plan-before-coding instruction", &ctx[plan_start..]);
+    note(
+        "refactor publish guidance",
+        newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE,
+    );
     ctx.push_str(newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE);
     ctx.push('\n');
 
@@ -5931,6 +5944,7 @@ fn build_system_prompt_with_persona(
         .and_then(|c| c.tui.as_ref())
         .is_some_and(|t| t.narration_intent_line);
     if let Some(line) = narration_intent_line(intent) {
+        note("narration intent line", line);
         ctx.push_str(&format!("\n{line}\n"));
     }
 
@@ -5942,6 +5956,7 @@ fn build_system_prompt_with_persona(
     // missing dir contributes nothing.
     let skills_dirs = cfg.map(|c| c.skill_search_dirs()).unwrap_or_default();
     if let Some(index) = skills_index_for_prompt(&skills_dirs) {
+        note("skills index", &index);
         ctx.push('\n');
         ctx.push_str(&index);
     }
@@ -5961,10 +5976,12 @@ fn build_system_prompt_with_persona(
             })
             .collect();
         names.sort();
+        let files_start = ctx.len();
         ctx.push_str("\nFiles:\n");
         for name in names.iter().take(40) {
             ctx.push_str(&format!("  {name}\n"));
         }
+        note("workspace file listing", &ctx[files_start..]);
     }
 
     // README (truncated)
@@ -5972,6 +5989,7 @@ fn build_system_prompt_with_persona(
         let path = std::path::Path::new(workspace).join(readme);
         if let Ok(text) = std::fs::read_to_string(&path) {
             let excerpt: String = text.chars().take(3000).collect();
+            note("README excerpt", &excerpt);
             ctx.push_str(&format!("\n{readme}:\n{excerpt}\n"));
             if text.len() > 3000 {
                 ctx.push_str("...[truncated]\n");
