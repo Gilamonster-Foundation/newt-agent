@@ -7620,29 +7620,34 @@ fn session_body(
                     // Ask disposition, which exits before the wire loop and
                     // mutates recorded_dispositions / session clarification state.
                     // Use a synthetic Act intake narrowed by the session's effective
-                    // operating mode, without consuming any pending Auto selection.
+                    // operating mode. Peek at any pending Auto selection with
+                    // pending_for (non-consuming) so the next real turn still sees it.
                     let (mut prompt_intake, turn_operating_mode) = if is_capture_turn {
                         let plan_mode_active = conversation_mode_states.plan.is_active();
                         let mut intake = newt_core::agentic::PromptIntake::analyze_with(
                             "act",
                             &Default::default(),
                         );
-                        // Derive the same effective mode the session would apply to
-                        // an Act-shaped task, but pass None for auto_selected so no
-                        // pending Auto selection is consumed by the capture.
+                        // Peek at the pending Auto selection without consuming it.
+                        // take_for would consume the selection; pending_for leaves it
+                        // for the next real turn.
+                        let auto_selected = (active_operating_mode == OperatingMode::Auto
+                            && !plan_mode_active
+                            && intake.disposition() == newt_core::agentic::PromptDisposition::Act)
+                            .then(|| {
+                                conversation_mode_states
+                                    .auto
+                                    .pending_for(&active_conversation_id)
+                            })
+                            .flatten();
                         let effective_mode = effective_operating_mode(
                             active_operating_mode,
                             &intake,
                             plan_mode_active,
-                            None,
+                            auto_selected,
                         );
                         apply_operating_mode_to_intake(effective_mode, &mut intake);
-                        let authority_mode = if plan_mode_active {
-                            OperatingMode::Plan
-                        } else {
-                            active_operating_mode
-                        };
-                        (intake, authority_mode)
+                        (intake, effective_mode)
                     } else {
                         comprehend_accepted_prompt(
                             &model_input_origin,
@@ -8873,6 +8878,10 @@ fn session_body(
                     // session state. The clone is two usizes and discarded after
                     // the turn.
                     let mut capture_note_nudge = note_nudge.clone();
+                    // #2937 P7: capture turns observe a snapshot of compression
+                    // state so compress accounting (floor, pass count, disable flag)
+                    // is not mutated by the preview pass. CompressState derives Clone.
+                    let mut capture_compress_state = compress_state.clone();
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -9028,7 +9037,11 @@ fn session_body(
                                         memory_source: Some(&memory_source),
                                         // Summarize-don't-discard (Step 18.4, #247).
                                         summarizer: loop_summarizer.as_deref(),
-                                        compress_state: Some(&mut compress_state),
+                                        compress_state: if is_capture_turn {
+                                            Some(&mut capture_compress_state)
+                                        } else {
+                                            Some(&mut compress_state)
+                                        },
                                         tool_events: Some(&mut turn_tool_events),
                                         phantom_reaches: Some(&mut turn_phantom_reaches),
                                         end_reason: Some(&mut turn_end_reason),
@@ -9213,6 +9226,22 @@ fn session_body(
                             );
                         }
                     }
+                    // #2937 P7: capture turn exits here, before cancel/persist
+                    // handlers, for all completion paths (success, failure, cancel).
+                    // The RAII CaptureSinkGuard drops on `continue`, disarming the
+                    // sink. No persistence, no cancel save, no live state mutation.
+                    if is_capture_turn {
+                        if let Some(r) = report_sink.last_report() {
+                            newt_core::tty::Terminal::emit_line(
+                                newt_core::tty::Sink::Stdout,
+                                |w| {
+                                    use std::io::Write;
+                                    writeln!(w, "{}", r.to_markdown())
+                                },
+                            );
+                        }
+                        continue;
+                    }
                     if turn_exit.load(std::sync::atomic::Ordering::Relaxed) {
                         clean_exit = true;
                         break;
@@ -9267,39 +9296,12 @@ fn session_body(
                             color,
                             verbose,
                         );
-                    } else if turn_end_reason == Some(newt_core::TurnEndReason::PrepareOnly) {
-                        // #2937: arm_capture_next path — the turn ran through
-                        // the real provider body-construction and stopped before
-                        // sending. Emit the captured report and discard the turn;
-                        // no memory sync, no conversation save.
-                        if let Some(r) = report_sink.last_report() {
-                            newt_core::tty::Terminal::emit_line(
-                                newt_core::tty::Sink::Stdout,
-                                |w| {
-                                    use std::io::Write;
-                                    writeln!(w, "{}", r.to_markdown())
-                                },
-                            );
-                        }
                     } else {
-                        // #2937 P2-3: RequestDumped is a typed clean stop — classify
-                        // it BEFORE the lifecycle emit so we never fire TurnFailed
-                        // for a successful capture. Pre-compute as a bool so we can
-                        // move `response` into the match arm below.
-                        let is_request_dumped_result = response.as_ref().err().is_some_and(|e| {
-                            e.chain().any(|c| {
-                                c.downcast_ref::<newt_core::agentic::request_report::RequestDumped>(
-                                )
-                                .is_some()
-                            })
+                        newt_core::lifecycle::emit(if response.is_ok() {
+                            newt_core::lifecycle::LifecycleEvent::TurnCompleted
+                        } else {
+                            newt_core::lifecycle::LifecycleEvent::TurnFailed { reason: None }
                         });
-                        newt_core::lifecycle::emit(
-                            if is_request_dumped_result || response.is_ok() {
-                                newt_core::lifecycle::LifecycleEvent::TurnCompleted
-                            } else {
-                                newt_core::lifecycle::LifecycleEvent::TurnFailed { reason: None }
-                            },
-                        );
                         match response {
                             Ok((reply, was_streamed, usage, hallucinations)) => {
                                 // Core's report carries the cap status. The TUI
@@ -9836,72 +9838,51 @@ fn session_body(
                                 }
                             }
                             Err(e) => {
-                                // #2937 P2-3: RequestDumped was already classified above.
-                                if is_request_dumped_result {
-                                    if let Some(r) = report_sink.last_report() {
-                                        newt_core::tty::Terminal::emit_line(
-                                            newt_core::tty::Sink::Stdout,
-                                            |w| {
-                                                use std::io::Write;
-                                                writeln!(w, "{}", r.to_markdown())
-                                            },
-                                        );
-                                    }
-                                } else if is_capture_turn {
-                                    // #2937 P6: a failed capture is a command
-                                    // error, not a real turn failure. Do not
-                                    // mutate interrupted_objective or persist a
-                                    // synthetic incomplete turn — the session
-                                    // state is untouched. The RAII guard above
-                                    // disarms the sink.
-                                    print_newt(&format!("error: {e}"), color, verbose);
-                                } else {
-                                    print_newt(&format!("error: {e}"), color, verbose);
-                                    // #2334: a failed turn did not finish its
-                                    // objective; keep it resumable, and say how.
-                                    interrupted_objective = active_prompt_context.clone();
-                                    if interrupted_objective.is_some() {
-                                        print_newt(failed_turn_footer(), color, verbose);
-                                    }
-                                    // #1963: `turn_tool_events`/`turn_phantom_reaches`
-                                    // still hold whatever earlier rounds actually did
-                                    // before this failure — real ledgers, not
-                                    // re-derived. Usage is NOT recoverable here: unlike
-                                    // a cancel, a genuine `Err` carries no accumulated-
-                                    // usage channel back to this caller, so `None`
-                                    // (stored as NULL) is the honest value — never a
-                                    // fabricated zero (it would poison the tuner,
-                                    // #1967).
-                                    let pricing = cfg.pricing.clone().unwrap_or_default();
-                                    persist_incomplete_turn(
-                                        conversation_store.as_ref(),
-                                        &active_conversation_id,
-                                        active_persona.as_ref(),
-                                        &task,
-                                        "",
-                                        &turn_tool_events,
-                                        &turn_phantom_reaches,
-                                        None,
-                                        turn_attempt_totals,
-                                        0,
-                                        newt_core::TurnEndReason::Failed,
-                                        elapsed,
-                                        &inf_model,
-                                        inf_kind,
-                                        &inf_url,
-                                        &pricing,
-                                        &mut memory,
-                                        &scratchpad_store,
-                                        &step_ledger,
-                                        artifact_sink,
-                                        active_prompt_context.as_ref(),
-                                        artifact_source,
-                                        Some(tool_round_limit),
-                                        &rt,
-                                        color,
-                                        verbose,
-                                    );
-                                } // end else (not RequestDumped, not capture)
+                                print_newt(&format!("error: {e}"), color, verbose);
+                                // #2334: a failed turn did not finish its
+                                // objective; keep it resumable, and say how.
+                                interrupted_objective = active_prompt_context.clone();
+                                if interrupted_objective.is_some() {
+                                    print_newt(failed_turn_footer(), color, verbose);
+                                }
+                                // #1963: `turn_tool_events`/`turn_phantom_reaches`
+                                // still hold whatever earlier rounds actually did
+                                // before this failure — real ledgers, not
+                                // re-derived. Usage is NOT recoverable here: unlike
+                                // a cancel, a genuine `Err` carries no accumulated-
+                                // usage channel back to this caller, so `None`
+                                // (stored as NULL) is the honest value — never a
+                                // fabricated zero (it would poison the tuner,
+                                // #1967).
+                                let pricing = cfg.pricing.clone().unwrap_or_default();
+                                persist_incomplete_turn(
+                                    conversation_store.as_ref(),
+                                    &active_conversation_id,
+                                    active_persona.as_ref(),
+                                    &task,
+                                    "",
+                                    &turn_tool_events,
+                                    &turn_phantom_reaches,
+                                    None,
+                                    turn_attempt_totals,
+                                    0,
+                                    newt_core::TurnEndReason::Failed,
+                                    elapsed,
+                                    &inf_model,
+                                    inf_kind,
+                                    &inf_url,
+                                    &pricing,
+                                    &mut memory,
+                                    &scratchpad_store,
+                                    &step_ledger,
+                                    artifact_sink,
+                                    active_prompt_context.as_ref(),
+                                    artifact_source,
+                                    Some(tool_round_limit),
+                                    &rt,
+                                    color,
+                                    verbose,
+                                );
                             }
                         }
                     }
