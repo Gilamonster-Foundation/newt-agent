@@ -8335,7 +8335,11 @@ fn session_body(
                             &task,
                             newt_core::EXPERIENCE_TOP_K,
                         ) {
-                            report_sink.annotate("experience", "newt_core::experience_block", &block);
+                            report_sink.annotate(
+                                "experience",
+                                "newt_core::experience_block",
+                                &block,
+                            );
                             turn_system = format!("{block}\n\n{turn_system}");
                         }
                     }

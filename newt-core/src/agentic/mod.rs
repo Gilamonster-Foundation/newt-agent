@@ -10269,7 +10269,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // #2937: capture per-round final body after tools gate.
             if let Some(sink) = report_sink {
                 let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
-                let send_tools: &[serde_json::Value] = if use_tools { &tools_anthropic } else { &[] };
+                let send_tools: &[serde_json::Value] =
+                    if use_tools { &tools_anthropic } else { &[] };
                 sink.observe_request(&sys_arr, send_tools)?;
             }
             let dispatch = anthropic_dispatch_round(
@@ -12781,7 +12782,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // #2937: capture per-round final body after tools gate.
             if let Some(sink) = report_sink {
                 let ins_str: &str = body["instructions"].as_str().unwrap_or("");
-                let sys_arr: &[&str] = if ins_str.is_empty() { &[] } else { std::slice::from_ref(&ins_str) };
+                let sys_arr: &[&str] = if ins_str.is_empty() {
+                    &[]
+                } else {
+                    std::slice::from_ref(&ins_str)
+                };
                 let empty: Vec<serde_json::Value> = vec![];
                 let send_tools: &[serde_json::Value] = body["tools"]
                     .as_array()

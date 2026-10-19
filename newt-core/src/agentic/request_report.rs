@@ -104,11 +104,7 @@ fn components_of(text: &str, notes: &[Annotation]) -> Vec<Component> {
 impl RequestReport {
     /// Build from raw system texts and tools (provider format). Preferred over
     /// `build` when the caller already has provider-specific values.
-    pub fn build_from_parts(
-        system_texts: &[&str],
-        tools: &[Value],
-        notes: &[Annotation],
-    ) -> Self {
+    pub fn build_from_parts(system_texts: &[&str], tools: &[Value], notes: &[Annotation]) -> Self {
         let card = Annotation {
             label: "active-prompt card".into(),
             source: "agentic::prompt_read::active_prompt_card".into(),
@@ -229,7 +225,10 @@ pub struct ReportSink {
 
 impl std::fmt::Debug for ReportSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f.debug_struct("ReportSink")
             .field("show_next", &s.show_next)
             .field("has_last", &s.last.is_some())
@@ -411,7 +410,7 @@ mod tests {
 
         // observe on A populates A's last but not B's.
         sink_a
-            .observe_request(&["hello"], &[json!({"name": "t1"})], )
+            .observe_request(&["hello"], &[json!({"name": "t1"})])
             .unwrap();
         assert!(sink_a.last_report().is_some());
         assert!(sink_b.last_report().is_none());
@@ -425,7 +424,10 @@ mod tests {
         sink.observe_request(&["sys text"], &[tool]).unwrap();
         let md = sink.last_report().unwrap().to_markdown();
         // Should contain the description from the schema
-        assert!(md.contains("does stuff"), "schema body missing from markdown");
+        assert!(
+            md.contains("does stuff"),
+            "schema body missing from markdown"
+        );
         assert!(md.contains("my_tool"), "tool name missing");
     }
 

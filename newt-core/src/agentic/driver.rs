@@ -898,9 +898,10 @@ async fn run_one_turn(
         Err(e) => {
             // #2937: a successful dump-and-stop is a TYPED clean completion, not a
             // failure. No inference was sent; the file was written before this error.
-            if e.chain()
-                .any(|c| c.downcast_ref::<super::request_report::RequestDumped>().is_some())
-            {
+            if e.chain().any(|c| {
+                c.downcast_ref::<super::request_report::RequestDumped>()
+                    .is_some()
+            }) {
                 return Ok(TurnOutcome {
                     reply: String::new(),
                     was_streamed: false,
