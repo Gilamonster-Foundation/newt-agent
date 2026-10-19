@@ -127,6 +127,11 @@ pub fn classify(name: &str) -> ExposureClass {
         .unwrap_or(ExposureClass::OnDemand)
 }
 
+/// Tools hidden when [`ExposureSettings::read_only`] is `true`. These are the
+/// filesystem mutation tools; `run_command` is NOT included — a read-only view
+/// may still need to run read-only commands (e.g. `cargo check`, `grep`).
+pub(crate) const WRITE_TOOL_NAMES: &[&str] = &["write_file", "edit_file", "delete_file"];
+
 /// The order bands fill remaining budget after Kernel + active. Lower index =
 /// kept first. Kernel is mandatory (not in this list); active tools are kept
 /// regardless of class before any band fill.
@@ -136,10 +141,10 @@ const FILL_ORDER: &[ExposureClass] = &[
     ExposureClass::OnDemand,
 ];
 
-/// A `Copy` snapshot of the resolved `[tool_exposure]` policy carried on
-/// `ChatCtx`. Default is [`ExposureProfile::Full`] — the identity controller
-/// (bit-for-bit unchanged advertised set).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The resolved `[tool_exposure]` policy carried on `ChatCtx`. Default is
+/// [`ExposureProfile::Full`] — the identity controller (bit-for-bit unchanged
+/// advertised set).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExposureSettings {
     pub profile: ExposureProfile,
     /// Percent of the live usable budget spent on tool schemas (`auto`).
@@ -147,6 +152,13 @@ pub struct ExposureSettings {
     /// Hard cap on exposed tool count (0 = unlimited). A safety rail, not the
     /// governor — the budget is.
     pub max_initial_tools: usize,
+    /// When `Some`, only the named tools are shown to the model — the
+    /// operator's explicit final-say filter, applied after all other exposure
+    /// logic including Kernel classification. Absent = no allow-list filter.
+    pub allow_list: Option<Vec<String>>,
+    /// When `true`, `write_file`, `edit_file`, and `delete_file` are hidden
+    /// regardless of `profile` or `allow_list`.
+    pub read_only: bool,
 }
 
 impl Default for ExposureSettings {
@@ -155,6 +167,8 @@ impl Default for ExposureSettings {
             profile: ExposureProfile::Full,
             schema_budget_pct: 15,
             max_initial_tools: 0,
+            allow_list: None,
+            read_only: false,
         }
     }
 }
@@ -165,6 +179,8 @@ impl From<crate::config::ToolExposureConfig> for ExposureSettings {
             profile: c.profile,
             schema_budget_pct: c.schema_budget_pct,
             max_initial_tools: c.max_initial_tools,
+            allow_list: c.allow_list,
+            read_only: c.read_only,
         }
     }
 }
@@ -352,6 +368,35 @@ fn budget_tokens(settings: &ExposureSettings, live_budget_tokens: Option<usize>)
     }
 }
 
+/// Apply `allow_list` and `read_only` operator filters to a name list,
+/// returning an [`ExposurePlan`]. Pure; used both on the budget-free path and
+/// after budget-based selection.
+fn apply_operator_filters(all_names: Vec<String>, settings: &ExposureSettings) -> ExposurePlan {
+    let has_filter = settings.allow_list.is_some() || settings.read_only;
+    if !has_filter {
+        return ExposurePlan {
+            exposed: all_names,
+            hidden: Vec::new(),
+        };
+    }
+    let allowed: Option<BTreeSet<&str>> = settings
+        .allow_list
+        .as_ref()
+        .map(|list| list.iter().map(String::as_str).collect());
+    let mut exposed = Vec::new();
+    let mut hidden = Vec::new();
+    for name in all_names {
+        let in_allow = allowed.as_ref().is_none_or(|a| a.contains(name.as_str()));
+        let is_write = settings.read_only && WRITE_TOOL_NAMES.contains(&name.as_str());
+        if in_allow && !is_write {
+            exposed.push(name);
+        } else {
+            hidden.push(name);
+        }
+    }
+    ExposurePlan { exposed, hidden }
+}
+
 /// Plan which authorized tools to expose given the live budget and the sticky
 /// `active` working set. Pure over the catalog `Value`; the actual filtering is
 /// [`select_exposed`]. `Full` (or a non-array catalog) exposes everything.
@@ -371,10 +416,8 @@ pub fn plan_exposure(
 
     // Identity: Full profile, non-array catalog, or no budget under Auto.
     let Some(budget) = budget_tokens(settings, live_budget_tokens) else {
-        return ExposurePlan {
-            exposed: all_names,
-            hidden: Vec::new(),
-        };
+        // Budget-free path: still apply operator filters if present.
+        return apply_operator_filters(all_names, settings);
     };
 
     let mut kept: BTreeSet<String> = BTreeSet::new();
@@ -416,22 +459,29 @@ pub fn plan_exposure(
         }
     }
 
-    let mut exposed = Vec::new();
-    let mut hidden = Vec::new();
-    for name in all_names {
-        if kept.contains(&name) {
-            exposed.push(name);
-        } else {
-            hidden.push(name);
-        }
-    }
-    ExposurePlan { exposed, hidden }
+    // Resolve budget-selected names to a plan, then apply the operator's
+    // final-say filters. allow_list and read_only can hide even Kernel tools —
+    // the operator is explicitly in control. Hidden tools remain authorized at
+    // dispatch and are reachable via tool_search / KnownHidden promotion.
+    let budget_names: Vec<String> = all_names
+        .iter()
+        .filter(|name| kept.contains(name.as_str()))
+        .cloned()
+        .collect();
+    let budget_hidden: Vec<String> = all_names
+        .into_iter()
+        .filter(|name| !kept.contains(name.as_str()))
+        .collect();
+    let mut plan = apply_operator_filters(budget_names, settings);
+    plan.hidden.extend(budget_hidden);
+    plan
 }
 
 /// Apply the exposure policy to an authorized catalog, returning the exposed
-/// subset in original order. `Full` (or a non-array catalog) is identity. This
-/// is the single seam the three agentic loops call after disposition filtering
-/// and before the token estimate, so what is counted and what is sent agree.
+/// subset in original order. `Full` (or a non-array catalog) without operator
+/// filters is identity. This is the single seam the three agentic loops call
+/// after disposition filtering and before the token estimate, so what is
+/// counted and what is sent agree.
 #[must_use]
 pub fn select_exposed(
     defs: Value,
@@ -440,7 +490,11 @@ pub fn select_exposed(
     active: &BTreeSet<String>,
     est: TokenEstimation,
 ) -> (Value, HiddenTools) {
-    if settings.profile == ExposureProfile::Full {
+    // Full profile with no operator filters is the identity — no allocation.
+    if settings.profile == ExposureProfile::Full
+        && settings.allow_list.is_none()
+        && !settings.read_only
+    {
         return (defs, HiddenTools::default());
     }
     let Value::Array(arr) = defs else {
@@ -716,6 +770,7 @@ mod tests {
             profile: ExposureProfile::Auto,
             schema_budget_pct: 1,
             max_initial_tools: 0,
+            ..Default::default()
         };
         // Budget = 1% of 10 = 0 tokens: only Kernel survives.
         let plan = plan_exposure(&defs, &settings, Some(10), &BTreeSet::new(), est());
@@ -742,6 +797,7 @@ mod tests {
                 profile,
                 schema_budget_pct: 1,
                 max_initial_tools: 1,
+                ..Default::default()
             };
             let out = select_exposed(defs.clone(), &settings, budget, &BTreeSet::new(), est()).0;
             assert_eq!(
@@ -767,6 +823,7 @@ mod tests {
             profile: ExposureProfile::Minimal,
             schema_budget_pct: 1,
             max_initial_tools: 0,
+            ..Default::default()
         };
         let mut active = BTreeSet::new();
         active.insert("git".to_string());
@@ -789,6 +846,7 @@ mod tests {
             profile: ExposureProfile::Auto,
             schema_budget_pct: 100,
             max_initial_tools: 0,
+            ..Default::default()
         };
         let out = select_exposed(
             defs.clone(),
@@ -829,6 +887,7 @@ mod tests {
             profile: ExposureProfile::Auto,
             schema_budget_pct: 15,
             max_initial_tools: 0,
+            ..Default::default()
         };
         // A small model: ~4k usable tokens → ~600-token schema budget.
         let plan = plan_exposure(&full, &settings, Some(4_000), &BTreeSet::new(), est());
@@ -870,6 +929,115 @@ mod tests {
     }
 
     #[test]
+    fn allow_list_hides_tools_not_in_list_even_in_full_profile() {
+        // Regression for #2932: an explicit allow_list is the operator's final
+        // say — tools not named are hidden regardless of profile or Kernel class.
+        let defs = json!([
+            tool("read_file", "k"),
+            tool("write_file", "k"),
+            tool("run_command", "k"),
+            tool("tool_search", "k"),
+            tool("git", "b"),
+        ]);
+        let settings = ExposureSettings {
+            profile: ExposureProfile::Full,
+            allow_list: Some(vec![
+                "read_file".to_string(),
+                "run_command".to_string(),
+                "write_file".to_string(),
+                "edit_file".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let (exposed, hidden_tools) =
+            select_exposed(defs, &settings, None, &BTreeSet::new(), est());
+        let names: Vec<_> = exposed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(entry_name)
+            .collect();
+        assert!(
+            names.contains(&"read_file"),
+            "allow-listed tool must appear"
+        );
+        assert!(
+            names.contains(&"run_command"),
+            "allow-listed tool must appear"
+        );
+        assert!(
+            names.contains(&"write_file"),
+            "allow-listed tool must appear"
+        );
+        assert!(
+            !names.contains(&"tool_search"),
+            "Kernel tool not in allow_list must be hidden"
+        );
+        assert!(
+            !names.contains(&"git"),
+            "ByIntent tool not in allow_list must be hidden"
+        );
+        assert!(
+            hidden_tools.is_hidden("tool_search"),
+            "hidden tools must be reachable via tool_search"
+        );
+        assert!(
+            hidden_tools.is_hidden("git"),
+            "hidden tools must be queryable"
+        );
+    }
+
+    #[test]
+    fn read_only_hides_write_tools_in_full_profile() {
+        // Regression for #2932: read_only = true hides write_file, edit_file,
+        // delete_file so the model never sees mutation tools.
+        let defs = json!([
+            tool("read_file", "k"),
+            tool("write_file", "k"),
+            tool("edit_file", "k"),
+            tool("delete_file", "k"),
+            tool("run_command", "k"),
+            tool("list_dir", "k"),
+        ]);
+        let settings = ExposureSettings {
+            profile: ExposureProfile::Full,
+            read_only: true,
+            ..Default::default()
+        };
+        let (exposed, hidden_tools) =
+            select_exposed(defs, &settings, None, &BTreeSet::new(), est());
+        let names: Vec<_> = exposed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(entry_name)
+            .collect();
+        assert!(
+            names.contains(&"read_file"),
+            "read_file must remain visible"
+        );
+        assert!(
+            names.contains(&"run_command"),
+            "run_command must remain visible"
+        );
+        assert!(names.contains(&"list_dir"), "list_dir must remain visible");
+        assert!(
+            !names.contains(&"write_file"),
+            "write_file must be hidden in read_only"
+        );
+        assert!(
+            !names.contains(&"edit_file"),
+            "edit_file must be hidden in read_only"
+        );
+        assert!(
+            !names.contains(&"delete_file"),
+            "delete_file must be hidden in read_only"
+        );
+        assert!(hidden_tools.is_hidden("write_file"));
+        assert!(hidden_tools.is_hidden("edit_file"));
+    }
+
+    #[test]
     fn max_initial_tools_caps_additional_fill() {
         let defs = json!([
             tool("read_file", "k"),
@@ -881,6 +1049,7 @@ mod tests {
             profile: ExposureProfile::Auto,
             schema_budget_pct: 100,
             max_initial_tools: 2,
+            ..Default::default()
         };
         let plan = plan_exposure(&defs, &settings, Some(100_000), &BTreeSet::new(), est());
         // Kernel read_file is mandatory; cap of 2 total limits ByIntent fill.
