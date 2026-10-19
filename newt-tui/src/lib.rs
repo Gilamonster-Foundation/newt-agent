@@ -5828,7 +5828,7 @@ fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String>
 }
 
 fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>, plan_path: &str) -> String {
-    build_system_prompt_with_persona(workspace, soul, None, plan_path)
+    build_system_prompt_with_persona(workspace, soul, None, None, plan_path)
 }
 
 /// FR-5 (#999): the minimal persona that carries ONLY an altitude, used when
@@ -5862,9 +5862,14 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
     enabled.then_some(NARRATION_INTENT_LINE)
 }
 
+/// `context` carries the non-soul provider blocks (AGENTS.md/CLAUDE.md,
+/// notes, memory index, project map).  It follows the identity whatever the
+/// altitude, so coach altitude, which replaces the soul/identity with
+/// `COACH_SOUL`, never silently drops project-specific instructions (#2934).
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: Option<&str>,
+    context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
 ) -> String {
@@ -5881,13 +5886,23 @@ fn build_system_prompt_with_persona(
         newt_core::Altitude::Coach => newt_core::COACH_SOUL,
         newt_core::Altitude::Doer => soul.unwrap_or(newt_core::DEFAULT_SOUL),
     };
-    let mut ctx = format!(
-        "{identity}\n\nWorkspace: {workspace}\n\
+    // #2934: project-context blocks (AGENTS.md/CLAUDE.md, notes, memory
+    // index, project map) follow the identity whatever the altitude. Coach
+    // replaces the soul above but must not drop project instructions. They
+    // sit BEFORE the live workspace line, as the combined block always did:
+    // historical notes must not redefine the runtime root stated below.
+    let mut ctx = identity.to_string();
+    if let Some(ctx_str) = context.filter(|c| !c.is_empty()) {
+        ctx.push_str("\n\n");
+        ctx.push_str(ctx_str);
+    }
+    ctx.push_str(&format!(
+        "\n\nWorkspace: {workspace}\n\
          This is the current runtime root. Relative tool paths resolve here; \
          run_command starts here unless its cwd or command selects another directory. \
          Other requested paths remain governed by the session's permissions. \
          Historical notes do not redefine this root.\n"
-    );
+    ));
     if let Some(persona) = persona {
         ctx.push_str(&format!(
             "\nActive persona: {}\n{}\n",
@@ -5993,15 +6008,25 @@ fn rebuild_system_prompt(
     persona: Option<&Persona>,
     conversation_id: &str,
 ) -> String {
-    let soul_additions = memory.build_system_prompt_additions();
-    let soul_text = if soul_additions.is_empty() {
+    // #2934: separate the soul/identity from the project-context additions so
+    // that coach altitude can replace the soul with COACH_SOUL without
+    // silently dropping AGENTS.md, notes, and the project map.
+    let soul_text = memory.soul_block();
+    let context = memory.context_additions();
+    let context_ref = if context.is_empty() {
         None
     } else {
-        Some(soul_additions.as_str())
+        Some(context.as_str())
     };
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
-    build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy())
+    build_system_prompt_with_persona(
+        workspace,
+        soul_text.as_deref(),
+        context_ref,
+        persona,
+        &plan_path.to_string_lossy(),
+    )
 }
 
 fn handle_operating_mode_command(
