@@ -12,16 +12,16 @@ description = "A verified, read-only follower of an agent-mesh flock for newt (t
 [dependencies]
 # Pinned to one agent-mesh main revision until the flock crates are published.
 # Read side only: no `serve` / `emit`, so no server, no signing key.
-agent-mesh-flock = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb" }
-agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb", default-features = false }
-agent-mesh-flock-session = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb", default-features = false }
+agent-mesh-flock = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "ba899f1f6e2d14e1ac2a051c3928d08b476226f3" }
+agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "ba899f1f6e2d14e1ac2a051c3928d08b476226f3", default-features = false }
+agent-mesh-flock-session = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "ba899f1f6e2d14e1ac2a051c3928d08b476226f3", default-features = false }
 content-addressable.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 # Writer features are for the in-process fixture only.
-agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb", features = ["serve"] }
-agent-mesh-protocol = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb" }
+agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "ba899f1f6e2d14e1ac2a051c3928d08b476226f3", features = ["serve"] }
+agent-mesh-protocol = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "ba899f1f6e2d14e1ac2a051c3928d08b476226f3" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 tempfile.workspace = true
