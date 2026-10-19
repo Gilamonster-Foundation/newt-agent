@@ -7601,44 +7601,60 @@ fn session_body(
                         .as_ref()
                         .map(newt_core::IntakeConfig::to_lexicon)
                         .unwrap_or_default();
-                    let (mut prompt_intake, turn_operating_mode) = comprehend_accepted_prompt(
-                        &model_input_origin,
-                        &task,
-                        pending_clarification.as_ref(),
-                        active_prompt_context.as_ref(),
-                        &mut recorded_dispositions,
-                        &intake_lexicon,
-                        |intake| {
-                            // A model-selected Auto style is a one-shot
-                            // instruction for the next action-shaped turn.
-                            // Protected intake does not consume it; it remains
-                            // pending until an Act turn or an explicit
-                            // conversation/mode boundary clears it.
-                            let plan_mode_active = conversation_mode_states.plan.is_active();
-                            let auto_selected = (active_operating_mode == OperatingMode::Auto
-                                && !plan_mode_active
-                                && intake.disposition()
-                                    == newt_core::agentic::PromptDisposition::Act)
-                                .then(|| {
-                                    conversation_mode_states
-                                        .auto
-                                        .take_for(&active_conversation_id)
-                                })
-                                .flatten();
-                            let style = effective_operating_mode(
-                                active_operating_mode,
-                                intake,
-                                plan_mode_active,
-                                auto_selected,
-                            );
-                            let authority_mode = if plan_mode_active {
-                                OperatingMode::Plan
-                            } else {
-                                active_operating_mode
-                            };
-                            (style, authority_mode)
-                        },
-                    );
+                    // #2937 P2-1: capture turns bypass intake classification.
+                    // An empty task through comprehend_accepted_prompt yields
+                    // Ask disposition, which exits before the wire loop and
+                    // mutates recorded_dispositions / session clarification state.
+                    // Use a synthetic Act intake so the prepare-only path is
+                    // reached without any session-state side effects.
+                    let (mut prompt_intake, turn_operating_mode) = if is_capture_turn {
+                        (
+                            newt_core::agentic::PromptIntake::analyze_with(
+                                "act",
+                                &Default::default(),
+                            ),
+                            active_operating_mode,
+                        )
+                    } else {
+                        comprehend_accepted_prompt(
+                            &model_input_origin,
+                            &task,
+                            pending_clarification.as_ref(),
+                            active_prompt_context.as_ref(),
+                            &mut recorded_dispositions,
+                            &intake_lexicon,
+                            |intake| {
+                                // A model-selected Auto style is a one-shot
+                                // instruction for the next action-shaped turn.
+                                // Protected intake does not consume it; it remains
+                                // pending until an Act turn or an explicit
+                                // conversation/mode boundary clears it.
+                                let plan_mode_active = conversation_mode_states.plan.is_active();
+                                let auto_selected = (active_operating_mode == OperatingMode::Auto
+                                    && !plan_mode_active
+                                    && intake.disposition()
+                                        == newt_core::agentic::PromptDisposition::Act)
+                                    .then(|| {
+                                        conversation_mode_states
+                                            .auto
+                                            .take_for(&active_conversation_id)
+                                    })
+                                    .flatten();
+                                let style = effective_operating_mode(
+                                    active_operating_mode,
+                                    intake,
+                                    plan_mode_active,
+                                    auto_selected,
+                                );
+                                let authority_mode = if plan_mode_active {
+                                    OperatingMode::Plan
+                                } else {
+                                    active_operating_mode
+                                };
+                                (style, authority_mode)
+                            },
+                        )
+                    };
                     attribute_carried_plan_clamp(
                         &mut prompt_intake,
                         active_operating_mode,
@@ -7720,7 +7736,8 @@ fn session_body(
                     // counts and digests. It is written before an Ask handoff
                     // and before Act inference so a later compacted or resumed
                     // session can audit why the harness chose its disposition.
-                    {
+                    // #2937 P2-1: skip for capture turns — no durable receipt exists.
+                    if !is_capture_turn {
                         let durable_artifact_store_owner =
                             conversation_store.as_ref().map(|store| {
                                 newt_core::agentic::StoreArtifactStore::new(

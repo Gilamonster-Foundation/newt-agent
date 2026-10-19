@@ -5901,14 +5901,24 @@ fn build_system_prompt_with_persona(
             s.annotate(label, "build_system_prompt_with_persona", text);
         }
     };
-    // #2937 P2-2: when soul comes from multiple providers, each provider was
-    // already annotated individually by annotate_system_prompt_additions before
-    // this call — skip the encompassing "identity" label so per-provider spans
-    // survive (components_of takes longest-first at equal offsets; an
-    // encompassing annotation would silently drop all shorter per-provider ones).
-    // When soul is None the default soul is the only source, so label it.
-    if soul.is_none() {
-        note("identity", identity);
+    // #2937 P2-2: annotate the identity actually selected by the altitude branch.
+    // Coach altitude always uses COACH_SOUL regardless of soul providers; label
+    // it directly so the report names the coach identity rather than leaving it
+    // unattributed. Doer altitude: if soul came from providers they were already
+    // annotated individually by annotate_system_prompt_additions — skip the
+    // encompassing "identity" label so per-provider spans survive (components_of
+    // takes longest-first at equal offsets; an encompassing annotation would
+    // silently drop all shorter per-provider ones). If no providers, DEFAULT_SOUL
+    // is the only source, so label it.
+    match effective_altitude {
+        newt_core::Altitude::Coach => {
+            note("coach-soul", identity);
+        }
+        newt_core::Altitude::Doer => {
+            if soul.is_none() {
+                note("identity", identity);
+            }
+        }
     }
     // Annotate only the workspace suffix so the identity span is not absorbed
     // into a longer overlapping annotation (components_of takes longest-first at

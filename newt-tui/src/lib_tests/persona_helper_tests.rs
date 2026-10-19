@@ -680,3 +680,57 @@ fn personal_assistant_persona_binds_gila_skill_and_modulex_tools_only() {
         "routine preferences should not include mutating tools: {tools:?}"
     );
 }
+
+/// #2937 P2-2: coach altitude must annotate the `COACH_SOUL` identity with the
+/// label "coach-soul" so the report can attribute it. Before this fix, the
+/// builder only annotated identity when `soul.is_none()`, so a coach session
+/// with a memory manager (which passes `Some(provider_additions)`) left the
+/// actual `COACH_SOUL` prefix unattributed in the report.
+#[test]
+fn coach_altitude_annotates_coach_soul_label_in_report() {
+    let mut persona = test_persona(
+        "coach",
+        "Always ask before acting.",
+        std::path::PathBuf::from("/personas/coach.md"),
+    );
+    persona.profile.altitude = Some(newt_core::Altitude::Coach);
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let system = build_system_prompt_with_persona(
+        "/workspace",
+        Some("soul additions"),
+        Some(&persona),
+        "plan.md",
+        Some(&sink),
+    );
+
+    // Arm a prepare-only capture and observe so the report is built from the
+    // exact annotated system text.
+    sink.arm_capture_next();
+    let result = sink.observe_request(&[system.as_str()], None);
+    assert!(
+        result.is_err(),
+        "arm_capture_next must produce RequestDumped, not Ok"
+    );
+
+    let report = sink
+        .last_report()
+        .expect("report captured after observe_request");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert!(
+        labels.contains(&"coach-soul"),
+        "coach altitude must annotate 'coach-soul'; got {labels:?}"
+    );
+    // Verify COACH_SOUL itself is not the first (unattributed) span — the bug
+    // left the identity prefix without any label. Other connector text between
+    // annotated sections may legitimately be unattributed.
+    assert_ne!(
+        labels.first().copied(),
+        Some("(unattributed)"),
+        "coach identity must be the first labelled span, not unattributed; got {labels:?}"
+    );
+}
