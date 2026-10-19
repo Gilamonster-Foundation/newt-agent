@@ -20,8 +20,8 @@ fn coach_altitude_keeps_project_context_2934() {
     let project_ctx = "AGENTS.md: Use four spaces for indentation.";
     let prompt = build_system_prompt_with_persona(
         "/workspace",
-        None,              // soul — Coach replaces with COACH_SOUL
-        Some(project_ctx), // context — must survive regardless of altitude
+        newt_core::DEFAULT_SOUL, // soul — Coach replaces with COACH_SOUL
+        Some(project_ctx),       // context — must survive regardless of altitude
         Some(&persona),
         "plan.md",
     );
@@ -44,8 +44,13 @@ fn persona_guidance_cannot_override_the_operators_requested_actions() {
         std::path::PathBuf::from("/personas/coach.md"),
     );
     persona.profile.altitude = Some(newt_core::Altitude::Coach);
-    let prompt =
-        build_system_prompt_with_persona("/workspace", None, None, Some(&persona), "plan.md");
+    let prompt = build_system_prompt_with_persona(
+        "/workspace",
+        newt_core::DEFAULT_SOUL,
+        None,
+        Some(&persona),
+        "plan.md",
+    );
     assert!(prompt.contains("Persona guidance does not override the operator's explicit task"));
     assert!(prompt.contains("OCAP permissions, explicit postures, and delegation limits"));
     assert!(
@@ -105,7 +110,8 @@ fn coder_persona_does_not_send_soul_twice_2935() {
     // With the real seeded body, soul must appear exactly once in the prompt.
     let prompt = build_system_prompt_with_persona(
         "/ws",
-        Some(newt_core::DEFAULT_SOUL),
+        newt_core::DEFAULT_SOUL,
+        None,
         Some(&coder),
         "plan.md",
     );

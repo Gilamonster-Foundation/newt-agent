@@ -78,7 +78,10 @@ fn no_soul_provider_means_no_default_soul_2935() {
         !prompt.contains(first_line),
         "the builder must not inject DEFAULT_SOUL on its own; got: {prompt:.200}"
     );
-    assert!(prompt.contains("Workspace: "), "the rest of the prompt is intact");
+    assert!(
+        prompt.contains("Workspace: "),
+        "the rest of the prompt is intact"
+    );
 }
 
 #[serial_test::serial(real_fs)]
@@ -90,7 +93,8 @@ fn system_prompt_names_the_per_session_plan_path() {
     let ws = tmp.path().to_str().unwrap();
     let path_a = newt_core::session_plan_path("sess-aaaa");
     let path_a = path_a.to_string_lossy();
-    let prompt_a = build_system_prompt_with_soul(ws, None, &path_a);
+    let prompt_a =
+        build_system_prompt_with_persona(ws, newt_core::DEFAULT_SOUL, None, None, &path_a);
     assert!(
         prompt_a.contains(path_a.as_ref()),
         "prompt must name the session plan path"
@@ -102,7 +106,13 @@ fn system_prompt_names_the_per_session_plan_path() {
 
     // Two different sessions get two different plan paths — the collision fix.
     let path_b = newt_core::session_plan_path("sess-bbbb");
-    let prompt_b = build_system_prompt_with_soul(ws, None, &path_b.to_string_lossy());
+    let prompt_b = build_system_prompt_with_persona(
+        ws,
+        newt_core::DEFAULT_SOUL,
+        None,
+        None,
+        &path_b.to_string_lossy(),
+    );
     assert!(prompt_b.contains(&*path_b.to_string_lossy()));
     assert!(
         !prompt_b.contains(path_a.as_ref()),
@@ -118,9 +128,11 @@ fn default_soul_no_longer_hardcodes_a_plan_path() {
     assert!(!newt_core::DEFAULT_SOUL.contains("plan.md"));
     // A custom soul (no plan text of its own) still gets the injected block.
     let tmp = tempfile::TempDir::new().unwrap();
-    let prompt = build_system_prompt_with_soul(
+    let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some("You are a custom agent."),
+        "You are a custom agent.",
+        None,
+        None,
         ".scratch/sessions/xyz/plan.md",
     );
     assert!(prompt.contains("You are a custom agent."));
@@ -277,7 +289,8 @@ async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
     let _sandbox = SkillRootSandbox::enter(&config_dir, &nested);
     let ws = nested.to_str().unwrap();
 
-    let prompt = build_system_prompt_with_soul(ws, None, "plan.md");
+    let prompt =
+        build_system_prompt_with_persona(ws, newt_core::DEFAULT_SOUL, None, None, "plan.md");
     assert!(
         prompt.contains("grounding-skill: Only in the bundled dir"),
         "the prompt index must list the bundled-only skill"
