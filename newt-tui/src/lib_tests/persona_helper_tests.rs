@@ -20,8 +20,8 @@ fn coach_altitude_keeps_project_context_2934() {
     let project_ctx = "AGENTS.md: Use four spaces for indentation.";
     let prompt = build_system_prompt_with_persona(
         "/workspace",
-        None,              // soul — Coach replaces with COACH_SOUL
-        Some(project_ctx), // context — must survive regardless of altitude
+        newt_core::DEFAULT_SOUL, // soul — Coach replaces with COACH_SOUL
+        Some(project_ctx),       // context — must survive regardless of altitude
         Some(&persona),
         "plan.md",
     );
@@ -44,8 +44,13 @@ fn persona_guidance_cannot_override_the_operators_requested_actions() {
         std::path::PathBuf::from("/personas/coach.md"),
     );
     persona.profile.altitude = Some(newt_core::Altitude::Coach);
-    let prompt =
-        build_system_prompt_with_persona("/workspace", None, None, Some(&persona), "plan.md");
+    let prompt = build_system_prompt_with_persona(
+        "/workspace",
+        newt_core::DEFAULT_SOUL,
+        None,
+        Some(&persona),
+        "plan.md",
+    );
     assert!(prompt.contains("Persona guidance does not override the operator's explicit task"));
     assert!(prompt.contains("OCAP permissions, explicit postures, and delegation limits"));
     assert!(
@@ -75,6 +80,79 @@ fn normalize_persona_name_lowercases_and_validates() {
     assert!(normalize_persona_name("").is_err());
     assert!(normalize_persona_name("bad name").is_err());
     assert!(normalize_persona_name("näme").is_err());
+}
+
+/// Regression test for #2935: the seeded `coder` persona body used to be a copy
+/// of `DEFAULT_SOUL`, so `--persona coder` sent the soul twice in the system
+/// prompt (once from the identity block, once from the persona overlay).
+///
+/// Red: on origin/main the seeded body IS DEFAULT_SOUL → soul appears twice.
+/// Green: after fix the seeded body is a short placeholder → soul appears once.
+#[serial_test::serial(real_fs)]
+#[test]
+fn coder_persona_does_not_send_soul_twice_2935() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = PersonaStore::new(tmp.path().join("personas"));
+    let coder = store.load("coder").unwrap();
+
+    let first_line = newt_core::DEFAULT_SOUL
+        .lines()
+        .find(|l| !l.is_empty())
+        .expect("DEFAULT_SOUL has at least one non-empty line");
+
+    // Coder body must no longer be a copy of DEFAULT_SOUL (#2935).
+    assert!(
+        !coder.prompt.contains(first_line),
+        "seeded coder body must not be DEFAULT_SOUL; got: {:.200}",
+        coder.prompt
+    );
+
+    // With the real seeded body, soul must appear exactly once in the prompt.
+    let prompt = build_system_prompt_with_persona(
+        "/ws",
+        newt_core::DEFAULT_SOUL,
+        None,
+        Some(&coder),
+        "plan.md",
+    );
+    let count = prompt.matches(first_line).count();
+    assert_eq!(
+        count, 1,
+        "DEFAULT_SOUL text must appear exactly once; got {count} occurrences of {first_line:?}"
+    );
+}
+
+/// #2935 (review round 1): an installed `coder.md` seeded by a release up to
+/// v0.8.2 holds DEFAULT_SOUL verbatim, and `ensure_defaults` skips existing
+/// files, so upgrading alone left the soul doubled. The exact old seed is
+/// replaced with the shipped placeholder; an operator-edited file is never
+/// touched, even one that merely appends to the old seed.
+///
+/// Red before the migration: the untouched old seed loads as DEFAULT_SOUL.
+#[serial_test::serial(real_fs)]
+#[test]
+fn legacy_coder_seed_is_migrated_but_edits_are_kept_2935() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("personas");
+    std::fs::create_dir_all(&dir).unwrap();
+    let coder_md = dir.join("coder.md");
+    std::fs::write(&coder_md, newt_core::DEFAULT_SOUL).unwrap();
+    let store = PersonaStore::new(dir.clone());
+
+    let coder = store.load("coder").unwrap();
+    assert_eq!(
+        coder.prompt.trim(),
+        CODER_PERSONA.trim(),
+        "the exact v0.8.2 seed must be replaced by the shipped placeholder"
+    );
+    assert_eq!(std::fs::read_to_string(&coder_md).unwrap(), CODER_PERSONA);
+
+    // An edit on top of the old seed is operator data: left byte-for-byte.
+    let edited = format!("{}\n\nAlways run just check.\n", newt_core::DEFAULT_SOUL);
+    std::fs::write(&coder_md, &edited).unwrap();
+    let coder = store.load("coder").unwrap();
+    assert_eq!(std::fs::read_to_string(&coder_md).unwrap(), edited);
+    assert!(coder.prompt.contains("Always run just check."));
 }
 
 /// Real persona files ground the named-preset picker: seeding, loading and

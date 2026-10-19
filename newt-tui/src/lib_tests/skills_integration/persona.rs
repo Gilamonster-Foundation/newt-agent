@@ -11,7 +11,7 @@ fn system_prompt_includes_active_persona_overlay() {
     );
     let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some(newt_core::DEFAULT_SOUL),
+        newt_core::DEFAULT_SOUL,
         None,
         Some(&persona),
         "test-plan.md",
@@ -39,7 +39,7 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
     };
     let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some(newt_core::DEFAULT_SOUL),
+        newt_core::DEFAULT_SOUL,
         None,
         Some(&coach),
         "test-plan.md",
@@ -61,7 +61,7 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
     let doer = test_persona("worker", "Do the work.", tmp.path().join("worker.md"));
     let doer_prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some(newt_core::DEFAULT_SOUL),
+        newt_core::DEFAULT_SOUL,
         None,
         Some(&doer),
         "test-plan.md",
@@ -146,7 +146,9 @@ fn persona_store_writes_coder_default_only_when_loaded() {
 
     assert_eq!(persona.name, "coder");
     assert_eq!(persona.path, dir.join("coder.md"));
-    assert!(persona.prompt.contains(newt_core::DEFAULT_SOUL));
+    // #2935: coder body is no longer DEFAULT_SOUL (that caused the soul to
+    // appear twice when --persona coder was active).
+    assert!(!persona.prompt.is_empty(), "coder has a non-empty body");
     assert!(
         dir.join("coder.md").is_file(),
         "first persona load should materialize the default coder file"
