@@ -2272,7 +2272,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 sink.observe_request(&sys_texts, send_tools)?;
                 if sink.take_show_flag() {
                     if let Some(r) = sink.last_report() {
-                        display::print_newt(&r.to_markdown(), color, false);
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
                     }
                 }
             }
@@ -7455,7 +7458,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 sink.observe_request(&sys_texts, send_tools)?;
                 if sink.take_show_flag() {
                     if let Some(r) = sink.last_report() {
-                        display::print_newt(&r.to_markdown(), color, false);
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
                     }
                 }
             }
@@ -10312,6 +10318,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             );
             // #2937: capture per-round final body after tools gate.
             if let Some(sink) = report_sink {
+                // Annotate active card before the join loses the message boundary.
+                for msg in &messages {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
                 let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
                 let send_tools: Option<&[serde_json::Value]> = if use_tools {
                     Some(&tools_anthropic)
@@ -10321,7 +10336,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 sink.observe_request(&sys_arr, send_tools)?;
                 if sink.take_show_flag() {
                     if let Some(r) = sink.last_report() {
-                        display::print_newt(&r.to_markdown(), color, false);
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
                     }
                 }
             }
@@ -12834,6 +12852,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let mut body = build_body(&input, if tools_supported { &tools } else { &[] });
             // #2937: capture per-round final body after tools gate.
             if let Some(sink) = report_sink {
+                // Annotate active card before the body join loses the message boundary.
+                for msg in &msgs_json {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
                 let ins_str: &str = body["instructions"].as_str().unwrap_or("");
                 let sys_arr: &[&str] = if ins_str.is_empty() {
                     &[]
@@ -12841,19 +12868,19 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     std::slice::from_ref(&ins_str)
                 };
                 let send_tools: Option<&[serde_json::Value]> = if tools_supported {
-                    Some(
-                        body["tools"]
-                            .as_array()
-                            .map(|a| a.as_slice())
-                            .unwrap_or(&[]),
-                    )
+                    body.get("tools")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.as_slice())
                 } else {
                     None
                 };
                 sink.observe_request(sys_arr, send_tools)?;
                 if sink.take_show_flag() {
                     if let Some(r) = sink.last_report() {
-                        display::print_newt(&r.to_markdown(), color, false);
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
                     }
                 }
             }
@@ -13959,11 +13986,19 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut body = build_body(&input, &[]);
     // #2937: capture summary send (no tools field — None distinguishes from []).
     if let Some(sink) = report_sink {
-        let sys_arr: Vec<&str> = instructions.as_deref().into_iter().collect();
-        let _ = sink.observe_request(&sys_arr, None);
+        let body_instr = body["instructions"].as_str().unwrap_or("");
+        let sys_arr: &[&str] = if body_instr.is_empty() {
+            &[]
+        } else {
+            &[body_instr]
+        };
+        sink.observe_request(sys_arr, None)?;
         if sink.take_show_flag() {
             if let Some(r) = sink.last_report() {
-                display::print_newt(&r.to_markdown(), color, false);
+                crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                    use std::io::Write;
+                    writeln!(w, "{}", r.to_markdown())
+                });
             }
         }
     }

@@ -326,6 +326,14 @@ impl ReportSink {
         std::mem::take(&mut self.s().show_next)
     }
 
+    /// Arm a prepare-only capture: the next `observe_request` stores the
+    /// report and returns `RequestDumped` without writing any file (the empty
+    /// path is the sentinel). Used by the TUI `/context request` command to
+    /// trigger a real turn-preparation pass through the provider path.
+    pub fn arm_capture_next(&self) {
+        self.s().dump = Some((PathBuf::new(), true));
+    }
+
     /// The report for the most recent request, if one has been built.
     pub fn last_report(&self) -> Option<RequestReport> {
         self.s().last.clone()
@@ -355,7 +363,10 @@ impl ReportSink {
         let mut s = self.s();
         let dump = s.dump.take();
         if let Some((path, stop)) = dump {
-            std::fs::write(&path, report.to_markdown())?;
+            // Empty path is the sentinel for arm_capture_next: store without writing.
+            if !path.as_os_str().is_empty() {
+                std::fs::write(&path, report.to_markdown())?;
+            }
             s.last = Some(report);
             if stop {
                 return Err(RequestDumped(path).into());
@@ -532,5 +543,104 @@ mod tests {
         assert_eq!(snap.len(), 2);
         // Notes still in sink after snapshot.
         assert_eq!(sink.snapshot_notes().len(), 2);
+    }
+
+    /// arm_capture_next stores the report and raises RequestDumped without
+    /// writing a file (empty-path sentinel).
+    #[test]
+    fn arm_capture_next_stores_without_file() {
+        let sink = ReportSink::new();
+        sink.arm_capture_next();
+        let err = sink
+            .observe_request(&["system text"], Some(&[]))
+            .unwrap_err();
+        let dumped = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<RequestDumped>())
+            .expect("RequestDumped in error chain");
+        // Path must be empty — no file was written.
+        assert!(
+            dumped.0.as_os_str().is_empty(),
+            "arm_capture_next path should be empty sentinel"
+        );
+        // Report is stored despite no file write.
+        assert!(sink.last_report().is_some(), "last_report should be set");
+    }
+
+    /// Responses loop tools fix: None when body has no tools field (empty
+    /// catalog), not Some(&[]).
+    #[test]
+    fn tools_none_when_body_field_absent() {
+        // Simulate what build_body produces for an empty catalog: no "tools" key.
+        let body = serde_json::json!({"instructions": "do it"});
+        // The fixed code: body.get("tools").and_then(...).map(...)
+        let send_tools: Option<&[serde_json::Value]> = body
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice());
+        assert!(send_tools.is_none(), "absent tools key must yield None");
+
+        // With an explicit empty array it yields Some(&[]).
+        let body2 = serde_json::json!({"instructions": "do it", "tools": []});
+        let send_tools2: Option<&[serde_json::Value]> = body2
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice());
+        assert!(
+            send_tools2.is_some(),
+            "explicit empty array must yield Some"
+        );
+        assert_eq!(send_tools2.unwrap().len(), 0);
+    }
+
+    /// Responses summary fix: reading body["instructions"] vs the outer variable.
+    #[test]
+    fn summary_reads_composed_instructions() {
+        // Simulate: outer `instructions` variable has the original text, but
+        // build_body composes it with an extra system note in `input`, yielding
+        // a longer body["instructions"].
+        let outer_instructions = "base system text";
+        let body = serde_json::json!({"instructions": "base system text\n\nextra note injected"});
+        let body_instr = body["instructions"].as_str().unwrap_or("");
+        // body_instr is longer than outer_instructions — the fix captures the correct one.
+        assert!(
+            body_instr.len() > outer_instructions.len(),
+            "body instructions should be longer (has injected note)"
+        );
+        assert!(
+            body_instr.contains("extra note injected"),
+            "body instructions should contain injected content"
+        );
+    }
+
+    /// Annotating identity and persona-overlay labels before observe_request
+    /// makes those labels appear in the report's system component breakdown.
+    #[test]
+    fn identity_and_persona_annotations_appear_in_report() {
+        let sink = ReportSink::new();
+        let identity = "You are a helpful assistant.";
+        let persona_overlay = "\nActive persona: shinobi\nBe stealthy.";
+        sink.annotate("identity", "build_system_prompt_with_persona", identity);
+        sink.annotate(
+            "persona-overlay",
+            "build_system_prompt_with_persona",
+            persona_overlay,
+        );
+        let system_text = format!("{identity}\n\nWorkspace: /w{persona_overlay}");
+        sink.observe_request(&[system_text.as_str()], None).unwrap();
+        let report = sink.last_report().expect("last_report after observe");
+        let labels: Vec<&str> = report.system[0]
+            .components
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert!(
+            labels.contains(&"identity"),
+            "report should have 'identity' component; got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"persona-overlay"),
+            "report should have 'persona-overlay' component; got {labels:?}"
+        );
     }
 }

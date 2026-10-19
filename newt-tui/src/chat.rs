@@ -5263,34 +5263,18 @@ fn session_body(
                                 print_newt(&line, color, verbose);
                             }
                         } else if rest == "request" {
-                            // #2937: rebuild the system prompt to pick up fresh
-                            // annotations (persona, plan, workspace), then build
-                            // the report immediately without submitting a turn.
-                            // Tools come from the last captured round so the
-                            // report is always current; they show empty until
-                            // after the first send.
-                            let fresh_system = rebuild_system_prompt(
-                                workspace,
-                                &memory,
-                                active_persona.as_ref(),
-                                &active_conversation_id,
-                                Some(&*report_sink),
+                            // #2937 P2: arm a prepare-only capture so the NEXT turn
+                            // goes through the real provider path (exposure/catalog,
+                            // semantic pins, body construction) and stops before
+                            // sending. The report is emitted after the turn ends with
+                            // PrepareOnly; the turn message is discarded (no memory
+                            // sync, no conversation save).
+                            report_sink.arm_capture_next();
+                            print_newt(
+                                "capturing next request — type a message to preview",
+                                color,
+                                verbose,
                             );
-                            let last_tools: Vec<serde_json::Value> = report_sink
-                                .last_report()
-                                .map(|r| r.tools.iter().map(|t| t.schema.clone()).collect())
-                                .unwrap_or_default();
-                            let notes = report_sink.snapshot_notes();
-                            let report =
-                                newt_core::agentic::request_report::RequestReport::build_from_parts(
-                                    &[fresh_system.as_str()],
-                                    Some(&last_tools),
-                                    &notes,
-                                );
-                            let md = report.to_markdown();
-                            for line in md.lines() {
-                                print_newt(line, color, verbose);
-                            }
                         } else if rest == "show" {
                             // Build the outbound message set fresh and render a
                             // compact per-message breakdown so the operator can
@@ -9199,6 +9183,20 @@ fn session_body(
                             color,
                             verbose,
                         );
+                    } else if turn_end_reason == Some(newt_core::TurnEndReason::PrepareOnly) {
+                        // #2937: arm_capture_next path — the turn ran through
+                        // the real provider body-construction and stopped before
+                        // sending. Emit the captured report and discard the turn;
+                        // no memory sync, no conversation save.
+                        if let Some(r) = report_sink.last_report() {
+                            newt_core::tty::Terminal::emit_line(
+                                newt_core::tty::Sink::Stdout,
+                                |w| {
+                                    use std::io::Write;
+                                    writeln!(w, "{}", r.to_markdown())
+                                },
+                            );
+                        }
                     } else {
                         newt_core::lifecycle::emit(if response.is_ok() {
                             newt_core::lifecycle::LifecycleEvent::TurnCompleted

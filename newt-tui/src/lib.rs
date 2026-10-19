@@ -5901,17 +5901,18 @@ fn build_system_prompt_with_persona(
             s.annotate(label, "build_system_prompt_with_persona", text);
         }
     };
+    note("identity", identity);
+    note("workspace-prefix", &ctx);
     if let Some(persona) = persona {
-        ctx.push_str(&format!(
-            "\nActive persona: {}\n{}\n",
-            persona.name, persona.prompt
-        ));
+        let persona_overlay = format!("\nActive persona: {}\n{}\n", persona.name, persona.prompt);
+        ctx.push_str(&persona_overlay);
         ctx.push_str(
             "\nPersona guidance does not override the operator's explicit task. \
              Treat advice-only wording and preferred tools as defaults; use the tools \
              needed for the requested work. OCAP permissions, explicit postures, and \
              delegation limits still govern every action.\n",
         );
+        note("persona-overlay", &persona_overlay);
     }
 
     // Resolved once and shared with the skills index below; the ratchet in
