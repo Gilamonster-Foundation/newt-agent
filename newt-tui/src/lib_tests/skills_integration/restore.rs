@@ -67,6 +67,7 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &mode_states,
+        sink: None,
     };
 
     let message = handle_conversation_command(
@@ -188,6 +189,7 @@ async fn prompt_only_restore_rehydrates_receipt_without_replaying_it_as_input() 
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -299,6 +301,7 @@ async fn conversation_restore_reseats_the_persona_cognition_layer() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &mode_states,
+        sink: None,
     };
 
     newt_core::cognition::set_persona_cognition(None);

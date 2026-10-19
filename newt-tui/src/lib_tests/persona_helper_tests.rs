@@ -379,6 +379,7 @@ async fn handle_persona_command_show_and_clear() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command("/persona show", workspace, &store, &mut active, &mut ctx).unwrap()
     };
@@ -392,6 +393,7 @@ async fn handle_persona_command_show_and_clear() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command("/persona clear", workspace, &store, &mut active, &mut ctx).unwrap()
     };
@@ -527,6 +529,7 @@ async fn persona_set_keep_context_preserves_history() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command(
             "/persona set terse --keep-context",
@@ -553,6 +556,7 @@ async fn persona_set_keep_context_preserves_history() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command(
             "/persona set terse",

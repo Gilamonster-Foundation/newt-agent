@@ -265,6 +265,7 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command(
             "/persona reviewer",
@@ -348,6 +349,7 @@ async fn new_conversation_preserves_active_persona() {
         system: &mut system,
         conversation_id: &mut active_conversation_id,
         mode_states: &mode_states,
+        sink: None,
     };
     let scratchpad = newt_core::SessionScratchpadStore::default();
     let ledger = newt_core::SessionStepLedger::default();

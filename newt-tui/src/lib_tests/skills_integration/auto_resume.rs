@@ -89,6 +89,7 @@ async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     let banner = auto_resume_latest(&mut ctx).unwrap().expect("a banner");
@@ -137,6 +138,7 @@ fn auto_resume_empty_workspace_is_silent_fresh_start() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     assert_eq!(auto_resume_latest(&mut ctx).unwrap(), None);
@@ -180,6 +182,7 @@ async fn resume_exact_restores_that_conversation() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &target).unwrap();
@@ -234,6 +237,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -307,6 +311,7 @@ async fn resume_rehydrates_plan_into_live_ledger() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -364,6 +369,7 @@ fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     for id in [newt_core::new_conversation_id(), foreign_id] {

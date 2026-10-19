@@ -140,6 +140,7 @@ impl Harness {
             input_stash: &mut self.input_stash,
             color: false,
             verbose: false,
+            report_sink: None,
         }
     }
 

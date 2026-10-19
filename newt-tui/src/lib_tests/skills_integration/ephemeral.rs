@@ -160,6 +160,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
     handle_conversation_command(&format!("/conversation restore {id}"), &mut ctx).unwrap();
 
