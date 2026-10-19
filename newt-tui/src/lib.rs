@@ -5863,10 +5863,9 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
 }
 
 /// `context` carries the non-soul provider blocks (AGENTS.md/CLAUDE.md,
-/// notes, memory index, project map).  It is appended unconditionally after
-/// the identity and workspace sections so that coach altitude, which replaces
-/// the soul/identity with `COACH_SOUL`, never silently drops project-specific
-/// instructions (#2934).
+/// notes, memory index, project map).  It follows the identity whatever the
+/// altitude, so coach altitude, which replaces the soul/identity with
+/// `COACH_SOUL`, never silently drops project-specific instructions (#2934).
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: Option<&str>,
@@ -5887,13 +5886,23 @@ fn build_system_prompt_with_persona(
         newt_core::Altitude::Coach => newt_core::COACH_SOUL,
         newt_core::Altitude::Doer => soul.unwrap_or(newt_core::DEFAULT_SOUL),
     };
-    let mut ctx = format!(
-        "{identity}\n\nWorkspace: {workspace}\n\
+    // #2934: project-context blocks (AGENTS.md/CLAUDE.md, notes, memory
+    // index, project map) follow the identity whatever the altitude. Coach
+    // replaces the soul above but must not drop project instructions. They
+    // sit BEFORE the live workspace line, as the combined block always did:
+    // historical notes must not redefine the runtime root stated below.
+    let mut ctx = identity.to_string();
+    if let Some(ctx_str) = context.filter(|c| !c.is_empty()) {
+        ctx.push_str("\n\n");
+        ctx.push_str(ctx_str);
+    }
+    ctx.push_str(&format!(
+        "\n\nWorkspace: {workspace}\n\
          This is the current runtime root. Relative tool paths resolve here; \
          run_command starts here unless its cwd or command selects another directory. \
          Other requested paths remain governed by the session's permissions. \
          Historical notes do not redefine this root.\n"
-    );
+    ));
     if let Some(persona) = persona {
         ctx.push_str(&format!(
             "\nActive persona: {}\n{}\n",
@@ -5983,17 +5992,6 @@ fn build_system_prompt_with_persona(
                 ctx.push_str("...[truncated]\n");
             }
             break;
-        }
-    }
-
-    // #2934: project-context blocks (AGENTS.md/CLAUDE.md, notes, memory
-    // index, project map) are always appended, independent of altitude.
-    // Coach altitude replaces the soul/identity above but must not drop
-    // project-specific instructions.
-    if let Some(ctx_str) = context {
-        if !ctx_str.is_empty() {
-            ctx.push_str("\n\n");
-            ctx.push_str(ctx_str);
         }
     }
 
