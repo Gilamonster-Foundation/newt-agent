@@ -1325,6 +1325,7 @@ impl AutoModeState {
         }
     }
 
+    #[cfg(test)]
     fn pending_for(&self, conversation_id: &str) -> Option<OperatingMode> {
         self.selected
             .lock()
@@ -10297,15 +10298,6 @@ mod skills_integration_tests;
 #[cfg(test)]
 #[path = "lib_tests/operating_mode_tests.rs"]
 mod operating_mode_tests;
-
-// ---------------------------------------------------------------------------
-// Capture-turn session-state isolation (#2937 P7): session fields (auto mode
-// selection, compress_state, note counter) are unchanged after /context request
-// across success, failure and cancel.
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-#[path = "lib_tests/capture_isolation_tests.rs"]
-mod capture_isolation_tests;
 
 #[cfg(test)]
 #[path = "lib_tests/plan_draft_state_tests.rs"]

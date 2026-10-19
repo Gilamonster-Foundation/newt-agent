@@ -152,31 +152,3 @@ async fn mid_session_save_does_not_change_the_frozen_prompt() {
         "the write itself is durable immediately"
     );
 }
-
-/// #2937 P6: a capture turn must observe a snapshot of the note counter so
-/// NoteNudge::begin_turn does not advance the live session state. With interval
-/// = 3, after 3 turns without a note save the counter is at the reminder
-/// boundary. Running a capture against a clone must not consume the reminder
-/// for the real next turn.
-#[test]
-fn note_nudge_clone_preserves_real_counter_across_capture_turn() {
-    let interval = 3;
-    let mut real = newt_core::NoteNudge::new(interval);
-    // Advance to the boundary: after `interval` calls turns_without_save == interval.
-    for _ in 0..interval {
-        assert!(real.begin_turn().is_none(), "no reminder before boundary");
-    }
-    // Simulate a capture turn: clone the real nudge and advance the clone only.
-    let mut capture_snapshot = real.clone();
-    let capture_result = capture_snapshot.begin_turn();
-    assert!(
-        capture_result.is_some(),
-        "capture snapshot sees reminder due at boundary"
-    );
-    // Real counter is untouched — reminder still fires on the next real turn.
-    let real_result = real.begin_turn();
-    assert!(
-        real_result.is_some(),
-        "real nudge still fires reminder on next turn after capture snapshot"
-    );
-}

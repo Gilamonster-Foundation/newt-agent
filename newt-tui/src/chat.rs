@@ -3224,10 +3224,6 @@ fn session_body(
     // it resets between turns while the failing command does not. This watch
     // spans turns, which is the half the guard structurally cannot do.
     let mut repeated_failures = newt_core::loop_watch::RepeatedFailureWatch::default();
-    // #2937 P2-1: set by /context request to trigger an immediate capture turn
-    // (no user message needed). Consumed at the top of each loop iteration.
-    let mut capture_request_pending = false;
-
     loop {
         if let Some(notice) = window_discovery.update(&mut choice, &mut inf_context_window) {
             print_newt(&notice, color, verbose);
@@ -3348,10 +3344,6 @@ fn session_body(
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before reading even starts.
-        // #2937 P2-1: tracks whether the current iteration is a synthetic
-        // capture turn injected by /context request (no user message, no
-        // begin_model_prompt, no persist).
-        let mut is_capture_turn = false;
         let (outcome, mut model_input_origin) = if let Some(retry) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
@@ -3362,12 +3354,6 @@ fn session_body(
                     parent: retry.parent,
                 },
             )
-        } else if capture_request_pending {
-            // #2937 P2-1: /context request sets this flag. Drive an immediate
-            // prepare-only turn with an empty task — the sink is already armed.
-            capture_request_pending = false;
-            is_capture_turn = true;
-            (ReadOutcome::Line(String::new()), ModelInputOrigin::Operator)
         } else if let Some(queued) = pending_plan_turn.take() {
             // #2424: run the turn the approval hook queued — the operator's
             // own "discuss" answer, or the harness-authored implementation
@@ -3537,30 +3523,10 @@ fn session_body(
                 continue;
             }
             ReadOutcome::Line(line) => {
-                // #2937 P6: RAII guard that disarms the capture sink on every
-                // exit from this arm (continue, break, or normal iteration end).
-                // After observe_request consumes the dump flag (RequestDumped),
-                // disarm_capture is a no-op — so success and failure are both safe.
-                struct CaptureSinkGuard<'a>(
-                    &'a std::sync::Arc<newt_core::agentic::request_report::ReportSink>,
-                );
-                impl Drop for CaptureSinkGuard<'_> {
-                    fn drop(&mut self) {
-                        self.0.disarm_capture();
-                    }
-                }
-                let _capture_guard = is_capture_turn.then(|| CaptureSinkGuard(&report_sink));
-
                 // Rejoin `\`-continued lines (multi-line entry) into real
                 // newlines; a no-op for single-line input.
-                let task = if is_capture_turn {
-                    // #2937 P2-1: capture turns are injected with an empty line;
-                    // keep empty so slash-command handling is bypassed.
-                    String::new()
-                } else {
-                    line.replace("\\\n", "\n").trim().to_string()
-                };
-                if task.is_empty() && !is_capture_turn {
+                let task = line.replace("\\\n", "\n").trim().to_string();
+                if task.is_empty() {
                     continue;
                 }
                 // NOTE: `TurnStarted` is NOT emitted here. A non-empty line is
@@ -5298,15 +5264,6 @@ fn session_body(
                             ) {
                                 print_newt(&line, color, verbose);
                             }
-                        } else if rest == "request" {
-                            // #2937 P2-1: arm the sink and schedule an immediate
-                            // capture turn — no user message needed. The next loop
-                            // iteration injects an empty task that bypasses command
-                            // handling and runs straight to the provider path; the
-                            // provider sees arm_capture_next and returns RequestDumped
-                            // (a typed clean stop) before any wire send.
-                            report_sink.arm_capture_next();
-                            capture_request_pending = true;
                         } else if rest == "show" {
                             // Build the outbound message set fresh and render a
                             // compact per-message breakdown so the operator can
@@ -7534,9 +7491,7 @@ fn session_body(
                     // `exit`): this line IS a model turn. Announce Working now
                     // — and only now — so commands never flip the pane state.
                     newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
-                    // #2937 P2-1: capture turns use an empty placeholder task and
-                    // must not create a prompt receipt — nothing is persisted.
-                    if !is_capture_turn {
+                    {
                         // Durable ingress is the FIRST operation in the final
                         // model-input branch. It precedes hardware probes,
                         // retrieval, inference, and every tool-capable path. Raw
@@ -7615,79 +7570,44 @@ fn session_body(
                         .as_ref()
                         .map(newt_core::IntakeConfig::to_lexicon)
                         .unwrap_or_default();
-                    // #2937 P2-1: capture turns bypass intake classification.
-                    // An empty task through comprehend_accepted_prompt yields
-                    // Ask disposition, which exits before the wire loop and
-                    // mutates recorded_dispositions / session clarification state.
-                    // Use a synthetic Act intake narrowed by the session's effective
-                    // operating mode. Peek at any pending Auto selection with
-                    // pending_for (non-consuming) so the next real turn still sees it.
-                    let (mut prompt_intake, turn_operating_mode) = if is_capture_turn {
-                        let plan_mode_active = conversation_mode_states.plan.is_active();
-                        let mut intake = newt_core::agentic::PromptIntake::analyze_with(
-                            "act",
-                            &Default::default(),
-                        );
-                        // Peek at the pending Auto selection without consuming it.
-                        // take_for would consume the selection; pending_for leaves it
-                        // for the next real turn.
-                        let auto_selected = (active_operating_mode == OperatingMode::Auto
-                            && !plan_mode_active
-                            && intake.disposition() == newt_core::agentic::PromptDisposition::Act)
-                            .then(|| {
-                                conversation_mode_states
-                                    .auto
-                                    .pending_for(&active_conversation_id)
-                            })
-                            .flatten();
-                        let effective_mode = effective_operating_mode(
-                            active_operating_mode,
-                            &intake,
-                            plan_mode_active,
-                            auto_selected,
-                        );
-                        apply_operating_mode_to_intake(effective_mode, &mut intake);
-                        (intake, effective_mode)
-                    } else {
-                        comprehend_accepted_prompt(
-                            &model_input_origin,
-                            &task,
-                            pending_clarification.as_ref(),
-                            active_prompt_context.as_ref(),
-                            &mut recorded_dispositions,
-                            &intake_lexicon,
-                            |intake| {
-                                // A model-selected Auto style is a one-shot
-                                // instruction for the next action-shaped turn.
-                                // Protected intake does not consume it; it remains
-                                // pending until an Act turn or an explicit
-                                // conversation/mode boundary clears it.
-                                let plan_mode_active = conversation_mode_states.plan.is_active();
-                                let auto_selected = (active_operating_mode == OperatingMode::Auto
-                                    && !plan_mode_active
-                                    && intake.disposition()
-                                        == newt_core::agentic::PromptDisposition::Act)
-                                    .then(|| {
-                                        conversation_mode_states
-                                            .auto
-                                            .take_for(&active_conversation_id)
-                                    })
-                                    .flatten();
-                                let style = effective_operating_mode(
-                                    active_operating_mode,
-                                    intake,
-                                    plan_mode_active,
-                                    auto_selected,
-                                );
-                                let authority_mode = if plan_mode_active {
-                                    OperatingMode::Plan
-                                } else {
-                                    active_operating_mode
-                                };
-                                (style, authority_mode)
-                            },
-                        )
-                    };
+                    let (mut prompt_intake, turn_operating_mode) = comprehend_accepted_prompt(
+                        &model_input_origin,
+                        &task,
+                        pending_clarification.as_ref(),
+                        active_prompt_context.as_ref(),
+                        &mut recorded_dispositions,
+                        &intake_lexicon,
+                        |intake| {
+                            // A model-selected Auto style is a one-shot
+                            // instruction for the next action-shaped turn.
+                            // Protected intake does not consume it; it remains
+                            // pending until an Act turn or an explicit
+                            // conversation/mode boundary clears it.
+                            let plan_mode_active = conversation_mode_states.plan.is_active();
+                            let auto_selected = (active_operating_mode == OperatingMode::Auto
+                                && !plan_mode_active
+                                && intake.disposition()
+                                    == newt_core::agentic::PromptDisposition::Act)
+                                .then(|| {
+                                    conversation_mode_states
+                                        .auto
+                                        .take_for(&active_conversation_id)
+                                })
+                                .flatten();
+                            let style = effective_operating_mode(
+                                active_operating_mode,
+                                intake,
+                                plan_mode_active,
+                                auto_selected,
+                            );
+                            let authority_mode = if plan_mode_active {
+                                OperatingMode::Plan
+                            } else {
+                                active_operating_mode
+                            };
+                            (style, authority_mode)
+                        },
+                    );
                     attribute_carried_plan_clamp(
                         &mut prompt_intake,
                         active_operating_mode,
@@ -7769,8 +7689,7 @@ fn session_body(
                     // counts and digests. It is written before an Ask handoff
                     // and before Act inference so a later compacted or resumed
                     // session can audit why the harness chose its disposition.
-                    // #2937 P2-1: skip for capture turns — no durable receipt exists.
-                    if !is_capture_turn {
+                    {
                         let durable_artifact_store_owner =
                             conversation_store.as_ref().map(|store| {
                                 newt_core::agentic::StoreArtifactStore::new(
@@ -8873,15 +8792,6 @@ fn session_body(
                     // #2313: one attempt ledger per turn; its totals price the turn.
                     let turn_attempts =
                         std::sync::Mutex::new(newt_core::attempts::AttemptLedger::default());
-                    // #2937 P6: capture turns observe a snapshot of the note
-                    // counter so NoteNudge::begin_turn does not advance the live
-                    // session state. The clone is two usizes and discarded after
-                    // the turn.
-                    let mut capture_note_nudge = note_nudge.clone();
-                    // #2937 P7: capture turns observe a snapshot of compression
-                    // state so compress accounting (floor, pass count, disable flag)
-                    // is not mutated by the preview pass. CompressState derives Clone.
-                    let mut capture_compress_state = compress_state.clone();
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -9023,11 +8933,7 @@ fn session_body(
                                         // stays TUI-side). See issue #223.
                                         recover_cw_400: Some(recover_context_window_400),
                                         note_sink: Some(&mut note_sink),
-                                        note_nudge: if is_capture_turn {
-                                            Some(&mut capture_note_nudge)
-                                        } else {
-                                            Some(&mut note_nudge)
-                                        },
+                                        note_nudge: Some(&mut note_nudge),
                                         // Recall over past conversations (Step 17.5).
                                         recall_source: recall_source
                                             .as_ref()
@@ -9037,11 +8943,7 @@ fn session_body(
                                         memory_source: Some(&memory_source),
                                         // Summarize-don't-discard (Step 18.4, #247).
                                         summarizer: loop_summarizer.as_deref(),
-                                        compress_state: if is_capture_turn {
-                                            Some(&mut capture_compress_state)
-                                        } else {
-                                            Some(&mut compress_state)
-                                        },
+                                        compress_state: Some(&mut compress_state),
                                         tool_events: Some(&mut turn_tool_events),
                                         phantom_reaches: Some(&mut turn_phantom_reaches),
                                         end_reason: Some(&mut turn_end_reason),
@@ -9225,22 +9127,6 @@ fn session_body(
                                 verbose,
                             );
                         }
-                    }
-                    // #2937 P7: capture turn exits here, before cancel/persist
-                    // handlers, for all completion paths (success, failure, cancel).
-                    // The RAII CaptureSinkGuard drops on `continue`, disarming the
-                    // sink. No persistence, no cancel save, no live state mutation.
-                    if is_capture_turn {
-                        if let Some(r) = report_sink.last_report() {
-                            newt_core::tty::Terminal::emit_line(
-                                newt_core::tty::Sink::Stdout,
-                                |w| {
-                                    use std::io::Write;
-                                    writeln!(w, "{}", r.to_markdown())
-                                },
-                            );
-                        }
-                        continue;
                     }
                     if turn_exit.load(std::sync::atomic::Ordering::Relaxed) {
                         clean_exit = true;
