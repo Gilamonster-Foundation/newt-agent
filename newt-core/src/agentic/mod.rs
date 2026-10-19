@@ -1256,6 +1256,8 @@ pub struct ChatCtx<'a> {
     /// `None` (every headless / eval caller) ⇒ nothing is ever drained and the
     /// request bodies are bit-for-bit today's.
     pub steering: Option<&'a dyn SteeringInbox>,
+    /// #2937: session-owned prompt-report capture sink. `None` disables capture.
+    pub report_sink: Option<&'a request_report::ReportSink>,
 }
 
 /// Drain operator steering into `messages` as genuine user turns (#952/#1669).
@@ -1535,6 +1537,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         emits_leading_reasoning,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -1760,8 +1763,6 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // usage or an overflow updates the session's calibration.
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
     let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
-    // #2937: measure the exact request about to be sent.
-    request_report::observe_request(&messages, &tools)?;
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -2255,6 +2256,21 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 if let Some(o) = body_no_stream.as_object_mut() {
                     o.remove("tools");
                 }
+            }
+            // #2937: capture exact final body per-round, after the tools gate.
+            if let Some(sink) = report_sink {
+                let sys_texts: Vec<&str> = messages
+                    .iter()
+                    .filter(|m| m["role"] == "system")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect();
+                let empty: Vec<serde_json::Value> = vec![];
+                let send_tools: &[serde_json::Value] = if tools_supported {
+                    tools.as_array().map(|a| a.as_slice()).unwrap_or(&empty)
+                } else {
+                    &empty
+                };
+                sink.observe_request(&sys_texts, send_tools)?;
             }
 
             // Retry the send+status+parse as one unit — a connection drop at any
@@ -6724,6 +6740,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // #2372: the primary content is filtered with the stream filter's
         // policy — a lone `</think>` is answer text unless the backend
@@ -6961,8 +6978,6 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // (mirrors the Ollama path).
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
     let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
-    // #2937: measure the exact request about to be sent.
-    request_report::observe_request(&messages, &tools)?;
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -7391,6 +7406,21 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     o.remove("tools");
                     o.remove("tool_choice");
                 }
+            }
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                let sys_texts: Vec<&str> = wire_messages
+                    .iter()
+                    .filter(|m| m["role"] == "system")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect();
+                let empty: Vec<serde_json::Value> = vec![];
+                let send_tools: &[serde_json::Value] = if tools_supported {
+                    tools.as_array().map(|a| a.as_slice()).unwrap_or(&empty)
+                } else {
+                    &empty
+                };
+                sink.observe_request(&sys_texts, send_tools)?;
             }
             // OpenAI-compatible endpoints do not accept a `num_ctx` request field,
             // but the operator-declared local window still bounds Newt's pre-send
@@ -9580,6 +9610,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // Anthropic streams reasoning in its own wire fields, not as a lone
         // leading `</think>` closer, so this loop never starts the filter
@@ -9844,8 +9875,6 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // (mirrors the OpenAI path).
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
     let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
-    // #2937: measure the exact request about to be sent.
-    request_report::observe_request(&messages, &tools)?;
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -10237,6 +10266,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 use_tools.then_some(tools_anthropic.as_slice()),
                 streaming_enabled,
             );
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
+                let send_tools: &[serde_json::Value] = if use_tools { &tools_anthropic } else { &[] };
+                sink.observe_request(&sys_arr, send_tools)?;
+            }
             let dispatch = anthropic_dispatch_round(
                 &dispatcher,
                 &body,
@@ -12259,6 +12294,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // The Responses wire carries reasoning in its own items, never as a
         // lone leading `</think>` closer, so the declared #528 shape does not
@@ -12462,8 +12498,6 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut cw_retries: u32 = 0;
     let mut output_recovery = output_limit_recovery::Recovery::default();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    // #2937: measure the exact request about to be sent.
-    request_report::observe_request(&msgs_json, &tools_chat)?;
     preflight_irreducible_request(
         &msgs_json,
         Some(&tools_for_estimate),
@@ -12744,6 +12778,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 harness.record_responses_messages(instructions.as_deref(), &input)?;
             }
             let mut body = build_body(&input, if tools_supported { &tools } else { &[] });
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                let ins_str: &str = body["instructions"].as_str().unwrap_or("");
+                let sys_arr: &[&str] = if ins_str.is_empty() { &[] } else { std::slice::from_ref(&ins_str) };
+                let empty: Vec<serde_json::Value> = vec![];
+                let send_tools: &[serde_json::Value] = body["tools"]
+                    .as_array()
+                    .map(|a| a.as_slice())
+                    .unwrap_or(empty.as_slice());
+                sink.observe_request(sys_arr, send_tools)?;
+            }
             let output_cap = generation_bounds::apply_responses(
                 &mut body,
                 output_recovery.allowance(generation_policy.output_allowance),

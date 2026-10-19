@@ -5862,8 +5862,6 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
     enabled.then_some(NARRATION_INTENT_LINE)
 }
 
-const SYSTEM_PROMPT_SRC: &str = "newt-tui build_system_prompt_with_persona";
-
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: Option<&str>,
@@ -5890,11 +5888,11 @@ fn build_system_prompt_with_persona(
          Other requested paths remain governed by the session's permissions. \
          Historical notes do not redefine this root.\n"
     );
-    // #2937: name each piece so `/context request` can attribute it.
-    let note = |label: &str, text: &str| {
-        newt_core::agentic::request_report::annotate(label, SYSTEM_PROMPT_SRC, text);
-    };
-    note("identity (soul) + workspace root", &ctx);
+    // #2937: attribution is threaded per-turn from chat.rs via the session's
+    // ReportSink. Pieces annotated here show as (unattributed) until
+    // report_sink threading reaches rebuild_system_prompt callers.
+    #[allow(unused_variables)]
+    let note = |_label: &str, _text: &str| {};
     if let Some(persona) = persona {
         ctx.push_str(&format!(
             "\nActive persona: {}\n{}\n",

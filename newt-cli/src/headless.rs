@@ -135,13 +135,9 @@ pub struct HeadlessArgs {
 /// same fact `newt-tui`'s interactive loop already states via its
 /// `Workspace: {path}` line (`newt-tui/src/lib.rs`).
 fn workspace_root_system_message(workspace: &str) -> newt_core::MemMessage {
-    let text = format!("Workspace root: {workspace}");
-    newt_core::agentic::request_report::annotate(
-        "workspace root",
-        "newt-cli headless workspace_root_system_message",
-        &text,
-    );
-    newt_core::MemMessage::system(text)
+    // #2937: annotation is session-owned; the piece shows as (unattributed)
+    // in the report until report_sink threading reaches this function.
+    newt_core::MemMessage::system(format!("Workspace root: {workspace}"))
 }
 
 fn seed_scratchpad(json: &str) -> Result<(Arc<newt_core::SessionScratchpadStore>, String)> {
@@ -462,10 +458,6 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         headless_contract::Feature::Crew => runtime.crew,
         headless_contract::Feature::CodeSearch => false,
     })?;
-    // #2937: arm the one-shot request report before any request is built.
-    if let Some(path) = &args.dump_request {
-        newt_core::agentic::request_report::dump_next_to(path.clone(), true);
-    }
     // #2312: the flag, else the model's `[[model_tuning]]` entry — the lookup
     // the TUI uses — else the cognition table and wire defaults downstream. An
     // unusable explicit value is refused here, like a required feature.
@@ -660,6 +652,12 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // Captured before `dc` moves into the driver: the cap the run ACTUALLY
     // uses initially (post `--max-rounds`), for the contract's effective_config.
     let max_rounds = dc.max_tool_rounds as u32;
+    // #2937: session-owned request-report sink; prepare-only mode stops before send.
+    if let Some(path) = &args.dump_request {
+        dc.report_sink = Some(std::sync::Arc::new(
+            newt_core::agentic::request_report::ReportSink::prepare_and_dump(path.clone()),
+        ));
+    }
     let read_scope = dc.caveats.fs_read.clone();
     let mut driver =
         TurnDriver::with_transcript(dc, vec![workspace_root_system_message(&workspace)])
@@ -764,13 +762,15 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             }
         }
     };
-    // #2937: a dump stops the request before it is sent; the report is the result.
-    if let (Some(path), Some(_)) = (
-        &args.dump_request,
-        newt_core::agentic::request_report::last_report(),
-    ) {
-        eprintln!("newt: request report written to {}", path.display());
-        return Ok(0);
+    // #2937: a successful dump-and-stop returns PrepareOnly; the file was written
+    // inside the driver. A write failure would have produced TurnEndReason::Failed.
+    if let Ok(ref o) = outcome {
+        if o.end_reason == Some(newt_core::metrics::TurnEndReason::PrepareOnly) {
+            if let Some(path) = &args.dump_request {
+                eprintln!("newt: request report written to {}", path.display());
+            }
+            return Ok(0);
+        }
     }
     match &outcome {
         Ok(o) if o.error.is_none() => {

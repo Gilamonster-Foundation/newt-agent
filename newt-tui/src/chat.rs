@@ -2526,6 +2526,9 @@ fn session_body(
             std::sync::Arc::new(newt_core::agentic::run_allowance::RunAllowance::new(calls))
         });
 
+    // #2937: session-owned prompt-report capture sink.
+    let report_sink = std::sync::Arc::new(newt_core::agentic::request_report::ReportSink::new());
+
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
     // Memory/compression budget (Step 18.2, #247): the SAME empirical
@@ -5263,10 +5266,10 @@ fn session_body(
                             // sized per component. Read off the request the loop
                             // built; before any request exists, arm it to print
                             // just before the first send.
-                            match newt_core::agentic::request_report::last_report() {
-                                Some(report) => println!("{}", report.to_markdown()),
+                            match report_sink.last_report() {
+                                Some(report) => print_newt(&report.to_markdown(), color, verbose),
                                 None => {
-                                    newt_core::agentic::request_report::show_next();
+                                    report_sink.arm_show_next();
                                     print_newt(
                                         "no request built yet; the report prints just before your next message is sent",
                                         color,
@@ -8120,7 +8123,6 @@ fn session_body(
                         ),
                     );
                     // #2937: name each piece so `/context request` can attribute it.
-                    use newt_core::agentic::request_report::annotate;
                     let ws_state = workspace_state_block(workspace, &turn_caveats.fs_read);
                     let runtime_ctx = runtime_context_block(
                         &inf_model,
@@ -8129,17 +8131,17 @@ fn session_body(
                         &session_identity,
                         turn_disposition,
                     );
-                    annotate(
+                    report_sink.annotate(
                         "workspace state",
                         "newt-tui workspace_state_block",
                         &ws_state,
                     );
-                    annotate(
+                    report_sink.annotate(
                         "runtime context",
                         "newt-tui runtime_context_block",
                         &runtime_ctx,
                     );
-                    annotate(
+                    report_sink.annotate(
                         "session controls",
                         "newt-tui session_control_prompt",
                         &session_controls,
@@ -8162,7 +8164,7 @@ fn session_body(
                         .resolve(active_persona.as_ref().and_then(|p| p.profile.personality))
                         .prompt_block();
                     if !communication_style.is_empty() {
-                        annotate(
+                        report_sink.annotate(
                             "communication style",
                             "newt-tui personality prompt_block",
                             &communication_style,
@@ -8185,7 +8187,7 @@ fn session_body(
                             .then_some(&scratchpad_store as &dyn newt_core::ScratchpadStore),
                         turn_features.scheduled,
                     ) {
-                        annotate(
+                        report_sink.annotate(
                             "working-memory head",
                             "newt_core::agentic::working_memory_head",
                             &head,
@@ -8314,7 +8316,7 @@ fn session_body(
                                     &ctx_hash,
                                 );
                                 nav_session.last_semantic = Some(result);
-                                annotate(
+                                report_sink.annotate(
                                     "code evidence",
                                     "newt_core::render_code_evidence",
                                     &block,
@@ -8333,7 +8335,7 @@ fn session_body(
                             &task,
                             newt_core::EXPERIENCE_TOP_K,
                         ) {
-                            annotate("experience", "newt_core::experience_block", &block);
+                            report_sink.annotate("experience", "newt_core::experience_block", &block);
                             turn_system = format!("{block}\n\n{turn_system}");
                         }
                     }
@@ -9048,6 +9050,7 @@ fn session_body(
                                         // dead plumbing; it is wired when the
                                         // editor stays live (the cockpit slice).
                                         steering: None,
+                                        report_sink: Some(&*report_sink),
                                         reader_source: Some(
                                             &newt_core::commit_review::HostReaders,
                                         ),

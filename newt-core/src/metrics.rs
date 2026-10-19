@@ -89,6 +89,9 @@ pub enum TurnEndReason {
     /// unavailable, requested but never executed, or left stale or unrun with
     /// no allowance or round left.
     VerificationIncomplete,
+    /// #2937: stopped at the request-capture boundary; no inference was sent.
+    /// Set by `--dump-request` / headless prepare-only mode.
+    PrepareOnly,
 }
 
 /// Full telemetry record for one inference turn.
@@ -218,6 +221,7 @@ impl TurnMetrics {
             Some(TurnEndReason::VerificationIncomplete) => {
                 format!("{base} · ⚠ verification incomplete")
             }
+            Some(TurnEndReason::PrepareOnly) => format!("{base} · prepared (no send)"),
             Some(TurnEndReason::Completed) | None => base,
         }
     }
