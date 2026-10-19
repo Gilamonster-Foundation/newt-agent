@@ -20,7 +20,7 @@ fn coach_altitude_keeps_project_context_2934() {
     let project_ctx = "AGENTS.md: Use four spaces for indentation.";
     let prompt = build_system_prompt_with_persona(
         "/workspace",
-        None,             // soul — Coach replaces with COACH_SOUL
+        None,              // soul — Coach replaces with COACH_SOUL
         Some(project_ctx), // context — must survive regardless of altitude
         Some(&persona),
         "plan.md",
