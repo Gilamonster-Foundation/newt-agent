@@ -117,6 +117,9 @@ pub struct HeadlessArgs {
     pub output_allowance: Option<u32>,
     /// `--run-allowance`: explicit run-level call-count allowance (#2313).
     pub run_allowance: Option<u32>,
+    /// `--dump-request`: write the first request's prompt report here and stop
+    /// before sending it (#2937).
+    pub dump_request: Option<PathBuf>,
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -132,7 +135,13 @@ pub struct HeadlessArgs {
 /// same fact `newt-tui`'s interactive loop already states via its
 /// `Workspace: {path}` line (`newt-tui/src/lib.rs`).
 fn workspace_root_system_message(workspace: &str) -> newt_core::MemMessage {
-    newt_core::MemMessage::system(format!("Workspace root: {workspace}"))
+    let text = format!("Workspace root: {workspace}");
+    newt_core::agentic::request_report::annotate(
+        "workspace root",
+        "newt-cli headless workspace_root_system_message",
+        &text,
+    );
+    newt_core::MemMessage::system(text)
 }
 
 fn seed_scratchpad(json: &str) -> Result<(Arc<newt_core::SessionScratchpadStore>, String)> {
@@ -453,6 +462,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         headless_contract::Feature::Crew => runtime.crew,
         headless_contract::Feature::CodeSearch => false,
     })?;
+    // #2937: arm the one-shot request report before any request is built.
+    if let Some(path) = &args.dump_request {
+        newt_core::agentic::request_report::dump_next_to(path.clone(), true);
+    }
     // #2312: the flag, else the model's `[[model_tuning]]` entry — the lookup
     // the TUI uses — else the cognition table and wire defaults downstream. An
     // unusable explicit value is refused here, like a required feature.
@@ -751,6 +764,14 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             }
         }
     };
+    // #2937: a dump stops the request before it is sent; the report is the result.
+    if let (Some(path), Some(_)) = (
+        &args.dump_request,
+        newt_core::agentic::request_report::last_report(),
+    ) {
+        eprintln!("newt: request report written to {}", path.display());
+        return Ok(0);
+    }
     match &outcome {
         Ok(o) if o.error.is_none() => {
             newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnCompleted);

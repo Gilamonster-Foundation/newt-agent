@@ -903,6 +903,12 @@ pub enum Command {
         /// been made.
         #[arg(long, value_name = "CALLS")]
         run_allowance: Option<u32>,
+        /// Write the final system message(s) and tools array of the first
+        /// request, each component sized in characters, to FILE (markdown) and
+        /// stop before anything is sent. The same report as `/context request`
+        /// in the TUI (#2937).
+        #[arg(long, value_name = "FILE")]
+        dump_request: Option<PathBuf>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
         /// otherwise starts a resumable frame; legacy headless keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
@@ -1881,6 +1887,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             require_feature,
             output_allowance,
             run_allowance,
+            dump_request,
             hermetic,
             resume_from,
         } => {
@@ -1910,6 +1917,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 require_feature,
                 output_allowance,
                 run_allowance,
+                dump_request,
                 launch,
             })
             .await?;
