@@ -1,0 +1,30 @@
+[package]
+name = "newt-flock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "A verified, read-only follower of an agent-mesh flock for newt (the inbox's read side)."
+
+[dependencies]
+# Pinned to one agent-mesh main revision until the flock crates are published.
+# Read side only: no `serve` / `emit`, so no server, no signing key.
+agent-mesh-flock = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb" }
+agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb", default-features = false }
+agent-mesh-flock-session = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb", default-features = false }
+content-addressable.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Writer features are for the in-process fixture only.
+agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb", features = ["serve"] }
+agent-mesh-protocol = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "62c6569a849fb71f0c382e83ceb110ecf76223bb" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+tempfile.workspace = true
+
+[lints]
+workspace = true
