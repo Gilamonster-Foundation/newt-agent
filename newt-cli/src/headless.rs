@@ -507,6 +507,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // 5. Drive one full turn (== a complete multi-round agentic turn).
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
+    // #2932: the same `[tool_exposure]` policy the TUI resolves, so a headless
+    // four-tool run is the configured surface and not the full catalog.
+    dc.exposure = newt_core::ExposureSettings::from(cfg.tool_exposure());
     dc.output_allowance = output_allowance;
     dc.overflow_retry = cfg
         .find_model_tuning(&model)

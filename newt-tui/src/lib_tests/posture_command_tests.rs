@@ -234,6 +234,47 @@ fn effective_caveats_intersect_base_with_the_posture_clamp() {
     assert_eq!(effective_caveats(&base, None), base);
 }
 
+/// #2932 / #2950 review 1: `[tool_exposure] read_only` is one toggle that
+/// hides the write tools AND meets the session's authority — so a session
+/// already authorized to write loses `fs_write` through every tool, including
+/// the shell, and nothing else widens.
+#[test]
+fn read_only_tool_policy_attenuates_session_authority_through_the_mode_seam() {
+    use newt_core::operating_mode::OperatingMode;
+    let base = newt_core::Caveats::top();
+    let narrowed = operating_mode_caveats(true, OperatingMode::Dev, false, base.clone());
+    assert!(!narrowed.permits_fs_write("/x"), "write authority is gone");
+    assert!(narrowed.permits_fs_read("/x"), "reads survive");
+    assert!(
+        narrowed.permits_exec("cargo"),
+        "exec survives: read-only still builds"
+    );
+    assert!(narrowed.leq(&base), "only narrows");
+    assert_eq!(
+        operating_mode_caveats(false, OperatingMode::Dev, false, base.clone()),
+        base,
+        "toggle off ⇒ bit-for-bit base"
+    );
+    // Composes with a mode clamp: Plan stays fully offline underneath it.
+    let planned = operating_mode_caveats(true, OperatingMode::Plan, false, base.clone());
+    assert!(!planned.permits_fs_write("/x") && !planned.permits_exec("cargo"));
+}
+
+/// The permission gate's ceiling carries the read-only clamp too, so a
+/// recalled or newly admitted grant cannot re-open writes above it.
+#[test]
+fn read_only_tool_policy_is_a_permission_gate_ceiling() {
+    use newt_core::operating_mode::OperatingMode;
+    let ceiling = operating_mode_permission_clamp(true, OperatingMode::Dev, false, None)
+        .expect("read_only alone yields a ceiling");
+    assert!(!ceiling.permits_fs_write("/x"));
+    assert_eq!(
+        operating_mode_permission_clamp(false, OperatingMode::Dev, false, None),
+        None,
+        "no toggle, no mode, no posture ⇒ no ceiling (unchanged)"
+    );
+}
+
 #[test]
 fn posture_command_and_settings_share_the_enforced_binding() {
     let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();

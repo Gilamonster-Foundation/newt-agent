@@ -278,6 +278,136 @@ per_wire!(an_exposure_hidden_tool_is_found_then_promoted:
     responses_promotes_an_exposure_hidden_tool,
     anthropic_promotes_an_exposure_hidden_tool);
 
+/// #2932 / #2950 review 1: an operator `allow_list` is a visibility CEILING,
+/// not a budget deferral. `save_note` is authorized but excluded: discovery
+/// never names it, a direct call is refused without running, and no later
+/// request carries its schema — on every wire.
+async fn an_operator_hidden_tool_is_never_found_or_promoted(wire: Wire) {
+    let note = serde_json::json!({"action": "add", "text": "must not land"});
+    let (server, requests) = scripted(
+        wire,
+        vec![
+            ("tool_search", serde_json::json!({"query": "save note"})),
+            ("save_note", note.clone()),
+            ("save_note", note),
+        ],
+    )
+    .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut sink = MockSink::default();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.action_nudges = false;
+    context.note_sink = Some(&mut sink);
+    context.exposure.allow_list = Some(
+        ["tool_search", "read_file", "run_command"]
+            .map(String::from)
+            .to_vec(),
+    );
+    wire.run(context, &mut NoMcp).await;
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        4,
+        "{wire:?}: search, refused call, refused call, answer"
+    );
+    let names: Vec<Vec<String>> = requests.iter().map(|r| wire.tool_names(r)).collect();
+    assert!(
+        !names[0].is_empty()
+            && names[0]
+                .iter()
+                .all(|n| ["tool_search", "read_file", "run_command"].contains(&n.as_str())),
+        "{wire:?}: only allow-listed tools are advertised: {:?}",
+        names[0]
+    );
+
+    let search = wire.last_tool_result(&requests[1]);
+    assert!(
+        !search.contains("save_note"),
+        "{wire:?}: discovery must not name an operator-hidden tool: {search}"
+    );
+    let refused = wire.last_tool_result(&requests[2]);
+    assert!(
+        refused.contains("not available in this session"),
+        "{wire:?}: a direct call is refused, not promoted: {refused}"
+    );
+    assert_eq!(
+        names[2], names[0],
+        "{wire:?}: the refused call loads nothing for the next request"
+    );
+    assert_eq!(
+        names[3], names[0],
+        "{wire:?}: a second call still loads nothing"
+    );
+    drop(requests);
+    assert!(
+        sink.calls.is_empty(),
+        "{wire:?}: an operator-hidden tool never runs: {:?}",
+        sink.calls
+    );
+}
+
+per_wire!(an_operator_hidden_tool_is_never_found_or_promoted:
+    an_operator_hidden_tool_is_never_found_or_promoted_on_ollama,
+    chat_completions_never_promotes_an_operator_hidden_tool,
+    responses_never_promotes_an_operator_hidden_tool,
+    anthropic_never_promotes_an_operator_hidden_tool);
+
+/// Twin for `read_only`: the three write tools are excluded the same way —
+/// unadvertised, undiscoverable, refused on call, never appended.
+async fn read_only_keeps_write_tools_off_every_request(wire: Wire) {
+    let write = serde_json::json!({"path": "never-written.txt", "content": "x"});
+    let (server, requests) = scripted(
+        wire,
+        vec![
+            ("tool_search", serde_json::json!({"query": "write file"})),
+            ("write_file", write),
+        ],
+    )
+    .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.action_nudges = false;
+    context.exposure.read_only = true;
+    wire.run(context, &mut NoMcp).await;
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "{wire:?}: search, refused call, answer");
+    let names: Vec<Vec<String>> = requests.iter().map(|r| wire.tool_names(r)).collect();
+    for hidden in ["write_file", "edit_file", "delete_file"] {
+        assert!(
+            !names[0].iter().any(|n| n == hidden),
+            "{wire:?}: `{hidden}` must not be advertised: {:?}",
+            names[0]
+        );
+    }
+    assert!(
+        names[0].iter().any(|n| n == "read_file"),
+        "{wire:?}: read tools stay"
+    );
+    let search = wire.last_tool_result(&requests[1]);
+    assert!(
+        !search.contains("write_file"),
+        "{wire:?}: discovery must not name a read_only-hidden tool: {search}"
+    );
+    assert!(
+        wire.last_tool_result(&requests[2])
+            .contains("not available in this session"),
+        "{wire:?}: the write call is refused"
+    );
+    assert_eq!(names[2], names[0], "{wire:?}: nothing is promoted");
+}
+
+per_wire!(read_only_keeps_write_tools_off_every_request:
+    read_only_keeps_write_tools_off_every_request_on_ollama,
+    chat_completions_keeps_write_tools_off_under_read_only,
+    responses_keeps_write_tools_off_under_read_only,
+    anthropic_keeps_write_tools_off_under_read_only);
+
 /// Twin: the default `full` profile is bit-identical. Every request carries the
 /// same tool list, nothing is marked unloaded, and the first call runs.
 async fn full_exposure_sends_one_tool_list(wire: Wire) {

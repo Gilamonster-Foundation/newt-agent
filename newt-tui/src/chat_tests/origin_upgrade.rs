@@ -533,7 +533,7 @@ async fn a_resumed_task_keeps_its_record_but_current_narrowing_wins() {
         "/nonexistent-workspace",
         false,
         20,
-        &operating_mode_caveats(mode, false, newt_core::Caveats::top()),
+        &operating_mode_caveats(false, mode, false, newt_core::Caveats::top()),
         &mut newt_core::agentic::NoMcp,
         None,
         None,

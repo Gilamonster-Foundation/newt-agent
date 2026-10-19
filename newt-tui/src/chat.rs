@@ -3596,7 +3596,7 @@ fn session_body(
                                     "{}", workspace_settings.unavailable.as_deref().unwrap_or("workspace settings were not protected at startup"));
                                 let recalled = permission_state.recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()))?;
                                 let posture = newt_core::posture::active_posture();
-                                let active = operating_mode_caveats(active_operating_mode,
+                                let active = operating_mode_caveats(cfg.tool_exposure().read_only, active_operating_mode,
                                     conversation_mode_states.plan.is_active(), effective_caveats(&recalled, posture.as_ref()));
                                 let permissions = resolve_tui(&cfg).map(|tui| tui.permissions).unwrap_or_default();
                                 let mut additional = vec![
@@ -3683,6 +3683,7 @@ fn session_body(
                                 open_panel: terminal_owns_turn.then_some(&open_permission_panel),
                                 state: &mut permission_state,
                                 base: operating_mode_caveats(
+                                    cfg.tool_exposure().read_only,
                                     active_operating_mode,
                                     conversation_mode_states.plan.is_active(),
                                     effective_caveats(cap.caveats(), posture.as_ref()),
@@ -3693,6 +3694,7 @@ fn session_body(
                                 denials_path: permission_denials_path.clone(),
                                 config_path: permission_config_path.clone(),
                                 preset_clamp: operating_mode_permission_clamp(
+                                    cfg.tool_exposure().read_only,
                                     active_operating_mode,
                                     conversation_mode_states.plan.is_active(),
                                     posture
@@ -8096,6 +8098,7 @@ fn session_body(
                     let recalled_caveats = permission_state
                         .recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()))?;
                     let turn_caveats = operating_mode_caveats(
+                        cfg.tool_exposure().read_only,
                         active_operating_mode,
                         conversation_mode_states.plan.is_active(),
                         meet_persona_caveats(
@@ -8448,6 +8451,7 @@ fn session_body(
                     // clamp remain ceilings when the gate replays old grants
                     // or admits new ones. An inferred style adds no ceiling.
                     let preset_clamp = operating_mode_permission_clamp(
+                        cfg.tool_exposure().read_only,
                         active_operating_mode,
                         conversation_mode_states.plan.is_active(),
                         turn_posture

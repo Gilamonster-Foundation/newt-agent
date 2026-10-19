@@ -185,6 +185,92 @@ impl From<crate::config::ToolExposureConfig> for ExposureSettings {
     }
 }
 
+impl ExposureSettings {
+    /// Whether the operator's `allow_list` / `read_only` policy lets `name`
+    /// reach the model at all. The ONE predicate behind catalog selection,
+    /// discovery, promotion and prompt rendering, so none of them can name a
+    /// tool another has hidden (#2932).
+    #[must_use]
+    pub fn operator_visible(&self, name: &str) -> bool {
+        let listed = self
+            .allow_list
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|allowed| allowed == name));
+        listed && !(self.read_only && WRITE_TOOL_NAMES.contains(&name))
+    }
+
+    /// Whether any operator policy is in force (absent = identity).
+    fn has_operator_filter(&self) -> bool {
+        self.allow_list.is_some() || self.read_only
+    }
+
+    /// Narrow a session's authority to match `read_only`: a meet with
+    /// [`read_only_clamp`](super::read_only_clamp), so visibility and authority
+    /// cannot drift apart. Only narrows; `read_only = false` is the identity.
+    #[must_use]
+    pub fn attenuate(&self, caveats: crate::caveats::Caveats) -> crate::caveats::Caveats {
+        if self.read_only {
+            caveats.meet(&super::read_only_clamp())
+        } else {
+            caveats
+        }
+    }
+
+    /// Render an identity prompt so it names only operator-visible tools: the
+    /// `You have tools: …` line is rewritten to the visible subset and any
+    /// paragraph that names a hidden built-in is dropped. Identity without an
+    /// operator filter is returned unchanged.
+    #[must_use]
+    pub fn render_identity<'a>(&self, identity: &'a str) -> std::borrow::Cow<'a, str> {
+        if !self.has_operator_filter() {
+            return std::borrow::Cow::Borrowed(identity);
+        }
+        let hidden_names = |text: &str| {
+            super::catalog::ALL_TOOL_NAMES
+                .iter()
+                .any(|name| !self.operator_visible(name) && mentions_tool(text, name))
+        };
+        let paragraphs: Vec<String> = identity
+            .split("\n\n")
+            .filter_map(|paragraph| {
+                // The tool sentence may sit mid-paragraph ("You are newt… You
+                // have tools: …"): rewrite it in place, then judge the rest.
+                let rewritten = match paragraph.find(TOOL_LINE_PREFIX) {
+                    Some(at) => {
+                        let (head, rest) = paragraph.split_at(at + TOOL_LINE_PREFIX.len());
+                        let (names, tail) = rest.split_once('.').unwrap_or((rest, ""));
+                        let kept: Vec<&str> = names
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty() && self.operator_visible(name))
+                            .collect();
+                        format!("{head}{}.{tail}", kept.join(", "))
+                    }
+                    None => paragraph.to_owned(),
+                };
+                (!hidden_names(&rewritten)).then_some(rewritten)
+            })
+            .collect();
+        std::borrow::Cow::Owned(paragraphs.join("\n\n"))
+    }
+}
+
+/// The sentence prefix an identity uses to enumerate its tools.
+const TOOL_LINE_PREFIX: &str = "You have tools: ";
+
+/// Whether `text` names `tool` as a whole word (`edit_file`, not `edit_files`).
+fn mentions_tool(text: &str, tool: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(tool).any(|(at, _)| {
+        let before = text[..at].chars().next_back().is_none_or(|c| !is_word(c));
+        let after = text[at + tool.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word(c));
+        before && after
+    })
+}
+
 /// What the controller decided this turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExposurePlan {
@@ -193,6 +279,10 @@ pub struct ExposurePlan {
     /// Authorized names dropped from the wire (still dispatchable). They seed
     /// the turn's [`HiddenTools`], which `tool_search` and dispatch read.
     pub hidden: Vec<String>,
+    /// Names the operator's `allow_list` / `read_only` policy excludes. They
+    /// are never discoverable or promotable: a call is refused, a search does
+    /// not list them (#2932).
+    pub operator_hidden: Vec<String>,
 }
 
 /// How `tool_search` marks an authorized tool whose schema is off the wire.
@@ -208,6 +298,8 @@ pub(crate) enum Promotion {
     Promoted,
     /// The request is already at this many function tools, the wire's cap.
     AtCap(usize),
+    /// The operator's tool policy excludes it: never loaded, never run (#2932).
+    OperatorHidden,
 }
 
 impl Promotion {
@@ -216,6 +308,10 @@ impl Promotion {
     pub(crate) fn message(self, name: &str) -> Option<String> {
         match self {
             Self::NotHidden => None,
+            Self::OperatorHidden => Some(format!(
+                "Tool `{name}` is not available in this session: the operator's tool policy \
+                 excludes it, and it cannot be loaded. Use the tools you were given."
+            )),
             Self::Promoted => Some(format!(
                 "Tool `{name}` did not run (schema not loaded). Its schema is loaded for your \
                  next request; call `{name}` with arguments that match it."
@@ -242,6 +338,9 @@ pub(crate) struct HiddenTools {
 struct HiddenState {
     /// Hidden definitions, in catalog order.
     defs: Vec<Value>,
+    /// Definitions the operator's policy excludes: refused on call, absent
+    /// from discovery, never promoted (#2932).
+    operator_hidden: Vec<Value>,
     /// Names activated since the last append, in request order.
     promoted: Vec<String>,
     /// `(cap, sent)`: the wire cap and its reserved next-request definitions,
@@ -264,6 +363,15 @@ impl HiddenTools {
             .any(|def| entry_name(def) == Some(name))
     }
 
+    /// Whether the operator's tool policy excludes `name` this turn (#2932).
+    /// Such a tool is neither discoverable nor promotable.
+    pub(crate) fn is_operator_hidden(&self, name: &str) -> bool {
+        self.state()
+            .operator_hidden
+            .iter()
+            .any(|def| entry_name(def) == Some(name))
+    }
+
     /// Register the actual wire projection so replacements preserve its
     /// narrowed definitions and can never displace Kernel schemas.
     fn limit_to(&self, cap: usize, sent: &[Value]) {
@@ -274,6 +382,13 @@ impl HiddenTools {
     /// unqueued optional schema; a refused tool never enters this state.
     pub(crate) fn promote(&self, name: &str) -> Promotion {
         let mut state = self.state();
+        if state
+            .operator_hidden
+            .iter()
+            .any(|def| entry_name(def) == Some(name))
+        {
+            return Promotion::OperatorHidden;
+        }
         let Some(requested) = state
             .defs
             .iter()
@@ -289,6 +404,7 @@ impl HiddenTools {
             defs,
             promoted,
             cap,
+            ..
         } = &mut *state;
         if let Some((cap, sent)) = cap {
             if sent.len() >= *cap {
@@ -372,29 +488,21 @@ fn budget_tokens(settings: &ExposureSettings, live_budget_tokens: Option<usize>)
 /// returning an [`ExposurePlan`]. Pure; used both on the budget-free path and
 /// after budget-based selection.
 fn apply_operator_filters(all_names: Vec<String>, settings: &ExposureSettings) -> ExposurePlan {
-    let has_filter = settings.allow_list.is_some() || settings.read_only;
-    if !has_filter {
+    if !settings.has_operator_filter() {
         return ExposurePlan {
             exposed: all_names,
             hidden: Vec::new(),
+            operator_hidden: Vec::new(),
         };
     }
-    let allowed: Option<BTreeSet<&str>> = settings
-        .allow_list
-        .as_ref()
-        .map(|list| list.iter().map(String::as_str).collect());
-    let mut exposed = Vec::new();
-    let mut hidden = Vec::new();
-    for name in all_names {
-        let in_allow = allowed.as_ref().is_none_or(|a| a.contains(name.as_str()));
-        let is_write = settings.read_only && WRITE_TOOL_NAMES.contains(&name.as_str());
-        if in_allow && !is_write {
-            exposed.push(name);
-        } else {
-            hidden.push(name);
-        }
+    let (exposed, operator_hidden): (Vec<String>, Vec<String>) = all_names
+        .into_iter()
+        .partition(|name| settings.operator_visible(name));
+    ExposurePlan {
+        exposed,
+        hidden: Vec::new(),
+        operator_hidden,
     }
-    ExposurePlan { exposed, hidden }
 }
 
 /// Plan which authorized tools to expose given the live budget and the sticky
@@ -508,12 +616,21 @@ pub fn select_exposed(
         est,
     );
     let hidden: BTreeSet<&str> = plan.hidden.iter().map(String::as_str).collect();
-    let (hidden, exposed): (Vec<Value>, Vec<Value>) = arr
-        .into_iter()
-        .partition(|def| entry_name(def).is_some_and(|name| hidden.contains(name)));
+    let operator: BTreeSet<&str> = plan.operator_hidden.iter().map(String::as_str).collect();
+    let mut exposed = Vec::new();
+    let mut deferred = Vec::new();
+    let mut excluded = Vec::new();
+    for def in arr {
+        match entry_name(&def) {
+            Some(name) if operator.contains(name) => excluded.push(def),
+            Some(name) if hidden.contains(name) => deferred.push(def),
+            _ => exposed.push(def),
+        }
+    }
     let hidden = HiddenTools {
         state: std::sync::Mutex::new(HiddenState {
-            defs: hidden,
+            defs: deferred,
+            operator_hidden: excluded,
             promoted: Vec::new(),
             cap: None,
         }),
@@ -928,6 +1045,120 @@ mod tests {
         }
     }
 
+    /// #2950 review 1: an operator exclusion is a ceiling, not a deferral. A
+    /// direct call or exact-name search must never load its schema.
+    #[test]
+    fn an_operator_hidden_tool_is_refused_not_promoted() {
+        let defs = json!([
+            tool("read_file", "k"),
+            tool("write_file", "k"),
+            tool("save_note", "n"),
+        ]);
+        let settings = ExposureSettings {
+            allow_list: Some(vec!["read_file".to_string()]),
+            ..Default::default()
+        };
+        let (exposed, hidden) = select_exposed(defs, &settings, None, &BTreeSet::new(), est());
+        assert_eq!(exposed.as_array().unwrap().len(), 1);
+        for name in ["write_file", "save_note"] {
+            assert_eq!(hidden.promote(name), Promotion::OperatorHidden, "{name}");
+            let message = hidden.promote(name).message(name).unwrap();
+            assert!(message.contains("not available"), "{message}");
+        }
+        let mut tools = json!([tool("read_file", "k")]);
+        assert!(
+            !hidden.append_promoted(&mut tools),
+            "nothing was queued, so the next request's tool list is unchanged"
+        );
+        assert_eq!(tools.as_array().unwrap().len(), 1);
+    }
+
+    /// #2950 review 1: `read_only` narrows authority, not only visibility.
+    #[test]
+    fn read_only_attenuates_fs_write_and_only_narrows() {
+        use crate::caveats::{Caveats, CaveatsExt, Scope};
+        let writable = Caveats::top();
+        let narrowed = ExposureSettings {
+            read_only: true,
+            ..Default::default()
+        }
+        .attenuate(writable.clone());
+        assert!(!narrowed.permits_fs_write("/w/x"), "writes are denied");
+        assert!(narrowed.permits_fs_read("/w/x"), "reads are untouched");
+        assert!(narrowed.permits_exec("cargo"), "exec is untouched");
+        assert!(narrowed.leq(&writable), "only narrows");
+        assert_eq!(
+            ExposureSettings::default().attenuate(writable.clone()),
+            writable,
+            "read_only = false is the identity"
+        );
+        let already_fenced = Caveats {
+            exec: Scope::none(),
+            ..Caveats::top()
+        };
+        let still_fenced = ExposureSettings {
+            read_only: true,
+            ..Default::default()
+        }
+        .attenuate(already_fenced);
+        assert!(
+            !still_fenced.permits_exec("cargo"),
+            "enabling the toggle never widens another axis"
+        );
+    }
+
+    /// #2950 review 1: the identity prompt names only operator-visible tools.
+    #[test]
+    fn identity_prompt_names_only_operator_visible_tools() {
+        let soul = crate::DEFAULT_SOUL;
+        assert_eq!(
+            ExposureSettings::default().render_identity(soul),
+            soul,
+            "no operator filter → identity unchanged"
+        );
+
+        let read_only = ExposureSettings {
+            read_only: true,
+            ..Default::default()
+        };
+        let rendered = read_only.render_identity(soul);
+        for hidden in WRITE_TOOL_NAMES {
+            assert!(
+                !mentions_tool(&rendered, hidden),
+                "read_only prompt must not name `{hidden}`:\n{rendered}"
+            );
+        }
+        assert!(mentions_tool(&rendered, "read_file"));
+        assert!(rendered.starts_with("You are newt"));
+
+        let four = ExposureSettings {
+            allow_list: Some(
+                ["read_file", "write_file", "edit_file", "run_command"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            ..Default::default()
+        };
+        let rendered = four.render_identity(soul);
+        let line = rendered
+            .lines()
+            .find(|l| l.contains(TOOL_LINE_PREFIX))
+            .expect("tool line survives");
+        assert!(
+            line.contains("You have tools: run_command, read_file, write_file, edit_file."),
+            "{line}"
+        );
+        assert!(!mentions_tool(&rendered, "render_report"));
+        assert!(!mentions_tool(&rendered, "list_dir"));
+    }
+
+    #[test]
+    fn mentions_tool_matches_whole_words_only() {
+        assert!(mentions_tool("call edit_file now", "edit_file"));
+        assert!(!mentions_tool("call edit_files now", "edit_file"));
+        assert!(!mentions_tool("use_edit_file", "edit_file"));
+    }
+
     #[test]
     fn allow_list_hides_tools_not_in_list_even_in_full_profile() {
         // Regression for #2932: an explicit allow_list is the operator's final
@@ -978,12 +1209,16 @@ mod tests {
             "ByIntent tool not in allow_list must be hidden"
         );
         assert!(
-            hidden_tools.is_hidden("tool_search"),
-            "hidden tools must be reachable via tool_search"
+            hidden_tools.is_operator_hidden("tool_search"),
+            "an operator-excluded Kernel tool is operator-hidden"
         );
         assert!(
-            hidden_tools.is_hidden("git"),
-            "hidden tools must be queryable"
+            hidden_tools.is_operator_hidden("git"),
+            "an operator-excluded ByIntent tool is operator-hidden"
+        );
+        assert!(
+            !hidden_tools.is_hidden("git") && !hidden_tools.is_hidden("tool_search"),
+            "operator-hidden tools are not in the discoverable (budget) pool"
         );
     }
 
@@ -1033,8 +1268,12 @@ mod tests {
             !names.contains(&"delete_file"),
             "delete_file must be hidden in read_only"
         );
-        assert!(hidden_tools.is_hidden("write_file"));
-        assert!(hidden_tools.is_hidden("edit_file"));
+        assert!(hidden_tools.is_operator_hidden("write_file"));
+        assert!(hidden_tools.is_operator_hidden("edit_file"));
+        assert!(
+            !hidden_tools.is_hidden("write_file"),
+            "a read_only exclusion is not a budget deferral"
+        );
     }
 
     #[test]
