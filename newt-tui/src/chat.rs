@@ -9232,20 +9232,20 @@ fn session_body(
                         // it BEFORE the lifecycle emit so we never fire TurnFailed
                         // for a successful capture. Pre-compute as a bool so we can
                         // move `response` into the match arm below.
-                        let is_request_dumped_result = response.as_ref().err().map_or(false, |e| {
+                        let is_request_dumped_result = response.as_ref().err().is_some_and(|e| {
                             e.chain().any(|c| {
                                 c.downcast_ref::<newt_core::agentic::request_report::RequestDumped>(
                                 )
                                 .is_some()
                             })
                         });
-                        newt_core::lifecycle::emit(if is_request_dumped_result {
-                            newt_core::lifecycle::LifecycleEvent::TurnCompleted
-                        } else if response.is_ok() {
-                            newt_core::lifecycle::LifecycleEvent::TurnCompleted
-                        } else {
-                            newt_core::lifecycle::LifecycleEvent::TurnFailed { reason: None }
-                        });
+                        newt_core::lifecycle::emit(
+                            if is_request_dumped_result || response.is_ok() {
+                                newt_core::lifecycle::LifecycleEvent::TurnCompleted
+                            } else {
+                                newt_core::lifecycle::LifecycleEvent::TurnFailed { reason: None }
+                            },
+                        );
                         match response {
                             Ok((reply, was_streamed, usage, hallucinations)) => {
                                 // Core's report carries the cap status. The TUI

@@ -720,13 +720,11 @@ mod tests {
 
         // Mirror the detection + emit logic from chat.rs P2-3.
         let response: anyhow::Result<()> = Err(RequestDumped(String::new().into()).into());
-        let is_request_dumped_result = response.as_ref().err().map_or(false, |e| {
+        let is_request_dumped_result = response.as_ref().err().is_some_and(|e| {
             e.chain()
                 .any(|c| c.downcast_ref::<RequestDumped>().is_some())
         });
-        lifecycle::emit(if is_request_dumped_result {
-            LifecycleEvent::TurnCompleted
-        } else if response.is_ok() {
+        lifecycle::emit(if is_request_dumped_result || response.is_ok() {
             LifecycleEvent::TurnCompleted
         } else {
             LifecycleEvent::TurnFailed { reason: None }
