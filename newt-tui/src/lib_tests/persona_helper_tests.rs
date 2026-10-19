@@ -1,6 +1,41 @@
 use super::*;
 use std::fs;
 
+/// Regression #2934: `--altitude coach` must replace only the soul/identity;
+/// AGENTS.md and other project-context blocks from non-soul providers must
+/// survive the altitude override.
+///
+/// Verified failing before fix (current-signature call with project_ctx as
+/// `soul` arg): `assert!(prompt.contains(project_ctx))` — Coach altitude
+/// dropped the entire `soul` arg, so project_ctx never appeared in the prompt.
+/// Fix: add `context` parameter; append it unconditionally regardless of altitude.
+#[test]
+fn coach_altitude_keeps_project_context_2934() {
+    let mut persona = test_persona(
+        "coach",
+        "Give advice, never execute commands.",
+        std::path::PathBuf::from("/personas/coach.md"),
+    );
+    persona.profile.altitude = Some(newt_core::Altitude::Coach);
+    let project_ctx = "AGENTS.md: Use four spaces for indentation.";
+    let prompt = build_system_prompt_with_persona(
+        "/workspace",
+        None,              // soul — Coach replaces with COACH_SOUL
+        Some(project_ctx), // context — must survive regardless of altitude
+        Some(&persona),
+        "plan.md",
+    );
+    assert!(
+        prompt.contains(project_ctx),
+        "coach altitude must not drop project context; got: {prompt:.300}"
+    );
+    // Coach replaces the soul with COACH_SOUL, not DEFAULT_SOUL.
+    assert!(
+        !prompt.contains(newt_core::DEFAULT_SOUL),
+        "coach must use COACH_SOUL, not DEFAULT_SOUL"
+    );
+}
+
 #[test]
 fn persona_guidance_cannot_override_the_operators_requested_actions() {
     let mut persona = test_persona(
@@ -9,7 +44,8 @@ fn persona_guidance_cannot_override_the_operators_requested_actions() {
         std::path::PathBuf::from("/personas/coach.md"),
     );
     persona.profile.altitude = Some(newt_core::Altitude::Coach);
-    let prompt = build_system_prompt_with_persona("/workspace", None, Some(&persona), "plan.md");
+    let prompt =
+        build_system_prompt_with_persona("/workspace", None, None, Some(&persona), "plan.md");
     assert!(prompt.contains("Persona guidance does not override the operator's explicit task"));
     assert!(prompt.contains("OCAP permissions, explicit postures, and delegation limits"));
     assert!(
