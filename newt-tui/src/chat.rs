@@ -3224,6 +3224,9 @@ fn session_body(
     // it resets between turns while the failing command does not. This watch
     // spans turns, which is the half the guard structurally cannot do.
     let mut repeated_failures = newt_core::loop_watch::RepeatedFailureWatch::default();
+    // #2937 P2-1: set by /context request to trigger an immediate capture turn
+    // (no user message needed). Consumed at the top of each loop iteration.
+    let mut capture_request_pending = false;
 
     loop {
         if let Some(notice) = window_discovery.update(&mut choice, &mut inf_context_window) {
@@ -3345,6 +3348,10 @@ fn session_body(
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before reading even starts.
+        // #2937 P2-1: tracks whether the current iteration is a synthetic
+        // capture turn injected by /context request (no user message, no
+        // begin_model_prompt, no persist).
+        let mut is_capture_turn = false;
         let (outcome, mut model_input_origin) = if let Some(retry) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
@@ -3355,6 +3362,12 @@ fn session_body(
                     parent: retry.parent,
                 },
             )
+        } else if capture_request_pending {
+            // #2937 P2-1: /context request sets this flag. Drive an immediate
+            // prepare-only turn with an empty task — the sink is already armed.
+            capture_request_pending = false;
+            is_capture_turn = true;
+            (ReadOutcome::Line(String::new()), ModelInputOrigin::Operator)
         } else if let Some(queued) = pending_plan_turn.take() {
             // #2424: run the turn the approval hook queued — the operator's
             // own "discuss" answer, or the harness-authored implementation
@@ -3526,8 +3539,14 @@ fn session_body(
             ReadOutcome::Line(line) => {
                 // Rejoin `\`-continued lines (multi-line entry) into real
                 // newlines; a no-op for single-line input.
-                let task = line.replace("\\\n", "\n").trim().to_string();
-                if task.is_empty() {
+                let task = if is_capture_turn {
+                    // #2937 P2-1: capture turns are injected with an empty line;
+                    // keep empty so slash-command handling is bypassed.
+                    String::new()
+                } else {
+                    line.replace("\\\n", "\n").trim().to_string()
+                };
+                if task.is_empty() && !is_capture_turn {
                     continue;
                 }
                 // NOTE: `TurnStarted` is NOT emitted here. A non-empty line is
@@ -5266,18 +5285,14 @@ fn session_body(
                                 print_newt(&line, color, verbose);
                             }
                         } else if rest == "request" {
-                            // #2937 P2: arm a prepare-only capture so the NEXT turn
-                            // goes through the real provider path (exposure/catalog,
-                            // semantic pins, body construction) and stops before
-                            // sending. The report is emitted after the turn ends with
-                            // PrepareOnly; the turn message is discarded (no memory
-                            // sync, no conversation save).
+                            // #2937 P2-1: arm the sink and schedule an immediate
+                            // capture turn — no user message needed. The next loop
+                            // iteration injects an empty task that bypasses command
+                            // handling and runs straight to the provider path; the
+                            // provider sees arm_capture_next and returns RequestDumped
+                            // (a typed clean stop) before any wire send.
                             report_sink.arm_capture_next();
-                            print_newt(
-                                "capturing next request — type a message to preview",
-                                color,
-                                verbose,
-                            );
+                            capture_request_pending = true;
                         } else if rest == "show" {
                             // Build the outbound message set fresh and render a
                             // compact per-message breakdown so the operator can
@@ -7505,56 +7520,62 @@ fn session_body(
                     // `exit`): this line IS a model turn. Announce Working now
                     // — and only now — so commands never flip the pane state.
                     newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
-                    // Durable ingress is the FIRST operation in the final
-                    // model-input branch. It precedes hardware probes,
-                    // retrieval, inference, and every tool-capable path. Raw
-                    // bytes are the accepted surface line; model bytes are the
-                    // exact normalized `task` sent below.
-                    match begin_model_prompt(
-                        PromptIngress {
-                            durable: conversation_store.as_ref(),
-                            ephemeral: &ephemeral_prompt_store,
-                        },
-                        &active_conversation_id,
-                        &conversation_title_from_task(&task),
-                        active_persona.as_ref().map(|p| p.name.as_str()),
-                        line.as_bytes(),
-                        task.as_bytes(),
-                        &model_input_origin,
-                    ) {
-                        Ok(context) => {
-                            // Receipt creation is the durable acceptance point.
-                            // A fresh substantive operator ask supersedes the
-                            // old capped objective here; a bare continuation was
-                            // upgraded above and deliberately retains the link.
-                            consume_interrupted_objective_for_accepted_prompt(
-                                &mut interrupted_objective,
-                                &model_input_origin,
-                            );
-                            // A3/W6: record the durable turn a web-injected prompt
-                            // became — the additive, auditable "entered via web"
-                            // proof (the receipt itself stays origin=operator, so
-                            // no CHECK migration). Best-effort: a link failure must
-                            // never abort a turn that was already durably minted.
-                            if let (ModelInputOrigin::WebInjected { inbox_id }, Some(store)) =
-                                (&model_input_origin, conversation_store.as_ref())
-                            {
-                                let _ = store.link_inbox_delivery(
-                                    inbox_id,
-                                    &context.submitted_prompt().id().to_string(),
+                    // #2937 P2-1: capture turns use an empty placeholder task and
+                    // must not create a prompt receipt — nothing is persisted.
+                    if !is_capture_turn {
+                        // Durable ingress is the FIRST operation in the final
+                        // model-input branch. It precedes hardware probes,
+                        // retrieval, inference, and every tool-capable path. Raw
+                        // bytes are the accepted surface line; model bytes are the
+                        // exact normalized `task` sent below.
+                        match begin_model_prompt(
+                            PromptIngress {
+                                durable: conversation_store.as_ref(),
+                                ephemeral: &ephemeral_prompt_store,
+                            },
+                            &active_conversation_id,
+                            &conversation_title_from_task(&task),
+                            active_persona.as_ref().map(|p| p.name.as_str()),
+                            line.as_bytes(),
+                            task.as_bytes(),
+                            &model_input_origin,
+                        ) {
+                            Ok(context) => {
+                                // Receipt creation is the durable acceptance point.
+                                // A fresh substantive operator ask supersedes the
+                                // old capped objective here; a bare continuation was
+                                // upgraded above and deliberately retains the link.
+                                consume_interrupted_objective_for_accepted_prompt(
+                                    &mut interrupted_objective,
+                                    &model_input_origin,
                                 );
+                                // A3/W6: record the durable turn a web-injected prompt
+                                // became — the additive, auditable "entered via web"
+                                // proof (the receipt itself stays origin=operator, so
+                                // no CHECK migration). Best-effort: a link failure must
+                                // never abort a turn that was already durably minted.
+                                if let (ModelInputOrigin::WebInjected { inbox_id }, Some(store)) =
+                                    (&model_input_origin, conversation_store.as_ref())
+                                {
+                                    let _ = store.link_inbox_delivery(
+                                        inbox_id,
+                                        &context.submitted_prompt().id().to_string(),
+                                    );
+                                }
+                                active_prompt_context = Some(context);
                             }
-                            active_prompt_context = Some(context);
-                        }
-                        Err(e) => {
-                            active_prompt_context = None;
-                            print_newt(
-                                &format!("prompt not sent: prompt receipt creation failed ({e})"),
-                                color,
-                                verbose,
-                            );
-                            println!();
-                            continue;
+                            Err(e) => {
+                                active_prompt_context = None;
+                                print_newt(
+                                    &format!(
+                                        "prompt not sent: prompt receipt creation failed ({e})"
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                                println!();
+                                continue;
+                            }
                         }
                     }
 
@@ -9207,7 +9228,20 @@ fn session_body(
                             );
                         }
                     } else {
-                        newt_core::lifecycle::emit(if response.is_ok() {
+                        // #2937 P2-3: RequestDumped is a typed clean stop — classify
+                        // it BEFORE the lifecycle emit so we never fire TurnFailed
+                        // for a successful capture. Pre-compute as a bool so we can
+                        // move `response` into the match arm below.
+                        let is_request_dumped_result = response.as_ref().err().map_or(false, |e| {
+                            e.chain().any(|c| {
+                                c.downcast_ref::<newt_core::agentic::request_report::RequestDumped>(
+                                )
+                                .is_some()
+                            })
+                        });
+                        newt_core::lifecycle::emit(if is_request_dumped_result {
+                            newt_core::lifecycle::LifecycleEvent::TurnCompleted
+                        } else if response.is_ok() {
                             newt_core::lifecycle::LifecycleEvent::TurnCompleted
                         } else {
                             newt_core::lifecycle::LifecycleEvent::TurnFailed { reason: None }
@@ -9748,16 +9782,8 @@ fn session_body(
                                 }
                             }
                             Err(e) => {
-                                // #2937: arm_capture_next yields RequestDumped —
-                                // a typed clean stop, not a real failure. Emit the
-                                // captured report and end the turn without
-                                // persisting anything or marking the objective
-                                // interrupted.
-                                let is_request_dumped = e.chain().any(|c| {
-                                    c.downcast_ref::<newt_core::agentic::request_report::RequestDumped>()
-                                        .is_some()
-                                });
-                                if is_request_dumped {
+                                // #2937 P2-3: RequestDumped was already classified above.
+                                if is_request_dumped_result {
                                     if let Some(r) = report_sink.last_report() {
                                         newt_core::tty::Terminal::emit_line(
                                             newt_core::tty::Sink::Stdout,

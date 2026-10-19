@@ -324,6 +324,22 @@ impl MemoryManager {
             .join("\n\n")
     }
 
+    /// Annotate each provider's system-prompt block separately in `sink`.
+    /// Call BEFORE `build_system_prompt_with_persona` so the per-provider
+    /// labels are not swallowed by an encompassing "identity" annotation.
+    pub fn annotate_system_prompt_additions(
+        &self,
+        sink: &crate::agentic::request_report::ReportSink,
+    ) {
+        for p in &self.providers {
+            if let Some(block) = p.system_prompt_block() {
+                if !block.is_empty() {
+                    sink.annotate(p.name(), "memory::build_system_prompt_additions", &block);
+                }
+            }
+        }
+    }
+
     /// Collect recalled context from all providers before a turn.
     pub async fn prefetch_all(&self, query: &str) -> String {
         let mut parts = Vec::new();

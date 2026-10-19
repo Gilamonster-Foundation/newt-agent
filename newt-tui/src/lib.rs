@@ -5901,7 +5901,15 @@ fn build_system_prompt_with_persona(
             s.annotate(label, "build_system_prompt_with_persona", text);
         }
     };
-    note("identity", identity);
+    // #2937 P2-2: when soul comes from multiple providers, each provider was
+    // already annotated individually by annotate_system_prompt_additions before
+    // this call — skip the encompassing "identity" label so per-provider spans
+    // survive (components_of takes longest-first at equal offsets; an
+    // encompassing annotation would silently drop all shorter per-provider ones).
+    // When soul is None the default soul is the only source, so label it.
+    if soul.is_none() {
+        note("identity", identity);
+    }
     // Annotate only the workspace suffix so the identity span is not absorbed
     // into a longer overlapping annotation (components_of takes longest-first at
     // equal offsets, which would silently drop the "identity" label).
@@ -6028,6 +6036,13 @@ fn rebuild_system_prompt(
     } else {
         Some(soul_additions.as_str())
     };
+    // #2937 P2-2: annotate each provider's block separately BEFORE building the
+    // combined prompt, so per-provider spans survive (see build_system_prompt_with_persona).
+    if let Some(s) = sink {
+        if soul_text.is_some() {
+            memory.annotate_system_prompt_additions(s);
+        }
+    }
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
     build_system_prompt_with_persona(

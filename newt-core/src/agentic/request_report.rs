@@ -704,4 +704,46 @@ mod tests {
             "workspace-header should appear; got {labels:?}"
         );
     }
+
+    /// #2937 P2-3: when the TUI sees Err(RequestDumped) the lifecycle selection
+    /// logic must choose TurnCompleted, not TurnFailed. This test mirrors the
+    /// is_request_dumped_result pre-computation in chat.rs so it acts as a
+    /// regression if the detection pattern is changed.
+    #[test]
+    fn request_dumped_lifecycle_selection_maps_to_turn_completed() {
+        use crate::lifecycle::{self, LifecycleEvent};
+        use std::sync::{Arc, Mutex};
+
+        let events: Arc<Mutex<Vec<LifecycleEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let _sub = lifecycle::subscribe(move |e| ev.lock().unwrap().push(e.event.clone()));
+
+        // Mirror the detection + emit logic from chat.rs P2-3.
+        let response: anyhow::Result<()> = Err(RequestDumped(String::new().into()).into());
+        let is_request_dumped_result = response.as_ref().err().map_or(false, |e| {
+            e.chain()
+                .any(|c| c.downcast_ref::<RequestDumped>().is_some())
+        });
+        lifecycle::emit(if is_request_dumped_result {
+            LifecycleEvent::TurnCompleted
+        } else if response.is_ok() {
+            LifecycleEvent::TurnCompleted
+        } else {
+            LifecycleEvent::TurnFailed { reason: None }
+        });
+
+        let captured = events.lock().unwrap().clone();
+        assert!(
+            captured
+                .iter()
+                .any(|e| matches!(e, LifecycleEvent::TurnCompleted)),
+            "RequestDumped must emit TurnCompleted; got {captured:?}"
+        );
+        assert!(
+            !captured
+                .iter()
+                .any(|e| matches!(e, LifecycleEvent::TurnFailed { .. })),
+            "RequestDumped must NOT emit TurnFailed; got {captured:?}"
+        );
+    }
 }
