@@ -188,6 +188,7 @@ pub mod smart_harness;
 mod prompt_intake;
 mod prompt_read;
 mod recall;
+pub mod request_report;
 mod tool_args;
 // #952/#1669: operator steering submitted mid-turn, drained at the next
 // round boundary as a genuine operator message.
@@ -1759,6 +1760,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // usage or an overflow updates the session's calibration.
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
     let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
+    // #2937: measure the exact request about to be sent.
+    request_report::observe_request(&messages, &tools)?;
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -6958,6 +6961,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // (mirrors the Ollama path).
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
     let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
+    // #2937: measure the exact request about to be sent.
+    request_report::observe_request(&messages, &tools)?;
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -9839,6 +9844,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // (mirrors the OpenAI path).
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
     let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
+    // #2937: measure the exact request about to be sent.
+    request_report::observe_request(&messages, &tools)?;
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -12455,6 +12462,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut cw_retries: u32 = 0;
     let mut output_recovery = output_limit_recovery::Recovery::default();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // #2937: measure the exact request about to be sent.
+    request_report::observe_request(&msgs_json, &tools_chat)?;
     preflight_irreducible_request(
         &msgs_json,
         Some(&tools_for_estimate),
