@@ -5902,7 +5902,10 @@ fn build_system_prompt_with_persona(
         }
     };
     note("identity", identity);
-    note("workspace-prefix", &ctx);
+    // Annotate only the workspace suffix so the identity span is not absorbed
+    // into a longer overlapping annotation (components_of takes longest-first at
+    // equal offsets, which would silently drop the "identity" label).
+    note("workspace-header", &ctx[identity.len()..]);
     if let Some(persona) = persona {
         let persona_overlay = format!("\nActive persona: {}\n{}\n", persona.name, persona.prompt);
         ctx.push_str(&persona_overlay);
@@ -6255,6 +6258,7 @@ struct ConversationResetContext<'a> {
     system: &'a mut String,
     conversation_id: &'a mut String,
     mode_states: &'a ConversationModeStates,
+    sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 fn reset_conversation(
@@ -6273,7 +6277,7 @@ fn reset_conversation(
         ctx.memory,
         active_persona,
         ctx.conversation_id,
-        None,
+        ctx.sink,
     );
 }
 
@@ -6891,6 +6895,7 @@ struct ConversationCommandContext<'a> {
     /// successful restore is a hard boundary and clears it before adopting
     /// the restored conversation, including A→B→A switches.
     mode_states: &'a ConversationModeStates,
+    sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 fn handle_conversation_command(
@@ -7084,6 +7089,7 @@ pub(crate) struct CommitContext<'a> {
     pub step_ledger: &'a dyn newt_core::StepLedger,
     pub active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
     pub mode_states: &'a ConversationModeStates,
+    pub sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 impl<'a> ConversationCommandContext<'a> {
@@ -7100,6 +7106,7 @@ impl<'a> ConversationCommandContext<'a> {
             step_ledger: self.step_ledger,
             active_prompt_context: self.active_prompt_context,
             mode_states: self.mode_states,
+            sink: self.sink,
         }
     }
 }
@@ -7189,7 +7196,7 @@ fn commit_prepared(
         ctx.memory,
         ctx.active_persona.as_ref(),
         ctx.active_conversation_id,
-        None,
+        ctx.sink,
     );
     (record, warning)
 }
@@ -7820,7 +7827,7 @@ fn handle_persona_command(
                     ctx.memory,
                     active_persona.as_ref(),
                     ctx.conversation_id,
-                    None,
+                    ctx.sink,
                 );
                 Ok(persona_swap_kept_context_message(active_persona.as_ref()))
             } else {

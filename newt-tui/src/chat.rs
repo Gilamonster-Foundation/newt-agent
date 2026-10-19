@@ -2894,6 +2894,7 @@ fn session_body(
                 input_stash: &mut tab_input_stash,
                 color,
                 verbose,
+                report_sink: Some(&*report_sink),
             }
         };
     }
@@ -2940,6 +2941,7 @@ fn session_body(
             step_ledger: &step_ledger as &dyn newt_core::StepLedger,
             active_prompt_context: &mut active_prompt_context,
             mode_states: &conversation_mode_states,
+            sink: Some(&*report_sink),
         };
         resumed_at_start = match &session_start {
             // NEWT_CONVERSATION_ID: an explicit override — errors are hard
@@ -3044,6 +3046,7 @@ fn session_body(
                     system: &mut system,
                     conversation_id: &mut active_conversation_id,
                     mode_states: &conversation_mode_states,
+                    sink: Some(&*report_sink),
                 };
                 handle_new_conversation(
                     workspace,
@@ -5453,6 +5456,7 @@ fn session_body(
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
                             mode_states: &conversation_mode_states,
+                            sink: Some(&*report_sink),
                         };
                         let started = handle_new_conversation(
                             workspace,
@@ -5781,6 +5785,7 @@ fn session_body(
                                     step_ledger: &step_ledger as &dyn newt_core::StepLedger,
                                     active_prompt_context: &mut active_prompt_context,
                                     mode_states: &conversation_mode_states,
+                                    sink: Some(&*report_sink),
                                 };
                                 match crate::conversation_op_plan(task) {
                                     // A retired MUTATOR redirects and changes
@@ -6122,6 +6127,7 @@ fn session_body(
                                                     active_prompt_context:
                                                         &mut active_prompt_context,
                                                     mode_states: &conversation_mode_states,
+                                                    sink: Some(&*report_sink),
                                                 };
                                                 match resume_session_conversation(
                                                     &mut resume_ctx,
@@ -6365,6 +6371,7 @@ fn session_body(
                                                             active_prompt_context:
                                                                 &mut active_prompt_context,
                                                             mode_states: &conversation_mode_states,
+                                                            sink: Some(&*report_sink),
                                                         };
                                                         match resume_session_conversation(
                                                             &mut ctx, &target,
@@ -6481,6 +6488,7 @@ fn session_body(
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
                             mode_states: &conversation_mode_states,
+                            sink: Some(&*report_sink),
                         };
                         match handle_persona_command(
                             task,
@@ -7016,6 +7024,7 @@ fn session_body(
                                             system: &mut system,
                                             conversation_id: &mut active_conversation_id,
                                             mode_states: &conversation_mode_states,
+                                            sink: Some(&*report_sink),
                                         };
                                         let msg = match handle_persona_command(
                                             &cmd,
@@ -9739,51 +9748,72 @@ fn session_body(
                                 }
                             }
                             Err(e) => {
-                                print_newt(&format!("error: {e}"), color, verbose);
-                                // #2334: a failed turn did not finish its
-                                // objective; keep it resumable, and say how.
-                                interrupted_objective = active_prompt_context.clone();
-                                if interrupted_objective.is_some() {
-                                    print_newt(failed_turn_footer(), color, verbose);
-                                }
-                                // #1963: `turn_tool_events`/`turn_phantom_reaches`
-                                // still hold whatever earlier rounds actually did
-                                // before this failure — real ledgers, not
-                                // re-derived. Usage is NOT recoverable here: unlike
-                                // a cancel, a genuine `Err` carries no accumulated-
-                                // usage channel back to this caller, so `None`
-                                // (stored as NULL) is the honest value — never a
-                                // fabricated zero (it would poison the tuner,
-                                // #1967).
-                                let pricing = cfg.pricing.clone().unwrap_or_default();
-                                persist_incomplete_turn(
-                                    conversation_store.as_ref(),
-                                    &active_conversation_id,
-                                    active_persona.as_ref(),
-                                    &task,
-                                    "",
-                                    &turn_tool_events,
-                                    &turn_phantom_reaches,
-                                    None,
-                                    turn_attempt_totals,
-                                    0,
-                                    newt_core::TurnEndReason::Failed,
-                                    elapsed,
-                                    &inf_model,
-                                    inf_kind,
-                                    &inf_url,
-                                    &pricing,
-                                    &mut memory,
-                                    &scratchpad_store,
-                                    &step_ledger,
-                                    artifact_sink,
-                                    active_prompt_context.as_ref(),
-                                    artifact_source,
-                                    Some(tool_round_limit),
-                                    &rt,
-                                    color,
-                                    verbose,
-                                );
+                                // #2937: arm_capture_next yields RequestDumped —
+                                // a typed clean stop, not a real failure. Emit the
+                                // captured report and end the turn without
+                                // persisting anything or marking the objective
+                                // interrupted.
+                                let is_request_dumped = e.chain().any(|c| {
+                                    c.downcast_ref::<newt_core::agentic::request_report::RequestDumped>()
+                                        .is_some()
+                                });
+                                if is_request_dumped {
+                                    if let Some(r) = report_sink.last_report() {
+                                        newt_core::tty::Terminal::emit_line(
+                                            newt_core::tty::Sink::Stdout,
+                                            |w| {
+                                                use std::io::Write;
+                                                writeln!(w, "{}", r.to_markdown())
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    print_newt(&format!("error: {e}"), color, verbose);
+                                    // #2334: a failed turn did not finish its
+                                    // objective; keep it resumable, and say how.
+                                    interrupted_objective = active_prompt_context.clone();
+                                    if interrupted_objective.is_some() {
+                                        print_newt(failed_turn_footer(), color, verbose);
+                                    }
+                                    // #1963: `turn_tool_events`/`turn_phantom_reaches`
+                                    // still hold whatever earlier rounds actually did
+                                    // before this failure — real ledgers, not
+                                    // re-derived. Usage is NOT recoverable here: unlike
+                                    // a cancel, a genuine `Err` carries no accumulated-
+                                    // usage channel back to this caller, so `None`
+                                    // (stored as NULL) is the honest value — never a
+                                    // fabricated zero (it would poison the tuner,
+                                    // #1967).
+                                    let pricing = cfg.pricing.clone().unwrap_or_default();
+                                    persist_incomplete_turn(
+                                        conversation_store.as_ref(),
+                                        &active_conversation_id,
+                                        active_persona.as_ref(),
+                                        &task,
+                                        "",
+                                        &turn_tool_events,
+                                        &turn_phantom_reaches,
+                                        None,
+                                        turn_attempt_totals,
+                                        0,
+                                        newt_core::TurnEndReason::Failed,
+                                        elapsed,
+                                        &inf_model,
+                                        inf_kind,
+                                        &inf_url,
+                                        &pricing,
+                                        &mut memory,
+                                        &scratchpad_store,
+                                        &step_ledger,
+                                        artifact_sink,
+                                        active_prompt_context.as_ref(),
+                                        artifact_source,
+                                        Some(tool_round_limit),
+                                        &rt,
+                                        color,
+                                        verbose,
+                                    );
+                                } // end else (not RequestDumped)
                             }
                         }
                     }

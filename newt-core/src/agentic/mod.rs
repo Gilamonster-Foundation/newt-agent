@@ -7445,6 +7445,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             }
             // #2937: capture per-round final body after tools gate.
             if let Some(sink) = report_sink {
+                // Annotate active card before wire_messages coalesces the
+                // message boundary (mirrors the Anthropic path at line ~10321).
+                for msg in &messages {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
                 let sys_texts: Vec<&str> = wire_messages
                     .iter()
                     .filter(|m| m["role"] == "system")

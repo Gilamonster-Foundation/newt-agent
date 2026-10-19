@@ -643,4 +643,65 @@ mod tests {
             "report should have 'persona-overlay' component; got {labels:?}"
         );
     }
+
+    /// arm_capture_next + observe_request returns a typed RequestDumped error
+    /// (not a generic failure), and last_report() is populated before the error
+    /// fires. The TUI Err(e) handler uses downcast_ref to distinguish this from a
+    /// real provider failure and skips persist_incomplete_turn.
+    #[test]
+    fn request_dumped_is_typed_clean_stop() {
+        let sink = ReportSink::new();
+        sink.arm_capture_next();
+        let err = sink
+            .observe_request(&["You are a helpful agent."], None)
+            .unwrap_err();
+        // The error chain must contain RequestDumped so the TUI can detect it.
+        let has_dumped = err
+            .chain()
+            .any(|c| c.downcast_ref::<RequestDumped>().is_some());
+        assert!(
+            has_dumped,
+            "arm_capture_next should yield RequestDumped; got {err}"
+        );
+        // The report must be stored before the error fires so last_report() works.
+        assert!(
+            sink.last_report().is_some(),
+            "last_report must be set even after RequestDumped"
+        );
+    }
+
+    /// Registering only the workspace suffix (not the full ctx that starts with
+    /// identity text) lets both "identity" and "workspace-header" appear as
+    /// distinct components. If the full ctx were registered, the longer span
+    /// would win at offset 0 and drop the identity label.
+    #[test]
+    fn workspace_header_does_not_shadow_identity() {
+        let sink = ReportSink::new();
+        let identity = "You are a helpful agent.";
+        let workspace_suffix = "\n\nWorkspace: /home/test\nThis is the runtime root.\n";
+        let ctx = format!("{identity}{workspace_suffix}");
+        // Production code: annotate identity, then annotate only the workspace
+        // suffix (not the full ctx).
+        sink.annotate("identity", "build_system_prompt_with_persona", identity);
+        sink.annotate(
+            "workspace-header",
+            "build_system_prompt_with_persona",
+            workspace_suffix,
+        );
+        sink.observe_request(&[ctx.as_str()], None).unwrap();
+        let report = sink.last_report().expect("last_report after observe");
+        let labels: Vec<&str> = report.system[0]
+            .components
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert!(
+            labels.contains(&"identity"),
+            "identity should appear; got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"workspace-header"),
+            "workspace-header should appear; got {labels:?}"
+        );
+    }
 }
