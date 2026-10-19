@@ -323,8 +323,13 @@ async fn new_conversation_preserves_active_persona() {
         "Keep replies short.",
         tmp.path().join("personas").join("terse.md"),
     ));
-    let mut system =
-        rebuild_system_prompt(workspace, &memory, active_persona.as_ref(), "test-session", None);
+    let mut system = rebuild_system_prompt(
+        workspace,
+        &memory,
+        active_persona.as_ref(),
+        "test-session",
+        None,
+    );
     let mut active_conversation_id = String::from("test-session");
 
     // A latched anti-thrash switch must be re-armed by /new (F4): the

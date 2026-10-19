@@ -6026,7 +6026,13 @@ fn rebuild_system_prompt(
     };
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
-    build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy(), sink)
+    build_system_prompt_with_persona(
+        workspace,
+        soul_text,
+        persona,
+        &plan_path.to_string_lossy(),
+        sink,
+    )
 }
 
 fn handle_operating_mode_command(
@@ -6261,7 +6267,13 @@ fn reset_conversation(
     // survive any of those paths.
     ctx.mode_states.clear();
     ctx.memory.reset_all();
-    *ctx.system = rebuild_system_prompt(workspace, ctx.memory, active_persona, ctx.conversation_id, None);
+    *ctx.system = rebuild_system_prompt(
+        workspace,
+        ctx.memory,
+        active_persona,
+        ctx.conversation_id,
+        None,
+    );
 }
 
 fn new_conversation_message(active_persona: Option<&Persona>) -> String {

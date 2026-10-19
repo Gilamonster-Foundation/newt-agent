@@ -140,7 +140,11 @@ fn workspace_root_system_message(
 ) -> newt_core::MemMessage {
     let text = format!("Workspace root: {workspace}");
     if let Some(s) = sink {
-        s.annotate("workspace root", "headless::workspace_root_system_message", &text);
+        s.annotate(
+            "workspace root",
+            "headless::workspace_root_system_message",
+            &text,
+        );
     }
     newt_core::MemMessage::system(text)
 }
@@ -668,11 +672,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         let sink_ref = dc.report_sink.as_deref();
         workspace_root_system_message(&workspace, sink_ref)
     };
-    let mut driver =
-        TurnDriver::with_transcript(dc, vec![sys_msg])
-            .with_cognition(runtime.cognition)
-            .with_tenacity(runtime.tenacity)
-            .with_initiative(runtime.initiative);
+    let mut driver = TurnDriver::with_transcript(dc, vec![sys_msg])
+        .with_cognition(runtime.cognition)
+        .with_tenacity(runtime.tenacity)
+        .with_initiative(runtime.initiative);
     if runtime.crew {
         driver = driver.with_crew_runner(Arc::new(crate::crew_runner::LocalCrewRunner::new(
             // The crew runner needs an owned flattened Config; the

@@ -3976,7 +3976,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         prompt_measurement: Default::default(),
         fell_back: Default::default(),
     };
-    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts, report_sink).await;
+    let result = final_summary_ollama(
+        &client,
+        &chat_url,
+        model,
+        trimmed,
+        &cap,
+        attempts,
+        report_sink,
+    )
+    .await;
     let (text, streamed, usage) = cap.recover_rejection(
         result,
         &mut solve_obs,
@@ -6407,7 +6416,8 @@ async fn final_summary_ollama(
     });
     // #2937: capture summary send (no tools field — None distinguishes from []).
     if let Some(s) = sink {
-        let sys_texts: Vec<&str> = messages.iter()
+        let sys_texts: Vec<&str> = messages
+            .iter()
             .filter(|m| m["role"] == "system")
             .filter_map(|m| m["content"].as_str())
             .collect();
@@ -6567,7 +6577,8 @@ async fn final_summary_openai(
     }
     // #2937: capture summary send (no tools field).
     if let Some(s) = sink {
-        let sys_texts: Vec<&str> = messages.iter()
+        let sys_texts: Vec<&str> = messages
+            .iter()
             .filter(|m| m["role"] == "system")
             .filter_map(|m| m["content"].as_str())
             .collect();
@@ -10302,8 +10313,11 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // #2937: capture per-round final body after tools gate.
             if let Some(sink) = report_sink {
                 let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
-                let send_tools: Option<&[serde_json::Value]> =
-                    if use_tools { Some(&tools_anthropic) } else { None };
+                let send_tools: Option<&[serde_json::Value]> = if use_tools {
+                    Some(&tools_anthropic)
+                } else {
+                    None
+                };
                 sink.observe_request(&sys_arr, send_tools)?;
                 if sink.take_show_flag() {
                     if let Some(r) = sink.last_report() {
@@ -12827,7 +12841,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     std::slice::from_ref(&ins_str)
                 };
                 let send_tools: Option<&[serde_json::Value]> = if tools_supported {
-                    Some(body["tools"].as_array().map(|a| a.as_slice()).unwrap_or(&[]))
+                    Some(
+                        body["tools"]
+                            .as_array()
+                            .map(|a| a.as_slice())
+                            .unwrap_or(&[]),
+                    )
                 } else {
                     None
                 };

@@ -512,7 +512,10 @@ mod tests {
         let sink = ReportSink::new();
         sink.arm_show_next();
         sink.observe_request(&["sys"], Some(&[])).unwrap();
-        assert!(sink.take_show_flag(), "flag should be set after arm_show_next");
+        assert!(
+            sink.take_show_flag(),
+            "flag should be set after arm_show_next"
+        );
         assert!(
             !sink.take_show_flag(),
             "flag should be clear after first consumption"

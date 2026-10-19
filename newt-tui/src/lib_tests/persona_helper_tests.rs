@@ -9,7 +9,8 @@ fn persona_guidance_cannot_override_the_operators_requested_actions() {
         std::path::PathBuf::from("/personas/coach.md"),
     );
     persona.profile.altitude = Some(newt_core::Altitude::Coach);
-    let prompt = build_system_prompt_with_persona("/workspace", None, Some(&persona), "plan.md", None);
+    let prompt =
+        build_system_prompt_with_persona("/workspace", None, Some(&persona), "plan.md", None);
     assert!(prompt.contains("Persona guidance does not override the operator's explicit task"));
     assert!(prompt.contains("OCAP permissions, explicit postures, and delegation limits"));
     assert!(
@@ -367,7 +368,8 @@ async fn handle_persona_command_show_and_clear() {
         "Short.",
         tmp.path().join("personas").join("terse.md"),
     ));
-    let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session", None);
+    let mut system =
+        rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session", None);
     let mut active_conversation_id = String::from("test-session");
     let mode_states = ConversationModeStates::default();
     // show: reports the active persona, does not reset anything.
@@ -514,7 +516,8 @@ async fn persona_set_keep_context_preserves_history() {
         )
         .await;
     let mut active: Option<Persona> = None;
-    let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session", None);
+    let mut system =
+        rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session", None);
     let mut active_conversation_id = String::from("test-session");
     let mode_states = ConversationModeStates::default();
 

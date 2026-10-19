@@ -64,7 +64,8 @@ fn system_prompt_fallback_uses_canonical_default_soul() {
     // identity string that drifted from newt-core's DEFAULT_SOUL. It must
     // now embed the canonical constant verbatim so the two can't diverge.
     let tmp = tempfile::TempDir::new().unwrap();
-    let prompt = build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None, "test-plan.md", None);
+    let prompt =
+        build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None, "test-plan.md", None);
     assert!(
         prompt.contains(newt_core::DEFAULT_SOUL),
         "fallback must embed newt_core::DEFAULT_SOUL verbatim"
