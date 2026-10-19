@@ -27,8 +27,7 @@ fn coach_altitude_keeps_project_context_2934() {
     );
     assert!(
         prompt.contains(project_ctx),
-        "coach altitude must not drop project context; got: {:.300}",
-        prompt
+        "coach altitude must not drop project context; got: {prompt:.300}"
     );
     // Coach replaces the soul with COACH_SOUL, not DEFAULT_SOUL.
     assert!(
