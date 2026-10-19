@@ -39,14 +39,48 @@ fn catalog_advertises_move() {
         .iter()
         .find(|v| v["function"]["name"] == "write_file")
         .unwrap();
-    assert!(write["function"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("move_from"));
+    let description = write["function"]["description"].as_str().unwrap();
+    assert!(description.contains("move_from"));
     assert_eq!(
         write["function"]["parameters"]["properties"]["move_from"]["required"],
         serde_json::json!(["path", "items"])
     );
+    // #2949/#2958: the sentence states the argument gate exactly as `execute`
+    // enforces it, before any path lookup: content must be empty and copy_from
+    // absent. The workspace here does not exist, so only the gate can answer.
+    assert!(
+        description.contains("content must be empty and copy_from absent"),
+        "{description}"
+    );
+    let content = write["function"]["parameters"]["properties"]["content"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        content.contains("with move_from, must be empty"),
+        "{content}"
+    );
+    let spec = serde_json::json!({ "path": "src/lib.rs", "items": ["helper"] });
+    let workspace = "newt-core-test-workspace-that-does-not-exist";
+    for args in [
+        serde_json::json!({ "path": "src/helper.rs", "content": "// helpers\n", "move_from": spec }),
+        serde_json::json!({ "path": "src/helper.rs", "content": "", "move_from": spec,
+            "copy_from": { "path": "src/lib.rs", "start_line": 1, "end_line": 2 } }),
+    ] {
+        let refused = execute(&args, workspace, &Caveats::top(), None, &mut None)
+            .err()
+            .expect("the move_from gate refuses");
+        assert_eq!(refused, "move_from requires empty content and no copy_from");
+    }
+    let past_gate = execute(
+        &serde_json::json!({ "path": "src/helper.rs", "content": "", "move_from": spec }),
+        workspace,
+        &Caveats::top(),
+        None,
+        &mut None,
+    )
+    .err()
+    .expect("the move_from gate refuses");
+    assert!(past_gate.starts_with("workspace:"), "{past_gate}");
 }
 
 /// #2724/#2723: sibling grants select the build root, while missing grants

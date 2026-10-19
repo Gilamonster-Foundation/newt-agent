@@ -77,12 +77,13 @@ pub(crate) fn tool_definitions_with_dialect(
                                 are created). To change part of an existing file use edit_file. \
                                 copy_from appends an exact line range from another file; \
                                 move_from extracts named Rust free functions from another file \
-                                into this new .rs file (content may be empty) and wires the module.",
+                                into this new .rs file and wires the module (content must be \
+                                empty and copy_from absent).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "content": { "type": "string", "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty)" },
+                        "content": { "type": "string", "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty); with move_from, must be empty" },
                         "move_from": { "type": "object", "properties": { "path": { "type": "string" }, "items": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true } }, "required": ["path", "items"] },
                         "copy_from": { "type": "object", "description": "Append lines start_line..end_line of another file, copied exactly", "properties": { "path": { "type": "string" }, "start_line": { "type": "integer" }, "end_line": { "type": "integer" } } }
                     },

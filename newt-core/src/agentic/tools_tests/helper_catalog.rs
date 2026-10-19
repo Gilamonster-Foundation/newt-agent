@@ -898,7 +898,7 @@ fn publish_2796_catalog_guidance() {
 /// diet left; a description that grows past it needs a reason in its PR.
 #[test]
 fn base_catalog_2949_chars_ratchet() {
-    const CEILING: usize = 7913;
+    const CEILING: usize = 7966;
     let chars = serde_json::to_string(&tool_definitions()).unwrap().len();
     assert!(
         chars <= CEILING,
