@@ -203,7 +203,7 @@ pub(crate) fn execute_save_note(
 /// restarts, giving a 1-in-N cadence for sessions that never save. Any
 /// organic `save_note` call resets the counter, so active curators are
 /// never nagged. `interval == 0` disables the nudge entirely.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NoteNudge {
     interval: usize,
     turns_without_save: usize,

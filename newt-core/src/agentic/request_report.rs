@@ -334,6 +334,13 @@ impl ReportSink {
         self.s().dump = Some((PathBuf::new(), true));
     }
 
+    /// Disarm a pending capture without consuming it. Called by the capture-turn
+    /// RAII guard on any early exit so the next real turn is not intercepted.
+    /// Idempotent: safe to call after `observe_request` already consumed the arm.
+    pub fn disarm_capture(&self) {
+        self.s().dump = None;
+    }
+
     /// The report for the most recent request, if one has been built.
     pub fn last_report(&self) -> Option<RequestReport> {
         self.s().last.clone()
@@ -543,6 +550,23 @@ mod tests {
         assert_eq!(snap.len(), 2);
         // Notes still in sink after snapshot.
         assert_eq!(sink.snapshot_notes().len(), 2);
+    }
+
+    /// #2937 P6: disarm_capture leaves the sink clean so the next real turn's
+    /// observe_request returns Ok rather than RequestDumped. The RAII guard
+    /// calls this on every capture-turn exit path.
+    #[test]
+    fn disarm_capture_prevents_next_observe_from_intercepting() {
+        let sink = ReportSink::new();
+        sink.arm_capture_next();
+        sink.disarm_capture();
+        let result = sink.observe_request(&["system text"], None);
+        assert!(
+            result.is_ok(),
+            "disarmed sink must not intercept the next observe_request"
+        );
+        // The report is still stored (observe_request always updates last).
+        assert!(sink.last_report().is_some());
     }
 
     /// arm_capture_next stores the report and raises RequestDumped without

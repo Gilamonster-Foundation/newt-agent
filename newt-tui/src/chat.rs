@@ -3537,6 +3537,20 @@ fn session_body(
                 continue;
             }
             ReadOutcome::Line(line) => {
+                // #2937 P6: RAII guard that disarms the capture sink on every
+                // exit from this arm (continue, break, or normal iteration end).
+                // After observe_request consumes the dump flag (RequestDumped),
+                // disarm_capture is a no-op — so success and failure are both safe.
+                struct CaptureSinkGuard<'a>(
+                    &'a std::sync::Arc<newt_core::agentic::request_report::ReportSink>,
+                );
+                impl Drop for CaptureSinkGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.disarm_capture();
+                    }
+                }
+                let _capture_guard = is_capture_turn.then(|| CaptureSinkGuard(&report_sink));
+
                 // Rejoin `\`-continued lines (multi-line entry) into real
                 // newlines; a no-op for single-line input.
                 let task = if is_capture_turn {
@@ -7605,16 +7619,30 @@ fn session_body(
                     // An empty task through comprehend_accepted_prompt yields
                     // Ask disposition, which exits before the wire loop and
                     // mutates recorded_dispositions / session clarification state.
-                    // Use a synthetic Act intake so the prepare-only path is
-                    // reached without any session-state side effects.
+                    // Use a synthetic Act intake narrowed by the session's effective
+                    // operating mode, without consuming any pending Auto selection.
                     let (mut prompt_intake, turn_operating_mode) = if is_capture_turn {
-                        (
-                            newt_core::agentic::PromptIntake::analyze_with(
-                                "act",
-                                &Default::default(),
-                            ),
+                        let plan_mode_active = conversation_mode_states.plan.is_active();
+                        let mut intake = newt_core::agentic::PromptIntake::analyze_with(
+                            "act",
+                            &Default::default(),
+                        );
+                        // Derive the same effective mode the session would apply to
+                        // an Act-shaped task, but pass None for auto_selected so no
+                        // pending Auto selection is consumed by the capture.
+                        let effective_mode = effective_operating_mode(
                             active_operating_mode,
-                        )
+                            &intake,
+                            plan_mode_active,
+                            None,
+                        );
+                        apply_operating_mode_to_intake(effective_mode, &mut intake);
+                        let authority_mode = if plan_mode_active {
+                            OperatingMode::Plan
+                        } else {
+                            active_operating_mode
+                        };
+                        (intake, authority_mode)
                     } else {
                         comprehend_accepted_prompt(
                             &model_input_origin,
@@ -8840,6 +8868,11 @@ fn session_body(
                     // #2313: one attempt ledger per turn; its totals price the turn.
                     let turn_attempts =
                         std::sync::Mutex::new(newt_core::attempts::AttemptLedger::default());
+                    // #2937 P6: capture turns observe a snapshot of the note
+                    // counter so NoteNudge::begin_turn does not advance the live
+                    // session state. The clone is two usizes and discarded after
+                    // the turn.
+                    let mut capture_note_nudge = note_nudge.clone();
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -8981,7 +9014,11 @@ fn session_body(
                                         // stays TUI-side). See issue #223.
                                         recover_cw_400: Some(recover_context_window_400),
                                         note_sink: Some(&mut note_sink),
-                                        note_nudge: Some(&mut note_nudge),
+                                        note_nudge: if is_capture_turn {
+                                            Some(&mut capture_note_nudge)
+                                        } else {
+                                            Some(&mut note_nudge)
+                                        },
                                         // Recall over past conversations (Step 17.5).
                                         recall_source: recall_source
                                             .as_ref()
@@ -9810,6 +9847,14 @@ fn session_body(
                                             },
                                         );
                                     }
+                                } else if is_capture_turn {
+                                    // #2937 P6: a failed capture is a command
+                                    // error, not a real turn failure. Do not
+                                    // mutate interrupted_objective or persist a
+                                    // synthetic incomplete turn — the session
+                                    // state is untouched. The RAII guard above
+                                    // disarms the sink.
+                                    print_newt(&format!("error: {e}"), color, verbose);
                                 } else {
                                     print_newt(&format!("error: {e}"), color, verbose);
                                     // #2334: a failed turn did not finish its
@@ -9856,7 +9901,7 @@ fn session_body(
                                         color,
                                         verbose,
                                     );
-                                } // end else (not RequestDumped)
+                                } // end else (not RequestDumped, not capture)
                             }
                         }
                     }
