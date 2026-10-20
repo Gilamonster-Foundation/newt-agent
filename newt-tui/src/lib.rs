@@ -5907,6 +5907,9 @@ fn build_system_prompt_with_persona(
         ctx.push_str("\n\n");
         ctx.push_str(ctx_str);
     }
+    // #2937: record the workspace-header start AFTER project context so the
+    // annotation covers only the workspace line, not provider blocks.
+    let workspace_start = ctx.len();
     ctx.push_str(&format!(
         "\n\nWorkspace: {workspace}\n\
          This is the current runtime root. Relative tool paths resolve here; \
@@ -5928,11 +5931,9 @@ fn build_system_prompt_with_persona(
     if let newt_core::Altitude::Coach = effective_altitude {
         note("coach-soul", identity);
     }
-    // Annotate only the workspace suffix. Skip when identity is empty (no soul
-    // provider) to avoid annotating the whole ctx as "workspace-header".
-    if !identity.is_empty() {
-        note("workspace-header", &ctx[identity.len()..]);
-    }
+    // workspace-header: only the workspace line suffix — providers' spans end
+    // at workspace_start, so this annotation never absorbs their content.
+    note("workspace-header", &ctx[workspace_start..]);
     if let Some(persona) = persona {
         let persona_overlay = format!("\nActive persona: {}\n{}\n", persona.name, persona.prompt);
         ctx.push_str(&persona_overlay);
@@ -6061,10 +6062,10 @@ fn rebuild_system_prompt(
     };
     // #2937 P2-2: annotate each provider's block separately BEFORE building the
     // combined prompt, so per-provider spans survive (see build_system_prompt_with_persona).
+    // Call unconditionally when a sink exists — the method skips empty blocks itself,
+    // and context providers (AGENTS.md, notes) need annotation even when soul is absent.
     if let Some(s) = sink {
-        if soul_text.is_some() {
-            memory.annotate_system_prompt_additions(s);
-        }
+        memory.annotate_system_prompt_additions(s);
     }
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);

@@ -327,3 +327,145 @@ async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
         "use_skill must load the copy the index listed, got: {body}"
     );
 }
+
+// #2937: workspace-header annotation must not swallow project-context provider
+// annotations. Doer: soul + agents + notes providers all get individual labels;
+// workspace-header covers only the workspace line, not provider content.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn provider_annotations_labeled_independently_doer_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Use four spaces for indentation.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "user: prefers vi\n§\n").unwrap();
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::SoulProvider::new(None));
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(ws.to_str().unwrap(), &memory, None, "sess-doer", Some(&sink));
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0].components.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(labels.contains(&"soul"), "doer must have 'soul' label; got {labels:?}");
+    assert!(labels.contains(&"agents"), "'agents' provider must be labeled; got {labels:?}");
+    assert!(labels.contains(&"note_store"), "'note_store' provider must be labeled; got {labels:?}");
+    assert!(labels.contains(&"workspace-header"), "workspace-header must be labeled; got {labels:?}");
+
+    // workspace-header must be a separate, short component — not one that swallows
+    // provider blocks. The workspace header text is ~200 chars; provider content
+    // adds thousands. A swallowing annotation would have chars >> 500.
+    let ws_chars = report.system[0]
+        .components
+        .iter()
+        .find(|c| c.label == "workspace-header")
+        .expect("workspace-header component must exist")
+        .chars;
+    assert!(ws_chars < 500, "workspace-header chars ({ws_chars}) must be small — not absorbing provider blocks");
+}
+
+// #2937: coach altitude — workspace-header must not swallow context providers.
+// Coach replaces soul with COACH_SOUL, but agents and notes remain labeled.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn provider_annotations_labeled_independently_coach_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Always ask before acting.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "project: uses just check\n§\n").unwrap();
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::SoulProvider::new(None));
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let mut coach_persona = test_persona(
+        "coach",
+        "Give advice.",
+        std::path::PathBuf::from("/personas/coach.md"),
+    );
+    coach_persona.profile.altitude = Some(newt_core::Altitude::Coach);
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(ws.to_str().unwrap(), &memory, Some(&coach_persona), "sess-coach", Some(&sink));
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0].components.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(labels.contains(&"coach-soul"), "coach must have 'coach-soul' label; got {labels:?}");
+    assert!(labels.contains(&"agents"), "'agents' provider must be labeled; got {labels:?}");
+    assert!(labels.contains(&"note_store"), "'note_store' provider must be labeled; got {labels:?}");
+    assert!(labels.contains(&"workspace-header"), "workspace-header must be labeled; got {labels:?}");
+
+    let ws_chars = report.system[0]
+        .components
+        .iter()
+        .find(|c| c.label == "workspace-header")
+        .expect("workspace-header component must exist")
+        .chars;
+    assert!(ws_chars < 500, "workspace-header chars ({ws_chars}) must not absorb provider blocks");
+
+    // Prompt must contain AGENTS.md and notes content despite coach altitude.
+    assert!(prompt.contains("Always ask before acting"), "agents content must reach prompt");
+    assert!(prompt.contains("uses just check"), "notes content must reach prompt");
+}
+
+// #2937: when no soul provider is present, context providers (agents, notes)
+// still receive individual annotations. No DEFAULT_SOUL must be invented.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn no_soul_provider_context_providers_still_annotated_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Commit with clear messages.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "user: uses rg not grep\n§\n").unwrap();
+
+    // No SoulProvider — soul_block() returns None.
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(ws.to_str().unwrap(), &memory, None, "sess-nosoul", Some(&sink));
+
+    // No DEFAULT_SOUL fallback — the builder never invents one (#2935).
+    let first_line = newt_core::DEFAULT_SOUL.lines().find(|l| !l.is_empty()).unwrap();
+    assert!(!prompt.contains(first_line), "builder must not inject DEFAULT_SOUL; got: {prompt:.200}");
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0].components.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(labels.contains(&"agents"), "'agents' must be labeled even with no soul; got {labels:?}");
+    assert!(labels.contains(&"note_store"), "'note_store' must be labeled even with no soul; got {labels:?}");
+    assert!(!labels.contains(&"soul"), "no soul provider means no 'soul' label; got {labels:?}");
+}
