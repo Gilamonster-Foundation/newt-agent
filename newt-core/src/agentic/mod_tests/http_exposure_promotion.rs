@@ -72,6 +72,25 @@ impl Wire {
             .unwrap_or_default()
     }
 
+    /// Every system-role instruction a provider request carried, as one
+    /// string: the message list's system entries plus the Anthropic `system`
+    /// and Responses `instructions` fields.
+    fn system_text(self, body: &serde_json::Value) -> String {
+        let items = match self {
+            Self::Responses => body["input"].as_array(),
+            _ => body["messages"].as_array(),
+        };
+        let mut text: String = items
+            .into_iter()
+            .flatten()
+            .filter(|item| item["role"] == "system")
+            .map(|item| item["content"].to_string())
+            .collect();
+        text.push_str(&body["system"].to_string());
+        text.push_str(&body["instructions"].to_string());
+        text
+    }
+
     /// The provider's reply for one round: a tool call, or the final answer.
     fn reply(self, round: usize, call: Option<&(&str, serde_json::Value)>) -> ResponseTemplate {
         let id = format!("call_{round}");
@@ -278,11 +297,16 @@ per_wire!(an_exposure_hidden_tool_is_found_then_promoted:
     responses_promotes_an_exposure_hidden_tool,
     anthropic_promotes_an_exposure_hidden_tool);
 
-/// #2932 / #2950 review 1: an operator `allow_list` is a visibility CEILING,
-/// not a budget deferral. `save_note` is authorized but excluded: discovery
-/// never names it, a direct call is refused without running, and no later
-/// request carries its schema — on every wire.
-async fn an_operator_hidden_tool_is_never_found_or_promoted(wire: Wire) {
+/// Run the operator-ceiling scenario under `profile`: `save_note` is
+/// authorized but excluded by the allow list, so discovery never names it, a
+/// direct call is refused without running, and no later request carries its
+/// schema. `safe_context` gives `Auto` a live budget; the schema budget is
+/// zero so the budget would defer every optional tool.
+async fn assert_operator_ceiling_holds(
+    wire: Wire,
+    profile: crate::config::ExposureProfile,
+    safe_context: Option<u32>,
+) {
     let note = serde_json::json!({"action": "add", "text": "must not land"});
     let (server, requests) = scripted(
         wire,
@@ -300,6 +324,9 @@ async fn an_operator_hidden_tool_is_never_found_or_promoted(wire: Wire) {
     let mut context = ctx(&uri, &messages, &caveats);
     context.action_nudges = false;
     context.note_sink = Some(&mut sink);
+    context.safe_context = safe_context;
+    context.exposure.profile = profile;
+    context.exposure.schema_budget_pct = 0;
     context.exposure.allow_list = Some(
         ["tool_search", "read_file", "run_command"]
             .map(String::from)
@@ -311,7 +338,7 @@ async fn an_operator_hidden_tool_is_never_found_or_promoted(wire: Wire) {
     assert_eq!(
         requests.len(),
         4,
-        "{wire:?}: search, refused call, refused call, answer"
+        "{wire:?} {profile:?}: search, refused call, refused call, answer"
     );
     let names: Vec<Vec<String>> = requests.iter().map(|r| wire.tool_names(r)).collect();
     assert!(
@@ -319,34 +346,40 @@ async fn an_operator_hidden_tool_is_never_found_or_promoted(wire: Wire) {
             && names[0]
                 .iter()
                 .all(|n| ["tool_search", "read_file", "run_command"].contains(&n.as_str())),
-        "{wire:?}: only allow-listed tools are advertised: {:?}",
+        "{wire:?} {profile:?}: only allow-listed tools are advertised: {:?}",
         names[0]
     );
 
     let search = wire.last_tool_result(&requests[1]);
     assert!(
         !search.contains("save_note"),
-        "{wire:?}: discovery must not name an operator-hidden tool: {search}"
+        "{wire:?} {profile:?}: discovery must not name an operator-hidden tool: {search}"
     );
     let refused = wire.last_tool_result(&requests[2]);
     assert!(
         refused.contains("not available in this session"),
-        "{wire:?}: a direct call is refused, not promoted: {refused}"
+        "{wire:?} {profile:?}: a direct call is refused, not promoted: {refused}"
     );
     assert_eq!(
         names[2], names[0],
-        "{wire:?}: the refused call loads nothing for the next request"
+        "{wire:?} {profile:?}: the refused call loads nothing for the next request"
     );
     assert_eq!(
         names[3], names[0],
-        "{wire:?}: a second call still loads nothing"
+        "{wire:?} {profile:?}: a second call still loads nothing"
     );
     drop(requests);
     assert!(
         sink.calls.is_empty(),
-        "{wire:?}: an operator-hidden tool never runs: {:?}",
+        "{wire:?} {profile:?}: an operator-hidden tool never runs: {:?}",
         sink.calls
     );
+}
+
+/// #2932 / #2950 review 1: an operator `allow_list` is a visibility CEILING,
+/// not a budget deferral — under the default `full` profile, on every wire.
+async fn an_operator_hidden_tool_is_never_found_or_promoted(wire: Wire) {
+    assert_operator_ceiling_holds(wire, crate::config::ExposureProfile::Full, None).await;
 }
 
 per_wire!(an_operator_hidden_tool_is_never_found_or_promoted:
@@ -354,6 +387,127 @@ per_wire!(an_operator_hidden_tool_is_never_found_or_promoted:
     chat_completions_never_promotes_an_operator_hidden_tool,
     responses_never_promotes_an_operator_hidden_tool,
     anthropic_never_promotes_an_operator_hidden_tool);
+
+/// #2950 review 2 (P1): the ceiling survives the budget-driven profiles. A
+/// tool BOTH the budget and the operator would drop is operator-hidden, not
+/// budget-deferred — so `minimal` and an exhausted `auto` budget cannot turn
+/// an excluded tool back into a promotable one.
+async fn a_budget_deferral_never_bypasses_the_operator_ceiling(wire: Wire) {
+    assert_operator_ceiling_holds(wire, crate::config::ExposureProfile::Minimal, None).await;
+    assert_operator_ceiling_holds(
+        wire,
+        crate::config::ExposureProfile::Auto,
+        Some(100_000_000),
+    )
+    .await;
+}
+
+per_wire!(a_budget_deferral_never_bypasses_the_operator_ceiling:
+    a_budget_deferral_never_bypasses_the_operator_ceiling_on_ollama,
+    chat_completions_budget_deferral_never_bypasses_the_operator_ceiling,
+    responses_budget_deferral_never_bypasses_the_operator_ceiling,
+    anthropic_budget_deferral_never_bypasses_the_operator_ceiling);
+
+/// #2950 review 2 (P2): Plan's disposition filter removes write tools before
+/// exposure, so they never reach the deferred pool — yet discovery deliberately
+/// lists disposition-refused tools as not callable. The operator ceiling must
+/// hold there too: `write_file` is absent from fuzzy and exact-name search,
+/// while `edit_file` (operator-allowed, Plan-refused) is still listed.
+#[tokio::test]
+async fn plan_mode_discovery_never_names_an_operator_hidden_tool() {
+    let wire = Wire::Ollama;
+    let allow = Some(
+        ["tool_search", "read_file", "edit_file"]
+            .map(String::from)
+            .to_vec(),
+    );
+    for (allow_list, read_only) in [(allow, false), (None, true)] {
+        let (server, requests) = scripted(
+            wire,
+            vec![
+                ("tool_search", serde_json::json!({"query": "write file"})),
+                ("tool_search", serde_json::json!({"query": "write_file"})),
+                ("tool_search", serde_json::json!({"query": "edit file"})),
+            ],
+        )
+        .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = ctx(&uri, &messages, &caveats);
+        context.action_nudges = false;
+        context.prompt_disposition = PromptDisposition::Plan;
+        context.exposure.allow_list = allow_list.clone();
+        context.exposure.read_only = read_only;
+        wire.run(context, &mut NoMcp).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "allow={allow_list:?} read_only={read_only}"
+        );
+        // The header echoes the query; only a `- name` line lists a tool.
+        let lists = |result: &str, tool: &str| {
+            result
+                .lines()
+                .any(|line| line.starts_with(&format!("- {tool}")))
+        };
+        for request in &requests[1..] {
+            let result = wire.last_tool_result(request);
+            assert!(
+                !lists(&result, "write_file"),
+                "allow={allow_list:?} read_only={read_only}: Plan discovery named an \
+                 operator-hidden tool: {result}"
+            );
+        }
+        let edit = wire.last_tool_result(&requests[3]);
+        assert_eq!(
+            lists(&edit, "edit_file"),
+            allow_list.is_some(),
+            "an operator-allowed tool Plan refuses is still listed; a read_only-hidden one \
+             is not: {edit}"
+        );
+    }
+}
+
+/// #2950 review 2 (P2): harness-owned guidance derives from the same resolved
+/// set as the catalog. With the pi-style four-tool list the active-prompt
+/// card keeps its provenance but drops the `prompt_read` / `artifact_read`
+/// recovery recipes; without an operator filter it still carries them.
+async fn the_active_card_recommends_only_operator_visible_recovery(wire: Wire) {
+    let four = ["read_file", "run_command", "edit_file", "write_file"];
+    for (allow_list, expect_recovery) in [(None, true), (Some(four), false)] {
+        let (server, requests) = scripted(wire, vec![]).await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = ctx(&uri, &messages, &caveats);
+        context.action_nudges = false;
+        context.exposure.allow_list = allow_list.map(|list| list.map(String::from).to_vec());
+        wire.run(context, &mut NoMcp).await;
+
+        let requests = requests.lock().unwrap();
+        let system = wire.system_text(&requests[0]);
+        assert!(
+            system.contains(crate::agentic::prompt_read::ACTIVE_PROMPT_PREFIX),
+            "{wire:?}: the card keeps its provenance: {system}"
+        );
+        for tool in ["prompt_read", "artifact_read"] {
+            assert_eq!(
+                system.contains(tool),
+                expect_recovery,
+                "{wire:?} allow={allow_list:?}: `{tool}` recovery recipe: {system}"
+            );
+        }
+    }
+}
+
+per_wire!(the_active_card_recommends_only_operator_visible_recovery:
+    the_active_card_recommends_only_operator_visible_recovery_on_ollama,
+    chat_completions_card_recommends_only_operator_visible_recovery,
+    responses_card_recommends_only_operator_visible_recovery,
+    anthropic_card_recommends_only_operator_visible_recovery);
 
 /// Twin for `read_only`: the three write tools are excluded the same way —
 /// unadvertised, undiscoverable, refused on call, never appended.

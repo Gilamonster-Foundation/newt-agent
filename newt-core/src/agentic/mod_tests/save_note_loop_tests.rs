@@ -400,6 +400,49 @@ async fn nudge_appended_to_user_message_when_due() {
     );
 }
 
+/// #2950 review 2 (P2): the reminder is harness-owned guidance that names
+/// `save_note`. When the operator's allow list hides that tool, the reminder
+/// stays silent on the due turn and the tool is not advertised — sink or no
+/// sink, so prompt and catalog cannot contradict each other.
+#[tokio::test]
+async fn operator_hidden_save_note_silences_the_nudge() {
+    let server = MockServer::start().await;
+    let advertised = Arc::new(AtomicBool::new(false));
+    let nudge_seen = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(NoSinkObserver {
+            save_note_advertised: advertised.clone(),
+            nudge_seen: nudge_seen.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut sink = MockSink::default();
+    let mut nudge = NoteNudge::new(1);
+    let _ = nudge.begin_turn();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.note_sink = Some(&mut sink);
+    c.note_nudge = Some(&mut nudge);
+    c.exposure.allow_list = Some(vec!["read_file".to_string(), "run_command".to_string()]);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("chat_complete should succeed");
+
+    assert_eq!(crate::agentic::model_explanation(&reply), "plain answer");
+    assert!(
+        !advertised.load(Ordering::SeqCst),
+        "save_note advertised although the operator hid it"
+    );
+    assert!(
+        !nudge_seen.load(Ordering::SeqCst),
+        "the reminder named a tool the operator hid"
+    );
+}
+
 #[tokio::test]
 async fn organic_save_resets_the_nudge_counter() {
     let server = MockServer::start().await;

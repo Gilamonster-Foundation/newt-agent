@@ -338,9 +338,11 @@ pub(crate) struct HiddenTools {
 struct HiddenState {
     /// Hidden definitions, in catalog order.
     defs: Vec<Value>,
-    /// Definitions the operator's policy excludes: refused on call, absent
-    /// from discovery, never promoted (#2932).
-    operator_hidden: Vec<Value>,
+    /// The operator's policy, resolved once per turn: the ceiling every other
+    /// set is drawn under. Held as the policy, not as a list of definitions,
+    /// so a tool an earlier stage already dropped (Plan's disposition filter)
+    /// is still refused on call and absent from discovery (#2932).
+    policy: ExposureSettings,
     /// Names activated since the last append, in request order.
     promoted: Vec<String>,
     /// `(cap, sent)`: the wire cap and its reserved next-request definitions,
@@ -366,10 +368,7 @@ impl HiddenTools {
     /// Whether the operator's tool policy excludes `name` this turn (#2932).
     /// Such a tool is neither discoverable nor promotable.
     pub(crate) fn is_operator_hidden(&self, name: &str) -> bool {
-        self.state()
-            .operator_hidden
-            .iter()
-            .any(|def| entry_name(def) == Some(name))
+        !self.state().policy.operator_visible(name)
     }
 
     /// Register the actual wire projection so replacements preserve its
@@ -382,11 +381,7 @@ impl HiddenTools {
     /// unqueued optional schema; a refused tool never enters this state.
     pub(crate) fn promote(&self, name: &str) -> Promotion {
         let mut state = self.state();
-        if state
-            .operator_hidden
-            .iter()
-            .any(|def| entry_name(def) == Some(name))
-        {
+        if !state.policy.operator_visible(name) {
             return Promotion::OperatorHidden;
         }
         let Some(requested) = state
@@ -516,24 +511,35 @@ pub fn plan_exposure(
     active: &BTreeSet<String>,
     est: TokenEstimation,
 ) -> ExposurePlan {
-    let entries = defs.as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let all_names: Vec<String> = entries
-        .iter()
+    let all_names: Vec<String> = defs
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter_map(|d| entry_name(d).map(str::to_owned))
         .collect();
 
+    // The operator ceiling comes FIRST: every set below (budget-exposed,
+    // budget-deferred) is drawn from the operator-visible names only, so a
+    // hidden tool can never enter the promotable pool (#2932).
+    let mut plan = apply_operator_filters(all_names, settings);
+
     // Identity: Full profile, non-array catalog, or no budget under Auto.
     let Some(budget) = budget_tokens(settings, live_budget_tokens) else {
-        // Budget-free path: still apply operator filters if present.
-        return apply_operator_filters(all_names, settings);
+        return plan;
     };
+    let entries: Vec<&Value> = defs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|def| entry_name(def).is_none_or(|name| settings.operator_visible(name)))
+        .collect();
 
     let mut kept: BTreeSet<String> = BTreeSet::new();
     let mut kept_tokens = 0usize;
 
     // Mandatory floor: Kernel + sticky active + any nameless (malformed) entry.
     // These are exempt from both the budget and `max_initial_tools`.
-    for def in entries {
+    for def in &entries {
         let Some(name) = entry_name(def) else {
             continue;
         };
@@ -548,7 +554,7 @@ pub fn plan_exposure(
     // on the final exposed set — additional fill stops once `kept.len()` hits it.
     let cap = settings.max_initial_tools;
     for band in FILL_ORDER {
-        for def in entries {
+        for def in &entries {
             let Some(name) = entry_name(def) else {
                 continue;
             };
@@ -567,21 +573,14 @@ pub fn plan_exposure(
         }
     }
 
-    // Resolve budget-selected names to a plan, then apply the operator's
-    // final-say filters. allow_list and read_only can hide even Kernel tools —
-    // the operator is explicitly in control. Hidden tools remain authorized at
-    // dispatch and are reachable via tool_search / KnownHidden promotion.
-    let budget_names: Vec<String> = all_names
-        .iter()
-        .filter(|name| kept.contains(name.as_str()))
-        .cloned()
-        .collect();
-    let budget_hidden: Vec<String> = all_names
+    // Split the operator-visible names by the budget's choice. The deferred
+    // half stays authorized at dispatch and reachable via tool_search /
+    // KnownHidden promotion; the operator-hidden half was set aside above.
+    let (exposed, hidden) = std::mem::take(&mut plan.exposed)
         .into_iter()
-        .filter(|name| !kept.contains(name.as_str()))
-        .collect();
-    let mut plan = apply_operator_filters(budget_names, settings);
-    plan.hidden.extend(budget_hidden);
+        .partition(|name| kept.contains(name.as_str()));
+    plan.exposed = exposed;
+    plan.hidden = hidden;
     plan
 }
 
@@ -619,10 +618,11 @@ pub fn select_exposed(
     let operator: BTreeSet<&str> = plan.operator_hidden.iter().map(String::as_str).collect();
     let mut exposed = Vec::new();
     let mut deferred = Vec::new();
-    let mut excluded = Vec::new();
     for def in arr {
         match entry_name(&def) {
-            Some(name) if operator.contains(name) => excluded.push(def),
+            // Operator-hidden definitions are dropped: the policy, not a
+            // copy of the schema, is what refuses them later.
+            Some(name) if operator.contains(name) => {}
             Some(name) if hidden.contains(name) => deferred.push(def),
             _ => exposed.push(def),
         }
@@ -630,7 +630,7 @@ pub fn select_exposed(
     let hidden = HiddenTools {
         state: std::sync::Mutex::new(HiddenState {
             defs: deferred,
-            operator_hidden: excluded,
+            policy: settings.clone(),
             promoted: Vec::new(),
             cap: None,
         }),
@@ -1071,6 +1071,72 @@ mod tests {
             "nothing was queued, so the next request's tool list is unchanged"
         );
         assert_eq!(tools.as_array().unwrap().len(), 1);
+    }
+
+    /// #2950 review 2 (P1): the operator ceiling is applied BEFORE budget
+    /// selection, so a tool both the budget and the operator would drop is
+    /// operator-hidden (refused), never budget-deferred (promotable).
+    #[test]
+    fn budget_deferral_never_admits_an_operator_hidden_tool() {
+        let defs = json!([
+            tool("read_file", "k"),
+            tool("tool_search", "k"),
+            tool("save_note", "n"),
+        ]);
+        let allow = Some(vec!["read_file".to_string(), "tool_search".to_string()]);
+        for profile in [ExposureProfile::Minimal, ExposureProfile::Auto] {
+            let settings = ExposureSettings {
+                profile,
+                schema_budget_pct: 0,
+                allow_list: allow.clone(),
+                ..Default::default()
+            };
+            let plan = plan_exposure(&defs, &settings, Some(1_000), &BTreeSet::new(), est());
+            assert!(
+                !plan.hidden.iter().any(|name| name == "save_note"),
+                "{profile:?}: the deferred pool is a subset of the visible set: {:?}",
+                plan.hidden
+            );
+            assert_eq!(
+                plan.operator_hidden,
+                vec!["save_note".to_string()],
+                "{profile:?}"
+            );
+            let (_, hidden) = select_exposed(
+                defs.clone(),
+                &settings,
+                Some(1_000),
+                &BTreeSet::new(),
+                est(),
+            );
+            assert!(!hidden.is_hidden("save_note"), "{profile:?}");
+            assert!(hidden.is_operator_hidden("save_note"), "{profile:?}");
+            assert_eq!(
+                hidden.promote("save_note"),
+                Promotion::OperatorHidden,
+                "{profile:?}"
+            );
+        }
+    }
+
+    /// #2950 review 2 (P2): the ceiling is the policy, not the stored
+    /// definitions. A tool an earlier stage (Plan's disposition filter)
+    /// already removed from the catalog is still operator-hidden to discovery
+    /// and promotion; without a policy nothing is.
+    #[test]
+    fn operator_policy_covers_tools_removed_before_selection() {
+        let defs = json!([tool("read_file", "k"), tool("tool_search", "k")]);
+        let settings = ExposureSettings {
+            read_only: true,
+            ..Default::default()
+        };
+        let (_, hidden) = select_exposed(defs, &settings, None, &BTreeSet::new(), est());
+        assert!(hidden.is_operator_hidden("write_file"));
+        assert!(!hidden.is_operator_hidden("read_file"));
+        assert!(
+            !HiddenTools::default().is_operator_hidden("write_file"),
+            "no policy, no ceiling"
+        );
     }
 
     /// #2950 review 1: `read_only` narrows authority, not only visibility.

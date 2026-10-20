@@ -1620,7 +1620,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake, &exposure);
     // #2313: one ledger attempt per primary request, keyed at the send.
     let attempt_turn = turn_prompt_context
         .map(|turn| turn.active_operator_prompt().id().to_string())
@@ -1641,7 +1641,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // user turns with zero organic save_note use, append a one-line reminder
     // to this turn's user message. Only when a sink exists — without one the
     // save_note tool isn't even advertised.
-    if note_sink.is_some() {
+    if note_sink.is_some() && exposure.operator_visible("save_note") {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
             if let Some(harness) = smart_harness {
                 harness.host_message(&line)?;
@@ -1863,6 +1863,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             &selected_target::root(workspace, worktree_session),
             &caveats.fs_read,
             estimation,
+            &exposure,
         );
         semantic_pins::refresh(
             &mut observed_facts,
@@ -6837,7 +6838,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake, &exposure);
     // #2313: one ledger attempt per primary request, keyed at the send.
     let attempt_turn = turn_prompt_context
         .map(|turn| turn.active_operator_prompt().id().to_string())
@@ -6855,7 +6856,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     });
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
-    if note_sink.is_some() {
+    if note_sink.is_some() && exposure.operator_visible("save_note") {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
             if let Some(harness) = smart_harness {
                 harness.host_message(&line)?;
@@ -7039,6 +7040,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             &selected_target::root(workspace, worktree_session),
             &caveats.fs_read,
             estimation,
+            &exposure,
         );
         semantic_pins::refresh(
             &mut observed_facts,
@@ -9719,7 +9721,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake, &exposure);
     // #2313: one ledger attempt per primary request, keyed at the send.
     let attempt_turn = turn_prompt_context
         .map(|turn| turn.active_operator_prompt().id().to_string())
@@ -9737,7 +9739,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     });
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
-    if note_sink.is_some() {
+    if note_sink.is_some() && exposure.operator_visible("save_note") {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
             if let Some(harness) = smart_harness {
                 harness.host_message(&line)?;
@@ -9914,6 +9916,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             &selected_target::root(workspace, worktree_session),
             &caveats.fs_read,
             estimation,
+            &exposure,
         );
         semantic_pins::refresh(
             &mut observed_facts,
@@ -12340,7 +12343,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
-    prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context, prompt_intake);
+    prompt_read::ensure_active_prompt_card(
+        &mut msgs_json,
+        prompt_context,
+        prompt_intake,
+        &exposure,
+    );
     // #2313: one ledger attempt per primary request, keyed at the send.
     let attempt_turn = turn_prompt_context
         .map(|turn| turn.active_operator_prompt().id().to_string())
@@ -12572,6 +12580,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             &selected_target::root(workspace, worktree_session),
             &caveats.fs_read,
             estimation,
+            &exposure,
         );
         semantic_pins::refresh(
             &mut observed_facts,

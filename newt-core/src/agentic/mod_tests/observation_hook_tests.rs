@@ -139,6 +139,7 @@ fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         &mut wire_messages,
         prompt_read::PromptReadContext::new(Some(&receipt), task, None),
         None,
+        &Default::default(),
     );
     super::compression_loop_tests::add_observed_note(&mut wire_messages, task, ".");
     estimate_request_tokens(

@@ -896,6 +896,7 @@ pub(super) fn add_observed_note(
         std::path::Path::new(workspace),
         &crate::Scope::All,
         crate::tokens::TokenEstimation::default(),
+        &Default::default(),
     );
     semantic_pins::refresh(
         &mut projection,
@@ -949,6 +950,7 @@ fn initial_request_budget(messages: &[MemMessage], task: &str, workspace: &str) 
         &mut wire_messages,
         prompt_read::PromptReadContext::new(Some(&receipt), task, None),
         None,
+        &Default::default(),
     );
     add_observed_note(&mut wire_messages, task, workspace);
     estimate_request_tokens(
