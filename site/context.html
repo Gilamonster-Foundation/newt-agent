@@ -17,7 +17,6 @@
   <a href="frame.html">Agent-frame</a>
   <a href="identity.html">Identity</a>
   <a href="mesh.html">Mesh</a>
-  <a href="paged.html">Paged context</a>
   <a href="https://github.com/Gilamonster-Foundation/newt-agent">Source</a>
 </nav>
 <main>
@@ -60,6 +59,8 @@
   <p class="fine">Token counts and the handle are illustrative. The stages follow <code>newt-core/src/agentic/compress.rs</code>. Keys: left/right arrows step, space plays or pauses.</p>
 </section>
 
+<h2>Going further</h2>
+<p><a href="paged.html"><strong>Paged context</strong></a> is the design that would extend this: bounded residency with unbounded reach, served from a derivation graph. It is not built yet, and the page says which parts are.</p>
 <h2>What each stage maps to</h2>
 <div class="tw"><table>
   <thead><tr><th>Stage</th><th>What it does</th><th>Where</th></tr></thead>
@@ -76,7 +77,7 @@
 <h2>Built, and not yet built</h2>
 <p>The design behind this is progressive disclosure: the window is a budgeted resource and the model pulls what it needs. The model is never told it holds everything. It is told what it holds and that the rest is reachable, because a confident summary suppresses re-reading while a labelled absence prompts it
 (<a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/notes/2026-06-13-summarization-induced-hallucination.md">measured here</a>).</p>
-<p>The wider idea, <a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md">paged context over a derivation graph</a>, is recorded intent and has no implementation yet. The animation above does not depict it.</p>
+<p>The wider idea, <a href="paged.html">paged context over a derivation graph</a>, is recorded intent and has no implementation yet. The animation above does not depict it; the linked page animates the design and labels it as such.</p>
 
 <h2>Try it</h2>
 <pre><code>git clone https://github.com/Gilamonster-Foundation/newt-agent
@@ -139,7 +140,6 @@ newt</code></pre>
       store: [{ name: 'compaction:‹cid›', body: 'still addressable for the session', hot: false }] }
   ];
 
-  
   var win = document.getElementById('window'), store = document.getElementById('store');
   var fill = document.getElementById('fill'), tick = document.getElementById('tick');
   var els = {}, PX = 15, MIN = 24;

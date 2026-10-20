@@ -133,3 +133,5 @@ footer { margin: 56px 0 40px; color: var(--muted); font-size: .9rem; border-top:
 @media (prefers-reduced-motion: reduce) { .scene .nd, .scene .edge { transition: none; } }
 
 .notice { border: 1px solid var(--warn); border-radius: 8px; padding: 10px 14px; background: var(--panel); margin: 16px 0 0; }
+
+.crumb { margin: 24px 0 0; color: var(--muted); font-size: .9rem; }
