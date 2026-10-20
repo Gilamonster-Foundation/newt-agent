@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newt-Agent: paged context</title>
+<meta name="description" content="The goal is the effect of a huge context window without a huge window: bounded residency, unbounded reach. The model is never told it holds everything">
+<link rel="icon" href="favicon.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="topnav" aria-label="Site">
+  <a href="index.html">Newt-Agent</a>
+  <a href="context.html">Context</a>
+  <a href="ocap.html">OCAP</a>
+  <a href="frame.html">Agent-frame</a>
+  <a href="identity.html">Identity</a>
+  <a href="mesh.html">Mesh</a>
+  <a href="paged.html" aria-current="page">Paged context</a>
+  <a href="https://github.com/Gilamonster-Foundation/newt-agent">Source</a>
+</nav>
+<main>
+<h1 style="margin-top:28px">Paged context over a derivation graph</h1>
+<p class="lede">The goal is the effect of a huge context window without a huge window: bounded residency, unbounded reach. The model is never told it holds everything. It is told what it holds and that it can reach the rest.</p>
+<p class="notice"><span class="impl design">Design only</span> This page shows a design, stated by the maintainer on 2026-09-12, that has no implementation yet. The building blocks it rests on (content-addressed units, spill handles, <code>memory_fetch</code>) do exist and are marked in the table.</p>
+<section class="demo" aria-labelledby="stage-title">
+  <div class="stage-head">
+    <h2 class="stage-title" id="stage-title" style="margin:0;font-size:1.1rem"></h2>
+    <span class="stage-count" id="stage-count"></span>
+  </div>
+  <p class="caption" id="caption" aria-live="polite"></p>
+  <div class="scene" id="scene"></div>
+  <div class="zones" id="zones"></div>
+  <div class="controls">
+    <button id="prev" type="button">Back</button>
+    <button id="play" type="button" aria-pressed="false">Play</button>
+    <button id="next" type="button">Next</button>
+    <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
+  </div>
+  <p class="fine">Everything on this page is intended behaviour, not shipped behaviour. Source: <a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md">docs/design/infinite-context-illusion.md</a>. Keys: left/right arrows step, space plays or pauses.</p>
+</section>
+<h2>What each stage maps to</h2>
+<div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
+<tr><td>Content-addressed units</td><td>ContentId names; derived records name their sources.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/"><code>agent-frame/src/</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Spill handles and memory_fetch</td><td>Verbatim spans stored under a CID and fetched on demand.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/memory_fetch.rs"><code>newt-core/src/agentic/memory_fetch.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Paged residency</td><td>Bounded resident set with a pager serving faults.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md"><code>docs/design/infinite-context-illusion.md</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
+<tr><td>Serve by re-derivation</td><td>Rebuild a unit from its sources and check it.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md"><code>docs/design/infinite-context-illusion.md</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
+<tr><td>Relative genesis</td><td>New root that names the parent it cannot produce.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md"><code>docs/design/infinite-context-illusion.md</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
+<tr><td>Recorded branch choice</td><td>Choice and reason are admitted facts; untaken branch stays addressable.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md"><code>docs/design/infinite-context-illusion.md</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
+<tr><td>Verify before rehydrate</td><td>Received block identity checked first, across the mesh.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md"><code>docs/design/infinite-context-illusion.md</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
+<tr><td>False-completion rate</td><td>The honesty signal, already measured.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/terminal-bench.md"><code>docs/terminal-bench.md</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+</tbody></table></div>
+<h2>What this does not show</h2>
+<ul>
+<li>Not infinite context. The doc states the intention as the effect of a huge window, and the mechanism as bounded residency with unbounded reach.</li>
+<li>An illusion presented to the operator is a goal. An illusion imposed on the model inside the loop is a defect, and the design forbids it.</li>
+<li>Open questions in the doc: the eviction policy and who owns it; whether a relative genesis carries replayable material; whether branches are ever garbage collected; and whether the "am I on a relative genesis" query costs a tool round.</li>
+<li>The doc also weighs names (paged context, atlas and chart, sheaf). The word "projection" is avoided because the codebase already uses it for something narrower.</li>
+</ul>
+</main>
+<footer>Apache-2.0. <a href="https://github.com/Gilamonster-Foundation/newt-agent">Gilamonster Foundation / newt-agent</a>.</footer>
+</div>
+<script src="stepper.js"></script>
+<script src="diagram.js"></script>
+<script>
+var SPEC = {
+ "nodes": [
+  {
+   "id": "win",
+   "label": "Resident set",
+   "x": 15,
+   "y": 12,
+   "sub": "the window; small and bounded"
+  },
+  {
+   "id": "graph",
+   "label": "Derivation graph",
+   "x": 50,
+   "y": 12,
+   "sub": "every unit has a ContentId",
+   "kind": "store"
+  },
+  {
+   "id": "unit",
+   "label": "Unit X",
+   "x": 85,
+   "y": 50,
+   "sub": "not resident"
+  },
+  {
+   "id": "model",
+   "label": "Model",
+   "x": 15,
+   "y": 50
+  },
+  {
+   "id": "mgr",
+   "label": "Pager",
+   "x": 50,
+   "y": 50,
+   "sub": "the context manager; a navigator"
+  },
+  {
+   "id": "met",
+   "label": "Signals",
+   "x": 85,
+   "y": 50
+  },
+  {
+   "id": "rel",
+   "label": "Relative genesis",
+   "x": 15,
+   "y": 88,
+   "sub": "new root after a break",
+   "kind": "new"
+  },
+  {
+   "id": "b2",
+   "label": "Branch not taken",
+   "x": 50,
+   "y": 88,
+   "sub": "stays addressable"
+  },
+  {
+   "id": "host",
+   "label": "Another host",
+   "x": 85,
+   "y": 88
+  }
+ ],
+ "stages": [
+  {
+   "title": "Bounded residency, unbounded reach",
+   "cap": "A large window sells reachability and charges for residency. The work rarely needs residency: a coding turn needs the task, a few files and the recent turns. It needs to be able to get to anything else, cheaply and verifiably.",
+   "show": [
+    "win",
+    "graph"
+   ],
+   "hot": [
+    "win"
+   ],
+   "edges": [
+    [
+     "win",
+     "graph",
+     "can address any unit"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Design only"
+  },
+  {
+   "title": "The window holds a working set",
+   "cap": "Only the working set is resident. Everything else stays in the graph, named by content, so the same bytes always have the same name.",
+   "show": [
+    "win",
+    "graph",
+    "model"
+   ],
+   "hot": [
+    "win"
+   ],
+   "edges": [
+    [
+     "model",
+     "win",
+     "sees"
+    ],
+    [
+     "win",
+     "graph",
+     "addresses",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "win": "task, a few files, recent turns"
+   },
+   "note": "Design only"
+  },
+  {
+   "title": "A fault is visible and handled",
+   "cap": "The model needs a unit that is not resident. Like a page fault in virtual memory, this is a visible, handled event. The model is told it has some things and can reach anything, never that it has everything.",
+   "show": [
+    "win",
+    "graph",
+    "unit",
+    "model",
+    "mgr"
+   ],
+   "hot": [
+    "model",
+    "unit"
+   ],
+   "edges": [
+    [
+     "model",
+     "mgr",
+     "needs X, not held"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "model": "told: held vs reachable"
+   },
+   "note": "Design only. Builds on memory_fetch handles (implemented)"
+  },
+  {
+   "title": "Served by retrieval or by re-derivation",
+   "cap": "The pager resolves the content id and pages the unit in. Because the backing store is a derivation graph, a fault can also be served by re-deriving the unit from its sources, and the rebuild can be checked because identity comes from content.",
+   "show": [
+    "win",
+    "graph",
+    "unit",
+    "model",
+    "mgr"
+   ],
+   "hot": [
+    "mgr"
+   ],
+   "edges": [
+    [
+     "mgr",
+     "graph",
+     "resolve ContentId"
+    ],
+    [
+     "graph",
+     "unit",
+     "retrieve or re-derive"
+    ],
+    [
+     "graph",
+     "win",
+     "page in"
+    ]
+   ],
+   "state": {
+    "unit": "ok"
+   },
+   "tag": {},
+   "note": "Design only. Content addressing exists in agent-frame"
+  },
+  {
+   "title": "Absent is labelled, never smoothed over",
+   "cap": "A measured result drives the rule: a confident summary suppresses re-reading, while a labelled absence prompts it. So the model is never given a summary that implies it holds the whole.",
+   "show": [
+    "model",
+    "mgr",
+    "win"
+   ],
+   "hot": [
+    "model"
+   ],
+   "edges": [
+    [
+     "mgr",
+     "model",
+     "labelled absence"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "model": "navigates, does not invent"
+   },
+   "note": "Measured: summarization-induced hallucination note"
+  },
+  {
+   "title": "A break becomes a transition",
+   "cap": "When the budget cannot shrink further, the model changes, or the session moves, the old blocks derive a new root: a relative genesis. It names the parent it cannot produce. Unreachable is not the same as absent.",
+   "show": [
+    "graph",
+    "rel"
+   ],
+   "hot": [
+    "rel"
+   ],
+   "edges": [
+    [
+     "rel",
+     "graph",
+     "names the parent it cannot produce",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "rel": "unreachable, not absent"
+   },
+   "note": "Design only"
+  },
+  {
+   "title": "Branching needs a recorded choice",
+   "cap": "One body of material can derive many candidate blocks. The choice and its reason are admitted facts in the frame, and the branch not taken stays addressable. Otherwise \"re-derivable\" is false.",
+   "show": [
+    "mgr",
+    "rel",
+    "b2"
+   ],
+   "hot": [
+    "mgr"
+   ],
+   "edges": [
+    [
+     "mgr",
+     "rel",
+     "admitted: choice + reason"
+    ],
+    [
+     "mgr",
+     "b2",
+     "kept",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Design only"
+  },
+  {
+   "title": "Across the mesh, verify before rehydrating",
+   "cap": "A signed block arrives from another host. Its identity is checked before it is rehydrated, and a host holding a block whose parent it lacks must say so.",
+   "show": [
+    "rel",
+    "host",
+    "graph"
+   ],
+   "hot": [
+    "host"
+   ],
+   "edges": [
+    [
+     "host",
+     "rel",
+     "signed block + CID"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "rel": "identity verified first"
+   },
+   "note": "Design only"
+  },
+  {
+   "title": "How we would know it works",
+   "cap": "Three signals: how often the model needs a non-resident unit, what each navigation costs, and whether it navigates when it should instead of inventing. The third is the false-completion rate already measured on terminal-bench.",
+   "show": [
+    "mgr",
+    "met"
+   ],
+   "hot": [
+    "met"
+   ],
+   "edges": [
+    [
+     "mgr",
+     "met",
+     "fault rate, fault cost, fault when it should"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Third signal: measured today"
+  }
+ ]
+};
+var onShow = Diagram(document.getElementById('scene'), SPEC);
+Stepper({ stages: SPEC.stages, onShow: onShow });
+</script>
+</body>
+</html>

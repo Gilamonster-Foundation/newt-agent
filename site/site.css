@@ -131,3 +131,5 @@ footer { margin: 56px 0 40px; color: var(--muted); font-size: .9rem; border-top:
 @media (max-width: 760px) { .scene { min-height: 480px; } .scene .nd { width: 30%; min-width: 0; font-size: .72rem; padding: 4px 5px; } .scene .nd small { font-size: .66rem; } }
 .tw { overflow-x: auto; }
 @media (prefers-reduced-motion: reduce) { .scene .nd, .scene .edge { transition: none; } }
+
+.notice { border: 1px solid var(--warn); border-radius: 8px; padding: 10px 14px; background: var(--panel); margin: 16px 0 0; }
