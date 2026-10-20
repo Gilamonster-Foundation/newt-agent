@@ -5895,7 +5895,7 @@ fn build_system_prompt_with_persona(
          Historical notes do not redefine this root.\n"
     );
     // #2937: annotate each named piece through the session's ReportSink so
-    // /context request can attribute components in the system message.
+    // the request report (TUI preview: #2959) can attribute components in the system message.
     let note = |label: &str, text: &str| {
         if let Some(s) = sink {
             s.annotate(label, "build_system_prompt_with_persona", text);

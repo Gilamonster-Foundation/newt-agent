@@ -8119,7 +8119,7 @@ fn session_body(
                             active_persona.as_ref(),
                         ),
                     );
-                    // #2937: name each piece so `/context request` can attribute it.
+                    // #2937: name each piece so the request report can attribute it (TUI preview: #2959).
                     let ws_state = workspace_state_block(workspace, &turn_caveats.fs_read);
                     let runtime_ctx = runtime_context_block(
                         &inf_model,
