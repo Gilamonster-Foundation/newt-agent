@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newt-Agent: agent-frame</title>
+<meta name="description" content="agent-frame is the pure kernel under Newt's memory: every record is named by a hash of its content, and every derived record names the records it came">
+<link rel="icon" href="favicon.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="topnav" aria-label="Site">
+  <a href="index.html">Newt-Agent</a>
+  <a href="context.html">Context</a>
+  <a href="ocap.html">OCAP</a>
+  <a href="frame.html" aria-current="page">Agent-frame</a>
+  <a href="identity.html">Identity</a>
+  <a href="mesh.html">Mesh</a>
+  <a href="https://github.com/Gilamonster-Foundation/newt-agent">Source</a>
+</nav>
+<main>
+<h1 style="margin-top:28px">How agent-frame records what happened</h1>
+<p class="lede">agent-frame is the pure kernel under Newt's memory: every record is named by a hash of its content, and every derived record names the records it came from. Step through one tool output being recorded, cut down, verified and projected into a request.</p>
+<section class="demo" aria-labelledby="stage-title">
+  <div class="stage-head">
+    <h2 class="stage-title" id="stage-title" style="margin:0;font-size:1.1rem"></h2>
+    <span class="stage-count" id="stage-count"></span>
+  </div>
+  <p class="caption" id="caption" aria-live="polite"></p>
+  <div class="scene" id="scene"></div>
+  <div class="zones" id="zones"></div>
+  <div class="controls">
+    <button id="prev" type="button">Back</button>
+    <button id="play" type="button" aria-pressed="false">Play</button>
+    <button id="next" type="button">Next</button>
+    <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
+  </div>
+  <p class="fine">Shapes are illustrative. Types come from <code>agent-frame/src/</code> and <code>agent-harness/src/</code>. Keys: left/right arrows step, space plays or pauses.</p>
+</section>
+<h2>What each stage maps to</h2>
+<div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
+<tr><td>Root</td><td>RootEvent with RootKind (OperatorPrompt, UserAction, HarnessEvent).</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/root.rs"><code>agent-frame/src/root.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Observation</td><td>Event with a RawContentId payload; no sources, depth 0.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/event.rs"><code>agent-frame/src/event.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Elision</td><td>Derivation + Unit::seal(Op::Elide). Concise and Generate are in the type but refused.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/derivation.rs"><code>agent-frame/src/derivation.rs</code></a></td><td class="status"><span class="impl">Implemented (elide only)</span></td></tr>
+<tr><td>Verify</td><td>verify_unit rederives from bytes.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/verify.rs"><code>agent-frame/src/verify.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Packets</td><td>Packet::genesis / following; a chain, not a general DAG.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/packet.rs"><code>agent-frame/src/packet.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Projection</td><td>Ordered Entry list rendered to a request.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-harness/src/projection.rs"><code>agent-harness/src/projection.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Sources in newt-core</td><td>Compaction summaries cite their source turns; spill handles are CIDs.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/memory.rs"><code>newt-core/src/memory.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Paged context over a derivation graph</td><td>Bounded residency, unbounded reach.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md"><code>docs/design/infinite-context-illusion.md</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
+</tbody></table></div>
+<h2>What this does not show</h2>
+<ul>
+<li>This is not "infinite context" or lossless memory. Elision is checked by recomputing from the source bytes.</li>
+<li>A content id proves these bytes hash here. It does not prove an agent may read them.</li>
+<li>Rows from before encoding v2 have no source attribution.</li>
+<li>agent-frame is a library, not a service. It has no storage of its own; <code>agent-harness</code> supplies the store.</li>
+</ul>
+</main>
+<footer>Apache-2.0. <a href="https://github.com/Gilamonster-Foundation/newt-agent">Gilamonster Foundation / newt-agent</a>.</footer>
+</div>
+<script src="stepper.js"></script>
+<script src="diagram.js"></script>
+<script>
+var SPEC = {
+ "nodes": [
+  {
+   "id": "root",
+   "label": "RootEvent",
+   "x": 15,
+   "y": 12,
+   "sub": "operator prompt"
+  },
+  {
+   "id": "obs",
+   "label": "Observation",
+   "x": 50,
+   "y": 12,
+   "sub": "payload: RawContentId, 40 KB tool output"
+  },
+  {
+   "id": "summ",
+   "label": "Compaction summary",
+   "x": 85,
+   "y": 12,
+   "sub": "sources: turn content ids",
+   "kind": "new"
+  },
+  {
+   "id": "el",
+   "label": "Elision unit",
+   "x": 15,
+   "y": 50,
+   "sub": "Derivation{op: elide, source, span, root}"
+  },
+  {
+   "id": "ver",
+   "label": "verify_unit",
+   "x": 50,
+   "y": 50,
+   "sub": "recompute from the bytes"
+  },
+  {
+   "id": "p1",
+   "label": "Packet (genesis)",
+   "x": 15,
+   "y": 88
+  },
+  {
+   "id": "p2",
+   "label": "Packet (following)",
+   "x": 50,
+   "y": 88,
+   "sub": "one predecessor"
+  },
+  {
+   "id": "proj",
+   "label": "Projection",
+   "x": 85,
+   "y": 88,
+   "sub": "ordered Entry list"
+  }
+ ],
+ "stages": [
+  {
+   "title": "Something caused this",
+   "cap": "A RootEvent records the cause, such as the operator's prompt. Its ContentId is the anchor everything else cites.",
+   "show": [
+    "root"
+   ],
+   "hot": [
+    "root"
+   ],
+   "edges": [],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: root.rs"
+  },
+  {
+   "title": "Raw output is stored as bytes",
+   "cap": "A tool runs and its output is stored as an Observation whose payload is a RawContentId. It names no sources and costs nothing to refer to later.",
+   "show": [
+    "root",
+    "obs"
+   ],
+   "hot": [
+    "obs"
+   ],
+   "edges": [
+    [
+     "obs",
+     "root",
+     "cites"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: event.rs"
+  },
+  {
+   "title": "Cut a span, keep an addressed pointer",
+   "cap": "An Elision unit says: this source, this byte range, under this root. Its id is the hash of that derivation, so the pointer names exactly what it removed. v0 mints elision only.",
+   "show": [
+    "root",
+    "obs",
+    "el"
+   ],
+   "hot": [
+    "el"
+   ],
+   "edges": [
+    [
+     "el",
+     "obs",
+     "source + span"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: derivation.rs, unit.rs"
+  },
+  {
+   "title": "Anyone can recheck the pointer",
+   "cap": "verify_unit recomputes the source, span and root claims from the bytes. Rederiving is the only check v0 offers. It proves provenance, not that the content is true.",
+   "show": [
+    "obs",
+    "el",
+    "ver"
+   ],
+   "hot": [
+    "ver"
+   ],
+   "edges": [
+    [
+     "ver",
+     "el",
+     "recompute"
+    ],
+    [
+     "ver",
+     "obs",
+     "read bytes",
+     1
+    ]
+   ],
+   "state": {
+    "ver": "ok"
+   },
+   "tag": {},
+   "note": "Implemented: verify.rs"
+  },
+  {
+   "title": "Packets chain the units",
+   "cap": "Packets form a Merkle chain: genesis, then each packet names its one predecessor and an ordered list of unit ids. Causal parents live on events, not on packets.",
+   "show": [
+    "el",
+    "p1",
+    "p2"
+   ],
+   "hot": [
+    "p2"
+   ],
+   "edges": [
+    [
+     "p2",
+     "p1",
+     "prior"
+    ],
+    [
+     "p1",
+     "el",
+     "unit id",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: packet.rs"
+  },
+  {
+   "title": "A projection renders the request",
+   "cap": "A Projection is an ordered list of entries that cite events. Order lives here because a Merkle parent set cannot carry it. It replays the host's request. It makes no claim about what a provider does inside.",
+   "show": [
+    "el",
+    "p2",
+    "proj"
+   ],
+   "hot": [
+    "proj"
+   ],
+   "edges": [
+    [
+     "proj",
+     "el",
+     "entries cite",
+     1
+    ],
+    [
+     "proj",
+     "p2",
+     "replays"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: agent-harness projection.rs"
+  },
+  {
+   "title": "newt-core cites sources too",
+   "cap": "A compaction summary is stored with the content ids of the turns it replaced. A test runs the real producer and fails if a derived record names no source. A summary is not a verified derivation; it cites its sources.",
+   "show": [
+    "obs",
+    "summ"
+   ],
+   "hot": [
+    "summ"
+   ],
+   "edges": [
+    [
+     "summ",
+     "obs",
+     "sources"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: persist_compaction_summary"
+  }
+ ]
+};
+var onShow = Diagram(document.getElementById('scene'), SPEC);
+Stepper({ stages: SPEC.stages, onShow: onShow });
+</script>
+</body>
+</html>

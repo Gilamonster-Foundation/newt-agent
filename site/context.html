@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newt-Agent: context management</title>
+<meta name="description" content="Step through one context compaction in Newt: prune, spill, summarize, page back in.">
+<link rel="icon" href="favicon.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="topnav" aria-label="Site">
+  <a href="index.html">Newt-Agent</a>
+  <a href="context.html" aria-current="page">Context</a>
+  <a href="ocap.html">OCAP</a>
+  <a href="frame.html">Agent-frame</a>
+  <a href="identity.html">Identity</a>
+  <a href="mesh.html">Mesh</a>
+  <a href="https://github.com/Gilamonster-Foundation/newt-agent">Source</a>
+</nav>
+<main>
+<h1 style="margin-top:28px">How Newt manages context</h1>
+<p class="lede">A model's window is small and every turn re-sends it. When the window nears its budget, Newt does not throw the middle away. It keeps the task, keeps the recent work, saves the rest verbatim, and leaves the model a way to ask for it back. Step through one compaction below.</p>
+
+<section class="demo" aria-labelledby="stage-title">
+  <div class="stage-head">
+    <h2 class="stage-title" id="stage-title" style="margin:0;font-size:1.1rem"></h2>
+    <span class="stage-count" id="stage-count"></span>
+  </div>
+  <p class="caption" id="caption" aria-live="polite"></p>
+  <div class="grid">
+    <div>
+      <p class="col-title">Context window (what the model sees)</p>
+      <div class="meter" role="img" aria-label="Window usage" id="meter">
+        <div class="fill" id="fill"></div><div class="tick" id="tick"></div>
+      </div>
+      <div class="meter-label"><span id="meter-text"></span><span>dashed line: compaction trigger</span></div>
+      <div class="window" id="window"></div>
+      <div class="zones" id="zones"></div>
+    </div>
+    <div>
+      <p class="col-title">Spill store (content-addressed, off-window)</p>
+      <div class="store" id="store"></div>
+      <div class="strikes" id="strikes">
+        <strong>Anti-thrash</strong>
+        <span class="dots" id="dots" aria-hidden="true"><i class="dot"></i><i class="dot"></i></span>
+        <span id="strike-text"></span>
+        <span class="note" id="strike-note"></span>
+      </div>
+    </div>
+  </div>
+  <div class="controls">
+    <button id="prev" type="button">Back</button>
+    <button id="play" type="button" aria-pressed="false">Play</button>
+    <button id="next" type="button">Next</button>
+    <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
+  </div>
+  <p class="fine">Token counts and the handle are illustrative. The stages follow <code>newt-core/src/agentic/compress.rs</code>. Keys: left/right arrows step, space plays or pauses.</p>
+</section>
+
+<h2>What each stage maps to</h2>
+<div class="tw"><table>
+  <thead><tr><th>Stage</th><th>What it does</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Structural prune</td><td>Zero-LLM-cost passes shrink stale tool output first. Most triggers end here.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/compress.rs"><code>compress.rs</code></a></td></tr>
+    <tr><td>Boundary</td><td>Head is every leading system message plus the active-prompt card, so the task can never be summarized away. The tail is protected by a token budget, with the latest user message anchored in it. The cut never splits a tool call from its result.</td><td><code>compress.rs</code></td></tr>
+    <tr><td>Spill</td><td>The verbatim middle is redacted and stored under a content-addressed handle (a BLAKE3 CID). Same bytes, same handle.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/decisions/1528b3-cid-spill-identity.md">spill identity decision</a></td></tr>
+    <tr><td>Summarize</td><td>A summarizer writes a reference-only card, fenced by start and end markers so weak local models do not read it as a fresh request. No summarizer, or a failed one, falls back to a plain "N messages were removed" marker and the turn goes on.</td><td><code>compress.rs</code></td></tr>
+    <tr><td>Page fault</td><td>The model calls <code>memory_fetch</code> with the handle and gets the verbatim span back, only when it needs the detail.</td><td><code>newt-core/src/agentic/memory_fetch.rs</code></td></tr>
+    <tr><td>Anti-thrash</td><td>Two compactions in a row that each reclaim under 10% turn auto-compaction off for the session and tell the operator once. The budget guard stays hard: an over-budget send is refused, never silently truncated.</td><td><code>CompressState</code> in <code>compress.rs</code></td></tr>
+  </tbody>
+</table></div>
+
+<h2>Built, and not yet built</h2>
+<p>The design behind this is progressive disclosure: the window is a budgeted resource and the model pulls what it needs. The model is never told it holds everything. It is told what it holds and that the rest is reachable, because a confident summary suppresses re-reading while a labelled absence prompts it
+(<a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/notes/2026-06-13-summarization-induced-hallucination.md">measured here</a>).</p>
+<p>The wider idea, <a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md">paged context over a derivation graph</a>, is recorded intent and has no implementation yet. The animation above does not depict it.</p>
+
+<h2>Try it</h2>
+<pre><code>git clone https://github.com/Gilamonster-Foundation/newt-agent
+cd newt-agent
+just install
+newt</code></pre>
+<p>The first run opens a setup wizard. <code>newt --help</code> is the authority on what the binary does.</p>
+</main>
+<footer>Apache-2.0. <a href="https://github.com/Gilamonster-Foundation/newt-agent">Gilamonster Foundation / newt-agent</a>.</footer>
+</div>
+<script src="stepper.js"></script>
+<script>
+(function () {
+  var BUDGET = 20, TRIGGER = 16; // thousands of tokens, illustrative
+  var B = [
+    { id: 'sys',  role: 'sys',  label: 'SYSTEM  system prompt + active-prompt card', tag: 'head',  z: 'head', t: [1.2,1.2,1.2,1.2,1.2,1.2,1.2,1.2] },
+    { id: 'task', role: 'user', label: 'USER  task: make the failing test pass',      tag: 'head',  z: 'head', t: [0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4] },
+    { id: 'm1',   role: 'asst', label: 'ASSISTANT  read_file src/lib.rs',             z: 'mid', t: [null,0.2,0.2,0.2,0.2,null,null,null] },
+    { id: 'm2',   role: 'tool', label: 'TOOL  file contents',                         z: 'mid', t: [null,6.1,3.4,3.4,3.4,null,null,null] },
+    { id: 'm3',   role: 'asst', label: 'ASSISTANT  grep "parse_header"',              z: 'mid', t: [null,0.2,0.2,0.2,0.2,null,null,null] },
+    { id: 'm4',   role: 'tool', label: 'TOOL  grep results',                          z: 'mid', t: [null,4.8,2.6,2.6,2.6,null,null,null] },
+    { id: 'm5',   role: 'asst', label: 'ASSISTANT  edit_file src/lib.rs',             z: 'mid', t: [null,0.2,0.2,0.2,0.2,null,null,null] },
+    { id: 'm6',   role: 'tool', label: 'TOOL  diff applied',                          z: 'mid', t: [null,1.9,1.9,1.9,1.9,null,null,null] },
+    { id: 'm7',   role: 'tool', label: 'TOOL  first test run (long log)',             z: 'mid', t: [null,5.2,2.8,2.8,2.8,null,null,null] },
+    { id: 'sum',  role: 'sum',  label: 'SUMMARY  [CONTEXT COMPACTION — REFERENCE ONLY] … --- END OF CONTEXT SUMMARY ---', tag: 'handle', z: 'mid', t: [null,null,null,null,null,0.9,0.9,0.9] },
+    { id: 't1',   role: 'asst', label: 'ASSISTANT  run tests again',                  z: 'tail', t: [null,0.8,0.8,0.8,0.8,0.8,0.8,0.8] },
+    { id: 't2',   role: 'tool', label: 'TOOL  test output (2 failures left)',         z: 'tail', t: [null,1.1,1.1,1.1,1.1,1.1,1.1,1.1] },
+    { id: 't3',   role: 'user', label: 'USER  also update the changelog',             tag: 'anchored', z: 'tail', t: [null,0.3,0.3,0.3,0.3,0.3,0.3,0.3] },
+    { id: 'mf',   role: 'tool', label: 'TOOL  memory_fetch result (needed lines only)', tag: 'fetched', z: 'tail', t: [null,null,null,null,null,null,1.6,1.6] }
+  ];
+
+  var S = [
+    { title: 'Start of a session',
+      cap: 'The window opens with the system prompt and the task. Both belong to the head, which is never summarized away.',
+      zones: 'Head: system prompt and task.', strikes: 0, store: [] },
+    { title: 'Work piles up',
+      cap: 'Each tool call adds its result. Big outputs (file reads, logs) dominate. The window crosses the compaction trigger, and the budget guard is about to refuse the next send.',
+      zones: 'Over the trigger: compaction runs before the next send.', strikes: 0, store: [] },
+    { title: '1. Structural prune',
+      cap: 'First, zero-cost passes shrink stale tool output. No model is called. Often this is enough. Here it is not: the window is still above the trigger.',
+      zones: 'Tool results shrunk in place. Still over the trigger.', strikes: 0, store: [] },
+    { title: '2. Mark the boundary',
+      cap: 'The head stays. The tail stays, sized by a token budget rather than a message count, with the latest user request anchored in it. Everything between (dashed outline) is the middle. The cut lands between whole tool-call and result pairs.',
+      zones: 'Head: kept.   Middle: to be compacted.   Tail: kept, user request anchored.', strikes: 0, store: [] },
+    { title: '3. Spill the middle',
+      cap: 'The middle is redacted of secrets and written to the store, verbatim, under a handle derived from its content. Nothing is lost yet, and nothing has left the window yet.',
+      zones: 'Middle copied to the store.', strikes: 0,
+      store: [{ name: 'compaction:‹cid›', body: 'verbatim middle span, 8 messages, secrets redacted', hot: true }] },
+    { title: '4. Summarize and replace',
+      cap: 'The middle becomes one reference-only card, fenced by start and end markers, carrying the handle. The window drops from over the trigger to about a quarter of the budget. If no summarizer is available, a plain "N messages were removed" marker takes its place.',
+      zones: 'Window now: head + summary card + tail.', strikes: 0,
+      store: [{ name: 'compaction:‹cid›', body: 'verbatim middle span, 8 messages, secrets redacted', hot: false }] },
+    { title: '5. The model pages detail back in',
+      cap: 'Later the model needs the exact failing line the summary only paraphrased. It calls memory_fetch with the handle and receives just that part, verbatim. The summary told it what it holds, and where the rest is.',
+      zones: 'memory_fetch compaction:‹cid›  →  a few lines come back.', strikes: 0,
+      store: [{ name: 'compaction:‹cid›', body: 'served: lines for the failing assertion', hot: true }] },
+    { title: '6. The brake',
+      cap: 'If compaction keeps reclaiming almost nothing, the loop would thrash. After two compactions in a row that each reclaim under 10%, auto-compaction is switched off for the session and the operator is told once. The budget guard stays hard: an over-budget send is refused, never silently truncated.',
+      zones: 'This run reclaimed far more than 10%, so no strike was recorded.', strikes: 0,
+      store: [{ name: 'compaction:‹cid›', body: 'still addressable for the session', hot: false }] }
+  ];
+
+  
+  var win = document.getElementById('window'), store = document.getElementById('store');
+  var fill = document.getElementById('fill'), tick = document.getElementById('tick');
+  var els = {}, PX = 15, MIN = 24;
+  tick.style.left = (TRIGGER / BUDGET * 100) + '%';
+  B.forEach(function (b) {
+    var d = document.createElement('div');
+    d.className = 'blk role-' + b.role + ' hide';
+    d.innerHTML = '<span class="name"></span><span class="t"></span>';
+    d.querySelector('.name').textContent = b.label;
+    if (b.tag) { var s = document.createElement('span'); s.className = 'tag'; s.textContent = b.tag; d.querySelector('.name').appendChild(s); }
+    win.appendChild(d); els[b.id] = d;
+  });
+  Stepper({ stages: S, onShow: function (i, prev, reduce) {
+    var total = 0, st = S[i];
+    B.forEach(function (b, idx) {
+      var el = els[b.id], t = b.t[i], was = b.t[prev];
+      if (t == null) { el.classList.add('hide'); el.style.height = ''; }
+      else {
+        total += t;
+        el.classList.remove('hide');
+        el.style.height = Math.max(MIN, t * PX) + 'px';
+        el.querySelector('.t').textContent = t.toFixed(1) + 'k';
+        el.style.transitionDelay = (!reduce && prev === 0 && i === 1) ? (idx * 90) + 'ms' : '';
+        if (was == null && prev >= 0 && !reduce) { el.classList.remove('fresh'); void el.offsetWidth; el.classList.add('fresh'); }
+      }
+      el.classList.toggle('mid', i >= 3 && i <= 4 && b.z === 'mid');
+      el.classList.toggle('ghost', i === 4 && b.z === 'mid');
+    });
+    fill.style.width = Math.min(100, total / BUDGET * 100) + '%';
+    fill.classList.toggle('over', total > TRIGGER);
+    document.getElementById('meter-text').textContent = total.toFixed(1) + 'k of ' + BUDGET + 'k tokens' + (total > TRIGGER ? ' (over the trigger)' : '');
+    document.getElementById('meter').setAttribute('aria-label', 'Window usage ' + total.toFixed(1) + 'k of ' + BUDGET + 'k tokens');
+    document.getElementById('zones').textContent = st.zones;
+    store.innerHTML = '';
+    if (!st.store.length) { var e = document.createElement('div'); e.className = 'empty'; e.textContent = 'Empty.'; store.appendChild(e); }
+    st.store.forEach(function (en) {
+      var d = document.createElement('div'); d.className = 'entry' + (en.hot ? ' hot' : '');
+      var n = document.createElement('div'); n.className = 'mono'; n.textContent = en.name;
+      var p = document.createElement('div'); p.textContent = en.body;
+      d.appendChild(n); d.appendChild(p); store.appendChild(d);
+    });
+    document.querySelectorAll('#dots .dot').forEach(function (d) { d.classList.remove('on'); });
+    document.getElementById('strike-text').textContent = 'strikes: 0 of 2';
+    document.getElementById('strike-note').textContent = i === 7 ? 'A strike is a compaction that reclaimed under 10%. Two in a row latch compaction off.' : '';
+  } });
+})();
+</script>
+</body>
+</html>

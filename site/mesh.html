@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newt-Agent: mesh</title>
+<meta name="description" content="A hub can list, mirror and steer sessions running on another of the operator's own machines. The session never moves: the host stays the only writer. ">
+<link rel="icon" href="favicon.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="topnav" aria-label="Site">
+  <a href="index.html">Newt-Agent</a>
+  <a href="context.html">Context</a>
+  <a href="ocap.html">OCAP</a>
+  <a href="frame.html">Agent-frame</a>
+  <a href="identity.html">Identity</a>
+  <a href="mesh.html" aria-current="page">Mesh</a>
+  <a href="https://github.com/Gilamonster-Foundation/newt-agent">Source</a>
+</nav>
+<main>
+<h1 style="margin-top:28px">How Newt sessions dock across machines</h1>
+<p class="lede">A hub can list, mirror and steer sessions running on another of the operator's own machines. The session never moves: the host stays the only writer. Step through discovery, pairing, approval, mirroring, injecting and revoking.</p>
+<section class="demo" aria-labelledby="stage-title">
+  <div class="stage-head">
+    <h2 class="stage-title" id="stage-title" style="margin:0;font-size:1.1rem"></h2>
+    <span class="stage-count" id="stage-count"></span>
+  </div>
+  <p class="caption" id="caption" aria-live="polite"></p>
+  <div class="scene" id="scene"></div>
+  <div class="zones" id="zones"></div>
+  <div class="controls">
+    <button id="prev" type="button">Back</button>
+    <button id="play" type="button" aria-pressed="false">Play</button>
+    <button id="next" type="button">Next</button>
+    <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
+  </div>
+  <p class="fine">Placeholders only. Types come from <code>newt-mesh/src/dock.rs</code>. The transport lives in the sibling agent-mesh repo, and newt-mesh is built outside the default workspace. Keys: left/right arrows step, space plays or pauses.</p>
+</section>
+<h2>What each stage maps to</h2>
+<div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
+<tr><td>Identify</td><td>Per-machine keys derived from one operator root.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-mesh/src/dock.rs"><code>newt-mesh/src/dock.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Discover</td><td>mDNS capability tags on the LAN; direct pubkey@addr dial.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-mesh/src/dock.rs"><code>newt-mesh/src/dock.rs</code></a></td><td class="status"><span class="impl">Implemented (LAN)</span></td></tr>
+<tr><td>Uplink</td><td>Host dials out and long-polls the hub.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-mesh/src/uplink.rs"><code>newt-mesh/src/uplink.rs</code></a></td><td class="status"><span class="impl">Implemented (interim)</span></td></tr>
+<tr><td>Pair</td><td>Commit-reveal numeric comparison, approved at the terminal.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/dock_registry.rs"><code>newt-core/src/dock_registry.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Authorize</td><td>Signed registry rows with a scope.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/dock_registry.rs"><code>newt-core/src/dock_registry.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Mirror and inject</td><td>Snapshots and a host-queued prompt.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-mesh/src/dock.rs"><code>newt-mesh/src/dock.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Delegated caveats</td><td>Attenuation is checked and handed to local plugins; the dock stage does not use caveats.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-mesh/src/caveats.rs"><code>newt-mesh/src/caveats.rs</code></a></td><td class="status"><span class="impl">Partly implemented</span></td></tr>
+<tr><td>Cross-operator trust, live streaming</td><td>Different operators pairing; push mirroring.</td><td></td><td class="status"><span class="impl design">Not built</span></td></tr>
+</tbody></table></div>
+<h2>What this does not show</h2>
+<ul>
+<li>Everything is the same operator with one shared root key. Cross-operator pairing is future work.</li>
+<li>The six-word key mnemonic is a cross-check of a public key, not a two-party SAS.</li>
+<li>Nothing migrates between hosts. The hub mirrors and injects.</li>
+<li>Caveats do not travel with a dock request and are not enforced on the remote side.</li>
+<li>No TLA+ spec covers the mesh.</li>
+</ul>
+</main>
+<footer>Apache-2.0. <a href="https://github.com/Gilamonster-Foundation/newt-agent">Gilamonster Foundation / newt-agent</a>.</footer>
+</div>
+<script src="stepper.js"></script>
+<script src="diagram.js"></script>
+<script>
+var SPEC = {
+ "nodes": [
+  {
+   "id": "hub",
+   "label": "Hub",
+   "x": 15,
+   "y": 22,
+   "sub": "newt-web or CLI"
+  },
+  {
+   "id": "host",
+   "label": "Host",
+   "x": 85,
+   "y": 22,
+   "sub": "a newt session"
+  },
+  {
+   "id": "reg",
+   "label": "docks.d/peers.toml",
+   "x": 50,
+   "y": 78,
+   "sub": "signed approvals",
+   "kind": "store"
+  }
+ ],
+ "stages": [
+  {
+   "title": "Each machine derives its own key",
+   "cap": "One operator root key; a per-machine key is derived from it, never stored, so an approved fingerprint survives restarts. Same operator only.",
+   "show": [
+    "hub",
+    "host"
+   ],
+   "hot": [
+    "hub",
+    "host"
+   ],
+   "edges": [],
+   "state": {},
+   "tag": {
+    "hub": "derived key",
+    "host": "derived key"
+   },
+   "note": "Implemented: dock_agent"
+  },
+  {
+   "title": "Discover on the LAN",
+   "cap": "The host advertises a capability tag over mDNS and the hub finds it by fingerprint, or dials a direct address. mDNS is LAN only.",
+   "show": [
+    "hub",
+    "host"
+   ],
+   "hot": [],
+   "edges": [
+    [
+     "host",
+     "hub",
+     "mDNS: newt-session"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented (LAN)"
+  },
+  {
+   "title": "Reach through NAT by calling out",
+   "cap": "Off the LAN, the host dials out and keeps one long-poll open on the uplink topic. The hub answers that poll when it has a request. Delivery is at-most-once.",
+   "show": [
+    "hub",
+    "host"
+   ],
+   "hot": [],
+   "edges": [
+    [
+     "host",
+     "hub",
+     "long-poll: newt/dock/uplink/v1",
+     1
+    ],
+    [
+     "hub",
+     "host",
+     "request in reply"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented (interim carrier)"
+  },
+  {
+   "title": "Pair with a code both sides compute",
+   "cap": "The host commits, the hub replies with a nonce, the host reveals. Both compute a short numeric code. The operator runs newt dock approve --staged at the terminal and compares them.",
+   "show": [
+    "hub",
+    "host"
+   ],
+   "hot": [
+    "hub",
+    "host"
+   ],
+   "edges": [
+    [
+     "host",
+     "hub",
+     "Commit, Reveal"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "hub": "6-digit code",
+    "host": "6-digit code"
+   },
+   "note": "Implemented: Numeric Comparison"
+  },
+  {
+   "title": "Approval is a signed row, fail-closed",
+   "cap": "Proving who you are does not grant access. The hub checks its own signed registry for a scope: mirror (read) or mirror-inject. No row, no dial.",
+   "show": [
+    "hub",
+    "host",
+    "reg"
+   ],
+   "hot": [
+    "reg"
+   ],
+   "edges": [
+    [
+     "hub",
+     "reg",
+     "scope: mirror | mirror-inject"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: dock_registry.rs"
+  },
+  {
+   "title": "Mirror: read the host's sessions",
+   "cap": "The hub asks for the session list and a transcript and gets snapshots back. It is request and reply, not a live stream.",
+   "show": [
+    "hub",
+    "host",
+    "reg"
+   ],
+   "hot": [],
+   "edges": [
+    [
+     "hub",
+     "host",
+     "ListSessions, Transcript"
+    ],
+    [
+     "host",
+     "hub",
+     "snapshot",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented (snapshots)"
+  },
+  {
+   "title": "Steer: inject a prompt",
+   "cap": "With mirror-inject, the hub sends a prompt. The host queues it in its own REPL. The hub never writes the remote transcript, so the host stays the sole writer.",
+   "show": [
+    "hub",
+    "host",
+    "reg"
+   ],
+   "hot": [
+    "host"
+   ],
+   "edges": [
+    [
+     "hub",
+     "host",
+     "Inject{conv, text}"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "host": "sole writer"
+   },
+   "note": "Implemented: rule D2"
+  },
+  {
+   "title": "Revoke",
+   "cap": "newt dock revoke, or the undock-all kill switch, bumps a generation. A live dock is dropped at its next re-check.",
+   "show": [
+    "hub",
+    "host",
+    "reg"
+   ],
+   "hot": [
+    "reg"
+   ],
+   "edges": [
+    [
+     "hub",
+     "host",
+     "dock ends",
+     1
+    ]
+   ],
+   "state": {
+    "hub": "deny"
+   },
+   "tag": {
+    "reg": "generation bump"
+   },
+   "note": "Implemented"
+  }
+ ]
+};
+var onShow = Diagram(document.getElementById('scene'), SPEC);
+Stepper({ stages: SPEC.stages, onShow: onShow });
+</script>
+</body>
+</html>
