@@ -9,6 +9,56 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+## [0.8.3] — UNRELEASED
+
+### Added
+
+- `newt headless --dump-request FILE` writes the first provider request as a
+  Markdown report — the system messages, every tool schema as sent with its
+  size, and the totals — then exits before any inference. The same
+  session-owned capture records each round's provider body in all four wire
+  loops, summary sends included (#2937).
+
+### Changed
+
+- Tool descriptions state what each tool does and its arguments. Guidance a
+  model only needs after a failure now lives in the result that failure
+  returns: the capability-denied result names the exact `request_permissions`
+  call, the timed-out result carries the literal `lifecycle action=build`
+  call, and the `render_report` acknowledgement carries the correction rules.
+  `find` no longer advertises its `code` alias (use `category=source`) or
+  `show_size`; both are still accepted. Measured with the new request report,
+  the tool schemas sent with each request drop from 26,296 to 19,004
+  characters (#2949).
+- The READMEs of `newt-git`, `agent-toolchain` and `newt-tools` are short
+  pointers: what the crate is, who uses it, where it sits and where it is
+  heading. `newt-git`'s behaviour and grant rules moved unchanged to
+  `docs/design/newt-git.md` (#2957).
+
+### Fixed
+
+- `--altitude coach` replaced the whole system-prompt addition with the coach
+  identity, so coach mode silently lost AGENTS.md / CLAUDE.md, notes, the
+  memory index and the project map. Altitude now replaces only the identity;
+  project context is always appended, in its usual place before the
+  `Workspace:` line (#2934).
+- `--persona coder` sent the built-in identity twice, as the identity and
+  again as the persona overlay (about 5 kB per request). `coder` is now seeded
+  from `personas/coder.md`, a three-line placeholder. An installed `coder.md`
+  that is byte-for-byte the old seed is migrated on the next start; one with
+  any edit is left alone. The prompt builder no longer injects the default
+  identity on its own when no soul provider is installed (#2935).
+
+### Release/CI
+
+- The native Git broker real tier also runs on pull requests that touch
+  `newt-core`, `agent-toolchain`, `Cargo.lock` or its workflow, with a
+  30-minute job timeout; before, only the weekly run and `v*` tags exercised
+  it, and a break on `main` went unnoticed for days (#2947).
+- The dock hub-restart test binds the old port once, straight after `close`,
+  instead of polling it for up to five seconds; agent-mesh#156 makes `close`
+  return only after the socket is released (#2946).
+
 ## [0.8.2] — 2026-10-18
 
 ### Security
