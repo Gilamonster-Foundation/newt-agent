@@ -323,7 +323,7 @@ fn looks_like_unverified_stale_file_blocker_requires_file_stale_and_blocker_cues
 
 #[test]
 fn stale_file_ground_truth_nudge_names_read_only_checks_and_revert_guard() {
-    let nudge = stale_file_ground_truth_nudge();
+    let nudge = stale_file_ground_truth_nudge(&Default::default());
     assert!(nudge.contains("git status --short"), "{nudge}");
     assert!(nudge.contains("git diff -- <file>"), "{nudge}");
     assert!(nudge.contains("wc -l <file>"), "{nudge}");

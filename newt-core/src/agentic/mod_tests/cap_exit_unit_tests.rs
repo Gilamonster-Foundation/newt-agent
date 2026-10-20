@@ -668,8 +668,8 @@ fn workflow_action_nudges_honor_operator_stop_and_report_only_requests() {
         narration_action_nudge(&Default::default()),
         escalated_narration_action_nudge(2, 2, Some(&ledger), &Default::default()),
         read_only_action_nudge(3, Some(2), None, None, &Default::default()),
-        pending_plan_completion_nudge(Some(&ledger), false, None).unwrap(),
-        pending_plan_completion_nudge(Some(&ledger), true, None).unwrap(),
+        pending_plan_completion_nudge(Some(&ledger), false, None, &Default::default()).unwrap(),
+        pending_plan_completion_nudge(Some(&ledger), true, None, &Default::default()).unwrap(),
     ] {
         assert!(nudge.contains("latest operator instruction"), "{nudge}");
         assert!(nudge.contains("newer steering"), "{nudge}");
@@ -743,7 +743,7 @@ fn read_only_action_nudge_omits_delegate_clause_when_none_offered() {
 fn pending_plan_completion_nudge_is_state_driven() {
     use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
 
-    assert!(pending_plan_completion_nudge(None, false, None).is_none());
+    assert!(pending_plan_completion_nudge(None, false, None, &Default::default()).is_none());
 
     let ledger = SessionStepLedger::default();
     ledger.restore(&PlanSnapshot {
@@ -759,8 +759,13 @@ fn pending_plan_completion_nudge_is_state_driven() {
             },
         ],
     });
-    let nudge = pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false, None)
-        .expect("open plan produces a nudge");
+    let nudge = pending_plan_completion_nudge(
+        Some(&ledger as &dyn StepLedger),
+        false,
+        None,
+        &Default::default(),
+    )
+    .expect("open plan produces a nudge");
     assert!(nudge.contains("1/2 unfinished step"), "{nudge}");
     assert!(nudge.contains("Active step 2"), "{nudge}");
     assert!(nudge.contains("update_plan"), "{nudge}");
@@ -772,8 +777,7 @@ fn pending_plan_completion_nudge_is_state_driven() {
             true,
             Some(
                 "Configured workflow 'github_pr' is active. Workflow steps:\n- commit_step: Commit the verified step",
-            ),
-        )
+            ), &Default::default())
         .expect("open plan produces a plan-update nudge");
     assert!(
         plan_update_nudge.contains("findings/next-steps summary"),
@@ -807,7 +811,13 @@ fn pending_plan_completion_nudge_is_state_driven() {
             status: StepStatus::Done,
         }],
     });
-    assert!(pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false, None).is_none());
+    assert!(pending_plan_completion_nudge(
+        Some(&ledger as &dyn StepLedger),
+        false,
+        None,
+        &Default::default()
+    )
+    .is_none());
 }
 
 #[test]
@@ -935,7 +945,13 @@ fn pending_plan_nudge_does_not_promote_agent_claims_to_runtime_facts() {
     ledger.set_plan(&["inspect".into(), claim.into()]);
     ledger.advance();
     for needs_plan_update in [false, true] {
-        let nudge = pending_plan_completion_nudge(Some(&ledger), needs_plan_update, None).unwrap();
+        let nudge = pending_plan_completion_nudge(
+            Some(&ledger),
+            needs_plan_update,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(
             !nudge.contains(claim),
             "agent-authored text is not a host reminder: {nudge}"

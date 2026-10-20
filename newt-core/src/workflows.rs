@@ -185,7 +185,14 @@ impl WorkflowConfig {
             out.push_str(": ");
             out.push_str(self.description.trim());
         }
-        out.push_str(". Track progress with update_plan so it survives session restarts/stops.");
+        // The plan ledger is harness-owned; the tool recipe rides only when the
+        // operator left update_plan visible (#2932).
+        let plan_tool = exposure.operator_visible("update_plan");
+        out.push_str(if plan_tool {
+            ". Track progress with update_plan so it survives session restarts/stops."
+        } else {
+            ". Track progress against these steps."
+        });
         if !self.steps.is_empty() {
             out.push_str(" Workflow steps:");
             for step in self.steps.iter().take(12) {
@@ -212,8 +219,13 @@ impl WorkflowConfig {
                 }
             }
         }
+        out.push_str(if plan_tool {
+            "\nUse update_plan now to align the active plan to this workflow."
+        } else {
+            "\nAlign the active plan to this workflow."
+        });
         out.push_str(
-            "\nUse update_plan now to align the active plan to this workflow. Commit each verified coherent implementation step on the feature branch before pushing/opening the PR.",
+            " Commit each verified coherent implementation step on the feature branch before pushing/opening the PR.",
         );
         out
     }

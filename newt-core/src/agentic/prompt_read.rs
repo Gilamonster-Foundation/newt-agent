@@ -36,6 +36,19 @@ repository_evidence: source_first\n\
 source_definition: resolved_language_packs\n\
 repository_instruction: inspect source first via find category=source; narrow by language; docs/manifests/lockfiles/generated only if requested or necessary; never replace code evidence with metadata";
 
+/// The policy block the card carries. Its one tool recipe (`find
+/// category=source`) rides only when the operator left `find` visible
+/// (#2932); the source-first rule itself always does.
+fn response_repository_policy(
+    exposure: &super::tools::ExposureSettings,
+) -> std::borrow::Cow<'static, str> {
+    if exposure.operator_visible("find") {
+        std::borrow::Cow::Borrowed(RESPONSE_REPOSITORY_POLICY)
+    } else {
+        std::borrow::Cow::Owned(RESPONSE_REPOSITORY_POLICY.replace(" via find category=source", ""))
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn response_repository_policy_tokens() -> usize {
     crate::tokens::TokenEstimation::default()
@@ -604,6 +617,7 @@ pub(crate) fn active_prompt_card(
     .filter(|(tool, _)| exposure.operator_visible(tool))
     .map(|(_, line)| line)
     .collect();
+    let repository_policy = response_repository_policy(exposure);
     format!(
         "{ACTIVE_PROMPT_PREFIX}\n\
          address: {address}\n\
@@ -611,7 +625,7 @@ pub(crate) fn active_prompt_card(
          model_digest: {digest}\n\
          {submitted_block}\n\
          {recovery}\
-         {RESPONSE_REPOSITORY_POLICY}"
+         {repository_policy}"
     )
 }
 

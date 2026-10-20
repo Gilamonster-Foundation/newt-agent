@@ -248,6 +248,7 @@ impl VerificationLedger {
                 }
             }
             let ((_, report), evidence) = conclude_with_evidence(&Conclusion {
+                exposure: &Default::default(),
                 checks: std::slice::from_ref(&check),
                 requested: &[],
                 ledger: &ledger,

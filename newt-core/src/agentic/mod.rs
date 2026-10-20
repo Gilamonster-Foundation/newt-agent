@@ -629,6 +629,7 @@ async fn compact_responses_input(
     color: bool,
     smart_harness: Option<&smart_harness::SmartHarness>,
     overflow_recovery: bool,
+    exposure: &tools::ExposureSettings,
 ) -> ResponsesCompaction {
     // #2766: the task location outlives lossy history. Reuse the continuation
     // marker so repeated compactions replace the old hint; include its bytes
@@ -639,7 +640,7 @@ async fn compact_responses_input(
         {
             candidate.retain(|item| !compress::is_continuation_message(item));
             candidate.push(serde_json::json!({"role":"user", "content":
-                format!("{} {}", compress::CONTINUATION_PREFIX, workflow_guidance(hint))}));
+                format!("{} {}", compress::CONTINUATION_PREFIX, workflow_guidance(hint, exposure))}));
         }
         candidate
     };
@@ -1590,7 +1591,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     // Native Git is the default interface; the injected adapter remains internal.
     let advertise_git = false;
-    let advertise_team = crew_runner.is_some();
+    // The delegate hint names `crew`/`team`; advertise them only when the operator left `crew` visible (#2932).
+    let advertise_team = crew_runner.is_some() && exposure.operator_visible("crew");
     let advertise_operating_mode = operating_mode_control.is_some();
     let advertise_plan_mode = plan_mode_control.is_some();
     let advertise_plan_mode_active =
@@ -1962,7 +1964,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             );
         }
         if round > 0 && action_nudges {
-            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+            if let Some(ptr) = step_ledger.and_then(|ledger| plan_reseat_pointer(ledger, &exposure))
+            {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
         }
@@ -2828,12 +2831,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     workflow_grace_rounds,
                 );
                 let control = harness
-                    .classify(&probe_content, narration_nudge_cap, more, cancel)
+                    .classify(&probe_content, narration_nudge_cap, more, cancel, &exposure)
                     .await?;
                 let control = harness
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            exposure: &exposure,
                             messages: &messages,
                             workspace,
                             task,
@@ -2982,6 +2986,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 step_ledger,
                                 nudge_classification.is_plan_update(),
                                 plan_nudge_hint.as_deref(),
+                                &exposure,
                             ) {
                                 if debug {
                                     print_debug(
@@ -3025,7 +3030,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(&exposure)
                     ),
                             }));
                             stale_file_nudges += 1;
@@ -3061,7 +3066,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             let direction = if narration_nudges == 0 {
                                 nudge_classifier
                                     .direction_for(nudge_classification.class)
-                                    .map(workflow_guidance)
+                                    .map(|direction| workflow_guidance(direction, &exposure))
                                     .unwrap_or_else(|| narration_action_nudge(&exposure))
                             } else {
                                 escalated_narration_action_nudge(
@@ -3914,6 +3919,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             smart_harness.is_some() && smart_verify,
             current_tool_round_limit,
             solve_obs.as_deref_mut(),
+            &exposure,
         )
         .await;
     if let Some(hit) = &mut round_cap_hit {
@@ -4809,18 +4815,39 @@ fn active_step_description(step_ledger: Option<&dyn scheduled::StepLedger>) -> O
         .map(|step| step.description.clone())
 }
 
-fn workflow_guidance(direction: impl std::fmt::Display) -> String {
+/// The shared tail of every harness steer. Every producer that names a tool
+/// renders through here and so must hold the resolved policy (#2932): the
+/// `update_plan` recipe rides only when the operator left that tool visible;
+/// the advisory, stop and plan-preservation advice always does.
+fn workflow_guidance(
+    direction: impl std::fmt::Display,
+    exposure: &tools::ExposureSettings,
+) -> String {
+    let reconcile = if exposure.operator_visible("update_plan") {
+        "Reconcile changed plans with update_plan"
+    } else {
+        "Reconcile changed plans"
+    };
     format!(
         "{direction} {REFACTOR_PUBLISH_GUIDANCE} Guidance is advisory: follow the latest operator instruction, including \
-         newer steering. Honor stop or report-only requests. Reconcile changed plans with \
-         update_plan; preserve completed work."
+         newer steering. Honor stop or report-only requests. {reconcile}; preserve completed work."
     )
 }
 
-const PERMISSION_RECOVERY_GUIDANCE: &str =
-    "Use an already-authorized alternative if permitted. For an exact requestable grant with \
-     an available operator, call request_permissions once. Never re-ask for or retry a permission \
-     the operator declined, or ask again with no operator available. Do not bypass a refusal.";
+/// Permission-recovery advice; the `request_permissions` recipe rides only
+/// when the operator left that tool visible.
+fn permission_recovery_guidance(exposure: &tools::ExposureSettings) -> String {
+    let request = if exposure.operator_visible("request_permissions") {
+        " For an exact requestable grant with an available operator, call request_permissions once."
+    } else {
+        ""
+    };
+    format!(
+        "Use an already-authorized alternative if permitted.{request} Never re-ask for or retry a \
+         permission the operator declined, or ask again with no operator available. Do not bypass \
+         a refusal."
+    )
+}
 
 /// Render saved plan, scratchpad and task worktree at a cap exit, so partial
 /// work is salvaged into the final summary / fallback instead of being lost
@@ -5525,12 +5552,15 @@ fn narration_action_nudge(exposure: &tools::ExposureSettings) -> String {
     let example = visible_examples(exposure, &["edit_file", "write_file"])
         .map(|names| format!(" (for example {names} with the real arguments)"))
         .unwrap_or_default();
-    workflow_guidance(format!(
-        "You described what you were about to do but did not call any tool, so \
+    workflow_guidance(
+        format!(
+            "You described what you were about to do but did not call any tool, so \
          nothing actually happened. If you intended to act, emit the tool call now\
          {example} — do not just describe it. If you are genuinely finished, say so \
          explicitly in one sentence."
-    ))
+        ),
+        exposure,
+    )
 }
 
 /// The act-now directive appended after a mid-turn compaction replaced the
@@ -5560,7 +5590,12 @@ fn post_compaction_continuation(
         .map(|plan| {
             format!(
                 " Your saved plan is below. Continue from the `→` step when it still \
-                 matches the operator's request; otherwise reconcile it with update_plan:\n{plan}\n"
+                 matches the operator's request; otherwise reconcile it{}:\n{plan}\n",
+                if exposure.operator_visible("update_plan") {
+                    " with update_plan"
+                } else {
+                    ""
+                }
             )
         })
         .unwrap_or_default();
@@ -5609,12 +5644,12 @@ fn post_compaction_continuation(
         "{} You are mid-task: the context above was just compacted, not \
          completed.{instruction_clause}{plan_clause}{task_clause}{artifact_clause} \
          When continuing, your next output should be the next concrete tool call; re-read \
-         files before editing. To re-anchor on ground truth, check the current git branch and the last few \
+         files before editing. To re-anchor on ground truth, check the current branch and the last few \
          commits: earlier work may already be COMMITTED, so a clean working tree does NOT mean \
          no work happened. Preserve completed work; \
          do not repeat work the log shows is done or silently narrow the task.",
         compress::CONTINUATION_PREFIX
-    ))
+    ), exposure)
 }
 
 /// After a compaction pass replaced the middle with a summary (or the static
@@ -5687,24 +5722,43 @@ fn escalated_narration_action_nudge(
     let example = visible_examples(exposure, &["read_file", "edit_file", "run_command"])
         .map(|names| format!(" (for example {names} with real arguments)"))
         .unwrap_or_default();
-    workflow_guidance(format!(
-        "Reminder {attempt}/{cap}: you again described an action without calling \
+    workflow_guidance(
+        format!(
+            "Reminder {attempt}/{cap}: you again described an action without calling \
          a tool, so nothing has happened.{step_clause} Your NEXT output must be \
          exactly one tool call that starts that action{example} — no prose before it. \
          If you are blocked, state the one concrete blocker in a single \
          sentence instead of announcing more intentions."
-    ))
+        ),
+        exposure,
+    )
 }
 
-fn stale_file_ground_truth_nudge() -> String {
+fn stale_file_ground_truth_nudge(exposure: &tools::ExposureSettings) -> String {
+    // The git probes run through run_command (or the git tool); without either
+    // the model can only re-read, so the recipe says so (#2932).
+    let can_probe = exposure.operator_visible("run_command") || exposure.operator_visible("git");
+    let probe = if can_probe {
+        "run read-only verification: git status --short, git diff -- <file>, wc -l <file>, \
+         and re-read the exact target range"
+    } else {
+        "re-read the exact target range with the read tools you have"
+    };
+    let revert = if can_probe {
+        "Never recommend git checkout/revert unless git diff proves unwanted changes and the \
+         operator approves."
+    } else {
+        "Never recommend a checkout or revert unless a diff proves unwanted changes and the \
+         operator approves."
+    };
     workflow_guidance(
-        "You claimed the file changed under you or that your edit context is stale, \
-     but you did not prove that with ground truth. Before stopping or asking the \
-     operator to restore/revert anything, run read-only verification: git status \
-     --short, git diff -- <file>, wc -l <file>, and re-read the exact target \
-     range. If those checks do not prove an actual concurrent change, continue \
-     from the verified file contents. Never recommend git checkout/revert unless \
-     git diff proves unwanted changes and the operator approves.",
+        format!(
+            "You claimed the file changed under you or that your edit context is stale, \
+             but you did not prove that with ground truth. Before stopping or asking the \
+             operator to restore/revert anything, {probe}. If those checks do not prove an \
+             actual concurrent change, continue from the verified file contents. {revert}"
+        ),
+        exposure,
     )
 }
 
@@ -5754,6 +5808,7 @@ fn pending_plan_completion_nudge(
     step_ledger: Option<&dyn scheduled::StepLedger>,
     needs_plan_update: bool,
     workflow_hint: Option<&str>,
+    exposure: &tools::ExposureSettings,
 ) -> Option<String> {
     let snapshot = step_ledger?.snapshot();
     let total = snapshot.steps.len();
@@ -5787,23 +5842,41 @@ fn pending_plan_completion_nudge(
         .filter(|hint| !hint.is_empty())
         .map(|hint| format!("\n\n{hint}"))
         .unwrap_or_default();
+    // The plan is harness-owned either way; the tool recipe rides only when
+    // the operator left update_plan visible (#2932).
+    let plan_tool = exposure.operator_visible("update_plan");
     if needs_plan_update {
-        Some(workflow_guidance(format!(
-            "You ended with a findings/next-steps summary while the agent-maintained, advisory plan still has \
-             {unfinished}/{total} unfinished {step_word}.{active_clause} Your summary says \
-             immediate prerequisite repair work now blocks the active step. Call update_plan now \
-             with the full ordered plan: mark completed steps completed, make the immediate \
-             blocker repair the active step, and keep later feature work pending. Then call the \
-             next concrete tool for that active repair. Do not repeat the findings summary or \
-             claim a tool-round limit while this nudge is giving you another round.{workflow_clause}"
-        )))
+        let restate = if plan_tool {
+            "Call update_plan now"
+        } else {
+            "Restate the plan now"
+        };
+        Some(workflow_guidance(
+            format!(
+                "You ended with a findings/next-steps summary while the agent-maintained, advisory plan still has \
+                 {unfinished}/{total} unfinished {step_word}.{active_clause} Your summary says \
+                 immediate prerequisite repair work now blocks the active step. {restate} \
+                 with the full ordered plan: mark completed steps completed, make the immediate \
+                 blocker repair the active step, and keep later feature work pending. Then call the \
+                 next concrete tool for that active repair. Do not repeat the findings summary or \
+                 claim a tool-round limit while this nudge is giving you another round.{workflow_clause}"
+            ),
+            exposure,
+        ))
     } else {
-        Some(workflow_guidance(format!(
-            "You ended the turn while the agent-maintained, advisory plan still has {unfinished}/{total} unfinished \
-             {step_word}.{active_clause} Either call update_plan with completed steps marked \
-             completed, call the next tool for the active step, or state the concrete blocker. \
-             Do not hand off by only describing remaining work."
-        )))
+        let mark = if plan_tool {
+            "call update_plan with completed steps marked completed"
+        } else {
+            "restate the plan with completed steps marked completed"
+        };
+        Some(workflow_guidance(
+            format!(
+                "You ended the turn while the agent-maintained, advisory plan still has {unfinished}/{total} unfinished \
+                 {step_word}.{active_clause} Either {mark}, call the next tool for the active step, \
+                 or state the concrete blocker. Do not hand off by only describing remaining work."
+            ),
+            exposure,
+        ))
     }
 }
 
@@ -5825,7 +5898,10 @@ fn read_only_action_nudge(
     } else {
         ""
     };
-    let plan_clause = if step_ledger.and_then(plan_reseat_pointer).is_some() {
+    let plan_clause = if step_ledger
+        .and_then(|ledger| plan_reseat_pointer(ledger, exposure))
+        .is_some()
+    {
         " You have an active multi-step plan; continue the ACTIVE step when it still \
          matches the operator's request."
     } else {
@@ -5843,14 +5919,18 @@ fn read_only_action_nudge(
             )
         })
         .unwrap_or_default();
-    workflow_guidance(format!(
-        "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
+    let permission_recovery = permission_recovery_guidance(exposure);
+    workflow_guidance(
+        format!(
+            "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
          making the change. This is a nudge, not a limit — you may still read, but if \
-         you have enough context, {act_clause}. {PERMISSION_RECOVERY_GUIDANCE} \
+         you have enough context, {act_clause}. {permission_recovery} \
          If you truly cannot proceed yet, state the \
          exact blocker.{edit_clause}\
          {plan_clause}{delegate_clause}{round_clause}]"
-    ))
+        ),
+        exposure,
+    )
 }
 
 /// Append the memory-nudge line to the current user message — the last
@@ -6861,7 +6941,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     // Native Git is the default interface; the injected adapter remains internal.
     let advertise_git = false;
-    let advertise_team = crew_runner.is_some();
+    // The delegate hint names `crew`/`team`; advertise them only when the operator left `crew` visible (#2932).
+    let advertise_team = crew_runner.is_some() && exposure.operator_visible("crew");
     let advertise_operating_mode = operating_mode_control.is_some();
     let advertise_plan_mode = plan_mode_control.is_some();
     let advertise_plan_mode_active =
@@ -7193,7 +7274,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             );
         }
         if round > 0 && action_nudges {
-            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+            if let Some(ptr) = step_ledger.and_then(|ledger| plan_reseat_pointer(ledger, &exposure))
+            {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
             // Initiative action-forcing: the OpenAI-chat loop had no read-only
@@ -8138,12 +8220,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     workflow_grace_rounds,
                 );
                 let control = harness
-                    .classify(&oa_content, narration_nudge_cap, more, cancel)
+                    .classify(&oa_content, narration_nudge_cap, more, cancel, &exposure)
                     .await?;
                 let control = harness
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            exposure: &exposure,
                             messages: &messages,
                             workspace,
                             task,
@@ -8297,6 +8380,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     step_ledger,
                     needs_plan_update,
                     plan_nudge_hint.as_deref(),
+                    &exposure,
                 ) {
                     if debug {
                         print_debug(
@@ -8335,7 +8419,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(&exposure)
                     ),
                 }));
                 stale_file_nudges += 1;
@@ -8371,7 +8455,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         .and_then(|classification| {
                             nudge_classifier.direction_for(classification.class)
                         })
-                        .map(workflow_guidance)
+                        .map(|direction| workflow_guidance(direction, &exposure))
                         .unwrap_or_else(|| narration_action_nudge(&exposure))
                 } else {
                     escalated_narration_action_nudge(
@@ -8405,6 +8489,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if verification.result_aware() && action_nudges && !content.is_empty() {
                 match self_verify::conclude_turn(
                     self_verify::Concluding {
+                        exposure: &exposure,
                         messages: &messages,
                         workspace,
                         task: active_task,
@@ -8450,7 +8535,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     .applicable_checks(workspace, active_task, &cmds)
                     .await
                     .unwrap_or_default();
-                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
+                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds, &exposure) {
                     if debug {
                         print_debug(
                             "concluding with unrun verification — self-verify nudge",
@@ -9078,6 +9163,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             },
             current_tool_round_limit,
             solve_obs.as_deref_mut(),
+            &exposure,
         )
         .await;
     if let Some(hit) = &mut round_cap_hit {
@@ -9750,7 +9836,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     // Native Git is the default interface; the injected adapter remains internal.
     let advertise_git = false;
-    let advertise_team = crew_runner.is_some();
+    // The delegate hint names `crew`/`team`; advertise them only when the operator left `crew` visible (#2932).
+    let advertise_team = crew_runner.is_some() && exposure.operator_visible("crew");
     let advertise_operating_mode = operating_mode_control.is_some();
     let advertise_plan_mode = plan_mode_control.is_some();
     let advertise_plan_mode_active =
@@ -10072,7 +10159,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             );
         }
         if round > 0 && action_nudges {
-            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+            if let Some(ptr) = step_ledger.and_then(|ledger| plan_reseat_pointer(ledger, &exposure))
+            {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
             // Initiative action-forcing — mirrors the OpenAI path.
@@ -10989,12 +11077,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     workflow_grace_rounds,
                 );
                 let control = harness
-                    .classify(&oa_content, narration_nudge_cap, more, cancel)
+                    .classify(&oa_content, narration_nudge_cap, more, cancel, &exposure)
                     .await?;
                 let control = harness
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            exposure: &exposure,
                             messages: &messages,
                             workspace,
                             task,
@@ -11147,6 +11236,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     step_ledger,
                     needs_plan_update,
                     plan_nudge_hint.as_deref(),
+                    &exposure,
                 ) {
                     if debug {
                         print_debug(
@@ -11185,7 +11275,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(&exposure)
                     ),
                 }));
                 stale_file_nudges += 1;
@@ -11218,7 +11308,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         .and_then(|classification| {
                             nudge_classifier.direction_for(classification.class)
                         })
-                        .map(workflow_guidance)
+                        .map(|direction| workflow_guidance(direction, &exposure))
                         .unwrap_or_else(|| narration_action_nudge(&exposure))
                 } else {
                     escalated_narration_action_nudge(
@@ -11242,6 +11332,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if verification.result_aware() && action_nudges && !content.is_empty() {
                 match self_verify::conclude_turn(
                     self_verify::Concluding {
+                        exposure: &exposure,
                         messages: &messages,
                         workspace,
                         task: active_task,
@@ -11287,7 +11378,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     .applicable_checks(workspace, active_task, &cmds)
                     .await
                     .unwrap_or_default();
-                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
+                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds, &exposure) {
                     if debug {
                         print_debug(
                             "concluding with unrun verification — self-verify nudge",
@@ -11876,6 +11967,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             },
             current_tool_round_limit,
             solve_obs.as_deref_mut(),
+            &exposure,
         )
         .await;
     if let Some(hit) = &mut round_cap_hit {
@@ -12388,7 +12480,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     // Native Git is the default interface; the injected adapter remains internal.
     let advertise_git = false;
-    let advertise_team = crew_runner.is_some();
+    // The delegate hint names `crew`/`team`; advertise them only when the operator left `crew` visible (#2932).
+    let advertise_team = crew_runner.is_some() && exposure.operator_visible("crew");
     let advertise_operating_mode = operating_mode_control.is_some();
     let advertise_plan_mode = plan_mode_control.is_some();
     let advertise_plan_mode_active =
@@ -12785,6 +12878,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         color,
                         smart_harness,
                         false,
+                        &exposure,
                     );
                     let Some(outcome) = cancellable(cancel, compression).await else {
                         return Ok((
@@ -12982,6 +13076,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 color,
                                 smart_harness,
                                 true,
+                                &exposure,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
                                 context_recovery::record(
@@ -13221,12 +13316,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     workflow_grace_rounds,
                 );
                 let control = harness
-                    .classify(&text, narration_nudge_cap, more, cancel)
+                    .classify(&text, narration_nudge_cap, more, cancel, &exposure)
                     .await?;
                 let control = harness
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            exposure: &exposure,
                             messages: &input,
                             workspace,
                             task,
@@ -13820,6 +13916,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             smart_harness.is_some() && smart_verify,
             current_tool_round_limit,
             solve_obs.as_deref_mut(),
+            &exposure,
         )
         .await;
     if let Some(hit) = &mut round_cap_hit {
@@ -13891,6 +13988,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 color,
                 smart_harness,
                 false,
+                &exposure,
             );
             let Some(outcome) = cancellable(cancel, compression).await else {
                 return Ok((
@@ -14419,6 +14517,10 @@ mod repeat_call_guard_tests;
 #[cfg(test)]
 #[path = "mod_tests/cap_exit_unit_tests.rs"]
 mod cap_exit_unit_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/guidance_policy_sweep.rs"]
+mod guidance_policy_sweep;
 
 // ---------------------------------------------------------------------------
 // Tool-call round cap + graceful cap-exit (issue: configurable max_tool_rounds)
