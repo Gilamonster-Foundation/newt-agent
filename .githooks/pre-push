@@ -437,7 +437,8 @@ cargo fmt --all -- --check
 # newt-core::native_git_broker_pipeline gates the SAME way but is NOT a
 # disclosed gap (#2693): `.github/workflows/native-git-broker-real.yml` runs
 # `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
-# weekly and on release tags, with NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL=1
+# weekly, on release tags and on PRs touching newt-core or agent-toolchain
+# (#2947), with NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL=1
 # so missing Landlock/git fails instead of silently skipping. This remains
 # a CI-only real-resource proof, excluded from the local pre-flight.
 #

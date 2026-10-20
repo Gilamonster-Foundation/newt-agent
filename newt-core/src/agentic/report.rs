@@ -89,23 +89,14 @@ impl Status {
 // Tool schema
 // ---------------------------------------------------------------------------
 
+// #2949: what the tool does and its arguments. The delivery rules (no repeat,
+// the correction form, continue unfinished work) ride the ack every call
+// returns — [`REPORT_DELIVERY_GUIDANCE`] — so they are not restated here.
 const RENDER_REPORT_DESCRIPTION: &str =
     "Present collected findings to the user as a rendered Markdown document \
-     (dashboards, triage results, status roll-ups, summaries). Use this when \
-     your deliverable is information TO READ, not a status line about your \
-     work — the moment you have gathered what was asked, render it. Full GFM \
-     renders: headings, tables, task lists, code fences, blockquotes. A failed \
-     data source is NOT a reason to abort the report: render what you have and \
-     mark the affected section `degraded` or `error` (or `pending` if it is \
-     still resolving) so the human sees the partial result plus exactly what is \
-     missing. Prefer ONE report with `sections` over many small calls. The tool \
-     result you receive back is a short ack, not the rendered text — the \
-     document has already been shown to the user, so do not repeat it in your \
-     reply. If your reading changes after rendering, explicitly state \
-     \"Correction: [one-line reason] — supersedes the report above\" before the \
-     corrected version. Reporting findings does not complete an unfinished execution request: \
-     continue the requested work with tools. When the task is complete, keep the \
-     final reply brief and include only new information.";
+     (GFM: headings, tables, task lists, code fences). Use it when the \
+     deliverable is information to read. The result is a short ack: the \
+     document has already been shown to the user.";
 
 const REPORT_DELIVERY_GUIDANCE: &str =
     "The report is already visible to the user. Do not repeat its contents in \
@@ -136,20 +127,17 @@ pub fn render_report_tool_definition() -> serde_json::Value {
                     "status": {
                         "type": "string",
                         "enum": ["ok", "degraded", "error"],
-                        "description": "Overall status. 'degraded' = some sections failed \
-                                        but the report is still useful; 'error' = the report \
-                                        is materially incomplete. Defaults to 'ok'."
+                        "description": "'ok' (default), 'degraded' (some sections failed), \
+                                        or 'error' (materially incomplete)."
                     },
                     "body": {
                         "type": "string",
-                        "description": "Optional Markdown summary/intro rendered under the \
-                                        title, before any sections. Use alone for a simple \
-                                        one-block report."
+                        "description": "Markdown rendered under the title, before any sections."
                     },
                     "sections": {
                         "type": "array",
-                        "description": "Optional detail sections, each a sub-heading. Prefer \
-                                        this over many separate render_report calls.",
+                        "description": "Detail sections, each a sub-heading. Prefer one report \
+                                        with sections over many calls.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -160,10 +148,9 @@ pub fn render_report_tool_definition() -> serde_json::Value {
                                 "status": {
                                     "type": "string",
                                     "enum": ["ok", "degraded", "error", "pending"],
-                                    "description": "Per-section status marker. Use \
-                                                    'degraded'/'error' for a failed data \
-                                                    source, 'pending' for a slice still \
-                                                    resolving. Defaults to 'ok'."
+                                    "description": "'ok' (default), 'degraded' or 'error' \
+                                                    for a failed data source, 'pending' for \
+                                                    a slice still resolving."
                                 },
                                 "body": {
                                     "type": "string",
@@ -627,13 +614,9 @@ mod tests {
             REPORT_DELIVERY_GUIDANCE.contains("Do not repeat"),
             "nudge must still discourage silent repetition: {REPORT_DELIVERY_GUIDANCE}"
         );
-        // The tool description and the delivery nudge must prescribe ONE
-        // correction path, or a model following either can still produce a
-        // second, unlabelled table.
-        assert!(
-            RENDER_REPORT_DESCRIPTION.contains("supersedes the report above"),
-            "tool description must prescribe the same correction statement: {RENDER_REPORT_DESCRIPTION}"
-        );
+        // ONE correction path: the nudge owns it (#2949 took the copy out of
+        // the tool description), so the description must not offer a second,
+        // unlabelled one.
         assert!(
             !RENDER_REPORT_DESCRIPTION.contains("render_report again"),
             "tool description must not offer a second, unlabelled correction path: {RENDER_REPORT_DESCRIPTION}"

@@ -340,6 +340,31 @@ impl MemoryManager {
         }
     }
 
+    /// Return only the soul provider's identity block — the text that altitude
+    /// selection may replace with `COACH_SOUL`.  Everything else (AGENTS.md,
+    /// notes, memory index, project map) is NOT included; use
+    /// [`context_additions`] for those.
+    pub fn soul_block(&self) -> Option<String> {
+        self.providers
+            .iter()
+            .find(|p| p.name() == "soul")
+            .and_then(|p| p.system_prompt_block())
+    }
+
+    /// Return the system-prompt contributions of every provider except the
+    /// soul — AGENTS.md/CLAUDE.md instructions, notes, the memory index, and
+    /// the project map.  These must appear in the system prompt regardless of
+    /// altitude, because they carry project-specific context that coach mode
+    /// must not silently drop (#2934).
+    pub fn context_additions(&self) -> String {
+        self.providers
+            .iter()
+            .filter(|p| p.name() != "soul")
+            .filter_map(|p| p.system_prompt_block())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// Collect recalled context from all providers before a turn.
     pub async fn prefetch_all(&self, query: &str) -> String {
         let mut parts = Vec::new();
