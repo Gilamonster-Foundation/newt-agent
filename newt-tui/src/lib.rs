@@ -5881,6 +5881,7 @@ fn build_system_prompt_with_persona(
     context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     // FR-5 (#999): the active persona's ALTITUDE selects the base identity. A
     // `Coach` altitude REPLACES the identity with COACH_SOUL (and overrides a
@@ -5906,6 +5907,9 @@ fn build_system_prompt_with_persona(
         ctx.push_str("\n\n");
         ctx.push_str(ctx_str);
     }
+    // #2937: record the workspace-header start AFTER project context so the
+    // annotation covers only the workspace line, not provider blocks.
+    let workspace_start = ctx.len();
     ctx.push_str(&format!(
         "\n\nWorkspace: {workspace}\n\
          This is the current runtime root. Relative tool paths resolve here; \
@@ -5913,17 +5917,33 @@ fn build_system_prompt_with_persona(
          Other requested paths remain governed by the session's permissions. \
          Historical notes do not redefine this root.\n"
     ));
+    // #2937: annotate each named piece through the session's ReportSink so
+    // the request report (TUI preview: #2959) can attribute components in the system message.
+    let note = |label: &str, text: &str| {
+        if let Some(s) = sink {
+            s.annotate(label, "build_system_prompt_with_persona", text);
+        }
+    };
+    // #2937 P2-2: annotate the identity selected by the altitude branch.
+    // Coach altitude always uses COACH_SOUL; label it directly.
+    // Doer altitude: providers were already annotated individually by
+    // annotate_system_prompt_additions in rebuild_system_prompt.
+    if let newt_core::Altitude::Coach = effective_altitude {
+        note("coach-soul", identity);
+    }
+    // workspace-header: only the workspace line suffix — providers' spans end
+    // at workspace_start, so this annotation never absorbs their content.
+    note("workspace-header", &ctx[workspace_start..]);
     if let Some(persona) = persona {
-        ctx.push_str(&format!(
-            "\nActive persona: {}\n{}\n",
-            persona.name, persona.prompt
-        ));
+        let persona_overlay = format!("\nActive persona: {}\n{}\n", persona.name, persona.prompt);
+        ctx.push_str(&persona_overlay);
         ctx.push_str(
             "\nPersona guidance does not override the operator's explicit task. \
              Treat advice-only wording and preferred tools as defaults; use the tools \
              needed for the requested work. OCAP permissions, explicit postures, and \
              delegation limits still govern every action.\n",
         );
+        note("persona-overlay", &persona_overlay);
     }
 
     // Resolved once and shared with the skills index below; the ratchet in
@@ -5936,6 +5956,7 @@ fn build_system_prompt_with_persona(
     // path is dynamic AND custom soul.md users still get the guidance. The path
     // is unique to this conversation, so concurrent newt instances in the same
     // repo never clobber each other's plan.
+    let plan_start = ctx.len();
     ctx.push_str(&format!(
         "\n**Plan before coding.** For any task requiring more than one file \
          change, write a plan to `{plan_path}` first (create it if it does not \
@@ -5945,6 +5966,11 @@ fn build_system_prompt_with_persona(
          re-reading the whole codebase.\n"
     ));
 
+    note("plan-before-coding instruction", &ctx[plan_start..]);
+    note(
+        "refactor publish guidance",
+        newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE,
+    );
     ctx.push_str(newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE);
     ctx.push('\n');
 
@@ -5956,6 +5982,7 @@ fn build_system_prompt_with_persona(
         .and_then(|c| c.tui.as_ref())
         .is_some_and(|t| t.narration_intent_line);
     if let Some(line) = narration_intent_line(intent) {
+        note("narration intent line", line);
         ctx.push_str(&format!("\n{line}\n"));
     }
 
@@ -5967,6 +5994,7 @@ fn build_system_prompt_with_persona(
     // missing dir contributes nothing.
     let skills_dirs = cfg.map(|c| c.skill_search_dirs()).unwrap_or_default();
     if let Some(index) = skills_index_for_prompt(&skills_dirs) {
+        note("skills index", &index);
         ctx.push('\n');
         ctx.push_str(&index);
     }
@@ -5986,10 +6014,12 @@ fn build_system_prompt_with_persona(
             })
             .collect();
         names.sort();
+        let files_start = ctx.len();
         ctx.push_str("\nFiles:\n");
         for name in names.iter().take(40) {
             ctx.push_str(&format!("  {name}\n"));
         }
+        note("workspace file listing", &ctx[files_start..]);
     }
 
     // README (truncated)
@@ -5997,6 +6027,7 @@ fn build_system_prompt_with_persona(
         let path = std::path::Path::new(workspace).join(readme);
         if let Ok(text) = std::fs::read_to_string(&path) {
             let excerpt: String = text.chars().take(3000).collect();
+            note("README excerpt", &excerpt);
             ctx.push_str(&format!("\n{readme}:\n{excerpt}\n"));
             if text.len() > 3000 {
                 ctx.push_str("...[truncated]\n");
@@ -6017,6 +6048,7 @@ fn rebuild_system_prompt(
     memory: &newt_core::MemoryManager,
     persona: Option<&Persona>,
     conversation_id: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     // #2934: separate the soul/identity from the project-context additions so
     // that coach altitude can replace the soul with COACH_SOUL without
@@ -6028,6 +6060,13 @@ fn rebuild_system_prompt(
     } else {
         Some(context.as_str())
     };
+    // #2937 P2-2: annotate each provider's block separately BEFORE building the
+    // combined prompt, so per-provider spans survive (see build_system_prompt_with_persona).
+    // Call unconditionally when a sink exists — the method skips empty blocks itself,
+    // and context providers (AGENTS.md, notes) need annotation even when soul is absent.
+    if let Some(s) = sink {
+        memory.annotate_system_prompt_additions(s);
+    }
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
     build_system_prompt_with_persona(
@@ -6037,6 +6076,7 @@ fn rebuild_system_prompt(
         context_ref,
         persona,
         &plan_path.to_string_lossy(),
+        sink,
     )
 }
 
@@ -6259,6 +6299,7 @@ struct ConversationResetContext<'a> {
     system: &'a mut String,
     conversation_id: &'a mut String,
     mode_states: &'a ConversationModeStates,
+    sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 fn reset_conversation(
@@ -6272,7 +6313,13 @@ fn reset_conversation(
     // survive any of those paths.
     ctx.mode_states.clear();
     ctx.memory.reset_all();
-    *ctx.system = rebuild_system_prompt(workspace, ctx.memory, active_persona, ctx.conversation_id);
+    *ctx.system = rebuild_system_prompt(
+        workspace,
+        ctx.memory,
+        active_persona,
+        ctx.conversation_id,
+        ctx.sink,
+    );
 }
 
 fn new_conversation_message(active_persona: Option<&Persona>) -> String {
@@ -6889,6 +6936,7 @@ struct ConversationCommandContext<'a> {
     /// successful restore is a hard boundary and clears it before adopting
     /// the restored conversation, including A→B→A switches.
     mode_states: &'a ConversationModeStates,
+    sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 fn handle_conversation_command(
@@ -7082,6 +7130,7 @@ pub(crate) struct CommitContext<'a> {
     pub step_ledger: &'a dyn newt_core::StepLedger,
     pub active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
     pub mode_states: &'a ConversationModeStates,
+    pub sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 impl<'a> ConversationCommandContext<'a> {
@@ -7098,6 +7147,7 @@ impl<'a> ConversationCommandContext<'a> {
             step_ledger: self.step_ledger,
             active_prompt_context: self.active_prompt_context,
             mode_states: self.mode_states,
+            sink: self.sink,
         }
     }
 }
@@ -7187,6 +7237,7 @@ fn commit_prepared(
         ctx.memory,
         ctx.active_persona.as_ref(),
         ctx.active_conversation_id,
+        ctx.sink,
     );
     (record, warning)
 }
@@ -7817,6 +7868,7 @@ fn handle_persona_command(
                     ctx.memory,
                     active_persona.as_ref(),
                     ctx.conversation_id,
+                    ctx.sink,
                 );
                 Ok(persona_swap_kept_context_message(active_persona.as_ref()))
             } else {

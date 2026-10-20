@@ -324,6 +324,22 @@ impl MemoryManager {
             .join("\n\n")
     }
 
+    /// Annotate each provider's system-prompt block separately in `sink`.
+    /// Call BEFORE `build_system_prompt_with_persona` so the per-provider
+    /// labels are not swallowed by an encompassing "identity" annotation.
+    pub fn annotate_system_prompt_additions(
+        &self,
+        sink: &crate::agentic::request_report::ReportSink,
+    ) {
+        for p in &self.providers {
+            if let Some(block) = p.system_prompt_block() {
+                if !block.is_empty() {
+                    sink.annotate(p.name(), "memory::build_system_prompt_additions", &block);
+                }
+            }
+        }
+    }
+
     /// Return only the soul provider's identity block — the text that altitude
     /// selection may replace with `COACH_SOUL`.  Everything else (AGENTS.md,
     /// notes, memory index, project map) is NOT included; use

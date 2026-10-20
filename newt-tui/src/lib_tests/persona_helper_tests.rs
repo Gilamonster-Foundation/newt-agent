@@ -24,6 +24,7 @@ fn coach_altitude_keeps_project_context_2934() {
         Some(project_ctx),       // context — must survive regardless of altitude
         Some(&persona),
         "plan.md",
+        None,
     );
     assert!(
         prompt.contains(project_ctx),
@@ -50,6 +51,7 @@ fn persona_guidance_cannot_override_the_operators_requested_actions() {
         None,
         Some(&persona),
         "plan.md",
+        None,
     );
     assert!(prompt.contains("Persona guidance does not override the operator's explicit task"));
     assert!(prompt.contains("OCAP permissions, explicit postures, and delegation limits"));
@@ -114,6 +116,7 @@ fn coder_persona_does_not_send_soul_twice_2935() {
         None,
         Some(&coder),
         "plan.md",
+        None,
     );
     let count = prompt.matches(first_line).count();
     assert_eq!(
@@ -481,7 +484,8 @@ async fn handle_persona_command_show_and_clear() {
         "Short.",
         tmp.path().join("personas").join("terse.md"),
     ));
-    let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session");
+    let mut system =
+        rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session", None);
     let mut active_conversation_id = String::from("test-session");
     let mode_states = ConversationModeStates::default();
     // show: reports the active persona, does not reset anything.
@@ -491,6 +495,7 @@ async fn handle_persona_command_show_and_clear() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command("/persona show", workspace, &store, &mut active, &mut ctx).unwrap()
     };
@@ -504,6 +509,7 @@ async fn handle_persona_command_show_and_clear() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command("/persona clear", workspace, &store, &mut active, &mut ctx).unwrap()
     };
@@ -628,7 +634,8 @@ async fn persona_set_keep_context_preserves_history() {
         )
         .await;
     let mut active: Option<Persona> = None;
-    let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session");
+    let mut system =
+        rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session", None);
     let mut active_conversation_id = String::from("test-session");
     let mode_states = ConversationModeStates::default();
 
@@ -638,6 +645,7 @@ async fn persona_set_keep_context_preserves_history() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command(
             "/persona set terse --keep-context",
@@ -664,6 +672,7 @@ async fn persona_set_keep_context_preserves_history() {
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command(
             "/persona set terse",
@@ -785,5 +794,60 @@ fn personal_assistant_persona_binds_gila_skill_and_modulex_tools_only() {
             .iter()
             .any(|t| t.starts_with("write_") || t == "run_command"),
         "routine preferences should not include mutating tools: {tools:?}"
+    );
+}
+
+/// #2937 P2-2: coach altitude must annotate the `COACH_SOUL` identity with the
+/// label "coach-soul" so the report can attribute it. Before this fix, the
+/// builder only annotated identity when `soul.is_none()`, so a coach session
+/// with a memory manager (which passes `Some(provider_additions)`) left the
+/// actual `COACH_SOUL` prefix unattributed in the report.
+#[test]
+fn coach_altitude_annotates_coach_soul_label_in_report() {
+    let mut persona = test_persona(
+        "coach",
+        "Always ask before acting.",
+        std::path::PathBuf::from("/personas/coach.md"),
+    );
+    persona.profile.altitude = Some(newt_core::Altitude::Coach);
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let system = build_system_prompt_with_persona(
+        "/workspace",
+        "soul additions",
+        None,
+        Some(&persona),
+        "plan.md",
+        Some(&sink),
+    );
+
+    // Arm a prepare-only capture and observe so the report is built from the
+    // exact annotated system text.
+    sink.arm_capture_next();
+    let result = sink.observe_request(&[system.as_str()], None);
+    assert!(
+        result.is_err(),
+        "arm_capture_next must produce RequestDumped, not Ok"
+    );
+
+    let report = sink
+        .last_report()
+        .expect("report captured after observe_request");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert!(
+        labels.contains(&"coach-soul"),
+        "coach altitude must annotate 'coach-soul'; got {labels:?}"
+    );
+    // Verify COACH_SOUL itself is not the first (unattributed) span — the bug
+    // left the identity prefix without any label. Other connector text between
+    // annotated sections may legitimately be unattributed.
+    assert_ne!(
+        labels.first().copied(),
+        Some("(unattributed)"),
+        "coach identity must be the first labelled span, not unattributed; got {labels:?}"
     );
 }

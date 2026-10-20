@@ -2526,6 +2526,9 @@ fn session_body(
             std::sync::Arc::new(newt_core::agentic::run_allowance::RunAllowance::new(calls))
         });
 
+    // #2937: session-owned prompt-report capture sink.
+    let report_sink = std::sync::Arc::new(newt_core::agentic::request_report::ReportSink::new());
+
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
     // Memory/compression budget (Step 18.2, #247): the SAME empirical
@@ -2792,6 +2795,7 @@ fn session_body(
         &memory,
         active_persona.as_ref(),
         &active_conversation_id,
+        Some(&*report_sink),
     );
 
     // 17.7: `/new` opts the SESSION out of auto-resume. Every auto-resume
@@ -2890,6 +2894,7 @@ fn session_body(
                 input_stash: &mut tab_input_stash,
                 color,
                 verbose,
+                report_sink: Some(&*report_sink),
             }
         };
     }
@@ -2936,6 +2941,7 @@ fn session_body(
             step_ledger: &step_ledger as &dyn newt_core::StepLedger,
             active_prompt_context: &mut active_prompt_context,
             mode_states: &conversation_mode_states,
+            sink: Some(&*report_sink),
         };
         resumed_at_start = match &session_start {
             // NEWT_CONVERSATION_ID: an explicit override — errors are hard
@@ -3040,6 +3046,7 @@ fn session_body(
                     system: &mut system,
                     conversation_id: &mut active_conversation_id,
                     mode_states: &conversation_mode_states,
+                    sink: Some(&*report_sink),
                 };
                 handle_new_conversation(
                     workspace,
@@ -3217,7 +3224,6 @@ fn session_body(
     // it resets between turns while the failing command does not. This watch
     // spans turns, which is the half the guard structurally cannot do.
     let mut repeated_failures = newt_core::loop_watch::RepeatedFailureWatch::default();
-
     loop {
         if let Some(notice) = window_discovery.update(&mut choice, &mut inf_context_window) {
             print_newt(&notice, color, verbose);
@@ -5436,6 +5442,7 @@ fn session_body(
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
                             mode_states: &conversation_mode_states,
+                            sink: Some(&*report_sink),
                         };
                         let started = handle_new_conversation(
                             workspace,
@@ -5764,6 +5771,7 @@ fn session_body(
                                     step_ledger: &step_ledger as &dyn newt_core::StepLedger,
                                     active_prompt_context: &mut active_prompt_context,
                                     mode_states: &conversation_mode_states,
+                                    sink: Some(&*report_sink),
                                 };
                                 match crate::conversation_op_plan(task) {
                                     // A retired MUTATOR redirects and changes
@@ -6105,6 +6113,7 @@ fn session_body(
                                                     active_prompt_context:
                                                         &mut active_prompt_context,
                                                     mode_states: &conversation_mode_states,
+                                                    sink: Some(&*report_sink),
                                                 };
                                                 match resume_session_conversation(
                                                     &mut resume_ctx,
@@ -6348,6 +6357,7 @@ fn session_body(
                                                             active_prompt_context:
                                                                 &mut active_prompt_context,
                                                             mode_states: &conversation_mode_states,
+                                                            sink: Some(&*report_sink),
                                                         };
                                                         match resume_session_conversation(
                                                             &mut ctx, &target,
@@ -6464,6 +6474,7 @@ fn session_body(
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
                             mode_states: &conversation_mode_states,
+                            sink: Some(&*report_sink),
                         };
                         match handle_persona_command(
                             task,
@@ -6999,6 +7010,7 @@ fn session_body(
                                             system: &mut system,
                                             conversation_id: &mut active_conversation_id,
                                             mode_states: &conversation_mode_states,
+                                            sink: Some(&*report_sink),
                                         };
                                         let msg = match handle_persona_command(
                                             &cmd,
@@ -7479,56 +7491,60 @@ fn session_body(
                     // `exit`): this line IS a model turn. Announce Working now
                     // — and only now — so commands never flip the pane state.
                     newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
-                    // Durable ingress is the FIRST operation in the final
-                    // model-input branch. It precedes hardware probes,
-                    // retrieval, inference, and every tool-capable path. Raw
-                    // bytes are the accepted surface line; model bytes are the
-                    // exact normalized `task` sent below.
-                    match begin_model_prompt(
-                        PromptIngress {
-                            durable: conversation_store.as_ref(),
-                            ephemeral: &ephemeral_prompt_store,
-                        },
-                        &active_conversation_id,
-                        &conversation_title_from_task(&task),
-                        active_persona.as_ref().map(|p| p.name.as_str()),
-                        line.as_bytes(),
-                        task.as_bytes(),
-                        &model_input_origin,
-                    ) {
-                        Ok(context) => {
-                            // Receipt creation is the durable acceptance point.
-                            // A fresh substantive operator ask supersedes the
-                            // old capped objective here; a bare continuation was
-                            // upgraded above and deliberately retains the link.
-                            consume_interrupted_objective_for_accepted_prompt(
-                                &mut interrupted_objective,
-                                &model_input_origin,
-                            );
-                            // A3/W6: record the durable turn a web-injected prompt
-                            // became — the additive, auditable "entered via web"
-                            // proof (the receipt itself stays origin=operator, so
-                            // no CHECK migration). Best-effort: a link failure must
-                            // never abort a turn that was already durably minted.
-                            if let (ModelInputOrigin::WebInjected { inbox_id }, Some(store)) =
-                                (&model_input_origin, conversation_store.as_ref())
-                            {
-                                let _ = store.link_inbox_delivery(
-                                    inbox_id,
-                                    &context.submitted_prompt().id().to_string(),
+                    {
+                        // Durable ingress is the FIRST operation in the final
+                        // model-input branch. It precedes hardware probes,
+                        // retrieval, inference, and every tool-capable path. Raw
+                        // bytes are the accepted surface line; model bytes are the
+                        // exact normalized `task` sent below.
+                        match begin_model_prompt(
+                            PromptIngress {
+                                durable: conversation_store.as_ref(),
+                                ephemeral: &ephemeral_prompt_store,
+                            },
+                            &active_conversation_id,
+                            &conversation_title_from_task(&task),
+                            active_persona.as_ref().map(|p| p.name.as_str()),
+                            line.as_bytes(),
+                            task.as_bytes(),
+                            &model_input_origin,
+                        ) {
+                            Ok(context) => {
+                                // Receipt creation is the durable acceptance point.
+                                // A fresh substantive operator ask supersedes the
+                                // old capped objective here; a bare continuation was
+                                // upgraded above and deliberately retains the link.
+                                consume_interrupted_objective_for_accepted_prompt(
+                                    &mut interrupted_objective,
+                                    &model_input_origin,
                                 );
+                                // A3/W6: record the durable turn a web-injected prompt
+                                // became — the additive, auditable "entered via web"
+                                // proof (the receipt itself stays origin=operator, so
+                                // no CHECK migration). Best-effort: a link failure must
+                                // never abort a turn that was already durably minted.
+                                if let (ModelInputOrigin::WebInjected { inbox_id }, Some(store)) =
+                                    (&model_input_origin, conversation_store.as_ref())
+                                {
+                                    let _ = store.link_inbox_delivery(
+                                        inbox_id,
+                                        &context.submitted_prompt().id().to_string(),
+                                    );
+                                }
+                                active_prompt_context = Some(context);
                             }
-                            active_prompt_context = Some(context);
-                        }
-                        Err(e) => {
-                            active_prompt_context = None;
-                            print_newt(
-                                &format!("prompt not sent: prompt receipt creation failed ({e})"),
-                                color,
-                                verbose,
-                            );
-                            println!();
-                            continue;
+                            Err(e) => {
+                                active_prompt_context = None;
+                                print_newt(
+                                    &format!(
+                                        "prompt not sent: prompt receipt creation failed ({e})"
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                                println!();
+                                continue;
+                            }
                         }
                     }
 
@@ -8103,20 +8119,36 @@ fn session_body(
                             active_persona.as_ref(),
                         ),
                     );
+                    // #2937: name each piece so the request report can attribute it (TUI preview: #2959).
+                    let ws_state = workspace_state_block(workspace, &turn_caveats.fs_read);
+                    let runtime_ctx = runtime_context_block(
+                        &inf_model,
+                        &inf_url,
+                        inf_kind,
+                        &session_identity,
+                        turn_disposition,
+                    );
+                    report_sink.annotate(
+                        "workspace state",
+                        "newt-tui workspace_state_block",
+                        &ws_state,
+                    );
+                    report_sink.annotate(
+                        "runtime context",
+                        "newt-tui runtime_context_block",
+                        &runtime_ctx,
+                    );
+                    report_sink.annotate(
+                        "session controls",
+                        "newt-tui session_control_prompt",
+                        &session_controls,
+                    );
                     let mut turn_system = format!(
-                        "{}\n\nCurrent command working directory: {}. \
+                        "{ws_state}\n\nCurrent command working directory: {}. \
                          run_command without cwd starts here. Explicit relative cwd and \
                          relative file-tool paths resolve from the workspace root. \
-                         This does not change granted access.\n\n{}\n\n{system}\n\n{session_controls}",
-                        workspace_state_block(workspace, &turn_caveats.fs_read),
+                         This does not change granted access.\n\n{runtime_ctx}\n\n{system}\n\n{session_controls}",
                         serde_json::json!(session_cwd),
-                        runtime_context_block(
-                            &inf_model,
-                            &inf_url,
-                            inf_kind,
-                            &session_identity,
-                            turn_disposition
-                        )
                     );
                     // Resolve current tab overrides against the current persona
                     // on every accepted turn. Never bake style into the frozen
@@ -8129,6 +8161,11 @@ fn session_body(
                         .resolve(active_persona.as_ref().and_then(|p| p.profile.personality))
                         .prompt_block();
                     if !communication_style.is_empty() {
+                        report_sink.annotate(
+                            "communication style",
+                            "newt-tui personality prompt_block",
+                            &communication_style,
+                        );
                         turn_system.push_str("\n\n");
                         turn_system.push_str(&communication_style);
                     }
@@ -8147,6 +8184,11 @@ fn session_body(
                             .then_some(&scratchpad_store as &dyn newt_core::ScratchpadStore),
                         turn_features.scheduled,
                     ) {
+                        report_sink.annotate(
+                            "working-memory head",
+                            "newt_core::agentic::working_memory_head",
+                            &head,
+                        );
                         turn_system = format!("{head}\n\n{turn_system}");
                     }
                     // Step 26.5.4 (#582): semantic RAG — index the repo's code once
@@ -8271,6 +8313,11 @@ fn session_body(
                                     &ctx_hash,
                                 );
                                 nav_session.last_semantic = Some(result);
+                                report_sink.annotate(
+                                    "code evidence",
+                                    "newt_core::render_code_evidence",
+                                    &block,
+                                );
                                 turn_system = format!("{block}\n\n{turn_system}");
                             }
                         }
@@ -8285,6 +8332,11 @@ fn session_body(
                             &task,
                             newt_core::EXPERIENCE_TOP_K,
                         ) {
+                            report_sink.annotate(
+                                "experience",
+                                "newt_core::experience_block",
+                                &block,
+                            );
                             turn_system = format!("{block}\n\n{turn_system}");
                         }
                     }
@@ -8999,6 +9051,7 @@ fn session_body(
                                         // dead plumbing; it is wired when the
                                         // editor stays live (the cockpit slice).
                                         steering: None,
+                                        report_sink: Some(&*report_sink),
                                         reader_source: Some(
                                             &newt_core::commit_review::HostReaders,
                                         ),

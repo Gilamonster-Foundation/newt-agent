@@ -193,6 +193,8 @@ pub struct TurnDriverConfig {
     /// #2313: explicit run-level call-count allowance for driven turns.
     /// `None` keeps dispatch unbudgeted (today's default behavior).
     pub run_allowance: Option<u32>,
+    /// #2937: session-owned prompt-report capture sink. `None` disables capture.
+    pub report_sink: Option<Arc<super::request_report::ReportSink>>,
 }
 
 impl TurnDriverConfig {
@@ -248,6 +250,7 @@ impl TurnDriverConfig {
             output_allowance: None,
             overflow_retry: Default::default(),
             run_allowance: None,
+            report_sink: None,
         }
     }
 
@@ -844,6 +847,7 @@ async fn run_one_turn(
         plan_mode_control: None,
         plan_draft_sink: None,
         steering: None,
+        report_sink: config.report_sink.as_deref(),
         reader_source: Some(&crate::commit_review::HostReaders),
     };
     let features = InstantiatedFeatures::of(&ctx);
@@ -892,6 +896,34 @@ async fn run_one_turn(
             attempt_lines,
         }),
         Err(e) => {
+            // #2937: a successful dump-and-stop is a TYPED clean completion, not a
+            // failure. No inference was sent; the file was written before this error.
+            if e.chain().any(|c| {
+                c.downcast_ref::<super::request_report::RequestDumped>()
+                    .is_some()
+            }) {
+                return Ok(TurnOutcome {
+                    reply: String::new(),
+                    was_streamed: false,
+                    usage: None,
+                    hallucinations: 0,
+                    tool_events,
+                    end_reason: Some(crate::TurnEndReason::PrepareOnly),
+                    error: None,
+                    error_class: None,
+                    served_model: solve_obs.served_model,
+                    parse_signals: solve_obs.parse_signals,
+                    behavior_signals: solve_obs.behavior_signals,
+                    features,
+                    semantic_cognition: runtime.cognition,
+                    responses_capability: solve_obs.responses_capability,
+                    reasoning_effort: solve_obs.reasoning_effort,
+                    output_allowance: solve_obs.output_allowance,
+                    harness_reply: false,
+                    attempts,
+                    attempt_lines,
+                });
+            }
             // #2313 / U4a: an exhausted `--run-allowance` is a budget WALL, not a
             // failure. Type it like the round cap (a clean stop, `RunAllowance`),
             // and let the HARNESS write the notice: a model summary is a call the

@@ -234,6 +234,7 @@ async fn fire_solve(
         require_feature: Vec::new(),
         output_allowance: None,
         run_allowance: None,
+        dump_request: None,
     };
     crate::headless::run(args).await
 }

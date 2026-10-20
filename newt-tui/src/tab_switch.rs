@@ -73,6 +73,7 @@ pub(crate) struct TabSwitchCtx<'a> {
     pub input_stash: &'a mut String,
     pub color: bool,
     pub verbose: bool,
+    pub report_sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 /// What a completed switch tells the caller.
@@ -288,6 +289,7 @@ impl TabSwitchCtx<'_> {
             system: self.system,
             conversation_id: self.active_conversation_id,
             mode_states: self.mode_states,
+            sink: self.report_sink,
         };
         crate::reset_conversation(self.workspace, self.active_persona.as_ref(), &mut reset);
         crate::ConversationScopedState {
@@ -325,6 +327,7 @@ impl TabSwitchCtx<'_> {
                     step_ledger: self.step_ledger,
                     active_prompt_context: self.active_prompt_context,
                     mode_states: self.mode_states,
+                    sink: self.report_sink,
                 };
                 let (_, warning) = crate::commit_conversation_restore(&mut commit, *prepared);
                 if let Some(w) = warning {
@@ -350,6 +353,7 @@ impl TabSwitchCtx<'_> {
                     self.memory,
                     self.active_persona.as_ref(),
                     self.active_conversation_id,
+                    self.report_sink,
                 );
             }
         }

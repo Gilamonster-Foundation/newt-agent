@@ -38,7 +38,7 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
         )
         .await;
     let workspace_str = workspace.to_str().unwrap();
-    let mut system = rebuild_system_prompt(workspace_str, &memory, None, "test-session");
+    let mut system = rebuild_system_prompt(workspace_str, &memory, None, "test-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = newt_core::new_conversation_id();
     // A latched anti-thrash switch must be re-armed by restore too (F4):
@@ -67,6 +67,7 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &mode_states,
+        sink: None,
     };
 
     let message = handle_conversation_command(
@@ -168,7 +169,7 @@ async fn prompt_only_restore_rehydrates_receipt_without_replaying_it_as_input() 
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     let workspace_str = workspace.to_str().unwrap();
-    let mut system = rebuild_system_prompt(workspace_str, &memory, None, "fresh-session");
+    let mut system = rebuild_system_prompt(workspace_str, &memory, None, "fresh-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = newt_core::new_conversation_id();
     let mut compress_state = newt_core::CompressState::new();
@@ -188,6 +189,7 @@ async fn prompt_only_restore_rehydrates_receipt_without_replaying_it_as_input() 
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -278,7 +280,7 @@ async fn conversation_restore_reseats_the_persona_cognition_layer() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     let workspace_str = workspace.to_str().unwrap();
-    let mut system = rebuild_system_prompt(workspace_str, &memory, None, "test-session");
+    let mut system = rebuild_system_prompt(workspace_str, &memory, None, "test-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = newt_core::new_conversation_id();
     let mut compress_state = newt_core::CompressState::new();
@@ -299,6 +301,7 @@ async fn conversation_restore_reseats_the_persona_cognition_layer() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &mode_states,
+        sink: None,
     };
 
     newt_core::cognition::set_persona_cognition(None);

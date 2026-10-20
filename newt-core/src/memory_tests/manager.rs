@@ -1,5 +1,72 @@
 use super::*;
 
+/// Minimal stub used by the per-provider annotation test (#2937 P2-2).
+struct StaticBlock {
+    name: &'static str,
+    block: &'static str,
+}
+
+#[async_trait]
+impl MemoryProvider for StaticBlock {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn system_prompt_block(&self) -> Option<String> {
+        Some(self.block.to_string())
+    }
+    fn build_messages(&self, _sys: &str, _task: &str) -> Vec<MemMessage> {
+        vec![]
+    }
+    async fn sync_turn(&mut self, _: &str, _: &str, _: &TurnMetrics) {}
+}
+
+/// #2937 P2-2: annotate_system_prompt_additions must label each provider's
+/// block separately so the /context request report shows per-provider sizes
+/// rather than one combined "identity" component.
+#[test]
+fn annotate_system_prompt_additions_emits_per_provider_labels() {
+    let mut mgr = MemoryManager::new();
+    mgr.add_provider(StaticBlock {
+        name: "soul",
+        block: "You are a helpful assistant.",
+    });
+    mgr.add_provider(StaticBlock {
+        name: "agents-md",
+        block: "# AGENTS.md\nFollow these rules.",
+    });
+
+    let sink = crate::agentic::request_report::ReportSink::new();
+    sink.arm_capture_next();
+    mgr.annotate_system_prompt_additions(&sink);
+
+    let combined = mgr.build_system_prompt_additions();
+    let err = sink
+        .observe_request(&[combined.as_str()], None)
+        .unwrap_err();
+    assert!(
+        err.chain().any(|c| c
+            .downcast_ref::<crate::agentic::request_report::RequestDumped>()
+            .is_some()),
+        "arm_capture_next must yield RequestDumped; got {err}"
+    );
+    let report = sink
+        .last_report()
+        .expect("report captured after arm_capture_next");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert!(
+        labels.contains(&"soul"),
+        "missing 'soul' label; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"agents-md"),
+        "missing 'agents-md' label; got {labels:?}"
+    );
+}
+
 #[tokio::test]
 async fn memory_manager_routes_to_provider() {
     let mut mgr = MemoryManager::new();
