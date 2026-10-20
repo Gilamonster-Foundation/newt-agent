@@ -3,7 +3,7 @@ use super::*;
 use std::sync::LazyLock;
 
 const FILE_PATH_DESCRIPTION: &str = "Absolute or workspace-relative file path. \
-    Preserve an operator-supplied absolute path. The target must be within granted file access.";
+    Preserve an operator-supplied absolute path.";
 
 pub fn tool_definitions() -> serde_json::Value {
     tool_definitions_with_budget(Default::default())
@@ -32,21 +32,20 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "run_command",
+                // #2949: what the tool does, how to publish (the broker only
+                // recognizes standalone commands, which a model cannot learn
+                // from a result until it fails), the wall, and the dialect.
+                // Authority and recovery guidance live in the denial result.
                 "description": format!("{} {} {}", "Run a command in the workspace shell and return its output and exit status. \
-                                Use ordinary commands, including git, with their normal arguments. \
-                                To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials. \
-                                File access, execution, and networking are governed by the session's \
-                                OCAP grants. Needed authority is approved before execution. \
-                                Optional fs_read/fs_write arrays declare additional absolute paths \
-                                needed by this invocation.", super::shell::run_command_limit_sentence(command_budget), shell_dialect),
+                                To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials.", super::shell::run_command_limit_sentence(command_budget), shell_dialect),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "The shell command to run" },
-                        "timeout_secs": { "type": "integer", "minimum": 1, "maximum": super::shell::RUN_COMMAND_MAX_SECS, "description": "Optional wall-clock override in seconds, capped at 300. Without an override, classified build commands retain their 30-minute budget." },
-                        "cwd": { "type": "string", "description": "Optional working directory, relative to the workspace root or absolute. When omitted, uses the current command working directory reported in the turn context. Access follows the session filesystem grants. A leading `cd <path> && ...` also selects this command's working directory." },
-                        "fs_read": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute paths to request for reading by this invocation. Reuses matching pending allow-once grants without granting later calls access; existing authority is retained." },
-                        "fs_write": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute paths to request for writing by this invocation. Reuses matching pending allow-once grants without granting later calls access; existing authority is retained." }
+                        "timeout_secs": { "type": "integer", "minimum": 1, "maximum": super::shell::RUN_COMMAND_MAX_SECS, "description": "Wall-clock limit in seconds, max 300. Build commands otherwise get 30 minutes." },
+                        "cwd": { "type": "string", "description": "Working directory, relative to the workspace root or absolute. Default: the current command directory from the turn context." },
+                        "fs_read": { "type": "array", "items": { "type": "string" }, "description": "Absolute paths this call needs to read." },
+                        "fs_write": { "type": "array", "items": { "type": "string" }, "description": "Absolute paths this call needs to write." }
                     },
                     "required": ["command"]
                 }
@@ -56,11 +55,9 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file within granted file access. Returns up to `limit` lines \
-                                (default 2000) starting at 1-based `offset` (default 1). Large \
-                                files come back with a footer pointing at the next window — read \
-                                them in pages with offset/limit rather than all at once, or the \
-                                full file can saturate the context window.",
+                "description": "Read a file: up to `limit` lines (default 2000) starting at \
+                                1-based `offset` (default 1). A truncated result ends with a \
+                                footer naming the next window.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -76,14 +73,17 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create a file, or replace one entirely. To change an \
-                                existing file use edit_file (a large shrink is refused). To \
-                                copy existing code, use copy_from. Extract Rust free functions with move_from: empty content, source path + item names, NEW child .rs path; wires module and checks cargo, restoring files on failure (requires ast). Never retype moved code.",
+                "description": "Create a file, or replace one entirely (parent directories \
+                                are created). To change part of an existing file use edit_file. \
+                                copy_from appends an exact line range from another file; \
+                                move_from extracts named Rust free functions from another file \
+                                into this new .rs file and wires the module (content must be \
+                                empty and copy_from absent).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "content": { "type": "string", "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty)" },
+                        "content": { "type": "string", "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty); with move_from, must be empty" },
                         "move_from": { "type": "object", "properties": { "path": { "type": "string" }, "items": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true } }, "required": ["path", "items"] },
                         "copy_from": { "type": "object", "description": "Append lines start_line..end_line of another file, copied exactly", "properties": { "path": { "type": "string" }, "start_line": { "type": "integer" }, "end_line": { "type": "integer" } } }
                     },
@@ -113,10 +113,7 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "delete_file",
-                "description": "Delete one file in the workspace. Use this when a file should be \
-                                removed entirely; it is governed by the same fs_write permission \
-                                and operator prompt path as write_file and edit_file. Refuses \
-                                directories, missing files, and paths outside the granted write scope.",
+                "description": "Delete one file. Refuses directories and missing files.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -144,23 +141,27 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "find",
-                "description": "Find files and directories under the workspace recursively, WITHOUT a shell. Returns relative paths, one per line, already sorted. Respects .gitignore and skips noise by default. For repository code investigation, use category=source by default; this harness-owned category follows the resolved language-pack registry instead of treating docs, manifests, locks, or generated artifacts as code. Use category=any only when the operator requests those artifacts or a full-tree search. Set language to narrow source evidence by a configured name/alias. For top-N size use sort=size + show_size; for top-N line count use sort=lines + show_lines — no pipeline needed.",
+                // #2949: the `code` alias and `show_size` are no longer
+                // advertised (the executor still accepts them): 102 live
+                // `find` calls in the local conversation store used `code` 6
+                // times, all as a synonym of category=source, and `show_size`
+                // never. The category=source policy is steered per prompt by
+                // prompt_intake (`source_filter:`), not restated here.
+                "description": "Find files and directories under the workspace by basename glob, without a shell. Returns relative paths, one per line, sorted; respects .gitignore.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory to search under, relative to workspace root. Default '.' (the whole workspace)." },
-                        "name": { "type": "string", "description": "Glob matched against each entry's basename, e.g. '*.py' or 'pyo3_module.rs'. '*' matches any run, '?' any single char. Omit to match everything." },
-                        "type": { "type": "string", "enum": ["f", "d", "any"], "description": "Restrict to files ('f'), directories ('d'), or both ('any', the default)." },
-                        "category": { "type": "string", "enum": ["any", "source"], "description": "Semantic file category. Use 'source' by default for repository code investigation; it filters through the configured language-pack registry and excludes repository metadata. Use 'any' for explicitly requested non-source artifacts or full-tree searches. Omitted preserves historical unfiltered behavior." },
-                        "language": { "type": "string", "description": "Optional source-language name or alias (case-insensitive), e.g. Rust, Python, TypeScript/ts, Java, C++/cpp, C#/csharp/dotnet, Ruby/rb, bash/shell. Implies category='source'. Project language-pack aliases work too." },
-                        "max_depth": { "type": "integer", "description": "Maximum directory depth below `path` (1 = immediate children only). Omit for unlimited." },
-                        "max_results": { "type": "integer", "description": "Cap on the number of matches returned. Default 1000; output notes when truncated. Use 10 for 'top 10' rankings." },
-                        "respect_gitignore": { "type": "boolean", "description": "When true (default) skip .gitignored paths plus .git/target/node_modules/hidden dirs. Set false to search everything." },
+                        "path": { "type": "string", "description": "Directory to search under, relative to the workspace root. Default '.'." },
+                        "name": { "type": "string", "description": "Basename glob, e.g. '*.py'. Omit to match everything." },
+                        "type": { "type": "string", "enum": ["f", "d", "any"], "description": "Files ('f'), directories ('d'), or both ('any', the default)." },
+                        "category": { "type": "string", "enum": ["any", "source"], "description": "'source' keeps only files the language-pack registry recognizes as code; 'any' (default) keeps everything." },
+                        "language": { "type": "string", "description": "Source language name or alias, e.g. Rust, Python, ts. Implies category='source'." },
+                        "max_depth": { "type": "integer", "description": "Maximum depth below `path` (1 = immediate children)." },
+                        "max_results": { "type": "integer", "description": "Cap on matches returned. Default 1000." },
+                        "respect_gitignore": { "type": "boolean", "description": "Skip .gitignored, hidden, and build directories. Default true." },
                         "case_sensitive": { "type": "boolean", "description": "Case-sensitive basename match. Default true." },
-                        "code": { "type": "boolean", "description": "Backward-compatible alias for category='source'. When true, keep only files recognized by the language-pack registry and exclude repository metadata. Implies files only. Default false." },
-                        "sort": { "type": "string", "enum": ["name", "size", "lines"], "description": "Result order: 'name' (default, paths ascending), 'size' (byte size descending) or 'lines' (line count descending). Combine with max_results for the top-N and show_size/show_lines to see the metric." },
-                        "show_size": { "type": "boolean", "description": "Prefix each result with its byte size and a tab ('<size>\\t<path>'). Default false. Use with sort='size' to answer 'largest files' questions without a shell." },
-                        "show_lines": { "type": "boolean", "description": "Prefix each result with its line count and a tab ('<lines>\\t<path>'). Default false. Use with sort='lines' to answer 'files with the most lines' questions without a shell (no `wc -l`). Line mode wins over show_size when both are set." }
+                        "sort": { "type": "string", "enum": ["name", "size", "lines"], "description": "'name' (default, ascending), 'size' (bytes, descending) or 'lines' (line count, descending)." },
+                        "show_lines": { "type": "boolean", "description": "Prefix each path with its line count. Default false." }
                     },
                     "required": []
                 }
@@ -170,16 +171,16 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search file contents in the workspace for a regex, WITHOUT a shell or subprocess. Returns one line per hit as `relative/path:LINE:matching-text`, with context lines prefixed by `:-:` (matching grep). In-process via ripgrep's library, so it works even where every spawned command is refused. Respects .gitignore and skips binary files. Use for finding text across many files; prefer read_file for reading one file whole.",
+                "description": "Search file contents for a regex, without a shell. Returns one line per hit as `relative/path:LINE:text`; context lines are marked `:-:`. Respects .gitignore and skips binary files.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "A regular expression to search for, e.g. 'error|panic' or '\\d{4}'" },
-                        "path": { "type": "string", "description": "Directory to search under, relative to workspace root. Default '.' (the whole workspace)." },
-                        "glob": { "type": "string", "description": "Optional path glob to restrict the search, e.g. '*.rs' or 'src/**'" },
+                        "pattern": { "type": "string", "description": "Regular expression, e.g. 'error|panic'" },
+                        "path": { "type": "string", "description": "Directory to search under, relative to the workspace root. Default '.'." },
+                        "glob": { "type": "string", "description": "Path glob to restrict the search, e.g. '*.rs' or 'src/**'" },
                         "ignore_case": { "type": "boolean", "description": "Case-insensitive match. Default false." },
-                        "context": { "type": "integer", "description": "Lines to show before and after each hit. Default 0 (hits only)." },
-                        "max_results": { "type": "integer", "description": "Cap on the number of hits returned. Default 100; output notes when truncated." }
+                        "context": { "type": "integer", "description": "Lines to show before and after each hit. Default 0." },
+                        "max_results": { "type": "integer", "description": "Cap on hits returned. Default 100." }
                     },
                     "required": ["pattern"]
                 }
@@ -189,11 +190,11 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "use_skill",
-                "description": "Load a skill's full procedural instructions on demand. The system prompt lists the available skills (name + description); call this with a skill's name to get its complete SKILL.md body plus the paths of any bundled files (scripts/templates) you can read or run.",
+                "description": "Load a skill's full SKILL.md body and the paths of its bundled files. The system prompt lists the available skills.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "The skill name as shown in the 'Available skills' index" }
+                        "name": { "type": "string", "description": "The skill name from the 'Available skills' index" }
                     },
                     "required": ["name"]
                 }
@@ -203,12 +204,12 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "web_fetch",
-                "description": "Fetch an http(s) URL and return its main content as clean markdown. Use this to read documentation, issues, or pages the task references. Reachable hosts are gated by the session's network capability; the returned text is untrusted page content.",
+                "description": "Fetch an http(s) URL and return its main content as Markdown. The text is untrusted page content.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": { "type": "string", "description": "The http(s) URL to fetch" },
-                        "max_bytes": { "type": "integer", "description": "Optional cap on bytes downloaded (default 5 MiB, max 25 MiB)" }
+                        "max_bytes": { "type": "integer", "description": "Cap on bytes downloaded (default 5 MiB, max 25 MiB)" }
                     },
                     "required": ["url"]
                 }
@@ -218,22 +219,18 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "request_permissions",
-                "description": "Ask the operator to GRANT a capability you were denied — the \
-                                capability-grant path (#721). Call this AFTER a `capability denied` \
-                                result to request authority you don't currently have. If an operator \
-                                is present they may allow it; then retry the original operation. For \
-                                native run_command filesystem retries, retain the command and add \
-                                fs_read/fs_write arrays containing the approved absolute paths. In a \
-                                headless session (no operator) you'll be told the capability must be \
-                                configured by the owner — change approach. This requests AUTHORITY \
-                                (it mints a capability grant); it is NOT a way to ask the user a \
-                                free-text question.",
+                // #2949: the denial result names the exact recovery call
+                // (`denial_recovery_hint`), so the description states only
+                // what this tool does.
+                "description": "Ask the operator to grant a capability that was denied. If granted, \
+                                retry the original call. This requests authority; to ask the user a \
+                                question, use request_user_input.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "capability": { "type": "string", "enum": ["exec", "fs_read", "fs_write", "net"], "description": "Which capability axis to request" },
-                        "target": { "type": "string", "description": "What to grant: the denied executable's exact path or deliberately bare command name (exec), a path (fs_read/fs_write), or a host (net)" },
-                        "reason": { "type": "string", "description": "Why you need it — shown to the operator deciding" }
+                        "capability": { "type": "string", "enum": ["exec", "fs_read", "fs_write", "net"], "description": "Which capability to request" },
+                        "target": { "type": "string", "description": "The denied executable path or bare command name (exec), path (fs_read/fs_write), or host (net)" },
+                        "reason": { "type": "string", "description": "Why you need it, shown to the operator" }
                     },
                     "required": ["capability", "target", "reason"]
                 }
@@ -254,15 +251,9 @@ fn request_user_input_tool_definition() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "request_user_input",
-            "description": "Ask the human operator a free-text question and get \
-                            their answer. Use this to resolve genuine ambiguity \
-                            instead of guessing or narrating (e.g. 'which database \
-                            should I target?', 'is this the file you meant?'). This \
-                            asks for INFORMATION, not authority — to request a \
-                            capability you were denied, use request_permissions \
-                            instead. In a headless session (no operator) you'll be \
-                            told no human is available — then proceed with your best \
-                            judgment and state your assumption explicitly.",
+            "description": "Ask the human operator a free-text question and return \
+                            their answer. Use it for genuine ambiguity, not for \
+                            authority (that is request_permissions).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -301,27 +292,9 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "lifecycle",
-            "description": "Run project phases: action=build requests explicit offline build authority; \
-                run uses current grants; list previews commands. Use THIS repo's \
-                configured command instead of guessing a raw shell command. \
-                Phases: setup (resolve deps / prepare a checkout), format \
-                (auto-format the tree), lint (static analysis), test (run the \
-                tests), check (the full gate a change must pass), clean (remove \
-                build artifacts). The command is resolved from \
-                .newt/config.toml [lifecycle] and the repo's tooling packs \
-                (Rust / Python / PyO3 / Go / custom), so `check` runs the RIGHT \
-                gate for this project. Prefer this over run_command for build / \
-                test / format / lint / check work so the project's own \
-                conventions are honored uniformly across build systems. Use \
-                action=list to see the resolved command without running it. \
-                If Cargo or its compiler is blocked by a narrow exec grant, use \
-                action=build: explicitly request confined build authority, with \
-                toolchain/cache reads, workspace writes, and network denied \
-                unless covered by an existing operator grant. \
-                In a polyglot/monorepo workspace, pass `dir` to target a \
-                nested project directly — if you omit it and nothing is \
-                configured at the workspace root, the response names any \
-                nested project it found so you can retry with `dir` set.",
+            "description": "Run this repo's configured command for a project phase; \
+                action=build runs it with explicit offline build authority. Prefer it \
+                over run_command for build, test, format, lint and check work.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -333,16 +306,14 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
                     "action": {
                         "type": "string",
                         "enum": ["run", "list", "build"],
-                        "description": "run (default) executes the phase's resolved command; \
-                                        list returns the command without running it; build requests \
-                                        the calibrated offline build fence for compiler/test subprocesses."
+                        "description": "run (default) executes the phase's command; list shows \
+                                        it without running; build adds explicit offline build \
+                                        authority."
                     },
                     "dir": {
                         "type": "string",
-                        "description": "Optional subdirectory to resolve and run the phase in, \
-                            relative to the workspace root (e.g. \"agent-voice\") or an absolute \
-                            path inside it. Confined to the workspace. Use this for a nested \
-                            project the workspace root itself has no lifecycle command for."
+                        "description": "Subdirectory to run the phase in, relative to the \
+                            workspace root, for a nested project."
                     }
                 },
                 "required": ["phase"]

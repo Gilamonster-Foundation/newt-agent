@@ -1873,13 +1873,11 @@ pub(super) fn dispatch_wall(
 }
 
 /// What the `run_command` description tells the model about its wall, up front.
-/// One owner with [`timed_out_note`], so the two cannot disagree (U6).
+/// The lane for long builds (`lifecycle` action=build) is coached by
+/// [`timed_out_note`] on the result that needs it, not here (#2949).
 pub(super) fn run_command_limit_sentence(command_budget: crate::RunCommandBudget) -> String {
     format!(
-        "Ordinary calls are killed after {} seconds (wall clock); classified builds get 30 minutes. Override with timeout_secs up to \
-         {} seconds; the result carries the exit code. For an offline build use \
-         `lifecycle` action=build, i.e. call the tool with {LIFECYCLE_BUILD_CALL} (`phase` is \
-         never `build`), or narrow the command (one test filter, one crate).",
+        "Ordinary calls are killed after {} seconds; timeout_secs raises the limit up to {} seconds.",
         command_budget.seconds(None),
         RUN_COMMAND_MAX_SECS
     )
