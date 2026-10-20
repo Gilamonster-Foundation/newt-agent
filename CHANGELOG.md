@@ -54,7 +54,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 - The native Git broker real tier also runs on pull requests that touch
   `newt-core`, `agent-toolchain`, `Cargo.lock` or its workflow, with a
   30-minute job timeout; before, only the weekly run and `v*` tags exercised
-  it, and a break on `main` went unnoticed for days (#2947).
+  it, so a break on `main` surfaced only at the next weekly run (#2947).
 - The dock hub-restart test binds the old port once, straight after `close`,
   instead of polling it for up to five seconds; agent-mesh#156 makes `close`
   return only after the socket is released (#2946).
