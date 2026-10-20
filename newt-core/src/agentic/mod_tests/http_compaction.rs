@@ -319,7 +319,7 @@ fn post_compaction_continuation_reanchors_on_ground_truth() {
         &Default::default(),
     );
     assert!(d.contains("re-anchor on ground truth"), "{d}");
-    assert!(d.contains("git branch"), "{d}");
+    assert!(d.contains("current branch"), "{d}");
     assert!(
         d.contains("clean working tree does NOT mean no work happened"),
         "{d}"
