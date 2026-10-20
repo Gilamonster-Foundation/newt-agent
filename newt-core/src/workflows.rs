@@ -169,7 +169,10 @@ impl WorkflowConfig {
             >= self.classifier.min_score
     }
 
-    fn render_plan_update_hint(&self) -> String {
+    fn render_plan_update_hint(
+        &self,
+        exposure: &crate::agentic::tools::ExposureSettings,
+    ) -> String {
         let mut out = format!(
             "Configured workflow '{}' is active",
             if self.name.is_empty() {
@@ -194,9 +197,17 @@ impl WorkflowConfig {
                     out.push_str(" - ");
                     out.push_str(step.steer.trim());
                 }
-                if !step.tools.is_empty() {
+                // Suggest only tools the operator left visible (#2932): a pack
+                // step that names only hidden tools renders no tools clause.
+                let tools: Vec<&str> = step
+                    .tools
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|tool| exposure.operator_visible(tool))
+                    .collect();
+                if !tools.is_empty() {
                     out.push_str(" (tools: ");
-                    out.push_str(&step.tools.join(", "));
+                    out.push_str(&tools.join(", "));
                     out.push(')');
                 }
             }
@@ -330,14 +341,16 @@ impl WorkflowSteerer {
         }
     }
 
-    /// Render a workflow hint for a plan-update stall.
+    /// Render a workflow hint for a plan-update stall. Per-step tool
+    /// suggestions are filtered to what `exposure` leaves visible.
     #[must_use]
-    pub fn plan_update_hint(&self, text: &str) -> Option<String> {
-        self.workflows
-            .iter()
-            .filter(|workflow| workflow.enabled)
-            .find(|workflow| workflow.matches(text))
-            .map(WorkflowConfig::render_plan_update_hint)
+    pub fn plan_update_hint(
+        &self,
+        text: &str,
+        exposure: &crate::agentic::tools::ExposureSettings,
+    ) -> Option<String> {
+        self.matching(text)
+            .map(|workflow| workflow.render_plan_update_hint(exposure))
     }
 
     /// The FIRST enabled matching workflow, if any (shared by
@@ -383,7 +396,10 @@ mod tests {
     fn builtin_github_pr_workflow_mentions_branch_commit_push_and_pr() {
         let steer = WorkflowSteerer::builtin();
         let hint = steer
-            .plan_update_hint("I need to plan the implementation and open a PR")
+            .plan_update_hint(
+                "I need to plan the implementation and open a PR",
+                &Default::default(),
+            )
             .expect("built-in workflow should match");
         assert!(hint.contains("github_pr"), "{hint}");
         assert!(hint.contains("create_branch"), "{hint}");
@@ -419,7 +435,7 @@ steer = "Always commit before pushing"
 
         let steer = WorkflowSteerer::load_from_dir(dir.path());
         let hint = steer
-            .plan_update_hint("ship it")
+            .plan_update_hint("ship it", &Default::default())
             .expect("drop-in workflow should match");
         assert!(hint.contains("custom PR flow"), "{hint}");
         assert!(
@@ -457,7 +473,7 @@ steer = "do the other thing"
 
         let steer = WorkflowSteerer::load_from_dir(dir.path());
         let hint = steer
-            .plan_update_hint("do the synthetic thing")
+            .plan_update_hint("do the synthetic thing", &Default::default())
             .expect("synthetic workflow should match");
         assert!(hint.contains("(tools: read_file, crew)"), "{hint}");
         // The tool-less step's line must not carry a stray/empty "(tools: )".
@@ -475,7 +491,10 @@ steer = "do the other thing"
     fn unmatched_text_does_not_select_a_default_workflow() {
         let steer = WorkflowSteerer::builtin();
         assert!(steer
-            .plan_update_hint("Summarize the local cache eviction behavior")
+            .plan_update_hint(
+                "Summarize the local cache eviction behavior",
+                &Default::default()
+            )
             .is_none());
     }
 
@@ -489,7 +508,10 @@ steer = "do the other thing"
     fn fix_failing_tests_workflow_matches_and_renders_tool_suggestions() {
         let steer = WorkflowSteerer::builtin();
         let hint = steer
-            .plan_update_hint("Keep iterating on the tests until the whole suite is green.")
+            .plan_update_hint(
+                "Keep iterating on the tests until the whole suite is green.",
+                &Default::default(),
+            )
             .expect("built-in fix_failing_tests workflow should match");
         assert!(hint.contains("fix_failing_tests"), "{hint}");
         assert!(hint.contains("run_suite"), "{hint}");
@@ -497,6 +519,27 @@ steer = "do the other thing"
         // Per-step tool suggestions render into the hint.
         assert!(hint.contains("(tools: run_command"), "{hint}");
         assert!(hint.contains("edit_file"), "{hint}");
+    }
+
+    /// #2932 round 3: a pack step's tool suggestions are filtered by the
+    /// operator policy. Under `read_only` the fix-tests hint still names the
+    /// read tools but never the write tools it would otherwise recommend.
+    #[test]
+    fn workflow_tool_suggestions_omit_operator_hidden_tools() {
+        let read_only = crate::agentic::tools::ExposureSettings {
+            read_only: true,
+            ..Default::default()
+        };
+        let hint = WorkflowSteerer::builtin()
+            .plan_update_hint(
+                "Keep iterating on the tests until the whole suite is green.",
+                &read_only,
+            )
+            .expect("built-in fix_failing_tests workflow should match");
+        assert!(hint.contains("(tools: run_command"), "{hint}");
+        assert!(hint.contains("read_file"), "{hint}");
+        assert!(!hint.contains("edit_file"), "{hint}");
+        assert!(!hint.contains("write_file"), "{hint}");
     }
 
     #[test]
@@ -517,6 +560,7 @@ steer = "do the other thing"
         let hint = steer
             .plan_update_hint(
                 "Investigate how these two subsystems communicate before we change either one.",
+                &Default::default(),
             )
             .expect("built-in research workflow should match");
         assert!(hint.contains("'research'"), "{hint}");
@@ -541,7 +585,10 @@ steer = "do the other thing"
     fn planning_workflow_matches_design_first_phrasing() {
         let steer = WorkflowSteerer::builtin();
         let hint = steer
-            .plan_update_hint("Write a design doc proposing an approach to this problem.")
+            .plan_update_hint(
+                "Write a design doc proposing an approach to this problem.",
+                &Default::default(),
+            )
             .expect("built-in planning workflow should match");
         assert!(hint.contains("'planning'"), "{hint}");
         assert!(hint.contains("adversarial_check"), "{hint}");
@@ -555,7 +602,10 @@ steer = "do the other thing"
         // stole this exact github_pr test phrase via example similarity.
         let steer = WorkflowSteerer::builtin();
         let hint = steer
-            .plan_update_hint("I need to plan the implementation and open a PR")
+            .plan_update_hint(
+                "I need to plan the implementation and open a PR",
+                &Default::default(),
+            )
             .expect("built-in workflow should match");
         assert!(hint.contains("github_pr"), "{hint}");
     }
@@ -564,7 +614,10 @@ steer = "do the other thing"
     fn tdd_peer_review_workflow_matches_test_first_phrasing() {
         let steer = WorkflowSteerer::builtin();
         let hint = steer
-            .plan_update_hint("Use TDD for this: write a failing test first, then implement.")
+            .plan_update_hint(
+                "Use TDD for this: write a failing test first, then implement.",
+                &Default::default(),
+            )
             .expect("built-in tdd_peer_review workflow should match");
         assert!(hint.contains("tdd_peer_review"), "{hint}");
         assert!(hint.contains("confirm_red"), "{hint}");
@@ -588,7 +641,10 @@ steer = "do the other thing"
     fn diagnose_failure_workflow_matches_failure_investigation_text() {
         let steer = WorkflowSteerer::builtin();
         let hint = steer
-            .plan_update_hint("I'm showing broken tests here, can you find and fix them?")
+            .plan_update_hint(
+                "I'm showing broken tests here, can you find and fix them?",
+                &Default::default(),
+            )
             .expect("built-in diagnose_failure workflow should match");
         assert!(hint.contains("diagnose_failure"), "{hint}");
         assert!(hint.contains("reproduce"), "{hint}");

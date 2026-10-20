@@ -635,7 +635,7 @@ fn read_only_call_classifies_simple_shell_probes() {
 
 #[test]
 fn read_only_action_nudge_names_edit_permission_and_blocker_paths() {
-    let nudge = read_only_action_nudge(3, Some(4), None, None);
+    let nudge = read_only_action_nudge(3, Some(4), None, None, &Default::default());
     assert!(nudge.contains("read-only rounds so far"), "{nudge}");
     assert!(nudge.contains("edit_file"), "{nudge}");
     assert!(nudge.contains("write_file"), "{nudge}");
@@ -647,13 +647,13 @@ fn read_only_action_nudge_names_edit_permission_and_blocker_paths() {
 #[test]
 fn read_only_action_nudge_counts_only_fixed_rounds_after_the_current_round() {
     for remaining in [0, 4] {
-        let nudge = read_only_action_nudge(3, Some(remaining), None, None);
+        let nudge = read_only_action_nudge(3, Some(remaining), None, None, &Default::default());
         assert!(nudge.contains(&format!(
             "After this round, at most {remaining} further tool rounds remain under the configured hard limit."
         )), "{nudge}");
         assert!(!nudge.contains("round(s) left"), "{nudge}");
     }
-    let renewable = read_only_action_nudge(3, None, None, None);
+    let renewable = read_only_action_nudge(3, None, None, None, &Default::default());
     assert!(renewable.contains("read-only rounds so far"), "{renewable}");
     assert!(renewable.contains("edit_file or write_file"), "{renewable}");
     assert!(!renewable.contains("configured hard limit"), "{renewable}");
@@ -665,9 +665,9 @@ fn workflow_action_nudges_honor_operator_stop_and_report_only_requests() {
     let ledger = SessionStepLedger::default();
     ledger.set_plan(&["finish the original task".into(), "verify it".into()]);
     for nudge in [
-        narration_action_nudge(),
-        escalated_narration_action_nudge(2, 2, Some(&ledger)),
-        read_only_action_nudge(3, Some(2), None, None),
+        narration_action_nudge(&Default::default()),
+        escalated_narration_action_nudge(2, 2, Some(&ledger), &Default::default()),
+        read_only_action_nudge(3, Some(2), None, None, &Default::default()),
         pending_plan_completion_nudge(Some(&ledger), false, None).unwrap(),
         pending_plan_completion_nudge(Some(&ledger), true, None).unwrap(),
     ] {
@@ -695,7 +695,13 @@ fn read_only_action_nudge_mentions_active_plan_when_present() {
             },
         ],
     });
-    let nudge = read_only_action_nudge(3, Some(2), Some(&ledger as &dyn StepLedger), None);
+    let nudge = read_only_action_nudge(
+        3,
+        Some(2),
+        Some(&ledger as &dyn StepLedger),
+        None,
+        &Default::default(),
+    );
     assert!(nudge.contains("active multi-step plan"), "{nudge}");
     assert!(nudge.contains("ACTIVE step"), "{nudge}");
     assert!(nudge.contains("latest operator instruction"), "{nudge}");
@@ -713,7 +719,13 @@ fn read_only_action_nudge_mentions_active_plan_when_present() {
 /// for, not just "stop reading, edit it yourself".
 #[test]
 fn read_only_action_nudge_includes_a_delegate_hint_when_offered() {
-    let nudge = read_only_action_nudge(3, Some(4), None, Some("consider calling crew or team"));
+    let nudge = read_only_action_nudge(
+        3,
+        Some(4),
+        None,
+        Some("consider calling crew or team"),
+        &Default::default(),
+    );
     assert!(nudge.contains("consider calling crew or team"), "{nudge}");
     // Still carries the original inline-action guidance too — delegation
     // is offered ALONGSIDE continuing directly, never in place of it.
@@ -722,7 +734,7 @@ fn read_only_action_nudge_includes_a_delegate_hint_when_offered() {
 
 #[test]
 fn read_only_action_nudge_omits_delegate_clause_when_none_offered() {
-    let nudge = read_only_action_nudge(3, Some(4), None, None);
+    let nudge = read_only_action_nudge(3, Some(4), None, None, &Default::default());
     assert!(!nudge.contains("crew"), "{nudge}");
     assert!(!nudge.contains("team"), "{nudge}");
 }
@@ -815,7 +827,7 @@ fn workflow_classifier_text_keeps_recent_user_issue_context() {
             "Summary of Findings\n\nCurrent Status: the build is broken. Next Steps Required: update the plan.",
         );
     let hint = crate::WorkflowSteerer::builtin()
-        .plan_update_hint(&text)
+        .plan_update_hint(&text, &Default::default())
         .expect("GitHub issue context should select the PR workflow");
     assert!(hint.contains("github_pr"), "{hint}");
     assert!(hint.contains("read_issue"), "{hint}");
@@ -1147,4 +1159,39 @@ fn capexit_voice_fallback_and_literal_model_words_stay_distinct() {
             .contains("finish helper"),
         "latest finalized turn replaces old notices"
     );
+}
+
+/// #2932 round 3: every action nudge draws its tool examples from the
+/// operator-visible set. Under `read_only` the write tools are hidden, so the
+/// nudges steer without naming them; an allow list narrows the examples to
+/// what it admits.
+#[test]
+fn action_nudges_name_only_operator_visible_tools() {
+    let read_only = crate::agentic::tools::ExposureSettings {
+        read_only: true,
+        ..Default::default()
+    };
+    let nudge = read_only_action_nudge(3, Some(4), None, None, &read_only);
+    assert!(nudge.contains("read-only rounds so far"), "{nudge}");
+    assert!(nudge.contains("request_permissions"), "{nudge}");
+    let narration = narration_action_nudge(&read_only);
+    assert!(narration.contains("did not call any tool"), "{narration}");
+    let escalated = escalated_narration_action_nudge(2, 2, None, &read_only);
+    assert!(escalated.contains("Reminder 2/2"), "{escalated}");
+    for text in [&nudge, &narration, &escalated] {
+        assert!(!text.contains("edit_file"), "{text}");
+        assert!(!text.contains("write_file"), "{text}");
+    }
+    assert!(escalated.contains("read_file"), "{escalated}");
+
+    let reads_only = crate::agentic::tools::ExposureSettings {
+        allow_list: Some(vec!["read_file".into()]),
+        ..Default::default()
+    };
+    let escalated = escalated_narration_action_nudge(2, 2, None, &reads_only);
+    assert!(
+        escalated.contains("for example read_file with"),
+        "{escalated}"
+    );
+    assert!(!escalated.contains("run_command"), "{escalated}");
 }

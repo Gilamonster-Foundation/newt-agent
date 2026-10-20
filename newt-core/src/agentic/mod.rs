@@ -1993,6 +1993,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     remaining,
                     step_ledger,
                     delegate_hint.as_deref(),
+                    &exposure,
                 )
             }));
             read_only_rounds = 0;
@@ -2158,6 +2159,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
+                        &exposure,
                         round > 0 && action_nudges,
                         |candidate| {
                             preflight_full_message_request(
@@ -2532,6 +2534,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
+                                    &exposure,
                                     round > 0 && action_nudges,
                                     |candidate| {
                                         preflight_full_message_request(
@@ -2930,7 +2933,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             workflow_classifier_text(&messages, content);
                         let workflow_hint = nudge_classification
                             .is_plan_update()
-                            .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text))
+                            .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text, &exposure))
                             .flatten();
                         let classifier_plan_direction = nudge_classification
                             .is_plan_update()
@@ -3059,12 +3062,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 nudge_classifier
                                     .direction_for(nudge_classification.class)
                                     .map(workflow_guidance)
-                                    .unwrap_or_else(narration_action_nudge)
+                                    .unwrap_or_else(|| narration_action_nudge(&exposure))
                             } else {
                                 escalated_narration_action_nudge(
                                     narration_nudges + 1,
                                     narration_nudge_cap,
                                     step_ledger,
+                                    &exposure,
                                 )
                             };
                             messages.push(serde_json::json!({
@@ -3278,6 +3282,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             outcome.action,
                             step_ledger,
                             prompt_context,
+                            &exposure,
                             round > 0 && action_nudges,
                             |candidate| {
                                 preflight_full_message_request(
@@ -4657,6 +4662,7 @@ impl WorkflowRuntimeState {
         hard_rounds_remaining: Option<usize>,
         step_ledger: Option<&dyn scheduled::StepLedger>,
         delegate_hint: Option<&str>,
+        exposure: &tools::ExposureSettings,
     ) -> Option<String> {
         if self.consecutive_read_only_rounds < self.initiative.read_only_nudge_after() {
             return None;
@@ -4666,6 +4672,7 @@ impl WorkflowRuntimeState {
             hard_rounds_remaining,
             step_ledger,
             delegate_hint,
+            exposure,
         );
         self.consecutive_read_only_rounds = 0;
         Some(nudge)
@@ -5494,16 +5501,36 @@ fn looks_like_unverified_stale_file_blocker(content: &str) -> bool {
         && BLOCKER_CUES.iter().any(|c| tail.contains(c))
 }
 
+/// The operator-visible names among `candidates`, phrased for a "for example"
+/// clause (`a`, `a or b`, `a, b, or c`). `None` when the policy hides them all,
+/// so a nudge never steers toward a tool the model cannot call (#2932): every
+/// recipe below is drawn from the same resolved set the catalog was.
+fn visible_examples(exposure: &tools::ExposureSettings, candidates: &[&str]) -> Option<String> {
+    let names: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|name| exposure.operator_visible(name))
+        .collect();
+    match names.as_slice() {
+        [] => None,
+        [one] => Some((*one).to_string()),
+        [a, b] => Some(format!("{a} or {b}")),
+        [init @ .., last] => Some(format!("{}, or {last}", init.join(", "))),
+    }
+}
+
 /// The corrective injected when the model narrated its next action but emitted
 /// no tool call (the narrate-then-stop stall). Sibling of [`read_only_action_nudge`].
-fn narration_action_nudge() -> String {
-    workflow_guidance(
+fn narration_action_nudge(exposure: &tools::ExposureSettings) -> String {
+    let example = visible_examples(exposure, &["edit_file", "write_file"])
+        .map(|names| format!(" (for example {names} with the real arguments)"))
+        .unwrap_or_default();
+    workflow_guidance(format!(
         "You described what you were about to do but did not call any tool, so \
-     nothing actually happened. If you intended to act, emit the tool call now \
-     (for example edit_file or write_file with the real arguments) — do not just \
-     describe it. If you are genuinely finished, say so explicitly in one \
-     sentence.",
-    )
+         nothing actually happened. If you intended to act, emit the tool call now\
+         {example} — do not just describe it. If you are genuinely finished, say so \
+         explicitly in one sentence."
+    ))
 }
 
 /// The act-now directive appended after a mid-turn compaction replaced the
@@ -5524,6 +5551,7 @@ fn post_compaction_continuation(
     worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     prompt_context: prompt_read::PromptReadContext<'_>,
+    exposure: &tools::ExposureSettings,
 ) -> String {
     // Retain every step and status after compaction without making the saved
     // plan override a newer operator correction.
@@ -5538,31 +5566,48 @@ fn post_compaction_continuation(
         .unwrap_or_default();
     // The exact prompt is already protected in the active-prompt metadata/user pair;
     // point at its immutable identity instead of injecting a lossy 400-char
-    // quote as a fresh user message.
+    // quote as a fresh user message. The recovery recipes name a tool only
+    // when the operator left it visible (#2932): the card is still there to
+    // re-read either way.
+    let prompt_read_visible = exposure.operator_visible("prompt_read");
     let instruction_clause = prompt_context.active_receipt().map_or_else(
         || {
-            " Re-read the protected [NEWT ACTIVE PROMPT v1] prompt pair (or call \
-             prompt_read with address `current`) before continuing."
-                .to_string()
+            if prompt_read_visible {
+                " Re-read the protected [NEWT ACTIVE PROMPT v1] prompt pair (or call \
+                 prompt_read with address `current`) before continuing."
+            } else {
+                " Re-read the protected [NEWT ACTIVE PROMPT v1] prompt pair before continuing."
+            }
+            .to_string()
         },
         |receipt| {
             format!(
                 " The authoritative operator prompt is protected in the [NEWT ACTIVE \
-                 PROMPT v1] metadata/user pair at address {} with model digest {}; call prompt_read \
-                 with address `current` to recover it verbatim before continuing.",
+                 PROMPT v1] metadata/user pair at address {} with model digest {}; {} \
+                 before continuing.",
                 receipt.id(),
-                receipt.model_digest()
+                receipt.model_digest(),
+                if prompt_read_visible {
+                    "call prompt_read with address `current` to recover it verbatim"
+                } else {
+                    "re-read it there"
+                }
             )
         },
     );
+    let artifact_clause = if exposure.operator_visible("artifact_read") {
+        " For prompt-rooted work, use artifact_read {\"address\":\"root\"} before deciding \
+         what remains."
+    } else {
+        ""
+    };
     let task_clause = worktree_session
         .and_then(crate::worktree_adoption::WorktreeSession::task_hint)
         .map(|hint| format!("\n{hint}\n"))
         .unwrap_or_default();
     workflow_guidance(format!(
         "{} You are mid-task: the context above was just compacted, not \
-         completed.{instruction_clause}{plan_clause}{task_clause} For prompt-rooted work, \
-         use artifact_read {{\"address\":\"root\"}} before deciding what remains. \
+         completed.{instruction_clause}{plan_clause}{task_clause}{artifact_clause} \
          When continuing, your next output should be the next concrete tool call; re-read \
          files before editing. To re-anchor on ground truth, check the current git branch and the last few \
          commits: earlier work may already be COMMITTED, so a clean working tree does NOT mean \
@@ -5599,6 +5644,7 @@ fn apply_post_compaction_continuation(
     action: CompressAction,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     prompt_context: prompt_read::PromptReadContext<'_>,
+    exposure: &tools::ExposureSettings,
     enabled_mid_turn: bool,
     admit: impl FnOnce(&[serde_json::Value]) -> bool,
 ) {
@@ -5617,7 +5663,7 @@ fn apply_post_compaction_continuation(
     candidate.retain(|m| !compress::is_continuation_message(m));
     candidate.push(serde_json::json!({
         "role": "user",
-        "content": post_compaction_continuation(worktree_session, step_ledger, prompt_context),
+        "content": post_compaction_continuation(worktree_session, step_ledger, prompt_context, exposure),
     }));
     if admit(&candidate) {
         *messages = candidate;
@@ -5633,15 +5679,18 @@ fn escalated_narration_action_nudge(
     attempt: usize,
     cap: usize,
     step_ledger: Option<&dyn scheduled::StepLedger>,
+    exposure: &tools::ExposureSettings,
 ) -> String {
     let step_clause = active_step_description(step_ledger)
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
+    let example = visible_examples(exposure, &["read_file", "edit_file", "run_command"])
+        .map(|names| format!(" (for example {names} with real arguments)"))
+        .unwrap_or_default();
     workflow_guidance(format!(
         "Reminder {attempt}/{cap}: you again described an action without calling \
          a tool, so nothing has happened.{step_clause} Your NEXT output must be \
-         exactly one tool call that starts that action (for example read_file, \
-         edit_file, or run_command with real arguments) — no prose before it. \
+         exactly one tool call that starts that action{example} — no prose before it. \
          If you are blocked, state the one concrete blocker in a single \
          sentence instead of announcing more intentions."
     ))
@@ -5763,7 +5812,19 @@ fn read_only_action_nudge(
     hard_rounds_remaining: Option<usize>,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     delegate_hint: Option<&str>,
+    exposure: &tools::ExposureSettings,
 ) -> String {
+    // Steer toward the write tools only when the operator left them visible;
+    // under `read_only` the change the model can still make is its answer.
+    let act_clause = visible_examples(exposure, &["edit_file", "write_file"])
+        .map(|names| format!("call {names} now"))
+        .unwrap_or_else(|| "act on it now with the tools you have, or answer".to_string());
+    let edit_clause = if exposure.operator_visible("edit_file") {
+        " Before edit_file, read the ONE file you are about to change so old_string \
+         matches exact text; never guess old_string or repeat a failed edit."
+    } else {
+        ""
+    };
     let plan_clause = if step_ledger.and_then(plan_reseat_pointer).is_some() {
         " You have an active multi-step plan; continue the ACTIVE step when it still \
          matches the operator's request."
@@ -5785,10 +5846,9 @@ fn read_only_action_nudge(
     workflow_guidance(format!(
         "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
          making the change. This is a nudge, not a limit — you may still read, but if \
-         you have enough context, call edit_file or write_file now. {PERMISSION_RECOVERY_GUIDANCE} \
+         you have enough context, {act_clause}. {PERMISSION_RECOVERY_GUIDANCE} \
          If you truly cannot proceed yet, state the \
-         exact blocker. Before edit_file, read the ONE file you are about to change so \
-         old_string matches exact text; never guess old_string or repeat a failed edit.\
+         exact blocker.{edit_clause}\
          {plan_clause}{delegate_clause}{round_clause}]"
     ))
 }
@@ -7142,7 +7202,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // nudge once the initiative level's read-only budget is spent.
             let remaining = (workflow_grace_rounds == 0)
                 .then_some(current_tool_round_limit.saturating_sub(round + 1));
-            if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
+            if let Some(nudge) =
+                workflow_runtime.action_forcing_nudge(remaining, step_ledger, None, &exposure)
             {
                 if debug {
                     print_debug(
@@ -7294,6 +7355,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
+                        &exposure,
                         round > 0 && action_nudges,
                         |candidate| {
                             openai_chat_wire_messages(candidate).is_ok_and(|wire| {
@@ -7734,6 +7796,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
+                                    &exposure,
                                     round > 0 && action_nudges,
                                     |candidate| {
                                         openai_chat_wire_messages(candidate).is_ok_and(|wire| {
@@ -8179,7 +8242,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let workflow_hint = nudge_classification
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
-                .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
+                .and_then(|_| {
+                    workflow_steerer.plan_update_hint(&workflow_classifier_text, &exposure)
+                });
             let classifier_plan_direction = nudge_classification
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
@@ -8307,12 +8372,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             nudge_classifier.direction_for(classification.class)
                         })
                         .map(workflow_guidance)
-                        .unwrap_or_else(narration_action_nudge)
+                        .unwrap_or_else(|| narration_action_nudge(&exposure))
                 } else {
                     escalated_narration_action_nudge(
                         narration_nudges + 1,
                         narration_nudge_cap,
                         step_ledger,
+                        &exposure,
                     )
                 };
                 messages.push(serde_json::json!({
@@ -10012,7 +10078,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // Initiative action-forcing — mirrors the OpenAI path.
             let remaining = (workflow_grace_rounds == 0)
                 .then_some(current_tool_round_limit.saturating_sub(round + 1));
-            if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
+            if let Some(nudge) =
+                workflow_runtime.action_forcing_nudge(remaining, step_ledger, None, &exposure)
             {
                 if debug {
                     print_debug(
@@ -10144,6 +10211,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
+                        &exposure,
                         round > 0 && action_nudges,
                         |candidate| {
                             anthropic_wire::anthropic_wire_messages(candidate).is_ok_and(
@@ -10452,6 +10520,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
+                                    &exposure,
                                     round > 0 && action_nudges,
                                     |candidate| {
                                         anthropic_wire::anthropic_wire_messages(candidate)
@@ -11023,7 +11092,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let workflow_hint = nudge_classification
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
-                .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
+                .and_then(|_| {
+                    workflow_steerer.plan_update_hint(&workflow_classifier_text, &exposure)
+                });
             let classifier_plan_direction = nudge_classification
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
@@ -11148,12 +11219,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                             nudge_classifier.direction_for(classification.class)
                         })
                         .map(workflow_guidance)
-                        .unwrap_or_else(narration_action_nudge)
+                        .unwrap_or_else(|| narration_action_nudge(&exposure))
                 } else {
                     escalated_narration_action_nudge(
                         narration_nudges + 1,
                         narration_nudge_cap,
                         step_ledger,
+                        &exposure,
                     )
                 };
                 messages.push(serde_json::json!({

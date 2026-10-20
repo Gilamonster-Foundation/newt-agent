@@ -862,3 +862,127 @@ async fn exact_search_recovers_a_full_profile_tool_clipped_only_by_the_wire() {
         assert!(wire.last_tool_result(&requests[1]).contains("did not run"));
     }
 }
+
+/// Under the pi-style four-tool list, the recovery recipes the initial card
+/// omits must not come back later in the turn: a forced mid-turn compaction
+/// appends the continuation directive, and that directive names only tools
+/// the operator left visible (`prompt_read`, `artifact_read` are hidden).
+/// The Responses loop ignores the trim threshold and has no continuation, so
+/// it is not replayed here.
+async fn a_mid_turn_compaction_never_restores_hidden_recovery_recipes(wire: Wire) {
+    let (server, requests) = scripted(
+        wire,
+        vec![
+            ("read_file", serde_json::json!({"path": "missing-one.txt"})),
+            ("read_file", serde_json::json!({"path": "missing-two.txt"})),
+        ],
+    )
+    .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.action_nudges = true;
+    // The card pair plus history fit on round 0; the first tool exchange
+    // grows the list past the threshold and forces a MID-TURN compaction.
+    context.mid_loop_trim_threshold = 5;
+    context.exposure.allow_list = Some(
+        ["read_file", "run_command", "edit_file", "write_file"]
+            .map(String::from)
+            .to_vec(),
+    );
+    wire.run(context, &mut NoMcp).await;
+
+    let requests = requests.lock().unwrap();
+    let continued = requests
+        .iter()
+        .any(|r| r.to_string().contains(compress::CONTINUATION_PREFIX));
+    assert!(
+        continued,
+        "{wire:?}: the continuation directive must reach the wire"
+    );
+    for (i, request) in requests.iter().enumerate() {
+        let body = request.to_string();
+        for hidden in ["prompt_read", "artifact_read"] {
+            assert!(
+                !body.contains(hidden),
+                "{wire:?}: request {i} names hidden {hidden}: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_mid_turn_compaction_never_restores_hidden_recovery_recipes_on_ollama() {
+    a_mid_turn_compaction_never_restores_hidden_recovery_recipes(Wire::Ollama).await;
+}
+
+#[tokio::test]
+async fn chat_completions_compaction_never_restores_hidden_recovery_recipes() {
+    a_mid_turn_compaction_never_restores_hidden_recovery_recipes(Wire::ChatCompletions).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn anthropic_compaction_never_restores_hidden_recovery_recipes() {
+    let _env = crate::agentic::anthropic_loop_tests::test_env(false);
+    a_mid_turn_compaction_never_restores_hidden_recovery_recipes(Wire::Anthropic).await;
+}
+
+/// Under `read_only`, the read-only-rounds nudge still fires but never asks for
+/// `edit_file` / `write_file`: the operator removed write authority, so a
+/// steer toward those tools would contradict the policy and be refused.
+/// The Responses loop has no read-only nudge.
+async fn read_only_nudges_never_name_write_tools(wire: Wire) {
+    let (server, requests) = scripted(
+        wire,
+        vec![
+            ("read_file", serde_json::json!({"path": "missing-one.txt"})),
+            ("read_file", serde_json::json!({"path": "missing-two.txt"})),
+            (
+                "read_file",
+                serde_json::json!({"path": "missing-three.txt"}),
+            ),
+        ],
+    )
+    .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.action_nudges = true;
+    context.exposure.read_only = true;
+    wire.run(context, &mut NoMcp).await;
+
+    let requests = requests.lock().unwrap();
+    let nudged = requests
+        .iter()
+        .any(|r| r.to_string().contains("read-only rounds so far"));
+    assert!(nudged, "{wire:?}: the read-only nudge must reach the wire");
+    for (i, request) in requests.iter().enumerate() {
+        let body = request.to_string();
+        for hidden in ["edit_file", "write_file"] {
+            assert!(
+                !body.contains(hidden),
+                "{wire:?}: request {i} names hidden {hidden}: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn read_only_nudges_never_name_write_tools_on_ollama() {
+    read_only_nudges_never_name_write_tools(Wire::Ollama).await;
+}
+
+#[tokio::test]
+async fn chat_completions_read_only_nudges_never_name_write_tools() {
+    read_only_nudges_never_name_write_tools(Wire::ChatCompletions).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn anthropic_read_only_nudges_never_name_write_tools() {
+    let _env = crate::agentic::anthropic_loop_tests::test_env(false);
+    read_only_nudges_never_name_write_tools(Wire::Anthropic).await;
+}
