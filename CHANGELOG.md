@@ -27,9 +27,8 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   call, the timed-out result carries the literal `lifecycle action=build`
   call, and the `render_report` acknowledgement carries the correction rules.
   `find` no longer advertises its `code` alias (use `category=source`) or
-  `show_size`; both are still accepted. Measured with the new request report,
-  the tool schemas sent with each request drop from 26,296 to 19,004
-  characters (#2949).
+  `show_size`; both are still accepted. For the measured 30-tool headless request,
+  the serialized tool schemas drop from 26,296 to 19,057 characters (#2949).
 - The READMEs of `newt-git`, `agent-toolchain` and `newt-tools` are short
   pointers: what the crate is, who uses it, where it sits and where it is
   heading. `newt-git`'s behaviour and grant rules moved unchanged to
@@ -45,8 +44,8 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 - `--persona coder` sent the built-in identity twice, as the identity and
   again as the persona overlay (about 5 kB per request). `coder` is now seeded
   from `personas/coder.md`, a three-line placeholder. An installed `coder.md`
-  that is byte-for-byte the old seed is migrated on the next start; one with
-  any edit is left alone. The prompt builder no longer injects the default
+  that matches the old seed after trimming surrounding whitespace is migrated
+  on the next start; other edits are preserved. The prompt builder no longer injects the default
   identity on its own when no soul provider is installed (#2935).
 
 ### Release/CI
