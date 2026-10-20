@@ -11,6 +11,12 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [0.8.3] — 2026-10-20
 
+### Security
+
+- `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10: certificate verification
+  could accept distrusted intermediates (RUSTSEC-2026-0382), and the bundled
+  roots trusted distrusted emSign intermediates (RUSTSEC-2026-0381) (#2968).
+
 ### Added
 
 - `newt headless --dump-request FILE` writes the first provider request as a
