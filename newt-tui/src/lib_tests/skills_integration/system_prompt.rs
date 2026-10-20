@@ -352,17 +352,39 @@ async fn provider_annotations_labeled_independently_doer_2937() {
     memory.initialize_all(&ctx).await;
 
     let sink = newt_core::agentic::request_report::ReportSink::new();
-    let prompt = rebuild_system_prompt(ws.to_str().unwrap(), &memory, None, "sess-doer", Some(&sink));
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        None,
+        "sess-doer",
+        Some(&sink),
+    );
 
     sink.arm_capture_next();
     let _ = sink.observe_request(&[&prompt], None);
     let report = sink.last_report().expect("report captured");
-    let labels: Vec<&str> = report.system[0].components.iter().map(|c| c.label.as_str()).collect();
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
 
-    assert!(labels.contains(&"soul"), "doer must have 'soul' label; got {labels:?}");
-    assert!(labels.contains(&"agents"), "'agents' provider must be labeled; got {labels:?}");
-    assert!(labels.contains(&"note_store"), "'note_store' provider must be labeled; got {labels:?}");
-    assert!(labels.contains(&"workspace-header"), "workspace-header must be labeled; got {labels:?}");
+    assert!(
+        labels.contains(&"soul"),
+        "doer must have 'soul' label; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"agents"),
+        "'agents' provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"note_store"),
+        "'note_store' provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"workspace-header"),
+        "workspace-header must be labeled; got {labels:?}"
+    );
 
     // workspace-header must be a separate, short component — not one that swallows
     // provider blocks. The workspace header text is ~200 chars; provider content
@@ -373,7 +395,10 @@ async fn provider_annotations_labeled_independently_doer_2937() {
         .find(|c| c.label == "workspace-header")
         .expect("workspace-header component must exist")
         .chars;
-    assert!(ws_chars < 500, "workspace-header chars ({ws_chars}) must be small — not absorbing provider blocks");
+    assert!(
+        ws_chars < 500,
+        "workspace-header chars ({ws_chars}) must be small — not absorbing provider blocks"
+    );
 }
 
 // #2937: coach altitude — workspace-header must not swallow context providers.
@@ -406,17 +431,39 @@ async fn provider_annotations_labeled_independently_coach_2937() {
     coach_persona.profile.altitude = Some(newt_core::Altitude::Coach);
 
     let sink = newt_core::agentic::request_report::ReportSink::new();
-    let prompt = rebuild_system_prompt(ws.to_str().unwrap(), &memory, Some(&coach_persona), "sess-coach", Some(&sink));
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        Some(&coach_persona),
+        "sess-coach",
+        Some(&sink),
+    );
 
     sink.arm_capture_next();
     let _ = sink.observe_request(&[&prompt], None);
     let report = sink.last_report().expect("report captured");
-    let labels: Vec<&str> = report.system[0].components.iter().map(|c| c.label.as_str()).collect();
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
 
-    assert!(labels.contains(&"coach-soul"), "coach must have 'coach-soul' label; got {labels:?}");
-    assert!(labels.contains(&"agents"), "'agents' provider must be labeled; got {labels:?}");
-    assert!(labels.contains(&"note_store"), "'note_store' provider must be labeled; got {labels:?}");
-    assert!(labels.contains(&"workspace-header"), "workspace-header must be labeled; got {labels:?}");
+    assert!(
+        labels.contains(&"coach-soul"),
+        "coach must have 'coach-soul' label; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"agents"),
+        "'agents' provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"note_store"),
+        "'note_store' provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"workspace-header"),
+        "workspace-header must be labeled; got {labels:?}"
+    );
 
     let ws_chars = report.system[0]
         .components
@@ -424,11 +471,20 @@ async fn provider_annotations_labeled_independently_coach_2937() {
         .find(|c| c.label == "workspace-header")
         .expect("workspace-header component must exist")
         .chars;
-    assert!(ws_chars < 500, "workspace-header chars ({ws_chars}) must not absorb provider blocks");
+    assert!(
+        ws_chars < 500,
+        "workspace-header chars ({ws_chars}) must not absorb provider blocks"
+    );
 
     // Prompt must contain AGENTS.md and notes content despite coach altitude.
-    assert!(prompt.contains("Always ask before acting"), "agents content must reach prompt");
-    assert!(prompt.contains("uses just check"), "notes content must reach prompt");
+    assert!(
+        prompt.contains("Always ask before acting"),
+        "agents content must reach prompt"
+    );
+    assert!(
+        prompt.contains("uses just check"),
+        "notes content must reach prompt"
+    );
 }
 
 // #2937: when no soul provider is present, context providers (agents, notes)
@@ -454,18 +510,43 @@ async fn no_soul_provider_context_providers_still_annotated_2937() {
     memory.initialize_all(&ctx).await;
 
     let sink = newt_core::agentic::request_report::ReportSink::new();
-    let prompt = rebuild_system_prompt(ws.to_str().unwrap(), &memory, None, "sess-nosoul", Some(&sink));
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        None,
+        "sess-nosoul",
+        Some(&sink),
+    );
 
     // No DEFAULT_SOUL fallback — the builder never invents one (#2935).
-    let first_line = newt_core::DEFAULT_SOUL.lines().find(|l| !l.is_empty()).unwrap();
-    assert!(!prompt.contains(first_line), "builder must not inject DEFAULT_SOUL; got: {prompt:.200}");
+    let first_line = newt_core::DEFAULT_SOUL
+        .lines()
+        .find(|l| !l.is_empty())
+        .unwrap();
+    assert!(
+        !prompt.contains(first_line),
+        "builder must not inject DEFAULT_SOUL; got: {prompt:.200}"
+    );
 
     sink.arm_capture_next();
     let _ = sink.observe_request(&[&prompt], None);
     let report = sink.last_report().expect("report captured");
-    let labels: Vec<&str> = report.system[0].components.iter().map(|c| c.label.as_str()).collect();
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
 
-    assert!(labels.contains(&"agents"), "'agents' must be labeled even with no soul; got {labels:?}");
-    assert!(labels.contains(&"note_store"), "'note_store' must be labeled even with no soul; got {labels:?}");
-    assert!(!labels.contains(&"soul"), "no soul provider means no 'soul' label; got {labels:?}");
+    assert!(
+        labels.contains(&"agents"),
+        "'agents' must be labeled even with no soul; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"note_store"),
+        "'note_store' must be labeled even with no soul; got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"soul"),
+        "no soul provider means no 'soul' label; got {labels:?}"
+    );
 }
