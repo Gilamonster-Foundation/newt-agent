@@ -27,6 +27,7 @@ agent-mesh-protocol = { git = "https://github.com/Gilamonster-Foundation/agent-m
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 tempfile.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

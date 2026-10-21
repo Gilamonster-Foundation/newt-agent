@@ -37,6 +37,42 @@ members = [
     "tests/common",
     "tests/pty",
 ]
+# Every member except `newt-flock`: its agent-mesh dependencies are git-only
+# until the flock crates are on crates.io, so a plain `cargo build` leaves it
+# out. CI and the ratchets still see it as a member; build it with
+# `-p newt-flock` (newt-flock/tests/default_build.rs asserts the split).
+default-members = [
+    "newt-core",
+    "newt-data",
+    "newt-inference",
+    "newt-tools",
+    "newt-skills",
+    "newt-tui",
+    "newt-acp-worker",
+    "newt-mcp-server",
+    "newt-mcp-data",
+    "newt-mcp-client",
+    "newt-cli",
+    "newt-coder",
+    "newt-identity",
+    "newt-interaction",
+    "newt-scheduler",
+    "newt-git",
+    "crates/newt-launch",
+    "crates/newt-carried-tools",
+    "crates/newt-tuner",
+    "newt-eval",
+    "scripts/eval/rust-evidence",
+    "newt-agent-py",
+    "agent-frame",
+    "agent-harness",
+    "agent-harness-py",
+    "agent-toolchain",
+    "plugins-protocol",
+    "providers/openai",
+    "tests/common",
+    "tests/pty",
+]
 # `newt-mesh` is intentionally NOT a workspace member: it depends on
 # `../agent-mesh/` via path, which isn't present on stock GitHub
 # Actions checkouts. Keeping it out of `members` lets the default
