@@ -901,6 +901,10 @@ fn rehydrate_pending_clarification(
         .first()
         .copied()
         .ok_or_else(|| anyhow::anyhow!("clarification receipt lineage is empty"))?;
+    // A flock task is never an Ask clarification: nothing is pending.
+    if root.origin() == newt_core::PromptOrigin::Flock {
+        return Ok(None);
+    }
     if root.origin() != newt_core::PromptOrigin::Operator {
         anyhow::bail!("clarification objective root is not an operator prompt");
     }
@@ -2877,6 +2881,8 @@ fn session_body(
     // staged switch. That keeps the hot path untouched: an active tab reads
     // plain locals exactly as before tabs existed.
     let mut tabs = crate::tabs::TabSet::new(lifecycle_session.clone(), &active_conversation_id);
+    // 12b: operator input outranks a queued flock task (see `FlockTurnGate`).
+    let mut flock_gate = crate::flock_intake::FlockTurnGate::default();
     // Unsubmitted prompt text for the ACTIVE tab. PR-C threads this to the
     // rich input's type-ahead seam; in PR-A it is the stash slot the staged
     // switch reads and writes, so the switch contract is complete and
@@ -3438,9 +3444,12 @@ fn session_body(
                 // a time, only here at the loop head: busy work is never
                 // interrupted and the rest stay queued. Rows that fail their
                 // own evidence are refused (and said so) on the way.
+                let degraded =
+                    crate::tab_switch::degraded_turn_refusal(tabs.active().pin_degraded.as_ref())
+                        .is_some();
                 conversation_store
                     .as_ref()
-                    .map(|s| crate::flock_intake::next_flock_task(s, &active_conversation_id))
+                    .map(|s| flock_gate.poll(s, &active_conversation_id, degraded))
             })
             .flatten()
             .and_then(|next| {
@@ -7544,6 +7553,9 @@ fn session_body(
                     // `/backends`, `/psyche` and `/tab` all still work.
                     print_newt(&refusal, color, verbose);
                     println!();
+                    if matches!(model_input_origin, ModelInputOrigin::FlockTask { .. }) {
+                        flock_gate.yield_to_operator();
+                    }
                     continue;
                 } else {
                     // Past every interception (`!shell`, `/command`, help,
@@ -7602,6 +7614,10 @@ fn session_body(
                                     verbose,
                                 );
                                 println!();
+                                if matches!(model_input_origin, ModelInputOrigin::FlockTask { .. })
+                                {
+                                    flock_gate.yield_to_operator();
+                                }
                                 continue;
                             }
                         }

@@ -537,3 +537,65 @@ fn an_older_database_is_migrated_to_allow_the_flock_origin() {
         .unwrap();
     assert_eq!(violations, 0);
 }
+
+/// Review 2976 r1 finding 1: a self-rooted flock receipt must be readable by
+/// every lineage reader: context rebuild (resume), an operator continuation,
+/// a harness retry (durable and ephemeral) and an artifact write.
+#[test]
+fn a_flock_rooted_objective_can_be_resumed_continued_retried_and_annotated() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+    let conv = store.create("session", None).unwrap();
+    store
+        .enqueue_flock_task(&conv, &flock_task("e1", "the brief"))
+        .unwrap();
+    let task = store.peek_flock_task(&conv).unwrap().unwrap();
+    let ctx = store
+        .accept_flock_task(&conv, "session", None, &task)
+        .unwrap();
+    let id = ctx.submitted_prompt().id();
+
+    // resume: the context rebuilds, and the flock receipt is its own authority
+    let again = store.turn_prompt_context(&conv, id).unwrap().unwrap();
+    assert_eq!(again.submitted_prompt().id(), id);
+    assert_eq!(again.active().id(), id);
+    assert_eq!(again.active().receipt().origin(), PromptOrigin::Flock);
+
+    // an operator continuation and a harness retry attach to it
+    let cont = store
+        .begin_prompt(
+            &conv,
+            "session",
+            None,
+            NewPrompt::operator_continuation("go on", "go on", id),
+        )
+        .unwrap();
+    assert_eq!(cont.submitted_prompt().receipt().root_prompt_id(), id);
+    let retry = store
+        .begin_prompt(
+            &conv,
+            "session",
+            None,
+            NewPrompt::harness_retry("retry", "retry", id),
+        )
+        .unwrap();
+    assert_eq!(retry.active().id(), id, "authority stays the task");
+
+    // an ephemeral retry from the rebuilt context
+    let eph =
+        crate::TurnPromptContext::ephemeral_harness_retry(conv.clone(), "r", "r", &again).unwrap();
+    assert_eq!(eph.active().id(), id);
+
+    // an artifact can be written against it
+    store
+        .append_prompt_artifact(
+            &conv,
+            id,
+            crate::NewPromptArtifact::new(
+                crate::ArtifactKind::Decision,
+                crate::ArtifactRelation::DerivedFrom,
+            ),
+        )
+        .unwrap();
+}

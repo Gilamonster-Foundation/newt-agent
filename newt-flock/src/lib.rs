@@ -29,7 +29,7 @@ use content_addressable::{ContentAddressable, MerkleNode};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -188,17 +188,41 @@ impl Inbox {
         Self::start_with(cfg, |_| {})
     }
 
+    /// Follow with a callback and nothing else: like [`start_with`](Self::start_with)
+    /// but no observation is ever buffered, so [`events`](Self::events) is
+    /// empty and closed. How the worker ended is still reported by
+    /// [`stop`](Self::stop); a pass that finds the server away is retried.
+    ///
+    /// # Errors
+    /// See [`Error`].
+    pub fn follow(
+        cfg: Config,
+        on_state: impl FnMut(&Follower) + Send + 'static,
+    ) -> Result<Self, Error> {
+        Self::launch(cfg, on_state, false)
+    }
+
     /// [`start`](Self::start), and `on_state` is called on the worker with the
     /// verified follower: once for the board the reader saved earlier (so
     /// work that arrived before a restart is seen even if no new frame ever
-    /// comes) and again after every frame and catch-up, always after the
-    /// reader has saved. It never sees anything the reader did not verify.
+    /// comes) and again at each catch-up, always after the reader has saved.
+    /// Never for a frame in the middle of a replay: a prefix of the log shows
+    /// work as open that a later frame closes. It never sees anything the
+    /// reader did not verify.
     ///
     /// # Errors
     /// See [`Error`].
     pub fn start_with(
         cfg: Config,
+        on_state: impl FnMut(&Follower) + Send + 'static,
+    ) -> Result<Self, Error> {
+        Self::launch(cfg, on_state, true)
+    }
+
+    fn launch(
+        cfg: Config,
         mut on_state: impl FnMut(&Follower) + Send + 'static,
+        observe: bool,
     ) -> Result<Self, Error> {
         match call(&cfg.session, &CtlReq::Whoami).map_err(|e| Error::Session(e.to_string()))? {
             CtlResp::Who {
@@ -224,6 +248,11 @@ impl Inbox {
                 private_dir(&cfg.state_dir).map_err(ReaderError::Io)?;
                 let mut reader = Reader::open(cfg.genesis.clone(), &cfg.state_dir, RealFs)?;
                 let (tx, rx) = channel();
+                // callback-only: nothing is ever sent, and the channel is closed
+                let tx = observe.then_some(tx);
+                let send = move |tx: &Option<Sender<Observed>>, o: Observed| {
+                    tx.as_ref().is_some_and(|t| t.send(o).is_err())
+                };
                 let halt = Arc::new(Halt::default());
                 let flag = Arc::clone(&halt);
                 let thread = thread::spawn(move || {
@@ -242,22 +271,24 @@ impl Inbox {
                         let r = conn.and_then(|conn| {
                             reader.follow_on(conn, &prove, true, &mut |s| match s {
                                 Seen::Frame(f, fol) => {
-                                    on_state(fol);
                                     removed =
                                         !fol.board().members().iter().any(|m| m.name == member);
-                                    gone |= tx
-                                        .send(Observed::Frame {
+                                    gone |= send(
+                                        &tx,
+                                        Observed::Frame {
                                             frame: f.to_vec(),
                                             admitted: fol.admitted(),
-                                        })
-                                        .is_err();
+                                        },
+                                    );
                                 }
                                 Seen::Caught(i, fol) => {
                                     on_state(fol);
                                     removed =
                                         !fol.board().members().iter().any(|m| m.name == member);
-                                    gone |= tx.send(Observed::Caught(i)).is_err();
-                                    gone |= tx.send(Observed::Asks(view(fol.board()))).is_err();
+                                    gone |= send(&tx, Observed::Caught(i));
+                                    if tx.is_some() {
+                                        gone |= send(&tx, Observed::Asks(view(fol.board())));
+                                    }
                                 }
                             })
                         });
@@ -278,7 +309,7 @@ impl Inbox {
                             }
                             Err(ReaderError::Save(e)) => return Ended::Failed(e.to_string()),
                             Err(e @ (ReaderError::Stream(_) | ReaderError::Io(_)))
-                                if tx.send(Observed::Unavailable(e.to_string())).is_err() =>
+                                if send(&tx, Observed::Unavailable(e.to_string())) =>
                             {
                                 return Ended::Stopped;
                             }

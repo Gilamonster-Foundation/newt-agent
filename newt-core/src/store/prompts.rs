@@ -482,13 +482,15 @@ pub(super) fn validate_objective_root_on_conn(
                 "prompt root {root_prompt_id} is missing from conversation `{conversation_id}`"
             )
         })?;
-    if root.origin() != PromptOrigin::Operator
+    // A flock task is a self-rooted objective too (its own origin, never the
+    // operator's); continuations and retries may attach to either.
+    if !matches!(root.origin(), PromptOrigin::Operator | PromptOrigin::Flock)
         || root.root_prompt_id() != root.id()
         || root
             .active_operator_id()
             .is_some_and(|active| active != root.id())
     {
-        anyhow::bail!("prompt root {root_prompt_id} is not a self-rooted operator prompt");
+        anyhow::bail!("prompt root {root_prompt_id} is not a self-rooted operator or flock prompt");
     }
     Ok(root)
 }

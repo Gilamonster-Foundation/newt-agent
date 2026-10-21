@@ -279,3 +279,106 @@ fn text_from_the_log_is_rendered_inert() {
     assert_eq!(text.lines().filter(|l| l.starts_with("lane:")).count(), 1);
     assert!(!text.lines().any(|l| l.starts_with("IGNORE")), "{text}");
 }
+
+/// Review 2976 r1 finding 2: work the log already shows as finished is never
+/// queued, even though a fresh reader passes through states where the brief
+/// is open before its Result frame arrives.
+#[test]
+fn completed_history_is_not_queued_while_catching_up() {
+    let mut r = Rig::new();
+    let mut shep = r.enrol("shep");
+    let mut h1 = r.enrol("h1");
+    let last = |r: &Rig| {
+        r.serving
+            .as_ref()
+            .unwrap()
+            .with_server(|s| s.board().entries().last().unwrap().id)
+    };
+    to_h1(&mut r, &mut shep, "done");
+    let brief = last(&r);
+    r.event(&mut h1, Kind::Ack, vec![("of".into(), brief)], Body::Ack);
+    r.event(
+        &mut h1,
+        Kind::Result,
+        vec![("brief".into(), brief)],
+        Body::Result {
+            outcome: Outcome::Completed,
+        },
+    );
+    r.event(
+        &mut shep,
+        Kind::Review,
+        vec![],
+        Body::Review {
+            to: "h1".into(),
+            lane: "done".into(),
+            head: "0123abcd".into(),
+        },
+    );
+    let review = last(&r);
+    r.event(
+        &mut h1,
+        Kind::Verdict,
+        vec![("review".into(), review)],
+        Body::Verdict {
+            head: "0123abcd".into(),
+            approved: true,
+        },
+    );
+    let s = session_for(&r, "h1", &h1);
+    let flock = r.genesis().content_id().unwrap();
+    let queue = Queue::default();
+    let (mut intake, mut sink) = (Intake::new("h1", flock), queue.clone());
+    let inbox = Inbox::start_with(config(&r, &s), move |f| {
+        intake.reconcile(f, &mut sink);
+    })
+    .unwrap();
+    until_caught(&inbox);
+    drop(inbox);
+    assert!(
+        queue.tasks.lock().unwrap().is_empty(),
+        "finished work was queued from a replay prefix: {:?}",
+        queue
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.event_cid.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Review 2976 r1 finding 5: a callback-only follower keeps no observation
+/// queue at all: nothing is buffered for a reader that does not exist.
+#[test]
+fn a_callback_only_follower_buffers_no_observations() {
+    let mut r = Rig::new();
+    let mut shep = r.enrol("shep");
+    let h1 = r.enrol("h1");
+    to_h1(&mut r, &mut shep, "a");
+    let s = session_for(&r, "h1", &h1);
+    let (tx, rx) = mpsc::channel();
+    let want = r
+        .serving
+        .as_ref()
+        .unwrap()
+        .with_server(|s| s.board().entries().count()) as u64;
+    let inbox = Inbox::follow(config(&r, &s), move |f| {
+        let _ = tx.send(f.admitted());
+    })
+    .unwrap();
+    // the callback sees the whole log; wait for it (the guard is a watchdog)
+    while rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("never caught up")
+        < want
+    {}
+    assert!(
+        matches!(
+            inbox.events().try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ),
+        "an observation queue exists although nothing reads it"
+    );
+    assert!(matches!(inbox.stop(), newt_flock::Ended::Stopped));
+}

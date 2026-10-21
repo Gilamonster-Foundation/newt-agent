@@ -628,8 +628,10 @@ impl TurnPromptContext {
                 parent_receipt.conversation_id()
             );
         }
-        if active_receipt.origin() != PromptOrigin::Operator
-            || active_receipt.active_operator_id() != Some(active_receipt.id())
+        if !matches!(
+            active_receipt.origin(),
+            PromptOrigin::Operator | PromptOrigin::Flock
+        ) || active_receipt.active_operator_id() != Some(active_receipt.id())
             || active_receipt.root_prompt_id() != parent_receipt.root_prompt_id()
         {
             anyhow::bail!("ephemeral harness retry has no validated operator authority");

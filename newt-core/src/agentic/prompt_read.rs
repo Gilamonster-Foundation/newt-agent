@@ -283,11 +283,11 @@ fn validate_session_objective_root(
         )
     })?;
     root.verify_integrity()?;
-    if root.origin() != PromptOrigin::Operator
+    if !matches!(root.origin(), PromptOrigin::Operator | PromptOrigin::Flock)
         || root.root_prompt_id() != root.id()
         || root.active_operator_id() != Some(root.id())
     {
-        anyhow::bail!("prompt root {root_id} is not a self-rooted operator prompt");
+        anyhow::bail!("prompt root {root_id} is not a self-rooted operator or flock prompt");
     }
     Ok(root)
 }

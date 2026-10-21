@@ -42,17 +42,11 @@ pub(crate) struct Next {
     pub(crate) rejected: Vec<String>,
 }
 
-/// Check a queued row against its own evidence.
+/// Check a queued row against its own evidence. Only a build that can verify
+/// polls at all (see [`next_flock_task`]).
+#[cfg(feature = "flock")]
 fn verify_row(row: &newt_core::FlockTask) -> Result<(), String> {
-    #[cfg(feature = "flock")]
-    {
-        newt_flock::verify(&to_new(&row.task)).map(drop)
-    }
-    #[cfg(not(feature = "flock"))]
-    {
-        let _ = row;
-        Err("this build cannot verify flock tasks".into())
-    }
+    newt_flock::verify(&to_new(&row.task)).map(drop)
 }
 
 #[cfg(feature = "flock")]
@@ -70,25 +64,68 @@ fn to_new(t: &newt_core::NewFlockTask) -> newt_flock::NewTask {
 /// verify is marked rejected (so it is never offered again) and the next is
 /// tried; nothing here runs a task. A store error ends the poll quietly: the
 /// queue is durable, so the next poll sees the same rows.
+///
+/// A build without `flock` cannot verify anything, and lack of a verifier is
+/// not a failed verification: it leaves every row queued and untouched for a
+/// build that can.
 pub(crate) fn next_flock_task(store: &newt_core::ConversationStore, conversation: &str) -> Next {
-    let mut next = Next::default();
-    loop {
-        let Ok(Some(row)) = store.peek_flock_task(conversation) else {
-            return next;
-        };
-        match verify_row(&row) {
-            Ok(()) => {
-                next.task = Some(row);
+    #[cfg(not(feature = "flock"))]
+    {
+        let _ = (store, conversation);
+        Next::default()
+    }
+    #[cfg(feature = "flock")]
+    {
+        let mut next = Next::default();
+        loop {
+            let Ok(Some(row)) = store.peek_flock_task(conversation) else {
                 return next;
-            }
-            Err(why) => {
-                // if it cannot even be marked, stop rather than spin on it
-                if store.reject_flock_task(&row).is_err() {
+            };
+            match verify_row(&row) {
+                Ok(()) => {
+                    next.task = Some(row);
                     return next;
                 }
-                next.rejected.push(why);
+                Err(why) => {
+                    // if it cannot even be marked, stop rather than spin on it
+                    if store.reject_flock_task(&row).is_err() {
+                        return next;
+                    }
+                    next.rejected.push(why);
+                }
             }
         }
+    }
+}
+
+/// Decides, at the loop head, whether a queued flock task may be selected
+/// instead of reading the operator. Operator input takes precedence: nothing
+/// is selected while the active tab cannot accept work, and a task whose
+/// admission just failed is not offered again until the operator has been
+/// read once. The row itself stays queued either way.
+#[derive(Debug, Default)]
+pub(crate) struct FlockTurnGate {
+    yield_once: bool,
+}
+
+impl FlockTurnGate {
+    /// The next verified task, or nothing when the operator goes first.
+    pub(crate) fn poll(
+        &mut self,
+        store: &newt_core::ConversationStore,
+        conversation: &str,
+        tab_degraded: bool,
+    ) -> Next {
+        if std::mem::take(&mut self.yield_once) || tab_degraded {
+            return Next::default();
+        }
+        next_flock_task(store, conversation)
+    }
+
+    /// The task just offered was not accepted (refused by the tab or the
+    /// store): read the operator before offering it again.
+    pub(crate) fn yield_to_operator(&mut self) {
+        self.yield_once = true;
     }
 }
 
@@ -150,7 +187,7 @@ mod follow {
                 conversation: conversation.to_owned(),
                 wake,
             };
-            let inbox = Inbox::start_with(cfg, move |f| {
+            let inbox = Inbox::follow(cfg, move |f| {
                 intake.reconcile(f, &mut sink);
             })?;
             Ok(Self { _inbox: inbox })

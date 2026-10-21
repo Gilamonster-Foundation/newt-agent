@@ -50,9 +50,11 @@ fn a_flock_origin_is_not_operator_input() {
     );
 }
 
+/// Review 2976 r1 finding 3: a build that cannot verify flock tasks must not
+/// touch them. Another build (with `flock`) will find the rows still queued.
 #[cfg(not(feature = "flock"))]
 #[test]
-fn a_build_that_cannot_verify_refuses_every_row_and_never_offers_it() {
+fn a_build_that_cannot_verify_leaves_every_row_queued_and_untouched() {
     let (_t, store, conv) = store();
     for e in ["e1", "e2"] {
         store
@@ -69,9 +71,60 @@ fn a_build_that_cannot_verify_refuses_every_row_and_never_offers_it() {
             .unwrap();
     }
     let next = next_flock_task(&store, &conv);
-    assert!(next.task.is_none());
-    assert_eq!(next.rejected.len(), 2);
-    assert_eq!(store.peek_flock_task(&conv).unwrap(), None);
+    assert!(next.task.is_none(), "nothing is offered");
+    assert!(next.rejected.is_empty(), "nothing is refused");
+    let row = store.peek_flock_task(&conv).unwrap().expect("still queued");
+    assert_eq!(row.task.event_cid, "e1", "the head row is untouched");
+    store.reject_flock_task(&row).unwrap(); // only a verifying build may do this
+    assert_eq!(
+        store
+            .peek_flock_task(&conv)
+            .unwrap()
+            .unwrap()
+            .task
+            .event_cid,
+        "e2"
+    );
+}
+
+/// Review 2976 r1 finding 4: operator input takes precedence. While the tab
+/// cannot accept work, or right after an admission failure, the loop head
+/// reads the operator instead of re-selecting the same queued row.
+#[test]
+fn a_queued_task_never_starves_operator_input() {
+    use crate::flock_intake::FlockTurnGate;
+    let (_t, store, conv) = store();
+    store
+        .enqueue_flock_task(
+            &conv,
+            &newt_core::NewFlockTask {
+                body: "b".into(),
+                flock_cid: "f".into(),
+                event_cid: "e1".into(),
+                evidence_cid: "c".into(),
+                evidence: "{}".into(),
+            },
+        )
+        .unwrap();
+    let mut gate = FlockTurnGate::default();
+    // a degraded tab: nothing is selected, however often the loop comes round
+    for _ in 0..3 {
+        assert!(gate.poll(&store, &conv, true).task.is_none());
+    }
+    assert!(store.peek_flock_task(&conv).unwrap().is_some(), "not lost");
+    // an admission failure yields one pass to the operator, then the row is
+    // offered again (it was never marked)
+    gate.yield_to_operator();
+    assert!(
+        gate.poll(&store, &conv, false).task.is_none(),
+        "operator first"
+    );
+    assert!(
+        store.peek_flock_task(&conv).unwrap().is_some(),
+        "still queued"
+    );
+    #[cfg(feature = "flock")]
+    let _ = gate.poll(&store, &conv, false); // verification needs real evidence
 }
 
 #[cfg(feature = "flock")]
@@ -203,4 +256,49 @@ mod with_flock {
         // the refused one never comes back, and its event stays deduped
         assert_eq!(next_flock_task(&store, &conv).rejected.len(), 0);
     }
+}
+
+/// Review 2976 r1 finding 1: an operator reply attached to an accepted flock
+/// task restores without error and is not a pending clarification.
+#[test]
+fn an_operator_reply_on_a_flock_task_restores_and_is_not_a_pending_clarification() {
+    let (_tmp, store, conv) = store();
+    store
+        .enqueue_flock_task(
+            &conv,
+            &newt_core::NewFlockTask {
+                body: "do the thing".into(),
+                flock_cid: "f".into(),
+                event_cid: "e1".into(),
+                evidence_cid: "ev1".into(),
+                evidence: "{}".into(),
+            },
+        )
+        .unwrap();
+    let task = store.peek_flock_task(&conv).unwrap().unwrap();
+    let ctx = store
+        .accept_flock_task(&conv, "flock session", None, &task)
+        .unwrap();
+    let reply = store
+        .begin_prompt(
+            &conv,
+            "flock session",
+            None,
+            newt_core::NewPrompt::operator_continuation(
+                "which one?",
+                "which one?",
+                ctx.submitted_prompt().id(),
+            ),
+        )
+        .unwrap();
+    let restored = store
+        .turn_prompt_context(&conv, reply.submitted_prompt().id())
+        .unwrap()
+        .expect("context");
+    assert!(
+        rehydrate_pending_clarification(&store, &conv, &restored)
+            .unwrap()
+            .is_none(),
+        "a flock objective is not an Ask clarification"
+    );
 }
