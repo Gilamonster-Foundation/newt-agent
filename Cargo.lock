@@ -77,7 +77,7 @@ name = "agent-bridle-core"
 version = "0.8.0-rc.5"
 dependencies = [
  "agent-bridle-fdguard",
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.7.0",
  "anyhow",
  "async-trait",
  "content-addressable",
@@ -166,6 +166,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-mesh-flock"
+version = "0.8.0"
+source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=8f1ee04066b7249999c6072888dd99a4630def68#8f1ee04066b7249999c6072888dd99a4630def68"
+dependencies = [
+ "agent-mesh-protocol 0.8.0",
+ "content-addressable",
+ "serde",
+]
+
+[[package]]
+name = "agent-mesh-flock-server"
+version = "0.8.0"
+source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=8f1ee04066b7249999c6072888dd99a4630def68#8f1ee04066b7249999c6072888dd99a4630def68"
+dependencies = [
+ "agent-mesh-flock",
+ "agent-mesh-protocol 0.8.0",
+ "blake3",
+ "content-addressable",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "rand 0.8.7",
+ "rustix 1.1.4",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "agent-mesh-flock-session"
+version = "0.8.0"
+source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=8f1ee04066b7249999c6072888dd99a4630def68#8f1ee04066b7249999c6072888dd99a4630def68"
+dependencies = [
+ "agent-mesh-flock",
+ "agent-mesh-flock-server",
+ "agent-mesh-protocol 0.8.0",
+ "content-addressable",
+ "ed25519-dalek",
+ "libc",
+ "rand 0.8.7",
+ "rustix 1.1.4",
+ "serde",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "agent-mesh-protocol"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -186,10 +234,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-mesh-protocol"
+version = "0.8.0"
+source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=8f1ee04066b7249999c6072888dd99a4630def68#8f1ee04066b7249999c6072888dd99a4630def68"
+dependencies = [
+ "blake3",
+ "content-addressable",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.7",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "ssh-key",
+ "thiserror 2.0.18",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "agent-toolchain"
 version = "0.1.0"
 dependencies = [
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.7.0",
  "content-addressable",
  "serde",
  "serde_bytes",
@@ -1235,9 +1302,9 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "content-addressable"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56f67d2c6abc332e3ce3121527028af12a71794cc059308d344aa0b88b9ac204"
+checksum = "d38e6c825208377cc35be2f02896c22fa43247b654aba55b183d2c5f7cd07744"
 dependencies = [
  "blake3",
  "ipld-core",
@@ -4480,7 +4547,7 @@ dependencies = [
 name = "newt-coder"
 version = "0.8.3"
 dependencies = [
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.7.0",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -4507,7 +4574,7 @@ dependencies = [
  "agent-bridle",
  "agent-bridle-fdguard",
  "agent-bridle-tool-shell",
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.7.0",
  "agent-toolchain",
  "anyhow",
  "async-trait",
@@ -4613,6 +4680,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-flock"
+version = "0.8.3"
+dependencies = [
+ "agent-mesh-flock",
+ "agent-mesh-flock-server",
+ "agent-mesh-flock-session",
+ "agent-mesh-protocol 0.8.0",
+ "content-addressable",
+ "ed25519-dalek",
+ "rand 0.8.7",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "newt-git"
 version = "0.8.3"
 dependencies = [
@@ -4645,7 +4728,7 @@ dependencies = [
 name = "newt-identity"
 version = "0.8.3"
 dependencies = [
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.7.0",
  "base64 0.22.1",
  "chrono",
  "content-addressable",
@@ -4659,7 +4742,7 @@ dependencies = [
 name = "newt-inference"
 version = "0.8.3"
 dependencies = [
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.7.0",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -4742,7 +4825,7 @@ name = "newt-mcp-server"
 version = "0.8.3"
 dependencies = [
  "agent-bridle",
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.7.0",
  "anyhow",
  "newt-core",
  "newt-git",
@@ -4833,7 +4916,7 @@ dependencies = [
 name = "newt-tui"
 version = "0.8.3"
 dependencies = [
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.7.0",
  "anyhow",
  "async-trait",
  "base64 0.22.1",

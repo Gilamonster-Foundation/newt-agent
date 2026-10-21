@@ -1,0 +1,35 @@
+[package]
+name = "newt-flock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "A verified, read-only follower of an agent-mesh flock for newt (the inbox's read side)."
+# Not on crates.io until the agent-mesh flock crates are: they are git-only here.
+publish = false
+
+[dependencies]
+# Pinned to one agent-mesh main revision until the flock crates are published.
+# Read side only: no `serve` / `emit`, so no server, no signing key.
+agent-mesh-flock = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "8f1ee04066b7249999c6072888dd99a4630def68" }
+agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "8f1ee04066b7249999c6072888dd99a4630def68", default-features = false }
+agent-mesh-flock-session = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "8f1ee04066b7249999c6072888dd99a4630def68", default-features = false }
+# The Prover's types (a stream challenge and its proof); newt signs nothing.
+agent-mesh-protocol = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "8f1ee04066b7249999c6072888dd99a4630def68" }
+# A connect that returns instead of waiting when the peer's accept queue is full.
+socket2 = "0.6"
+content-addressable.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Writer features are for the in-process fixture only.
+agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "8f1ee04066b7249999c6072888dd99a4630def68", features = ["serve"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -121,6 +121,12 @@ jobs:
         # feature the tests enable makes a feature-gated lint regression
         # invisible until someone builds it locally.
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+      # HOOK PARITY: CI-only; named in .githooks/pre-push. The read-only
+      # newt-flock library on its own, without dev-dependencies: its test
+      # fixture enables the agent-mesh writer features, so tests and
+      # `--all-targets` clippy cannot see a production-only build break (#2973).
+      - name: newt-flock production library builds
+        run: cargo check -p newt-flock --lib --locked
       # OCAP security gates (pure-Python, no cargo deps). Mirrored by the
       # `ocap-check` + `spawn-inventory` recipes in the justfile.
       - name: OCAP register honesty (ocap-check)

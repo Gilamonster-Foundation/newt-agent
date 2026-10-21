@@ -106,6 +106,9 @@
 #   - `just cov-ci` (coverage floor, cargo-llvm-cov instrumented whole-workspace)
 #   - the `--no-default-features` lean build/test config (issue #416, #1409, #1828)
 #   - `just msrv` (MSRV toolchain check)
+#   - `cargo check -p newt-flock --lib --locked` (ci.yml lint job): the read-only
+#     library without dev-dependencies; its fixture's writer features hide a
+#     production-only build break from every test/clippy run (#2973)
 #   - `just audit` (cargo-audit against .cargo/audit.toml)
 #   - `just eval-selftest` (bench/harbor and refactor-grader offline fixture suites;
 #     .github/workflows/ci.yml lint job runs scripts/eval/tests)
