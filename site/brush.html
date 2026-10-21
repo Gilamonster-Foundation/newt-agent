@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newt-Agent: the brush shell</title>
+<meta name="description" content="Models write shell. A shell string like cat a | grep b && rm c hides several commands behind one call, so Newt does not hand it to the host shell. It ">
+<link rel="icon" href="favicon.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="topnav" aria-label="Site">
+  <a href="index.html">Newt-Agent</a>
+  <a href="context.html">Context</a>
+  <a href="ocap.html" aria-current="page">OCAP</a>
+  <a href="frame.html">Agent-frame</a>
+  <a href="identity.html">Identity</a>
+  <a href="mesh.html">Mesh</a>
+  <a href="https://github.com/Gilamonster-Foundation/newt-agent">Source</a>
+</nav>
+<main>
+<p class="crumb"><a href="ocap.html">OCAP</a> / The brush shell</p>
+<h1 style="margin-top:28px">How Newt runs shell commands with brush</h1>
+<p class="lede">Models write shell. A shell string like <code>cat a | grep b &amp;&amp; rm c</code> hides several commands behind one call, so Newt does not hand it to the host shell. It parses it with <a href="https://github.com/reubeno/brush">brush</a>, a bash-compatible shell written in Rust, and checks each program the string would start against the grant. Step through how, and why.</p>
+
+<section class="demo" aria-labelledby="stage-title">
+  <div class="stage-head">
+    <h2 class="stage-title" id="stage-title" style="margin:0;font-size:1.1rem"></h2>
+    <span class="stage-count" id="stage-count"></span>
+  </div>
+  <p class="caption" id="caption" aria-live="polite"></p>
+  <div class="scene" id="scene"></div>
+  <div class="zones" id="zones"></div>
+  <div class="controls">
+    <button id="prev" type="button">Back</button>
+    <button id="play" type="button" aria-pressed="false">Play</button>
+    <button id="next" type="button">Next</button>
+    <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
+  </div>
+  <p class="fine">The command is illustrative. Names and paths come from <code>newt-core/src/config/shell.rs</code> and the vendored <code>vendor/agent-bridle-tool-shell</code>. Keys: left/right arrows step, space plays or pauses.</p>
+</section>
+
+<h2>What each stage maps to</h2>
+<div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
+<tr><td>Engine choice</td><td>safe-subset, host or brush; brush only with an active fence on Linux or macOS.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/config/shell.rs"><code>newt-core/src/config/shell.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Parse and run</td><td>Brush in an authenticated worker process; exec is removed from its builtins.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/vendor/agent-bridle-tool-shell/src/brush_shell.rs"><code>vendor/agent-bridle-tool-shell/src/brush_shell.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Empty environment</td><td>do_not_inherit_env, explicit env seam, seeded PATH.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/tools/shell.rs"><code>newt-core/src/agentic/tools/shell.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Spawn gate</td><td>Every external spawn is checked on resolved program and cwd.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/vendor/agent-bridle-tool-shell/src/caveat_interceptor.rs"><code>vendor/agent-bridle-tool-shell/src/caveat_interceptor.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Open gate</td><td>Files brush opens itself are checked against fs_read and fs_write.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/vendor/agent-bridle-tool-shell/src/caveat_interceptor.rs"><code>vendor/agent-bridle-tool-shell/src/caveat_interceptor.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Carried coreutils</td><td>Six uutils commands, re-executed through Newt and gated.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/vendor/agent-bridle-tool-shell/src/coreutils_dispatch.rs"><code>vendor/agent-bridle-tool-shell/src/coreutils_dispatch.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Kernel fence</td><td>Inherited by the worker and descendants.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/captured-shell-cross-platform.md"><code>docs/design/captured-shell-cross-platform.md</code></a></td><td class="status"><span class="impl">Implemented, open deviations</span></td></tr>
+<tr><td>Network check in the interpreter</td><td>Network is the kernel backend's job, not brush's.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/config/shell.rs"><code>newt-core/src/config/shell.rs</code></a></td><td class="status"><span class="impl">Not done by brush</span></td></tr>
+</tbody></table></div>
+<h2>What this does not show</h2>
+<ul>
+<li>The interpreter gate is mediation and audit with exec precision. It is not an independent security boundary: the kernel fence is the boundary for files and network.</li>
+<li>Only spawns and opens that brush itself makes are gated. An admitted child and its descendants rely on the inherited kernel fence.</li>
+<li>Brush is not used on Windows. Selecting it there is refused, and the default there is safe-subset.</li>
+<li>Brush is the default only when a kernel fence is active. Where no native fence exists, the shell can collapse to advisory, a recorded open deviation.</li>
+<li>Carried coreutils are not in-process. Each is a re-exec, which is also a cost.</li>
+<li>Newt builds on renamed <code>brush-ocap-*</code> forks published on crates.io, not on upstream brush itself. The upstream interceptor proposal (reubeno/brush#1184) is still open, and the bundled-command dispatch code is marked for upstreaming.</li>
+<li>No speed claim: the repo documents N admissions for N spawns but has no measurement of what that costs in time.</li>
+</ul>
+</main>
+<footer>Apache-2.0. <a href="https://github.com/Gilamonster-Foundation/newt-agent">Gilamonster Foundation / newt-agent</a>.</footer>
+</div>
+<script src="stepper.js"></script>
+<script src="diagram.js"></script>
+<script>
+var SPEC = {
+ "nodes": [
+  {
+   "id": "cmd",
+   "label": "run_command",
+   "x": 15,
+   "y": 12,
+   "sub": "cat a | grep b && rm c"
+  },
+  {
+   "id": "eng",
+   "label": "Engine choice",
+   "x": 50,
+   "y": 12,
+   "sub": "safe-subset, host or brush"
+  },
+  {
+   "id": "env",
+   "label": "Environment",
+   "x": 85,
+   "y": 12,
+   "sub": "starts empty"
+  },
+  {
+   "id": "brush",
+   "label": "brush worker",
+   "x": 15,
+   "y": 50,
+   "sub": "parses and runs the string"
+  },
+  {
+   "id": "gate",
+   "label": "Spawn gate",
+   "x": 50,
+   "y": 50,
+   "sub": "authorize_external_cmd"
+  },
+  {
+   "id": "grant",
+   "label": "Grant",
+   "x": 85,
+   "y": 50,
+   "sub": "Caveats: exec allowlist, paths"
+  },
+  {
+   "id": "kern",
+   "label": "Kernel fence",
+   "x": 15,
+   "y": 88,
+   "sub": "Landlock or Seatbelt"
+  },
+  {
+   "id": "child",
+   "label": "Child process",
+   "x": 50,
+   "y": 88
+  },
+  {
+   "id": "deny",
+   "label": "rm",
+   "x": 85,
+   "y": 88,
+   "sub": "not on the allowlist"
+  }
+ ],
+ "stages": [
+  {
+   "title": "Why a shell at all",
+   "cap": "A model reaches for the shell first, so Newt widens that familiar tool instead of teaching a new one. The cost is that one string can start many programs, and a host shell would run them all without Newt seeing any of them.",
+   "show": [
+    "cmd"
+   ],
+   "hot": [
+    "cmd"
+   ],
+   "edges": [],
+   "state": {},
+   "tag": {},
+   "note": "Design law: make the first instinct work"
+  },
+  {
+   "title": "Pick an engine",
+   "cap": "There are three: safe-subset, host and brush. Confined, brush is chosen when a kernel fence is active and the worker exists on this platform, otherwise safe-subset. --full-access picks host. Windows never uses brush.",
+   "show": [
+    "cmd",
+    "eng"
+   ],
+   "hot": [
+    "eng"
+   ],
+   "edges": [
+    [
+     "cmd",
+     "eng",
+     "which engine?"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "eng": "brush: Linux and macOS, fence active"
+   },
+   "note": "Implemented: config/shell.rs, rechecked per call"
+  },
+  {
+   "title": "Brush parses the string",
+   "cap": "Brush runs in a separate, authenticated worker process and parses and interprets the string itself. That is the reason for using it: it sees each command the string would start, which a host shell keeps to itself.",
+   "show": [
+    "cmd",
+    "eng",
+    "brush"
+   ],
+   "hot": [
+    "brush"
+   ],
+   "edges": [
+    [
+     "eng",
+     "brush",
+     "brush engine"
+    ],
+    [
+     "cmd",
+     "brush",
+     "string",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: brush_shell.rs"
+  },
+  {
+   "title": "The environment starts empty",
+   "cap": "Nothing ambient is inherited. The harness passes only what a child needs: a few allowlisted variables, a seeded PATH, and any venv. PATH grants no authority, because the resolved program is still checked.",
+   "show": [
+    "cmd",
+    "env",
+    "brush"
+   ],
+   "hot": [
+    "env"
+   ],
+   "edges": [
+    [
+     "env",
+     "brush",
+     "explicit env only"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: do_not_inherit_env"
+  },
+  {
+   "title": "Every spawn goes through the gate",
+   "cap": "Each time brush is about to start a program, the gate checks the final resolved program and working directory against the exec allowlist in the grant. File opens that brush makes itself are checked against the read and write scopes. cat is allowed.",
+   "show": [
+    "brush",
+    "gate",
+    "grant",
+    "child"
+   ],
+   "hot": [
+    "gate"
+   ],
+   "edges": [
+    [
+     "brush",
+     "gate",
+     "each spawn"
+    ],
+    [
+     "gate",
+     "grant",
+     "check_exec",
+     1
+    ],
+    [
+     "gate",
+     "child",
+     "cat: allowed"
+    ]
+   ],
+   "state": {
+    "child": "ok"
+   },
+   "tag": {},
+   "note": "Implemented: caveat_interceptor.rs"
+  },
+  {
+   "title": "A denied spawn stops there",
+   "cap": "rm is not on the allowlist, so it never starts. The gate records a typed denial and returns a permission error, and the denial appears on the result so the permission loop can ask the operator.",
+   "show": [
+    "brush",
+    "gate",
+    "grant",
+    "deny"
+   ],
+   "hot": [
+    "gate"
+   ],
+   "edges": [
+    [
+     "brush",
+     "gate",
+     "each spawn"
+    ],
+    [
+     "gate",
+     "deny",
+     "rm: denied"
+    ]
+   ],
+   "state": {
+    "deny": "deny"
+   },
+   "tag": {
+    "gate": "DenialKind::Exec"
+   },
+   "note": "Implemented"
+  },
+  {
+   "title": "Carried coreutils are checked too",
+   "cap": "Newt bundles ls, cat, echo, head, sort and wc. They are not run inside brush: each one re-runs Newt itself as a fresh process, because forking in a multi-threaded runtime is unsafe, and that re-run passes the same gate. Brush's own builtins, like echo, stay in-process.",
+   "show": [
+    "brush",
+    "gate",
+    "child"
+   ],
+   "hot": [
+    "child"
+   ],
+   "edges": [
+    [
+     "brush",
+     "gate",
+     "re-exec of newt"
+    ],
+    [
+     "gate",
+     "child",
+     "--invoke-bundled"
+    ]
+   ],
+   "state": {
+    "child": "ok"
+   },
+   "tag": {
+    "child": "ls cat head sort wc"
+   },
+   "note": "Implemented: coreutils_dispatch.rs"
+  },
+  {
+   "title": "The kernel fence is the boundary",
+   "cap": "Underneath, the worker and everything it starts inherit the OS fence. It still holds if the gate were wrong, and it covers what brush does not check: network, and the children of an admitted program (for example the commands inside find -exec).",
+   "show": [
+    "brush",
+    "gate",
+    "child",
+    "kern"
+   ],
+   "hot": [
+    "kern"
+   ],
+   "edges": [
+    [
+     "child",
+     "kern",
+     "inherited fence"
+    ]
+   ],
+   "state": {
+    "kern": "ok"
+   },
+   "tag": {
+    "gate": "mediation, not the boundary"
+   },
+   "note": "Implemented: Landlock, Seatbelt"
+  },
+  {
+   "title": "Mediation has a price",
+   "cap": "Each spawn is an admission. A loop over N files is N spawns and N checks. Allow decisions are remembered within one invocation and denials are recomputed. No timing is claimed here, because none has been measured in the repo.",
+   "show": [
+    "cmd",
+    "brush",
+    "gate",
+    "child"
+   ],
+   "hot": [
+    "gate"
+   ],
+   "edges": [
+    [
+     "brush",
+     "gate",
+     "N spawns"
+    ],
+    [
+     "gate",
+     "child",
+     "N admissions"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "gate": "allows cached per call"
+   },
+   "note": "Implemented: allow memo (B1.3)"
+  }
+ ]
+};
+var onShow = Diagram(document.getElementById('scene'), SPEC);
+Stepper({ stages: SPEC.stages, onShow: onShow });
+</script>
+</body>
+</html>
