@@ -41,6 +41,7 @@ NO_NEXTEST_GATE = ["docs-check", "fmt", "clippy", "test"]
 NEXTEST_CI_ONLY = [
     "newt-core::brush_build_pipeline",
     "newt-core::native_git_broker_pipeline",
+    "newt-core::macos_exec_basenames",
     "newt-harness::writer_inheritance",
     "newt-git::native_git_commit",
     "newt-agent::lean_surface_purity",

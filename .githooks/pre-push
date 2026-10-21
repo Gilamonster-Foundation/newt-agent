@@ -435,6 +435,10 @@ cargo fmt --all -- --check
 # -- `cargo test -p newt-git --test native_git_commit -- --ignored` and
 # `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
 # real-resource CI lane of their own (tracked separately; out of scope here).
+# newt-core::macos_exec_basenames (#2816) runs its whole native-Seatbelt proof on
+# any argv containing --ignored, so nextest's discovery pass fails it on a dev Mac
+# whose ambient Homebrew gh is not a trusted exec fixture. It is CI-only (see the
+# header entry above; newt-tui-pty.yml stages a root-owned gh copy).
 # newt-core::native_git_broker_pipeline gates the SAME way but is NOT a
 # disclosed gap (#2693): `.github/workflows/native-git-broker-real.yml` runs
 # `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
@@ -450,6 +454,7 @@ cargo fmt --all -- --check
 # change both together.
 NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-core::native_git_broker_pipeline)
+    and not binary_id(newt-core::macos_exec_basenames)
     and not binary_id(newt-harness::writer_inheritance)
     and not binary_id(newt-git::native_git_commit)
     and not binary_id(newt-agent::lean_surface_purity)
