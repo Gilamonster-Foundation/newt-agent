@@ -312,9 +312,8 @@ fn sync_dir_real(dir: &Path) -> std::io::Result<()> {
 /// parent). The empty path is never named. This is the lexical chain; a
 /// symlinked ancestor hides the directories that really hold the entries, so
 /// [`Journal::open`] adds the resolved chain too.
-#[doc(hidden)]
 #[must_use]
-pub fn sync_plan(dir: &Path) -> Vec<std::path::PathBuf> {
+fn sync_plan(dir: &Path) -> Vec<std::path::PathBuf> {
     dir.ancestors()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
@@ -484,8 +483,7 @@ impl<C: ToolCaller> Replies<C> {
     ///
     /// # Errors
     /// As [`open`](Self::open).
-    #[doc(hidden)]
-    pub fn open_with_append(
+    pub(crate) fn open_with_append(
         dir: &Path,
         member: impl Into<String>,
         caller: C,
@@ -504,18 +502,13 @@ impl<C: ToolCaller> Replies<C> {
     ///
     /// # Errors
     /// As [`open`](Self::open); a failing sync is an error.
-    #[doc(hidden)]
-    pub fn open_with(
+    pub(crate) fn open_with(
         dir: &Path,
         member: impl Into<String>,
         caller: C,
         sync_dir: SyncDir,
     ) -> Result<Self, String> {
-        Ok(Self {
-            member: member.into(),
-            journal: Journal::open(dir, &sync_dir, Box::new(append_real))?,
-            caller,
-        })
+        Self::open_with_append(dir, member, caller, sync_dir, Box::new(append_real))
     }
 
     /// Send `reply` once. A reply with any recorded state is not sent again:
@@ -646,3 +639,6 @@ fn clip(t: &str) -> String {
     let t = agent_mesh_flock::text::inert(t);
     t.chars().take(200).collect()
 }
+
+#[cfg(test)]
+mod tests;

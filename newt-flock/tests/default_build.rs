@@ -34,3 +34,41 @@ fn it_is_a_member_but_not_a_default_member() {
     let rest: Vec<_> = members.iter().filter(|m| **m != "newt-flock").collect();
     assert_eq!(defaults.iter().collect::<Vec<_>>(), rest);
 }
+
+/// Nothing fault-injecting is part of the public API (Codex round 7). A test
+/// cannot prove a symbol absent from a compiled library, so this reads the
+/// library's own sources (compile-time, no filesystem): no `#[doc(hidden)]`
+/// item anywhere, and none of the seams is `pub`. The seams are `pub(crate)`
+/// and their tests are unit tests inside the crate (`src/reply/tests.rs`).
+#[test]
+fn the_library_exports_no_test_hooks() {
+    let sources = [
+        ("answer.rs", include_str!("../src/answer.rs")),
+        ("asks.rs", include_str!("../src/asks.rs")),
+        ("lib.rs", include_str!("../src/lib.rs")),
+        ("reply.rs", include_str!("../src/reply.rs")),
+        ("task.rs", include_str!("../src/task.rs")),
+        ("view.rs", include_str!("../src/view.rs")),
+    ];
+    for (name, text) in sources {
+        for (n, line) in text.lines().enumerate() {
+            let l = line.trim_start();
+            if l.starts_with("//") {
+                continue;
+            }
+            assert!(!l.contains("doc(hidden)"), "{name}:{}: {l}", n + 1);
+            for seam in [
+                "open_with",
+                "open_with_append",
+                "sync_plan",
+                "render_for_test",
+            ] {
+                assert!(
+                    !(l.starts_with("pub fn ") || l.starts_with("pub use ")) || !l.contains(seam),
+                    "{name}:{}: {seam} is public: {l}",
+                    n + 1
+                );
+            }
+        }
+    }
+}

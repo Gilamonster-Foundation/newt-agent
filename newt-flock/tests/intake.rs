@@ -276,7 +276,7 @@ fn text_from_the_log_is_rendered_inert() {
         head: Some("h\u{9b}2J".into()),
         files: vec![],
     };
-    let text = newt_flock::render_for_test(&ev);
+    let text = newt_flock::Task { evidence: ev }.to_new().unwrap().body;
     assert!(
         !text.chars().any(|c| c.is_control() && c != '\n'),
         "{text:?}"

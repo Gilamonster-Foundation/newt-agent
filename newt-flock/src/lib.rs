@@ -13,16 +13,9 @@ mod view;
 
 pub use answer::{Answerer, Draft, Outcome, SignReply, SignRequest};
 pub use asks::{view, AskView, OpenAsk};
-pub use reply::{sync_plan, FnCaller, Lost, Replies, Reply, Sent, Step, ToolCaller, ToolReply};
+pub use reply::{FnCaller, Lost, Replies, Reply, Sent, Step, ToolCaller, ToolReply};
 pub use task::{open_tasks, verify, CitedFile, Evidence, Intake, NewTask, Sink, Task, TaskKind};
 pub use view::{present, Local, Phase, TaskView};
-
-/// The task text, for tests of its inertness.
-#[doc(hidden)]
-#[must_use]
-pub fn render_for_test(ev: &Evidence) -> String {
-    task::render(ev)
-}
 
 use agent_mesh_flock::Genesis;
 use agent_mesh_flock_server::wire::{read_msg, write_msg, StreamChallenge};
