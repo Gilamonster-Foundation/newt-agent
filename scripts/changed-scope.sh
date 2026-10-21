@@ -6,7 +6,8 @@
 #   "<local-ref> <local-sha> <remote-ref> <remote-sha>"
 # line per ref (see githooks(5)). Prints exactly one line to stdout:
 #
-#   (nothing)   — a deletion, a tag push, or a docs-only change: no cargo
+#   (nothing)   — a deletion, a tag push, or a docs-only change (*.md, *.txt,
+#                 docs/, LICENSE, site/, the Pages workflow): no cargo
 #                 gate is needed for this ref range.
 #   ALL         — a workspace-wide file changed (Cargo.toml, Cargo.lock,
 #                 rust-toolchain*, .cargo/**, vendor/**, build.rs) or a
@@ -74,7 +75,8 @@ $changed
 EOF
 
 # Drop docs-only files. If nothing code-shaped remains, no gate is needed.
-code_changed="$(printf '%s\n' "$changed" | grep -Ev '(^|/)[^/]*\.(md|txt)$|^docs/|^LICENSE' || true)"
+# `site/` (static GitHub Pages content) and its deploy workflow hold no Rust.
+code_changed="$(printf '%s\n' "$changed" | grep -Ev '(^|/)[^/]*\.(md|txt)$|^docs/|^LICENSE|^site/|^\.github/workflows/pages\.yml$' || true)"
 [ -z "$code_changed" ] && exit 0
 
 # Map each remaining file to its owning crate: the longest manifest-dir
