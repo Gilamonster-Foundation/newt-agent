@@ -442,19 +442,44 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
 /// ... ADD COLUMN` any additive drift. Removed/renamed columns are NOT
 /// handled here — destructive migrations get their own explicit step.
 pub(super) fn reconcile_schema(conn: &Connection) -> anyhow::Result<()> {
-    for (table, expected) in EXPECTED_COLUMNS {
+    fn missing(
+        conn: &Connection,
+        table: &str,
+        expected: &[(&'static str, &'static str)],
+    ) -> anyhow::Result<Vec<(&'static str, &'static str)>> {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let present: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
-        for (name, decl) in *expected {
-            if !present.iter().any(|c| c == name) {
+        Ok(expected
+            .iter()
+            .filter(|(name, _)| !present.iter().any(|c| c == name))
+            .copied()
+            .collect())
+    }
+    for (table, expected) in EXPECTED_COLUMNS {
+        if missing(conn, table, expected)?.is_empty() {
+            continue;
+        }
+        // Another opener may add the same columns first: take the write lock,
+        // then look again, so a column is only ever added by one of them.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let run = (|| -> anyhow::Result<()> {
+            for (name, decl) in missing(conn, table, expected)? {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"))?;
                 tracing::info!(
                     table = *table,
-                    column = *name,
+                    column = name,
                     "schema migration: added missing column"
                 );
+            }
+            Ok(())
+        })();
+        match run {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
             }
         }
     }

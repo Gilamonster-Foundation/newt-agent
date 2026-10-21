@@ -599,3 +599,31 @@ fn a_flock_rooted_objective_can_be_resumed_continued_retried_and_annotated() {
         )
         .unwrap();
 }
+
+/// Review 2976 CI: concurrent openers of one fresh database race the additive
+/// column migration (`duplicate column name: ...`). Every opener must
+/// succeed, over many rounds, each released together by a barrier.
+#[test]
+fn concurrent_openers_of_a_fresh_database_all_succeed() {
+    for _ in 0..40 {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (root, ws, gate) = (
+                    root.path().to_path_buf(),
+                    ws.path().to_path_buf(),
+                    std::sync::Arc::clone(&gate),
+                );
+                std::thread::spawn(move || {
+                    gate.wait();
+                    ConversationStore::new(&root, &ws, 100).map(drop)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+}
