@@ -234,6 +234,7 @@ impl FakeSession {
                             CtlReq::ProveStream { challenge } => CtlResp::Proof(Box::new(
                                 Assertion::sign(&key, &challenge.id().unwrap()),
                             )),
+                            _ => CtlResp::Err("the stand-in session does not sign".into()),
                         };
                         write_msg(&mut c, &resp).unwrap();
                     }
