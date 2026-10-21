@@ -324,6 +324,47 @@ impl MemoryManager {
             .join("\n\n")
     }
 
+    /// Annotate each provider's system-prompt block separately in `sink`.
+    /// Call BEFORE `build_system_prompt_with_persona` so the per-provider
+    /// labels are not swallowed by an encompassing "identity" annotation.
+    pub fn annotate_system_prompt_additions(
+        &self,
+        sink: &crate::agentic::request_report::ReportSink,
+    ) {
+        for p in &self.providers {
+            if let Some(block) = p.system_prompt_block() {
+                if !block.is_empty() {
+                    sink.annotate(p.name(), "memory::build_system_prompt_additions", &block);
+                }
+            }
+        }
+    }
+
+    /// Return only the soul provider's identity block — the text that altitude
+    /// selection may replace with `COACH_SOUL`.  Everything else (AGENTS.md,
+    /// notes, memory index, project map) is NOT included; use
+    /// [`context_additions`] for those.
+    pub fn soul_block(&self) -> Option<String> {
+        self.providers
+            .iter()
+            .find(|p| p.name() == "soul")
+            .and_then(|p| p.system_prompt_block())
+    }
+
+    /// Return the system-prompt contributions of every provider except the
+    /// soul — AGENTS.md/CLAUDE.md instructions, notes, the memory index, and
+    /// the project map.  These must appear in the system prompt regardless of
+    /// altitude, because they carry project-specific context that coach mode
+    /// must not silently drop (#2934).
+    pub fn context_additions(&self) -> String {
+        self.providers
+            .iter()
+            .filter(|p| p.name() != "soul")
+            .filter_map(|p| p.system_prompt_block())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// Collect recalled context from all providers before a turn.
     pub async fn prefetch_all(&self, query: &str) -> String {
         let mut parts = Vec::new();

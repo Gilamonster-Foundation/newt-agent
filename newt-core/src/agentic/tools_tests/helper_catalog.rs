@@ -892,3 +892,16 @@ fn publish_2796_catalog_guidance() {
         assert!(description.contains("To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials."), "{description}");
     }
 }
+
+/// #2949: the base catalog (the eleven always-on tools) serialized as sent to
+/// the model, as a ceiling that only ratchets DOWN. The number is what the
+/// diet left; a description that grows past it needs a reason in its PR.
+#[test]
+fn base_catalog_2949_chars_ratchet() {
+    const CEILING: usize = 7966;
+    let chars = serde_json::to_string(&tool_definitions()).unwrap().len();
+    assert!(
+        chars <= CEILING,
+        "base catalog is {chars} chars as sent; ceiling {CEILING}"
+    );
+}

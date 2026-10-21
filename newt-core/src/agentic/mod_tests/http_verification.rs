@@ -213,11 +213,15 @@ async fn explain_turn_request_user_input_dispatches_and_completes() {
         !all.contains("Tool `request_user_input` is not available for this request"),
         "request_user_input must NOT be disposition-refused in an Explain turn"
     );
-    // The actual exec boundary still holds in the same turn.
+    // run_command is dispatched in the same turn (never disposition-refused)
+    // and no command ran. #2949: this asserted "capability denied", which only
+    // ever matched the request_permissions DESCRIPTION in the request body;
+    // the fixture's workspace does not exist, so the dispatched result is the
+    // working-directory error, not an exec denial.
     assert!(
-        all.contains("capability denied")
+        all.contains("no command ran")
             && !all.contains("Tool `run_command` is not available for this request"),
-        "run_command must respect the session exec denial regardless of Explain style: {all}"
+        "run_command must dispatch and run nothing regardless of Explain style: {all}"
     );
 }
 

@@ -188,6 +188,7 @@ pub mod smart_harness;
 mod prompt_intake;
 mod prompt_read;
 mod recall;
+pub mod request_report;
 mod tool_args;
 // #952/#1669: operator steering submitted mid-turn, drained at the next
 // round boundary as a genuine operator message.
@@ -1257,6 +1258,8 @@ pub struct ChatCtx<'a> {
     /// `None` (every headless / eval caller) ⇒ nothing is ever drained and the
     /// request bodies are bit-for-bit today's.
     pub steering: Option<&'a dyn SteeringInbox>,
+    /// #2937: session-owned prompt-report capture sink. `None` disables capture.
+    pub report_sink: Option<&'a request_report::ReportSink>,
 }
 
 /// Drain operator steering into `messages` as genuine user turns (#952/#1669).
@@ -1536,6 +1539,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         emits_leading_reasoning,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -2258,6 +2262,28 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if !tools_supported {
                 if let Some(o) = body_no_stream.as_object_mut() {
                     o.remove("tools");
+                }
+            }
+            // #2937: capture exact final body per-round, after the tools gate.
+            if let Some(sink) = report_sink {
+                let sys_texts: Vec<&str> = messages
+                    .iter()
+                    .filter(|m| m["role"] == "system")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect();
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    Some(tools.as_array().map(|a| a.as_slice()).unwrap_or(&[]))
+                } else {
+                    None
+                };
+                sink.observe_request(&sys_texts, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
+                    }
                 }
             }
 
@@ -3966,7 +3992,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         prompt_measurement: Default::default(),
         fell_back: Default::default(),
     };
-    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts).await;
+    let result = final_summary_ollama(
+        &client,
+        &chat_url,
+        model,
+        trimmed,
+        &cap,
+        attempts,
+        report_sink,
+    )
+    .await;
     let (text, streamed, usage) = cap.recover_rejection(
         result,
         &mut solve_obs,
@@ -6512,6 +6547,7 @@ async fn final_summary_ollama(
     mut messages: Vec<serde_json::Value>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     if !cap.fits(&messages, model) {
@@ -6523,6 +6559,15 @@ async fn final_summary_ollama(
         "messages": &messages,
         "stream": false,
     });
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(s) = sink {
+        let sys_texts: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        s.observe_request(&sys_texts, None)?;
+    }
     if let Some(options) = &cap.ollama_options {
         body["options"] = options.clone();
     }
@@ -6667,12 +6712,22 @@ async fn final_summary_openai(
     context_window: Option<u32>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     let (count_client, stream_client) = clients;
     cap.push_nudge(&mut messages);
     let messages = openai_chat_wire_messages(&messages)?;
     if !cap.fits(&messages, model) {
         return Ok(cap.fallback());
+    }
+    // #2937: capture summary send (no tools field).
+    if let Some(s) = sink {
+        let sys_texts: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        s.observe_request(&sys_texts, None)?;
     }
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
     let mut body = serde_json::json!({
@@ -6863,6 +6918,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // #2372: the primary content is filtered with the stream filter's
         // policy — a lone `</think>` is answer text unless the backend
@@ -7532,6 +7588,38 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 if let Some(o) = body.as_object_mut() {
                     o.remove("tools");
                     o.remove("tool_choice");
+                }
+            }
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                // Annotate active card before wire_messages coalesces the
+                // message boundary (mirrors the Anthropic path at line ~10321).
+                for msg in &messages {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
+                let sys_texts: Vec<&str> = wire_messages
+                    .iter()
+                    .filter(|m| m["role"] == "system")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect();
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    Some(tools.as_array().map(|a| a.as_slice()).unwrap_or(&[]))
+                } else {
+                    None
+                };
+                sink.observe_request(&sys_texts, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
+                    }
                 }
             }
             // OpenAI-compatible endpoints do not accept a `num_ctx` request field,
@@ -9220,6 +9308,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         generation_window,
         &cap,
         attempts,
+        report_sink,
     );
     let Some(result) = cancellable(cancel, summary).await else {
         cap.learn_measurement(compress_state)?;
@@ -9586,11 +9675,17 @@ async fn final_summary_anthropic(
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
     if !cap.fits(&wire_messages, model) {
         return Ok(cap.fallback());
+    }
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(s) = sink {
+        let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
+        s.observe_request(&sys_arr, None)?;
     }
     // Omit `tools` => the model cannot emit tool_use blocks (mirrors the
     // OpenAI path's tools-disabled summary).
@@ -9730,6 +9825,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // Anthropic streams reasoning in its own wire fields, not as a lone
         // leading `</think>` closer, so this loop never starts the filter
@@ -10390,6 +10486,33 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 use_tools.then_some(tools_anthropic.as_slice()),
                 streaming_enabled,
             );
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                // Annotate active card before the join loses the message boundary.
+                for msg in &messages {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
+                let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
+                let send_tools: Option<&[serde_json::Value]> = if use_tools {
+                    Some(&tools_anthropic)
+                } else {
+                    None
+                };
+                sink.observe_request(&sys_arr, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
+                    }
+                }
+            }
             let dispatch = anthropic_dispatch_round(
                 &dispatcher,
                 &body,
@@ -12023,6 +12146,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         generation_policy,
         &cap,
         attempts,
+        report_sink,
     )
     .await;
     let (text, streamed, usage) = cap.recover_rejection(
@@ -12420,6 +12544,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // The Responses wire carries reasoning in its own items, never as a
         // lone leading `</think>` closer, so the declared #528 shape does not
@@ -12911,6 +13036,40 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 harness.record_responses_messages(instructions.as_deref(), &input)?;
             }
             let mut body = build_body(&input, if tools_supported { &tools } else { &[] });
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                // Annotate active card before the body join loses the message boundary.
+                for msg in &msgs_json {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
+                let ins_str: &str = body["instructions"].as_str().unwrap_or("");
+                let sys_arr: &[&str] = if ins_str.is_empty() {
+                    &[]
+                } else {
+                    std::slice::from_ref(&ins_str)
+                };
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    body.get("tools")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.as_slice())
+                } else {
+                    None
+                };
+                sink.observe_request(sys_arr, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
+                    }
+                }
+            }
             let output_cap = generation_bounds::apply_responses(
                 &mut body,
                 output_recovery.allowance(generation_policy.output_allowance),
@@ -14015,6 +14174,24 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // final summary can carry NO tools; a proactive-compaction reason (if any) rides
     // its error chain. Only a `ValidatedResponsesRequest` reaches the dispatcher.
     let mut body = build_body(&input, &[]);
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(sink) = report_sink {
+        let body_instr = body["instructions"].as_str().unwrap_or("");
+        let sys_arr: &[&str] = if body_instr.is_empty() {
+            &[]
+        } else {
+            &[body_instr]
+        };
+        sink.observe_request(sys_arr, None)?;
+        if sink.take_show_flag() {
+            if let Some(r) = sink.last_report() {
+                crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                    use std::io::Write;
+                    writeln!(w, "{}", r.to_markdown())
+                });
+            }
+        }
+    }
     let output_cap = generation_bounds::apply_responses(
         &mut body,
         generation_policy.output_allowance,

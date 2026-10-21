@@ -5177,13 +5177,6 @@ pub(crate) fn persist_preference_actions(
 #[path = "lib_tests/resumed_preference_tests.rs"]
 mod resumed_preference_tests;
 
-/// Build a system prompt with workspace context so the model knows the project.
-// build_system_prompt_with_soul is used directly now; this wrapper kept for tests.
-#[allow(dead_code)]
-fn build_system_prompt(workspace: &str, plan_path: &str) -> String {
-    build_system_prompt_with_soul(workspace, None, plan_path)
-}
-
 /// Seat `persona`'s declared dials (cognition and initiative) as the persona
 /// resolution layers, or clear them for `None`. Every persona activation site
 /// calls this one function: startup, `/persona set|clear`, a conversation
@@ -5404,7 +5397,9 @@ impl PersonaStore {
     /// Shipped default personas, seeded per-file-idempotently (FR-16, #1000):
     /// each MISSING one is written on any store access, so an upgrade that
     /// predates a new default still receives it (the old empty-dir gate would
-    /// strand it forever). `coder` is the doer identity (DEFAULT_SOUL); `coach`
+    /// strand it forever). `coder` is a short editable placeholder (#2935 — it
+    /// used to seed DEFAULT_SOUL, which doubled the soul in the system prompt);
+    /// `coach`
     /// prefers advising first; its `altitude = "coach"` selects COACH_SOUL.
     /// `personal-assistant` specializes in routine automation. Its `skills:`
     /// binding preloads `gila-personal-assistant`, and its `tools:` preferences
@@ -5414,7 +5409,7 @@ impl PersonaStore {
     /// not capability or action-policy settings. A user who deletes a default
     /// gets it back next launch; empty the file to suppress it.
     const DEFAULT_PERSONAS: &'static [(&'static str, &'static str)] = &[
-        (Self::DEFAULT_NAME, newt_core::DEFAULT_SOUL),
+        (Self::DEFAULT_NAME, CODER_PERSONA),
         ("coach", COACH_PERSONA),
         ("personal-assistant", PERSONAL_ASSISTANT_PERSONA),
         ("steady", include_str!("../../personas/steady.md")),
@@ -5426,13 +5421,31 @@ impl PersonaStore {
         std::fs::create_dir_all(&self.dir)?;
         for &(name, body) in Self::DEFAULT_PERSONAS {
             let path = self.dir.join(format!("{name}.md"));
-            if !path.exists() {
+            if !path.exists() || Self::is_legacy_coder_seed(name, &path) {
                 std::fs::write(&path, body)?;
             }
         }
         Ok(())
     }
+
+    /// #2935: through v0.8.2 `coder` was seeded with DEFAULT_SOUL verbatim,
+    /// which doubled the soul in every `--persona coder` prompt. An existing
+    /// file whose body is still exactly that seed is the untouched old seed,
+    /// not an operator edit, so it is replaced like a missing default. Any
+    /// other content is operator data and is left alone.
+    // ponytail: matches the live DEFAULT_SOUL; if #2933 rewrites the soul,
+    // snapshot the v0.8.2 text here so older installs still migrate.
+    fn is_legacy_coder_seed(name: &str, path: &std::path::Path) -> bool {
+        name == Self::DEFAULT_NAME
+            && std::fs::read_to_string(path)
+                .is_ok_and(|body| body.trim() == newt_core::DEFAULT_SOUL.trim())
+    }
 }
+
+/// The default coder persona (#2935): a short placeholder the user can edit.
+/// Using DEFAULT_SOUL here would send the soul twice when `--persona coder` is
+/// active (once from the identity block, once from the persona overlay).
+const CODER_PERSONA: &str = include_str!("../../personas/coder.md");
 
 /// The read-only coach persona shipped as a repo template (FR-16, #1000), so
 /// `shipped_role_templates_parse` type-checks its front-matter beside the others.
@@ -5833,14 +5846,10 @@ fn parse_conversation_rest<'a>(
 /// from the skills found across `skills_dirs` (names + descriptions only, never
 /// bodies), or `None` when no skills are installed. Uses the same ordered,
 /// first-directory-wins union as discovery. Split out from
-/// [`build_system_prompt_with_soul`] so the injection can be unit-tested against
+/// [`build_system_prompt_with_persona`] so the injection can be unit-tested against
 /// controlled directories without mutating the process-wide `$HOME`.
 fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String> {
     newt_skills::index_block(&newt_skills::discover_paths(skills_dirs))
-}
-
-fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>, plan_path: &str) -> String {
-    build_system_prompt_with_persona(workspace, soul, None, plan_path)
 }
 
 /// FR-5 (#999): the minimal persona that carries ONLY an altitude, used when
@@ -5874,24 +5883,31 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
     enabled.then_some(NARRATION_INTENT_LINE)
 }
 
+/// `context` carries the non-soul provider blocks (AGENTS.md/CLAUDE.md,
+/// notes, memory index, project map).  It follows the identity whatever the
+/// altitude, so coach altitude, which replaces the soul/identity with
+/// `COACH_SOUL`, never silently drops project-specific instructions (#2934).
 fn build_system_prompt_with_persona(
     workspace: &str,
-    soul: Option<&str>,
+    soul: &str,
+    context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     // FR-5 (#999): the active persona's ALTITUDE selects the base identity. A
     // `Coach` altitude REPLACES the identity with COACH_SOUL (and overrides a
     // doer-flavored soul.md), so a coaching persona's overlay no longer sits on
     // top of a contradictory doer soul. Doer (the default, and every persona
-    // that doesn't declare an altitude) keeps today's behavior: the resolved
-    // soul.md, else DEFAULT_SOUL. The `--altitude` flag rides here too — it
+    // that doesn't declare an altitude) keeps the soul it is given. That soul is
+    // resolved by `SoulProvider` (soul.md, else DEFAULT_SOUL); the builder has
+    // no fallback of its own (#2935). The `--altitude` flag rides here too — it
     // seeds/overrides `active_persona`'s altitude at startup (see `run_code`),
     // so it needs no separate plumbing through the session-management helpers.
     let effective_altitude = persona.and_then(|p| p.profile.altitude).unwrap_or_default();
     let identity = match effective_altitude {
         newt_core::Altitude::Coach => newt_core::COACH_SOUL,
-        newt_core::Altitude::Doer => soul.unwrap_or(newt_core::DEFAULT_SOUL),
+        newt_core::Altitude::Doer => soul,
     };
     // Resolved once and shared with the skills index below; the ratchet in
     // newt-core/tests/resolve_publishes_ratchet.rs pins the publishing resolve
@@ -5906,24 +5922,53 @@ fn build_system_prompt_with_persona(
         .map(|c| newt_core::ExposureSettings::from(c.tool_exposure()))
         .unwrap_or_default();
     let identity = exposure.render_identity(identity);
-    let mut ctx = format!(
-        "{identity}\n\nWorkspace: {workspace}\n\
+    // #2934: project-context blocks (AGENTS.md/CLAUDE.md, notes, memory
+    // index, project map) follow the identity whatever the altitude. Coach
+    // replaces the soul above but must not drop project instructions. They
+    // sit BEFORE the live workspace line, as the combined block always did:
+    // historical notes must not redefine the runtime root stated below.
+    let mut ctx = identity.to_string();
+    if let Some(ctx_str) = context.filter(|c| !c.is_empty()) {
+        ctx.push_str("\n\n");
+        ctx.push_str(ctx_str);
+    }
+    // #2937: record the workspace-header start AFTER project context so the
+    // annotation covers only the workspace line, not provider blocks.
+    let workspace_start = ctx.len();
+    ctx.push_str(&format!(
+        "\n\nWorkspace: {workspace}\n\
          This is the current runtime root. Relative tool paths resolve here; \
          run_command starts here unless its cwd or command selects another directory. \
          Other requested paths remain governed by the session's permissions. \
          Historical notes do not redefine this root.\n"
-    );
+    ));
+    // #2937: annotate each named piece through the session's ReportSink so
+    // the request report (TUI preview: #2959) can attribute components in the system message.
+    let note = |label: &str, text: &str| {
+        if let Some(s) = sink {
+            s.annotate(label, "build_system_prompt_with_persona", text);
+        }
+    };
+    // #2937 P2-2: annotate the identity selected by the altitude branch.
+    // Coach altitude always uses COACH_SOUL; label it directly.
+    // Doer altitude: providers were already annotated individually by
+    // annotate_system_prompt_additions in rebuild_system_prompt.
+    if let newt_core::Altitude::Coach = effective_altitude {
+        note("coach-soul", &identity);
+    }
+    // workspace-header: only the workspace line suffix — providers' spans end
+    // at workspace_start, so this annotation never absorbs their content.
+    note("workspace-header", &ctx[workspace_start..]);
     if let Some(persona) = persona {
-        ctx.push_str(&format!(
-            "\nActive persona: {}\n{}\n",
-            persona.name, persona.prompt
-        ));
+        let persona_overlay = format!("\nActive persona: {}\n{}\n", persona.name, persona.prompt);
+        ctx.push_str(&persona_overlay);
         ctx.push_str(
             "\nPersona guidance does not override the operator's explicit task. \
              Treat advice-only wording and preferred tools as defaults; use the tools \
              needed for the requested work. OCAP permissions, explicit postures, and \
              delegation limits still govern every action.\n",
         );
+        note("persona-overlay", &persona_overlay);
     }
 
     // Per-session plan instruction (issue #220). Injected here, with the
@@ -5931,6 +5976,7 @@ fn build_system_prompt_with_persona(
     // path is dynamic AND custom soul.md users still get the guidance. The path
     // is unique to this conversation, so concurrent newt instances in the same
     // repo never clobber each other's plan.
+    let plan_start = ctx.len();
     ctx.push_str(&format!(
         "\n**Plan before coding.** For any task requiring more than one file \
          change, write a plan to `{plan_path}` first (create it if it does not \
@@ -5940,6 +5986,11 @@ fn build_system_prompt_with_persona(
          re-reading the whole codebase.\n"
     ));
 
+    note("plan-before-coding instruction", &ctx[plan_start..]);
+    note(
+        "refactor publish guidance",
+        newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE,
+    );
     ctx.push_str(newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE);
     ctx.push('\n');
 
@@ -5951,6 +6002,7 @@ fn build_system_prompt_with_persona(
         .and_then(|c| c.tui.as_ref())
         .is_some_and(|t| t.narration_intent_line);
     if let Some(line) = narration_intent_line(intent) {
+        note("narration intent line", line);
         ctx.push_str(&format!("\n{line}\n"));
     }
 
@@ -5962,6 +6014,7 @@ fn build_system_prompt_with_persona(
     // missing dir contributes nothing.
     let skills_dirs = cfg.map(|c| c.skill_search_dirs()).unwrap_or_default();
     if let Some(index) = skills_index_for_prompt(&skills_dirs) {
+        note("skills index", &index);
         ctx.push('\n');
         ctx.push_str(&index);
     }
@@ -5981,10 +6034,12 @@ fn build_system_prompt_with_persona(
             })
             .collect();
         names.sort();
+        let files_start = ctx.len();
         ctx.push_str("\nFiles:\n");
         for name in names.iter().take(40) {
             ctx.push_str(&format!("  {name}\n"));
         }
+        note("workspace file listing", &ctx[files_start..]);
     }
 
     // README (truncated)
@@ -5992,6 +6047,7 @@ fn build_system_prompt_with_persona(
         let path = std::path::Path::new(workspace).join(readme);
         if let Ok(text) = std::fs::read_to_string(&path) {
             let excerpt: String = text.chars().take(3000).collect();
+            note("README excerpt", &excerpt);
             ctx.push_str(&format!("\n{readme}:\n{excerpt}\n"));
             if text.len() > 3000 {
                 ctx.push_str("...[truncated]\n");
@@ -6012,16 +6068,36 @@ fn rebuild_system_prompt(
     memory: &newt_core::MemoryManager,
     persona: Option<&Persona>,
     conversation_id: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
-    let soul_additions = memory.build_system_prompt_additions();
-    let soul_text = if soul_additions.is_empty() {
+    // #2934: separate the soul/identity from the project-context additions so
+    // that coach altitude can replace the soul with COACH_SOUL without
+    // silently dropping AGENTS.md, notes, and the project map.
+    let soul_text = memory.soul_block();
+    let context = memory.context_additions();
+    let context_ref = if context.is_empty() {
         None
     } else {
-        Some(soul_additions.as_str())
+        Some(context.as_str())
     };
+    // #2937 P2-2: annotate each provider's block separately BEFORE building the
+    // combined prompt, so per-provider spans survive (see build_system_prompt_with_persona).
+    // Call unconditionally when a sink exists — the method skips empty blocks itself,
+    // and context providers (AGENTS.md, notes) need annotation even when soul is absent.
+    if let Some(s) = sink {
+        memory.annotate_system_prompt_additions(s);
+    }
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
-    build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy())
+    build_system_prompt_with_persona(
+        workspace,
+        // No soul provider means no soul; the builder never invents one (#2935).
+        soul_text.as_deref().unwrap_or_default(),
+        context_ref,
+        persona,
+        &plan_path.to_string_lossy(),
+        sink,
+    )
 }
 
 fn handle_operating_mode_command(
@@ -6243,6 +6319,7 @@ struct ConversationResetContext<'a> {
     system: &'a mut String,
     conversation_id: &'a mut String,
     mode_states: &'a ConversationModeStates,
+    sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 fn reset_conversation(
@@ -6256,7 +6333,13 @@ fn reset_conversation(
     // survive any of those paths.
     ctx.mode_states.clear();
     ctx.memory.reset_all();
-    *ctx.system = rebuild_system_prompt(workspace, ctx.memory, active_persona, ctx.conversation_id);
+    *ctx.system = rebuild_system_prompt(
+        workspace,
+        ctx.memory,
+        active_persona,
+        ctx.conversation_id,
+        ctx.sink,
+    );
 }
 
 fn new_conversation_message(active_persona: Option<&Persona>) -> String {
@@ -6873,6 +6956,7 @@ struct ConversationCommandContext<'a> {
     /// successful restore is a hard boundary and clears it before adopting
     /// the restored conversation, including A→B→A switches.
     mode_states: &'a ConversationModeStates,
+    sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 fn handle_conversation_command(
@@ -7066,6 +7150,7 @@ pub(crate) struct CommitContext<'a> {
     pub step_ledger: &'a dyn newt_core::StepLedger,
     pub active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
     pub mode_states: &'a ConversationModeStates,
+    pub sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 impl<'a> ConversationCommandContext<'a> {
@@ -7082,6 +7167,7 @@ impl<'a> ConversationCommandContext<'a> {
             step_ledger: self.step_ledger,
             active_prompt_context: self.active_prompt_context,
             mode_states: self.mode_states,
+            sink: self.sink,
         }
     }
 }
@@ -7171,6 +7257,7 @@ fn commit_prepared(
         ctx.memory,
         ctx.active_persona.as_ref(),
         ctx.active_conversation_id,
+        ctx.sink,
     );
     (record, warning)
 }
@@ -7801,6 +7888,7 @@ fn handle_persona_command(
                     ctx.memory,
                     active_persona.as_ref(),
                     ctx.conversation_id,
+                    ctx.sink,
                 );
                 Ok(persona_swap_kept_context_message(active_persona.as_ref()))
             } else {

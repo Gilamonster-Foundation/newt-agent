@@ -57,17 +57,30 @@ fn system_prompt_index_unions_search_path_first_dir_wins() {
     assert!(block.contains("judge: scoring"));
 }
 
+/// #2935: the identity comes from the `SoulProvider` the runtime always
+/// installs (`chat.rs`), so the prompt builder no longer carries its own
+/// `DEFAULT_SOUL` fallback. A memory manager with no soul provider yields a
+/// prompt with no soul — the builder never invents one.
+///
+/// Red before the removal: the `None` soul arm injected DEFAULT_SOUL.
 #[serial_test::serial(real_fs)]
 #[test]
-fn system_prompt_fallback_uses_canonical_default_soul() {
-    // Regression: the no-soul fallback used to be a private copy of the
-    // identity string that drifted from newt-core's DEFAULT_SOUL. It must
-    // now embed the canonical constant verbatim so the two can't diverge.
+fn no_soul_provider_means_no_default_soul_2935() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
-    let prompt = build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None, "test-plan.md");
+    let memory = newt_core::MemoryManager::new();
+    let prompt = rebuild_system_prompt(tmp.path().to_str().unwrap(), &memory, None, "s", None);
+    let first_line = newt_core::DEFAULT_SOUL
+        .lines()
+        .find(|l| !l.is_empty())
+        .unwrap();
     assert!(
-        prompt.contains(newt_core::DEFAULT_SOUL),
-        "fallback must embed newt_core::DEFAULT_SOUL verbatim"
+        !prompt.contains(first_line),
+        "the builder must not inject DEFAULT_SOUL on its own; got: {prompt:.200}"
+    );
+    assert!(
+        prompt.contains("Workspace: "),
+        "the rest of the prompt is intact"
     );
 }
 
@@ -80,7 +93,8 @@ fn system_prompt_names_the_per_session_plan_path() {
     let ws = tmp.path().to_str().unwrap();
     let path_a = newt_core::session_plan_path("sess-aaaa");
     let path_a = path_a.to_string_lossy();
-    let prompt_a = build_system_prompt_with_soul(ws, None, &path_a);
+    let prompt_a =
+        build_system_prompt_with_persona(ws, newt_core::DEFAULT_SOUL, None, None, &path_a, None);
     assert!(
         prompt_a.contains(path_a.as_ref()),
         "prompt must name the session plan path"
@@ -92,7 +106,14 @@ fn system_prompt_names_the_per_session_plan_path() {
 
     // Two different sessions get two different plan paths — the collision fix.
     let path_b = newt_core::session_plan_path("sess-bbbb");
-    let prompt_b = build_system_prompt_with_soul(ws, None, &path_b.to_string_lossy());
+    let prompt_b = build_system_prompt_with_persona(
+        ws,
+        newt_core::DEFAULT_SOUL,
+        None,
+        None,
+        &path_b.to_string_lossy(),
+        None,
+    );
     assert!(prompt_b.contains(&*path_b.to_string_lossy()));
     assert!(
         !prompt_b.contains(path_a.as_ref()),
@@ -108,10 +129,13 @@ fn default_soul_no_longer_hardcodes_a_plan_path() {
     assert!(!newt_core::DEFAULT_SOUL.contains("plan.md"));
     // A custom soul (no plan text of its own) still gets the injected block.
     let tmp = tempfile::TempDir::new().unwrap();
-    let prompt = build_system_prompt_with_soul(
+    let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some("You are a custom agent."),
+        "You are a custom agent.",
+        None,
+        None,
         ".scratch/sessions/xyz/plan.md",
+        None,
     );
     assert!(prompt.contains("You are a custom agent."));
     assert!(prompt.contains(".scratch/sessions/xyz/plan.md"));
@@ -142,6 +166,7 @@ async fn registered_agents_provider_block_reaches_prompt() {
         &memory,
         None,
         "test-conversation",
+        None,
     );
     assert!(prompt.contains("# Project instructions"));
     assert!(prompt.contains("Run just check before PRs."));
@@ -171,7 +196,7 @@ async fn historical_notes_preserve_content_without_redefining_the_live_workspace
         session_id: "current-session".into(),
     };
     memory.initialize_all(&ctx).await;
-    let prompt = rebuild_system_prompt(&ctx.workspace, &memory, None, &ctx.session_id);
+    let prompt = rebuild_system_prompt(&ctx.workspace, &memory, None, &ctx.session_id, None);
 
     assert_eq!(fs::read_to_string(&notes_path).unwrap(), original_notes);
     assert_eq!(prompt.matches(&note).count(), 1, "retain the note verbatim");
@@ -267,7 +292,8 @@ async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
     let _sandbox = SkillRootSandbox::enter(&config_dir, &nested);
     let ws = nested.to_str().unwrap();
 
-    let prompt = build_system_prompt_with_soul(ws, None, "plan.md");
+    let prompt =
+        build_system_prompt_with_persona(ws, newt_core::DEFAULT_SOUL, None, None, "plan.md", None);
     assert!(
         prompt.contains("grounding-skill: Only in the bundled dir"),
         "the prompt index must list the bundled-only skill"
@@ -299,5 +325,228 @@ async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
     assert!(
         body.contains("Full body of grounding-skill."),
         "use_skill must load the copy the index listed, got: {body}"
+    );
+}
+
+// #2937: workspace-header annotation must not swallow project-context provider
+// annotations. Doer: soul + agents + notes providers all get individual labels;
+// workspace-header covers only the workspace line, not provider content.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn provider_annotations_labeled_independently_doer_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Use four spaces for indentation.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "user: prefers vi\n§\n").unwrap();
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::SoulProvider::new(None));
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        None,
+        "sess-doer",
+        Some(&sink),
+    );
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+
+    assert!(
+        labels.contains(&"soul"),
+        "doer must have 'soul' label; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"agents"),
+        "'agents' provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"note_store"),
+        "'note_store' provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"workspace-header"),
+        "workspace-header must be labeled; got {labels:?}"
+    );
+
+    // workspace-header must be a separate, short component — not one that swallows
+    // provider blocks. The workspace header text is ~200 chars; provider content
+    // adds thousands. A swallowing annotation would have chars >> 500.
+    let ws_chars = report.system[0]
+        .components
+        .iter()
+        .find(|c| c.label == "workspace-header")
+        .expect("workspace-header component must exist")
+        .chars;
+    assert!(
+        ws_chars < 500,
+        "workspace-header chars ({ws_chars}) must be small — not absorbing provider blocks"
+    );
+}
+
+// #2937: coach altitude — workspace-header must not swallow context providers.
+// Coach replaces soul with COACH_SOUL, but agents and notes remain labeled.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn provider_annotations_labeled_independently_coach_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Always ask before acting.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "project: uses just check\n§\n").unwrap();
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::SoulProvider::new(None));
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let mut coach_persona = test_persona(
+        "coach",
+        "Give advice.",
+        std::path::PathBuf::from("/personas/coach.md"),
+    );
+    coach_persona.profile.altitude = Some(newt_core::Altitude::Coach);
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        Some(&coach_persona),
+        "sess-coach",
+        Some(&sink),
+    );
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+
+    assert!(
+        labels.contains(&"coach-soul"),
+        "coach must have 'coach-soul' label; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"agents"),
+        "'agents' provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"note_store"),
+        "'note_store' provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"workspace-header"),
+        "workspace-header must be labeled; got {labels:?}"
+    );
+
+    let ws_chars = report.system[0]
+        .components
+        .iter()
+        .find(|c| c.label == "workspace-header")
+        .expect("workspace-header component must exist")
+        .chars;
+    assert!(
+        ws_chars < 500,
+        "workspace-header chars ({ws_chars}) must not absorb provider blocks"
+    );
+
+    // Prompt must contain AGENTS.md and notes content despite coach altitude.
+    assert!(
+        prompt.contains("Always ask before acting"),
+        "agents content must reach prompt"
+    );
+    assert!(
+        prompt.contains("uses just check"),
+        "notes content must reach prompt"
+    );
+}
+
+// #2937: when no soul provider is present, context providers (agents, notes)
+// still receive individual annotations. No DEFAULT_SOUL must be invented.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn no_soul_provider_context_providers_still_annotated_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Commit with clear messages.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "user: uses rg not grep\n§\n").unwrap();
+
+    // No SoulProvider — soul_block() returns None.
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        None,
+        "sess-nosoul",
+        Some(&sink),
+    );
+
+    // No DEFAULT_SOUL fallback — the builder never invents one (#2935).
+    let first_line = newt_core::DEFAULT_SOUL
+        .lines()
+        .find(|l| !l.is_empty())
+        .unwrap();
+    assert!(
+        !prompt.contains(first_line),
+        "builder must not inject DEFAULT_SOUL; got: {prompt:.200}"
+    );
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+
+    assert!(
+        labels.contains(&"agents"),
+        "'agents' must be labeled even with no soul; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"note_store"),
+        "'note_store' must be labeled even with no soul; got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"soul"),
+        "no soul provider means no 'soul' label; got {labels:?}"
     );
 }

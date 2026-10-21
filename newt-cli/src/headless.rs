@@ -117,6 +117,9 @@ pub struct HeadlessArgs {
     pub output_allowance: Option<u32>,
     /// `--run-allowance`: explicit run-level call-count allowance (#2313).
     pub run_allowance: Option<u32>,
+    /// `--dump-request`: write the first request's prompt report here and stop
+    /// before sending it (#2937).
+    pub dump_request: Option<PathBuf>,
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -131,8 +134,19 @@ pub struct HeadlessArgs {
 /// driver's transcript with one system message naming the real root, the
 /// same fact `newt-tui`'s interactive loop already states via its
 /// `Workspace: {path}` line (`newt-tui/src/lib.rs`).
-fn workspace_root_system_message(workspace: &str) -> newt_core::MemMessage {
-    newt_core::MemMessage::system(format!("Workspace root: {workspace}"))
+fn workspace_root_system_message(
+    workspace: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> newt_core::MemMessage {
+    let text = format!("Workspace root: {workspace}");
+    if let Some(s) = sink {
+        s.annotate(
+            "workspace root",
+            "headless::workspace_root_system_message",
+            &text,
+        );
+    }
+    newt_core::MemMessage::system(text)
 }
 
 fn seed_scratchpad(json: &str) -> Result<(Arc<newt_core::SessionScratchpadStore>, String)> {
@@ -650,12 +664,21 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // Captured before `dc` moves into the driver: the cap the run ACTUALLY
     // uses initially (post `--max-rounds`), for the contract's effective_config.
     let max_rounds = dc.max_tool_rounds as u32;
+    // #2937: session-owned request-report sink; prepare-only mode stops before send.
+    if let Some(path) = &args.dump_request {
+        dc.report_sink = Some(std::sync::Arc::new(
+            newt_core::agentic::request_report::ReportSink::prepare_and_dump(path.clone()),
+        ));
+    }
     let read_scope = dc.caveats.fs_read.clone();
-    let mut driver =
-        TurnDriver::with_transcript(dc, vec![workspace_root_system_message(&workspace)])
-            .with_cognition(runtime.cognition)
-            .with_tenacity(runtime.tenacity)
-            .with_initiative(runtime.initiative);
+    let sys_msg = {
+        let sink_ref = dc.report_sink.as_deref();
+        workspace_root_system_message(&workspace, sink_ref)
+    };
+    let mut driver = TurnDriver::with_transcript(dc, vec![sys_msg])
+        .with_cognition(runtime.cognition)
+        .with_tenacity(runtime.tenacity)
+        .with_initiative(runtime.initiative);
     if runtime.crew {
         driver = driver.with_crew_runner(Arc::new(crate::crew_runner::LocalCrewRunner::new(
             // The crew runner needs an owned flattened Config; the
@@ -754,6 +777,16 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             }
         }
     };
+    // #2937: a successful dump-and-stop returns PrepareOnly; the file was written
+    // inside the driver. A write failure would have produced TurnEndReason::Failed.
+    if let Ok(ref o) = outcome {
+        if o.end_reason == Some(newt_core::metrics::TurnEndReason::PrepareOnly) {
+            if let Some(path) = &args.dump_request {
+                eprintln!("newt: request report written to {}", path.display());
+            }
+            return Ok(0);
+        }
+    }
     match &outcome {
         Ok(o) if o.error.is_none() => {
             newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnCompleted);
@@ -1796,7 +1829,7 @@ mod tests {
     /// exactly like newt-tui's `Workspace: {path}` line.
     #[test]
     fn workspace_root_system_message_names_the_real_root() {
-        let msg = workspace_root_system_message("/home/dev/proj");
+        let msg = workspace_root_system_message("/home/dev/proj", None);
         assert_eq!(msg.role, newt_core::memory::Role::System);
         assert!(
             msg.content.contains("/home/dev/proj"),
