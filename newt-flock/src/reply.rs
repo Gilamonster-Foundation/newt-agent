@@ -282,9 +282,20 @@ fn verify_chain(lines: &[Line]) -> Result<(), String> {
 /// whole row and dropped if it is torn, so the next line never glues onto it.
 struct Journal {
     file: std::fs::File,
+    append: AppendFn,
+    /// Set by a failed append; see [`Journal::put`].
+    poisoned: bool,
     /// The id of the last line: the parent of the next.
     head: Option<ContentId>,
     rows: BTreeMap<String, Row>,
+}
+
+/// Writes one line and makes it durable (tests inject a fault here).
+type AppendFn = Box<dyn FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()> + Send>;
+
+fn append_real(f: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 /// Makes a directory entry durable (fsync of the directory).
@@ -315,7 +326,7 @@ fn jerr(e: impl std::fmt::Display) -> String {
 }
 
 impl Journal {
-    fn open(dir: &Path, sync_dir: &SyncDir) -> Result<Self, String> {
+    fn open(dir: &Path, sync_dir: &SyncDir, append: AppendFn) -> Result<Self, String> {
         // ours, a real directory, closed to others (a loose or linked one is refused)
         private_dir(dir).map_err(jerr)?;
         let path = dir.join("replies.jsonl");
@@ -408,10 +419,25 @@ impl Journal {
             let row = line.node.payload;
             rows.insert(row.reply.key(), row);
         }
-        Ok(Self { file, head, rows })
+        Ok(Self {
+            file,
+            append,
+            poisoned: false,
+            head,
+            rows,
+        })
     }
 
+    /// Append one line. A failed write or fsync may have left the line in the
+    /// file while the head here did not move (or the reverse), so the next
+    /// append would fork the chain: the journal refuses every later append
+    /// until it is reopened, which verifies the file and recovers its tail.
     fn put(&mut self, reply: &Reply, sent: Sent) -> Result<(), String> {
+        if self.poisoned {
+            return Err(jerr(
+                "an earlier write failed; reopen the journal (it verifies the file again)",
+            ));
+        }
         let row = Row {
             reply: reply.clone(),
             sent,
@@ -427,10 +453,10 @@ impl Journal {
         })
         .map_err(|e| e.to_string())?;
         line.push('\n');
-        self.file
-            .write_all(line.as_bytes())
-            .and_then(|()| self.file.sync_all())
-            .map_err(jerr)?;
+        if let Err(e) = (self.append)(&mut self.file, line.as_bytes()) {
+            self.poisoned = true;
+            return Err(jerr(e));
+        }
         self.head = Some(id);
         self.rows.insert(reply.key(), row);
         Ok(())
@@ -453,6 +479,26 @@ impl<C: ToolCaller> Replies<C> {
         Self::open_with(dir, member, caller, Box::new(sync_dir_real))
     }
 
+    /// [`open_with`](Self::open_with) with the append supplied too (tests fail
+    /// an fsync once).
+    ///
+    /// # Errors
+    /// As [`open`](Self::open).
+    #[doc(hidden)]
+    pub fn open_with_append(
+        dir: &Path,
+        member: impl Into<String>,
+        caller: C,
+        sync_dir: SyncDir,
+        append: AppendFn,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            member: member.into(),
+            journal: Journal::open(dir, &sync_dir, append)?,
+            caller,
+        })
+    }
+
     /// [`open`](Self::open) with the directory sync supplied (tests check its
     /// order against the first emission).
     ///
@@ -467,7 +513,7 @@ impl<C: ToolCaller> Replies<C> {
     ) -> Result<Self, String> {
         Ok(Self {
             member: member.into(),
-            journal: Journal::open(dir, &sync_dir)?,
+            journal: Journal::open(dir, &sync_dir, Box::new(append_real))?,
             caller,
         })
     }

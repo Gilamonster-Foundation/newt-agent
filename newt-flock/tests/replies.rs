@@ -952,3 +952,72 @@ fn an_intact_chain_reopens_and_extends() {
     assert!(after.lines().count() > lines.len());
     let (_rp, _) = replies(&w, &dir); // and the longer chain verifies
 }
+
+// ---- Codex round 6 on #2977 --------------------------------------------------
+
+/// Finding 8: a failed append poisons the journal. The head is not advanced, a
+/// retry on the same object writes and emits nothing, and a reopen (verify +
+/// tail recovery) is the only way back, with the chain intact.
+#[test]
+fn a_failed_append_poisons_the_journal_until_it_is_reopened() {
+    use std::io::Write as _;
+    let w = world();
+    let dir = journal(&w);
+    let emitted = Arc::new(Mutex::new(0usize));
+    let e = Arc::clone(&emitted);
+    let caller = newt_flock::FnCaller(move |_: &str, _| {
+        *e.lock().unwrap() += 1;
+        Ok(newt_flock::ToolReply::Text("???".into()))
+    });
+    let one_shot = Arc::new(Mutex::new(true));
+    let fault = Arc::clone(&one_shot);
+    let mut rp = Replies::open_with_append(
+        &dir,
+        "h1",
+        caller,
+        Box::new(|_: &Path| Ok(())),
+        // the line reaches the file, then the fsync fails: the file and the
+        // in-memory head now disagree unless the journal refuses to go on
+        Box::new(move |f: &mut std::fs::File, bytes: &[u8]| {
+            f.write_all(bytes)?;
+            if std::mem::replace(&mut *fault.lock().unwrap(), false) {
+                return Err(std::io::Error::other("fsync"));
+            }
+            f.sync_all()
+        }),
+    )
+    .unwrap();
+    let ack = Reply::ack(&w.brief);
+    assert!(rp.send(&ack).is_err(), "the failed append is an error");
+    assert_eq!(
+        *emitted.lock().unwrap(),
+        0,
+        "nothing left before the intent"
+    );
+    let before = std::fs::read(dir.join("replies.jsonl")).unwrap();
+    // the fault is spent, yet the same object refuses to go on
+    let again = rp.send(&Reply::result(&w.brief, true).unwrap());
+    assert!(
+        again.err().is_some_and(|e| e.contains("reopen")),
+        "poisoned"
+    );
+    assert_eq!(*emitted.lock().unwrap(), 0);
+    assert_eq!(std::fs::read(dir.join("replies.jsonl")).unwrap(), before);
+    drop(rp);
+
+    // reopening verifies the file (the intent line did land) and works again
+    let (mut rp, _) = replies(&w, &dir);
+    rp.send(&Reply::result(&w.brief, true).unwrap()).unwrap();
+    drop(rp);
+    let text = std::fs::read_to_string(dir.join("replies.jsonl")).unwrap();
+    let geneses = text
+        .lines()
+        .filter(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["node"]["parents"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        })
+        .count();
+    assert_eq!(geneses, 1, "a second genesis forked the chain");
+    let (_rp, _) = replies(&w, &dir); // the whole chain still verifies
+}
