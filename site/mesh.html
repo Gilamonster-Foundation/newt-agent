@@ -94,7 +94,7 @@ var SPEC = {
  "stages": [
   {
    "title": "Each machine derives its own key",
-   "cap": "One operator root key; a per-machine key is derived from it, never stored, so an approved fingerprint survives restarts. Same operator only.",
+   "cap": "Your operator root key (the same UserKey as on the Identity page) plus a label naming the role and the machine, newt/dock/v1/host/<instance>, derive that machine's key. The instance name is random on first use, not secret, and kept in a dock-instance file you can rename. The key itself is never stored, so an approved fingerprint survives restarts. Change the instance name and the identity changes, so approvals must be re-granted.",
    "show": [
     "hub",
     "host"
@@ -106,10 +106,10 @@ var SPEC = {
    "edges": [],
    "state": {},
    "tag": {
-    "hub": "derived key",
-    "host": "derived key"
+    "hub": "root key + label",
+    "host": "root key + label"
    },
-   "note": "Implemented: dock_agent"
+   "note": "Implemented: dock_agent. Same operator only"
   },
   {
    "title": "Discover on the LAN",
