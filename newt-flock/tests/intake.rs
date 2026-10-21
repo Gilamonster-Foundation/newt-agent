@@ -509,3 +509,38 @@ fn a_restart_from_a_replay_prefix_ending_at_a_brief_queues_nothing_finished() {
 fn a_restart_from_a_replay_prefix_ending_at_a_review_queues_nothing_finished() {
     restart_from_a_prefix_ending_at(Kind::Review);
 }
+
+/// 13e on 12b r2's contract (state at the saved board and each catch-up): an
+/// ask admitted after the follower has caught up reaches the callback's view
+/// on the next pass, so `/asks` keeps up with live frames.
+#[test]
+fn an_ask_admitted_after_catch_up_reaches_the_callback_view() {
+    let mut r = Rig::new();
+    let mut h1 = r.enrol("h1");
+    let s = session_for(&r, "h1", &h1);
+    let (tx, rx) = mpsc::channel();
+    let inbox = Inbox::follow(config(&r, &s), move |f| {
+        let _ = tx.send(newt_flock::view(f.board()).open.len());
+    })
+    .unwrap();
+    let wait = |want: usize| loop {
+        let n = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the view never reached the expected count");
+        if n == want {
+            break;
+        }
+    };
+    wait(0); // caught up with nothing open
+    r.event(
+        &mut h1,
+        Kind::Ask,
+        vec![],
+        Body::Ask {
+            lane: None,
+            text: "which one?".into(),
+        },
+    );
+    wait(1);
+    assert!(matches!(inbox.stop(), newt_flock::Ended::Stopped));
+}

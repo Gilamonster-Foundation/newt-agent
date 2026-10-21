@@ -188,6 +188,9 @@ mod follow {
                 wake,
             };
             let inbox = Inbox::follow(cfg, move |f| {
+                if let Some(ui) = crate::flock_ui::installed() {
+                    ui.observe(newt_flock::view(f.board()));
+                }
                 intake.reconcile(f, &mut sink);
             })?;
             Ok(Self { _inbox: inbox })

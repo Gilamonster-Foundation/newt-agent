@@ -4922,11 +4922,13 @@ dependencies = [
 name = "newt-tui"
 version = "0.8.3"
 dependencies = [
+ "agent-mesh-flock-server",
  "agent-mesh-protocol 0.7.0",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "content-addressable",
  "crossterm",
  "getrandom 0.2.17",
  "libc",

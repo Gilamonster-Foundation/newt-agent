@@ -11,6 +11,7 @@ mod reply;
 mod task;
 mod view;
 
+pub use agent_mesh_flock::text::inert;
 pub use answer::{Answerer, Draft, Outcome, SignReply, SignRequest};
 pub use asks::{view, AskView, OpenAsk};
 pub use reply::{FnCaller, Lost, Replies, Reply, Sent, Step, ToolCaller, ToolReply};
