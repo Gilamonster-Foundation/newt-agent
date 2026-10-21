@@ -120,6 +120,9 @@ embedded = ["newt-inference/embedded"]
 # module that uses it.
 [target.'cfg(unix)'.dev-dependencies]
 tests-pty.workspace = true
+# 13e flock_ui tests: a signer double speaks the signer's wire format.
+agent-mesh-flock-server = { version = "0.8.0", default-features = false }
+content-addressable.workspace = true
 
 [dev-dependencies]
 # Paused-time metadata retry tests; no wall-clock sleeps.

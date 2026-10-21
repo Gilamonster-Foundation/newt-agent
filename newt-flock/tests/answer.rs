@@ -108,7 +108,10 @@ fn a_declined_answer_comes_back_as_the_signers_refusal_and_is_not_retried() {
 fn no_signer_running_is_an_error_not_a_silent_success() {
     let tmp = TempDir::new().unwrap();
     let a = Answerer::new(id(1), tmp.path().join("nobody.sock"));
-    assert!(a.send(a.draft(&ask(2, "q"), "x")).is_err());
+    assert!(matches!(
+        a.send(a.draft(&ask(2, "q"), "x")),
+        Err(newt_flock::SendError::NotSent(_))
+    ));
 }
 
 #[test]
@@ -203,6 +206,9 @@ fn a_signer_that_hangs_up_without_answering_is_an_error_not_a_decision() {
         // drop the connection with no reply
     });
     let a = Answerer::new(id(1), path);
-    assert!(a.send(a.draft(&ask(2, "q"), "x")).is_err());
+    assert!(matches!(
+        a.send(a.draft(&ask(2, "q"), "x")),
+        Err(newt_flock::SendError::Unknown(_))
+    ));
     join.join().unwrap();
 }

@@ -63,6 +63,29 @@ impl Outcome {
     }
 }
 
+/// Why [`Answerer::send`] gave no outcome. The two cases call for opposite
+/// advice: retry, or look at the verified log first.
+#[derive(Debug)]
+pub enum SendError {
+    /// The signer could not be reached; nothing was written, so nothing can
+    /// have been signed.
+    NotSent(std::io::Error),
+    /// The request was written and no decision came back (hang-up, reset, bad
+    /// reply). The human may have signed and the server may have admitted it.
+    Unknown(std::io::Error),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSent(e) => write!(f, "signer not reached: {e}"),
+            Self::Unknown(e) => write!(f, "no answer after the request was sent: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
 /// An answer being composed. It is immutable once made: what [`Draft::shown`]
 /// returns is what [`Answerer::send`] puts on the wire, and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,23 +132,25 @@ impl Answerer {
     /// retried blindly.
     ///
     /// # Errors
-    /// The signer is not running or the connection broke; the draft's fate is
-    /// then unknown until the log says otherwise.
-    pub fn send(&self, draft: Draft) -> Result<Outcome, std::io::Error> {
-        let mut c = UnixStream::connect(&self.signer)?;
+    /// [`SendError::NotSent`] if the signer is not running (nothing was
+    /// written); [`SendError::Unknown`] once the request was written and the
+    /// connection broke: the draft's fate is then unknown until the log says
+    /// otherwise.
+    pub fn send(&self, draft: Draft) -> Result<Outcome, SendError> {
+        let mut c = UnixStream::connect(&self.signer).map_err(SendError::NotSent)?;
         let req = SignRequest {
             flock: self.flock,
             ask: draft.ask,
             text: draft.text,
         };
-        write_msg(&mut c, &req).map_err(io)?;
-        match read_msg::<SignReply>(&mut c).map_err(io)? {
+        write_msg(&mut c, &req).map_err(|e| SendError::Unknown(io(e)))?;
+        match read_msg::<SignReply>(&mut c).map_err(|e| SendError::Unknown(io(e)))? {
             Some(SignReply::Admitted { event, index }) => Ok(Outcome::Admitted { event, index }),
             Some(SignReply::Refused(why)) => Ok(Outcome::Refused(why)),
-            None => Err(std::io::Error::new(
+            None => Err(SendError::Unknown(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "the signer closed without an answer",
-            )),
+            ))),
         }
     }
 }

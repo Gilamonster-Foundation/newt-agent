@@ -3995,6 +3995,40 @@ fn session_body(
                         println!();
                         continue;
                     }
+                    // 13e: `/asks` and `/answer` (verified flock asks; the signer
+                    // is a separate process). Operator-only, behind `flock`.
+                    #[cfg(feature = "flock")]
+                    {
+                        // lines shown before a blocking send go out at once
+                        let mut printed = false;
+                        let mut show = |line: &str| {
+                            if printed {
+                                println!("{line}");
+                            } else {
+                                print_newt(line, color, verbose);
+                                printed = true;
+                            }
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        };
+                        if let Some(lines) = crate::flock_ui::command(
+                            model_input_origin.is_operator(),
+                            task,
+                            crate::flock_ui::installed(),
+                            &mut show,
+                        ) {
+                            let mut it = lines.into_iter();
+                            if !printed {
+                                if let Some(first) = it.next() {
+                                    print_newt(&first, color, verbose);
+                                }
+                            }
+                            for line in it {
+                                println!("{line}");
+                            }
+                            println!();
+                            continue;
+                        }
+                    }
                     let slash_body = task.trim_start_matches('/');
                     // #1030: `/status` / `/info` quick state surfaces.
                     if slash_body == "status" || slash_body == "info" {
@@ -9944,6 +9978,10 @@ mod prompt_ingress_tests;
 #[cfg(test)]
 #[path = "chat_tests/flock_ingress.rs"]
 mod flock_ingress_tests;
+
+#[cfg(all(test, feature = "flock"))]
+#[path = "chat_tests/flock_ui.rs"]
+mod flock_ui_tests;
 
 /// What an interrupted turn persists. A streamed reply was already on screen,
 /// so it is saved as shown; an unstreamed one was never rendered, so the turn

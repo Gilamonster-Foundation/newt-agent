@@ -15,6 +15,8 @@ mod color;
 mod context_window;
 mod crew_form;
 mod flock_intake;
+#[cfg(feature = "flock")]
+mod flock_ui;
 mod help;
 #[cfg(feature = "rich-tui")]
 mod inference_panel;
