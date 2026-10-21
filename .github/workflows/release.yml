@@ -483,6 +483,7 @@ jobs:
           - newt-coder
           - newt-mcp-server
           - newt-scheduler
+          - newt-flock
           - newt-tui
           - newt-acp-worker
           - newt-agent

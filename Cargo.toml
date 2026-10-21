@@ -37,10 +37,10 @@ members = [
     "tests/common",
     "tests/pty",
 ]
-# Every member except `newt-flock`: its agent-mesh dependencies are git-only
-# until the flock crates are on crates.io, so a plain `cargo build` leaves it
-# out. CI and the ratchets still see it as a member; build it with
-# `-p newt-flock` (newt-flock/tests/default_build.rs asserts the split).
+# Every member except `newt-flock`: it is Unix-only and pulls the agent-mesh
+# flock crates, so a plain `cargo build` leaves it out. CI and the ratchets
+# still see it as a member; build it with `-p newt-flock`
+# (newt-flock/tests/default_build.rs asserts the split).
 default-members = [
     "newt-core",
     "newt-data",
@@ -411,6 +411,7 @@ agent-mesh-protocol = "0.7"
 # Internal crates — pinned with = for lock-step publishing
 newt-core         = { path = "newt-core",         version = "=0.8.3" }
 newt-data         = { path = "newt-data",         version = "=0.8.3" }
+newt-flock        = { path = "newt-flock",        version = "=0.8.3" }
 newt-git          = { path = "newt-git",          version = "=0.8.3" }
 newt-inference    = { path = "newt-inference",    version = "=0.8.3" }
 newt-scheduler    = { path = "newt-scheduler",    version = "=0.8.3" }

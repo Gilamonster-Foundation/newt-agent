@@ -7,13 +7,22 @@
 
 mod answer;
 mod asks;
+mod task;
 
 pub use answer::{Answerer, Draft, Outcome, SignReply, SignRequest};
 pub use asks::{view, AskView, OpenAsk};
+pub use task::{open_tasks, verify, CitedFile, Evidence, Intake, NewTask, Sink, Task, TaskKind};
+
+/// The task text, for tests of its inertness.
+#[doc(hidden)]
+#[must_use]
+pub fn render_for_test(ev: &Evidence) -> String {
+    task::render(ev)
+}
 
 use agent_mesh_flock::Genesis;
 use agent_mesh_flock_server::wire::{read_msg, write_msg, StreamChallenge};
-use agent_mesh_flock_server::{private_dir, Sealed};
+use agent_mesh_flock_server::{private_dir, Follower, Sealed};
 use agent_mesh_flock_session::{call, CtlReq, CtlResp, Reader, ReaderError, RealFs, Seen};
 use agent_mesh_protocol::Assertion;
 use content_addressable::{ContentAddressable, MerkleNode};
@@ -176,6 +185,21 @@ impl Inbox {
     /// # Errors
     /// See [`Error`].
     pub fn start(cfg: Config) -> Result<Self, Error> {
+        Self::start_with(cfg, |_| {})
+    }
+
+    /// [`start`](Self::start), and `on_state` is called on the worker with the
+    /// verified follower: once for the board the reader saved earlier (so
+    /// work that arrived before a restart is seen even if no new frame ever
+    /// comes) and again after every frame and catch-up, always after the
+    /// reader has saved. It never sees anything the reader did not verify.
+    ///
+    /// # Errors
+    /// See [`Error`].
+    pub fn start_with(
+        cfg: Config,
+        mut on_state: impl FnMut(&Follower) + Send + 'static,
+    ) -> Result<Self, Error> {
         match call(&cfg.session, &CtlReq::Whoami).map_err(|e| Error::Session(e.to_string()))? {
             CtlResp::Who {
                 flock,
@@ -203,6 +227,7 @@ impl Inbox {
                 let halt = Arc::new(Halt::default());
                 let flag = Arc::clone(&halt);
                 let thread = thread::spawn(move || {
+                    on_state(reader.follower());
                     let prove = |c: &StreamChallenge| flag.prove(&cfg.session, c);
                     // ponytail: each pass is a catch-up stream, re-opened after
                     // `retry`; the live tail waits for the next pass. One long
@@ -217,6 +242,7 @@ impl Inbox {
                         let r = conn.and_then(|conn| {
                             reader.follow_on(conn, &prove, true, &mut |s| match s {
                                 Seen::Frame(f, fol) => {
+                                    on_state(fol);
                                     removed =
                                         !fol.board().members().iter().any(|m| m.name == member);
                                     gone |= tx
@@ -227,6 +253,7 @@ impl Inbox {
                                         .is_err();
                                 }
                                 Seen::Caught(i, fol) => {
+                                    on_state(fol);
                                     removed =
                                         !fol.board().members().iter().any(|m| m.name == member);
                                     gone |= tx.send(Observed::Caught(i)).is_err();
