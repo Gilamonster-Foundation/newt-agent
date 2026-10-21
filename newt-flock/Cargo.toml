@@ -19,6 +19,8 @@ agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/age
 agent-mesh-flock-session = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "8f1ee04066b7249999c6072888dd99a4630def68", default-features = false }
 # The Prover's types (a stream challenge and its proof); newt signs nothing.
 agent-mesh-protocol = { git = "https://github.com/Gilamonster-Foundation/agent-mesh", rev = "8f1ee04066b7249999c6072888dd99a4630def68" }
+# A connect that returns instead of waiting when the peer's accept queue is full.
+socket2 = "0.6"
 content-addressable.workspace = true
 thiserror.workspace = true
 
@@ -28,7 +30,6 @@ agent-mesh-flock-server = { git = "https://github.com/Gilamonster-Foundation/age
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 tempfile.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

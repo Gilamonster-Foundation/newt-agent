@@ -543,3 +543,58 @@ fn stop_returns_when_the_session_accepted_the_prove_call_and_never_answers() {
     accepted.recv().unwrap();
     returns_promptly(move || assert_eq!(inbox.stop(), Ended::Stopped));
 }
+
+/// Fill a listener's accept queue (it never accepts) with non-blocking
+/// connects until the kernel says it is full. On Linux a further blocking
+/// `connect` to such a socket waits for room; a non-blocking one fails with
+/// `WouldBlock`, which is how the saturation is detected here.
+#[cfg(target_os = "linux")]
+fn saturate(path: &Path) -> Vec<socket2::Socket> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let addr = SockAddr::unix(path).unwrap();
+    let mut held = vec![];
+    loop {
+        let s = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        s.set_nonblocking(true).unwrap();
+        match s.connect(&addr) {
+            Ok(()) => held.push(s),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return held,
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stop_and_drop_return_while_the_server_will_not_take_a_connection() {
+    for drop_it in [false, true] {
+        let r = Rig::new();
+        let h1 = r.enrol("h1");
+        let s = session_for(&r, "h1", &h1);
+        let full = r.tmp.path().join("full.sock");
+        let _listener = UnixListener::bind(&full).unwrap(); // never accepts
+        let _queued = saturate(&full);
+        let inbox = Inbox::start(Config {
+            serve: full,
+            ..config(&r, &s)
+        })
+        .unwrap();
+        // the worker has tried to connect and been told the server is full
+        // (a blocking connect would never get here)
+        match inbox.events().recv_timeout(HANG_GUARD) {
+            Ok(Observed::Unavailable(_)) => {}
+            _ => {
+                // dropping it would join the stuck worker and hang the test
+                std::mem::forget(inbox);
+                panic!("the worker is stuck in connect");
+            }
+        }
+        returns_promptly(move || {
+            if drop_it {
+                drop(inbox);
+            } else {
+                assert_eq!(inbox.stop(), Ended::Stopped);
+            }
+        });
+    }
+}

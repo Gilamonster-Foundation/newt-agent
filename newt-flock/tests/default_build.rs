@@ -2,61 +2,35 @@
 //! default member: a plain `cargo build` at the root does not build it, and it
 //! is built on request with `-p newt-flock`. Its dependencies are git-only
 //! until the agent-mesh flock crates are on crates.io.
+//!
+//! Reads the root manifest at compile time: no subprocess, no filesystem. The
+//! production-features library check (`cargo check -p newt-flock --lib`) is a
+//! CI build step in ci.yml, not a test.
 
-use std::process::Command;
+const ROOT: &str = include_str!("../../Cargo.toml");
+
+/// The entries of the `[workspace]` array that starts with `key = [`.
+fn array(key: &str) -> Vec<&'static str> {
+    let start = ROOT
+        .find(&format!("\n{key} = ["))
+        .unwrap_or_else(|| panic!("`{key}` moved out of the root manifest"))
+        + key.len()
+        + 5;
+    let body = &ROOT[start..];
+    let body = &body[..body.find("\n]").expect("the array ends")];
+    body.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('"'))
+        .map(|l| l.split('"').nth(1).unwrap())
+        .collect()
+}
 
 #[test]
 fn it_is_a_member_but_not_a_default_member() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let out = Command::new(env!("CARGO"))
-        .args([
-            "metadata",
-            "--no-deps",
-            "--offline",
-            "--format-version",
-            "1",
-        ])
-        .arg("--manifest-path")
-        .arg(root.join("Cargo.toml"))
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let ids = |key: &str| -> Vec<String> {
-        meta[key]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_owned())
-            .collect()
-    };
-    let is_flock = |id: &String| id.contains("/newt-flock#");
-    let (members, defaults) = (ids("workspace_members"), ids("workspace_default_members"));
-    assert!(members.iter().any(is_flock), "still a workspace member");
-    assert!(!defaults.iter().any(is_flock), "{defaults:?}");
+    let (members, defaults) = (array("members"), array("default-members"));
+    assert!(members.contains(&"newt-flock"), "still a workspace member");
+    assert!(!defaults.contains(&"newt-flock"), "{defaults:?}");
     // the default set is every other member: nothing else fell out of it
-    assert_eq!(defaults.len() + 1, members.len());
-}
-
-/// The library as a consumer gets it: no dev-dependencies, so none of the
-/// writer features the test fixture turns on (`serve` through feature
-/// unification) are available. `cargo test` alone cannot see a production
-/// build break, because the fixture's dev-dependency enables them.
-#[test]
-fn the_library_builds_with_production_features_only() {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-    let out = Command::new(env!("CARGO"))
-        .args(["check", "--offline", "--locked", "--lib", "--manifest-path"])
-        .arg(manifest)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "newt-flock --lib (no dev-dependencies) does not build:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let rest: Vec<_> = members.iter().filter(|m| **m != "newt-flock").collect();
+    assert_eq!(defaults.iter().collect::<Vec<_>>(), rest);
 }

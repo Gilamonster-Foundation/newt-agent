@@ -82,6 +82,19 @@ pub enum Ended {
     Failed(String),
 }
 
+/// Connect without waiting: a peer whose accept queue is full fails with
+/// `WouldBlock` at once, where a blocking connect would wait for room with no
+/// socket yet for `halt` to shut down. The pass then ends as `Unavailable` and
+/// is retried after `retry`.
+fn connect(path: &Path) -> std::io::Result<UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    sock.set_nonblocking(true)?;
+    sock.connect(&SockAddr::unix(path)?)?;
+    sock.set_nonblocking(false)?;
+    Ok(UnixStream::from(std::os::fd::OwnedFd::from(sock)))
+}
+
 /// The sockets a worker is blocked on, so [`Inbox::stop`] can shut them down:
 /// a read the peer never answers then fails and the worker sees the stop flag.
 #[derive(Default)]
@@ -127,7 +140,7 @@ impl Halt {
     /// Ask the session to sign `challenge`, over a connection `halt` can cut.
     fn prove(&self, session: &Path, challenge: &StreamChallenge) -> Result<Assertion, ReaderError> {
         let stream = |e: String| ReaderError::Stream(e);
-        let mut s = UnixStream::connect(session).map_err(|e| stream(e.to_string()))?;
+        let mut s = connect(session).map_err(|e| stream(e.to_string()))?;
         self.track(&s).map_err(|e| stream(e.to_string()))?;
         let req = CtlReq::ProveStream {
             challenge: challenge.clone(),
@@ -184,13 +197,13 @@ impl Inbox {
                 let thread = thread::spawn(move || {
                     let prove = |c: &StreamChallenge| flag.prove(&cfg.session, c);
                     // ponytail: each pass is a catch-up stream, re-opened after
-                    // `retry`; the live tail waits for the next pass. Upgrade
-                    // to one long stream once `Watch` can be shut down from
-                    // outside.
+                    // `retry`; the live tail waits for the next pass. One long
+                    // stream (`once = false`) is possible now that `halt` can
+                    // cut a stream from outside.
                     while !flag.is_stopped() {
                         let mut removed = false;
                         let mut gone = false;
-                        let conn = UnixStream::connect(&cfg.serve)
+                        let conn = connect(&cfg.serve)
                             .map_err(ReaderError::Io)
                             .and_then(|c| flag.track(&c).map(|()| c).map_err(ReaderError::Io));
                         let r = conn.and_then(|conn| {
