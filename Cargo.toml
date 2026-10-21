@@ -17,6 +17,7 @@ members = [
     "newt-interaction",
     "newt-scheduler",
     "newt-git",
+    "newt-flock",
     "crates/newt-launch",
     "crates/newt-carried-tools",
     "crates/newt-tuner",
