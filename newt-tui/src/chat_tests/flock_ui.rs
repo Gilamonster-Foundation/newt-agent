@@ -31,6 +31,15 @@ struct Signer {
 }
 
 fn signer_with(reply: SignReply, before_reply: impl FnOnce() + Send + 'static) -> Signer {
+    serve(Some(reply), before_reply)
+}
+
+/// A signer that reads the request and hangs up without a decision.
+fn hangup_with(before_hangup: impl FnOnce() + Send + 'static) -> Signer {
+    serve(None, before_hangup)
+}
+
+fn serve(reply: Option<SignReply>, before_reply: impl FnOnce() + Send + 'static) -> Signer {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("sign.sock");
     let l = UnixListener::bind(&path).unwrap();
@@ -42,7 +51,10 @@ fn signer_with(reply: SignReply, before_reply: impl FnOnce() + Send + 'static) -
         let req: SignRequest = read_msg(&mut c).unwrap().unwrap();
         log.lock().unwrap().push(req);
         before_reply();
-        write_msg(&mut c, &reply).unwrap();
+        if let Some(reply) = reply {
+            write_msg(&mut c, &reply).unwrap();
+        }
+        drop(c);
         let _ = tx.send(());
     });
     Signer {
@@ -70,10 +82,18 @@ fn open(asks: Vec<OpenAsk>) -> AskView {
     }
 }
 
+/// What was shown before the command finished, then what it returned.
+fn run_split(ui: &FlockUi, line: &str) -> (Vec<String>, Vec<String>) {
+    let mut shown = vec![];
+    let back =
+        command(true, line, Some(ui), &mut |l| shown.push(l.to_owned())).expect("a flock command");
+    (shown, back)
+}
+
 fn run(ui: &FlockUi, line: &str) -> String {
-    command(true, line, Some(ui))
-        .expect("a flock command")
-        .join("\n")
+    let (mut all, back) = run_split(ui, line);
+    all.extend(back);
+    all.join("\n")
 }
 
 #[test]
@@ -175,8 +195,11 @@ fn a_refusal_is_shown_inert_and_is_not_success() {
 fn no_signer_names_the_signer_command_and_does_not_retry() {
     let tmp = tempfile::TempDir::new().unwrap();
     let ui = ui(tmp.path().join("absent.sock"), open(vec![ask(1, "q")]));
-    let out = run(&ui, "/answer 1 text");
+    let (_, back) = run_split(&ui, "/answer 1 text");
+    let out = back.join("\n");
     assert!(out.contains("amesh flock sign"), "{out}");
+    assert!(out.contains("run /answer again"), "{out}");
+    assert!(!out.contains("unknown"), "{out}");
     assert!(!out.contains("verified log"), "{out}");
 }
 
@@ -228,7 +251,7 @@ fn flock_origin_input_cannot_run_either_command() {
     };
     for line in ["/asks", "/asks all", "/answer 1 yes"] {
         assert_eq!(
-            command(origin.is_operator(), line, Some(&ui)),
+            command(origin.is_operator(), line, Some(&ui), &mut |_| {}),
             None,
             "{line}"
         );
@@ -242,8 +265,71 @@ fn flock_origin_input_cannot_run_either_command() {
 #[test]
 fn other_commands_and_a_missing_flock_are_not_swallowed() {
     let ui = ui("/none".into(), AskView::default());
-    assert_eq!(command(true, "/status", Some(&ui)), None);
-    assert_eq!(command(true, "/askswhat", Some(&ui)), None);
-    let none = command(true, "/asks", None).unwrap().join(" ");
+    assert_eq!(command(true, "/status", Some(&ui), &mut |_| {}), None);
+    assert_eq!(command(true, "/askswhat", Some(&ui), &mut |_| {}), None);
+    let none = command(true, "/asks", None, &mut |_| {}).unwrap().join(" ");
     assert!(none.contains("no flock"), "{none}");
+}
+
+#[test]
+fn the_draft_and_signer_instructions_are_shown_before_the_signer_can_reply() {
+    let shown: Arc<Mutex<Vec<String>>> = Arc::default();
+    let shown_at_reply: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
+    let (live, snap) = (Arc::clone(&shown), Arc::clone(&shown_at_reply));
+    // the signer double replies only after taking a copy of what was displayed
+    let s = signer_with(SignReply::Refused("n".into()), move || {
+        *snap.lock().unwrap() = Some(live.lock().unwrap().clone());
+    });
+    let ui = ui(s.path.clone(), open(vec![ask(1, "q")]));
+    let sink = Arc::clone(&shown);
+    let back = command(true, "/answer 1 go ahead", Some(&ui), &mut |l| {
+        sink.lock().unwrap().push(l.to_owned());
+    })
+    .unwrap();
+    s.done.recv().unwrap();
+    let at_reply = shown_at_reply.lock().unwrap().clone().expect("signer ran");
+    assert_eq!(at_reply.len(), 2, "{at_reply:?}");
+    assert!(at_reply[0].contains("go ahead"), "{at_reply:?}");
+    assert!(at_reply[1].contains("amesh flock sign"), "{at_reply:?}");
+    assert!(
+        back.iter().all(|l| !l.contains("go ahead")),
+        "the draft is not held back for the end: {back:?}"
+    );
+}
+
+#[test]
+fn a_hangup_after_the_request_is_unknown_not_retry_advice() {
+    let s = hangup_with(|| {});
+    let ui = ui(s.path.clone(), open(vec![ask(1, "q")]));
+    let out = run(&ui, "/answer 1 text");
+    s.done.recv().unwrap();
+    assert_eq!(s.seen.lock().unwrap().len(), 1, "the request was consumed");
+    assert!(out.contains("outcome is unknown"), "{out}");
+    assert!(out.contains("/asks"), "{out}");
+    assert!(!out.contains("run /answer again"), "{out}");
+    assert!(!out.contains("answered:"), "{out}");
+}
+
+#[test]
+fn a_hangup_stays_unknown_even_once_the_view_shows_the_ask_answered() {
+    let slot: Arc<Mutex<Option<Arc<FlockUi>>>> = Arc::default();
+    let hook = Arc::clone(&slot);
+    // the human signed and the follower learned of it, but the reply was lost
+    let s = hangup_with(move || {
+        let mut v = AskView::default();
+        v.answered.insert(id(1), id(9));
+        hook.lock().unwrap().as_ref().unwrap().observe(v);
+    });
+    let ui = Arc::new(ui(s.path.clone(), open(vec![ask(1, "q")])));
+    *slot.lock().unwrap() = Some(Arc::clone(&ui));
+    let out = run(&ui, "/answer 1 text");
+    s.done.recv().unwrap();
+    // no event came back to match, so the log cannot be said to confirm it
+    assert!(out.contains("outcome is unknown"), "{out}");
+    assert!(!out.contains("run /answer again"), "{out}");
+    assert!(!out.contains("is in the verified log"), "{out}");
+    assert!(
+        run(&ui, "/asks all").contains("answered"),
+        "the view shows it"
+    );
 }

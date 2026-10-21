@@ -9,11 +9,12 @@
 // are exercised by tests only.
 #![allow(dead_code)]
 
-use newt_flock::{inert, Answerer, AskView, Outcome};
+use newt_flock::{inert, Answerer, AskView, Outcome, SendError};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 const NO_SIGNER: &str =
     "no signer answered: start `amesh flock sign` in another terminal, then run /answer again";
+const UNKNOWN: &str = "the outcome is unknown: the request was sent but no decision came back; check /asks (or /asks all) before answering again";
 
 /// The verified ask view and the way to the operator's signer.
 pub(crate) struct FlockUi {
@@ -70,7 +71,9 @@ impl FlockUi {
         out
     }
 
-    fn answer(&self, n: &str, text: &str) -> Vec<String> {
+    /// `show` receives the draft and the signer instructions before the blocking
+    /// send, so the operator sees them while the decision is pending.
+    fn answer(&self, n: &str, text: &str, show: &mut dyn FnMut(&str)) -> Vec<String> {
         let v = self.snapshot();
         let Some(ask) = n
             .parse::<usize>()
@@ -85,13 +88,13 @@ impl FlockUi {
         }
         let draft = self.answerer.draft(ask, text);
         let (id, shown) = draft.shown();
-        let mut out = vec![
-            format!("answer to {id}: {}", inert(shown)),
-            "waiting for the signer: confirm or decline in the `amesh flock sign` terminal"
-                .to_owned(),
-        ];
+        let first = format!("answer to {id}: {}", inert(shown));
+        show(&first);
+        show("waiting for the signer: confirm or decline in the `amesh flock sign` terminal");
+        let mut out = vec![];
         match self.answerer.send(draft) {
-            Err(_) => out.push(NO_SIGNER.to_owned()),
+            Err(SendError::NotSent(_)) => out.push(NO_SIGNER.to_owned()),
+            Err(SendError::Unknown(_)) => out.push(UNKNOWN.to_owned()),
             Ok(Outcome::Refused(why)) => out.push(format!("not signed: {}", inert(&why))),
             Ok(o) => {
                 let Outcome::Admitted { event, index } = &o else {
@@ -111,8 +114,14 @@ impl FlockUi {
 }
 
 /// Run `/asks` or `/answer` if `line` is one. `None` means "not mine". Input
-/// that is not the operator's is never answered, whatever it says.
-pub(crate) fn command(operator: bool, line: &str, ui: Option<&FlockUi>) -> Option<Vec<String>> {
+/// that is not the operator's is never answered, whatever it says. Lines that
+/// must be seen before the command finishes go to `show`; the rest are returned.
+pub(crate) fn command(
+    operator: bool,
+    line: &str,
+    ui: Option<&FlockUi>,
+    show: &mut dyn FnMut(&str),
+) -> Option<Vec<String>> {
     if !operator {
         return None;
     }
@@ -124,13 +133,13 @@ pub(crate) fn command(operator: bool, line: &str, ui: Option<&FlockUi>) -> Optio
     let Some(ui) = ui else {
         return Some(vec!["no flock is connected to this session".to_owned()]);
     };
-    Some(run(ui, name, rest.trim()))
+    Some(run(ui, name, rest.trim(), show))
 }
 
-fn run(ui: &FlockUi, name: &str, rest: &str) -> Vec<String> {
+fn run(ui: &FlockUi, name: &str, rest: &str, show: &mut dyn FnMut(&str)) -> Vec<String> {
     if name == "asks" {
         return ui.list(rest == "all");
     }
     let (n, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-    ui.answer(n, text.trim())
+    ui.answer(n, text.trim(), show)
 }

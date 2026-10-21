@@ -3998,20 +3998,36 @@ fn session_body(
                     // 13e: `/asks` and `/answer` (verified flock asks; the signer
                     // is a separate process). Operator-only, behind `flock`.
                     #[cfg(feature = "flock")]
-                    if let Some(lines) = crate::flock_ui::command(
-                        model_input_origin.is_operator(),
-                        task,
-                        crate::flock_ui::installed(),
-                    ) {
-                        let mut it = lines.into_iter();
-                        if let Some(first) = it.next() {
-                            print_newt(&first, color, verbose);
+                    {
+                        // lines shown before a blocking send go out at once
+                        let mut printed = false;
+                        let mut show = |line: &str| {
+                            if printed {
+                                println!("{line}");
+                            } else {
+                                print_newt(line, color, verbose);
+                                printed = true;
+                            }
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        };
+                        if let Some(lines) = crate::flock_ui::command(
+                            model_input_origin.is_operator(),
+                            task,
+                            crate::flock_ui::installed(),
+                            &mut show,
+                        ) {
+                            let mut it = lines.into_iter();
+                            if !printed {
+                                if let Some(first) = it.next() {
+                                    print_newt(&first, color, verbose);
+                                }
+                            }
+                            for line in it {
+                                println!("{line}");
+                            }
+                            println!();
+                            continue;
                         }
-                        for line in it {
-                            println!("{line}");
-                        }
-                        println!();
-                        continue;
                     }
                     let slash_body = task.trim_start_matches('/');
                     // #1030: `/status` / `/info` quick state surfaces.
