@@ -389,3 +389,54 @@ fn a_removed_member_reads_nothing_more_and_is_told_the_stream_is_unavailable() {
     }
     assert!(matches!(inbox.stop(), Ended::Stopped | Ended::Removed));
 }
+
+fn started_with_state(r: &Rig, s: &FakeSession, dir: PathBuf) -> Result<Inbox, Error> {
+    Inbox::start(Config {
+        state_dir: dir,
+        ..config(r, s)
+    })
+}
+
+#[test]
+fn a_state_directory_others_can_enter_is_refused_and_one_we_made_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = Rig::new();
+    let h1 = r.enrol("h1");
+    let s = session_for(&r, "h1", &h1);
+    let loose = r.tmp.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        started_with_state(&r, &s, loose.clone()),
+        Err(Error::Reader(_))
+    ));
+    // the refusal did not loosen or tighten anything it does not own
+    assert_eq!(
+        std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    let fresh = r.tmp.path().join("fresh");
+    drop(started_with_state(&r, &s, fresh.clone()).unwrap());
+    assert_eq!(
+        std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    // an existing private directory is fine
+    drop(started_with_state(&r, &s, fresh).unwrap());
+}
+
+#[test]
+fn a_state_directory_that_is_a_symlink_is_refused() {
+    let r = Rig::new();
+    let h1 = r.enrol("h1");
+    let s = session_for(&r, "h1", &h1);
+    let real = r.tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = r.tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(matches!(
+        started_with_state(&r, &s, link),
+        Err(Error::Reader(_))
+    ));
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+}

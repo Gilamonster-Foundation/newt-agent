@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use agent_mesh_flock::Genesis;
-use agent_mesh_flock_server::Sealed;
+use agent_mesh_flock_server::{private_dir, Sealed};
 use agent_mesh_flock_session::{
     call, session_prover, CtlReq, CtlResp, Reader, ReaderError, RealFs, Seen,
 };
@@ -114,14 +114,8 @@ impl Inbox {
                 if pending {
                     return Err(Error::Pending);
                 }
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    std::fs::DirBuilder::new()
-                        .recursive(true)
-                        .mode(0o700)
-                        .create(&cfg.state_dir)
-                        .map_err(ReaderError::Io)?;
-                }
+                // ours, a real directory, closed to others (a loose or linked one is refused)
+                private_dir(&cfg.state_dir).map_err(ReaderError::Io)?;
                 let mut reader = Reader::open(cfg.genesis.clone(), &cfg.state_dir, RealFs)?;
                 let (tx, rx) = channel();
                 let stop = Arc::new(AtomicBool::new(false));
