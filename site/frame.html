@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Newt-Agent: agent-frame</title>
-<meta name="description" content="agent-frame is the pure kernel under Newt's memory: every record is named by a hash of its content, and every derived record names the records it came">
+<title>Newt-Agent: agent-frame and context</title>
+<meta name="description" content="Newt has two ways of managing context. The default one, compaction, does not use agent-frame. The opt-in smart harness does: it records the session as">
 <link rel="icon" href="favicon.png">
 <link rel="stylesheet" href="site.css">
 </head>
@@ -21,8 +21,8 @@
 </nav>
 <main>
 
-<h1 style="margin-top:28px">How agent-frame records what happened</h1>
-<p class="lede">agent-frame is the pure kernel under Newt's memory: every record is named by a hash of its content, and every derived record names the records it came from. Step through one tool output being recorded, cut down, verified and projected into a request.</p>
+<h1 style="margin-top:28px">How agent-frame assists context</h1>
+<p class="lede">Newt has two ways of managing context. The default one, compaction, does not use agent-frame. The opt-in smart harness does: it records the session as content-addressed events, lets a small model propose what to keep, lets the host decide what is allowed, and renders the request from the result. Both stand on the same content-addressing crate.</p>
 
 <section class="demo" aria-labelledby="stage-title">
   <div class="stage-head">
@@ -38,26 +38,30 @@
     <button id="next" type="button">Next</button>
     <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
   </div>
-  <p class="fine">Shapes are illustrative. Types come from <code>agent-frame/src/</code> and <code>agent-harness/src/</code>. Keys: left/right arrows step, space plays or pauses.</p>
+  <p class="fine">Names are from <code>agent-frame/</code>, <code>agent-harness/</code>, <code>newt-core/src/agentic/smart_harness.rs</code> and <code>content_spill.rs</code>. Smart mode is opt-in and experimental. Keys: left/right arrows step, space plays or pauses.</p>
 </section>
-
+<h2>Going further</h2>
+<p>The default path is on the <a href="context.html">Context</a> page. The design that would join the two is on the <a href="paged.html">Paged context</a> page.</p>
 <h2>What each stage maps to</h2>
 <div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
-<tr><td>Root</td><td>RootEvent with RootKind (OperatorPrompt, UserAction, HarnessEvent).</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/root.rs"><code>agent-frame/src/root.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
-<tr><td>Observation</td><td>Event with a RawContentId payload; no sources, depth 0.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/event.rs"><code>agent-frame/src/event.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
-<tr><td>Elision</td><td>Derivation + Unit::seal(Op::Elide). Concise and Generate are in the type but refused.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/derivation.rs"><code>agent-frame/src/derivation.rs</code></a></td><td class="status"><span class="impl">Implemented (elide only)</span></td></tr>
-<tr><td>Verify</td><td>verify_unit rederives from bytes.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/verify.rs"><code>agent-frame/src/verify.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
-<tr><td>Packets</td><td>Packet::genesis / following; a chain, not a general DAG.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/packet.rs"><code>agent-frame/src/packet.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
-<tr><td>Projection</td><td>Ordered Entry list rendered to a request.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-harness/src/projection.rs"><code>agent-harness/src/projection.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
-<tr><td>Sources in newt-core</td><td>Compaction summaries cite their source turns; spill handles are CIDs.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/memory.rs"><code>newt-core/src/memory.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
-<tr><td>Paged context over a derivation graph</td><td>Bounded residency, unbounded reach.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md"><code>docs/design/infinite-context-illusion.md</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
+<tr><td>Shared foundation</td><td>content-addressable: ContentId and RawContentId.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/"><code>agent-frame/src/</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Compaction spill</td><td>SpillCid wraps a ContentId; summaries cite source turns. No agent-frame.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/content_spill.rs"><code>newt-core/src/agentic/content_spill.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Session recording</td><td>Root and Observation events in a FrameStore.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-harness/src/session.rs"><code>agent-harness/src/session.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Elision and verify</td><td>Elide unit; verify_unit recomputes from bytes.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-frame/src/verify.rs"><code>agent-frame/src/verify.rs</code></a></td><td class="status"><span class="impl">Implemented (elide only)</span></td></tr>
+<tr><td>Context proposal</td><td>Auxiliary model proposes ids to retain.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/smart_harness.rs"><code>newt-core/src/agentic/smart_harness.rs</code></a></td><td class="status"><span class="impl">Implemented, experimental</span></td></tr>
+<tr><td>Host validation</td><td>Candidate-only, pinned kept, no split exchange, byte budget.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-harness/src/navigation.rs"><code>agent-harness/src/navigation.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Projection</td><td>Ordered entries rendered to a request.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-harness/src/projection.rs"><code>agent-harness/src/projection.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Forensics</td><td>Navigation and overflow events are inspectable.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/agent-harness/src/forensics.rs"><code>agent-harness/src/forensics.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Paged context</td><td>A pager serving faults from the graph.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/infinite-context-illusion.md"><code>docs/design/infinite-context-illusion.md</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
 </tbody></table></div>
 <h2>What this does not show</h2>
 <ul>
-<li>This is not "infinite context" or lossless memory. Elision is checked by recomputing from the source bytes.</li>
-<li>A content id proves these bytes hash here. It does not prove an agent may read them.</li>
-<li>Rows from before encoding v2 have no source attribution.</li>
-<li>agent-frame is a library, not a service. It has no storage of its own; <code>agent-harness</code> supplies the store.</li>
+<li>Compaction, the default, does not run on agent-frame. Only the smart harness does, and it is opt-in and experimental.</li>
+<li>Measured quality is thin: an installed 0.5B auxiliary produced no valid verdicts with the initial protocol, and an external model's 8 of 8 covers eight curated fixtures. Neither shows general quality.</li>
+<li>The host check guarantees legality (budget, pinned inputs, intact tool exchanges), not that the model chose the best context.</li>
+<li>A content id proves bytes hash to a name. It does not prove an agent may read them, and a verified elision proves provenance, not truth.</li>
+<li>Only elision is minted in v0. Concise and Generate exist in the type and are refused.</li>
+<li>A projection replays the host's request. It makes no claim about what a provider does inside.</li>
 </ul>
 </main>
 <footer>Apache-2.0. <a href="https://github.com/Gilamonster-Foundation/newt-agent">Gilamonster Foundation / newt-agent</a>.</footer>
@@ -68,184 +72,256 @@
 var SPEC = {
  "nodes": [
   {
-   "id": "root",
-   "label": "RootEvent",
+   "id": "comp",
+   "label": "Compaction",
    "x": 15,
    "y": 12,
-   "sub": "operator prompt"
+   "sub": "default; compress.rs"
   },
   {
-   "id": "obs",
-   "label": "Observation",
+   "id": "ca",
+   "label": "content-addressable",
    "x": 50,
    "y": 12,
-   "sub": "payload: RawContentId, 40 KB tool output"
+   "sub": "CIDv1, dag-cbor, BLAKE3",
+   "kind": "store"
   },
   {
-   "id": "summ",
-   "label": "Compaction summary",
+   "id": "smart",
+   "label": "Smart harness",
    "x": 85,
    "y": 12,
-   "sub": "sources: turn content ids",
-   "kind": "new"
+   "sub": "opt-in, experimental"
   },
   {
-   "id": "el",
-   "label": "Elision unit",
+   "id": "spill",
+   "label": "Spill handle",
    "x": 15,
    "y": 50,
-   "sub": "Derivation{op: elide, source, span, root}"
+   "sub": "SpillCid wraps a ContentId"
   },
   {
-   "id": "ver",
-   "label": "verify_unit",
+   "id": "frame",
+   "label": "agent-frame",
    "x": 50,
    "y": 50,
-   "sub": "recompute from the bytes"
+   "sub": "Event, Unit, Packet, verify"
   },
   {
-   "id": "p1",
-   "label": "Packet (genesis)",
+   "id": "store",
+   "label": "FrameStore",
+   "x": 85,
+   "y": 50,
+   "sub": "agent-harness, on disk"
+  },
+  {
+   "id": "aux",
+   "label": "Auxiliary model",
    "x": 15,
-   "y": 88
+   "y": 88,
+   "sub": "proposes what to keep"
   },
   {
-   "id": "p2",
-   "label": "Packet (following)",
+   "id": "host",
+   "label": "Host check",
    "x": 50,
    "y": 88,
-   "sub": "one predecessor"
+   "sub": "validate_selection"
   },
   {
    "id": "proj",
    "label": "Projection",
    "x": 85,
    "y": 88,
-   "sub": "ordered Entry list"
+   "sub": "ordered request"
   }
  ],
  "stages": [
   {
-   "title": "Something caused this",
-   "cap": "A RootEvent records the cause, such as the operator's prompt. Its ContentId is the anchor everything else cites.",
+   "title": "Two ways to manage context",
+   "cap": "The default is compaction: prune, summarize, spill (see the Context page). The smart harness is a second, opt-in mechanism: enabled with --smart-harness or a config key, and documented as experimental. They are separate code paths.",
    "show": [
-    "root"
+    "comp",
+    "smart"
    ],
    "hot": [
-    "root"
+    "comp",
+    "smart"
    ],
    "edges": [],
    "state": {},
    "tag": {},
-   "note": "Implemented: root.rs"
+   "note": "Implemented. Smart mode is experimental"
   },
   {
-   "title": "Raw output is stored as bytes",
-   "cap": "A tool runs and its output is stored as an Observation whose payload is a RawContentId. It names no sources and costs nothing to refer to later.",
+   "title": "Both stand on content addressing",
+   "cap": "Both name things by a hash of their content, using the same crate: a ContentId is CIDv1 over dag-cbor with BLAKE3. Same bytes, same name. That is the whole of what they share directly.",
    "show": [
-    "root",
-    "obs"
+    "comp",
+    "ca",
+    "smart"
    ],
    "hot": [
-    "obs"
+    "ca"
    ],
    "edges": [
     [
-     "obs",
-     "root",
-     "cites"
-    ]
-   ],
-   "state": {},
-   "tag": {},
-   "note": "Implemented: event.rs"
-  },
-  {
-   "title": "Cut a span, keep an addressed pointer",
-   "cap": "An Elision unit says: this source, this byte range, under this root. Its id is the hash of that derivation, so the pointer names exactly what it removed. v0 mints elision only.",
-   "show": [
-    "root",
-    "obs",
-    "el"
-   ],
-   "hot": [
-    "el"
-   ],
-   "edges": [
-    [
-     "el",
-     "obs",
-     "source + span"
-    ]
-   ],
-   "state": {},
-   "tag": {},
-   "note": "Implemented: derivation.rs, unit.rs"
-  },
-  {
-   "title": "Anyone can recheck the pointer",
-   "cap": "verify_unit recomputes the source, span and root claims from the bytes. Rederiving is the only check v0 offers. It proves provenance, not that the content is true.",
-   "show": [
-    "obs",
-    "el",
-    "ver"
-   ],
-   "hot": [
-    "ver"
-   ],
-   "edges": [
-    [
-     "ver",
-     "el",
-     "recompute"
+     "comp",
+     "ca",
+     "SpillCid"
     ],
     [
-     "ver",
-     "obs",
-     "read bytes",
-     1
+     "smart",
+     "ca",
+     "ContentId"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented"
+  },
+  {
+   "title": "Compaction does not use agent-frame",
+   "cap": "The default path stores the spilled middle under a handle, a SpillCid that wraps a ContentId, and compaction summaries cite their source turns. It reaches content addressing directly, not through agent-frame or agent-harness.",
+   "show": [
+    "comp",
+    "ca",
+    "spill"
+   ],
+   "hot": [
+    "spill"
+   ],
+   "edges": [
+    [
+     "comp",
+     "spill",
+     "spill the middle"
+    ],
+    [
+     "spill",
+     "ca",
+     "named by content"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "comp": "no agent-frame here"
+   },
+   "note": "Implemented: content_spill.rs, compress.rs"
+  },
+  {
+   "title": "The smart harness records the session",
+   "cap": "Here agent-frame matters. The session is recorded as events: a root for the operator's prompt, observations for tool output, each addressed by content. agent-harness persists them in a FrameStore.",
+   "show": [
+    "smart",
+    "frame",
+    "store"
+   ],
+   "hot": [
+    "frame"
+   ],
+   "edges": [
+    [
+     "smart",
+     "frame",
+     "events"
+    ],
+    [
+     "frame",
+     "store",
+     "persist"
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "frame": "RootEvent, Observation"
+   },
+   "note": "Implemented"
+  },
+  {
+   "title": "Large output becomes an addressed pointer",
+   "cap": "A long tool result can be cut to an Elision unit that names its source and byte range. verify_unit recomputes that claim from the bytes. Only elision is minted today.",
+   "show": [
+    "frame",
+    "store"
+   ],
+   "hot": [
+    "frame"
+   ],
+   "edges": [
+    [
+     "frame",
+     "store",
+     "unit + source"
     ]
    ],
    "state": {
-    "ver": "ok"
+    "frame": "ok"
    },
-   "tag": {},
-   "note": "Implemented: verify.rs"
+   "tag": {
+    "frame": "Elision, verify_unit"
+   },
+   "note": "Implemented (elide only)"
   },
   {
-   "title": "Packets chain the units",
-   "cap": "Packets form a Merkle chain: genesis, then each packet names its one predecessor and an ordered list of unit ids. Causal parents live on events, not on packets.",
+   "title": "An auxiliary model proposes what to keep",
+   "cap": "When context must be chosen, the harness shows an auxiliary model a catalog of the recorded messages and asks which to retain. The proposal is only a list of ids.",
    "show": [
-    "el",
-    "p1",
-    "p2"
+    "store",
+    "aux",
+    "host"
    ],
    "hot": [
-    "p2"
+    "aux"
    ],
    "edges": [
     [
-     "p2",
-     "p1",
-     "prior"
+     "store",
+     "aux",
+     "catalog of recorded messages"
     ],
     [
-     "p1",
-     "el",
-     "unit id",
-     1
+     "aux",
+     "host",
+     "proposal: ids"
     ]
    ],
    "state": {},
    "tag": {},
-   "note": "Implemented: packet.rs"
+   "note": "Implemented. Quality not established"
+  },
+  {
+   "title": "The host decides what is legal",
+   "cap": "A proposal cannot relax the rules. Every id must be a real candidate, pinned inputs and unseen results cannot be dropped, a tool call and its result stay together, and the total must fit the byte budget. Otherwise it is rejected.",
+   "show": [
+    "aux",
+    "host",
+    "store"
+   ],
+   "hot": [
+    "host"
+   ],
+   "edges": [
+    [
+     "aux",
+     "host",
+     "proposal: ids"
+    ]
+   ],
+   "state": {
+    "host": "ok"
+   },
+   "tag": {
+    "host": "pinned kept; no split exchange; fits budget"
+   },
+   "note": "Implemented: navigation.rs"
   },
   {
    "title": "A projection renders the request",
-   "cap": "A Projection is an ordered list of entries that cite events. Order lives here because a Merkle parent set cannot carry it. It replays the host's request. It makes no claim about what a provider does inside.",
+   "cap": "The accepted selection becomes a Projection: an ordered list of entries that cite events. Order is stored there because a Merkle parent set cannot carry it. The request is built from it.",
    "show": [
-    "el",
-    "p2",
+    "host",
+    "store",
     "proj"
    ],
    "hot": [
@@ -253,41 +329,76 @@ var SPEC = {
    ],
    "edges": [
     [
+     "host",
      "proj",
-     "el",
-     "entries cite",
-     1
+     "accepted ids"
     ],
     [
      "proj",
-     "p2",
-     "replays"
+     "store",
+     "entries cite events",
+     1
     ]
    ],
    "state": {},
    "tag": {},
-   "note": "Implemented: agent-harness projection.rs"
+   "note": "Implemented: projection.rs"
   },
   {
-   "title": "newt-core cites sources too",
-   "cap": "A compaction summary is stored with the content ids of the turns it replaced. A test runs the real producer and fails if a derived record names no source. A summary is not a verified derivation; it cites its sources.",
+   "title": "Everything is recorded, even failures",
+   "cap": "The navigation request, the reply, a rejected proposal, and an overflow the backend rejected are all recorded as events. That makes a context failure inspectable afterwards instead of silent.",
    "show": [
-    "obs",
-    "summ"
+    "proj",
+    "store",
+    "host"
    ],
    "hot": [
-    "summ"
+    "store"
    ],
    "edges": [
     [
-     "summ",
-     "obs",
-     "sources"
+     "proj",
+     "store",
+     "request recorded"
+    ],
+    [
+     "host",
+     "store",
+     "failures recorded"
     ]
    ],
    "state": {},
    "tag": {},
-   "note": "Implemented: persist_compaction_summary"
+   "note": "Implemented: forensics"
+  },
+  {
+   "title": "Where this could converge",
+   "cap": "The paged-context design would join these: bounded residency and recovery of evicted material by content id, using the graph this page records. That is intent only and has no implementation.",
+   "show": [
+    "comp",
+    "ca",
+    "frame"
+   ],
+   "hot": [
+    "frame"
+   ],
+   "edges": [
+    [
+     "comp",
+     "frame",
+     "joined by a pager?",
+     1
+    ],
+    [
+     "frame",
+     "ca",
+     "same identity",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Design only"
   }
  ]
 };
