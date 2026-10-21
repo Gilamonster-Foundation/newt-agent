@@ -69,24 +69,31 @@
 var SPEC = {
  "nodes": [
   {
+   "id": "root",
+   "label": "Operator root key",
+   "x": 50,
+   "y": 9,
+   "sub": "UserKey, ~/.newt/identity.pem"
+  },
+  {
    "id": "hub",
    "label": "Hub",
    "x": 15,
-   "y": 22,
+   "y": 45,
    "sub": "newt-web or CLI"
   },
   {
    "id": "host",
    "label": "Host",
    "x": 85,
-   "y": 22,
+   "y": 45,
    "sub": "a newt session"
   },
   {
    "id": "reg",
    "label": "docks.d/peers.toml",
    "x": 50,
-   "y": 78,
+   "y": 86,
    "sub": "signed approvals",
    "kind": "store"
   }
@@ -96,18 +103,29 @@ var SPEC = {
    "title": "Each machine derives its own key",
    "cap": "Your operator root key (the same UserKey as on the Identity page) plus a label naming the role and the machine, newt/dock/v1/host/<instance>, derive that machine's key. The instance name is random on first use, not secret, and kept in a dock-instance file you can rename. The key itself is never stored, so an approved fingerprint survives restarts. Change the instance name and the identity changes, so approvals must be re-granted.",
    "show": [
+    "root",
     "hub",
     "host"
    ],
    "hot": [
-    "hub",
-    "host"
+    "root"
    ],
-   "edges": [],
+   "edges": [
+    [
+     "root",
+     "hub",
+     "+ label: hub"
+    ],
+    [
+     "root",
+     "host",
+     "+ label: host"
+    ]
+   ],
    "state": {},
    "tag": {
-    "hub": "root key + label",
-    "host": "root key + label"
+    "hub": "newt/dock/v1/hub/<instance>",
+    "host": "newt/dock/v1/host/<instance>"
    },
    "note": "Implemented: dock_agent. Same operator only"
   },
