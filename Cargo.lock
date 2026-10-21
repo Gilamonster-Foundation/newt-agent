@@ -168,9 +168,9 @@ dependencies = [
 [[package]]
 name = "agent-mesh-flock"
 version = "0.7.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=c2ed748c74148d386c09b80e0f770963fcb2d061#c2ed748c74148d386c09b80e0f770963fcb2d061"
+source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=98c69825ebdf5b0daed917c122809077cde0d119#98c69825ebdf5b0daed917c122809077cde0d119"
 dependencies = [
- "agent-mesh-protocol 0.7.0 (git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=c2ed748c74148d386c09b80e0f770963fcb2d061)",
+ "agent-mesh-protocol 0.7.0 (git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=98c69825ebdf5b0daed917c122809077cde0d119)",
  "content-addressable",
  "serde",
 ]
@@ -178,10 +178,10 @@ dependencies = [
 [[package]]
 name = "agent-mesh-flock-server"
 version = "0.7.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=c2ed748c74148d386c09b80e0f770963fcb2d061#c2ed748c74148d386c09b80e0f770963fcb2d061"
+source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=98c69825ebdf5b0daed917c122809077cde0d119#98c69825ebdf5b0daed917c122809077cde0d119"
 dependencies = [
  "agent-mesh-flock",
- "agent-mesh-protocol 0.7.0 (git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=c2ed748c74148d386c09b80e0f770963fcb2d061)",
+ "agent-mesh-protocol 0.7.0 (git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=98c69825ebdf5b0daed917c122809077cde0d119)",
  "blake3",
  "content-addressable",
  "ed25519-dalek",
@@ -198,11 +198,11 @@ dependencies = [
 [[package]]
 name = "agent-mesh-flock-session"
 version = "0.7.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=c2ed748c74148d386c09b80e0f770963fcb2d061#c2ed748c74148d386c09b80e0f770963fcb2d061"
+source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=98c69825ebdf5b0daed917c122809077cde0d119#98c69825ebdf5b0daed917c122809077cde0d119"
 dependencies = [
  "agent-mesh-flock",
  "agent-mesh-flock-server",
- "agent-mesh-protocol 0.7.0 (git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=c2ed748c74148d386c09b80e0f770963fcb2d061)",
+ "agent-mesh-protocol 0.7.0 (git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=98c69825ebdf5b0daed917c122809077cde0d119)",
  "content-addressable",
  "ed25519-dalek",
  "libc",
@@ -236,7 +236,7 @@ dependencies = [
 [[package]]
 name = "agent-mesh-protocol"
 version = "0.7.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=c2ed748c74148d386c09b80e0f770963fcb2d061#c2ed748c74148d386c09b80e0f770963fcb2d061"
+source = "git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=98c69825ebdf5b0daed917c122809077cde0d119#98c69825ebdf5b0daed917c122809077cde0d119"
 dependencies = [
  "blake3",
  "content-addressable",
@@ -4686,7 +4686,7 @@ dependencies = [
  "agent-mesh-flock",
  "agent-mesh-flock-server",
  "agent-mesh-flock-session",
- "agent-mesh-protocol 0.7.0 (git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=c2ed748c74148d386c09b80e0f770963fcb2d061)",
+ "agent-mesh-protocol 0.7.0 (git+https://github.com/Gilamonster-Foundation/agent-mesh?rev=98c69825ebdf5b0daed917c122809077cde0d119)",
  "content-addressable",
  "ed25519-dalek",
  "rand 0.8.7",

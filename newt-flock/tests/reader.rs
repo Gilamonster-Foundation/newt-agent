@@ -440,3 +440,106 @@ fn a_state_directory_that_is_a_symlink_is_refused() {
     ));
     assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
 }
+
+/// How long a test waits for a call that must return. A hang guard only: a
+/// correct implementation returns as soon as the sockets are shut down.
+const HANG_GUARD: Duration = Duration::from_secs(20);
+
+/// A listener that accepts connections, says so on `accepted`, and then keeps
+/// them open without ever answering.
+fn stalled_listener(path: &Path) -> std::sync::mpsc::Receiver<()> {
+    let l = UnixListener::bind(path).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = vec![];
+        for c in l.incoming() {
+            let mut c = c.unwrap();
+            // read the request so the peer's write is not what blocks
+            let _ = std::io::Read::read(&mut c, &mut [0u8; 1]);
+            held.push(c);
+            let _ = tx.send(());
+        }
+    });
+    rx
+}
+
+fn returns_promptly(f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(HANG_GUARD)
+        .expect("stop/drop did not return: the worker is stuck in a blocking read");
+}
+
+fn stalled_server_inbox(r: &Rig, s: &FakeSession) -> Inbox {
+    let stalled = r.tmp.path().join("stalled-serve.sock");
+    let accepted = stalled_listener(&stalled);
+    let inbox = Inbox::start(Config {
+        serve: stalled,
+        ..config(r, s)
+    })
+    .unwrap();
+    accepted.recv().unwrap(); // the server has the watch and will not answer
+    inbox
+}
+
+#[test]
+fn stop_returns_when_the_server_accepted_the_watch_and_never_answers() {
+    let r = Rig::new();
+    let h1 = r.enrol("h1");
+    let s = session_for(&r, "h1", &h1);
+    let inbox = stalled_server_inbox(&r, &s);
+    returns_promptly(move || assert_eq!(inbox.stop(), Ended::Stopped));
+}
+
+#[test]
+fn drop_returns_when_the_server_accepted_the_watch_and_never_answers() {
+    let r = Rig::new();
+    let h1 = r.enrol("h1");
+    let s = session_for(&r, "h1", &h1);
+    let inbox = stalled_server_inbox(&r, &s);
+    returns_promptly(move || drop(inbox));
+}
+
+#[test]
+fn stop_returns_when_the_session_accepted_the_prove_call_and_never_answers() {
+    let r = Rig::new();
+    let h1 = r.enrol("h1");
+    // a session that answers Whoami (its first connection) and then stalls
+    let path = r.tmp.path().join("stalled-session.sock");
+    let l = UnixListener::bind(&path).unwrap();
+    let (tx, accepted) = std::sync::mpsc::channel();
+    let (flock, session) = (r.genesis().content_id().unwrap(), h1.session.clone());
+    std::thread::spawn(move || {
+        let mut held = vec![];
+        for (i, c) in l.incoming().enumerate() {
+            let mut c = c.unwrap();
+            if i == 0 {
+                let _ = read_msg::<CtlReq>(&mut c).unwrap();
+                let who = CtlResp::Who {
+                    flock,
+                    member: "h1".into(),
+                    session: session.clone(),
+                    pending: false,
+                };
+                write_msg(&mut c, &who).unwrap();
+            } else {
+                let _ = read_msg::<CtlReq>(&mut c);
+                held.push(c);
+                let _ = tx.send(());
+            }
+        }
+    });
+    let inbox = Inbox::start(Config {
+        session: path,
+        state_dir: r.tmp.path().join("newt-state"),
+        serve: r.sock.clone(),
+        genesis: r.genesis(),
+        retry: Duration::from_millis(20),
+    })
+    .unwrap();
+    accepted.recv().unwrap();
+    returns_promptly(move || assert_eq!(inbox.stop(), Ended::Stopped));
+}

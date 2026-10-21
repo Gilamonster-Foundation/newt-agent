@@ -6,15 +6,17 @@
 #![cfg(unix)]
 
 use agent_mesh_flock::Genesis;
+
+use agent_mesh_flock_server::wire::{read_msg, write_msg, StreamChallenge};
 use agent_mesh_flock_server::{private_dir, Sealed};
-use agent_mesh_flock_session::{
-    call, session_prover, CtlReq, CtlResp, Reader, ReaderError, RealFs, Seen,
-};
+use agent_mesh_flock_session::{call, CtlReq, CtlResp, Reader, ReaderError, RealFs, Seen};
+use agent_mesh_protocol::Assertion;
 use content_addressable::{ContentAddressable, MerkleNode};
-use std::path::PathBuf;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -80,10 +82,69 @@ pub enum Ended {
     Failed(String),
 }
 
+/// The sockets a worker is blocked on, so [`Inbox::stop`] can shut them down:
+/// a read the peer never answers then fails and the worker sees the stop flag.
+#[derive(Default)]
+struct Halt {
+    stopped: AtomicBool,
+    open: Mutex<Vec<UnixStream>>,
+}
+
+impl Halt {
+    /// Keep a handle to `s` so `halt` can shut it down; if halt has already
+    /// run, shut it down now (a connection made after the stop is dead).
+    fn track(&self, s: &UnixStream) -> std::io::Result<()> {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let clone = s.try_clone()?;
+        if self.stopped.load(Ordering::SeqCst) {
+            let _ = clone.shutdown(std::net::Shutdown::Both);
+        } else {
+            open.push(clone);
+        }
+        Ok(())
+    }
+
+    /// The pass is over: drop the handles (they would otherwise pile up).
+    fn release(&self) {
+        self.open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    fn halt(&self) {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        self.stopped.store(true, Ordering::SeqCst);
+        for c in open.iter() {
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Ask the session to sign `challenge`, over a connection `halt` can cut.
+    fn prove(&self, session: &Path, challenge: &StreamChallenge) -> Result<Assertion, ReaderError> {
+        let stream = |e: String| ReaderError::Stream(e);
+        let mut s = UnixStream::connect(session).map_err(|e| stream(e.to_string()))?;
+        self.track(&s).map_err(|e| stream(e.to_string()))?;
+        let req = CtlReq::ProveStream {
+            challenge: challenge.clone(),
+        };
+        write_msg(&mut s, &req).map_err(|e| stream(e.to_string()))?;
+        match read_msg::<CtlResp>(&mut s).map_err(|e| stream(e.to_string()))? {
+            Some(CtlResp::Proof(p)) => Ok(*p),
+            Some(CtlResp::Err(why)) => Err(stream(why)),
+            _ => Err(stream("the session answered something else".into())),
+        }
+    }
+}
+
 /// A running follower. Dropping it stops and joins the worker.
 pub struct Inbox {
     rx: Receiver<Observed>,
-    stop: Arc<AtomicBool>,
+    halt: Arc<Halt>,
     thread: Option<JoinHandle<Ended>>,
 }
 
@@ -118,32 +179,44 @@ impl Inbox {
                 private_dir(&cfg.state_dir).map_err(ReaderError::Io)?;
                 let mut reader = Reader::open(cfg.genesis.clone(), &cfg.state_dir, RealFs)?;
                 let (tx, rx) = channel();
-                let stop = Arc::new(AtomicBool::new(false));
-                let flag = Arc::clone(&stop);
+                let halt = Arc::new(Halt::default());
+                let flag = Arc::clone(&halt);
                 let thread = thread::spawn(move || {
-                    let prove = session_prover(&cfg.session);
+                    let prove = |c: &StreamChallenge| flag.prove(&cfg.session, c);
                     // ponytail: each pass is a catch-up stream, re-opened after
                     // `retry`; the live tail waits for the next pass. Upgrade
                     // to one long stream once `Watch` can be shut down from
                     // outside.
-                    while !flag.load(Ordering::SeqCst) {
+                    while !flag.is_stopped() {
                         let mut removed = false;
                         let mut gone = false;
-                        let r = reader.follow(&cfg.serve, &prove, true, &mut |s| match s {
-                            Seen::Frame(f, fol) => {
-                                removed = !fol.board().members().iter().any(|m| m.name == member);
-                                gone |= tx
-                                    .send(Observed::Frame {
-                                        frame: f.to_vec(),
-                                        admitted: fol.admitted(),
-                                    })
-                                    .is_err();
-                            }
-                            Seen::Caught(i, fol) => {
-                                removed = !fol.board().members().iter().any(|m| m.name == member);
-                                gone |= tx.send(Observed::Caught(i)).is_err();
-                            }
+                        let conn = UnixStream::connect(&cfg.serve)
+                            .map_err(ReaderError::Io)
+                            .and_then(|c| flag.track(&c).map(|()| c).map_err(ReaderError::Io));
+                        let r = conn.and_then(|conn| {
+                            reader.follow_on(conn, &prove, true, &mut |s| match s {
+                                Seen::Frame(f, fol) => {
+                                    removed =
+                                        !fol.board().members().iter().any(|m| m.name == member);
+                                    gone |= tx
+                                        .send(Observed::Frame {
+                                            frame: f.to_vec(),
+                                            admitted: fol.admitted(),
+                                        })
+                                        .is_err();
+                                }
+                                Seen::Caught(i, fol) => {
+                                    removed =
+                                        !fol.board().members().iter().any(|m| m.name == member);
+                                    gone |= tx.send(Observed::Caught(i)).is_err();
+                                }
+                            })
                         });
+                        flag.release();
+                        // a read cut by `stop` is not the server's doing
+                        if flag.is_stopped() {
+                            return Ended::Stopped;
+                        }
                         if removed {
                             return Ended::Removed;
                         }
@@ -168,7 +241,7 @@ impl Inbox {
                 });
                 Ok(Self {
                     rx,
-                    stop,
+                    halt,
                     thread: Some(thread),
                 })
             }
@@ -188,7 +261,7 @@ impl Inbox {
     }
 
     fn halt(&mut self) -> Ended {
-        self.stop.store(true, Ordering::SeqCst);
+        self.halt.halt();
         match self.thread.take() {
             Some(t) => {
                 t.thread().unpark();
