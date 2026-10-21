@@ -12,13 +12,13 @@
 //! the send and its answer leaves an intent that restart resolves from the
 //! log, not by emitting twice.
 
-use agent_mesh_flock::{Body, Kind};
-use agent_mesh_flock_server::Follower;
+use agent_mesh_flock::Kind;
+use agent_mesh_flock_server::{private_dir, Follower};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::io::{Read as _, Write as _};
+use std::path::Path;
 
 use crate::task::{Evidence, TaskKind};
 
@@ -210,6 +210,13 @@ pub enum Sent {
         /// What was seen.
         why: String,
     },
+    /// The verified log shows this member's reply to the task, but not the
+    /// one intended (the other verdict, or the other result outcome). The
+    /// intended reply is not in the log and is never sent here.
+    Contradicted {
+        /// The log's reply, by event id.
+        event: String,
+    },
     /// The verified log shows this member's reply.
     Confirmed {
         /// The reply's event id in the log.
@@ -224,53 +231,80 @@ struct Row {
 }
 
 /// The durable record of replies: one JSON line per change, fsync'd, the
-/// last line for a key wins. A torn final line (a crash mid-append) is
-/// dropped; the line before it stands.
+/// last line for a key wins. One owner at a time (an exclusive file lock held
+/// for its lifetime). A final line without its newline is completed if it is a
+/// whole row and dropped if it is torn, so the next line never glues onto it.
 struct Journal {
-    path: PathBuf,
+    file: std::fs::File,
     rows: BTreeMap<String, Row>,
 }
 
+/// Makes a directory entry durable (fsync of the directory).
+type SyncDir = Box<dyn Fn(&Path) -> std::io::Result<()> + Send>;
+
+fn sync_dir_real(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+fn jerr(e: impl std::fmt::Display) -> String {
+    format!("reply journal: {e}")
+}
+
 impl Journal {
-    fn open(dir: &Path) -> Result<Self, String> {
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(|e| format!("reply journal: {e}"))?;
-        }
+    fn open(dir: &Path, sync_dir: &SyncDir) -> Result<Self, String> {
+        // ours, a real directory, closed to others (a loose or linked one is refused)
+        private_dir(dir).map_err(jerr)?;
         let path = dir.join("replies.jsonl");
-        let mut rows = BTreeMap::new();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let lines: Vec<&str> = text.lines().collect();
-                for (i, line) in lines.iter().enumerate() {
-                    match serde_json::from_str::<Row>(line) {
-                        Ok(row) => {
-                            rows.insert(row.reply.key(), row);
-                        }
-                        Err(_) if i + 1 == lines.len() && !text.ends_with('\n') => {
-                            // a torn final append: drop it so the next line
-                            // does not glue onto it
-                            let keep = text.rfind('\n').map_or(0, |n| n + 1);
-                            let f = std::fs::OpenOptions::new()
-                                .write(true)
-                                .open(&path)
-                                .map_err(|e| format!("reply journal: {e}"))?;
-                            f.set_len(keep as u64)
-                                .and_then(|()| f.sync_all())
-                                .map_err(|e| format!("reply journal: {e}"))?;
-                        }
-                        Err(e) => return Err(format!("reply journal line {}: {e}", i + 1)),
-                    }
-                }
-            }
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if !m.is_file() => return Err(jerr("replies.jsonl is not a regular file")),
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("reply journal: {e}")),
+            Err(e) => return Err(jerr(e)),
         }
-        Ok(Self { path, rows })
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(jerr)?
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(jerr(
+                    "another owner holds this journal (replies.jsonl); a second would send the same reply twice",
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(jerr(e)),
+        }
+        // the name must survive a crash before anything can be emitted
+        sync_dir(dir).map_err(jerr)?;
+        if let Some(parent) = dir.parent() {
+            sync_dir(parent).map_err(jerr)?;
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(jerr)?;
+        if !text.is_empty() && !text.ends_with('\n') {
+            let keep = text.rfind('\n').map_or(0, |n| n + 1);
+            if serde_json::from_str::<Row>(&text[keep..]).is_ok() {
+                file.write_all(b"\n").map_err(jerr)?;
+                text.push('\n');
+            } else {
+                file.set_len(keep as u64).map_err(jerr)?;
+                text.truncate(keep);
+            }
+            file.sync_all().map_err(jerr)?;
+        }
+        let mut rows = BTreeMap::new();
+        for (i, line) in text.lines().enumerate() {
+            let row = serde_json::from_str::<Row>(line)
+                .map_err(|e| format!("reply journal line {}: {e}", i + 1))?;
+            rows.insert(row.reply.key(), row);
+        }
+        Ok(Self { file, rows })
     }
 
     fn put(&mut self, reply: &Reply, sent: Sent) -> Result<(), String> {
@@ -280,14 +314,10 @@ impl Journal {
         };
         let mut line = serde_json::to_string(&row).map_err(|e| e.to_string())?;
         line.push('\n');
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| format!("reply journal: {e}"))?;
-        f.write_all(line.as_bytes())
-            .and_then(|()| f.sync_all())
-            .map_err(|e| format!("reply journal: {e}"))?;
+        self.file
+            .write_all(line.as_bytes())
+            .and_then(|()| self.file.sync_all())
+            .map_err(jerr)?;
         self.rows.insert(reply.key(), row);
         Ok(())
     }
@@ -306,9 +336,24 @@ impl<C: ToolCaller> Replies<C> {
     /// # Errors
     /// The journal cannot be read or created.
     pub fn open(dir: &Path, member: impl Into<String>, caller: C) -> Result<Self, String> {
+        Self::open_with(dir, member, caller, Box::new(sync_dir_real))
+    }
+
+    /// [`open`](Self::open) with the directory sync supplied (tests check its
+    /// order against the first emission).
+    ///
+    /// # Errors
+    /// As [`open`](Self::open); a failing sync is an error.
+    #[doc(hidden)]
+    pub fn open_with(
+        dir: &Path,
+        member: impl Into<String>,
+        caller: C,
+        sync_dir: SyncDir,
+    ) -> Result<Self, String> {
         Ok(Self {
             member: member.into(),
-            journal: Journal::open(dir)?,
+            journal: Journal::open(dir, &sync_dir)?,
             caller,
         })
     }
@@ -320,6 +365,12 @@ impl<C: ToolCaller> Replies<C> {
     /// The journal could not record the intent; nothing was sent.
     pub fn send(&mut self, reply: &Reply) -> Result<Sent, String> {
         if let Some(row) = self.journal.rows.get(&reply.key()) {
+            if row.reply.body != reply.body {
+                return Err(format!(
+                    "a different {:?} reply to this task is already recorded",
+                    reply.kind
+                ));
+            }
             return Ok(row.sent.clone());
         }
         // written, and durable, before the request can leave
@@ -369,14 +420,17 @@ impl<C: ToolCaller> Replies<C> {
             .rows
             .values()
             .filter(|r| {
-                !matches!(r.sent, Sent::Confirmed { .. } | Sent::Refused { .. })
-                    && r.reply.flock == board.flock().to_string()
+                !matches!(
+                    r.sent,
+                    Sent::Confirmed { .. } | Sent::Refused { .. } | Sent::Contradicted { .. }
+                ) && r.reply.flock == board.flock().to_string()
             })
             .map(|r| r.reply.clone())
             .collect();
         let mut n = 0;
         for reply in pending {
-            let found = board.entries().find(|e| {
+            // this member's reply to the same task, of the same kind
+            let mine = |e: &&agent_mesh_flock::Entry| {
                 e.conflict.is_none()
                     && e.member.as_deref() == Some(self.member.as_str())
                     && e.event.kind == reply.kind
@@ -386,20 +440,31 @@ impl<C: ToolCaller> Replies<C> {
                         .map(ToString::to_string)
                         .as_deref()
                         == Some(reply.event.as_str())
-                    && match (&e.event.body, &reply.head) {
-                        (Body::Verdict { head, .. }, Some(want)) => head == want,
-                        (Body::Verdict { .. }, None) => false,
-                        _ => true,
-                    }
-            });
-            if let Some(e) = found {
-                self.journal.put(
-                    &reply,
-                    Sent::Confirmed {
+            };
+            // the intended body, exactly (verdict head and approval, result outcome)
+            let same = |e: &agent_mesh_flock::Entry| {
+                serde_json::to_value(&e.event.body).ok().as_ref() == Some(&reply.body)
+            };
+            let state = board
+                .entries()
+                .filter(mine)
+                .find(|e| same(e))
+                .map(|e| Sent::Confirmed {
+                    event: e.id.to_string(),
+                })
+                .or_else(|| {
+                    board.entries().find(mine).map(|e| Sent::Contradicted {
                         event: e.id.to_string(),
-                    },
-                )?;
-                n += 1;
+                    })
+                });
+            if let Some(state) = state {
+                self.journal.put(&reply, state)?;
+                if matches!(
+                    self.journal.rows.get(&reply.key()).map(|r| &r.sent),
+                    Some(Sent::Confirmed { .. })
+                ) {
+                    n += 1;
+                }
             }
         }
         Ok(n)

@@ -94,6 +94,14 @@ fn replies(w: &World, dir: &Path) -> (Replies<SessionTool>, Calls) {
     (Replies::open(dir, "h1", t).unwrap(), calls)
 }
 
+/// A journal directory only its owner can enter (the umask may be looser).
+fn private_tmp() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 fn count(f: &Follower, kind: Kind) -> usize {
     f.board()
         .entries()
@@ -400,7 +408,7 @@ fn an_mcp_tool_result_is_read_as_text_or_error_and_anything_else_is_no_answer() 
     ));
     // an "admitted" text that does not parse is not taken as admitted
     let (mut rp, _) = {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = private_tmp();
         (
             Replies::open(
                 &dir,
@@ -428,7 +436,7 @@ fn a_log_entry_for_another_task_does_not_confirm_a_pending_reply() {
     let dir = journal(&w);
     {
         // the decoys go out through another journal: only the log is shared
-        let (mut rp, _) = replies(&w, &tempfile::tempdir().unwrap().keep());
+        let (mut rp, _) = replies(&w, &private_tmp());
         rp.send(&Reply::ack(&w.brief)).unwrap();
     }
     // the real replies are pending with no clear answer
@@ -477,7 +485,7 @@ fn an_admitted_answer_carries_the_log_index_and_a_bad_index_is_no_answer() {
         .index;
     assert_eq!(index, at);
 
-    let dir = tempfile::tempdir().unwrap().keep();
+    let dir = private_tmp();
     let cid = fol
         .board()
         .entries()
@@ -495,4 +503,183 @@ fn an_admitted_answer_carries_the_log_index_and_a_bad_index_is_no_answer() {
         bad.send(&Reply::ack(&w.brief)).unwrap(),
         Sent::Ambiguous { .. }
     ));
+}
+
+// ---- Codex round 1 on #2977 ------------------------------------------------
+
+fn unclear() -> newt_flock::FnCaller<
+    impl FnMut(&str, serde_json::Value) -> Result<newt_flock::ToolReply, newt_flock::Lost>,
+> {
+    newt_flock::FnCaller(|_: &str, _| Ok(newt_flock::ToolReply::Text("???".into())))
+}
+
+/// Finding 1: one owner at a time. A second opener on the same directory is
+/// refused (it would see no intent and emit the same reply again); once the
+/// first is gone the journal opens again with its record.
+#[test]
+fn a_second_journal_owner_is_refused_until_the_first_is_gone() {
+    let w = world();
+    let dir = journal(&w);
+    let (mut first, calls) = replies(&w, &dir);
+    let second = replies_try(&w, &dir);
+    let why = second.err().expect("two owners on one journal");
+    assert!(why.contains("another"), "{why}");
+    first.send(&Reply::ack(&w.brief)).unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    drop(first);
+    let (again, _) = replies(&w, &dir);
+    assert!(again
+        .state(&w.brief.flock, &w.brief.event, Step::Ack)
+        .is_some());
+}
+
+fn replies_try(w: &World, dir: &Path) -> Result<Replies<SessionTool>, String> {
+    let (t, _) = tool(w);
+    Replies::open(dir, "h1", t)
+}
+
+/// Finding 2: a complete row whose newline was not written is repaired, so the
+/// next append does not glue onto it and every row reads after a reopen.
+#[test]
+fn a_row_without_its_newline_is_terminated_before_the_next_append() {
+    let w = world();
+    let dir = journal(&w);
+    let (mut rp, _) = replies(&w, &dir);
+    rp.send(&Reply::ack(&w.brief)).unwrap();
+    drop(rp);
+    let path = dir.join("replies.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.trim_end_matches('\n')).unwrap();
+
+    let (mut rp, _) = replies(&w, &dir);
+    rp.send(&Reply::result(&w.brief, true).unwrap()).unwrap();
+    drop(rp);
+    let (rp, _) = replies(&w, &dir);
+    for step in [Step::Ack, Step::Finish] {
+        assert!(
+            rp.state(&w.brief.flock, &w.brief.event, step).is_some(),
+            "{step:?} lost"
+        );
+    }
+}
+
+/// Finding 3: the log's reply must be the one intended. The opposite verdict
+/// or result does not confirm; the journal says the log disagrees, and the
+/// intended reply is never sent.
+#[test]
+fn an_opposite_verdict_or_result_in_the_log_does_not_confirm_the_intended_reply() {
+    let w = world();
+    // the log gets a rejecting verdict and a failed result, from this member
+    let (mut via, _) = replies(&w, &private_tmp());
+    via.send(&Reply::verdict(&w.review, false).unwrap())
+        .unwrap();
+    via.send(&Reply::result(&w.brief, false).unwrap()).unwrap();
+    drop(via);
+
+    // this journal intended to approve and to complete, and lost both answers
+    let dir = journal(&w);
+    let mut rp = Replies::open(&dir, "h1", unclear()).unwrap();
+    let approve = Reply::verdict(&w.review, true).unwrap();
+    let complete = Reply::result(&w.brief, true).unwrap();
+    rp.send(&approve).unwrap();
+    rp.send(&complete).unwrap();
+    assert_eq!(rp.reconcile(&fresh_follower(&w)).unwrap(), 0);
+    for r in [&approve, &complete] {
+        let s = rp.state(&r.flock, &r.event, r.step).unwrap();
+        assert!(
+            matches!(s, Sent::Contradicted { .. }),
+            "{:?} -> {s:?}",
+            r.kind
+        );
+    }
+    // shown as a refusal-like end state, never as replied
+    let row = present(&w.review, fresh_follower(&w).board(), Local::Running, &rp);
+    assert!(matches!(row.phase, Phase::Refused(_)), "{:?}", row.phase);
+    // and a journal key never stands in for a different requested body
+    let opposite = Reply::verdict(&w.review, false).unwrap();
+    assert!(rp.send(&opposite).is_err());
+}
+
+/// Finding 4: the journal's directory entry is durable before the first
+/// emission, and a failing sync stops the open.
+#[test]
+fn the_journal_directory_is_synced_before_any_emission() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let w = world();
+    let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let o = Arc::clone(&order);
+    let caller = newt_flock::FnCaller(move |_: &str, _| {
+        o.lock().unwrap().push("emit");
+        Ok(newt_flock::ToolReply::Text("???".into()))
+    });
+    let o = Arc::clone(&order);
+    let syncs = Arc::new(AtomicUsize::new(0));
+    let s2 = Arc::clone(&syncs);
+    let mut rp = Replies::open_with(
+        &journal(&w),
+        "h1",
+        caller,
+        Box::new(move |_dir: &Path| {
+            o.lock().unwrap().push("sync");
+            s2.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+    )
+    .unwrap();
+    rp.send(&Reply::ack(&w.brief)).unwrap();
+    let seen = order.lock().unwrap().clone();
+    assert_eq!(seen.first(), Some(&"sync"), "{seen:?}");
+    assert_eq!(seen.iter().position(|x| *x == "emit"), Some(seen.len() - 1));
+    assert!(syncs.load(Ordering::SeqCst) >= 1);
+
+    let failing = Replies::open_with(
+        &w.r.tmp.path().join("other-journal"),
+        "h1",
+        unclear(),
+        Box::new(|_: &Path| Err(std::io::Error::other("disk"))),
+    );
+    assert!(failing.is_err(), "an unsynced journal must not open");
+}
+
+/// Finding 5: the journal lives in a private directory (upstream's check), and
+/// the journal file itself is not a link.
+#[test]
+fn the_journal_directory_must_be_private_and_the_file_not_a_link() {
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    let w = world();
+    let tmp = w.r.tmp.path();
+    // world-readable
+    let open_dir = tmp.join("open");
+    std::fs::create_dir(&open_dir).unwrap();
+    std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(replies_try(&w, &open_dir).is_err(), "0755 accepted");
+    // a link to a real private directory
+    let real = tmp.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = tmp.join("link");
+    symlink(&real, &link).unwrap();
+    assert!(
+        replies_try(&w, &link).is_err(),
+        "a linked directory accepted"
+    );
+    assert!(
+        real.read_dir().unwrap().next().is_none(),
+        "wrote through it"
+    );
+    // a private directory whose journal is a link elsewhere
+    let priv_dir = tmp.join("priv");
+    std::fs::create_dir(&priv_dir).unwrap();
+    std::fs::set_permissions(&priv_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let elsewhere = tmp.join("elsewhere.jsonl");
+    std::fs::write(&elsewhere, "").unwrap();
+    symlink(&elsewhere, priv_dir.join("replies.jsonl")).unwrap();
+    assert!(
+        replies_try(&w, &priv_dir).is_err(),
+        "a linked journal accepted"
+    );
+    assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "");
+    // and the ordinary case still works
+    let ok = tmp.join("fine");
+    assert!(replies_try(&w, &ok).is_ok());
 }

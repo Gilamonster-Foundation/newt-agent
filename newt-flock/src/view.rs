@@ -70,6 +70,9 @@ pub fn present<C: ToolCaller>(
     let phase = match (state(Step::Finish), state(Step::Ack), local) {
         (Some(Sent::Confirmed { .. }), _, _) => Phase::Replied,
         (Some(Sent::Refused { why }), _, _) => Phase::Refused(inert(why).into_owned()),
+        (Some(Sent::Contradicted { .. }), _, _) => {
+            Phase::Refused("the log shows a different reply to this task".into())
+        }
         (Some(Sent::Intent), _, _) => Phase::ReplyPending("sending".into()),
         (Some(Sent::Admitted { .. }), _, _) => Phase::ReplyPending("not yet in the log".into()),
         (Some(Sent::Ambiguous { why }), _, _) => {
