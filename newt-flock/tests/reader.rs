@@ -548,12 +548,27 @@ fn stop_returns_when_the_session_accepted_the_prove_call_and_never_answers() {
 /// connects until the kernel says it is full. On Linux a further blocking
 /// `connect` to such a socket waits for room; a non-blocking one fails with
 /// `WouldBlock`, which is how the saturation is detected here.
+/// A listener that never accepts, with an accept queue of one.
+#[cfg(target_os = "linux")]
+fn full_listener(path: &Path) -> socket2::Socket {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let l = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    l.bind(&SockAddr::unix(path).unwrap()).unwrap();
+    l.listen(1).unwrap();
+    l
+}
+
 #[cfg(target_os = "linux")]
 fn saturate(path: &Path) -> Vec<socket2::Socket> {
     use socket2::{Domain, SockAddr, Socket, Type};
+    /// The listener has backlog 1, so a couple of clients fill it; needing
+    /// more means the backlog is not what this test assumes, and the test
+    /// would depend on the host's fd limit.
+    const MOST: usize = 16;
     let addr = SockAddr::unix(path).unwrap();
     let mut held = vec![];
     loop {
+        assert!(held.len() <= MOST, "the accept queue took {MOST}+ clients");
         let s = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
         s.set_nonblocking(true).unwrap();
         match s.connect(&addr) {
@@ -572,7 +587,7 @@ fn stop_and_drop_return_while_the_server_will_not_take_a_connection() {
         let h1 = r.enrol("h1");
         let s = session_for(&r, "h1", &h1);
         let full = r.tmp.path().join("full.sock");
-        let _listener = UnixListener::bind(&full).unwrap(); // never accepts
+        let _listener = full_listener(&full);
         let _queued = saturate(&full);
         let inbox = Inbox::start(Config {
             serve: full,
