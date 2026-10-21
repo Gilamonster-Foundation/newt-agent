@@ -233,6 +233,7 @@ impl FakeSession {
                             CtlReq::ProveStream { challenge } => CtlResp::Proof(Box::new(
                                 Assertion::sign(&key, &challenge.id().unwrap()),
                             )),
+                            _ => CtlResp::Err("the stand-in session does not sign".into()),
                         };
                         write_msg(&mut c, &resp).unwrap();
                     }
@@ -288,6 +289,162 @@ pub fn until_caught(inbox: &Inbox) -> Vec<Kind> {
             Observed::Asks(_) => {}
             Observed::Caught(_) => return kinds,
             Observed::Unavailable(w) => panic!("unavailable: {w}"),
+        }
+    }
+}
+
+/// What the real session's socket does with an Emit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// Sign and admit, and answer.
+    None,
+    /// Admit it, then close without answering: the caller cannot tell.
+    DropAnswerAfterAdmit,
+    /// Close without doing anything: nothing is admitted.
+    DropBeforeAdmit,
+}
+
+/// A real member session (the key is held and used by Session, as in the
+/// session process), served on a ctl socket by a thread, as the real process
+/// does. A test sets `fault` to lose an answer.
+pub struct RealSession {
+    pub path: PathBuf,
+    pub fault: Arc<std::sync::Mutex<Fault>>,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RealSession {
+    pub fn new(r: &Rig, name: &str) -> Self {
+        use agent_mesh_flock_session::{Policy, Session};
+        let mut c = r.conn();
+        let Resp::Invited { token } = rpc(
+            &mut c,
+            &Req::Invite {
+                member: name.into(),
+            },
+        ) else {
+            panic!()
+        };
+        let mut s = Session::enroll(&r.sock, &token, name, Policy::AllowUnlocked).unwrap();
+        let flock = r.genesis().content_id().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("rs")
+            .tempdir_in(r.tmp.path())
+            .unwrap()
+            .keep();
+        let path = dir.join("session.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        l.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let fault = Arc::new(std::sync::Mutex::new(Fault::None));
+        let f2 = Arc::clone(&fault);
+        let name = name.to_owned();
+        let join = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                let Ok((mut c, _)) = l.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                c.set_nonblocking(false).unwrap();
+                let Some(req) = read_msg::<CtlReq>(&mut c).unwrap() else {
+                    continue;
+                };
+                let resp = match req {
+                    CtlReq::Whoami => CtlResp::Who {
+                        flock,
+                        member: name.clone(),
+                        session: s.id().to_owned(),
+                        pending: false,
+                    },
+                    CtlReq::Emit {
+                        kind, refs, body, ..
+                    } => {
+                        let fault = *f2.lock().unwrap();
+                        if fault == Fault::DropBeforeAdmit {
+                            continue;
+                        }
+                        let out = s.emit(kind, refs, body);
+                        if fault == Fault::DropAnswerAfterAdmit {
+                            continue;
+                        }
+                        out.map_or_else(
+                            |e| CtlResp::Err(e.to_string()),
+                            |(event, index)| CtlResp::Admitted { event, index },
+                        )
+                    }
+                    CtlReq::ProveStream { challenge } => s.prove_stream(&challenge).map_or_else(
+                        |e| CtlResp::Err(e.to_string()),
+                        |p| CtlResp::Proof(Box::new(p)),
+                    ),
+                    _ => CtlResp::Err("not served here".into()),
+                };
+                write_msg(&mut c, &resp).unwrap();
+            }
+            let _ = s.end();
+        });
+        Self {
+            path,
+            fault,
+            stop,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for RealSession {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// The MCP child's flock_emit, in-process: the same JSON in, the same words
+/// out, over a real session socket. The tool parses kind, refs and body as
+/// the flock types and makes one Emit; a refusal is an error result, a lost
+/// connection is no answer.
+pub struct SessionTool {
+    pub sock: PathBuf,
+    pub calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl newt_flock::ToolCaller for SessionTool {
+    fn call_tool(
+        &mut self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<newt_flock::ToolReply, newt_flock::Lost> {
+        use newt_flock::{Lost, ToolReply};
+        assert_eq!(name, "flock_emit");
+        self.calls.lock().unwrap().push(args.clone());
+        let kind = serde_json::from_value(args["kind"].clone());
+        let refs = serde_json::from_value(args["refs"].clone());
+        let body = serde_json::from_value(args["body"].clone());
+        let (Ok(kind), Ok(refs), Ok(body)) = (kind, refs, body) else {
+            return Ok(ToolReply::Error("the arguments are not an event".into()));
+        };
+        match agent_mesh_flock_session::call(
+            &self.sock,
+            &CtlReq::Emit {
+                kind,
+                refs,
+                body,
+                files: vec![],
+            },
+        ) {
+            Ok(CtlResp::Admitted { event, index }) => {
+                Ok(ToolReply::Text(format!("admitted {event} at {index}")))
+            }
+            Ok(_) => Ok(ToolReply::Error(
+                "the session answered something else".into(),
+            )),
+            Err(agent_mesh_flock_session::SessionError::Refused(why)) => {
+                Ok(ToolReply::Error(format!("refused: {why}")))
+            }
+            Err(e) => Err(Lost(e.to_string())),
         }
     }
 }

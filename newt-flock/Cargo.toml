@@ -24,6 +24,8 @@ serde = { workspace = true }
 serde_json.workspace = true
 
 [dev-dependencies]
+# The member session with its signer, so replies are signed by the real thing.
+agent-mesh-flock-session = { version = "0.8.0", features = ["emit"] }
 # Writer features are for the in-process fixture only.
 agent-mesh-flock-server = { version = "0.8.0", features = ["serve"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
