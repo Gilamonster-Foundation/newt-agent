@@ -43,21 +43,23 @@
 
 <h2>What each stage maps to</h2>
 <div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
-<tr><td>Engine choice</td><td>safe-subset, host or brush; brush only with an active fence on Linux or macOS.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/config/shell.rs"><code>newt-core/src/config/shell.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Engine choice</td><td>safe-subset, host or brush; the confined brush worker needs an active fence on Linux or macOS.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/config/shell.rs"><code>newt-core/src/config/shell.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Parse and run</td><td>Brush in an authenticated worker process; exec is removed from its builtins.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/vendor/agent-bridle-tool-shell/src/brush_shell.rs"><code>vendor/agent-bridle-tool-shell/src/brush_shell.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Empty environment</td><td>do_not_inherit_env, explicit env seam, seeded PATH.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/tools/shell.rs"><code>newt-core/src/agentic/tools/shell.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Spawn gate</td><td>Every external spawn is checked on resolved program and cwd.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/vendor/agent-bridle-tool-shell/src/caveat_interceptor.rs"><code>vendor/agent-bridle-tool-shell/src/caveat_interceptor.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Open gate</td><td>Files brush opens itself are checked against fs_read and fs_write.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/vendor/agent-bridle-tool-shell/src/caveat_interceptor.rs"><code>vendor/agent-bridle-tool-shell/src/caveat_interceptor.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Carried coreutils</td><td>Six uutils commands, re-executed through Newt and gated.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/vendor/agent-bridle-tool-shell/src/coreutils_dispatch.rs"><code>vendor/agent-bridle-tool-shell/src/coreutils_dispatch.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Kernel fence</td><td>Inherited by the worker and descendants.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/design/captured-shell-cross-platform.md"><code>docs/design/captured-shell-cross-platform.md</code></a></td><td class="status"><span class="impl">Implemented, open deviations</span></td></tr>
+<tr><td>Windows ambient runner</td><td>Separate newt-ambient-brush.exe gives POSIX syntax when OCAP is off; cmd.exe fallback; kill-on-close job object.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/windows-ambient-shell.md"><code>docs/windows-ambient-shell.md</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Network check in the interpreter</td><td>Network is the kernel backend's job, not brush's.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/config/shell.rs"><code>newt-core/src/config/shell.rs</code></a></td><td class="status"><span class="impl">Not done by brush</span></td></tr>
 </tbody></table></div>
 <h2>What this does not show</h2>
 <ul>
 <li>The interpreter gate is mediation and audit with exec precision. It is not an independent security boundary: the kernel fence is the boundary for files and network.</li>
 <li>Only spawns and opens that brush itself makes are gated. An admitted child and its descendants rely on the inherited kernel fence.</li>
-<li>Brush is not used on Windows. Selecting it there is refused, and the default there is safe-subset.</li>
-<li>Brush is the default only when a kernel fence is active. Where no native fence exists, the shell can collapse to advisory, a recorded open deviation.</li>
+<li>On Windows, <code>--full-access</code> currently selects the restricted safe-subset engine, not brush, because the authenticated worker transport the brush engine needs exists only on Linux and macOS. A source branch meant to pick brush there is unreachable, and the changelog still describes it. </li>
+<li>On Windows, brush runs as a separate ambient runner when OCAP is off. It is not the confined, per-spawn-gated worker, which exists only on Linux and macOS. Confined on Windows, the shell engine is safe-subset, and choosing the confined brush engine there is refused.</li>
+<li>The confined brush worker is the default only when a kernel fence is active. Where no native fence exists, the shell can collapse to advisory, a recorded open deviation.</li>
 <li>Carried coreutils are not in-process. Each is a re-exec, which is also a cost.</li>
 <li>Newt builds on renamed <code>brush-ocap-*</code> forks published on crates.io, not on upstream brush itself. The upstream interceptor proposal (reubeno/brush#1184) is still open, and the bundled-command dispatch code is marked for upstreaming.</li>
 <li>No speed claim: the repo documents N admissions for N spawns but has no measurement of what that costs in time.</li>
@@ -150,7 +152,7 @@ var SPEC = {
   },
   {
    "title": "Pick an engine",
-   "cap": "There are three: safe-subset, host and brush. Confined, brush is chosen when a kernel fence is active and the worker exists on this platform, otherwise safe-subset. --full-access picks host. Windows never uses brush.",
+   "cap": "There are three: safe-subset, host and brush. Confined, brush is chosen when a kernel fence is active and the worker exists on this platform, otherwise safe-subset. --full-access picks host on Linux and macOS. The confined brush worker does not exist on Windows; see the next step.",
    "show": [
     "cmd",
     "eng"
@@ -167,9 +169,39 @@ var SPEC = {
    ],
    "state": {},
    "tag": {
-    "eng": "brush: Linux and macOS, fence active"
+    "eng": "confined brush: Linux and macOS"
    },
    "note": "Implemented: config/shell.rs, rechecked per call"
+  },
+  {
+   "title": "On Windows: a carried brush runner",
+   "cap": "The reason brush is on Windows at all is POSIX syntax there: pipelines, ; and $?, redirection and quoted paths. When OCAP is off, Windows runs commands through a separate carried runner, tools/newt-ambient-brush.exe, by default. If the runner is not installed, it falls back to cmd.exe and says so once. --windows-cmd forces cmd.",
+   "show": [
+    "cmd",
+    "eng",
+    "brush"
+   ],
+   "hot": [
+    "brush"
+   ],
+   "edges": [
+    [
+     "cmd",
+     "brush",
+     "POSIX syntax"
+    ],
+    [
+     "eng",
+     "brush",
+     "ambient runner",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "brush": "newt-ambient-brush.exe; job-object kill-on-close"
+   },
+   "note": "Implemented: docs/windows-ambient-shell.md. Not the gated worker"
   },
   {
    "title": "Brush parses the string",
