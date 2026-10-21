@@ -732,6 +732,22 @@ mod tests {
         assert!(Verdict::try_from(PermissionAction::AllowPermanent).is_err());
     }
 
+    /// macOS spells /etc, /tmp and /var as symlinks into /private; a grant
+    /// for the alias must be stored (and so matched) under the real spelling.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn widen_stores_macos_fs_grants_under_their_private_spelling() {
+        let widened = widen_caveats(
+            &base(),
+            &[
+                (DenialKind::FsRead, "/etc/hosts".to_string()),
+                (DenialKind::FsWrite, "/tmp/out".to_string()),
+            ],
+        );
+        assert!(widened.permits_fs_read("/private/etc/hosts"));
+        assert!(widened.permits_fs_write("/private/tmp/out"));
+    }
+
     #[test]
     fn widen_adds_each_grant_to_its_axis_only() {
         let widened = widen_caveats(
@@ -746,8 +762,10 @@ mod tests {
         assert!(widened.permits_exec("npm"));
         assert!(widened.permits_exec("cargo"), "existing grants kept");
         assert!(widened.permits_net("docs.rs"));
-        assert!(widened.permits_fs_read("/etc/hosts"));
-        assert!(widened.permits_fs_write("/tmp/out"));
+        // macOS stores fs grants under their canonical alias (/private/...);
+        // `rewrite` is the identity elsewhere.
+        assert!(widened.permits_fs_read(&crate::fs_aliases::rewrite("/etc/hosts")));
+        assert!(widened.permits_fs_write(&crate::fs_aliases::rewrite("/tmp/out")));
         // Untouched axes / non-granted targets stay denied.
         assert!(!widened.permits_exec("rm"));
         assert!(!widened.permits_net("evil.example.com"));

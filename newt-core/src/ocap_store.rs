@@ -865,7 +865,8 @@ mod tests {
         let k = key();
         // A platform-absolute path: `/ws` has no drive on Windows. Compare the
         // PARSED entry, since TOML escapes Windows backslashes in the text.
-        let ws = dir.path().join("ws");
+        // Canonical root: macOS signs the /private/var spelling of /var temp dirs.
+        let ws = dir.path().canonicalize().unwrap().join("ws");
         let raw = ws.join("x").join("..").join("y");
         persist_approve(
             &config,
@@ -885,6 +886,35 @@ mod tests {
             ws.join("y").as_path(),
             "{text}"
         );
+    }
+
+    /// macOS temp dirs sit under the /var symlink; the signed entry must carry
+    /// the /private/var spelling the fence enforces, not the alias.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persist_approve_signs_the_private_spelling_of_a_var_alias() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let k = key();
+        let raw = dir.path().join("ws").join("x").join("..").join("y");
+        assert!(
+            raw.starts_with("/var/"),
+            "fixture must use the alias: {raw:?}"
+        );
+        persist_approve(
+            &config,
+            ApproveEntry::Fs {
+                path: raw.to_string_lossy().into_owned(),
+                write: false,
+            },
+            |_, _| false,
+            |payload| k.sign(payload).to_bytes(),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("ocap").join("approve.toml")).unwrap();
+        let file = PolicyFile::parse(&text).unwrap();
+        let expected = dir.path().canonicalize().unwrap().join("ws").join("y");
+        assert_eq!(std::path::Path::new(&file.fs[0].path), expected, "{text}");
     }
 
     /// #2524 round 2 item 4: `persist_approve` and `newt doctor --sign-ocap`
