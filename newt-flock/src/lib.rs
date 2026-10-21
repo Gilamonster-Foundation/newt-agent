@@ -5,8 +5,13 @@
 //! challenge over its control socket; this crate never sees a key.
 #![cfg(unix)]
 
-use agent_mesh_flock::Genesis;
+mod answer;
+mod asks;
 
+pub use answer::{Answerer, Draft, Outcome, SignReply, SignRequest};
+pub use asks::{view, AskView, OpenAsk};
+
+use agent_mesh_flock::Genesis;
 use agent_mesh_flock_server::wire::{read_msg, write_msg, StreamChallenge};
 use agent_mesh_flock_server::{private_dir, Sealed};
 use agent_mesh_flock_session::{call, CtlReq, CtlResp, Reader, ReaderError, RealFs, Seen};
@@ -65,6 +70,9 @@ pub enum Observed {
     },
     /// The replay is over at this index.
     Caught(u64),
+    /// The verified asks after a catch-up: open ones, and which event answered
+    /// each closed one.
+    Asks(AskView),
     /// The stream was refused or could not be opened (the server is away, or
     /// this member's session no longer reads); nothing was read this pass and
     /// the next is tried after `retry`.
@@ -222,6 +230,7 @@ impl Inbox {
                                     removed =
                                         !fol.board().members().iter().any(|m| m.name == member);
                                     gone |= tx.send(Observed::Caught(i)).is_err();
+                                    gone |= tx.send(Observed::Asks(view(fol.board()))).is_err();
                                 }
                             })
                         });

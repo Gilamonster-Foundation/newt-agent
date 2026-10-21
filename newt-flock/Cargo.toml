@@ -23,6 +23,7 @@ agent-mesh-protocol = { git = "https://github.com/Gilamonster-Foundation/agent-m
 socket2 = "0.6"
 content-addressable.workspace = true
 thiserror.workspace = true
+serde = { workspace = true }
 
 [dev-dependencies]
 # Writer features are for the in-process fixture only.
