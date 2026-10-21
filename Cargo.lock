@@ -4690,6 +4690,7 @@ dependencies = [
  "content-addressable",
  "ed25519-dalek",
  "rand 0.8.7",
+ "serde",
  "socket2",
  "tempfile",
  "thiserror 2.0.18",

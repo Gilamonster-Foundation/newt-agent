@@ -287,6 +287,7 @@ fn until_caught(inbox: &Inbox) -> Vec<Kind> {
                 kinds.extend(frame.iter().map(|s| s.event.payload.kind));
             }
             Observed::Caught(_) => return kinds,
+            Observed::Asks(_) => {}
             Observed::Unavailable(w) => panic!("unavailable: {w}"),
         }
     }
@@ -380,7 +381,7 @@ fn a_removed_member_reads_nothing_more_and_is_told_the_stream_is_unavailable() {
     loop {
         match inbox.events().recv().unwrap() {
             Observed::Unavailable(_) => break,
-            Observed::Caught(_) => {}
+            Observed::Caught(_) | Observed::Asks(_) => {}
             Observed::Frame { frame, .. } => {
                 // only the roster that drops the member may still arrive
                 assert!(frame.iter().all(|s| s.event.payload.kind == Kind::Roster));
@@ -612,4 +613,37 @@ fn stop_and_drop_return_while_the_server_will_not_take_a_connection() {
             }
         });
     }
+}
+
+#[test]
+fn a_verified_open_ask_is_shown_with_its_text_made_inert() {
+    let mut r = Rig::new();
+    let mut h1 = r.enrol("h1");
+    let s = session_for(&r, "h1", &h1);
+    r.event(
+        &mut h1,
+        Kind::Ask,
+        vec![],
+        Body::Ask {
+            lane: Some("l1".into()),
+            text: "go?\u{1b}[2J\nFORGED row".into(),
+        },
+    );
+    let inbox = Inbox::start(config(&r, &s)).unwrap();
+    let view = loop {
+        if let Observed::Asks(v) = inbox.events().recv().unwrap() {
+            break v;
+        }
+    };
+    assert_eq!(view.open.len(), 1);
+    let ask = &view.open[0];
+    assert_eq!((ask.from.as_str(), ask.lane.as_deref()), ("h1", Some("l1")));
+    let line = ask.line();
+    assert!(!line.contains('\u{1b}') && !line.contains('\n'), "{line:?}");
+    assert!(
+        line.contains("FORGED row"),
+        "escaped, not dropped: {line:?}"
+    );
+    assert!(view.answered.is_empty());
+    inbox.stop();
 }
