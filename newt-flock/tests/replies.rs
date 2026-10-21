@@ -683,3 +683,89 @@ fn the_journal_directory_must_be_private_and_the_file_not_a_link() {
     let ok = tmp.join("fine");
     assert!(replies_try(&w, &ok).is_ok());
 }
+
+// ---- Codex round 2 on #2977 --------------------------------------------------
+
+/// Finding 4: every directory the open created is published in its parent, top
+/// down, and the journal's own directory last, before anything is emitted.
+#[test]
+fn every_new_directory_is_synced_into_its_parent_before_any_emission() {
+    let w = world();
+    let base = w.r.tmp.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    let dir = base.join("a").join("b");
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (l, l2) = (Arc::clone(&log), Arc::clone(&log));
+    let caller = newt_flock::FnCaller(move |_: &str, _| {
+        l2.lock().unwrap().push("emit".into());
+        Ok(newt_flock::ToolReply::Text("???".into()))
+    });
+    let mut rp = Replies::open_with(
+        &dir,
+        "h1",
+        caller,
+        Box::new(move |p: &Path| {
+            l.lock().unwrap().push(p.display().to_string());
+            Ok(())
+        }),
+    )
+    .unwrap();
+    rp.send(&Reply::ack(&w.brief)).unwrap();
+    let want: Vec<String> = [
+        base.clone(),
+        base.join("a"),
+        dir.clone(), // the journal's own directory last
+    ]
+    .iter()
+    .map(|p| p.display().to_string())
+    .chain(["emit".to_string()])
+    .collect();
+    assert_eq!(*log.lock().unwrap(), want);
+}
+
+/// Finding 6: a multibyte character cut in half by a crash in the last row is
+/// a torn tail (dropped), not an unreadable journal.
+#[test]
+fn a_multibyte_character_cut_mid_sequence_is_a_torn_tail() {
+    let w = world();
+    let dir = journal(&w);
+    let (mut rp, _) = replies(&w, &dir);
+    rp.send(&Reply::ack(&w.brief)).unwrap();
+    drop(rp);
+    let path = dir.join("replies.jsonl");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"{\"reply\":{\"flock\":\"\xc3"); // half of "é"
+    std::fs::write(&path, bytes).unwrap();
+
+    let (mut rp, _) = replies(&w, &dir);
+    assert!(rp
+        .state(&w.brief.flock, &w.brief.event, Step::Ack)
+        .is_some());
+    rp.send(&Reply::result(&w.brief, true).unwrap()).unwrap();
+    drop(rp);
+    let (rp, _) = replies(&w, &dir);
+    for step in [Step::Ack, Step::Finish] {
+        assert!(rp.state(&w.brief.flock, &w.brief.event, step).is_some());
+    }
+}
+
+/// Finding 7: a one-component relative directory has the empty path as its
+/// parent, which cannot be synced; the plan names "." instead. (Pure, so no
+/// test changes the process's directory.)
+#[test]
+fn a_one_component_relative_dir_syncs_dot_not_the_empty_path() {
+    let plan = newt_flock::sync_plan(Path::new("replies"), &|_| false);
+    assert_eq!(
+        plan,
+        [
+            Path::new(".").to_path_buf(),
+            Path::new("replies").to_path_buf()
+        ]
+    );
+    assert!(plan.iter().all(|p| !p.as_os_str().is_empty()));
+    // an existing directory needs only its own entry list made durable
+    assert_eq!(
+        newt_flock::sync_plan(Path::new("replies"), &|_| true),
+        [Path::new("replies").to_path_buf()]
+    );
+}

@@ -246,12 +246,40 @@ fn sync_dir_real(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// Which directories to fsync, in order, so that `dir` and its journal entry
+/// survive a crash: the parent of every directory this call had to create
+/// (topmost first), then `dir` itself. `exists` is asked before anything is
+/// created.
+#[doc(hidden)]
+#[must_use]
+pub fn sync_plan(dir: &Path, exists: &dyn Fn(&Path) -> bool) -> Vec<std::path::PathBuf> {
+    // the directories that do not exist yet, deepest first
+    let mut missing = vec![];
+    let mut at = Some(dir);
+    while let Some(p) = at.filter(|p| !p.as_os_str().is_empty() && !exists(p)) {
+        missing.push(p);
+        at = p.parent();
+    }
+    let mut plan: Vec<std::path::PathBuf> = missing
+        .iter()
+        .rev()
+        .map(|p| match p.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => Path::new(".").to_path_buf(), // a one-component relative path
+        })
+        .collect();
+    plan.push(dir.to_path_buf());
+    plan
+}
+
 fn jerr(e: impl std::fmt::Display) -> String {
     format!("reply journal: {e}")
 }
 
 impl Journal {
     fn open(dir: &Path, sync_dir: &SyncDir) -> Result<Self, String> {
+        let existed = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+        let plan = sync_plan(dir, &existed);
         // ours, a real directory, closed to others (a loose or linked one is refused)
         private_dir(dir).map_err(jerr)?;
         let path = dir.join("replies.jsonl");
@@ -281,23 +309,28 @@ impl Journal {
             Err(std::fs::TryLockError::Error(e)) => return Err(jerr(e)),
         }
         // the name must survive a crash before anything can be emitted
-        sync_dir(dir).map_err(jerr)?;
-        if let Some(parent) = dir.parent() {
-            sync_dir(parent).map_err(jerr)?;
+        for p in &plan {
+            sync_dir(p).map_err(jerr)?;
         }
-        let mut text = String::new();
-        file.read_to_string(&mut text).map_err(jerr)?;
-        if !text.is_empty() && !text.ends_with('\n') {
-            let keep = text.rfind('\n').map_or(0, |n| n + 1);
-            if serde_json::from_str::<Row>(&text[keep..]).is_ok() {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(jerr)?;
+        // rows end in a newline; what follows the last one is a tail
+        let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |n| n + 1);
+        if keep < bytes.len() {
+            let whole = std::str::from_utf8(&bytes[keep..])
+                .ok()
+                .is_some_and(|t| serde_json::from_str::<Row>(t).is_ok());
+            if whole {
                 file.write_all(b"\n").map_err(jerr)?;
-                text.push('\n');
+                bytes.push(b'\n');
             } else {
+                // torn (including a character cut in half): drop it
                 file.set_len(keep as u64).map_err(jerr)?;
-                text.truncate(keep);
+                bytes.truncate(keep);
             }
             file.sync_all().map_err(jerr)?;
         }
+        let text = String::from_utf8(bytes).map_err(|e| jerr(format!("not UTF-8: {e}")))?;
         let mut rows = BTreeMap::new();
         for (i, line) in text.lines().enumerate() {
             let row = serde_json::from_str::<Row>(line)

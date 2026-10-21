@@ -13,7 +13,7 @@ mod view;
 
 pub use answer::{Answerer, Draft, Outcome, SignReply, SignRequest};
 pub use asks::{view, AskView, OpenAsk};
-pub use reply::{FnCaller, Lost, Replies, Reply, Sent, Step, ToolCaller, ToolReply};
+pub use reply::{sync_plan, FnCaller, Lost, Replies, Reply, Sent, Step, ToolCaller, ToolReply};
 pub use task::{open_tasks, verify, CitedFile, Evidence, Intake, NewTask, Sink, Task, TaskKind};
 pub use view::{present, Local, Phase, TaskView};
 
