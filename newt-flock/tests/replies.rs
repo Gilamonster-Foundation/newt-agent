@@ -686,13 +686,15 @@ fn the_journal_directory_must_be_private_and_the_file_not_a_link() {
 
 // ---- Codex round 2 on #2977 --------------------------------------------------
 
-/// Finding 4: every directory the open created is published in its parent, top
-/// down, and the journal's own directory last, before anything is emitted.
+/// Finding 4 (r4): existence is not consulted. Every open syncs the journal
+/// directory and each ancestor up to `/`, before any emission, whoever
+/// created which directory.
 #[test]
-fn every_new_directory_is_synced_into_its_parent_before_any_emission() {
+fn every_open_syncs_the_whole_chain_before_any_emission() {
     let w = world();
     let base = w.r.tmp.path().join("base");
-    std::fs::create_dir(&base).unwrap();
+    // "another opener" already made the first level
+    std::fs::create_dir_all(base.join("a")).unwrap();
     let dir = base.join("a").join("b");
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let (l, l2) = (Arc::clone(&log), Arc::clone(&log));
@@ -711,15 +713,48 @@ fn every_new_directory_is_synced_into_its_parent_before_any_emission() {
     )
     .unwrap();
     rp.send(&Reply::ack(&w.brief)).unwrap();
-    let want: Vec<String> = [
-        base.clone(),
-        base.join("a"),
-        dir.clone(), // the journal's own directory last
-    ]
-    .iter()
-    .map(|p| p.display().to_string())
-    .chain(["emit".to_string()])
-    .collect();
+    let want: Vec<String> = dir
+        .ancestors()
+        .map(|p| p.display().to_string())
+        .chain(["emit".to_string()])
+        .collect();
+    assert_eq!(*log.lock().unwrap(), want, "child first, up to the root");
+}
+
+/// A sync that fails stops the open (nothing is emitted); the retry syncs the
+/// whole chain again, though every directory now exists.
+#[test]
+fn a_failed_sync_fails_the_open_and_the_retry_syncs_everything_again() {
+    let w = world();
+    let dir = w.r.tmp.path().join("x").join("y");
+    let first = Arc::new(Mutex::new(true));
+    let f = Arc::clone(&first);
+    let failed = Replies::open_with(
+        &dir,
+        "h1",
+        unclear(),
+        Box::new(move |_: &Path| {
+            if std::mem::replace(&mut *f.lock().unwrap(), false) {
+                Err(std::io::Error::other("disk"))
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    assert!(failed.is_err());
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let l = Arc::clone(&log);
+    let rp = Replies::open_with(
+        &dir,
+        "h1",
+        unclear(),
+        Box::new(move |p: &Path| {
+            l.lock().unwrap().push(p.display().to_string());
+            Ok(())
+        }),
+    );
+    assert!(rp.is_ok(), "the failed open left the journal locked");
+    let want: Vec<String> = dir.ancestors().map(|p| p.display().to_string()).collect();
     assert_eq!(*log.lock().unwrap(), want);
 }
 
@@ -754,18 +789,25 @@ fn a_multibyte_character_cut_mid_sequence_is_a_torn_tail() {
 /// test changes the process's directory.)
 #[test]
 fn a_one_component_relative_dir_syncs_dot_not_the_empty_path() {
-    let plan = newt_flock::sync_plan(Path::new("replies"), &|_| false);
+    let plan = newt_flock::sync_plan(Path::new("replies"));
     assert_eq!(
         plan,
         [
-            Path::new(".").to_path_buf(),
-            Path::new("replies").to_path_buf()
+            Path::new("replies").to_path_buf(),
+            Path::new(".").to_path_buf()
         ]
     );
-    assert!(plan.iter().all(|p| !p.as_os_str().is_empty()));
-    // an existing directory needs only its own entry list made durable
+    let nested = newt_flock::sync_plan(Path::new("a/b"));
     assert_eq!(
-        newt_flock::sync_plan(Path::new("replies"), &|_| true),
-        [Path::new("replies").to_path_buf()]
+        nested,
+        [
+            Path::new("a/b").to_path_buf(),
+            Path::new("a").to_path_buf(),
+            Path::new(".").to_path_buf()
+        ]
     );
+    assert!(plan
+        .iter()
+        .chain(&nested)
+        .all(|p| !p.as_os_str().is_empty()));
 }

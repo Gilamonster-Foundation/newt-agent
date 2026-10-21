@@ -247,28 +247,22 @@ fn sync_dir_real(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Which directories to fsync, in order, so that `dir` and its journal entry
-/// survive a crash: the parent of every directory this call had to create
-/// (topmost first), then `dir` itself. `exists` is asked before anything is
-/// created.
+/// survive a crash: `dir`, then every ancestor, child first. Whether a
+/// directory already existed is not consulted (another opener, or an earlier
+/// attempt that failed part way, may have made it without syncing its
+/// parent). An empty parent of a relative path is ".", whose own ancestors
+/// [`Journal::open`] resolves with the working directory.
 #[doc(hidden)]
 #[must_use]
-pub fn sync_plan(dir: &Path, exists: &dyn Fn(&Path) -> bool) -> Vec<std::path::PathBuf> {
-    // the directories that do not exist yet, deepest first
-    let mut missing = vec![];
-    let mut at = Some(dir);
-    while let Some(p) = at.filter(|p| !p.as_os_str().is_empty() && !exists(p)) {
-        missing.push(p);
-        at = p.parent();
-    }
-    let mut plan: Vec<std::path::PathBuf> = missing
-        .iter()
-        .rev()
-        .map(|p| match p.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => Path::new(".").to_path_buf(), // a one-component relative path
-        })
+pub fn sync_plan(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut plan: Vec<std::path::PathBuf> = dir
+        .ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
         .collect();
-    plan.push(dir.to_path_buf());
+    if dir.is_relative() {
+        plan.push(Path::new(".").to_path_buf());
+    }
     plan
 }
 
@@ -278,8 +272,6 @@ fn jerr(e: impl std::fmt::Display) -> String {
 
 impl Journal {
     fn open(dir: &Path, sync_dir: &SyncDir) -> Result<Self, String> {
-        let existed = |p: &Path| std::fs::symlink_metadata(p).is_ok();
-        let plan = sync_plan(dir, &existed);
         // ours, a real directory, closed to others (a loose or linked one is refused)
         private_dir(dir).map_err(jerr)?;
         let path = dir.join("replies.jsonl");
@@ -309,6 +301,12 @@ impl Journal {
             Err(std::fs::TryLockError::Error(e)) => return Err(jerr(e)),
         }
         // the name must survive a crash before anything can be emitted
+        let mut plan = sync_plan(dir);
+        if dir.is_relative() {
+            // "." is the working directory: its own ancestors up to `/`
+            let cwd = std::fs::canonicalize(".").map_err(jerr)?;
+            plan.extend(cwd.ancestors().skip(1).map(Path::to_path_buf));
+        }
         for p in &plan {
             sync_dir(p).map_err(jerr)?;
         }
