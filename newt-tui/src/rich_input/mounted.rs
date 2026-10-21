@@ -72,6 +72,10 @@ pub(crate) struct MountedEditor {
 }
 
 impl MountedEditor {
+    /// Nothing is typed.
+    pub(crate) fn is_blank(&self) -> bool {
+        self.textarea.lines().iter().all(|l| l.is_empty())
+    }
     pub(crate) fn new(
         edit: Edit,
         gutter: Option<u16>,

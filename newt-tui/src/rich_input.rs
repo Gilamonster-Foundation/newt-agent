@@ -1231,6 +1231,9 @@ pub(crate) struct RichSurface {
     /// the turn runs to completion before the session ends. A `Cell` because
     /// the event loop runs behind `&self`.
     pending_end_quit: Cell<bool>,
+    /// The flock intake's doorbell: rung while the prompt is empty, it ends
+    /// the read with [`ReadOutcome::Wake`] so the session can take the task.
+    waker: crate::flock_intake::Wake,
     /// The active model + endpoint shown in the status header (#527), refreshed
     /// each turn via [`InputSurface::set_runtime_context`] so a `/model` switch
     /// is reflected. Empty until the first turn sets them.
@@ -1338,6 +1341,7 @@ impl RichSurface {
             unsaved: Vec::new(),
             gutter: crate::resolve_gutter_setting(),
             pending_end_quit: Cell::new(false),
+            waker: crate::flock_intake::Wake::default(),
             model: String::new(),
             endpoint: String::new(),
             gauge: None,
@@ -1465,6 +1469,11 @@ impl RichSurface {
 
             // 250ms timeout drives the live clock when idle.
             if !event::poll(Duration::from_millis(250))? {
+                // Ring only wakes an EMPTY prompt: never discard what the
+                // operator is typing. A ring that finds text stays rung.
+                if me.is_blank() && self.waker.take() {
+                    break ReadOutcome::Wake;
+                }
                 continue;
             }
             let evt = event::read()?;
@@ -1528,6 +1537,10 @@ impl ScrollbackSink for Term {
 }
 
 impl InputSurface for RichSurface {
+    fn set_waker(&mut self, wake: crate::flock_intake::Wake) {
+        self.waker = wake;
+    }
+
     /// **The terminal adapter** (C1, #1862), rendering natively (C2, #1876).
     ///
     /// This surface owns the terminal, so it — and not the session —

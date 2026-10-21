@@ -96,6 +96,10 @@ pub(crate) enum ReadOutcome {
     /// breaks **without** a clean exit (no close-time network round-trip on a
     /// broken terminal). Raw mode is already disabled by the surface.
     Fatal(String),
+    /// The surface was idle (nothing typed) and the flock intake rang the
+    /// doorbell: no line was read, the loop head should look at the queue.
+    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+    Wake,
 }
 
 /// Provenance attached to a line entering the model-input branch.
@@ -137,6 +141,14 @@ enum ModelInputOrigin {
     /// it in the store inbox. `inbox_id` back-links the delivered turn.
     WebInjected {
         inbox_id: String,
+    },
+    /// A verified brief or review from this member's flock, queued durably
+    /// (`conversation_inbox`, source `flock`). Like `WebInjected` it is NOT
+    /// operator input (see `is_operator`), but it is recorded under its own
+    /// `flock` receipt origin, minted in the same transaction that marks the
+    /// row delivered.
+    FlockTask {
+        task: Box<newt_core::FlockTask>,
     },
 }
 
@@ -1067,6 +1079,14 @@ fn begin_model_prompt(
             conversation_id,
             newt_core::NewPrompt::operator(raw.to_vec(), model.to_vec()),
         ),
+        // The row is delivered in the transaction that mints the receipt, so
+        // a crash between dequeue and receipt cannot lose or double a task.
+        (Some(store), ModelInputOrigin::FlockTask { task }) => {
+            store.accept_flock_task(conversation_id, title, persona, task)
+        }
+        (None, ModelInputOrigin::FlockTask { .. }) => {
+            anyhow::bail!("a flock task needs a persistent conversation")
+        }
     }
 }
 
@@ -1398,6 +1418,12 @@ pub(crate) trait InputSurface {
         self.read_line(prompt)
     }
     /// Record a submitted entry in history.
+    /// Hand the surface the flock intake's doorbell. A surface that can wake
+    /// an idle read returns [`ReadOutcome::Wake`] when it rings and nothing is
+    /// typed; the default ignores it, so such a surface sees a queued task at
+    /// the next turn boundary or keypress instead. The rich surface wakes.
+    #[allow(dead_code)] // called by the launcher once it composes the intake
+    fn set_waker(&mut self, _wake: crate::flock_intake::Wake) {}
     fn add_history(&mut self, entry: &str);
     /// Persist history to disk (no-op when there is no history path).
     fn save_history(&mut self);
@@ -3403,6 +3429,37 @@ fn session_body(
                 ReadOutcome::Line(injected.body),
                 ModelInputOrigin::WebInjected {
                     inbox_id: injected.id,
+                },
+            )
+        } else if let Some(flock) = pending_clarification
+            .is_none()
+            .then(|| {
+                // 12b: a verified flock task runs as this turn's input, one at
+                // a time, only here at the loop head: busy work is never
+                // interrupted and the rest stay queued. Rows that fail their
+                // own evidence are refused (and said so) on the way.
+                conversation_store
+                    .as_ref()
+                    .map(|s| crate::flock_intake::next_flock_task(s, &active_conversation_id))
+            })
+            .flatten()
+            .and_then(|next| {
+                for why in &next.rejected {
+                    print_newt(&format!("[flock] task refused: {why}"), color, verbose);
+                }
+                next.task
+            })
+        {
+            retry_budget = retry_max;
+            print_newt(
+                &crate::flock_intake::provenance_line(&flock),
+                color,
+                verbose,
+            );
+            (
+                ReadOutcome::Line(flock.task.body.clone()),
+                ModelInputOrigin::FlockTask {
+                    task: Box::new(flock),
                 },
             )
         } else {
@@ -9779,6 +9836,9 @@ fn session_body(
                 }
                 println!();
             }
+            // The doorbell rang while the prompt was empty: no turn was
+            // read; go round so the loop head takes the queued task.
+            ReadOutcome::Wake => continue,
             ReadOutcome::Interrupted | ReadOutcome::Eof => {
                 clean_exit = true;
                 break;
@@ -9860,6 +9920,10 @@ fn session_body(
 #[cfg(test)]
 #[path = "chat_tests/prompt_ingress.rs"]
 mod prompt_ingress_tests;
+
+#[cfg(test)]
+#[path = "chat_tests/flock_ingress.rs"]
+mod flock_ingress_tests;
 
 /// What an interrupted turn persists. A streamed reply was already on screen,
 /// so it is saved as shown; an unstreamed one was never rendered, so the turn

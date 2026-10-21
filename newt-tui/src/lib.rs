@@ -14,6 +14,7 @@ mod codex_env;
 mod color;
 mod context_window;
 mod crew_form;
+mod flock_intake;
 mod help;
 #[cfg(feature = "rich-tui")]
 mod inference_panel;
