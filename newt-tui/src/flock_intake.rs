@@ -169,8 +169,8 @@ mod follow {
 
     impl FlockIntake {
         /// Follow the flock as `member` and queue its open tasks for
-        /// `conversation`, starting with whatever the reader had already
-        /// saved.
+        /// `conversation`, once each catch-up of the verified log is saved
+        /// (never from a saved prefix on its own).
         ///
         /// # Errors
         /// The session or the saved state was refused.

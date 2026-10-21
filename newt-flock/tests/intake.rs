@@ -1,7 +1,7 @@
 //! Intake against a real in-process flock server: which events become tasks,
-//! that a restart or replay queues nothing twice, that the saved board is
-//! reconciled before any new frame, and that the evidence binds a review's
-//! exact head.
+//! that a restart or replay queues nothing twice, that a saved prefix is never
+//! published before this run catches up, and that the evidence binds a
+//! review's exact head.
 #![cfg(unix)]
 
 mod common;
@@ -159,8 +159,10 @@ fn running_intake_again_over_the_same_board_queues_nothing_twice() {
     assert_eq!(queue.tasks.lock().unwrap().len(), 1);
 }
 
+/// Review 2976 r2 finding 2: a saved board is only a verified prefix (the
+/// reader marks no catch-up), so it is never published on its own.
 #[test]
-fn the_saved_board_is_reconciled_before_any_new_frame() {
+fn a_saved_board_is_not_published_before_this_run_catches_up() {
     let mut r = Rig::new();
     let mut shep = r.enrol("shep");
     let h1 = r.enrol("h1");
@@ -171,23 +173,27 @@ fn the_saved_board_is_reconciled_before_any_new_frame() {
     let inbox = Inbox::start(config(&r, &s)).unwrap();
     until_caught(&inbox);
     drop(inbox);
-    // second life, with the server gone: no frame and no catch-up will ever
-    // arrive, yet the task the reader had saved must still be offered
+    // second life, with the server gone: this run never catches up
     r.serving.take().unwrap().stop();
     let queue = Queue::default();
-    let (tx, rx) = mpsc::channel();
     let (mut intake, mut sink) = (Intake::new("h1", flock), queue.clone());
     let inbox = Inbox::start_with(config(&r, &s), move |f| {
-        let n = intake.reconcile(f, &mut sink);
-        if n > 0 {
-            let _ = tx.send(n);
-        }
+        intake.reconcile(f, &mut sink);
     })
     .unwrap();
-    // the first state the worker reports is the retained board
-    assert_eq!(rx.recv().unwrap(), 1);
-    assert_eq!(queue.tasks.lock().unwrap().len(), 1);
+    // the worker has tried a pass and found the server away
+    loop {
+        match inbox.events().recv().unwrap() {
+            newt_flock::Observed::Unavailable(_) => break,
+            newt_flock::Observed::Caught(_) => panic!("caught up with no server"),
+            _ => {}
+        }
+    }
     drop(inbox);
+    assert!(
+        queue.tasks.lock().unwrap().is_empty(),
+        "a saved prefix was published without a catch-up"
+    );
 }
 
 #[test]
@@ -381,4 +387,125 @@ fn a_callback_only_follower_buffers_no_observations() {
         "an observation queue exists although nothing reads it"
     );
     assert!(matches!(inbox.stop(), newt_flock::Ended::Stopped));
+}
+
+/// Review 2976 r2 finding 2: the reader saves every verified frame, so a crash
+/// mid-replay leaves a checkpoint that ends before a closing Result/Verdict.
+/// Restarting from it must not queue the finished work, and must queue what is
+/// genuinely open once this run is caught up.
+fn restart_from_a_prefix_ending_at(finished: Kind) {
+    let mut r = Rig::new();
+    let mut shep = r.enrol("shep");
+    let mut h1 = r.enrol("h1");
+    let last = |r: &Rig| {
+        r.serving
+            .as_ref()
+            .unwrap()
+            .with_server(|s| s.board().entries().last().unwrap().id)
+    };
+    // finished work, then work that is still open
+    if finished == Kind::Brief {
+        to_h1(&mut r, &mut shep, "done");
+        let brief = last(&r);
+        r.event(&mut h1, Kind::Ack, vec![("of".into(), brief)], Body::Ack);
+        r.event(
+            &mut h1,
+            Kind::Result,
+            vec![("brief".into(), brief)],
+            Body::Result {
+                outcome: Outcome::Completed,
+            },
+        );
+    } else {
+        let body = |lane: &str| Body::Review {
+            to: "h1".into(),
+            lane: lane.into(),
+            head: "0123abcd".into(),
+        };
+        r.event(&mut shep, Kind::Review, vec![], body("done"));
+        let review = last(&r);
+        r.event(
+            &mut h1,
+            Kind::Verdict,
+            vec![("review".into(), review)],
+            Body::Verdict {
+                head: "0123abcd".into(),
+                approved: true,
+            },
+        );
+    }
+    to_h1(&mut r, &mut shep, "still-open");
+    let s = session_for(&r, "h1", &h1);
+    let flock = r.genesis().content_id().unwrap();
+
+    // every verified frame, from a first life with its own state
+    let mut first = config(&r, &s);
+    first.state_dir = r.tmp.path().join("first-state");
+    let inbox = Inbox::start(first).unwrap();
+    let mut frames = vec![];
+    loop {
+        match inbox.events().recv().unwrap() {
+            newt_flock::Observed::Frame { frame, .. } => frames.push(frame),
+            newt_flock::Observed::Caught(_) => break,
+            newt_flock::Observed::Asks(_) => {}
+            newt_flock::Observed::Unavailable(w) => panic!("unavailable: {w}"),
+        }
+    }
+    drop(inbox);
+
+    // the crash: a checkpoint holding the log up to the opening event only
+    let cfg = config(&r, &s);
+    agent_mesh_flock_server::private_dir(&cfg.state_dir).unwrap();
+    let mut reader = agent_mesh_flock_session::Reader::open(
+        cfg.genesis.clone(),
+        &cfg.state_dir,
+        agent_mesh_flock_session::RealFs,
+    )
+    .unwrap();
+    for frame in &frames {
+        let kinds: Vec<Kind> = frame.iter().map(|s| s.event.payload.kind).collect();
+        reader.apply(frame.clone()).unwrap();
+        reader.save().unwrap();
+        if kinds.contains(&finished) {
+            break;
+        }
+    }
+    drop(reader);
+
+    let queue = Queue::default();
+    let (mut intake, mut sink) = (Intake::new("h1", flock), queue.clone());
+    let (tx, rx) = mpsc::channel();
+    let inbox = Inbox::start_with(cfg, move |f| {
+        intake.reconcile(f, &mut sink);
+        let _ = tx.send(open_tasks(f.board(), "h1").len());
+    })
+    .unwrap();
+    until_caught(&inbox);
+    // the worker publishes at catch-up; wait for that publish
+    let open = rx.recv().unwrap();
+    drop(inbox);
+    let queued: Vec<String> = queue
+        .tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.body.clone())
+        .collect();
+    assert_eq!(open, 1, "the log has exactly one open task");
+    assert_eq!(
+        queued.len(),
+        1,
+        "the queue and the board must agree after catch-up: {queued:?}"
+    );
+    assert!(queued[0].contains("still-open"), "{queued:?}");
+}
+
+#[test]
+fn a_restart_from_a_replay_prefix_ending_at_a_brief_queues_nothing_finished() {
+    restart_from_a_prefix_ending_at(Kind::Brief);
+}
+
+#[test]
+fn a_restart_from_a_replay_prefix_ending_at_a_review_queues_nothing_finished() {
+    restart_from_a_prefix_ending_at(Kind::Review);
 }

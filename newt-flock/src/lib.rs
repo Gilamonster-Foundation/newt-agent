@@ -203,12 +203,13 @@ impl Inbox {
     }
 
     /// [`start`](Self::start), and `on_state` is called on the worker with the
-    /// verified follower: once for the board the reader saved earlier (so
-    /// work that arrived before a restart is seen even if no new frame ever
-    /// comes) and again at each catch-up, always after the reader has saved.
-    /// Never for a frame in the middle of a replay: a prefix of the log shows
-    /// work as open that a later frame closes. It never sees anything the
-    /// reader did not verify.
+    /// verified follower at each catch-up, always after the reader has saved.
+    /// Never before this run has caught up, not for a frame in the middle of a
+    /// replay and not for the board a previous run saved: the reader saves
+    /// every verified frame and records no "caught up" mark, so a saved board
+    /// may be a prefix of the log that shows work as open which a later frame
+    /// closes. (So with the server away nothing is published.) It never sees
+    /// anything the reader did not verify.
     ///
     /// # Errors
     /// See [`Error`].
@@ -256,7 +257,6 @@ impl Inbox {
                 let halt = Arc::new(Halt::default());
                 let flag = Arc::clone(&halt);
                 let thread = thread::spawn(move || {
-                    on_state(reader.follower());
                     let prove = |c: &StreamChallenge| flag.prove(&cfg.session, c);
                     // ponytail: each pass is a catch-up stream, re-opened after
                     // `retry`; the live tail waits for the next pass. One long

@@ -861,7 +861,12 @@ fn rehydrate_pending_clarification(
     const MAX_LINEAGE_DEPTH: usize = 256;
 
     let submitted = parent.submitted_prompt().receipt();
-    if submitted.origin() != newt_core::PromptOrigin::Operator {
+    // The objective may be an operator prompt or a flock task; either can
+    // end in Ask. A reply to it can only be the operator's.
+    if !matches!(
+        submitted.origin(),
+        newt_core::PromptOrigin::Operator | newt_core::PromptOrigin::Flock
+    ) {
         return Ok(None);
     }
 
@@ -901,12 +906,11 @@ fn rehydrate_pending_clarification(
         .first()
         .copied()
         .ok_or_else(|| anyhow::anyhow!("clarification receipt lineage is empty"))?;
-    // A flock task is never an Ask clarification: nothing is pending.
-    if root.origin() == newt_core::PromptOrigin::Flock {
-        return Ok(None);
-    }
-    if root.origin() != newt_core::PromptOrigin::Operator {
-        anyhow::bail!("clarification objective root is not an operator prompt");
+    if !matches!(
+        root.origin(),
+        newt_core::PromptOrigin::Operator | newt_core::PromptOrigin::Flock
+    ) {
+        anyhow::bail!("clarification objective root is not an operator or flock prompt");
     }
     let root_text = root
         .model_text_utf8()

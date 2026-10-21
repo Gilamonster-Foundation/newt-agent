@@ -302,3 +302,62 @@ fn an_operator_reply_on_a_flock_task_restores_and_is_not_a_pending_clarification
         "a flock objective is not an Ask clarification"
     );
 }
+
+/// Review 2976 r2 finding 8: a flock task whose text is an Ask can leave a
+/// pending clarification, and a restore must bring it back, both from the
+/// flock receipt alone and after an operator continuation.
+#[test]
+fn a_flock_rooted_ask_restores_its_pending_clarification() {
+    let (_tmp, store, conv) = store();
+    let body = "Implement either SQLite or Postgres.";
+    assert_eq!(
+        newt_core::agentic::PromptIntake::analyze(body).disposition(),
+        newt_core::agentic::PromptDisposition::Ask,
+        "setup: this text needs a decision"
+    );
+    store
+        .enqueue_flock_task(
+            &conv,
+            &newt_core::NewFlockTask {
+                body: body.into(),
+                flock_cid: "f".into(),
+                event_cid: "e-ask".into(),
+                evidence_cid: "c".into(),
+                evidence: "{}".into(),
+            },
+        )
+        .unwrap();
+    let row = store.peek_flock_task(&conv).unwrap().unwrap();
+    let ctx = store
+        .accept_flock_task(&conv, "flock session", None, &row)
+        .unwrap();
+    // before any operator reply: the flock receipt itself
+    let pending = rehydrate_pending_clarification(&store, &conv, &ctx).unwrap();
+    assert!(
+        pending.is_some(),
+        "the flock receipt's own pending clarification was lost"
+    );
+    // after an operator continuation that does not settle it
+    let reply = store
+        .begin_prompt(
+            &conv,
+            "flock session",
+            None,
+            newt_core::NewPrompt::operator_continuation(
+                "continue",
+                "continue",
+                ctx.submitted_prompt().id(),
+            ),
+        )
+        .unwrap();
+    let restored = store
+        .turn_prompt_context(&conv, reply.submitted_prompt().id())
+        .unwrap()
+        .expect("context");
+    assert!(
+        rehydrate_pending_clarification(&store, &conv, &restored)
+            .unwrap()
+            .is_some(),
+        "the pending decision vanished after an unsettled reply"
+    );
+}
