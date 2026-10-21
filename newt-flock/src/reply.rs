@@ -250,20 +250,16 @@ fn sync_dir_real(dir: &Path) -> std::io::Result<()> {
 /// survive a crash: `dir`, then every ancestor, child first. Whether a
 /// directory already existed is not consulted (another opener, or an earlier
 /// attempt that failed part way, may have made it without syncing its
-/// parent). An empty parent of a relative path is ".", whose own ancestors
-/// [`Journal::open`] resolves with the working directory.
+/// parent). The empty path is never named. This is the lexical chain; a
+/// symlinked ancestor hides the directories that really hold the entries, so
+/// [`Journal::open`] adds the resolved chain too.
 #[doc(hidden)]
 #[must_use]
 pub fn sync_plan(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut plan: Vec<std::path::PathBuf> = dir
-        .ancestors()
+    dir.ancestors()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
-        .collect();
-    if dir.is_relative() {
-        plan.push(Path::new(".").to_path_buf());
-    }
-    plan
+        .collect()
 }
 
 fn jerr(e: impl std::fmt::Display) -> String {
@@ -301,11 +297,14 @@ impl Journal {
             Err(std::fs::TryLockError::Error(e)) => return Err(jerr(e)),
         }
         // the name must survive a crash before anything can be emitted
+        // the lexical chain, then the physical one (a relative path and any
+        // symlinked ancestor resolve here), each directory once
         let mut plan = sync_plan(dir);
-        if dir.is_relative() {
-            // "." is the working directory: its own ancestors up to `/`
-            let cwd = std::fs::canonicalize(".").map_err(jerr)?;
-            plan.extend(cwd.ancestors().skip(1).map(Path::to_path_buf));
+        let physical = std::fs::canonicalize(dir).map_err(jerr)?;
+        for p in physical.ancestors() {
+            if !plan.iter().any(|q| q == p) {
+                plan.push(p.to_path_buf());
+            }
         }
         for p in &plan {
             sync_dir(p).map_err(jerr)?;

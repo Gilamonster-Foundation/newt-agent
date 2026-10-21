@@ -785,29 +785,75 @@ fn a_multibyte_character_cut_mid_sequence_is_a_torn_tail() {
 }
 
 /// Finding 7: a one-component relative directory has the empty path as its
-/// parent, which cannot be synced; the plan names "." instead. (Pure, so no
-/// test changes the process's directory.)
+/// parent, which cannot be synced, so the plan never names it. (Pure, so no
+/// test changes the process's directory; `open` adds the resolved chain.)
 #[test]
-fn a_one_component_relative_dir_syncs_dot_not_the_empty_path() {
-    let plan = newt_flock::sync_plan(Path::new("replies"));
+fn a_relative_dir_never_syncs_the_empty_path() {
     assert_eq!(
-        plan,
-        [
-            Path::new("replies").to_path_buf(),
-            Path::new(".").to_path_buf()
-        ]
+        newt_flock::sync_plan(Path::new("replies")),
+        [Path::new("replies").to_path_buf()]
     );
-    let nested = newt_flock::sync_plan(Path::new("a/b"));
     assert_eq!(
-        nested,
-        [
-            Path::new("a/b").to_path_buf(),
-            Path::new("a").to_path_buf(),
-            Path::new(".").to_path_buf()
-        ]
+        newt_flock::sync_plan(Path::new("a/b")),
+        [Path::new("a/b").to_path_buf(), Path::new("a").to_path_buf()]
     );
-    assert!(plan
-        .iter()
-        .chain(&nested)
-        .all(|p| !p.as_os_str().is_empty()));
+}
+
+// ---- Codex round 4 on #2977 --------------------------------------------------
+
+/// Finding 4 (r5): a symlinked ancestor. The lexical chain names the alias, but
+/// the directory entries that must be durable are in the physical parents, so
+/// the resolved chain is synced too, before any emission.
+#[test]
+fn a_symlinked_ancestor_has_its_physical_chain_synced_before_any_emission() {
+    use std::os::unix::fs::symlink;
+    let w = world();
+    let base = std::fs::canonicalize(w.r.tmp.path()).unwrap().join("base");
+    let physical = base.join("physical");
+    let parent = physical.join("parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    symlink(&parent, base.join("alias")).unwrap();
+    let dir = base.join("alias").join("journal");
+
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (l, l2) = (Arc::clone(&log), Arc::clone(&log));
+    let caller = newt_flock::FnCaller(move |_: &str, _| {
+        l2.lock().unwrap().push("emit".into());
+        Ok(newt_flock::ToolReply::Text("???".into()))
+    });
+    let mut rp = Replies::open_with(
+        &dir,
+        "h1",
+        caller,
+        Box::new(move |p: &Path| {
+            l.lock().unwrap().push(p.display().to_string());
+            Ok(())
+        }),
+    )
+    .unwrap();
+    rp.send(&Reply::ack(&w.brief)).unwrap();
+    let seen = log.lock().unwrap().clone();
+    let at = |p: &Path| seen.iter().position(|x| *x == p.display().to_string());
+    let emit = seen.iter().position(|x| x == "emit").unwrap();
+    for p in [
+        parent.join("journal"),
+        parent.clone(),
+        physical.clone(),
+        base.clone(),
+    ] {
+        assert!(
+            at(&p).is_some_and(|i| i < emit),
+            "{} not synced before emission: {seen:?}",
+            p.display()
+        );
+    }
+    assert!(at(&dir).is_some(), "the lexical chain is kept: {seen:?}");
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        seen.len(),
+        "a directory synced twice: {seen:?}"
+    );
 }
