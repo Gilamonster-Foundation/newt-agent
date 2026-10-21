@@ -170,6 +170,7 @@ fn prompt_origin_name(origin: crate::PromptOrigin) -> &'static str {
     match origin {
         crate::PromptOrigin::Operator => "operator",
         crate::PromptOrigin::HarnessRetry => "harness_retry",
+        crate::PromptOrigin::Flock => "flock",
     }
 }
 

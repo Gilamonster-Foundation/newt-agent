@@ -334,8 +334,9 @@ pub use newt_interaction::ControlKind;
 /// vocabulary" the note above is about.
 pub use newt_interaction::InteractionDefinition;
 pub use store::{
-    sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, InjectOutcome,
-    InjectedPrompt, LivenessFn, Roadmap, RoadmapSummary, SearchHit, StoredOwner, Verdict,
+    sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, FlockTask, InjectOutcome,
+    InjectedPrompt, LivenessFn, NewFlockTask, Roadmap, RoadmapSummary, SearchHit, StoredOwner,
+    Verdict,
 };
 pub use tokens::TokenEstimation;
 pub use tty::{Action, Question};

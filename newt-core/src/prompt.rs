@@ -88,6 +88,11 @@ pub enum PromptOrigin {
     /// Harness-generated retry text explicitly descended from an operator
     /// prompt. It is recorded, but never becomes the active operator prompt.
     HarnessRetry,
+    /// A task from an agent-mesh flock: a signed brief or review addressed to
+    /// this member. It roots its own objective like an operator prompt but is
+    /// not one: it is recorded as what it is (never as `Operator`), and its
+    /// text is untrusted content that tool confinement still applies to.
+    Flock,
 }
 
 impl PromptOrigin {
@@ -95,6 +100,7 @@ impl PromptOrigin {
         match self {
             Self::Operator => "operator",
             Self::HarnessRetry => "harness_retry",
+            Self::Flock => "flock",
         }
     }
 
@@ -102,6 +108,7 @@ impl PromptOrigin {
         match value {
             "operator" => Ok(Self::Operator),
             "harness_retry" => Ok(Self::HarnessRetry),
+            "flock" => Ok(Self::Flock),
             other => anyhow::bail!("unknown prompt origin `{other}`"),
         }
     }
@@ -161,6 +168,17 @@ impl NewPrompt {
             raw_text: raw_text.into(),
             model_text: model_text.into(),
             parent_prompt_id: Some(parent_prompt_id),
+        }
+    }
+
+    /// A task delivered by a flock: a new objective with no semantic parent,
+    /// recorded under its own origin.
+    pub fn flock(raw_text: impl Into<Vec<u8>>, model_text: impl Into<Vec<u8>>) -> Self {
+        Self {
+            origin: PromptOrigin::Flock,
+            raw_text: raw_text.into(),
+            model_text: model_text.into(),
+            parent_prompt_id: None,
         }
     }
 

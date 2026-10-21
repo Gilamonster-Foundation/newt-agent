@@ -167,6 +167,12 @@ impl SessionPromptStore {
         let active_operator = match (prompt.origin(), parent.as_ref()) {
             // A fresh operator submission is its own active authority.
             (PromptOrigin::Operator, None) => None,
+            // A flock task roots its own objective and carries itself as the
+            // active prompt; it never has a parent.
+            (PromptOrigin::Flock, None) => None,
+            (PromptOrigin::Flock, Some(_)) => {
+                anyhow::bail!("a flock task roots its own objective and has no parent")
+            }
             // bug/steering-regressions: an operator CONTINUATION (a decision
             // or clarification reply bound to a parent ask) REFINES the parent
             // objective — it must not usurp it as the active operator prompt.
@@ -889,6 +895,7 @@ fn prompt_origin_name(origin: PromptOrigin) -> &'static str {
     match origin {
         PromptOrigin::Operator => "operator",
         PromptOrigin::HarnessRetry => "harness_retry",
+        PromptOrigin::Flock => "flock",
     }
 }
 

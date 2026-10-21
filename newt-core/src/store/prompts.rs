@@ -34,6 +34,21 @@ impl ConversationStore {
         persona: Option<&str>,
         prompt: NewPrompt,
     ) -> anyhow::Result<TurnPromptContext> {
+        self.begin_prompt_with(conversation_id, title, persona, prompt, &mut |_, _| Ok(()))
+    }
+
+    /// [`begin_prompt`](Self::begin_prompt) plus `in_tx`, run inside the same
+    /// transaction after the receipt is written and before it commits. An
+    /// error from `in_tx` rolls the receipt back with it: this is how a queue
+    /// row is marked delivered in the very transaction that mints its receipt.
+    pub(super) fn begin_prompt_with(
+        &self,
+        conversation_id: &str,
+        title: &str,
+        persona: Option<&str>,
+        prompt: NewPrompt,
+        in_tx: &mut dyn FnMut(&Connection, &TurnPromptContext) -> anyhow::Result<()>,
+    ) -> anyhow::Result<TurnPromptContext> {
         validate_record_id(conversation_id)?;
         std::str::from_utf8(prompt.model_text()).map_err(|error| {
             anyhow::anyhow!(
@@ -121,6 +136,9 @@ impl ConversationStore {
         if prompt.origin == PromptOrigin::HarnessRetry && parent.is_none() {
             anyhow::bail!("a harness retry must name an operator-prompt parent");
         }
+        if prompt.origin == PromptOrigin::Flock && parent.is_some() {
+            anyhow::bail!("a flock task roots its own objective and has no parent");
+        }
 
         let root_prompt_id = match parent.as_ref() {
             Some(parent) => {
@@ -137,6 +155,13 @@ impl ConversationStore {
         let active_operator = match (prompt.origin, parent.as_ref()) {
             // A fresh operator submission is its own active authority.
             (PromptOrigin::Operator, None) => None,
+            // A flock task roots its own objective; like a fresh operator
+            // submission it carries itself as the active prompt (its origin,
+            // not this field, says it is not the operator's).
+            (PromptOrigin::Flock, None) => None,
+            (PromptOrigin::Flock, Some(_)) => {
+                anyhow::bail!("a flock task roots its own objective and has no parent")
+            }
             // bug/steering-regressions: an operator CONTINUATION (a decision
             // or clarification reply bound to a parent ask) REFINES the parent
             // objective — it must not usurp it as the active operator prompt.
@@ -186,6 +211,7 @@ impl ConversationStore {
             receipt.clone(),
             active_operator.unwrap_or_else(|| receipt.clone()),
         );
+        in_tx(&tx, &context)?;
         tx.commit()?;
         drop(conn);
 
