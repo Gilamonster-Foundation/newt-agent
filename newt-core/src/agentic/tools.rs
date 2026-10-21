@@ -449,6 +449,21 @@ pub fn plan_phase_clamp() -> crate::caveats::Caveats {
     }
 }
 
+/// The authority `[tool_exposure] read_only = true` clamps a session to
+/// (#2932): no filesystem writes, every other axis untouched. MEETing this
+/// into the session caveats is what makes the toggle attenuate authority and
+/// not merely hide `write_file` / `edit_file` / `delete_file` — the confined
+/// shell enforces the same `fs_write` floor, so `run_command` cannot write
+/// what the hidden tools could not. Exec and net stay as granted: read-only
+/// still runs builds and tests. Only narrows; never widens.
+pub fn read_only_clamp() -> crate::caveats::Caveats {
+    use crate::caveats::Scope;
+    crate::caveats::Caveats {
+        fs_write: Scope::none(),
+        ..crate::caveats::Caveats::top()
+    }
+}
+
 /// facade P4 (#780): is the convenience **routing** turned OFF for this call?
 ///
 /// True only when `NEWT_NO_ROUTE=1` — set by the CLI's `--no-route` flag. It
@@ -4305,8 +4320,13 @@ async fn execute_authorized_tool(
             // An exact known name is an explicit schema request through an
             // already-exposed tool. Reuse only the controller's admitted
             // definitions; fuzzy search never activates or executes anything.
+            // An operator-hidden name is not an explicit schema request: it
+            // falls through to the search, which does not list it (#2932).
             if let Some(message) = hidden_tools
-                .filter(|_| tool_allowed(disposition, query.trim()))
+                .filter(|hidden| {
+                    tool_allowed(disposition, query.trim())
+                        && !hidden.is_operator_hidden(query.trim())
+                })
                 .and_then(|hidden| hidden.promote(query.trim()).message(query.trim()))
             {
                 return host_return(message);

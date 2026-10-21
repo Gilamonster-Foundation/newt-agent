@@ -4,6 +4,9 @@ use crate::{tokens::TokenEstimation, Scope};
 use std::{collections::BTreeSet, io::Read, path::Path, sync::LazyLock};
 
 const COPY: &str = "Move large blocks with write_file + copy_from {path, start_line, end_line} (inclusive line ranges; no retyping). Otherwise split into several cohesive extractions, one per publish cycle. This is planning advice, never a refusal.";
+/// The same advice when the operator's policy hides `write_file` (#2932): the
+/// recipe that names it is omitted, the planning advice stays.
+const SPLIT: &str = "Split large blocks into several cohesive extractions, one per publish cycle. This is planning advice, never a refusal.";
 
 pub(super) fn guidance(
     cap: Option<u32>,
@@ -11,12 +14,15 @@ pub(super) fn guidance(
     root: &Path,
     read: &Scope<String>,
     estimation: TokenEstimation,
+    exposure: &super::tools::ExposureSettings,
 ) -> String {
+    let copy_from = exposure.operator_visible("write_file");
+    let copy = if copy_from { COPY } else { SPLIT };
     let Some(cap) = cap else {
-        return format!("[Harness output planning; not assistant-authored]\nPer-reply output budget: unknown (no configured provider allowance). {COPY}");
+        return format!("[Harness output planning; not assistant-authored]\nPer-reply output budget: unknown (no configured provider allowance). {copy}");
     };
     let retype = cap / 4;
-    let mut note = format!("[Harness output planning; not assistant-authored]\nPer-reply output budget: {cap} tokens (configured ceiling; request admission may lower it). Keep all retyped content in one reply at most {retype} tokens (one quarter), leaving room for reasoning and tool syntax. {COPY}");
+    let mut note = format!("[Harness output planning; not assistant-authored]\nPer-reply output budget: {cap} tokens (configured ceiling; request admission may lower it). Keep all retyped content in one reply at most {retype} tokens (one quarter), leaving room for reasoning and tool syntax. {copy}");
     let Some(ledger) = ledger else {
         return note;
     };
@@ -51,7 +57,8 @@ pub(super) fn guidance(
         let label = serde_json::to_string(&path).expect("path string");
         match measured_range(&root.join(&path), read, start, end, estimation) {
             Some(tokens) if tokens > retype as usize => note.push_str(&format!(
-                "\nPlanned extraction exceeds the recommended retyping budget: source (data) {label}, lines {start}-{end}, approximately {tokens} tokens of serialized content versus {retype}. Use copy_from or split into cohesive extractions, one per publish cycle."
+                "\nPlanned extraction exceeds the recommended retyping budget: source (data) {label}, lines {start}-{end}, approximately {tokens} tokens of serialized content versus {retype}. {}",
+                if copy_from { "Use copy_from or split into cohesive extractions, one per publish cycle." } else { "Split into cohesive extractions, one per publish cycle." }
             )),
             None => note.push_str(&format!("\nPlanned source range (data) {label}, lines {start}-{end}: size unavailable under current read authority or read limits; do not assume it fits.")),
             _ => {},
@@ -135,6 +142,7 @@ mod tests {
                 dir.path(),
                 read,
                 TokenEstimation::default(),
+                &Default::default(),
             )
         };
         assert!(render(&Scope::All).contains("Planned extraction exceeds"));
@@ -154,8 +162,39 @@ mod tests {
             dir.path(),
             &Scope::All,
             TokenEstimation::default(),
+            &Default::default(),
         );
         assert!(unknown.contains("unknown") && unknown.contains("copy_from"));
+    }
+
+    /// #2950 review 2 (P2): the planning advice is harness-owned guidance;
+    /// when the operator hides `write_file` it must not recommend it.
+    #[test]
+    fn output_budget_planning_omits_the_write_file_recipe_when_hidden() {
+        let ledger = SessionStepLedger::default();
+        ledger.set_plan(&["Extract source.rs:1-100".into()]);
+        let read_only = super::super::tools::ExposureSettings {
+            read_only: true,
+            ..Default::default()
+        };
+        for cap in [None, Some(400)] {
+            let note = guidance(
+                cap,
+                Some(&ledger),
+                Path::new("unused"),
+                &Scope::All,
+                TokenEstimation::default(),
+                &read_only,
+            );
+            assert!(
+                !note.contains("write_file") && !note.contains("copy_from"),
+                "{note}"
+            );
+            assert!(
+                note.contains("cohesive extractions"),
+                "advice stays: {note}"
+            );
+        }
     }
 
     /// Absolute, parent-traversing and ambiguous subjects cannot be rebound to
@@ -182,6 +221,7 @@ mod tests {
                 dir.path(),
                 &Scope::All,
                 TokenEstimation::default(),
+                &Default::default(),
             );
             assert!(
                 !text.contains("Planned extraction exceeds"),
@@ -206,6 +246,7 @@ mod tests {
             Path::new("unused"),
             &Scope::none(),
             TokenEstimation::default(),
+            &Default::default(),
         );
         assert!(note.contains("Per-reply output budget: 800 tokens"));
         assert!(note.contains("at most 200 tokens"));

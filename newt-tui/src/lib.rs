@@ -1795,11 +1795,21 @@ fn apply_operating_mode_to_intake(
 /// Only an operator-selected mode or an active model Plan phase may clamp
 /// authority. Inferred working styles guide the response; they cannot remove
 /// existing grants. Every clamp is a meet, so it cannot add authority either.
+///
+/// `tool_read_only` is `[tool_exposure] read_only` (#2932): the one toggle
+/// that hides the write tools ALSO meets [`newt_core::agentic::read_only_clamp`]
+/// here, so what the model cannot see it also cannot do — through any tool.
 fn operating_mode_caveats(
+    tool_read_only: bool,
     configured: OperatingMode,
     model_plan_phase: bool,
     caveats: newt_core::Caveats,
 ) -> newt_core::Caveats {
+    let caveats = if tool_read_only {
+        caveats.meet(&newt_core::agentic::read_only_clamp())
+    } else {
+        caveats
+    };
     let mode = if model_plan_phase {
         OperatingMode::Plan
     } else {
@@ -1814,12 +1824,14 @@ fn operating_mode_caveats(
 
 /// The ceiling re-applied by the permission gate after recalled or new grants.
 fn operating_mode_permission_clamp(
+    tool_read_only: bool,
     configured: OperatingMode,
     model_plan_phase: bool,
     posture_clamp: Option<newt_core::Caveats>,
 ) -> Option<newt_core::Caveats> {
     let has_posture_clamp = posture_clamp.is_some();
     let ceiling = operating_mode_caveats(
+        tool_read_only,
         configured,
         model_plan_phase,
         posture_clamp.unwrap_or_else(newt_core::Caveats::top),
@@ -5897,6 +5909,19 @@ fn build_system_prompt_with_persona(
         newt_core::Altitude::Coach => newt_core::COACH_SOUL,
         newt_core::Altitude::Doer => soul,
     };
+    // Resolved once and shared with the skills index below; the ratchet in
+    // newt-core/tests/resolve_publishes_ratchet.rs pins the publishing resolve
+    // count per file.
+    let cfg = crate::migration_notices::read(|report| newt_core::Config::resolve(report));
+    // #2932: the identity names only the tools the operator lets the model
+    // see — the same `[tool_exposure]` policy that selects the catalog, so the
+    // prompt cannot steer the model at a tool the wire never carries.
+    let exposure = cfg
+        .as_ref()
+        .ok()
+        .map(|c| newt_core::ExposureSettings::from(c.tool_exposure()))
+        .unwrap_or_default();
+    let identity = exposure.render_identity(identity);
     // #2934: project-context blocks (AGENTS.md/CLAUDE.md, notes, memory
     // index, project map) follow the identity whatever the altitude. Coach
     // replaces the soul above but must not drop project instructions. They
@@ -5929,7 +5954,7 @@ fn build_system_prompt_with_persona(
     // Doer altitude: providers were already annotated individually by
     // annotate_system_prompt_additions in rebuild_system_prompt.
     if let newt_core::Altitude::Coach = effective_altitude {
-        note("coach-soul", identity);
+        note("coach-soul", &identity);
     }
     // workspace-header: only the workspace line suffix — providers' spans end
     // at workspace_start, so this annotation never absorbs their content.
@@ -5945,11 +5970,6 @@ fn build_system_prompt_with_persona(
         );
         note("persona-overlay", &persona_overlay);
     }
-
-    // Resolved once and shared with the skills index below; the ratchet in
-    // newt-core/tests/resolve_publishes_ratchet.rs pins the publishing resolve
-    // count per file.
-    let cfg = crate::migration_notices::read(|report| newt_core::Config::resolve(report));
 
     // Per-session plan instruction (issue #220). Injected here, with the
     // resolved per-session path, rather than baked into DEFAULT_SOUL — so the

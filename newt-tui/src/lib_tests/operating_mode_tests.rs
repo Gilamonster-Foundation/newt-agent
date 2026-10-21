@@ -107,8 +107,12 @@ fn plan_and_diagnose_share_one_effective_disposition_with_the_executor() {
         diagnose.disposition(),
         "run_command"
     ));
-    let authority =
-        operating_mode_caveats(OperatingMode::Diagnose, false, newt_core::Caveats::top());
+    let authority = operating_mode_caveats(
+        false,
+        OperatingMode::Diagnose,
+        false,
+        newt_core::Caveats::top(),
+    );
     assert!(!authority.permits_exec("git"));
     assert!(!authority.permits_fs_write("/workspace/src/lib.rs"));
 
@@ -296,24 +300,24 @@ fn auto_model_selection_rejects_self_escalation() {
 fn plan_and_diagnose_attenuate_caveats_while_full_auto_preserves_them() {
     let base = newt_core::Caveats::top();
     for mode in [OperatingMode::Plan, OperatingMode::Diagnose] {
-        let effective = operating_mode_caveats(mode, false, base.clone());
+        let effective = operating_mode_caveats(false, mode, false, base.clone());
         assert!(effective.leq(&base), "{mode:?} must only attenuate");
         assert!(effective.permits_fs_read("/workspace/src/lib.rs"));
         assert!(!effective.permits_fs_write("/workspace/src/lib.rs"));
         assert!(!effective.permits_exec("cargo"));
     }
     assert!(
-        !operating_mode_caveats(OperatingMode::Plan, false, base.clone())
+        !operating_mode_caveats(false, OperatingMode::Plan, false, base.clone())
             .permits_net("example.com"),
         "Plan remains offline"
     );
     assert!(
-        operating_mode_caveats(OperatingMode::Diagnose, false, base.clone())
+        operating_mode_caveats(false, OperatingMode::Diagnose, false, base.clone())
             .permits_net("example.com"),
         "Diagnose may gather remote read-only evidence"
     );
     assert_eq!(
-        operating_mode_caveats(OperatingMode::FullAuto, false, base.clone()),
+        operating_mode_caveats(false, OperatingMode::FullAuto, false, base.clone()),
         base,
         "full-auto changes persistence, not authority"
     );
@@ -341,7 +345,7 @@ fn inferred_operating_style_preserves_operator_authority() {
                     assert_eq!(style, OperatingMode::Diagnose);
                 }
                 assert_eq!(
-                    operating_mode_caveats(configured, false, base.clone()),
+                    operating_mode_caveats(false, configured, false, base.clone()),
                     base,
                     "{prompt}: inferred {style:?} must not remove an operator's grant"
                 );
@@ -358,14 +362,14 @@ fn model_entered_plan_clamps_authority_without_changing_configured_mode() {
         OperatingMode::Dev,
         OperatingMode::FullAuto,
     ] {
-        let clamped = operating_mode_caveats(configured, true, base.clone());
+        let clamped = operating_mode_caveats(false, configured, true, base.clone());
         assert!(clamped.leq(&base));
         assert!(clamped.permits_fs_read("/workspace/src/lib.rs"));
         assert!(!clamped.permits_fs_write("/workspace/src/lib.rs"));
         assert!(!clamped.permits_exec("git"));
         assert!(!clamped.permits_net("example.com"));
         assert_eq!(
-            operating_mode_caveats(configured, false, base.clone()),
+            operating_mode_caveats(false, configured, false, base.clone()),
             base,
             "leaving model Plan restores the operator's existing authority"
         );
@@ -379,9 +383,13 @@ fn explicit_operating_mode_ceiling_composes_with_posture() {
         net: newt_core::Scope::none(),
         ..newt_core::Caveats::top()
     };
-    let ceiling =
-        operating_mode_permission_clamp(OperatingMode::Diagnose, false, Some(posture.clone()))
-            .expect("explicit mode and posture both impose a ceiling");
+    let ceiling = operating_mode_permission_clamp(
+        false,
+        OperatingMode::Diagnose,
+        false,
+        Some(posture.clone()),
+    )
+    .expect("explicit mode and posture both impose a ceiling");
     assert_eq!(
         ceiling.fs_read, posture.fs_read,
         "the posture's read grant survives"
@@ -390,7 +398,7 @@ fn explicit_operating_mode_ceiling_composes_with_posture() {
     assert!(!ceiling.permits_exec("git"));
     assert!(!ceiling.permits_net("example.com"));
     assert_eq!(
-        operating_mode_permission_clamp(OperatingMode::Auto, false, Some(posture.clone())),
+        operating_mode_permission_clamp(false, OperatingMode::Auto, false, Some(posture.clone())),
         Some(posture),
         "Auto must preserve the operator's existing posture exactly"
     );

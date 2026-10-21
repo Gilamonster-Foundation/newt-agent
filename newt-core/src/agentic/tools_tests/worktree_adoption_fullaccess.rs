@@ -400,6 +400,7 @@ fn assert_task_handoff(
             action,
             None,
             PromptReadContext::new(None, "Refactor in a new worktree", None),
+            &Default::default(),
             true,
             |_| true,
         );
@@ -420,6 +421,7 @@ fn assert_task_handoff(
         CompressAction::Summarized,
         None,
         PromptReadContext::new(None, "Refactor in a new worktree", None),
+        &Default::default(),
         true,
         |candidate| {
             assert!(candidate.last().unwrap()["content"]
@@ -724,6 +726,7 @@ fn handoff_2783_task_path_survives_model_and_operator_rendering() {
                 action,
                 None,
                 PromptReadContext::new(None, "Continue the task", None),
+                &Default::default(),
                 true,
                 |_| true,
             );
