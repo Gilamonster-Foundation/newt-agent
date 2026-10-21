@@ -857,3 +857,98 @@ fn a_symlinked_ancestor_has_its_physical_chain_synced_before_any_emission() {
         "a directory synced twice: {seen:?}"
     );
 }
+
+// ---- the journal is a chain (content-addressable ratchet) -----------------
+
+/// Three rows in a fresh journal (an Ack, a Result, a Verdict), and the lines
+/// as written.
+fn three_rows(w: &World, dir: &Path) -> Vec<String> {
+    let (mut rp, _) = replies(w, dir);
+    rp.send(&Reply::ack(&w.brief)).unwrap();
+    rp.send(&Reply::result(&w.brief, true).unwrap()).unwrap();
+    rp.send(&Reply::verdict(&w.review, true).unwrap()).unwrap();
+    drop(rp);
+    let text = std::fs::read_to_string(dir.join("replies.jsonl")).unwrap();
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    // each reply is an intent then its answer: the chain is longer than three
+    assert!(lines.len() >= 6, "{} rows", lines.len());
+    lines
+}
+
+fn write_lines(dir: &Path, lines: &[String]) {
+    std::fs::write(dir.join("replies.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
+fn refused_open(w: &World, dir: &Path) -> String {
+    let (t, calls) = tool(w);
+    let before = calls.lock().unwrap().len();
+    let err = Replies::open(dir, "h1", t)
+        .err()
+        .expect("a broken chain opened");
+    assert_eq!(calls.lock().unwrap().len(), before, "nothing was emitted");
+    err
+}
+
+#[test]
+fn a_deleted_middle_row_fails_the_open() {
+    let w = world();
+    let dir = journal(&w);
+    let mut lines = three_rows(&w, &dir);
+    lines.remove(2);
+    write_lines(&dir, &lines);
+    assert!(refused_open(&w, &dir).contains("chain"), "clear error");
+}
+
+#[test]
+fn two_swapped_rows_fail_the_open() {
+    let w = world();
+    let dir = journal(&w);
+    let mut lines = three_rows(&w, &dir);
+    lines.swap(1, 2);
+    write_lines(&dir, &lines);
+    assert!(refused_open(&w, &dir).contains("chain"));
+}
+
+#[test]
+fn an_edited_row_fails_the_open() {
+    let w = world();
+    let dir = journal(&w);
+    let mut lines = three_rows(&w, &dir);
+    let edited = lines[3].replacen("completed", "failed", 1);
+    assert_ne!(edited, lines[3], "the fixture must change something");
+    lines[3] = edited;
+    write_lines(&dir, &lines);
+    assert!(refused_open(&w, &dir).contains("chain"));
+}
+
+/// A complete last row that breaks the chain is tampering, not a torn tail:
+/// it is never silently dropped.
+#[test]
+fn a_complete_final_row_that_breaks_the_chain_is_not_dropped_as_torn() {
+    let w = world();
+    let dir = journal(&w);
+    let mut lines = three_rows(&w, &dir);
+    let last = lines.pop().unwrap();
+    lines.remove(1); // the last row's parent is gone, too
+    let _ = last.len();
+    lines.push(last);
+    // and the final newline is missing, as a crash could leave it
+    std::fs::write(dir.join("replies.jsonl"), lines.join("\n")).unwrap();
+    assert!(refused_open(&w, &dir).contains("chain"));
+}
+
+#[test]
+fn an_intact_chain_reopens_and_extends() {
+    let w = world();
+    let dir = journal(&w);
+    let lines = three_rows(&w, &dir);
+    let (mut rp, _) = replies(&w, &dir);
+    assert!(rp
+        .state(&w.review.flock, &w.review.event, Step::Finish)
+        .is_some());
+    rp.send(&Reply::ack(&w.review)).unwrap();
+    drop(rp);
+    let after = std::fs::read_to_string(dir.join("replies.jsonl")).unwrap();
+    assert!(after.lines().count() > lines.len());
+    let (_rp, _) = replies(&w, &dir); // and the longer chain verifies
+}

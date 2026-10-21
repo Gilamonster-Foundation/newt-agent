@@ -14,6 +14,7 @@
 
 use agent_mesh_flock::Kind;
 use agent_mesh_flock_server::{private_dir, Follower};
+use content_addressable::{ContentAddressable as _, ContentId, MerkleNode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -224,18 +225,65 @@ pub enum Sent {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Row {
     reply: Reply,
     sent: Sent,
 }
 
-/// The durable record of replies: one JSON line per change, fsync'd, the
+/// One journal line: a [`MerkleNode`] over the row and the id of the line
+/// before it, plus that id. The same shape as `newt-core`'s `event_journal`
+/// (which this crate cannot depend on without pulling in all of `newt-core`),
+/// minted by the same `content-addressable` crate.
+#[derive(Serialize, Deserialize)]
+struct Line {
+    id: String,
+    node: MerkleNode<Row>,
+}
+
+/// Verify a whole chain: every line's id is the id of its own bytes, the first
+/// line is a genesis, and every later line names exactly the line before it.
+/// An edited, deleted or reordered row fails here, and the open with it.
+fn verify_chain(lines: &[Line]) -> Result<(), String> {
+    for (i, line) in lines.iter().enumerate() {
+        let id = line
+            .id
+            .parse::<ContentId>()
+            .map_err(|e| format!("reply journal chain broken at row {}: bad id ({e})", i + 1))?;
+        if !line.node.verify(&id).unwrap_or(false) {
+            return Err(format!(
+                "reply journal chain broken at row {}: the row was edited",
+                i + 1
+            ));
+        }
+        let parents = line.node.parents();
+        let linked = match (i, parents.len()) {
+            (0, 0) => true,
+            (_, 1) if i > 0 => {
+                parents.iter().next().map(ToString::to_string).as_deref()
+                    == Some(lines[i - 1].id.as_str())
+            }
+            _ => false,
+        };
+        if !linked {
+            return Err(format!(
+                "reply journal chain broken at row {}: a row is missing, reordered or not a chain",
+                i + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The durable record of replies: one JSON line per change, fsync'd, each a
+/// chained [`Line`] (a deleted, reordered or edited row fails the open), the
 /// last line for a key wins. One owner at a time (an exclusive file lock held
 /// for its lifetime). A final line without its newline is completed if it is a
 /// whole row and dropped if it is torn, so the next line never glues onto it.
 struct Journal {
     file: std::fs::File,
+    /// The id of the last line: the parent of the next.
+    head: Option<ContentId>,
     rows: BTreeMap<String, Row>,
 }
 
@@ -313,28 +361,54 @@ impl Journal {
         file.read_to_end(&mut bytes).map_err(jerr)?;
         // rows end in a newline; what follows the last one is a tail
         let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |n| n + 1);
-        if keep < bytes.len() {
-            let whole = std::str::from_utf8(&bytes[keep..])
+        let parse = |b: &[u8]| -> Result<Vec<Line>, String> {
+            let text = std::str::from_utf8(b).map_err(|e| jerr(format!("not UTF-8: {e}")))?;
+            text.lines()
+                .enumerate()
+                .map(|(i, l)| {
+                    serde_json::from_str::<Line>(l)
+                        .map_err(|e| format!("reply journal line {}: {e}", i + 1))
+                })
+                .collect()
+        };
+        let mut lines = parse(&bytes[..keep])?;
+        let tail = &bytes[keep..];
+        let mut terminate = false;
+        if !tail.is_empty() {
+            // a whole row without its newline is a row; anything else is torn
+            // (a crash mid-append, even through a multibyte character)
+            let whole = std::str::from_utf8(tail)
                 .ok()
-                .is_some_and(|t| serde_json::from_str::<Row>(t).is_ok());
-            if whole {
-                file.write_all(b"\n").map_err(jerr)?;
-                bytes.push(b'\n');
-            } else {
-                // torn (including a character cut in half): drop it
-                file.set_len(keep as u64).map_err(jerr)?;
-                bytes.truncate(keep);
+                .and_then(|t| serde_json::from_str::<Line>(t).ok());
+            match whole {
+                Some(line) => {
+                    lines.push(line);
+                    terminate = true;
+                }
+                None => {
+                    file.set_len(keep as u64).map_err(jerr)?;
+                    file.sync_all().map_err(jerr)?;
+                }
             }
+        }
+        // a chain that does not verify (including a whole final row that does
+        // not link) is tampering, not a torn tail: fail closed
+        verify_chain(&lines)?;
+        if terminate {
+            file.write_all(b"\n").map_err(jerr)?;
             file.sync_all().map_err(jerr)?;
         }
-        let text = String::from_utf8(bytes).map_err(|e| jerr(format!("not UTF-8: {e}")))?;
+        let head = lines
+            .last()
+            .map(|l| l.id.parse::<ContentId>())
+            .transpose()
+            .map_err(jerr)?;
         let mut rows = BTreeMap::new();
-        for (i, line) in text.lines().enumerate() {
-            let row = serde_json::from_str::<Row>(line)
-                .map_err(|e| format!("reply journal line {}: {e}", i + 1))?;
+        for line in lines {
+            let row = line.node.payload;
             rows.insert(row.reply.key(), row);
         }
-        Ok(Self { file, rows })
+        Ok(Self { file, head, rows })
     }
 
     fn put(&mut self, reply: &Reply, sent: Sent) -> Result<(), String> {
@@ -342,12 +416,22 @@ impl Journal {
             reply: reply.clone(),
             sent,
         };
-        let mut line = serde_json::to_string(&row).map_err(|e| e.to_string())?;
+        let node = match self.head {
+            Some(parent) => MerkleNode::new(row.clone(), [parent]),
+            None => MerkleNode::genesis(row.clone()),
+        };
+        let id = node.id().map_err(jerr)?;
+        let mut line = serde_json::to_string(&Line {
+            id: id.to_string(),
+            node,
+        })
+        .map_err(|e| e.to_string())?;
         line.push('\n');
         self.file
             .write_all(line.as_bytes())
             .and_then(|()| self.file.sync_all())
             .map_err(jerr)?;
+        self.head = Some(id);
         self.rows.insert(reply.key(), row);
         Ok(())
     }
