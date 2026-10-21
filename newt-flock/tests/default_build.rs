@@ -41,3 +41,22 @@ fn it_is_a_member_but_not_a_default_member() {
     // the default set is every other member: nothing else fell out of it
     assert_eq!(defaults.len() + 1, members.len());
 }
+
+/// The library as a consumer gets it: no dev-dependencies, so none of the
+/// writer features the test fixture turns on (`serve` through feature
+/// unification) are available. `cargo test` alone cannot see a production
+/// build break, because the fixture's dev-dependency enables them.
+#[test]
+fn the_library_builds_with_production_features_only() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let out = Command::new(env!("CARGO"))
+        .args(["check", "--offline", "--locked", "--lib", "--manifest-path"])
+        .arg(manifest)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "newt-flock --lib (no dev-dependencies) does not build:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
