@@ -29,7 +29,7 @@ pub enum ExposureProfile {
 /// may occupy. `None` (section absent) → [`ExposureProfile::Full`] defaults,
 /// i.e. the pre-controller behaviour. See
 /// `docs/design/tool-exposure-controller.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolExposureConfig {
     /// Which exposure policy to run. Default `full` (identity).
@@ -49,6 +49,23 @@ pub struct ToolExposureConfig {
     /// per-round working-set pass; unused in Pass 1. Default true.
     #[serde(default = "default_supports_dynamic_catalog")]
     pub supports_dynamic_catalog: bool,
+
+    /// Explicit tool allow-list. When `Some`, only the named tools are shown to
+    /// the model; every other tool is hidden (moved to [`HiddenTools`]) and
+    /// remains authorized at dispatch. Applies on top of — and overrides —
+    /// `profile`-driven selection: even Kernel tools absent from this list are
+    /// hidden. An empty list hides everything.
+    ///
+    /// Set in `[tool_exposure]` as `allow_list = ["read_file", "run_command"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_list: Option<Vec<String>>,
+
+    /// When `true`, `write_file`, `edit_file`, and `delete_file` are hidden
+    /// regardless of `profile` or `allow_list`. Combined with a role-profile
+    /// `readonly = true` the authority and visibility cannot drift apart.
+    /// Default `false`.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl Default for ToolExposureConfig {
@@ -58,6 +75,8 @@ impl Default for ToolExposureConfig {
             schema_budget_pct: default_schema_budget_pct(),
             max_initial_tools: default_max_initial_tools(),
             supports_dynamic_catalog: default_supports_dynamic_catalog(),
+            allow_list: None,
+            read_only: false,
         }
     }
 }

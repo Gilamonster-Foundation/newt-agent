@@ -11,6 +11,7 @@ fn responses_keeps_exact_active_prompt_at_user_priority() {
         &mut messages,
         prompt_read::PromptReadContext::new(None, exact, None),
         None,
+        &Default::default(),
     );
 
     let (instructions, input) = crate::responses_wire::build_responses_input(&messages);
@@ -566,6 +567,7 @@ async fn responses_output_allowance_bounds_the_request_body() {
             std::path::Path::new("."),
             &crate::Scope::All,
             crate::tokens::TokenEstimation::default(),
+            &Default::default(),
         );
         let instructions = body["instructions"].as_str().expect("host instructions");
         assert_eq!(instructions.matches(&guidance).count(), 1);

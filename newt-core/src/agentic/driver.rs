@@ -131,6 +131,10 @@ pub struct TurnDriverConfig {
     pub workspace: String,
     /// Permission caveats enforced for this turn's tool calls.
     pub caveats: crate::caveats::Caveats,
+    /// `[tool_exposure]` policy for driven turns (#2932). Default is the
+    /// identity (full catalog); `read_only` also attenuates `caveats` at the
+    /// turn boundary through [`ExposureSettings::attenuate`].
+    pub exposure: crate::agentic::tools::ExposureSettings,
     /// Initial tool-call round allowance; recent concrete progress may renew it.
     /// Explicit inference budgets and cancellation remain binding.
     pub max_tool_rounds: usize,
@@ -227,6 +231,7 @@ impl TurnDriverConfig {
             emits_leading_reasoning: false,
             workspace: workspace.into(),
             caveats: crate::caveats::Caveats::top(),
+            exposure: Default::default(),
             max_tool_rounds: 40,
             narration_nudge_cap: 1,
             workflow_grace_rounds: 5,
@@ -715,6 +720,9 @@ async fn run_one_turn(
     let run_allowance = config
         .run_allowance
         .map(super::run_allowance::RunAllowance::new);
+    // #2932: `read_only` narrows authority here, at the turn boundary, so the
+    // hidden write tools and the shell share one `fs_write` floor.
+    let turn_caveats = config.exposure.attenuate(config.caveats.clone());
     let ctx = ChatCtx {
         shell_dialect: config.shell_dialect,
         command_budget: config.command_budget,
@@ -767,13 +775,12 @@ async fn run_one_turn(
         // it from the leaf's gather) — the where_is tool degrades honestly.
         where_is: None,
         nav: None,
-        // Headless driver: identity exposure (advertise the full authorized
-        // catalog, unchanged). The `[tool_exposure]` controller is a TUI-session
-        // concern; the driver keeps bit-for-bit behaviour.
-        exposure: crate::agentic::tools::ExposureSettings::default(),
+        // #2932: the configured `[tool_exposure]` policy drives headless turns
+        // too, so a four-tool-versus-full comparison measures what it claims.
+        exposure: config.exposure.clone(),
         experience_store: None,
         step_ledger: None,
-        caveats: &config.caveats,
+        caveats: &turn_caveats,
         // Headless cowork carries no persona surface (FR-1 part 2, #997). The
         // driver captured the effective cognition before spawning this thread,
         // preserving semantic intent independently of supported wire controls.

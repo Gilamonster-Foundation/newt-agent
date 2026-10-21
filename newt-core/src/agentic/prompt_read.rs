@@ -36,6 +36,19 @@ repository_evidence: source_first\n\
 source_definition: resolved_language_packs\n\
 repository_instruction: inspect source first via find category=source; narrow by language; docs/manifests/lockfiles/generated only if requested or necessary; never replace code evidence with metadata";
 
+/// The policy block the card carries. Its one tool recipe (`find
+/// category=source`) rides only when the operator left `find` visible
+/// (#2932); the source-first rule itself always does.
+fn response_repository_policy(
+    exposure: &super::tools::ExposureSettings,
+) -> std::borrow::Cow<'static, str> {
+    if exposure.operator_visible("find") {
+        std::borrow::Cow::Borrowed(RESPONSE_REPOSITORY_POLICY)
+    } else {
+        std::borrow::Cow::Owned(RESPONSE_REPOSITORY_POLICY.replace(" via find category=source", ""))
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn response_repository_policy_tokens() -> usize {
     crate::tokens::TokenEstimation::default()
@@ -454,8 +467,9 @@ pub(crate) fn ensure_active_prompt_card(
     messages: &mut Vec<serde_json::Value>,
     context: PromptReadContext<'_>,
     intake: Option<&PromptIntake>,
+    exposure: &super::tools::ExposureSettings,
 ) {
-    let base_card = active_prompt_card(context);
+    let base_card = active_prompt_card(context, exposure);
     let card = match intake {
         Some(intake) => active_prompt_card_with_intake(base_card.clone(), intake),
         None => base_card.clone(),
@@ -541,7 +555,13 @@ fn has_prompt_comprehension_marker(content: &str) -> bool {
     content.lines().next() == Some(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX)
 }
 
-pub(crate) fn active_prompt_card(context: PromptReadContext<'_>) -> String {
+/// The protected active-prompt card. Its recovery recipes name `prompt_read`
+/// and `artifact_read`, so each rides only when the operator's tool policy
+/// lets the model see that tool (#2932); provenance and policy always ride.
+pub(crate) fn active_prompt_card(
+    context: PromptReadContext<'_>,
+    exposure: &super::tools::ExposureSettings,
+) -> String {
     let (address, root, digest) = context.active_receipt().map_or_else(
         || {
             (
@@ -586,15 +606,26 @@ pub(crate) fn active_prompt_card(context: PromptReadContext<'_>) -> String {
              submitted_root_address: {submitted_root}"
         )
     };
+    let recovery: String = [
+        ("prompt_read", "recovery: prompt_read current\n"),
+        (
+            "artifact_read",
+            "artifact_recovery: for prompt-rooted work, artifact_read {\"address\":\"root\"}\n",
+        ),
+    ]
+    .into_iter()
+    .filter(|(tool, _)| exposure.operator_visible(tool))
+    .map(|(_, line)| line)
+    .collect();
+    let repository_policy = response_repository_policy(exposure);
     format!(
         "{ACTIVE_PROMPT_PREFIX}\n\
          address: {address}\n\
          objective_root: {root}\n\
          model_digest: {digest}\n\
          {submitted_block}\n\
-         recovery: prompt_read current\n\
-         artifact_recovery: for prompt-rooted work, artifact_read {{\"address\":\"root\"}}\n\
-         {RESPONSE_REPOSITORY_POLICY}"
+         {recovery}\
+         {repository_policy}"
     )
 }
 
@@ -1193,8 +1224,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":"act now"}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
 
         let cards: Vec<_> = messages
             .iter()
@@ -1235,7 +1266,7 @@ mod tests {
     fn comprehension_projection_replaces_base_and_prior_projection_in_one_active_card() {
         let exact = "PRIVATE OPERATOR PROMPT that remains at user priority";
         let context = PromptReadContext::new(None, exact, None);
-        let base_card = active_prompt_card(context);
+        let base_card = active_prompt_card(context, &Default::default());
         let research_card = append_prompt_comprehension_model_card(
             base_card.clone(),
             &format!(
@@ -1259,7 +1290,7 @@ mod tests {
             serde_json::json!({"role":"user", "content":exact}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
         insert_active_prompt_card(&mut messages, context, &base_card, research_card);
         insert_active_prompt_card(&mut messages, context, &base_card, act_card);
 
@@ -1309,13 +1340,45 @@ mod tests {
         );
     }
 
+    /// #2950 review 2 (P2): the card's recovery recipes derive from the same
+    /// operator-visible set as the catalog. Hidden recovery tools are not
+    /// named; provenance and the response policy stay.
+    #[test]
+    fn active_prompt_card_omits_recovery_recipes_for_operator_hidden_tools() {
+        let context = PromptReadContext::new(None, "task", None);
+        let open = active_prompt_card(context, &Default::default());
+        assert!(
+            open.contains("recovery: prompt_read current") && open.contains("artifact_read"),
+            "{open}"
+        );
+        let fenced = active_prompt_card(
+            context,
+            &super::super::tools::ExposureSettings {
+                allow_list: Some(vec!["read_file".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(fenced.starts_with(ACTIVE_PROMPT_PREFIX));
+        assert!(
+            !fenced.contains("prompt_read") && !fenced.contains("artifact_read"),
+            "{fenced}"
+        );
+        assert!(
+            fenced.contains("response_format: gfm_markdown"),
+            "the policy stays: {fenced}"
+        );
+    }
+
     #[test]
     fn active_prompt_card_always_steers_markdown_and_source_first_repository_evidence() {
-        let card = active_prompt_card(PromptReadContext::new(
-            None,
-            "How does authentication work in this repository?",
-            None,
-        ));
+        let card = active_prompt_card(
+            PromptReadContext::new(
+                None,
+                "How does authentication work in this repository?",
+                None,
+            ),
+            &Default::default(),
+        );
 
         assert!(
             card.contains("response_format: gfm_markdown"),
@@ -1359,9 +1422,9 @@ mod tests {
 
         // Intake runs after receipt/card creation. Repeated insertion models a
         // retry or compression rebuild and must still replace, not accumulate.
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, Some(&intake));
-        ensure_active_prompt_card(&mut messages, context, Some(&intake));
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, Some(&intake), &Default::default());
+        ensure_active_prompt_card(&mut messages, context, Some(&intake), &Default::default());
 
         let cards = messages
             .iter()
@@ -1425,8 +1488,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":user_data}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
 
         assert!(messages.iter().any(|message| {
             message["role"] == "user"
@@ -1463,8 +1526,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":current}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
 
         assert_eq!(
             messages.last(),
@@ -1493,8 +1556,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":current}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
 
         assert!(messages.iter().any(|message| {
             message["role"] == "system" && message["content"].as_str() == Some(collision.as_str())
@@ -1600,7 +1663,7 @@ mod tests {
             serde_json::json!({"role":"system", "content":"base"}),
             serde_json::json!({"role":"user", "content":"continue"}),
         ];
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
         let card = messages[1]["content"].as_str().unwrap();
         assert!(
             card.contains(&format!("submitted_previous_address: {original_id}")),

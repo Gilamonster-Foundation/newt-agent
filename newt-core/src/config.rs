@@ -1822,7 +1822,7 @@ impl Config {
     /// The resolved `[tool_exposure]` policy, or the identity (`Full`) default
     /// when the section is absent. See [`ToolExposureConfig`].
     pub fn tool_exposure(&self) -> ToolExposureConfig {
-        self.tool_exposure.unwrap_or_default()
+        self.tool_exposure.clone().unwrap_or_default()
     }
 
     /// The configured head allocation for oversized `run_command` output
