@@ -92,3 +92,50 @@ fn remove_deletes_the_entry_and_an_absent_name_errors() {
         .failure()
         .stderr(predicate::str::contains("scrybe"));
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn remove_edits_the_file_that_owns_the_effective_server() {
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"main\"\ncommand = \"main-mcp\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"broken-out\"\ncommand = \"mcp-file-server\"\n",
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args(["mcp", "remove", "broken-out"])
+        .assert()
+        .success();
+
+    assert!(std::fs::read_to_string(config)
+        .unwrap()
+        .contains("main-mcp"));
+    assert!(newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(mcp).unwrap()).is_empty());
+}
+
+#[test]
+fn list_reports_malformed_mcp_toml_without_echoing_its_contents() {
+    let sb = sandbox();
+    let marker = "private-mcp-marker";
+    std::fs::write(
+        sb.config_dir.join("mcp.toml"),
+        format!("[[mcp_servers]]\nname = \"{marker}\"\ncommand = =\n"),
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args(["mcp", "list"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid MCP TOML syntax"))
+        .stderr(predicate::str::contains(marker).not());
+}

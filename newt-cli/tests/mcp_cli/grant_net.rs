@@ -242,7 +242,12 @@ fn appended_project_same_name_obeys_default_merge_and_force_semantics() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Overwrote 1"));
+        .stdout(predicate::str::contains(
+            "Replaced 1 lower-precedence server(s)",
+        ))
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+        ));
     let config = load_config(&sb.config_dir.join("config.toml"));
     assert_eq!(config.mcp_servers[0].name, "review");
     assert_eq!(config.tui.unwrap().permissions.net, ["review.example.test"]);

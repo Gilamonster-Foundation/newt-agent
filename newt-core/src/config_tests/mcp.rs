@@ -52,6 +52,119 @@ fn with_mcp_enabled_toggles_and_preserves_comments() {
     assert!(!d.enabled);
 }
 
+#[test]
+fn with_mcp_server_merged_updates_imported_fields_and_keeps_local_fields() {
+    let text = "# local MCP settings\n[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nenabled = false\nlogin_argv = [\"client\", \"login\"]\nrequest_timeout_secs = 90\n";
+    let incoming = crate::mcp::McpServerEntry {
+        name: "review".into(),
+        enabled: true,
+        transport: crate::mcp::TransportKind::Http,
+        command: None,
+        args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        url: Some("https://new.example/mcp/".into()),
+        headers: std::collections::BTreeMap::new(),
+        login_argv: Vec::new(),
+        request_timeout_secs: None,
+        trust: crate::mcp::McpTrust::Untrusted,
+        origin: None,
+    };
+
+    let updated = Config::with_mcp_server_merged(text, &incoming).unwrap();
+    assert!(updated.contains("# local MCP settings"));
+    assert!(updated.contains("url = \"https://new.example/mcp/\""));
+    assert!(updated.contains("enabled = false"));
+    assert!(updated.contains("login_argv = [\"client\", \"login\"]"));
+    assert!(updated.contains("request_timeout_secs = 90"));
+    let parsed: Config = toml::from_str(&updated).unwrap();
+    assert_eq!(
+        parsed.mcp_servers[0].url.as_deref(),
+        Some("https://new.example/mcp/")
+    );
+    assert!(!parsed.mcp_servers[0].enabled);
+    assert_eq!(parsed.mcp_servers[0].login_argv, vec!["client", "login"]);
+    assert_eq!(parsed.mcp_servers[0].request_timeout_secs, Some(90));
+}
+
+#[test]
+fn with_mcp_server_merged_is_a_noop_when_source_fields_match() {
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"review-mcp\"\n";
+    let incoming: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\n").unwrap();
+    assert_eq!(
+        Config::with_mcp_server_merged(text, &incoming).unwrap(),
+        text
+    );
+}
+
+#[test]
+fn with_mcp_server_merged_resets_a_changed_transport_to_default_stdio() {
+    let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nheaders = { Authorization = \"Bearer old\" }\n";
+    let incoming: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\n").unwrap();
+
+    let updated = Config::with_mcp_server_merged(text, &incoming).unwrap();
+    let parsed: Config = toml::from_str(&updated).unwrap();
+    assert_eq!(
+        parsed.mcp_servers[0].transport,
+        crate::mcp::TransportKind::Stdio
+    );
+    assert_eq!(parsed.mcp_servers[0].command.as_deref(), Some("review-mcp"));
+    assert!(parsed.mcp_servers[0].url.is_none());
+    assert!(parsed.mcp_servers[0].headers.is_empty());
+    assert!(!updated.contains("type ="));
+}
+
+#[test]
+fn with_mcp_server_merged_removes_stdio_fields_when_switching_to_http() {
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"old-mcp\"\nargs = [\"serve\"]\nenv = { TOKEN = \"secret\" }\n";
+    let incoming: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ntype = \"http\"\nurl = \"https://new.example/mcp\"\n")
+            .unwrap();
+
+    let updated = Config::with_mcp_server_merged(text, &incoming).unwrap();
+    let parsed: Config = toml::from_str(&updated).unwrap();
+    let server = &parsed.mcp_servers[0];
+    assert_eq!(server.transport, crate::mcp::TransportKind::Http);
+    assert_eq!(server.url.as_deref(), Some("https://new.example/mcp"));
+    assert!(server.command.is_none());
+    assert!(server.args.is_empty());
+    assert!(server.env.is_empty());
+}
+
+#[test]
+fn with_mcp_server_removed_does_not_echo_malformed_config_contents() {
+    let text = "[[mcp_servers]]\nname = \"private-marker\"\ncommand = =\n";
+    let error = Config::with_mcp_server_removed(text, "private-marker").unwrap_err();
+    assert!(error.to_string().contains("invalid MCP TOML syntax"));
+    assert!(!error.to_string().contains("private-marker"));
+}
+
+#[test]
+#[serial_test::serial(real_fs)]
+fn set_mcp_server_enabled_in_file_uses_atomic_writeback() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let path = dir.path().join("mcp.toml");
+    let original =
+        "# keep this comment\n[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\n";
+    std::fs::write(&path, original).unwrap();
+
+    Config::set_mcp_server_enabled_in_file(&path, "docs", false).unwrap();
+
+    let updated = std::fs::read_to_string(&path).unwrap();
+    assert!(updated.contains("# keep this comment"));
+    assert!(updated.contains("enabled = false"));
+    assert!(!newt_core_lock_path(&path).exists());
+}
+
+fn newt_core_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    crate::atomic_fs::ResolvedPath::resolve(path)
+        .unwrap()
+        .lock_path()
+}
+
 // ---- `newt mcp add|remove` comment-preserving config writers ----
 
 #[test]
@@ -257,9 +370,9 @@ fn mcp_writer_error_branches_are_loud() {
     };
     // Invalid TOML input text.
     let err = Config::with_mcp_server_added("not toml [", &entry).unwrap_err();
-    assert!(err.to_string().contains("not valid TOML"), "{err}");
+    assert!(err.to_string().contains("invalid MCP TOML syntax"), "{err}");
     let err = Config::with_mcp_server_removed("not toml [", "x").unwrap_err();
-    assert!(err.to_string().contains("not valid TOML"), "{err}");
+    assert!(err.to_string().contains("invalid MCP TOML syntax"), "{err}");
     // A section that is not an array of tables.
     let err = Config::with_mcp_server_added("mcp_servers = 3\n", &entry).unwrap_err();
     assert!(err.to_string().contains("not an array of tables"), "{err}");
