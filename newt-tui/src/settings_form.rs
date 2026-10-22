@@ -112,6 +112,12 @@ pub(crate) enum Field {
     GitAuthor,
     GitConfig,
     GitSigning,
+    /// `[tool_exposure] allow_list` (#2932): which tools the model sees —
+    /// `all`, the `pi` preset, or a comma-separated list.
+    Tools,
+    /// `[tool_exposure] read_only` (#2932): hide the write tools and clamp
+    /// `fs_write` with them.
+    ReadOnly,
 }
 
 impl Field {
@@ -134,6 +140,8 @@ impl Field {
         Self::GitAuthor,
         Self::GitConfig,
         Self::GitSigning,
+        Self::Tools,
+        Self::ReadOnly,
     ];
 
     /// The deep-link token: `/settings <name> [value]`. This is ALSO the
@@ -158,6 +166,8 @@ impl Field {
             Self::GitAuthor => "git-author",
             Self::GitConfig => "git-config",
             Self::GitSigning => "git-signing",
+            Self::Tools => "tools",
+            Self::ReadOnly => "read-only",
         }
     }
 
@@ -180,6 +190,8 @@ impl Field {
             Self::GitAuthor => "sandbox git commit author",
             Self::GitConfig => "sandbox git settings",
             Self::GitSigning => "harness commit signing",
+            Self::Tools => "tools the model sees",
+            Self::ReadOnly => "hide the write tools",
         }
     }
 
@@ -322,6 +334,20 @@ impl Field {
                 release: "reset",
                 placeholder: "\"[$TIME] ❯ \"",
             },
+            // Free text, not a vocabulary: `pi` and `all` are words, but the
+            // general value is a list of tool names the checklist assembles.
+            // `all` releases the allow list (the whole catalog again).
+            Self::Tools => ValueSpace::Text {
+                release: "all",
+                placeholder: "pi  or  read_file,run_command,find",
+            },
+            Self::ReadOnly => owned(&[
+                (
+                    "on",
+                    "hide write_file / edit_file / delete_file and clamp fs_write with them",
+                ),
+                ("off", "the write tools follow the allow list"),
+            ]),
             // A count, like the round cap — and for the same reason: the
             // absorbed verb takes `/spill <rows>` with any number, so a
             // vocabulary could not represent the state the operator can
@@ -436,6 +462,13 @@ impl Field {
             }
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
+            Self::Tools => tools_token(&tool_exposure_setting()),
+            Self::ReadOnly => if tool_exposure_setting().read_only {
+                "on"
+            } else {
+                "off"
+            }
+            .to_string(),
         }
     }
 
@@ -649,11 +682,77 @@ pub(crate) fn prefix_setting() -> String {
 
 /// Write one `[tui]` scalar to the operator's config, preserving the rest.
 fn persist_tui_key(key: &str, value: &str) -> Result<(), String> {
+    persist_config(|text| newt_core::Config::with_tui_key(text, key, value))
+}
+
+/// Read-modify-write the operator's config through one of `Config`'s pure,
+/// comment-preserving writers. The fs goes through the test seam.
+fn persist_config(
+    rewrite: impl FnOnce(&str) -> Result<String, newt_core::NewtError>,
+) -> Result<(), String> {
     let path = newt_core::Config::user_config_path()
         .ok_or_else(|| "no config directory to save the setting in".to_string())?;
     let text = config_fs::read(&path);
-    let updated = newt_core::Config::with_tui_key(&text, key, value).map_err(|e| e.to_string())?;
-    config_fs::write(&path, &updated).map_err(|e| format!("saving {key}: {e}"))
+    let updated = rewrite(&text).map_err(|e| e.to_string())?;
+    config_fs::write(&path, &updated).map_err(|e| format!("saving config: {e}"))
+}
+
+/// The `[tool_exposure]` policy in force (#2932), read from the resolved
+/// config the way the turn loop reads it — there is no session override to
+/// consult, because `/settings tools` persists and the loop re-resolves.
+pub(crate) fn tool_exposure_setting() -> newt_core::ToolExposureConfig {
+    crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
+        .map(|c| c.tool_exposure())
+        .unwrap_or_default()
+}
+
+/// The `/settings tools` token for a policy: `all`, `pi`, or the list.
+pub(crate) fn tools_token(exposure: &newt_core::ToolExposureConfig) -> String {
+    match &exposure.allow_list {
+        None => "all".to_string(),
+        Some(_) if exposure.is_pi_preset() => "pi".to_string(),
+        Some(list) => list.join(","),
+    }
+}
+
+/// Parse a `/settings tools` value into an allow list: `all` → `None`, `pi`
+/// → the preset, otherwise a comma/space-separated list of tool names. Every
+/// built-in name is checked against the catalog; an MCP `server__tool` name
+/// is taken as written, since the catalog cannot know it.
+fn parse_tools_token(value: &str) -> Result<Option<Vec<String>>, String> {
+    match value.trim() {
+        "all" => Ok(None),
+        "pi" => Ok(Some(
+            newt_core::PI_PRESET_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )),
+        list => {
+            let names: Vec<String> = list
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            let known = newt_core::agentic::builtin_tool_names();
+            let unknown: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|n| !n.contains("__") && !known.contains(n))
+                .collect();
+            if unknown.is_empty() {
+                Ok(Some(names))
+            } else {
+                Err(format!(
+                    "unknown tool{} {} — the catalog has: {}",
+                    if unknown.len() == 1 { "" } else { "s" },
+                    unknown.join(", "),
+                    known.join(", ")
+                ))
+            }
+        }
+    }
 }
 
 /// The config file, as a seam: the unit tier never touches a real file.
@@ -871,6 +970,25 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
             newt_core::process_env::set_var("NEWT_PREFIX_KEY", value);
             #[cfg(feature = "rich-tui")]
             crate::prefix::invalidate();
+        }
+        // #2932: persisted to `[tool_exposure]`; the chat loop re-resolves its
+        // config after the write, so the next turn's catalog, prompt and
+        // caveats all follow. Validated BEFORE the write so a typo hides
+        // nothing.
+        Field::Tools => {
+            let list = parse_tools_token(value)?;
+            let names: Vec<&str> = list.iter().flatten().map(String::as_str).collect();
+            persist_config(|text| {
+                newt_core::Config::with_tool_exposure_allow_list(
+                    text,
+                    list.as_ref().map(|_| names.as_slice()),
+                )
+            })?;
+        }
+        Field::ReadOnly => {
+            persist_config(|text| {
+                newt_core::Config::with_tool_exposure_read_only(text, value == "on")
+            })?;
         }
     }
     Ok(format!("{}: {value}", field.label()))
@@ -1872,6 +1990,69 @@ mod tests {
             "a refused value writes nothing"
         );
         newt_core::process_env::remove_var("NEWT_PREFIX_KEY");
+    }
+
+    /// #2932: `/settings tools` and `/settings read-only` persist to
+    /// `[tool_exposure]` through the config seam (no real file), take the
+    /// `pi` preset and the `all` release, validate names against the catalog
+    /// before writing, and render back through the one token mapping the
+    /// checklist panel also uses.
+    #[test]
+    fn the_tools_fields_persist_the_exposure_policy_and_refuse_unknown_names() {
+        let _guard = settings_guard();
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        let saved_policy = || {
+            toml::from_str::<newt_core::Config>(&config_fs::read(&path))
+                .expect("valid TOML")
+                .tool_exposure()
+        };
+
+        assert_eq!(
+            apply(Field::Tools, "pi"),
+            Ok("tools the model sees: pi".to_string())
+        );
+        assert!(saved_policy().is_pi_preset());
+        assert_eq!(tools_token(&saved_policy()), "pi");
+
+        assert_eq!(
+            apply(Field::Tools, "read_file, run_command,find"),
+            Ok("tools the model sees: read_file, run_command,find".to_string())
+        );
+        assert_eq!(tools_token(&saved_policy()), "read_file,run_command,find");
+
+        let before = config_fs::read(&path);
+        let refused = apply(Field::Tools, "read_file,frobnicate").unwrap_err();
+        assert!(refused.contains("frobnicate"), "{refused}");
+        assert_eq!(
+            config_fs::read(&path),
+            before,
+            "a refused value writes nothing"
+        );
+        // An MCP name cannot be checked against the catalog, so it is taken.
+        apply(Field::Tools, "read_file,github__search").expect("mcp names pass");
+
+        assert_eq!(
+            apply(Field::ReadOnly, "on"),
+            Ok("hide the write tools: on".to_string())
+        );
+        assert!(saved_policy().read_only);
+        assert_eq!(
+            saved_policy().status_label().as_deref(),
+            Some("2 tools · read-only")
+        );
+        assert_eq!(
+            apply(Field::ReadOnly, "off"),
+            Ok("hide the write tools: off".to_string())
+        );
+        assert!(!saved_policy().read_only);
+
+        assert_eq!(
+            apply(Field::Tools, "all"),
+            Ok("tools the model sees: all".to_string())
+        );
+        assert_eq!(saved_policy().allow_list, None);
+        assert_eq!(tools_token(&saved_policy()), "all");
+        assert_eq!(saved_policy().status_label(), None);
     }
 
     #[test]

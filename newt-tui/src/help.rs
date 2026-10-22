@@ -121,6 +121,9 @@ The text form works everywhere; bare /settings uses it outside a rich terminal:
   /settings thinking fold
   /settings rounds 40
   /settings workspaces       interactive operator editor for next-launch access
+  /settings tools pi         show the model only read_file, write_file, edit_file, run_command
+  /settings tools a,b,c      an explicit allow list; `all` releases it (bare: checklist on a rich TTY)
+  /settings read-only on     hide the write tools and clamp fs_write with them; the footer shows [tools: …]
 
 /model, /backends, /permissions, and /workspace remain direct shortcuts."
         }
@@ -864,6 +867,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /ocap propose save       - also write them, unsigned, to approve.toml (existing entries kept)",
         "  /workspace               - review and save workspace access for the next process launch",
         "  /settings workspaces     - open the same operator workspace editor",
+        "  /settings tools [all|pi|a,b,c] - which tools the model sees; bare opens the checklist on a rich TTY",
+        "  /settings read-only [on|off] - hide write_file/edit_file/delete_file and clamp fs_write with them",
         "  /status                  - session and environment summary (the default view)",
         "  /status <topic>          - config · version · workspace · loadout · byline · memory · models · info",
         "  /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers",
