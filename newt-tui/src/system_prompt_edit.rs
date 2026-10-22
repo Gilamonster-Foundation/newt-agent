@@ -63,6 +63,33 @@ fn scratch_path(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
+/// The system text for one turn: the operator's file when there is one —
+/// alone, with none of the harness context the session otherwise wraps around
+/// the prompt — else what the session assembled.
+pub(crate) fn turn_system_text(
+    override_text: Option<&str>,
+    assembled: impl FnOnce() -> String,
+) -> String {
+    override_text.map_or_else(assembled, str::to_string)
+}
+
+/// Re-resolve the override and, when it differs from `last`, rebuild the
+/// session prompt (which also refreshes the footer marker). Returns whether it
+/// rebuilt. Resolve and rebuild are injected so the decision is testable.
+pub(crate) fn refresh_override<T: PartialEq>(
+    last: &mut T,
+    resolve: impl FnOnce() -> T,
+    rebuild: impl FnOnce(),
+) -> bool {
+    let now = resolve();
+    if now == *last {
+        return false;
+    }
+    *last = now;
+    rebuild();
+    true
+}
+
 /// Where an edit with no `[prompt] file` yet saves to: beside the config.
 pub(crate) fn default_target() -> Option<PathBuf> {
     newt_core::Config::user_config_dir().map(|dir| dir.join("system-prompt.md"))
@@ -233,6 +260,31 @@ mod tests {
         };
         assert!(run(&mut io, Path::new(TARGET), "assembled").is_err());
         assert!(io.files.is_empty());
+    }
+
+    #[test]
+    fn the_override_is_the_whole_turn_system_text_and_skips_the_assembly() {
+        let text = turn_system_text(Some("pruned\n"), || panic!("assembled anyway"));
+        assert_eq!(text, "pruned\n");
+        assert_eq!(turn_system_text(None, || "assembled".into()), "assembled");
+    }
+
+    #[test]
+    fn a_changed_override_rebuilds_once_and_an_unchanged_one_does_not() {
+        let mut last: Option<&str> = None;
+        let mut rebuilds = 0;
+        for (now, expect) in [
+            (Some("f"), true),  // set
+            (Some("f"), false), // unchanged
+            (None, true),       // reset
+            (None, false),
+        ] {
+            assert_eq!(
+                refresh_override(&mut last, || now, || rebuilds += 1),
+                expect
+            );
+        }
+        assert_eq!(rebuilds, 2);
     }
 
     #[test]
