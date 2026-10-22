@@ -19,6 +19,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   (`tool_set::derive_tool_set`), so the preview shows the exposure-filtered tools
   (allow list, read-only). It omits the turn-head blocks.
 
+### Fixed
+
+- `plan_approval_turn` no longer fails under a narrow terminal: the child runs in its
+  own session, so crossterm cannot read the test runner's PTY width (#2972).
+
 ## [0.8.3] — 2026-10-20
 
 ### Security
@@ -49,6 +54,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   pointers: what the crate is, who uses it, where it sits and where it is
   heading. `newt-git`'s behaviour and grant rules moved unchanged to
   `docs/design/newt-git.md` (#2957).
+
 
 ### Fixed
 
@@ -88,6 +94,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 - A project config can no longer set `[context.semantic].embeddings_endpoint`,
   `intake.adjudicator` or `smart_harness.backend`, in any shape TOML accepts.
   Each names an endpoint that receives source text or a credential (#2930).
+
 
 ### Fixed
 
@@ -149,6 +156,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   data sent after an ECH rejection, a 1 GiB allocation from Brotli certificate
   decompression before authentication, and a classical key-exchange downgrade
   from an unauthenticated ServerHello (#2889).
+
 
 ### Fixed
 
@@ -746,6 +754,7 @@ missing from the publish matrix entirely. Only `newt-skills`, `newt-data`, and
 `plugins-protocol` reached crates.io at 0.7.2; the tag can't be reused, so
 0.7.3 re-ships 0.7.2's content with the pipeline fixed. No functional changes.
 
+
 ### Fixed
 
 - **`newt-tuner` now publishes** (#1091): inherits the workspace version,
@@ -813,6 +822,7 @@ tree out of the per-machine store into a checked-in file.
   skills with untrusted-MCP-result wrapping. (#1045–#1058, #1021/#1042)
 - **DGX.** An interactive vLLM model switcher (`newt dgx models`) and the DGX
   unboxing plan. (#1032, #1055)
+
 
 ### Fixed
 
@@ -910,6 +920,7 @@ per step, and reviews — under capability leashes that only ever *attenuate*.
   folding `step_up` into the durable stub branch `feat/stub-shell`. Full workspace
   green, no API drift.
 
+
 ### Fixed
 
 - **backendless config** no longer re-grows a synthesized `ollama` backend when only
@@ -1001,6 +1012,7 @@ support per model family.
   reusable cowork turn-driver (#227, #312, #310).
 - Project-local `.newt/config.toml` overrides; per-session plan files (#236, #239).
 - ADR: plain-scroller TUI, amphibious by design (#304).
+
 
 ### Fixed
 
