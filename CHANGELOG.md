@@ -9,18 +9,6 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
-### Added
-
-- A system prompt you can prune by hand (#2938). `[prompt] file = "…"` (or
-  `newt headless --system-prompt-file FILE`, which wins) makes that file's
-  bytes the whole system message: newt builds no prompt of its own and adds no
-  active-prompt card or observed-facts note behind it. A missing or empty file
-  fails a headless run; the TUI says so and sends its own prompt. In the TUI,
-  `/settings system-prompt edit` opens the prompt newt would send (or your
-  file) in `$VISUAL`/`$EDITOR` and saves what you change; `/settings
-  system-prompt <path>` and `reset` set it for the session. The footer shows
-  `[prompt: <file>]` while an override is in force.
-
 ### Fixed
 
 - `plan_approval_turn` no longer fails under a narrow terminal: the child runs in its
