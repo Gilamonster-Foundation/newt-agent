@@ -9,6 +9,14 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Added
+
+- TUI `/context request` previews the next request's system messages and tools
+  without sending anything or touching the session (#2959). It builds from an
+  owned `RequestSnapshot` through a builder that takes no sink, store or
+  client, and shares the turn's system-message assembly with the live turn.
+  The preview omits the turn-head blocks and shows the base tool catalog.
+
 ## [0.8.3] — 2026-10-20
 
 ### Security

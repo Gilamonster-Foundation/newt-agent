@@ -188,6 +188,7 @@ pub mod smart_harness;
 mod prompt_intake;
 mod prompt_read;
 mod recall;
+pub mod request_preview;
 pub mod request_report;
 mod tool_args;
 // #952/#1669: operator steering submitted mid-turn, drained at the next

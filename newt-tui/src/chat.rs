@@ -5370,6 +5370,88 @@ fn session_body(
                             ) {
                                 print_newt(&line, color, verbose);
                             }
+                        } else if rest == "request" {
+                            // #2959: preview the next request from an OWNED snapshot.
+                            // Shared borrows only: no sink, store, queued-style
+                            // consumption, or inference call is reachable from here.
+                            let posture = newt_core::posture::active_posture();
+                            let preview = permission_state
+                                .recalled_caveats(
+                                    cap.caveats(),
+                                    cap.delegation().map(|d| d.caveats()),
+                                )
+                                .map_err(|e| e.to_string())
+                                .and_then(|recalled| {
+                                    let caveats = operating_mode_caveats(
+                                        cfg.tool_exposure().read_only,
+                                        active_operating_mode,
+                                        conversation_mode_states.plan.is_active(),
+                                        meet_persona_caveats(
+                                            effective_caveats(&recalled, posture.as_ref()),
+                                            active_persona.as_ref(),
+                                        ),
+                                    );
+                                    let ws_state =
+                                        workspace_state_block(workspace, &caveats.fs_read);
+                                    let runtime_ctx = runtime_context_block(
+                                        &inf_model,
+                                        &inf_url,
+                                        inf_kind,
+                                        &session_identity,
+                                        newt_core::agentic::PromptDisposition::Act,
+                                    );
+                                    let controls = session_control_prompt(
+                                        active_operating_mode,
+                                        active_operating_mode,
+                                        posture.as_ref(),
+                                    );
+                                    let style = tabs
+                                        .active()
+                                        .sidecar
+                                        .personality
+                                        .resolve(
+                                            active_persona
+                                                .as_ref()
+                                                .and_then(|p| p.profile.personality),
+                                        )
+                                        .prompt_block();
+                                    let turn = crate::turn_system::assemble_turn_system(
+                                        &crate::turn_system::TurnSystemParts {
+                                            ws_state: &ws_state,
+                                            session_cwd: &session_cwd,
+                                            runtime_ctx: &runtime_ctx,
+                                            system: &system,
+                                            session_controls: &controls,
+                                            communication_style: &style,
+                                            is_clarification_answer: false,
+                                        },
+                                    );
+                                    newt_core::agentic::request_preview::RequestSnapshot {
+                                        system_texts: vec![turn.text],
+                                        tools: newt_core::agentic::tool_definitions()
+                                            .as_array()
+                                            .cloned(),
+                                        notes: turn.notes,
+                                    }
+                                    .report()
+                                    .map_err(|e| e.to_string())
+                                });
+                            match preview {
+                                Ok(report) => {
+                                    print_newt(
+                                        "next request (preview; nothing sent). Not shown: \
+                                         per-turn head blocks (working memory, code evidence, \
+                                         experience, plan) and the exposure-filtered tool set — \
+                                         tools are the base catalog.",
+                                        color,
+                                        verbose,
+                                    );
+                                    for line in report.to_markdown().lines() {
+                                        print_newt(line, color, verbose);
+                                    }
+                                }
+                                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                            }
                         } else if rest == "show" {
                             // Build the outbound message set fresh and render a
                             // compact per-message breakdown so the operator can
@@ -8242,54 +8324,31 @@ fn session_body(
                         &session_identity,
                         turn_disposition,
                     );
-                    report_sink.annotate(
-                        "workspace state",
-                        "newt-tui workspace_state_block",
-                        &ws_state,
-                    );
-                    report_sink.annotate(
-                        "runtime context",
-                        "newt-tui runtime_context_block",
-                        &runtime_ctx,
-                    );
-                    report_sink.annotate(
-                        "session controls",
-                        "newt-tui session_control_prompt",
-                        &session_controls,
-                    );
-                    let mut turn_system = format!(
-                        "{ws_state}\n\nCurrent command working directory: {}. \
-                         run_command without cwd starts here. Explicit relative cwd and \
-                         relative file-tool paths resolve from the workspace root. \
-                         This does not change granted access.\n\n{runtime_ctx}\n\n{system}\n\n{session_controls}",
-                        serde_json::json!(session_cwd),
-                    );
-                    // Resolve current tab overrides against the current persona
-                    // on every accepted turn. Never bake style into the frozen
-                    // system/history: switching or clearing a persona must not
-                    // leave an old block behind. Unspecified style adds no bytes.
                     let communication_style = tabs
                         .active()
                         .sidecar
                         .personality
                         .resolve(active_persona.as_ref().and_then(|p| p.profile.personality))
                         .prompt_block();
-                    if !communication_style.is_empty() {
-                        report_sink.annotate(
-                            "communication style",
-                            "newt-tui personality prompt_block",
-                            &communication_style,
-                        );
-                        turn_system.push_str("\n\n");
-                        turn_system.push_str(&communication_style);
+                    // Resolve current tab overrides against the current persona
+                    // on every accepted turn. Never bake style into the frozen
+                    // system/history: switching or clearing a persona must not
+                    // leave an old block behind. Unspecified style adds no bytes.
+                    let assembled = crate::turn_system::assemble_turn_system(
+                        &crate::turn_system::TurnSystemParts {
+                            ws_state: &ws_state,
+                            session_cwd: &session_cwd,
+                            runtime_ctx: &runtime_ctx,
+                            system: &system,
+                            session_controls: &session_controls,
+                            communication_style: &communication_style,
+                            is_clarification_answer,
+                        },
+                    );
+                    for n in &assembled.notes {
+                        report_sink.annotate(&n.label, &n.source, &n.text);
                     }
-                    if is_clarification_answer {
-                        turn_system = format!(
-                            "<clarification_context>\n\
-                             This accepted operator line is a clarification continuation. The protected prompt card names its objective root; use prompt_read {{\"address\":\"root\"}} to re-read the original objective before acting whenever the answer alone is insufficient.\n\
-                             </clarification_context>\n\n{turn_system}"
-                        );
-                    }
+                    let mut turn_system = assembled.text;
                     // Step 26.4 / 27.4: the working-memory head (usage hints, then
                     // the <state> block) rides the ephemeral message[0] and is NEVER
                     // persisted to the log. Shared with the headless driver (#2314).
