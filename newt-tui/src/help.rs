@@ -825,6 +825,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
         "  /context compaction [headroom_aware|message_count|reset] - set this session's automatic-compaction trigger policy",
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
+        "  /context request         - preview the next request's system messages and tools; sends nothing",
         "  /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /discuss [text]          - talk through a pending clarification batch instead of answering it (alias: /chat); \

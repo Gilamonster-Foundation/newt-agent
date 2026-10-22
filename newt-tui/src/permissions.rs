@@ -1011,17 +1011,29 @@ impl PermissionPromptState {
         &'a self,
         danger: &'a danger::DangerTable,
     ) -> impl Iterator<Item = &'a (newt_core::DenialKind, String)> {
+        self.recalled_grants_with(danger, true)
+    }
+
+    /// `quarantine = false` filters exactly as the committing form does but
+    /// leaves `rejected_durable_grants` (and stderr) untouched (#2959).
+    fn recalled_grants_with<'a>(
+        &'a self,
+        danger: &'a danger::DangerTable,
+        quarantine: bool,
+    ) -> impl Iterator<Item = &'a (newt_core::DenialKind, String)> {
         self.session_grants
             .iter()
             .chain(&self.durable_grants)
-            .filter(|(kind, target)| {
+            .filter(move |(kind, target)| {
                 !self.recall_conflicts_with_denial(*kind, target)
                     && danger.classify(*kind, target) != danger::DangerTier::High
                     && self.protection.as_ref().is_none_or(|guard| {
                         match guard.validate_request(*kind, target) {
                             Ok(()) => true,
                             Err(error) => {
-                                self.reject_durable_grant(*kind, target, &error);
+                                if quarantine {
+                                    self.reject_durable_grant(*kind, target, &error);
+                                }
                                 false
                             }
                         }
@@ -1076,6 +1088,26 @@ impl PermissionPromptState {
         base: &newt_core::Caveats,
         ceiling: Option<&newt_core::Caveats>,
     ) -> anyhow::Result<newt_core::Caveats> {
+        self.recall(base, ceiling, true)
+    }
+
+    /// The caveats `recalled_caveats` would return, without committing any
+    /// quarantine: a grant that fails validation is skipped for this call only
+    /// and stays eligible for the next one (#2959 preview).
+    pub(crate) fn peek_recalled_caveats(
+        &self,
+        base: &newt_core::Caveats,
+        ceiling: Option<&newt_core::Caveats>,
+    ) -> anyhow::Result<newt_core::Caveats> {
+        self.recall(base, ceiling, false)
+    }
+
+    fn recall(
+        &self,
+        base: &newt_core::Caveats,
+        ceiling: Option<&newt_core::Caveats>,
+        quarantine: bool,
+    ) -> anyhow::Result<newt_core::Caveats> {
         // Invalid configured authority is still fatal. Only recalled durable
         // approvals can be discarded, and only before committing their widening.
         let clamp = |policy: newt_core::Caveats| {
@@ -1083,14 +1115,16 @@ impl PermissionPromptState {
         };
         let mut policy = clamp(base.clone());
         self.validate_caveats(&policy)?;
-        for (kind, target) in self.recalled_grants(&production_danger_table()) {
+        for (kind, target) in self.recalled_grants_with(&production_danger_table(), quarantine) {
             let candidate = clamp(newt_core::widen_caveats(
                 &policy,
                 &[(*kind, target.clone())],
             ));
             match self.validate_caveats(&candidate) {
                 Ok(()) => policy = candidate,
-                Err(error) if self.reject_durable_grant(*kind, target, &error) => {}
+                Err(_) if !quarantine && self.durable_grants.contains(&(*kind, target.clone())) => {
+                }
+                Err(error) if quarantine && self.reject_durable_grant(*kind, target, &error) => {}
                 Err(error) => return Err(error),
             }
         }
