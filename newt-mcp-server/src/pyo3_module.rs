@@ -108,25 +108,20 @@ impl Default for PyMcpServer {
 /// This lets Python callers list the canonical tool schema without
 /// reaching into Rust dispatch internals.
 ///
-/// Currently re-encodes the four built-in tools (`code_read`,
-/// `code_edit`, `code_search`, `goal_run`) by spinning up an
-/// `McpServer`, registering the protocol handlers, and asking
-/// `tools/list` for its response.
+/// The file tools are newt-core's catalog entries (#2956); `goal_run` is
+/// this server's own.
 #[pyfunction]
 fn default_tool_definitions(py: Python<'_>) -> PyResult<String> {
-    // We can't drive a tokio runtime from inside this sync function,
-    // so re-emit the JSON inline. The shape mirrors `tool_definitions`
-    // in `handlers.rs`; keep in sync by editing both together (or
-    // refactor `handlers::tool_definitions` to be pub).
     let _ = py;
-    let _ = McpServer::new; // touch to force the use-path
-    Ok(r#"[
-        {"name":"code_read","description":"Read a file's contents"},
-        {"name":"code_edit","description":"Apply a unified diff patch to a file"},
-        {"name":"code_search","description":"Search files for a regex pattern"},
-        {"name":"goal_run","description":"Run a tier-routed inference turn"}
-    ]"#
-    .to_string())
+    let mut tools: Vec<serde_json::Value> = crate::handlers::FILE_TOOLS
+        .iter()
+        .map(|name| serde_json::json!({"name": name}))
+        .collect();
+    tools.push(serde_json::json!({
+        "name": "goal_run",
+        "description": "Run a tier-routed inference turn"
+    }));
+    serde_json::to_string(&tools).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Register the `mcp` submodule on the parent `_newt_agent` module.

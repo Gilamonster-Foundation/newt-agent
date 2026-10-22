@@ -9,6 +9,17 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed
+
+- One file-tool implementation (#2956). The MCP server now serves newt-core's
+  `read_file` / `write_file` / `edit_file` / `list_dir` / `find` / `grep`,
+  with newt-core's schemas, through its governed executor under the granted
+  `[caveats]` leash. Before, `code_read` / `code_edit` / `code_search` /
+  `fs_list` ran unconfined `newt-tools` primitives; those tools and the
+  `newt_agent.tools.read` / `edit` / `search` Python bindings are removed.
+  `newt-tools` keeps only `apply_patch` / `apply_whole_files`; `newt-cli` and
+  `newt-tui` drop the unused dependency.
+
 ## [0.8.3] — 2026-10-20
 
 ### Security

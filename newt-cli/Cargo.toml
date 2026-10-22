@@ -34,7 +34,6 @@ newt-git.workspace = true
 newt-inference.workspace = true
 newt-scheduler.workspace = true
 newt-skills.workspace = true
-newt-tools.workspace = true
 newt-tui.workspace = true
 newt-acp-worker.workspace = true
 newt-mcp-server.workspace = true

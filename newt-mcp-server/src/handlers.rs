@@ -4,11 +4,11 @@
 //!
 //! `goal_run` is the only handler that needs runtime state — it
 //! borrows a [`BackendRegistry`] (to pick a backend) and a [`Router`]
-//! (to classify the prompt into a [`Tier`]). The other tools
-//! (`code_read` / `code_edit` / `code_search`) are pure file I/O and
-//! need no shared state.
+//! (to classify the prompt into a [`Tier`]). The file tools
+//! ([`FILE_TOOLS`]) are newt-core's own, run by its governed executor
+//! under the granted leash (#2956).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_bridle::{Caveats, Grant, Registry, ToolError};
@@ -65,9 +65,42 @@ pub fn register_handlers(
         router,
         bridle_registry(),
         Arc::new(granted.caveats),
+        std::env::current_dir().unwrap_or_default(),
         toolset,
         persona_tools,
     );
+}
+
+/// The file tools the model gets in the TUI and headless, exposed here by the
+/// same name, schema and implementation (#2956): newt-core's catalog is the
+/// one source of their definitions and its executor the one place they run.
+pub const FILE_TOOLS: [&str; 6] = [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "find",
+    "grep",
+];
+
+/// [`FILE_TOOLS`] in MCP shape, taken verbatim from newt-core's catalog.
+fn file_tool_definitions() -> Vec<Value> {
+    let Value::Array(defs) = newt_core::agentic::tool_definitions() else {
+        unreachable!("tool_definitions always returns a JSON array");
+    };
+    defs.into_iter()
+        .filter_map(|def| {
+            let function = def.get("function")?;
+            let name = function["name"].as_str()?;
+            FILE_TOOLS.contains(&name).then(|| {
+                serde_json::json!({
+                    "name": name,
+                    "description": function["description"],
+                    "inputSchema": function["parameters"],
+                })
+            })
+        })
+        .collect()
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────
@@ -126,57 +159,8 @@ fn register_tools_list(
 
 /// Return the JSON array of tool definitions (shared by tools/list).
 fn tool_definitions() -> Value {
-    let tools = vec![
-        serde_json::json!({
-            "name": "code_read",
-            "description": "Read a file's contents",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path to read"
-                    }
-                },
-                "required": ["path"]
-            }
-        }),
-        serde_json::json!({
-            "name": "code_edit",
-            "description": "Apply a unified diff patch to a file",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path to edit"
-                    },
-                    "patch": {
-                        "type": "string",
-                        "description": "Unified diff to apply"
-                    }
-                },
-                "required": ["path", "patch"]
-            }
-        }),
-        serde_json::json!({
-            "name": "code_search",
-            "description": "Search files for a regex pattern",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Regex pattern"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Root directory to search"
-                    }
-                },
-                "required": ["query", "path"]
-            }
-        }),
+    let mut tools = file_tool_definitions();
+    tools.extend([
         serde_json::json!({
             "name": "git",
             "description": "Run a git operation via the embedded engine (grit-lib), gated by GitCaveats derived from the granted Caveats leash. Requires unrestricted fs_read because legacy repository reads are not path-confined. ops: status | log | diff | add | commit | branch. Local-only; network ops (clone/fetch/push) are fail-closed. A write op (add/commit/branch) under a read-only grant is DENIED (isError). Returns structured JSON.",
@@ -211,20 +195,6 @@ fn tool_definitions() -> Value {
                     }
                 },
                 "required": ["prompt"]
-            }
-        }),
-        serde_json::json!({
-            "name": "fs_list",
-            "description": "List directory contents (dirs first, then files, alphabetical). Returns name, kind, and size_bytes for each entry.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path to list"
-                    }
-                },
-                "required": ["path"]
             }
         }),
         serde_json::json!({
@@ -267,7 +237,7 @@ fn tool_definitions() -> Value {
                 "required": ["url"]
             }
         }),
-    ];
+    ]);
 
     Value::Array(tools)
 }
@@ -281,6 +251,7 @@ fn register_tools_call(
     router: Arc<Router>,
     bridle: Arc<Registry>,
     granted: Arc<Caveats>,
+    workspace: PathBuf,
     toolset: Arc<Mutex<McpToolset>>,
     persona_tools: Arc<Option<Vec<String>>>,
 ) {
@@ -289,6 +260,7 @@ fn register_tools_call(
     // `max_calls` budget on every dispatch instead of accounting it
     // cross-call, as the session's single `granted` leash always did.
     let grant = Arc::new(bridle.mint_grant((*granted).clone()));
+    let workspace: Arc<str> = workspace.to_string_lossy().into();
     server.register("tools/call", move |params| {
         // Move clones into the async block so each invocation owns its
         // own Arc (the outer closure is `Fn`, not `FnOnce`).
@@ -297,6 +269,7 @@ fn register_tools_call(
         let bridle = bridle.clone();
         let granted = granted.clone();
         let grant = grant.clone();
+        let workspace = workspace.clone();
         let toolset = toolset.clone();
         let persona_tools = persona_tools.clone();
         async move {
@@ -320,11 +293,10 @@ fn register_tools_call(
             }
 
             match name.as_str() {
-                "code_read" => handle_code_read(&arguments),
-                "code_edit" => handle_code_edit(&arguments),
-                "code_search" => handle_code_search(&arguments),
+                tool if FILE_TOOLS.contains(&tool) => {
+                    Ok(handle_file_tool(tool, &arguments, &workspace, &granted).await)
+                }
                 "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
-                "fs_list" => handle_fs_list(&arguments),
                 "git" => handle_git(&arguments, &granted),
                 "shell_run" => Ok(handle_shell_run(arguments, &bridle, &grant).await),
                 "web_fetch" => Ok(handle_web_fetch(arguments, &bridle, &grant).await),
@@ -424,61 +396,62 @@ fn gerr(e: newt_git::GitError) -> anyhow::Error {
     anyhow::anyhow!("git: {e}")
 }
 
-fn handle_code_read(args: &Value) -> anyhow::Result<Value> {
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: path"))?;
-
-    let content = newt_tools::read(Path::new(path))?;
-    Ok(mcp_text_content(&content))
-}
-
-fn handle_code_edit(args: &Value) -> anyhow::Result<Value> {
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: path"))?;
-    let patch = args
-        .get("patch")
-        .and_then(|p| p.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: patch"))?;
-
-    newt_tools::edit(Path::new(path), patch)?;
-    Ok(mcp_text_content(&format!("patched {path}")))
-}
-
-fn handle_code_search(args: &Value) -> anyhow::Result<Value> {
-    let query = args
-        .get("query")
-        .and_then(|q| q.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: path"))?;
-
-    let hits = newt_tools::search(query, Path::new(path))?;
-    let lines: Vec<String> = hits
-        .iter()
-        .map(|h| format!("{}:{}: {}", h.path, h.line_number, h.line))
-        .collect();
-    let text = if lines.is_empty() {
-        "no matches".to_string()
-    } else {
-        lines.join("\n")
-    };
-    Ok(mcp_text_content(&text))
-}
-
-fn handle_fs_list(args: &Value) -> anyhow::Result<Value> {
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: path"))?;
-
-    let entries = newt_tools::list_dir(Path::new(path))?;
-    Ok(mcp_text_content(&serde_json::to_string_pretty(&entries)?))
+/// One of [`FILE_TOOLS`], run by newt-core's executor under the granted leash:
+/// the same object-bound fence, paging and model-facing error text the TUI
+/// and headless get (#2956). Before this the MCP file tools were unconfined
+/// `newt-tools` primitives — `code_edit` wrote anywhere on disk while the
+/// `[caveats]` leash confined only `shell_run`. There is no human behind an
+/// MCP server, so no permission gate: an out-of-scope path is denied, never
+/// asked about.
+async fn handle_file_tool(name: &str, args: &Value, workspace: &str, granted: &Caveats) -> Value {
+    let (tool, args, workspace, granted) = (
+        name.to_owned(),
+        args.clone(),
+        workspace.to_owned(),
+        granted.clone(),
+    );
+    // The executor's future is `!Send` (its permission-gate seam) and this
+    // server's handlers must be `Send`, so it runs to completion on a
+    // blocking thread with its own reactor (the dispatch polls a cancel
+    // flag on a tokio timer).
+    let out = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok::<_, std::io::Error>(rt.block_on(newt_core::execute_tool(
+            &tool,
+            &args,
+            &workspace,
+            false,
+            20,
+            &granted,
+            &mut newt_core::NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )))
+    })
+    .await;
+    match out {
+        // ponytail: the executor reports failure only in its model-facing
+        // text; switch to a typed outcome if that entry point ever returns one.
+        Ok(Ok(text)) if text.starts_with("error:") || text.starts_with("capability denied") => {
+            mcp_error_content(&text)
+        }
+        Ok(Ok(text)) => mcp_text_content(&text),
+        Ok(Err(e)) => mcp_error_content(&format!("error: {name}: {e}")),
+        Err(e) => mcp_error_content(&format!("error: {name}: {e}")),
+    }
 }
 
 /// `shell_run` — the Caveats-confined shell.
@@ -754,6 +727,12 @@ mod tests {
     /// granted Caveats from the real home dir, which a test must not depend
     /// on.) This drives `register_tools_call` directly with a chosen grant.
     async fn rpc_with_caveats(granted: Caveats, request: &Value) -> Value {
+        rpc_in(&std::env::current_dir().unwrap(), granted, request).await
+    }
+
+    /// [`rpc_with_caveats`] with an explicit workspace root — the file tools
+    /// resolve relative paths and fence `find`/`grep` against it (#2956).
+    async fn rpc_in(workspace: &std::path::Path, granted: Caveats, request: &Value) -> Value {
         let mut server = McpServer::new();
         let toolset = Arc::new(Mutex::new(McpToolset::empty()));
         let persona_tools = Arc::new(None);
@@ -770,6 +749,7 @@ mod tests {
             Arc::new(Router::new()),
             bridle_registry(),
             Arc::new(granted),
+            workspace.to_path_buf(),
             toolset,
             persona_tools,
         );
@@ -840,12 +820,36 @@ mod tests {
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"code_read"));
-        assert!(names.contains(&"code_edit"));
-        assert!(names.contains(&"code_search"));
+        for tool in FILE_TOOLS {
+            assert!(names.contains(&tool), "{tool} missing from {names:?}");
+        }
         assert!(names.contains(&"goal_run"));
-        assert!(names.contains(&"fs_list"));
         assert!(names.contains(&"shell_run"));
+    }
+
+    /// #2956: ONE schema per file tool. The MCP surface advertises exactly the
+    /// definitions newt-core gives the TUI and headless model, never a restated
+    /// copy that can drift.
+    #[tokio::test]
+    async fn file_tool_schemas_are_newt_core_catalog_entries() {
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }))
+        .await;
+        let listed = resp["result"]["tools"].as_array().unwrap();
+        let catalog = newt_core::agentic::tool_definitions();
+        for tool in FILE_TOOLS {
+            let mcp = listed.iter().find(|t| t["name"] == tool).unwrap();
+            let core = catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| &d["function"])
+                .find(|f| f["name"] == tool)
+                .unwrap();
+            assert_eq!(mcp["description"], core["description"], "{tool}");
+            assert_eq!(mcp["inputSchema"], core["parameters"], "{tool}");
+        }
     }
 
     #[tokio::test]
@@ -883,7 +887,7 @@ mod tests {
             Arc::new(BackendRegistry::new()),
             Arc::new(Router::new()),
             McpToolset::empty(),
-            Some(vec!["code_read".to_string()]),
+            Some(vec!["read_file".to_string()]),
             &serde_json::json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
             }),
@@ -895,7 +899,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["code_read"], "only the allowed tool is listed");
+        assert_eq!(names, vec!["read_file"], "only the allowed tool is listed");
     }
 
     #[tokio::test]
@@ -919,7 +923,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"code_read"));
+        assert!(names.contains(&"read_file"));
         assert!(names.contains(&"shell_run"));
         assert!(names.contains(&"web_fetch"));
     }
@@ -932,7 +936,7 @@ mod tests {
             Arc::new(BackendRegistry::new()),
             Arc::new(Router::new()),
             McpToolset::empty(),
-            Some(vec!["code_read".to_string()]),
+            Some(vec!["read_file".to_string()]),
             &serde_json::json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": { "name": "shell_run", "arguments": { "command": "echo hi" } }
@@ -952,10 +956,10 @@ mod tests {
             Arc::new(BackendRegistry::new()),
             Arc::new(Router::new()),
             McpToolset::empty(),
-            Some(vec!["fs_list".to_string()]),
+            Some(vec!["list_dir".to_string()]),
             &serde_json::json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": { "name": "fs_list", "arguments": { "path": "." } }
+                "params": { "name": "list_dir", "arguments": { "path": "." } }
             }),
         )
         .await;
@@ -983,39 +987,137 @@ mod tests {
         assert!(err.contains("unknown tool"), "got: {resp}");
     }
 
-    // ── tools/call — code_read ──────────────────────────────────────────────
+    // ── tools/call — file tools (newt-core's, #2956) ────────────────────────
 
-    #[tokio::test]
-    async fn code_read_happy_path() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "hello from newt\n").unwrap();
+    /// A `tools/call` of `name` with `arguments`, in `workspace`, under `granted`.
+    async fn call_file_tool(
+        workspace: &std::path::Path,
+        granted: Caveats,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        rpc_in(
+            workspace,
+            granted,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }),
+        )
+        .await
+    }
 
-        let resp = rpc(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
-            "params": {
-                "name": "code_read",
-                "arguments": { "path": tmp.path().to_str().unwrap() }
-            }
-        }))
-        .await;
+    /// A leash confined to `root` on both fs axes; exec/net untouched.
+    fn fenced_to(root: &std::path::Path) -> Caveats {
+        let only = agent_bridle::Scope::only([root.to_string_lossy().into_owned()]);
+        Caveats {
+            fs_read: only.clone(),
+            fs_write: only,
+            ..Caveats::top()
+        }
+    }
 
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("hello from newt"));
+    fn text_of(resp: &Value) -> &str {
+        resp["result"]["content"][0]["text"].as_str().unwrap()
     }
 
     #[tokio::test]
-    async fn code_read_missing_file() {
-        let resp = rpc(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
-            "params": {
-                "name": "code_read",
-                "arguments": { "path": "/tmp/newt-mcp-no-such-file-xyz" }
-            }
-        }))
+    async fn read_file_happy_path() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("note.txt"), "hello from newt\n").unwrap();
+
+        let resp = call_file_tool(
+            ws.path(),
+            Caveats::top(),
+            "read_file",
+            serde_json::json!({ "path": "note.txt" }),
+        )
         .await;
 
-        assert!(resp["error"].is_object(), "expected error, got: {resp}");
-        assert_eq!(resp["error"]["code"], -32603);
+        assert!(text_of(&resp).contains("hello from newt"), "{resp}");
+        assert!(resp["result"]["isError"].is_null(), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn read_file_missing_file_is_a_tool_error() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let resp = call_file_tool(
+            ws.path(),
+            Caveats::top(),
+            "read_file",
+            serde_json::json!({ "path": "no-such-file.txt" }),
+        )
+        .await;
+
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        assert!(text_of(&resp).starts_with("error:"), "{resp}");
+    }
+
+    /// Regression (#2956): the MCP file tools run under the granted leash.
+    /// Before, `code_read` called a bare `newt_tools::read` and read any path
+    /// on disk regardless of `fs_read`.
+    #[tokio::test]
+    async fn read_file_outside_the_leash_is_denied() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let secret = elsewhere.path().join("secret.txt");
+        std::fs::write(&secret, "must not leak\n").unwrap();
+
+        let resp = call_file_tool(
+            ws.path(),
+            fenced_to(ws.path()),
+            "read_file",
+            serde_json::json!({ "path": secret.to_str().unwrap() }),
+        )
+        .await;
+
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = text_of(&resp);
+        assert!(text.starts_with("capability denied"), "{text}");
+        assert!(!text.contains("must not leak"), "{text}");
+    }
+
+    /// Regression (#2956): before, `code_edit` wrote anywhere on disk while
+    /// the `[caveats]` leash confined only `shell_run`.
+    #[tokio::test]
+    async fn edit_file_outside_the_leash_is_denied() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let target = elsewhere.path().join("hello.txt");
+        std::fs::write(&target, "line1\nline2\n").unwrap();
+
+        let resp = call_file_tool(
+            ws.path(),
+            fenced_to(ws.path()),
+            "edit_file",
+            serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "old_string": "line2",
+                "new_string": "edited"
+            }),
+        )
+        .await;
+
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        assert!(text_of(&resp).starts_with("capability denied"), "{resp}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "line1\nline2\n");
+    }
+
+    #[tokio::test]
+    async fn list_dir_lists_names() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("b.txt"), "").unwrap();
+        std::fs::create_dir(ws.path().join("a_dir")).unwrap();
+
+        let resp = call_file_tool(
+            ws.path(),
+            fenced_to(ws.path()),
+            "list_dir",
+            serde_json::json!({ "path": "." }),
+        )
+        .await;
+
+        assert_eq!(text_of(&resp), "a_dir\nb.txt", "{resp}");
     }
 
     // ── tools/call — git (embedded engine) ──────────────────────────────────
@@ -1138,117 +1240,95 @@ mod tests {
         );
     }
 
-    // ── tools/call — code_search ────────────────────────────────────────────
+    // ── tools/call — grep ───────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn code_search_happy_path() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "needle in hay\nhay only\n").unwrap();
-        std::fs::write(tmp.path().join("b.txt"), "more hay\nneedle again\n").unwrap();
+    async fn grep_happy_path() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "needle in hay\nhay only\n").unwrap();
+        std::fs::write(ws.path().join("b.txt"), "more hay\nneedle again\n").unwrap();
 
-        let resp = rpc(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 20, "method": "tools/call",
-            "params": {
-                "name": "code_search",
-                "arguments": {
-                    "query": "needle",
-                    "path": tmp.path().to_str().unwrap()
-                }
-            }
-        }))
+        let resp = call_file_tool(
+            ws.path(),
+            fenced_to(ws.path()),
+            "grep",
+            serde_json::json!({ "pattern": "needle", "path": "." }),
+        )
         .await;
 
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("needle"), "expected hits, got: {text}");
-        // Two files should have matches
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "expected 2 hits, got: {text}");
+        let text = text_of(&resp);
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(lines, ["a.txt:1:needle in hay", "b.txt:2:needle again"]);
     }
 
     #[tokio::test]
-    async fn code_search_no_matches() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "nothing here\n").unwrap();
+    async fn grep_no_matches() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "nothing here\n").unwrap();
 
-        let resp = rpc(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 21, "method": "tools/call",
-            "params": {
-                "name": "code_search",
-                "arguments": {
-                    "query": "zzz_absent",
-                    "path": tmp.path().to_str().unwrap()
-                }
-            }
-        }))
+        let resp = call_file_tool(
+            ws.path(),
+            fenced_to(ws.path()),
+            "grep",
+            serde_json::json!({ "pattern": "zzz_absent" }),
+        )
         .await;
 
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert_eq!(text, "no matches");
+        assert!(
+            text_of(&resp).starts_with("no matches for zzz_absent"),
+            "{resp}"
+        );
     }
 
-    // ── tools/call — code_edit ──────────────────────────────────────────────
+    // ── tools/call — edit_file ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn code_edit_happy_path() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let file = tmp.path().join("hello.txt");
+    async fn edit_file_happy_path() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let file = ws.path().join("hello.txt");
         std::fs::write(&file, "line1\nline2\n").unwrap();
 
-        let patch = "\
---- a/hello.txt
-+++ b/hello.txt
-@@ -1,2 +1,2 @@
- line1
--line2
-+edited
-";
-
-        let resp = rpc(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 30, "method": "tools/call",
-            "params": {
-                "name": "code_edit",
-                "arguments": {
-                    "path": file.to_str().unwrap(),
-                    "patch": patch
-                }
-            }
-        }))
+        let resp = call_file_tool(
+            ws.path(),
+            fenced_to(ws.path()),
+            "edit_file",
+            serde_json::json!({
+                "path": "hello.txt",
+                "old_string": "line2",
+                "new_string": "edited"
+            }),
+        )
         .await;
 
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("patched"), "expected success, got: {text}");
-
-        let content = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(content, "line1\nedited\n");
+        assert!(resp["result"]["isError"].is_null(), "{resp}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line1\nedited\n");
     }
 
     #[tokio::test]
-    async fn code_edit_bad_patch() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let file = tmp.path().join("hello.txt");
+    async fn edit_file_old_string_missing_is_a_tool_error() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let file = ws.path().join("hello.txt");
         std::fs::write(&file, "actual\n").unwrap();
 
-        let patch = "\
---- a/hello.txt
-+++ b/hello.txt
-@@ -1,1 +1,1 @@
- WRONG_CONTEXT
-";
-
-        let resp = rpc(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 31, "method": "tools/call",
-            "params": {
-                "name": "code_edit",
-                "arguments": {
-                    "path": file.to_str().unwrap(),
-                    "patch": patch
-                }
-            }
-        }))
+        let resp = call_file_tool(
+            ws.path(),
+            fenced_to(ws.path()),
+            "edit_file",
+            serde_json::json!({
+                "path": "hello.txt",
+                "old_string": "WRONG_CONTEXT",
+                "new_string": "x"
+            }),
+        )
         .await;
 
-        assert!(resp["error"].is_object(), "expected error, got: {resp}");
-        assert_eq!(resp["error"]["code"], -32603);
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        assert!(
+            text_of(&resp).starts_with("error: old_string not found"),
+            "{resp}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "actual\n");
     }
 
     // ── tools/call — unknown tool ───────────────────────────────────────────

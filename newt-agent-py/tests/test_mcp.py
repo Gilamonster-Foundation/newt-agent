@@ -7,11 +7,11 @@ import json
 import newt_agent.mcp as mcp
 
 
-def test_default_tool_definitions_lists_four() -> None:
+def test_default_tool_definitions_lists_the_builtins() -> None:
     raw = mcp.default_tool_definitions()
     tools = json.loads(raw)
     names = {t["name"] for t in tools}
-    assert names == {"code_read", "code_edit", "code_search", "goal_run"}
+    assert {"read_file", "edit_file", "list_dir", "grep", "goal_run"} <= names
 
 
 def test_mcp_server_register_and_handle() -> None:
