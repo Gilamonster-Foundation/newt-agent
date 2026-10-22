@@ -242,6 +242,16 @@ scheduled = true
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // #2972: crossterm falls back to /dev/tty for the width, so under a narrow
+    // PTY the transcript wrapped and broke the substring checks. A new session
+    // has no controlling terminal, so the child always sees the 80-column default.
+    // SAFETY: `setsid` is async-signal-safe and touches no shared state.
+    unsafe {
+        cmd.pre_exec(|| match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
     let mut child = cmd.spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
     input
