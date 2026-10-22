@@ -55,7 +55,7 @@
 </tbody></table></div>
 <h2>What this does not show</h2>
 <ul>
-<li>On macOS the kernel cannot enforce a restricted network grant, so a confined command there needs an explicit <code>net = ["*"]</code>. A per-host network fence is not shown for that reason.</li>
+<li>On macOS, deny-all network is supported for audited launches by an unprivileged caller with pipe or null stdio. Hostname-scoped and deputy-relayed network grants are not enforceable there and are refused, so a per-host network fence is not shown.</li>
 <li>Windows AppContainer does not enforce a restricted exec allowlist; it fails closed and refuses the shell tool.</li>
 <li><code>--yolo</code> (<code>--disable-ocap</code>) runs on the host shell with no confinement.</li>
 <li>Signatures do not stop an older valid file being restored, and do not help if an attacker holds the operator key.</li>

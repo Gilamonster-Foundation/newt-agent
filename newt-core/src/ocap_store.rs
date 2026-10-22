@@ -893,7 +893,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn persist_approve_signs_the_private_spelling_of_a_var_alias() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Explicit /var location: independent of TMPDIR.
+        let dir = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
         let config = dir.path().join("config.toml");
         let k = key();
         let raw = dir.path().join("ws").join("x").join("..").join("y");

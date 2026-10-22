@@ -3,6 +3,8 @@ name: pages
 # Publishes `site/` (static, no build step) to GitHub Pages. Requires the repo's
 # Pages source set to "GitHub Actions" (Settings -> Pages). Runs only when the
 # site changes; PRs get a no-deploy sanity check that the files exist.
+# HOOK PARITY: CI-only (deploy/validation); .githooks/pre-push skips site-only
+# pushes and does not mirror this workflow.
 on:
   push:
     branches: [main]
