@@ -763,9 +763,13 @@ mod tests {
         assert!(widened.permits_exec("cargo"), "existing grants kept");
         assert!(widened.permits_net("docs.rs"));
         // macOS stores fs grants under their canonical alias (/private/...);
-        // `rewrite` is the identity elsewhere.
-        assert!(widened.permits_fs_read(&crate::fs_aliases::rewrite("/etc/hosts")));
-        assert!(widened.permits_fs_write(&crate::fs_aliases::rewrite("/tmp/out")));
+        // `rewrite` is the identity elsewhere, and absent off Unix.
+        #[cfg(unix)]
+        let alias = |p: &'static str| crate::fs_aliases::rewrite(p).into_owned();
+        #[cfg(not(unix))]
+        let alias = |p: &'static str| p.to_owned();
+        assert!(widened.permits_fs_read(&alias("/etc/hosts")));
+        assert!(widened.permits_fs_write(&alias("/tmp/out")));
         // Untouched axes / non-granted targets stay denied.
         assert!(!widened.permits_exec("rm"));
         assert!(!widened.permits_net("evil.example.com"));
