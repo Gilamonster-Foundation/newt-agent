@@ -15,6 +15,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   tiers run (`newt-tui`: `native-permission-test`, `rich-tui`, `rich-tui,live-spill`;
   `newt-core`: `ast`), so a struct change can no longer break a feature-gated test unseen (#2971).
 
+### Fixed
+
+- `plan_approval_turn` no longer fails under a narrow terminal: the child runs in its
+  own session, so crossterm cannot read the test runner's PTY width (#2972).
+
 ## [0.8.3] — 2026-10-20
 
 ### Security
