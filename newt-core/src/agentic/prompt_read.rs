@@ -530,7 +530,7 @@ fn insert_active_prompt_card(
     );
 }
 
-fn active_prompt_card_with_intake(base_card: String, intake: &PromptIntake) -> String {
+pub(crate) fn active_prompt_card_with_intake(base_card: String, intake: &PromptIntake) -> String {
     append_prompt_comprehension_model_card(base_card, &intake.model_card())
 }
 

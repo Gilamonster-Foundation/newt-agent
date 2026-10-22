@@ -42,6 +42,7 @@ pub use mcp::{classify_readiness, readiness_label, saved_oauth_valid, McpReadine
 // the crate does, so this is a private import rather than a re-export.
 use codex_env::{codex_env_allowed, codex_env_backend};
 mod turn_input;
+mod turn_system;
 // `with_live_spill_watch` (both cfg arms) and `with_interrupt_watch` are the
 // only two the rest of the crate calls from non-test code: chat.rs,
 // commands/model.rs and interrupt_ack_pty_test.rs. Both exist in EVERY config,
@@ -1333,7 +1334,7 @@ impl AutoModeState {
         }
     }
 
-    #[cfg(test)]
+    /// Read the pending selection without consuming it (`/context request`).
     fn pending_for(&self, conversation_id: &str) -> Option<OperatingMode> {
         self.selected
             .lock()

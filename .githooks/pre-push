@@ -129,7 +129,7 @@
 #     behind a fixed wall-clock bound, and under this hook's parallel nextest
 #     run on a loaded dev box they cross it and reject the push (measured:
 #     three rejections on 2026-09-30, all in this shape, every one green in
-#     CI on the same SHA). CI's `test` job runs all eight on every PR via
+#     CI on the same SHA). CI's `test` job runs all nine on every PR via
 #     `cargo test --workspace` (the `windows` job runs the three that are
 #     not `#![cfg(unix)]`); terminal_exit_pty also runs in newt-tui-pty.yml.
 #       newt-agent::lean_surface_purity  lean-surface byte contract; six
@@ -143,6 +143,7 @@
 #                                         (#2938), 30 s budget per wait
 #       newt-agent::headless_prompt_override  real headless CLI against a
 #                                         capturing provider (#2938)
+#       newt-agent::context_request_preview  real chat loop x5, 90 s cap
 #   - two more real-resource lanes, same tier as the six above (#2663 named
 #     the six original real-`newt`-session binaries but missed these -- measured in
 #     the push rejections of 2026-10-01/02):
@@ -460,7 +461,7 @@ cargo fmt --all -- --check
 # so missing Landlock/git fails instead of silently skipping. This remains
 # a CI-only real-resource proof, excluded from the local pre-flight.
 #
-# The eight newt-agent binaries are the real-`newt`-session / real-PTY tier;
+# The nine newt-agent binaries are the real-`newt`-session / real-PTY tier;
 # newt-eval::mock_e2e (whole binary) and the two named newt-tui tests are the
 # same tier, added later: see the CI-ONLY list in the header for each one's
 # reason and where CI runs it. scripts/test_pre_push.py pins this list;
@@ -478,6 +479,7 @@ NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-agent::terminal_exit_pty)
     and not binary_id(newt-agent::prompt_override_pty)
     and not binary_id(newt-agent::headless_prompt_override)
+    and not binary_id(newt-agent::context_request_preview)
     and not binary_id(newt-eval::mock_e2e)
     and not (binary_id(newt-tui) and test(=prompt_visibility_test::mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal))
     and not (binary_id(newt-tui) and test(=prompt_visibility_test::a_permission_prompt_is_visible_and_survives_a_live_spinner))
