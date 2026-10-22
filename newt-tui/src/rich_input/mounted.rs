@@ -275,6 +275,7 @@ impl MountedEditor {
                 headline: chrome.headline,
                 modal: chrome.modal,
                 background_jobs: chrome.background_jobs,
+                tools: chrome.tools,
                 palette: Some(&self.palette),
                 chat_inactive,
                 turn_running: self.turn_running,
