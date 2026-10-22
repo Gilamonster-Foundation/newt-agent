@@ -50,6 +50,8 @@ NEXTEST_CI_ONLY = [
     "newt-agent::personality_turn",
     "newt-agent::migration_notices",
     "newt-agent::terminal_exit_pty",
+    "newt-agent::prompt_override_pty",
+    "newt-agent::headless_prompt_override",
     "newt-eval::mock_e2e",
 ]
 # Same tier, but these two live as individual tests inside newt-tui's lib
@@ -57,8 +59,9 @@ NEXTEST_CI_ONLY = [
 # so the hook excludes them by exact test() match scoped to that binary_id
 # instead of excluding the whole binary.
 NEXTEST_TEST_CI_ONLY = [
-    "mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal",
-    "a_permission_prompt_is_visible_and_survives_a_live_spinner",
+    "prompt_visibility_test::mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal",
+    "prompt_visibility_test::a_permission_prompt_is_visible_and_survives_a_live_spinner",
+    "system_prompt_edit::tests::real_fs_pre_existing_sibling_survives_and_a_failed_rename_leaves_nothing",
 ]
 # Generated synthetic addresses exercise the guard without embedding a host.
 PRIVATE_FIXTURE = str(ipaddress.IPv4Network("10.0.0.0/8")[7])
@@ -390,7 +393,7 @@ class PrePushTests(unittest.TestCase):
             self.assertIn(f"not binary_id({binary})", nextest)
         for test_name in NEXTEST_TEST_CI_ONLY:
             self.assertIn(
-                f"not (binary_id(newt-tui) and test(=prompt_visibility_test::{test_name}))",
+                f"not (binary_id(newt-tui) and test(={test_name}))",
                 nextest,
             )
 
@@ -425,7 +428,7 @@ class PrePushTests(unittest.TestCase):
             self.assertIn(f"not binary_id({binary})", nextest)
         for test_name in NEXTEST_TEST_CI_ONLY:
             self.assertIn(
-                f"not (binary_id(newt-tui) and test(=prompt_visibility_test::{test_name}))",
+                f"not (binary_id(newt-tui) and test(={test_name}))",
                 nextest,
             )
 

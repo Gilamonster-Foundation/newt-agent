@@ -2834,12 +2834,12 @@ fn session_body(
     // #2938: the operator's system prompt file as the session last built its
     // prompt from it. A set, reset or edited file rebuilds the prompt on the
     // spot (and refreshes the footer), not at the next `/new`.
-    let mut last_override = crate::try_system_prompt_override().ok().flatten();
+    let mut last_override = crate::try_system_prompt_override();
     macro_rules! refresh_prompt_override {
         () => {
             if crate::system_prompt_edit::refresh_override(
                 &mut last_override,
-                || crate::try_system_prompt_override().ok().flatten(),
+                crate::try_system_prompt_override,
                 || {
                     system = rebuild_system_prompt(
                         workspace,
@@ -6779,8 +6779,9 @@ fn session_body(
                             );
                             continue;
                         };
-                        let mut io =
-                            spe::RealIo(|cmd: &str| surface.run_bang_escape(cmd, color, verbose));
+                        let mut io = spe::RealIo::new(|cmd: &str| {
+                            surface.run_bang_escape(cmd, color, verbose)
+                        });
                         match spe::run(&mut io, &target, &system) {
                             Ok(Outcome::Saved) => {
                                 let path = target.display().to_string();
@@ -8544,7 +8545,11 @@ fn session_body(
                     // #2938: the operator's file is the whole system message;
                     // nothing the session assembled rides along.
                     let turn_system = crate::system_prompt_edit::turn_system_text(
-                        last_override.as_ref().map(|o| o.text.as_str()),
+                        last_override
+                            .as_ref()
+                            .ok()
+                            .and_then(Option::as_ref)
+                            .map(|o| o.text.as_str()),
                         || turn_system,
                     );
                     let messages = messages_with_plan(
@@ -9076,7 +9081,7 @@ fn session_body(
                                         exposure: newt_core::ExposureSettings {
                                             // #2938: a system prompt file is the
                                             // whole system message.
-                                            verbatim_system: last_override.is_some(),
+                                            verbatim_system: matches!(last_override, Ok(Some(_))),
                                             ..newt_core::ExposureSettings::from(cfg.tool_exposure())
                                         },
                                         // Step 26.6a (#585): the experiential store

@@ -13,11 +13,16 @@ use std::path::{Path, PathBuf};
 /// terminal or a filesystem.
 pub(crate) trait EditIo {
     fn read(&self, path: &Path) -> io::Result<String>;
-    fn write(&mut self, path: &Path, text: &str) -> io::Result<()>;
-    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()>;
-    fn remove(&mut self, path: &Path);
+    /// Create a scratch file holding `text`, exclusively and under a unique
+    /// name in `target`'s directory, and own it until `persist` or `discard`
+    /// (or drop). Returns its path for the editor.
+    fn scratch(&mut self, target: &Path, text: &str) -> io::Result<PathBuf>;
     /// Run the operator's editor on `path`, handing it the terminal.
     fn edit(&mut self, path: &Path) -> anyhow::Result<()>;
+    /// Move the scratch file over `target`.
+    fn persist(&mut self, target: &Path) -> io::Result<()>;
+    /// Remove the scratch file if one is still owned. Idempotent.
+    fn discard(&mut self);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -31,36 +36,29 @@ pub(crate) enum Outcome {
 }
 
 /// Edit `target`'s current contents, or `assembled` (what newt would send) when
-/// there is no override yet.
+/// there is no override yet. The scratch file is discarded on every exit.
 pub(crate) fn run(io: &mut impl EditIo, target: &Path, assembled: &str) -> anyhow::Result<Outcome> {
     let start = match io.read(target) {
         Ok(text) if !text.trim().is_empty() => text,
         _ => assembled.to_string(),
     };
-    let scratch = scratch_path(target);
-    io.write(&scratch, &start)?;
-    let edited = io.edit(&scratch).and_then(|()| Ok(io.read(&scratch)?));
-    let outcome = match edited {
-        Err(e) => {
-            io.remove(&scratch);
-            return Err(e);
-        }
-        Ok(text) if text.trim().is_empty() => Outcome::Empty,
-        Ok(text) if text == start => Outcome::Unchanged,
-        Ok(_) => Outcome::Saved,
-    };
-    if outcome == Outcome::Saved {
-        io.rename(&scratch, target)?;
-    } else {
-        io.remove(&scratch);
-    }
-    Ok(outcome)
+    let outcome = edit_scratch(io, target, &start);
+    io.discard();
+    outcome
 }
 
-fn scratch_path(target: &Path) -> PathBuf {
-    let mut name = target.file_name().unwrap_or_default().to_os_string();
-    name.push(".edit");
-    target.with_file_name(name)
+fn edit_scratch(io: &mut impl EditIo, target: &Path, start: &str) -> anyhow::Result<Outcome> {
+    let scratch = io.scratch(target, start)?;
+    io.edit(&scratch)?;
+    let edited = io.read(&scratch)?;
+    if edited.trim().is_empty() {
+        return Ok(Outcome::Empty);
+    }
+    if edited == start {
+        return Ok(Outcome::Unchanged);
+    }
+    io.persist(target)?;
+    Ok(Outcome::Saved)
 }
 
 /// The system text for one turn: the operator's file when there is one —
@@ -96,27 +94,53 @@ pub(crate) fn default_target() -> Option<PathBuf> {
 }
 
 /// The real filesystem, with the editor run through `run_shell` — the
-/// surface's terminal hand-off.
-pub(crate) struct RealIo<F>(pub F);
+/// surface's terminal hand-off. The scratch file is a `NamedTempFile`, so
+/// dropping this (or `discard`) removes it whatever path the flow took.
+pub(crate) struct RealIo<F> {
+    run_shell: F,
+    scratch: Option<tempfile::NamedTempFile>,
+}
+
+impl<F> RealIo<F> {
+    pub(crate) fn new(run_shell: F) -> Self {
+        Self {
+            run_shell,
+            scratch: None,
+        }
+    }
+}
 
 impl<F: FnMut(&str) -> anyhow::Result<()>> EditIo for RealIo<F> {
     fn read(&self, path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
     }
-    fn write(&mut self, path: &Path, text: &str) -> io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, text)
-    }
-    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
-    }
-    fn remove(&mut self, path: &Path) {
-        let _ = std::fs::remove_file(path);
+    fn scratch(&mut self, target: &Path, text: &str) -> io::Result<PathBuf> {
+        use std::io::Write;
+        let dir = target.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let mut file = tempfile::Builder::new()
+            .prefix(".system-prompt-")
+            .suffix(".edit")
+            .tempfile_in(dir)?;
+        file.write_all(text.as_bytes())?;
+        file.flush()?;
+        let path = file.path().to_path_buf();
+        self.scratch = Some(file);
+        Ok(path)
     }
     fn edit(&mut self, path: &Path) -> anyhow::Result<()> {
-        (self.0)(&editor_command(path))
+        (self.run_shell)(&editor_command(path))
+    }
+    fn persist(&mut self, target: &Path) -> io::Result<()> {
+        let file = self
+            .scratch
+            .take()
+            .ok_or_else(|| io::Error::other("no scratch file to save"))?;
+        // A failed rename hands the file back; dropping it removes it.
+        file.persist(target).map(|_| ()).map_err(|e| e.error)
+    }
+    fn discard(&mut self) {
+        self.scratch = None;
     }
 }
 
@@ -161,9 +185,12 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         files: HashMap<PathBuf, String>,
+        scratch: Option<PathBuf>,
         /// What the "editor" turns the scratch text into.
         editor: Option<Editor>,
         editor_fails: bool,
+        persist_fails: bool,
+        scratches_made: usize,
     }
 
     impl EditIo for Fake {
@@ -173,17 +200,12 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| io::ErrorKind::NotFound.into())
         }
-        fn write(&mut self, path: &Path, text: &str) -> io::Result<()> {
-            self.files.insert(path.into(), text.into());
-            Ok(())
-        }
-        fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
-            let text = self.files.remove(from).ok_or(io::ErrorKind::NotFound)?;
-            self.files.insert(to.into(), text);
-            Ok(())
-        }
-        fn remove(&mut self, path: &Path) {
-            self.files.remove(path);
+        fn scratch(&mut self, target: &Path, text: &str) -> io::Result<PathBuf> {
+            self.scratches_made += 1;
+            let path = target.with_file_name(format!(".scratch-{}.edit", self.scratches_made));
+            self.files.insert(path.clone(), text.into());
+            self.scratch = Some(path.clone());
+            Ok(path)
         }
         fn edit(&mut self, path: &Path) -> anyhow::Result<()> {
             anyhow::ensure!(!self.editor_fails, "no editor");
@@ -194,6 +216,20 @@ mod tests {
                 .map_or_else(|| text.clone(), |f| f(&text));
             self.files.insert(path.into(), edited);
             Ok(())
+        }
+        fn persist(&mut self, target: &Path) -> io::Result<()> {
+            if self.persist_fails {
+                return Err(io::Error::other("rename failed"));
+            }
+            let from = self.scratch.take().unwrap();
+            let text = self.files.remove(&from).unwrap();
+            self.files.insert(target.into(), text);
+            Ok(())
+        }
+        fn discard(&mut self) {
+            if let Some(path) = self.scratch.take() {
+                self.files.remove(&path);
+            }
         }
     }
 
@@ -263,6 +299,66 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_save_is_an_error_and_cleans_up() {
+        let mut io = fake(|_| "changed\n".to_string());
+        io.persist_fails = true;
+        assert!(run(&mut io, Path::new(TARGET), "assembled").is_err());
+        assert!(io.files.is_empty(), "{:?}", io.files);
+    }
+
+    #[test]
+    fn a_pre_existing_edit_sibling_is_never_the_scratch_file() {
+        let mut io = fake(|_| "changed\n".to_string());
+        let sibling = Path::new("/home/x/.newt/system-prompt.md.edit");
+        io.files.insert(sibling.into(), "unrelated\n".into());
+        run(&mut io, Path::new(TARGET), "assembled").unwrap();
+        assert_eq!(io.files[sibling], "unrelated\n");
+    }
+
+    /// Grounds the fake above in the real filesystem: `NamedTempFile` really
+    /// does create exclusively under a unique name, and really is removed when
+    /// the rename fails. Real-resource tier (CI only; see the pre-push hook).
+    #[test]
+    fn real_fs_pre_existing_sibling_survives_and_a_failed_rename_leaves_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("system-prompt.md");
+        let sibling = dir.path().join("system-prompt.md.edit");
+        std::fs::write(&sibling, "unrelated\n").unwrap();
+
+        // A no-op editor: the sibling is untouched and nothing new remains.
+        let mut io = RealIo::new(|_: &str| Ok(()));
+        assert_eq!(
+            run(&mut io, &target, "assembled\n").unwrap(),
+            Outcome::Unchanged
+        );
+        assert_eq!(std::fs::read_to_string(&sibling).unwrap(), "unrelated\n");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // The target is a directory, so the rename fails: error, no scratch.
+        std::fs::remove_file(&sibling).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let scratch_of = |io_cmd: &str| {
+            let quoted = io_cmd
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .trim_matches('\'')
+                .to_string();
+            std::fs::write(&quoted, "changed\n").unwrap();
+        };
+        let mut io = RealIo::new(|cmd: &str| {
+            scratch_of(cmd);
+            Ok(())
+        });
+        assert!(run(&mut io, &target, "assembled\n").is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "only the directory"
+        );
+    }
+
+    #[test]
     fn the_override_is_the_whole_turn_system_text_and_skips_the_assembly() {
         let text = turn_system_text(Some("pruned\n"), || panic!("assembled anyway"));
         assert_eq!(text, "pruned\n");
@@ -285,6 +381,26 @@ mod tests {
             );
         }
         assert_eq!(rebuilds, 2);
+    }
+
+    /// An unusable selection is a state of its own, so moving into one (from
+    /// unset, or from a different bad file) rebuilds — and the rebuild is what
+    /// warns — while staying in the same bad state does not repeat itself.
+    #[test]
+    fn moving_into_an_unusable_file_rebuilds_so_it_can_warn() {
+        type State = Result<Option<&'static str>, &'static str>;
+        let mut last: State = Ok(None);
+        let mut rebuilds = 0;
+        for (now, expect) in [
+            (Err("missing a"), true),  // unset -> bad
+            (Err("missing a"), false), // same bad
+            (Err("empty b"), true),    // bad -> different bad
+            (Ok(Some("f")), true),     // bad -> good
+            (Err("unreadable"), true), // good -> bad
+        ] {
+            assert_eq!(refresh_override(&mut last, || now, || rebuilds += 1), expect);
+        }
+        assert_eq!(rebuilds, 4);
     }
 
     #[test]

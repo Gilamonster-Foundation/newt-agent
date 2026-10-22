@@ -568,8 +568,9 @@ fn a_system_prompt_file_replaces_the_assembled_prompt_2938() {
 
     newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, file.to_str().unwrap());
     let overridden = rebuild_system_prompt(workspace, &memory, None, "s", None);
-    newt_core::process_env::remove_var(newt_core::SYSTEM_PROMPT_FILE_ENV);
+    newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, "");
     let assembled = rebuild_system_prompt(workspace, &memory, None, "s", None);
+    newt_core::process_env::remove_var(newt_core::SYSTEM_PROMPT_FILE_ENV);
 
     assert_eq!(overridden, pruned);
     assert!(

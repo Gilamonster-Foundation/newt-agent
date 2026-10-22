@@ -96,9 +96,8 @@ fn say(pty: &Pty, line: &str, expect: &str) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial_test::serial(prompt_override_pty)]
-async fn the_tui_sends_exactly_the_file_and_set_and_reset_apply_at_once() {
+/// A mock provider plus an isolated config; `config_tail` is appended to it.
+async fn fixture(config_tail: &str) -> (MockServer, tempfile::TempDir, std::path::PathBuf) {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -112,7 +111,6 @@ async fn the_tui_sends_exactly_the_file_and_set_and_reset_apply_at_once() {
         .respond_with(Echo)
         .mount(&server)
         .await;
-
     let root = common::isolated_root();
     let config_dir = root.path().join(".newt");
     std::fs::create_dir(&config_dir).unwrap();
@@ -120,20 +118,21 @@ async fn the_tui_sends_exactly_the_file_and_set_and_reset_apply_at_once() {
     std::fs::write(
         &config,
         format!(
-            "default_backend = \"fixture\"\n\n[[backends]]\nname = \"fixture\"\nendpoint = \"{}\"\nmodel = \"{MODEL}\"\nkind = \"openai\"\n\n[tui.permissions]\npreset = \"read_only\"\nprompt = false\nextra_exec = []\nnet = []\n",
+            "default_backend = \"fixture\"\n\n[[backends]]\nname = \"fixture\"\nendpoint = \"{}\"\nmodel = \"{MODEL}\"\nkind = \"openai\"\n\n[tui.permissions]\npreset = \"read_only\"\nprompt = false\nextra_exec = []\nnet = []\n{config_tail}",
             server.uri()
         ),
     )
     .unwrap();
-    let file = root.path().join("pruned.md");
-    std::fs::write(&file, PRUNED).unwrap();
+    (server, root, config)
+}
 
+fn start(root: &tempfile::TempDir, config: &std::path::Path) -> (Pty, tokio::process::Child) {
     let pty = Pty::open();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_newt"));
     common::isolate(&mut cmd, root.path());
     cmd.args(["--no-splash", "--ephemeral", "--no-prompt-for-permissions"])
         .arg("--config")
-        .arg(&config)
+        .arg(config)
         .env("NEWT_DISABLE_OCAP", "0")
         .env("NEWT_FULL_ACCESS", "0")
         .env("NEWT_EDIT_MODE", "emacs")
@@ -146,9 +145,19 @@ async fn the_tui_sends_exactly_the_file_and_set_and_reset_apply_at_once() {
         .stdout(pty.slave_stdio())
         .stderr(pty.slave_stdio())
         .kill_on_drop(true);
-    let mut child = cmd.spawn().expect("spawn real CLI on the owned PTY");
+    let child = cmd.spawn().expect("spawn real CLI on the owned PTY");
     drop(cmd);
     assert!(pty.wait_for_screen(READY, BUDGET), "{:?}", pty.screen());
+    (pty, child)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(prompt_override_pty)]
+async fn the_tui_sends_exactly_the_file_and_set_and_reset_apply_at_once() {
+    let (server, root, config) = fixture("").await;
+    let file = root.path().join("pruned.md");
+    std::fs::write(&file, PRUNED).unwrap();
+    let (pty, mut child) = start(&root, &config);
 
     say(&pty, "TURN_ONE", "ECHO[TURN_ONE]");
     say(
@@ -177,5 +186,51 @@ async fn the_tui_sends_exactly_the_file_and_set_and_reset_apply_at_once() {
     assert!(
         three.contains("Workspace: ") && !three.contains(PRUNED),
         "reset applies at once: {three:.300}"
+    );
+}
+
+/// `reset` is a session state: it suppresses a configured `[prompt] file`
+/// (leaving the config alone) rather than revealing it again, and selecting an
+/// unusable file is refused and leaves the previous state in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(prompt_override_pty)]
+async fn reset_beats_a_configured_file_and_an_unusable_file_is_refused() {
+    let root_for_file = common::isolated_root();
+    let file = root_for_file.path().join("configured.md");
+    std::fs::write(&file, PRUNED).unwrap();
+    let (server, root, config) = fixture(&format!("\n[prompt]\nfile = {:?}\n", file)).await;
+    let (pty, mut child) = start(&root, &config);
+
+    say(&pty, "TURN_ONE", "ECHO[TURN_ONE]");
+    say(
+        &pty,
+        "/settings system-prompt reset",
+        "system prompt file: reset",
+    );
+    say(&pty, "TURN_TWO", "ECHO[TURN_TWO]");
+    say(
+        &pty,
+        "/settings system-prompt /no/such/prompt.md",
+        "nothing changed",
+    );
+    say(&pty, "TURN_THREE", "ECHO[TURN_THREE]");
+    pty.type_in("/exit\r");
+    let _ = tokio::time::timeout(BUDGET, child.wait()).await;
+
+    assert_eq!(system_message_for(&server, "TURN_ONE").await, PRUNED);
+    let two = system_message_for(&server, "TURN_TWO").await;
+    assert!(
+        two.contains("Workspace: ") && !two.contains(PRUNED),
+        "{two:.300}"
+    );
+    let three = system_message_for(&server, "TURN_THREE").await;
+    assert!(
+        three.contains("Workspace: ") && !three.contains(PRUNED),
+        "{three:.300}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        PRUNED,
+        "config file untouched"
     );
 }

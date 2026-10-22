@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{expand_tilde, Config};
 
-/// Session twin of `[prompt] file`: set by `--system-prompt-file` and
-/// `/settings system-prompt`, read before the config.
+/// Session twin of `[prompt] file`, set by `/settings system-prompt` and read
+/// before the config: a path overrides it, a blank value (`reset`) suppresses
+/// it, and absence defers to it.
 pub const SYSTEM_PROMPT_FILE_ENV: &str = "NEWT_SYSTEM_PROMPT_FILE";
 
 /// `[prompt]` — when `file` is set, its bytes REPLACE newt's assembled system
@@ -39,11 +40,15 @@ impl Config {
         self.system_prompt_file_with(std::env::var(SYSTEM_PROMPT_FILE_ENV).ok())
     }
 
+    /// The twin has three states: absent (use `[prompt] file`), a path, and
+    /// present-but-blank — a session `reset`, which suppresses the configured
+    /// file and restores the assembled prompt without touching the config.
     pub(crate) fn system_prompt_file_with(&self, env: Option<String>) -> Option<PathBuf> {
-        let configured = self.prompt.as_ref().and_then(|p| p.file.clone());
-        env.filter(|s| !s.trim().is_empty())
-            .or(configured.filter(|s| !s.trim().is_empty()))
-            .map(|s| expand_tilde(&s))
+        let chosen = match env {
+            Some(twin) => twin,
+            None => self.prompt.as_ref().and_then(|p| p.file.clone())?,
+        };
+        (!chosen.trim().is_empty()).then(|| expand_tilde(&chosen))
     }
 
     /// The replacement system prompt, if an override file is configured.
@@ -58,6 +63,11 @@ impl Config {
 }
 
 impl SystemPromptOverride {
+    /// [`read`](Self::read) for a path as the operator typed it (`~/` expands).
+    pub fn read_typed(path: &str) -> Result<Self, String> {
+        Self::read(expand_tilde(path))
+    }
+
     pub fn read(path: PathBuf) -> Result<Self, String> {
         Self::read_with(path, |p| std::fs::read_to_string(p))
     }
@@ -99,11 +109,8 @@ mod tests {
             c.system_prompt_file_with(Some("/tmp/session.md".into())),
             Some("/tmp/session.md".into())
         );
-        // A blank twin is "unset", not "override with nothing".
-        assert_eq!(
-            c.system_prompt_file_with(Some("  ".into())),
-            Some("/etc/p.md".into())
-        );
+        // A blank twin is a session reset: it suppresses the configured file.
+        assert_eq!(c.system_prompt_file_with(Some("  ".into())), None);
     }
 
     #[test]

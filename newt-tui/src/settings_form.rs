@@ -831,8 +831,15 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // (it needs the terminal), so it never lands here as a path.
         Field::SystemPrompt => match value {
             "edit" => return Err("system-prompt edit needs the interactive session".to_string()),
-            "reset" => newt_core::process_env::remove_var(newt_core::SYSTEM_PROMPT_FILE_ENV),
-            path => newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, path),
+            // Blank, not removed: a removed twin would reveal `[prompt] file`.
+            "reset" => newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, ""),
+            path => {
+                // An unusable file is refused here, not reported as active.
+                newt_core::SystemPromptOverride::read_typed(path).map_err(|e| {
+                    format!("{e}; nothing changed, newt keeps sending its previous prompt")
+                })?;
+                newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, path);
+            }
         },
         // The one field here that PERSISTS: a prefix you had to set again every
         // session would be a trap. `[tui] prefix_key`, through the

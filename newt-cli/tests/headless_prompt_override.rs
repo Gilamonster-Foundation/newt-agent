@@ -28,7 +28,10 @@ impl Respond for Capture {
 
 /// Run `newt headless` once against a capturing peer, with `extra` args and an
 /// optional config body; return the first request's system message.
-async fn system_message(extra: &[&std::ffi::OsStr], config_tail: &str) -> Result<String, String> {
+async fn system_messages(
+    extra: &[&std::ffi::OsStr],
+    config_tail: &str,
+) -> Result<Vec<String>, String> {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -66,7 +69,20 @@ async fn system_message(extra: &[&std::ffi::OsStr], config_tail: &str) -> Result
     }
     let body = requests.lock().unwrap().pop().expect("one request");
     assert_eq!(body["messages"][0]["role"], "system", "{body}");
-    Ok(body["messages"][0]["content"].as_str().unwrap().to_string())
+    Ok(body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "system")
+        .map(|m| m["content"].as_str().unwrap().to_string())
+        .collect())
+}
+
+/// The first system message (the plain-mode tests' view).
+async fn system_message(extra: &[&std::ffi::OsStr], config_tail: &str) -> Result<String, String> {
+    system_messages(extra, config_tail)
+        .await
+        .map(|all| all[0].clone())
 }
 
 const PRUNED: &str = "You are terse.\n\n  Keep this spacing.\n";
@@ -123,4 +139,40 @@ async fn a_missing_override_file_fails_the_run_instead_of_falling_back() {
     .await
     .unwrap_err();
     assert!(err.contains("/no/such/prompt.md"), "{err}");
+}
+
+/// Every provider-visible system message is the file and nothing else, also
+/// with a scratchpad installed (its working-memory head used to lead message 0).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scratchpad_adds_nothing_to_the_system_material() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), PRUNED).unwrap();
+    let seed = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(seed.path(), r#"{"k": "v"}"#).unwrap();
+    let all = system_messages(
+        &[
+            "--system-prompt-file".as_ref(),
+            file.path().as_os_str(),
+            "--scratchpad-state".as_ref(),
+            seed.path().as_os_str(),
+        ],
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(all, vec![PRUNED.to_string()]);
+}
+
+/// The plain control, over ALL system messages rather than the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_file_is_the_only_system_message() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), PRUNED).unwrap();
+    let all = system_messages(
+        &["--system-prompt-file".as_ref(), file.path().as_os_str()],
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(all, vec![PRUNED.to_string()]);
 }
