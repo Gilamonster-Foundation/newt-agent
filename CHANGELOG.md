@@ -16,6 +16,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   `[tools: …]` footer segment and a `$TOOLS` prompt token. A write that a
   pinned `NEWT_CONFIG` or project overlay overrides is refused, naming the layer.
 
+### Fixed
+
+- `plan_approval_turn` no longer fails under a narrow terminal: the child runs in its
+  own session, so crossterm cannot read the test runner's PTY width (#2972).
+
 ## [0.8.3] — 2026-10-20
 
 ### Security

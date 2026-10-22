@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newt-Agent: OCAP</title>
+<meta name="description" content="Every tool call runs under a capability: what it may read, write, run, and reach. The operator sets the ceiling, the gate checks each call, and the ke">
+<link rel="icon" href="favicon.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="topnav" aria-label="Site">
+  <a href="index.html">Newt-Agent</a>
+  <a href="context.html">Context</a>
+  <a href="ocap.html" aria-current="page">OCAP</a>
+  <a href="frame.html">Agent-frame</a>
+  <a href="identity.html">Identity</a>
+  <a href="mesh.html">Mesh</a>
+  <a href="https://github.com/Gilamonster-Foundation/newt-agent">Source</a>
+</nav>
+<main>
+
+<h1 style="margin-top:28px">How Newt grants and enforces authority</h1>
+<p class="lede">Every tool call runs under a capability: what it may read, write, run, and reach. The operator sets the ceiling, the gate checks each call, and the kernel enforces it where the OS allows. Step through one write that is allowed and one network call that is not.</p>
+
+<section class="demo" aria-labelledby="stage-title">
+  <div class="stage-head">
+    <h2 class="stage-title" id="stage-title" style="margin:0;font-size:1.1rem"></h2>
+    <span class="stage-count" id="stage-count"></span>
+  </div>
+  <p class="caption" id="caption" aria-live="polite"></p>
+  <div class="scene" id="scene"></div>
+  <div class="zones" id="zones"></div>
+  <div class="controls">
+    <button id="prev" type="button">Back</button>
+    <button id="play" type="button" aria-pressed="false">Play</button>
+    <button id="next" type="button">Next</button>
+    <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
+  </div>
+  <p class="fine">Example paths and hosts are illustrative. Types come from <code>newt-core/src/caveats.rs</code> and <code>newt-core/src/agentic/permissions.rs</code>. Keys: left/right arrows step, space plays or pauses.</p>
+</section>
+<h2>Going further</h2>
+<p><a href="brush.html"><strong>The brush shell</strong></a>: how a shell command becomes individually checked spawns, and why.</p>
+<h2>What each stage maps to</h2>
+<div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
+<tr><td>Ceiling</td><td>Operator picks workspace access once; frozen for the session.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/launch_authority.rs"><code>newt-core/src/launch_authority.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Check</td><td>Each call is tested on fs_read, fs_write, exec and net.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/caveats.rs"><code>newt-core/src/caveats.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Deny and ask</td><td>Typed denial (DenialKind), then the gate asks the operator.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/permissions.rs"><code>newt-core/src/agentic/permissions.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Widen once</td><td>widen_caveats adds one target to one axis for one re-run.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/permissions.rs"><code>newt-core/src/agentic/permissions.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Durable grants</td><td>Signed approve.toml; four verdict files; unsigned approvals are dropped.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/ocap_store.rs"><code>newt-core/src/ocap_store.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Kernel fence</td><td>Confined child via agent-bridle; refuses if it cannot enforce.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/confined_exec.rs"><code>newt-core/src/confined_exec.rs</code></a></td><td class="status"><span class="impl">Implemented, open deviations</span></td></tr>
+<tr><td>Delegation</td><td>meet only narrows; Lean proofs cover the lattice, not the whole runtime.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/formal/CaveatLattice/"><code>formal/CaveatLattice/</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Grant tree view</td><td>A per-host, per-path grant tree is a pure view, not wired in.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/grant_tree.rs"><code>newt-core/src/grant_tree.rs</code></a></td><td class="status"><span class="impl design">Design only</span></td></tr>
+</tbody></table></div>
+<h2>What this does not show</h2>
+<ul>
+<li>On macOS, deny-all network is supported for audited launches by an unprivileged caller with pipe or null stdio. Hostname-scoped and deputy-relayed network grants are not enforceable there and are refused, so a per-host network fence is not shown.</li>
+<li>Windows AppContainer does not enforce a restricted exec allowlist; it fails closed and refuses the shell tool.</li>
+<li><code>--yolo</code> (<code>--disable-ocap</code>) runs on the host shell with no confinement.</li>
+<li>Signatures do not stop an older valid file being restored, and do not help if an attacker holds the operator key.</li>
+<li>Open deviations are tracked in <a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/docs/security/ocap-deviations.md">docs/security/ocap-deviations.md</a>.</li>
+</ul>
+</main>
+<footer>Apache-2.0. <a href="https://github.com/Gilamonster-Foundation/newt-agent">Gilamonster Foundation / newt-agent</a>.</footer>
+</div>
+<script src="stepper.js"></script>
+<script src="diagram.js"></script>
+<script>
+var SPEC = {
+ "nodes": [
+  {
+   "id": "op",
+   "label": "Operator",
+   "x": 15,
+   "y": 12
+  },
+  {
+   "id": "grant",
+   "label": "Session grant",
+   "x": 50,
+   "y": 12,
+   "sub": "Caveats: fs_write ~/proj, net none"
+  },
+  {
+   "id": "store",
+   "label": "approve.toml",
+   "x": 85,
+   "y": 12,
+   "sub": "signed durable grants",
+   "kind": "store"
+  },
+  {
+   "id": "model",
+   "label": "Model",
+   "x": 15,
+   "y": 50
+  },
+  {
+   "id": "gate",
+   "label": "Permission gate",
+   "x": 50,
+   "y": 50,
+   "sub": "fs_read, fs_write, exec, net"
+  },
+  {
+   "id": "bridle",
+   "label": "agent-bridle",
+   "x": 85,
+   "y": 50,
+   "sub": "Landlock, Seatbelt, AppContainer"
+  },
+  {
+   "id": "child",
+   "label": "Sub-agent key",
+   "x": 15,
+   "y": 88,
+   "sub": "delegated authority"
+  },
+  {
+   "id": "net",
+   "label": "api.example.com",
+   "x": 50,
+   "y": 88
+  },
+  {
+   "id": "file",
+   "label": "~/proj/src/a.rs",
+   "x": 85,
+   "y": 88
+  }
+ ],
+ "stages": [
+  {
+   "title": "The operator sets the ceiling",
+   "cap": "At launch the operator picks what the session may touch, for example --workspace-access code ~/proj. The grant is resolved once and frozen for the session. Network is off unless granted.",
+   "show": [
+    "op",
+    "grant"
+   ],
+   "hot": [
+    "grant"
+   ],
+   "edges": [
+    [
+     "op",
+     "grant",
+     "--workspace-access"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: launch_authority.rs"
+  },
+  {
+   "title": "A call inside the grant passes",
+   "cap": "The model asks to write a file under the project. The gate checks the call against the grant on each axis (read, write, exec, net). The path is inside fs_write, so it proceeds.",
+   "show": [
+    "op",
+    "grant",
+    "model",
+    "gate",
+    "file"
+   ],
+   "hot": [
+    "gate"
+   ],
+   "edges": [
+    [
+     "model",
+     "gate",
+     "write_file"
+    ],
+    [
+     "grant",
+     "gate",
+     "checked against",
+     1
+    ],
+    [
+     "gate",
+     "file",
+     "permits_fs_write"
+    ]
+   ],
+   "state": {
+    "file": "ok"
+   },
+   "tag": {},
+   "note": "Implemented: CaveatsExt::permits_fs_write"
+  },
+  {
+   "title": "A call outside the grant is denied",
+   "cap": "Now the model tries to reach a host that is not granted. The check fails and the gate returns a typed denial, here DenialKind::Net. Nothing was sent.",
+   "show": [
+    "op",
+    "grant",
+    "model",
+    "gate",
+    "net"
+   ],
+   "hot": [
+    "gate"
+   ],
+   "edges": [
+    [
+     "model",
+     "gate",
+     "curl api.example.com"
+    ],
+    [
+     "grant",
+     "gate",
+     "checked against",
+     1
+    ],
+    [
+     "gate",
+     "net",
+     "permits_net"
+    ]
+   ],
+   "state": {
+    "net": "deny"
+   },
+   "tag": {
+    "gate": "DenialKind::Net"
+   },
+   "note": "Implemented: PermissionDecision::Deny"
+  },
+  {
+   "title": "The operator can widen by one target",
+   "cap": "The gate asks. If the operator allows it, widen_caveats adds exactly that one host to one axis for the re-run of this call. Operator approval widens. It is delegation that only narrows.",
+   "show": [
+    "op",
+    "grant",
+    "model",
+    "gate",
+    "net"
+   ],
+   "hot": [
+    "op"
+   ],
+   "edges": [
+    [
+     "gate",
+     "op",
+     "allow once?"
+    ],
+    [
+     "op",
+     "gate",
+     "Allow(+1 host)"
+    ],
+    [
+     "gate",
+     "net",
+     "re-run"
+    ]
+   ],
+   "state": {
+    "net": "ok"
+   },
+   "tag": {
+    "grant": "one host added, this call only"
+   },
+   "note": "Implemented: widen_caveats"
+  },
+  {
+   "title": "Always-allow is saved and signed",
+   "cap": "If the operator picks always-allow, the grant is written to approve.toml with an Ed25519 signature from the operator root key. Unsigned or tampered approvals are dropped and the gate asks again. Deny, ask and passkey files can only narrow, so they load unsigned.",
+   "show": [
+    "op",
+    "grant",
+    "gate",
+    "store"
+   ],
+   "hot": [
+    "store"
+   ],
+   "edges": [
+    [
+     "op",
+     "store",
+     "sign (Ed25519)"
+    ],
+    [
+     "store",
+     "gate",
+     "precedence: deny > passkey > ask > approve"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: ocap_store.rs"
+  },
+  {
+   "title": "The kernel enforces what the gate decided",
+   "cap": "An allowed command runs in a confined child. The resolved caveats go to agent-bridle as an ExecRequest. The filesystem fence is Landlock on Linux and Seatbelt on macOS; Windows uses AppContainer. If the host cannot enforce the fence, the spawn is refused rather than run unconfined.",
+   "show": [
+    "grant",
+    "gate",
+    "bridle",
+    "file"
+   ],
+   "hot": [
+    "bridle"
+   ],
+   "edges": [
+    [
+     "gate",
+     "bridle",
+     "ExecRequest(Caveats)"
+    ],
+    [
+     "bridle",
+     "file",
+     "kernel fence"
+    ]
+   ],
+   "state": {
+    "file": "ok"
+   },
+   "tag": {
+    "bridle": "fail-closed"
+   },
+   "note": "Implemented, with open platform deviations (see table)"
+  },
+  {
+   "title": "Delegated authority only shrinks",
+   "cap": "When a sub-agent gets its own key, its caveats are combined with meet against its parent. A child that tries to widen is refused. The lattice laws are machine-checked in Lean.",
+   "show": [
+    "grant",
+    "child"
+   ],
+   "hot": [
+    "child"
+   ],
+   "edges": [
+    [
+     "grant",
+     "child",
+     "meet(): can only narrow"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: meet + formal/CaveatLattice"
+  }
+ ]
+};
+var onShow = Diagram(document.getElementById('scene'), SPEC);
+Stepper({ stages: SPEC.stages, onShow: onShow });
+</script>
+</body>
+</html>

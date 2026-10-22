@@ -1,5 +1,9 @@
-pub(in crate::agentic::tools) use super::super::git_fixture::{hermetic_git, hermetic_git_env};
+pub(in crate::agentic::tools) use super::super::git_fixture::hermetic_git;
+// Only the Linux real-kernel-fence tests consume these.
+#[cfg(target_os = "linux")]
+pub(in crate::agentic::tools) use super::super::git_fixture::hermetic_git_env;
 
+#[cfg(target_os = "linux")]
 const FIXTURE_GIT: &str = "/usr/bin/git";
 
 /// The real-kernel-fence tests in this file need Landlock AND the
