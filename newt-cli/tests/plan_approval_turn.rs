@@ -321,3 +321,63 @@ scheduled = true
         assert!(result(id).contains("denied"), "{id}: {}", result(id));
     }
 }
+
+/// #2972 regression: re-run the production test with a 32-column PTY as its
+/// controlling terminal. Without the child's `setsid`, crossterm reads that
+/// width through `/dev/tty` and the transcript wraps.
+#[test]
+fn production_plan_approval_is_independent_of_terminal_width() {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::process::CommandExt as _;
+    const GUARD: &str = "NEWT_PLAN_APPROVAL_NARROW_PTY";
+    if std::env::var_os(GUARD).is_some() {
+        return;
+    }
+    let (mut master, mut slave) = (-1, -1);
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 32,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `openpty` fills both descriptors on success; each is moved into
+    // exactly one `OwnedFd` below.
+    let (_master, slave) = unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &size as *const _ as *mut _
+            ),
+            0
+        );
+        (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))
+    };
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "production_plan_approval_preserves_adoption_and_recalled_grants",
+        "--nocapture",
+    ])
+    .env(GUARD, "1")
+    .stdin(slave.try_clone().unwrap());
+    let slave_fd = slave.as_raw_fd();
+    // SAFETY: only async-signal-safe `setsid`/`ioctl` run between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() == -1 || libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
