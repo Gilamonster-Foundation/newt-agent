@@ -123,12 +123,7 @@ fn search_one(
     // One handle opened beneath the workspace without following a final link:
     // a file swapped for a symlink after the walk saw it fails the open
     // instead of being read (#2980).
-    let searched = path
-        .strip_prefix(workspace_root)
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
-        .and_then(|rel| {
-            crate::fs_cap::WorkspaceDir::open_root(workspace_root)?.open_regular(rel, true)
-        })
+    let searched = super::open_workspace_file(workspace_root, path)
         .map_err(|_| ())
         .and_then(|file| {
             searcher

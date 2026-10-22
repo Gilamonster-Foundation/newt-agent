@@ -3274,22 +3274,28 @@ fn find_walk(
 /// evidence question and the walk is already bounded to a source workspace. The
 /// counting itself is factored into [`count_newlines`] so it stays unit-testable
 /// without touching the filesystem (the mocked tier).
+/// Open one file found by a `find`/`grep` walk through the same platform
+/// boundary `read_file` and artifact capture use: beneath the workspace as the
+/// only read scope, never following a final link. Platforms without a
+/// race-safe opener refuse; there is no ambient `fs::read` fallback.
+pub(super) fn open_workspace_file(
+    workspace_root: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    let scope = crate::caveats::Scope::only([workspace_root.to_string_lossy().into_owned()]);
+    file_capture::open_for_scope(&scope, path, true)
+}
+
 fn count_lines(workspace_root: &std::path::Path, path: &std::path::Path) -> u64 {
     use std::io::Read;
     // One handle, opened beneath the workspace without following a final
     // link: a leaf swapped for a symlink after the walk saw it fails the open
     // instead of being read (#2980).
-    let counted = path
-        .strip_prefix(workspace_root)
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
-        .and_then(|rel| {
-            crate::fs_cap::WorkspaceDir::open_root(workspace_root)?.open_regular(rel, true)
-        })
-        .and_then(|mut file| {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            Ok(count_newlines(&bytes))
-        });
+    let counted = open_workspace_file(workspace_root, path).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(count_newlines(&bytes))
+    });
     counted.unwrap_or(0)
 }
 
