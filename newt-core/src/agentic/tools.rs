@@ -55,7 +55,8 @@ mod path_suggest;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
 pub use dispatch::{
-    execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
+    execute_tool, execute_tool_quiet, execute_tool_with_offload,
+    execute_tool_with_offload_and_prompt_and_artifacts,
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 use path_suggest::FileIoError;
@@ -864,6 +865,29 @@ fn find_root_contained(
         // Can't canonicalize — keep the old permissive behaviour (deny only on a
         // proven escape).
         _ => true,
+    }
+}
+
+/// `find`/`grep` walk with a legacy walker that reopens every path by name,
+/// so only the workspace fence (object-bound, above) holds for the walk. A
+/// narrower `fs_read` scope cannot be enforced there — a symlink inside the
+/// scope can lead to a denied sibling (#2980) — so the walkers fail closed
+/// unless the read scope covers the whole workspace.
+const SCOPE_NOT_WALKABLE: &str = "capability denied: find/grep walk the whole workspace and cannot enforce a narrower fs_read scope. Use list_dir/read_file inside the granted scope, or run_command within your granted authority.";
+
+fn read_scope_covers_workspace(scope: &crate::caveats::Scope<String>, workspace: &str) -> bool {
+    match scope {
+        crate::caveats::Scope::All => true,
+        crate::caveats::Scope::Only(set) => {
+            let Ok(ws) = std::path::Path::new(workspace).canonicalize() else {
+                return false;
+            };
+            set.iter().any(|root| {
+                std::path::Path::new(root)
+                    .canonicalize()
+                    .is_ok_and(|root| ws.starts_with(root))
+            })
+        }
     }
 }
 
@@ -3212,6 +3236,11 @@ fn find_walk(
 /// counting itself is factored into [`count_newlines`] so it stays unit-testable
 /// without touching the filesystem (the mocked tier).
 fn count_lines(path: &std::path::Path) -> u64 {
+    // A symlink entry is never followed: its target may lie outside the
+    // authorized tree (#2980).
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return 0;
+    }
     match std::fs::read(path) {
         Ok(bytes) => count_newlines(&bytes),
         Err(_) => 0,
@@ -5525,7 +5554,7 @@ async fn execute_authorized_tool(
                     Err(tool_output) => receipt.present(file_capture::failure(tool_output.render(workspace, &caveats.fs_read), ""), "", presentation),
                 }
             } else {
-                format!("user declined to write {path}")
+                executed((format!("user declined to write {path}"), crate::ExecOutcome::Denied))
             }
         }
 
@@ -5933,6 +5962,10 @@ async fn execute_authorized_tool(
                 if !allowed {
                     return denied_fs_result("fs_read", &full_str);
                 }
+            } else if !read_scope_covers_workspace(&caveats.fs_read, workspace) {
+                // Lexically inside a narrower grant: the walk below cannot
+                // keep to it (a symlink can lead to a denied sibling).
+                return SCOPE_NOT_WALKABLE.to_string();
             }
             // #1176: shadow-OCAP — record the search root under --full-access
             // (the fuzzer's "find the 10 largest files" is a canonical case).
@@ -6018,6 +6051,10 @@ async fn execute_authorized_tool(
                 if !allowed {
                     return denied_fs_result("fs_read", &full_str);
                 }
+            } else if !read_scope_covers_workspace(&caveats.fs_read, workspace) {
+                // Lexically inside a narrower grant: the walk below cannot
+                // keep to it (a symlink can lead to a denied sibling).
+                return SCOPE_NOT_WALKABLE.to_string();
             }
             // #1176: shadow-OCAP — record the search root under --full-access.
             if full_access_requested() {

@@ -84,7 +84,7 @@ pub const FILE_TOOLS: [&str; 6] = [
 ];
 
 /// [`FILE_TOOLS`] in MCP shape, taken verbatim from newt-core's catalog.
-fn file_tool_definitions() -> Vec<Value> {
+pub(crate) fn file_tool_definitions() -> Vec<Value> {
     let Value::Array(defs) = newt_core::agentic::tool_definitions() else {
         unreachable!("tool_definitions always returns a JSON array");
     };
@@ -412,43 +412,21 @@ async fn handle_file_tool(name: &str, args: &Value, workspace: &str, granted: &C
     );
     // The executor's future is `!Send` (its permission-gate seam) and this
     // server's handlers must be `Send`, so it runs to completion on a
-    // blocking thread with its own reactor (the dispatch polls a cancel
-    // flag on a tokio timer).
+    // blocking thread with its own reactor. The quiet entry point prints
+    // nothing: stdout is the JSON-RPC wire. There is no cancel flag here — a
+    // dropped request leaves the (finite) file operation to finish.
     let out = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        Ok::<_, std::io::Error>(rt.block_on(newt_core::execute_tool(
-            &tool,
-            &args,
-            &workspace,
-            false,
-            20,
-            &granted,
-            &mut newt_core::NoMcp,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+        Ok::<_, std::io::Error>(rt.block_on(newt_core::execute_tool_quiet(
+            &tool, &args, &workspace, &granted,
         )))
     })
     .await;
     match out {
-        // ponytail: the executor reports failure only in its model-facing
-        // text; switch to a typed outcome if that entry point ever returns one.
-        Ok(Ok(text)) if text.starts_with("error:") || text.starts_with("capability denied") => {
-            mcp_error_content(&text)
-        }
-        Ok(Ok(text)) => mcp_text_content(&text),
+        Ok(Ok((text, true))) => mcp_text_content(&text),
+        Ok(Ok((text, false))) => mcp_error_content(&text),
         Ok(Err(e)) => mcp_error_content(&format!("error: {name}: {e}")),
         Err(e) => mcp_error_content(&format!("error: {name}: {e}")),
     }
@@ -1075,6 +1053,94 @@ mod tests {
         let text = text_of(&resp);
         assert!(text.starts_with("capability denied"), "{text}");
         assert!(!text.contains("must not leak"), "{text}");
+    }
+
+    /// Fixture: `ws/allowed` (the only granted root), `ws/private/secret.txt`,
+    /// and `ws/allowed/link -> ../private`.
+    #[cfg(unix)]
+    fn symlink_escape_fixture() -> tempfile::TempDir {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("allowed")).unwrap();
+        std::fs::create_dir_all(ws.path().join("private")).unwrap();
+        std::fs::write(ws.path().join("private/secret.txt"), "SCOPE_SECRET_2980\n").unwrap();
+        std::os::unix::fs::symlink("../private", ws.path().join("allowed/link")).unwrap();
+        ws
+    }
+
+    /// Regression (#2980 review): `find`/`grep` checked the read scope
+    /// lexically and the walk root against the WORKSPACE only, so a symlink
+    /// inside the granted root disclosed a denied sibling. The walkers now
+    /// refuse a read scope narrower than the workspace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_and_find_refuse_a_read_scope_narrower_than_the_workspace() {
+        let ws = symlink_escape_fixture();
+        let granted = fenced_to(&ws.path().join("allowed"));
+        for (tool, args) in [
+            (
+                "grep",
+                serde_json::json!({"pattern": "SCOPE_SECRET_2980", "path": "allowed/link"}),
+            ),
+            (
+                "grep",
+                serde_json::json!({"pattern": "SCOPE_SECRET_2980", "path": "allowed"}),
+            ),
+            ("find", serde_json::json!({"path": "allowed/link"})),
+            (
+                "find",
+                serde_json::json!({"path": "allowed", "show_lines": true}),
+            ),
+        ] {
+            let resp = call_file_tool(ws.path(), granted.clone(), tool, args).await;
+            assert_eq!(resp["result"]["isError"], true, "{tool}: {resp}");
+            assert!(
+                text_of(&resp).starts_with("capability denied"),
+                "{tool}: {resp}"
+            );
+            assert!(
+                !text_of(&resp).contains("SCOPE_SECRET_2980"),
+                "{tool}: {resp}"
+            );
+        }
+    }
+
+    /// Regression (#2980 review): `find show_lines` counted lines through
+    /// ambient `std::fs::read`, following a leaf symlink to a file outside
+    /// the tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_show_lines_does_not_follow_a_leaf_symlink() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        std::fs::write(elsewhere.path().join("big.txt"), "a\nb\nc\nd\n").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("big.txt"), ws.path().join("ln.txt"))
+            .unwrap();
+        let resp = call_file_tool(
+            ws.path(),
+            Caveats::top(),
+            "find",
+            serde_json::json!({"path": ".", "show_lines": true}),
+        )
+        .await;
+        assert_eq!(text_of(&resp), "0\tln.txt", "{resp}");
+    }
+
+    /// Regression (#2980 review): the default (unconfined) leash refuses
+    /// `write_file` — core's `user declined to write` — and that refusal was
+    /// returned as MCP success.
+    #[tokio::test]
+    async fn write_file_refused_under_the_default_leash_is_a_tool_error() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let resp = call_file_tool(
+            ws.path(),
+            Caveats::top(),
+            "write_file",
+            serde_json::json!({"path": "declined.txt", "content": "no grant\n"}),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        assert!(text_of(&resp).contains("declined"), "{resp}");
+        assert!(!ws.path().join("declined.txt").exists());
     }
 
     /// Regression (#2956): before, `code_edit` wrote anywhere on disk while

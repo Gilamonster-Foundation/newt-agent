@@ -11,7 +11,21 @@ def test_default_tool_definitions_lists_the_builtins() -> None:
     raw = mcp.default_tool_definitions()
     tools = json.loads(raw)
     names = {t["name"] for t in tools}
-    assert {"read_file", "edit_file", "list_dir", "grep", "goal_run"} <= names
+    assert {
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "find",
+        "grep",
+        "goal_run",
+    } <= names
+    # The file tools carry newt-core's catalog description and schema, same
+    # as `tools/list` (#2980 review) — not a bare name.
+    for tool in tools:
+        assert tool["description"], tool["name"]
+        if tool["name"] != "goal_run":
+            assert tool["inputSchema"]["type"] == "object", tool["name"]
 
 
 def test_mcp_server_register_and_handle() -> None:

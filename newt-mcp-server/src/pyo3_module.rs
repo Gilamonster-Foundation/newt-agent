@@ -112,10 +112,7 @@ impl Default for PyMcpServer {
 #[pyfunction]
 fn default_tool_definitions(py: Python<'_>) -> PyResult<String> {
     let _ = py;
-    let mut tools: Vec<serde_json::Value> = crate::handlers::FILE_TOOLS
-        .iter()
-        .map(|name| serde_json::json!({"name": name}))
-        .collect();
+    let mut tools = crate::handlers::file_tool_definitions();
     tools.push(serde_json::json!({
         "name": "goal_run",
         "description": "Run a tier-routed inference turn"

@@ -19,6 +19,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   `newt_agent.tools.read` / `edit` / `search` Python bindings are removed.
   `newt-tools` keeps only `apply_patch` / `apply_whole_files`; `newt-cli` and
   `newt-tui` drop the unused dependency.
+  `find` / `grep` now refuse (rather than walk) a read scope narrower than the
+  workspace, since their walker reopens paths by name and a symlink could lead
+  to a denied sibling; `find show_lines` no longer follows a symlink to count
+  lines. MCP file tools print nothing on stdout (it is the JSON-RPC wire) and
+  report refusals such as `user declined to write` as tool errors.
 
 ## [0.8.3] — 2026-10-20
 
