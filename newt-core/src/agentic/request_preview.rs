@@ -7,8 +7,34 @@
 //! reach live state or the network; the type of [`RequestSnapshot::report`]
 //! (`&self`, no sink) is the whole contract.
 
+use super::prompt_intake::PromptIntake;
+use super::prompt_read::{self, PromptReadContext};
 use super::request_report::{Annotation, RequestReport};
+use super::tools::ExposureSettings;
+use crate::{BackendKind, OpenAiApi};
 use serde_json::Value;
+
+/// The protected active-prompt card as the next turn would install it, built
+/// by the wire loops' own renderer. The prompt addresses are placeholders (no
+/// receipt exists before the operator submits), and `intake` is a stand-in for
+/// the unseen task; everything else is the real card.
+pub fn active_prompt_card_preview(exposure: &ExposureSettings, intake: &PromptIntake) -> String {
+    let base = prompt_read::active_prompt_card(PromptReadContext::new(None, "", None), exposure);
+    prompt_read::active_prompt_card_with_intake(base, intake)
+}
+
+/// The tools array in the shape the wire's body builder sends: Anthropic and
+/// Responses get their converted schemas, and Responses omits the field when
+/// the set is empty (`None`), exactly as its `build_body` does.
+pub fn wire_tools(kind: BackendKind, api: OpenAiApi, tools: &Value) -> Option<Vec<Value>> {
+    match (kind, api) {
+        (BackendKind::Anthropic, _) => Some(super::anthropic_wire::tools_to_anthropic(tools)),
+        (BackendKind::Openai, OpenAiApi::Responses) => {
+            Some(super::tools_to_responses(tools)).filter(|t| !t.is_empty())
+        }
+        _ => Some(tools.as_array().cloned().unwrap_or_default()),
+    }
+}
 
 /// Everything a preview reads, copied out of the session. Owned, so it cannot
 /// alias live state; built by the caller from shared borrows only.
@@ -18,6 +44,9 @@ pub struct RequestSnapshot {
     /// `None` when the provider omits the tools field entirely.
     pub tools: Option<Vec<Value>>,
     pub notes: Vec<Annotation>,
+    /// What this snapshot knowingly leaves out; printed in the report header
+    /// and marks the totals partial. Never empty: a preview is never "as sent".
+    pub omitted: String,
 }
 
 /// A preview needs at least one system message; nothing else can fail.
@@ -39,11 +68,10 @@ impl RequestSnapshot {
             return Err(EmptyPreview);
         }
         let texts: Vec<&str> = self.system_texts.iter().map(String::as_str).collect();
-        Ok(RequestReport::build_from_parts(
-            &texts,
-            self.tools.as_deref(),
-            &self.notes,
-        ))
+        let mut report =
+            RequestReport::build_from_parts(&texts, self.tools.as_deref(), &self.notes);
+        report.partial = Some(self.omitted.clone());
+        Ok(report)
     }
 }
 
@@ -63,6 +91,7 @@ mod tests {
                 source: "test".into(),
                 text: "Workspace: /w".into(),
             }],
+            omitted: "test".into(),
         }
     }
 
@@ -105,8 +134,10 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
-    /// The preview report is byte-identical to what the send path records for
-    /// the same texts and tools, so it cannot drift from the real request.
+    /// The preview report matches what the send path records for the same
+    /// texts and tools in every component and schema, so it cannot drift from
+    /// the real request. Only the preview wording differs: the header, the
+    /// `previewed` labels and the `(partial)` total.
     #[test]
     fn preview_matches_the_send_path_report() {
         let snap = snapshot(&["Workspace: /w\n\nrules"]);
@@ -114,9 +145,53 @@ mod tests {
         sink.annotate("ws", "test", "Workspace: /w");
         sink.observe_request(&["Workspace: /w\n\nrules"], snap.tools.as_deref())
             .unwrap();
+        let preview = snap.report().unwrap();
+        let sent = sink.last_report().unwrap();
+        assert_eq!(preview.system.len(), sent.system.len());
         assert_eq!(
-            snap.report().unwrap().to_markdown(),
-            sink.last_report().unwrap().to_markdown()
+            format!("{:?}{:?}", preview.system, preview.tools),
+            format!("{:?}{:?}", sent.system, sent.tools)
         );
+        let body = |md: String| {
+            md.split_once("\n## System message 1 (")
+                .unwrap()
+                .1
+                .to_string()
+        };
+        assert_eq!(
+            body(preview.to_markdown())
+                .replace("previewed", "as sent")
+                .replace("Total (partial)", "Total"),
+            body(sent.to_markdown())
+        );
+        assert!(preview.to_markdown().contains("preview, partial"));
+        assert!(!preview.to_markdown().contains("as sent"));
+    }
+
+    /// Finding (#2985 r1): a Responses request omits the tools field when the
+    /// exposed set is empty, and sends the flat Responses schema otherwise.
+    #[test]
+    fn wire_tools_follow_each_provider_body_builder() {
+        let chat =
+            json!([{"type":"function","function":{"name":"t","description":"d","parameters":{}}}]);
+        let get = |k, a, v: &Value| wire_tools(k, a, v);
+        assert_eq!(
+            get(BackendKind::Openai, OpenAiApi::Responses, &json!([])),
+            None
+        );
+        let responses = get(BackendKind::Openai, OpenAiApi::Responses, &chat).unwrap();
+        assert_eq!(responses[0]["name"], "t");
+        assert!(responses[0].get("function").is_none());
+        assert_eq!(
+            get(BackendKind::Openai, OpenAiApi::ChatCompletions, &chat).unwrap(),
+            chat.as_array().unwrap().clone()
+        );
+        assert_eq!(
+            get(BackendKind::Openai, OpenAiApi::ChatCompletions, &json!([])),
+            Some(vec![])
+        );
+        let anthropic = get(BackendKind::Anthropic, OpenAiApi::ChatCompletions, &chat).unwrap();
+        assert_eq!(anthropic[0]["name"], "t");
+        assert!(anthropic[0].get("input_schema").is_some());
     }
 }
