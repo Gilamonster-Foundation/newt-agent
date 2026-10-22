@@ -6742,6 +6742,56 @@ fn session_body(
                     // (Shared by the psyche panel gate here and the backend
                     // panel gate below, #1667.)
                     let panel_tokens: Vec<&str> = slash_body.split_whitespace().collect();
+                    // #2938: `/settings system-prompt edit` needs the terminal
+                    // (the editor) and the live system prompt, so it is the
+                    // session's, ahead of the typed form (which refuses it).
+                    if panel_tokens.as_slice() == ["settings", "system-prompt", "edit"] {
+                        use crate::system_prompt_edit::{self as spe, Outcome};
+                        let target = cfg.system_prompt_file().or_else(spe::default_target);
+                        let Some(target) = target else {
+                            print_newt(
+                                "no config directory to keep a system prompt in; set [prompt] file",
+                                color,
+                                verbose,
+                            );
+                            continue;
+                        };
+                        let mut io =
+                            spe::RealIo(|cmd: &str| surface.run_bang_escape(cmd, color, verbose));
+                        match spe::run(&mut io, &target, &system) {
+                            Ok(Outcome::Saved) => {
+                                let path = target.display().to_string();
+                                let _ = crate::settings_form::apply_and_record(
+                                    crate::settings_form::Field::SystemPrompt,
+                                    &path,
+                                    "/settings system-prompt edit",
+                                );
+                                system = rebuild_system_prompt(
+                                    workspace,
+                                    &memory,
+                                    active_persona.as_ref(),
+                                    &active_conversation_id,
+                                    Some(&*report_sink),
+                                );
+                                print_newt(&format!("system prompt saved to {path}: the next request sends exactly this file (add [prompt] file = \"{path}\" to keep it next session)"), color, verbose);
+                            }
+                            Ok(Outcome::Unchanged) => {
+                                print_newt("system prompt unchanged; nothing saved", color, verbose)
+                            }
+                            Ok(Outcome::Empty) => print_newt(
+                                "the editor left nothing; keeping the previous system prompt",
+                                color,
+                                verbose,
+                            ),
+                            Err(error) => print_newt(
+                                &format!("system prompt edit failed: {error:#}"),
+                                color,
+                                verbose,
+                            ),
+                        }
+                        println!();
+                        continue;
+                    }
                     // Bare `/settings` IS the panel on a rich-tui TTY — the
                     // chooser `slash_registry` has classified this family as
                     // since #1981, now that #1986/#2020 supply a region to draw
@@ -8986,9 +9036,13 @@ fn session_body(
                                         // Default `full` = identity (unchanged
                                         // advertised catalog); `auto`/`minimal`
                                         // size the schema set to the live budget.
-                                        exposure: newt_core::ExposureSettings::from(
-                                            cfg.tool_exposure(),
-                                        ),
+                                        exposure: newt_core::ExposureSettings {
+                                            // #2938: a system prompt file is the
+                                            // whole system message.
+                                            verbatim_system: crate::try_system_prompt_override()
+                                                .is_ok_and(|found| found.is_some()),
+                                            ..newt_core::ExposureSettings::from(cfg.tool_exposure())
+                                        },
                                         // Step 26.6a (#585): the experiential store
                                         // for record/recall — Some only when on.
                                         experience_store: experiential_on.then_some(

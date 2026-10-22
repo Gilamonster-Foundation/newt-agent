@@ -143,6 +143,7 @@ mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
 mod status_topics;
+mod system_prompt_edit;
 /// #1669 PR-A — the staged tab switch and the one tab-action handler, against
 /// live session state. Separate from the pure model so the staging discipline
 /// (Stage-0 read, deactivate, hydrate, reset⊕overlay, owner handoff) reads in
@@ -6066,6 +6067,32 @@ fn build_system_prompt_with_persona(
 // Tool-use loop — the real agentic core
 // ---------------------------------------------------------------------------
 
+/// The operator's system prompt file (`[prompt] file`, or the session's
+/// `/settings system-prompt`), if one is set. A file that is set but cannot
+/// be used is said out loud and the assembled prompt is sent instead: the
+/// session is already running, and a dead override must not stop it.
+pub(crate) fn system_prompt_override() -> Option<newt_core::SystemPromptOverride> {
+    match try_system_prompt_override() {
+        Ok(found) => found,
+        Err(error) => {
+            print_newt(
+                &format!("{error}; sending newt's own system prompt"),
+                false,
+                false,
+            );
+            None
+        }
+    }
+}
+
+/// [`system_prompt_override`] without the warning, for per-turn checks.
+pub(crate) fn try_system_prompt_override() -> Result<Option<newt_core::SystemPromptOverride>, String>
+{
+    migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
+        .map_err(|e| e.to_string())?
+        .system_prompt_override()
+}
+
 fn rebuild_system_prompt(
     workspace: &str,
     memory: &newt_core::MemoryManager,
@@ -6073,6 +6100,19 @@ fn rebuild_system_prompt(
     conversation_id: &str,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
+    // #2938: the operator's file REPLACES the assembled prompt entirely.
+    let found = system_prompt_override();
+    system_prompt_edit::set_active(found.as_ref().map(|f| f.path.clone()));
+    if let Some(found) = found {
+        if let Some(s) = sink {
+            s.annotate(
+                "prompt override",
+                &found.path.display().to_string(),
+                &found.text,
+            );
+        }
+        return found.text;
+    }
     // #2934: separate the soul/identity from the project-context additions so
     // that coach altitude can replace the soul with COACH_SOUL without
     // silently dropping AGENTS.md, notes, and the project map.

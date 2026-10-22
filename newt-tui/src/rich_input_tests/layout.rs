@@ -565,6 +565,20 @@ fn no_region_draws_a_horizontal_rule() {
     }
 }
 
+/// #2938: the footer says when the operator's own system prompt file is what
+/// the next request sends, and stops saying so when it is not. The only test
+/// that touches the process-wide override marker.
+#[test]
+fn footer_shows_an_active_system_prompt_override() {
+    let ed = vi_editor();
+    assert!(!footer_text(&ed, "m", "e").contains("[prompt:"));
+    crate::system_prompt_edit::set_active(Some("/home/x/.newt/system-prompt.md".into()));
+    let shown = footer_text(&ed, "m", "e");
+    crate::system_prompt_edit::set_active(None);
+    assert!(shown.contains("[prompt: system-prompt.md]"), "{shown}");
+    assert!(!footer_text(&ed, "m", "e").contains("[prompt:"));
+}
+
 #[test]
 fn header_shows_context_budget_gauge_when_known() {
     let ed = vi_editor();
