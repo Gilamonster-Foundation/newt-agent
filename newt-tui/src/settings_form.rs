@@ -1836,6 +1836,44 @@ mod tests {
         );
     }
 
+    /// Re-run ONE test of this binary in a child with a scrubbed environment
+    /// (same policy as the CLI `common::isolate`: no inherited `NEWT_*`, no
+    /// provider endpoints), `HOME` set to `home`, cwd `cwd` and `envs` on top.
+    /// The one spawn site of the settings tests (#2981).
+    async fn run_isolated_child(
+        test: &str,
+        cwd: &std::path::Path,
+        home: &std::path::Path,
+        envs: &[(&str, &std::ffi::OsStr)],
+    ) -> std::process::Output {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("NEWT_") {
+                command.env_remove(key);
+            }
+        }
+        for key in [
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
+            "OLLAMA_HOST",
+        ] {
+            command.env_remove(key);
+        }
+        command
+            .args(["--exact", test, "--nocapture"])
+            .current_dir(cwd)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .envs(envs.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        tokio::time::timeout(newt_core::test_guard::HANG_GUARD, command.output())
+            .await
+            .expect("settings fixture watchdog expired; child is killed on drop")
+            .unwrap()
+    }
+
     /// Grounds the atomic resolver tests in the real config-loading and
     /// receipt path used by the settings form. A declared but invalid posture
     /// must neither change authority nor journal a successful setting change.
@@ -1851,39 +1889,17 @@ mod tests {
             std::fs::create_dir_all(&config_dir).unwrap();
             let config = config_dir.join("config.toml");
             std::fs::write(&config, "[modes.broken]\npreset = 'missing'\n").unwrap();
-            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-            // Same three-axis policy as CLI common::isolate: an explicit
-            // config alone does not stop the project walk or user drop-ins.
-            for (key, _) in std::env::vars_os() {
-                if key.to_string_lossy().starts_with("NEWT_") {
-                    command.env_remove(key);
-                }
-            }
-            for key in [
-                "OPENAI_BASE_URL",
-                "OPENAI_API_KEY",
-                "OPENAI_MODEL",
-                "OLLAMA_HOST",
-            ] {
-                command.env_remove(key);
-            }
-            command.args([
-                    "--exact",
-                    "settings_form::tests::posture_settings_resolution_failure_is_not_a_success_receipt",
-                    "--nocapture",
-                ])
-                .current_dir(fixture.path())
-                .env("HOME", fixture.path())
-                .env("USERPROFILE", fixture.path())
-                .env("NEWT_CONFIG_DIR", &config_dir)
-                .env("NEWT_CONFIG", &config)
-                .env(CHILD, "1")
-                .stdin(std::process::Stdio::null())
-                .kill_on_drop(true);
-            let output = tokio::time::timeout(newt_core::test_guard::HANG_GUARD, command.output())
-                .await
-                .expect("settings fixture watchdog expired; child is killed on drop")
-                .unwrap();
+            let output = run_isolated_child(
+                "settings_form::tests::posture_settings_resolution_failure_is_not_a_success_receipt",
+                fixture.path(),
+                fixture.path(),
+                &[
+                    ("NEWT_CONFIG_DIR", config_dir.as_os_str()),
+                    ("NEWT_CONFIG", config.as_os_str()),
+                    (CHILD, "1".as_ref()),
+                ],
+            )
+            .await;
             assert!(
                 output.status.success(),
                 "isolated settings fixture failed: {}\n{}",
@@ -2355,33 +2371,26 @@ mod tests {
             if let Some(text) = project {
                 std::fs::write(&project_path, text).unwrap();
             }
-            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-            for (key, _) in std::env::vars_os() {
-                if key.to_string_lossy().starts_with("NEWT_") {
-                    command.env_remove(key);
-                }
-            }
-            command
-                .args([
-                    "--exact",
-                    "settings_form::tests::layered_config_names_the_winning_layer_through_the_real_resolver",
-                    "--nocapture",
-                ])
-                .current_dir(&work)
-                .env("HOME", &home)
-                .env("USERPROFILE", &home)
-                .env("NEWT_CONFIG_DIR", &cfg)
-                .env(config_fs::REAL_LAYERS, "1")
-                .env(CHILD, if case == "pinned+project" { "project" } else { case })
-                .stdin(std::process::Stdio::null())
-                .kill_on_drop(true);
+            let case_env = if case == "pinned+project" {
+                "project"
+            } else {
+                case
+            };
+            let mut envs: Vec<(&str, &std::ffi::OsStr)> = vec![
+                ("NEWT_CONFIG_DIR", cfg.as_os_str()),
+                (config_fs::REAL_LAYERS, "1".as_ref()),
+                (CHILD, case_env.as_ref()),
+            ];
             if pinned.is_some() {
-                command.env("NEWT_CONFIG", &pinned_path);
+                envs.push(("NEWT_CONFIG", pinned_path.as_os_str()));
             }
-            let output = tokio::time::timeout(newt_core::test_guard::HANG_GUARD, command.output())
-                .await
-                .expect("layer fixture watchdog expired")
-                .unwrap();
+            let output = run_isolated_child(
+                "settings_form::tests::layered_config_names_the_winning_layer_through_the_real_resolver",
+                &work,
+                &home,
+                &envs,
+            )
+            .await;
             assert!(
                 output.status.success()
                     && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
