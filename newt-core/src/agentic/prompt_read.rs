@@ -475,6 +475,10 @@ pub(crate) fn ensure_active_prompt_card(
     intake: Option<&PromptIntake>,
     exposure: &super::tools::ExposureSettings,
 ) {
+    // An operator-owned system prompt is the whole system message (#2938).
+    if exposure.verbatim_system {
+        return;
+    }
     let base_card = active_prompt_card(context, exposure);
     let card = match intake {
         Some(intake) => active_prompt_card_with_intake(base_card.clone(), intake),

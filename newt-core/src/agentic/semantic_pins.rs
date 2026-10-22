@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 pub(crate) struct Projection {
     previous: Option<String>,
     pub(super) planning: String,
+    /// The operator's system prompt is the whole system message (#2938): the
+    /// observed-facts note is not added.
+    pub(super) verbatim: bool,
 }
 
 impl Projection {
@@ -41,6 +44,10 @@ pub(super) fn refresh(
         {
             messages.remove(index);
         }
+    }
+    // The smart harness pins the note by index, so only the plain loops skip it.
+    if projection.verbatim && smart.is_none() {
+        return Ok(());
     }
     let report = claims.observed_report(workspace, read, "");
     let report = report

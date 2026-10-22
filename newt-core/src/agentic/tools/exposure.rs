@@ -159,6 +159,10 @@ pub struct ExposureSettings {
     /// When `true`, `write_file`, `edit_file`, and `delete_file` are hidden
     /// regardless of `profile` or `allow_list`.
     pub read_only: bool,
+    /// The operator's own system prompt file is in force (#2938): the request
+    /// carries that text as the only system message, so the harness adds none
+    /// of its own (active-prompt card, observed facts, output planning).
+    pub verbatim_system: bool,
 }
 
 impl Default for ExposureSettings {
@@ -169,6 +173,7 @@ impl Default for ExposureSettings {
             max_initial_tools: 0,
             allow_list: None,
             read_only: false,
+            verbatim_system: false,
         }
     }
 }
@@ -181,6 +186,7 @@ impl From<crate::config::ToolExposureConfig> for ExposureSettings {
             max_initial_tools: c.max_initial_tools,
             allow_list: c.allow_list,
             read_only: c.read_only,
+            verbatim_system: false,
         }
     }
 }

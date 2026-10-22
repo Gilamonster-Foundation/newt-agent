@@ -120,6 +120,9 @@ pub struct HeadlessArgs {
     /// `--dump-request`: write the first request's prompt report here and stop
     /// before sending it (#2937).
     pub dump_request: Option<PathBuf>,
+    /// `--system-prompt-file`: this file's bytes replace the system prompt
+    /// entirely, over `[prompt] file` (#2938).
+    pub system_prompt_file: Option<PathBuf>,
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -147,6 +150,17 @@ fn workspace_root_system_message(
         );
     }
     newt_core::MemMessage::system(text)
+}
+
+/// #2938: the operator's system prompt file, sent as the one system message.
+fn override_system_message(
+    o: newt_core::SystemPromptOverride,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> newt_core::MemMessage {
+    if let Some(s) = sink {
+        s.annotate("prompt override", &o.path.display().to_string(), &o.text);
+    }
+    newt_core::MemMessage::system(o.text)
 }
 
 fn seed_scratchpad(json: &str) -> Result<(Arc<newt_core::SessionScratchpadStore>, String)> {
@@ -671,9 +685,19 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         ));
     }
     let read_scope = dc.caveats.fs_read.clone();
+    let prompt_override = match &args.system_prompt_file {
+        Some(path) => Some(newt_core::SystemPromptOverride::read(path.clone())),
+        None => cfg.system_prompt_override().transpose(),
+    }
+    .transpose()
+    .map_err(anyhow::Error::msg)?;
+    dc.exposure.verbatim_system = prompt_override.is_some();
     let sys_msg = {
         let sink_ref = dc.report_sink.as_deref();
-        workspace_root_system_message(&workspace, sink_ref)
+        match prompt_override {
+            Some(o) => override_system_message(o, sink_ref),
+            None => workspace_root_system_message(&workspace, sink_ref),
+        }
     };
     let mut driver = TurnDriver::with_transcript(dc, vec![sys_msg])
         .with_cognition(runtime.cognition)

@@ -252,10 +252,11 @@ pub use config::{
     DropinOwnership, EditMode, ExposureProfile, FooterMode, IntakeConfig, Loadout, LoadoutSettings,
     LogConfig, ManagedMode, MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind,
     MeterConfig, OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia, PlanConfig, PlanPruneConfig,
-    ProbeObservation, ProbeWriteback, ProbedServing, ProfilePick, ProviderConfig, RequestMeter,
-    RequestMode, ResolvedBackend, ResolvedConfig, RunCommandBudget, ScratchConfig, SemanticConfig,
-    Serving, ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode,
-    ToolExposureConfig, ToolPermissions, TuiConfig,
+    ProbeObservation, ProbeWriteback, ProbedServing, ProfilePick, PromptConfig, ProviderConfig,
+    RequestMeter, RequestMode, ResolvedBackend, ResolvedConfig, RunCommandBudget, ScratchConfig,
+    SemanticConfig, Serving, ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig,
+    SystemPromptOverride, ThinkingMode, ToolExposureConfig, ToolPermissions, TuiConfig,
+    SYSTEM_PROMPT_FILE_ENV,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
