@@ -28,7 +28,9 @@ pub fn active_prompt_card_preview(exposure: &ExposureSettings, intake: &PromptIn
 /// the set is empty (`None`), exactly as its `build_body` does.
 pub fn wire_tools(kind: BackendKind, api: OpenAiApi, tools: &Value) -> Option<Vec<Value>> {
     match (kind, api) {
-        (BackendKind::Anthropic, _) => Some(super::anthropic_wire::tools_to_anthropic(tools)),
+        (BackendKind::Anthropic, _) => {
+            Some(super::anthropic_wire::tools_to_anthropic(tools)).filter(|t| !t.is_empty())
+        }
         (BackendKind::Openai, OpenAiApi::Responses) => {
             Some(super::tools_to_responses(tools)).filter(|t| !t.is_empty())
         }
@@ -193,5 +195,14 @@ mod tests {
         let anthropic = get(BackendKind::Anthropic, OpenAiApi::ChatCompletions, &chat).unwrap();
         assert_eq!(anthropic[0]["name"], "t");
         assert!(anthropic[0].get("input_schema").is_some());
+        // Anthropic's body builder omits an empty tools field too.
+        assert_eq!(
+            get(
+                BackendKind::Anthropic,
+                OpenAiApi::ChatCompletions,
+                &json!([])
+            ),
+            None
+        );
     }
 }
