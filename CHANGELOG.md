@@ -9,18 +9,6 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
-### Added
-
-- TUI `/context request` previews the next request's system messages and tools
-  without sending anything or touching the session (#2959). It builds from an
-  owned `RequestSnapshot`, never commits a permission quarantine, resolves the
-  working style and disposition as an ordinary action-shaped turn would (so
-  `/mode plan`, an allow list and read-only narrow the preview like the
-  request), and shows the active-prompt card and provider-shaped tools. The
-  four wire loops and the preview derive the tool set through one function
-  (`tool_set::derive_tool_set`). The report is labelled partial: it omits the
-  turn-head blocks and the observed-report text.
-
 ### Fixed
 
 - `plan_approval_turn` no longer fails under a narrow terminal: the child runs in its
@@ -631,6 +619,7 @@ deviations in
   under-engagement (tracked in #1500). This is a *re-baseline under stricter
   measurement*, not a raw champion-defeat; tb-30 is a 30-task sample, so per-model
   numbers carry ~+/-10pp run-to-run variance.
+
 
 ### Security
 
