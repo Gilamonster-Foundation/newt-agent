@@ -9,6 +9,13 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Added
+
+- `/settings tools` and `/settings read-only` (#2932): choose which tools the
+  model sees (checklist panel on a rich TTY, `all|pi|none|a,b,c` typed), with a
+  `[tools: …]` footer segment and a `$TOOLS` prompt token. A write that a
+  pinned `NEWT_CONFIG` or project overlay overrides is refused, naming the layer.
+
 ## [0.8.3] — 2026-10-20
 
 ### Security
