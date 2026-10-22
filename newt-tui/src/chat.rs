@@ -5366,25 +5366,72 @@ fn session_body(
                             }
                         } else if rest == "request" {
                             // #2959: preview the next request from an OWNED snapshot.
-                            // Shared borrows only: no sink, store, queued-style
-                            // consumption, or inference call is reachable from here.
+                            // Shared borrows only: no sink write, store, queued-style
+                            // consumption, permission quarantine or inference call is
+                            // reachable from here.
                             let posture = newt_core::posture::active_posture();
                             let preview = permission_state
-                                .recalled_caveats(
+                                .peek_recalled_caveats(
                                     cap.caveats(),
                                     cap.delegation().map(|d| d.caveats()),
                                 )
                                 .map_err(|e| e.to_string())
                                 .and_then(|recalled| {
+                                    let plan_active = conversation_mode_states.plan.is_active();
                                     let caveats = operating_mode_caveats(
                                         cfg.tool_exposure().read_only,
                                         active_operating_mode,
-                                        conversation_mode_states.plan.is_active(),
+                                        plan_active,
                                         meet_persona_caveats(
                                             effective_caveats(&recalled, posture.as_ref()),
                                             active_persona.as_ref(),
                                         ),
                                     );
+                                    // The task is not known yet, so resolve the style and
+                                    // disposition the way ordinary preparation does for a
+                                    // stand-in action-shaped task: style from the raw
+                                    // intake (a pending Auto selection is peeked, never
+                                    // taken), then the authority clamp.
+                                    let lexicon = cfg
+                                        .intake
+                                        .as_ref()
+                                        .map(newt_core::IntakeConfig::to_lexicon)
+                                        .unwrap_or_default();
+                                    let mut intake = newt_core::agentic::PromptIntake::analyze_with(
+                                        "Implement the requested change.",
+                                        &lexicon,
+                                    );
+                                    let auto_selected = (active_operating_mode
+                                        == OperatingMode::Auto
+                                        && !plan_active
+                                        && intake.disposition()
+                                            == newt_core::agentic::PromptDisposition::Act)
+                                        .then(|| {
+                                            conversation_mode_states
+                                                .auto
+                                                .pending_for(&active_conversation_id)
+                                        })
+                                        .flatten();
+                                    let style = effective_operating_mode(
+                                        active_operating_mode,
+                                        &intake,
+                                        plan_active,
+                                        auto_selected,
+                                    );
+                                    apply_operating_mode_to_intake(
+                                        if plan_active {
+                                            OperatingMode::Plan
+                                        } else {
+                                            active_operating_mode
+                                        },
+                                        &mut intake,
+                                    );
+                                    attribute_carried_plan_clamp(
+                                        &mut intake,
+                                        active_operating_mode,
+                                        plan_active,
+                                    );
+                                    let disposition = intake.disposition();
                                     let ws_state =
                                         workspace_state_block(workspace, &caveats.fs_read);
                                     let runtime_ctx = runtime_context_block(
@@ -5392,14 +5439,14 @@ fn session_body(
                                         &inf_url,
                                         inf_kind,
                                         &session_identity,
-                                        newt_core::agentic::PromptDisposition::Act,
+                                        disposition,
                                     );
                                     let controls = session_control_prompt(
                                         active_operating_mode,
-                                        active_operating_mode,
+                                        style,
                                         posture.as_ref(),
                                     );
-                                    let style = tabs
+                                    let communication_style = tabs
                                         .active()
                                         .sidecar
                                         .personality
@@ -5416,7 +5463,7 @@ fn session_body(
                                             runtime_ctx: &runtime_ctx,
                                             system: &system,
                                             session_controls: &controls,
-                                            communication_style: &style,
+                                            communication_style: &communication_style,
                                             is_clarification_answer: false,
                                         },
                                     );
@@ -5454,9 +5501,7 @@ fn session_body(
                                                 operating_mode: active_operating_mode
                                                     == OperatingMode::Auto,
                                                 plan_mode: true,
-                                                plan_mode_active: conversation_mode_states
-                                                    .plan
-                                                    .is_active(),
+                                                plan_mode_active: plan_active,
                                             },
                                             command_budget,
                                             shell_dialect,
@@ -5464,7 +5509,7 @@ fn session_body(
                                                 .as_ref()
                                                 .and_then(|p| p.profile.tools.as_deref()),
                                             smart_harness: None,
-                                            disposition: newt_core::agentic::PromptDisposition::Act,
+                                            disposition,
                                             exposure: &exposure,
                                             exposure_budget_tokens: last_exposure_budget,
                                             estimation: cfg
@@ -5476,17 +5521,32 @@ fn session_body(
                                                 == newt_core::BackendKind::Openai,
                                         },
                                     );
-                                    let tools = if inf_kind == newt_core::BackendKind::Anthropic {
-                                        newt_core::agentic::anthropic_wire::tools_to_anthropic(
-                                            &tools,
-                                        )
-                                    } else {
-                                        tools.as_array().cloned().unwrap_or_default()
-                                    };
+                                    // Session annotations (identity/provider labels) plus
+                                    // this turn's; a later label replaces an earlier one,
+                                    // as `ReportSink::annotate` does.
+                                    let mut notes = report_sink.snapshot_notes();
+                                    for n in turn.notes {
+                                        notes.retain(|k| k.label != n.label);
+                                        notes.push(n);
+                                    }
+                                    let card = newt_core::agentic::request_preview::active_prompt_card_preview(
+                                        &exposure, &intake,
+                                    );
                                     newt_core::agentic::request_preview::RequestSnapshot {
-                                        system_texts: vec![turn.text],
-                                        tools: Some(tools),
-                                        notes: turn.notes,
+                                        system_texts: vec![turn.text, card],
+                                        tools: newt_core::agentic::request_preview::wire_tools(
+                                            inf_kind, choice.api, &tools,
+                                        ),
+                                        notes,
+                                        omitted: "the per-turn head blocks (working memory, \
+                                            code evidence, experience, plan); the harness's \
+                                            observed-report system text; smart-harness tool \
+                                            changes. The active-prompt card uses placeholder \
+                                            prompt addresses and a stand-in action-shaped task, \
+                                            and the tool budget is the last turn's. Anthropic and \
+                                            Responses join system messages on the wire; they are \
+                                            listed separately here."
+                                            .to_string(),
                                     }
                                     .report()
                                     .map_err(|e| e.to_string())
@@ -5494,10 +5554,7 @@ fn session_body(
                             match preview {
                                 Ok(report) => {
                                     print_newt(
-                                        "next request (preview; nothing sent). Not shown: \
-                                         per-turn head blocks (working memory, code evidence, \
-                                         experience, plan). Tools may differ only for: \
-                                         smart-harness changes and per-wire output reserves in a budget-clipped `auto` exposure.",
+                                        "next request (preview; nothing sent):",
                                         color,
                                         verbose,
                                     );

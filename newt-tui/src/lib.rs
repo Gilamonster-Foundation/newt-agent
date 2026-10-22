@@ -1329,7 +1329,7 @@ impl AutoModeState {
         }
     }
 
-    #[cfg(test)]
+    /// Read the pending selection without consuming it (`/context request`).
     fn pending_for(&self, conversation_id: &str) -> Option<OperatingMode> {
         self.selected
             .lock()
