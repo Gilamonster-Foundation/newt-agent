@@ -662,6 +662,10 @@ fn footer_line(
     if !tools.is_empty() {
         spans.push(Span::styled(format!(" [tools: {tools}]"), dim));
     }
+    // #2938: an operator-owned system prompt is on the wire.
+    if let Some(badge) = crate::system_prompt_edit::status_badge() {
+        spans.push(Span::styled(format!(" {badge}"), accent));
+    }
     // Step 24.6 (#559): the context-budget gauge — `used/budget` (e.g.
     // `899k/1024k`) colored by fill, so the operator sees context pressure
     // BEFORE compression fires. Hidden until a turn has reported usage.

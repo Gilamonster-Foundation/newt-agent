@@ -2839,6 +2839,29 @@ fn session_body(
         &active_conversation_id,
         Some(&*report_sink),
     );
+    // #2938: the operator's system prompt file as the session last built its
+    // prompt from it. A set, reset or edited file rebuilds the prompt on the
+    // spot (and refreshes the footer), not at the next `/new`.
+    let mut last_override = crate::try_system_prompt_override();
+    macro_rules! refresh_prompt_override {
+        () => {
+            if crate::system_prompt_edit::refresh_override(
+                &mut last_override,
+                crate::try_system_prompt_override,
+                || {
+                    system = rebuild_system_prompt(
+                        workspace,
+                        &memory,
+                        active_persona.as_ref(),
+                        &active_conversation_id,
+                        Some(&*report_sink),
+                    );
+                },
+            ) {
+                print_newt("system prompt rebuilt (override changed)", color, verbose);
+            }
+        };
+    }
 
     // 17.7: `/new` opts the SESSION out of auto-resume. Every auto-resume
     // consult goes through `should_auto_resume`, so an explicit /new is
@@ -6945,6 +6968,63 @@ fn session_body(
                     // (Shared by the psyche panel gate here and the backend
                     // panel gate below, #1667.)
                     let panel_tokens: Vec<&str> = slash_body.split_whitespace().collect();
+                    // #2938: `/settings system-prompt edit` needs the terminal
+                    // (the editor) and the live system prompt, so it is the
+                    // session's, ahead of the typed form (which refuses it).
+                    if panel_tokens.as_slice() == ["settings", "system-prompt", "edit"] {
+                        use crate::system_prompt_edit::{self as spe, Outcome};
+                        let target = cfg.system_prompt_file().or_else(spe::default_target);
+                        let Some(target) = target else {
+                            print_newt(
+                                "no config directory to keep a system prompt in; set [prompt] file",
+                                color,
+                                verbose,
+                            );
+                            continue;
+                        };
+                        let mut io = spe::RealIo::new(|cmd: &str| {
+                            surface.run_bang_escape(cmd, color, verbose)
+                        });
+                        match spe::run(&mut io, &target, &system) {
+                            Ok(Outcome::Saved) => {
+                                let path = target.display().to_string();
+                                let _ = crate::settings_form::apply_and_record(
+                                    crate::settings_form::Field::SystemPrompt,
+                                    &path,
+                                    "/settings system-prompt edit",
+                                );
+                                refresh_prompt_override!();
+                                let keep = if cfg.prompt.as_ref().is_some_and(|p| p.file.is_some())
+                                {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " (add [prompt] file = \"{path}\" to keep it next session)"
+                                    )
+                                };
+                                print_newt(&format!("system prompt saved to {path}: the next request sends exactly this file{keep}"), color, verbose);
+                            }
+                            Ok(Outcome::Unchanged) => {
+                                print_newt(
+                                    "system prompt unchanged; nothing saved",
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(Outcome::Empty) => print_newt(
+                                "the editor left nothing; keeping the previous system prompt",
+                                color,
+                                verbose,
+                            ),
+                            Err(error) => print_newt(
+                                &format!("system prompt edit failed: {error:#}"),
+                                color,
+                                verbose,
+                            ),
+                        }
+                        println!();
+                        continue;
+                    }
                     // Bare `/settings` IS the panel on a rich-tui TTY — the
                     // chooser `slash_registry` has classified this family as
                     // since #1981, now that #1986/#2020 supply a region to draw
@@ -7787,6 +7867,7 @@ fn session_body(
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
                     cfg = crate::resolve_runtime_or_default();
+                    refresh_prompt_override!();
                     // Ephemeral is a session-wide decision (17.7): a config
                     // refresh never re-grows a store handle mid-session.
                     if !ephemeral_session {
@@ -8507,6 +8588,7 @@ fn session_body(
                         ),
                     );
                     // #2937: name each piece so the request report can attribute it (TUI preview: #2959).
+                    refresh_prompt_override!();
                     let ws_state = workspace_state_block(workspace, &turn_caveats.fs_read);
                     let runtime_ctx = runtime_context_block(
                         &inf_model,
@@ -8710,6 +8792,16 @@ fn session_body(
                     let plan = scheduled_on
                         .then(|| newt_core::plan_block(&step_ledger))
                         .flatten();
+                    // #2938: the operator's file is the whole system message;
+                    // nothing the session assembled rides along.
+                    let turn_system = crate::system_prompt_edit::turn_system_text(
+                        last_override
+                            .as_ref()
+                            .ok()
+                            .and_then(Option::as_ref)
+                            .map(|o| o.text.as_str()),
+                        || turn_system,
+                    );
                     let messages = messages_with_plan(
                         memory.build_messages(&turn_system, &task),
                         plan.as_deref(),
@@ -9236,9 +9328,12 @@ fn session_body(
                                         // Default `full` = identity (unchanged
                                         // advertised catalog); `auto`/`minimal`
                                         // size the schema set to the live budget.
-                                        exposure: newt_core::ExposureSettings::from(
-                                            cfg.tool_exposure(),
-                                        ),
+                                        exposure: newt_core::ExposureSettings {
+                                            // #2938: a system prompt file is the
+                                            // whole system message.
+                                            verbatim_system: matches!(last_override, Ok(Some(_))),
+                                            ..newt_core::ExposureSettings::from(cfg.tool_exposure())
+                                        },
                                         // Step 26.6a (#585): the experiential store
                                         // for record/recall — Some only when on.
                                         experience_store: experiential_on.then_some(

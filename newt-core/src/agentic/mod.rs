@@ -1856,6 +1856,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        observed_facts.verbatim = exposure.verbatim_system;
         observed_facts.planning = output_budget::guidance(
             output_allowance,
             step_ledger,
@@ -7207,6 +7208,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        observed_facts.verbatim = exposure.verbatim_system;
         observed_facts.planning = output_budget::guidance(
             Some(generation_bounds::output_cap(
                 generation_policy.output_allowance,
@@ -10135,6 +10137,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        observed_facts.verbatim = exposure.verbatim_system;
         observed_facts.planning = output_budget::guidance(
             Some(max_tokens),
             step_ledger,
@@ -12830,6 +12833,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             worktree_session,
             true,
         );
+        observed_facts.verbatim = exposure.verbatim_system;
         observed_facts.planning = output_budget::guidance(
             Some(generation_bounds::output_cap(
                 generation_policy.output_allowance,
