@@ -6776,7 +6776,11 @@ fn session_body(
                                 print_newt(&format!("system prompt saved to {path}: the next request sends exactly this file (add [prompt] file = \"{path}\" to keep it next session)"), color, verbose);
                             }
                             Ok(Outcome::Unchanged) => {
-                                print_newt("system prompt unchanged; nothing saved", color, verbose)
+                                print_newt(
+                                    "system prompt unchanged; nothing saved",
+                                    color,
+                                    verbose,
+                                );
                             }
                             Ok(Outcome::Empty) => print_newt(
                                 "the editor left nothing; keeping the previous system prompt",
