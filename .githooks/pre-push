@@ -43,6 +43,8 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - GitHub Pages deploy and site entry-point check, .github/workflows/pages.yml
+#     (deployment/validation only; site-only pushes skip tests here).
 #   - hosted-model live eval, .github/workflows/eval-hosted.yml (weekly +
 #     release/**; needs EVAL_BASE_URL/EVAL_API_KEY, skips when unconfigured).
 #   - MCP import real-resource tier, .github/workflows/mcp-import-real.yml
@@ -363,7 +365,8 @@ fi
 
 # ── Changed-scope classification (#1098) ───────────────────────────────────────
 # scripts/changed-scope.sh reads the same ref list and prints:
-#   (nothing) -- deletion, tag push, or docs-only: skip the cargo gates
+#   (nothing) -- deletion, tag push, or docs-only (incl. site/ and the Pages
+#                workflow): skip the cargo gates
 #   ALL       -- a workspace-wide file changed: gate everything
 #   <crates>  -- only these crates (and their reverse dependents) changed
 SCOPE="$(printf '%s\n' "$REFS" | bash scripts/changed-scope.sh)"
@@ -437,6 +440,10 @@ cargo fmt --all -- --check
 # -- `cargo test -p newt-git --test native_git_commit -- --ignored` and
 # `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
 # real-resource CI lane of their own (tracked separately; out of scope here).
+# newt-core::macos_exec_basenames (#2816) runs its whole native-Seatbelt proof on
+# any argv containing --ignored, so nextest's discovery pass fails it on a dev Mac
+# whose ambient Homebrew gh is not a trusted exec fixture. It is CI-only (see the
+# header entry above; newt-tui-pty.yml stages a root-owned gh copy).
 # newt-core::native_git_broker_pipeline gates the SAME way but is NOT a
 # disclosed gap (#2693): `.github/workflows/native-git-broker-real.yml` runs
 # `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
@@ -452,6 +459,7 @@ cargo fmt --all -- --check
 # change both together.
 NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-core::native_git_broker_pipeline)
+    and not binary_id(newt-core::macos_exec_basenames)
     and not binary_id(newt-harness::writer_inheritance)
     and not binary_id(newt-git::native_git_commit)
     and not binary_id(newt-agent::lean_surface_purity)

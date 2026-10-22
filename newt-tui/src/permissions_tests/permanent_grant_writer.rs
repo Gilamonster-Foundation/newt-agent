@@ -493,7 +493,9 @@ fn danger_target_is_normalized_before_classification() {
     // Windows — same class of failure as #2545). Compare as `Path`, not
     // string, since a Windows root renders with backslashes.
     let dir = tempfile::TempDir::new().unwrap();
-    let root = dir.path();
+    // Canonical root: macOS normalizes /var temp dirs to /private/var.
+    let root = dir.path().canonicalize().unwrap();
+    let root = root.as_path();
     let ws = root.join("ws");
 
     let climbing = ws.join("..");
@@ -539,7 +541,8 @@ fn danger_target_is_normalized_before_classification() {
 #[test]
 fn allow_permanent_refuses_a_climbing_path_that_normalizes_to_a_broad_root() {
     let (dir, config, key_path, _root) = fixture();
-    let broad_root = dir.path().to_path_buf();
+    // Canonical root: macOS normalizes /var temp dirs to /private/var.
+    let broad_root = dir.path().canonicalize().unwrap();
     let climbing = broad_root.join("ws").join("..");
     let mut state = PermissionPromptState::default();
     let request = req(DenialKind::FsWrite, &climbing.to_string_lossy());

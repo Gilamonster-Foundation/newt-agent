@@ -43,6 +43,10 @@ async fn interpreter_allow_once_executes_the_matching_retry() {
     let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
     let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    // A user-writable Homebrew bash earlier on PATH is correctly refused by the
+    // exec-trust check; resolve the interpreters from the root-owned system dirs.
+    #[cfg(target_os = "macos")]
+    let _path = EnvVar::set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     assert!(newt_core::confined_exec::kernel_fs_fence_available());
     for (program, shape) in ["bash", "sh", "/bin/bash", "/bin/sh"]
         .into_iter()
