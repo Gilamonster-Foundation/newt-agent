@@ -448,3 +448,74 @@ async fn find_show_lines_does_not_follow_a_leaf_symlink() {
     let out = run_find(serde_json::json!({"show_lines": true}), ws.path()).await;
     assert_eq!(out, "0\tln.txt", "got: {out}");
 }
+
+/// Regression (#2980 round 2): the narrow-scope refusal ran only when the
+/// baseline already permitted the root, so a gate that granted just
+/// `ws/allowed` walked `allowed/link -> ../private`. Walkability is now
+/// decided once, on the scope in force AFTER the gate.
+#[cfg(unix)]
+#[tokio::test]
+async fn find_and_grep_refuse_a_gate_grant_narrower_than_the_workspace() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(ws.path().join("allowed")).unwrap();
+    std::fs::create_dir_all(ws.path().join("private")).unwrap();
+    std::fs::write(ws.path().join("private/secret.txt"), "SCOPE_SECRET_2980\n").unwrap();
+    std::os::unix::fs::symlink("../private", ws.path().join("allowed/link")).unwrap();
+    let baseline = Caveats {
+        fs_read: Scope::none(),
+        ..caveats_rw(ws.path())
+    };
+    for (tool, path) in [
+        ("find", "allowed"),
+        ("find", "allowed/link"),
+        ("grep", "allowed"),
+        ("grep", "allowed/link"),
+    ] {
+        let mut gate = MockGate::new(true, &baseline);
+        let out = run_tool_gated(
+            tool,
+            serde_json::json!({"path": path, "pattern": "SCOPE_SECRET_2980"}),
+            ws.path(),
+            &baseline,
+            &mut gate,
+        )
+        .await;
+        assert!(out.starts_with("capability denied"), "{tool} {path}: {out}");
+        assert!(!out.contains("secret.txt"), "{tool} {path}: {out}");
+    }
+}
+
+/// Regression (#2980 round 2): `count_lines` checked the leaf with
+/// `symlink_metadata` and then reopened it by name, so a swapped leaf (or a
+/// symlinked directory component) was followed. The count now comes from one
+/// handle opened beneath the workspace, so a path that crosses a link out of
+/// it fails the open and counts 0.
+#[cfg(unix)]
+#[test]
+fn line_counts_and_grep_reads_do_not_cross_a_symlink_out_of_the_workspace() {
+    let parent = tempfile::TempDir::new().unwrap();
+    let ws = parent.path().join("ws");
+    let outside = parent.path().join("outside");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("big.txt"), "a\nb\nc\nSCOPE_SECRET_2980\n").unwrap();
+    std::os::unix::fs::symlink(&outside, ws.join("dirlink")).unwrap();
+    std::fs::write(ws.join("own.txt"), "x\ny\n").unwrap();
+    assert_eq!(count_lines(&ws, &ws.join("own.txt")), 2);
+    assert_eq!(count_lines(&ws, &ws.join("dirlink/big.txt")), 0);
+    let found = grep_tool::grep_search(
+        &ws.join("dirlink"),
+        &ws,
+        &grep_tool::GrepOpts {
+            pattern: "SCOPE_SECRET_2980",
+            glob: None,
+            ignore_case: false,
+            context: 0,
+            max_results: 10,
+        },
+    );
+    assert!(
+        found.is_ok_and(|f| f.lines.is_empty()),
+        "grep read through a link out of the workspace"
+    );
+}

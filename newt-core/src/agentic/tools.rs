@@ -1749,6 +1749,17 @@ fn fs_gate_allows(
     full_path: &str,
     axis: impl Fn(&crate::caveats::Caveats) -> &crate::caveats::Scope<String>,
 ) -> bool {
+    fs_gate_widened(gate, tool, kind, full_path, axis).is_some()
+}
+
+/// The caveats the operator granted for `full_path`, or `None` when refused.
+fn fs_gate_widened(
+    gate: &mut dyn PermissionGate,
+    tool: &str,
+    kind: DenialKind,
+    full_path: &str,
+    axis: impl Fn(&crate::caveats::Caveats) -> &crate::caveats::Scope<String>,
+) -> Option<crate::caveats::Caveats> {
     let request = PermissionRequest {
         tool: tool.to_string(),
         kind,
@@ -1757,8 +1768,36 @@ fn fs_gate_allows(
         harness_bound: false,
     };
     match gate.ask(std::slice::from_ref(&request)) {
-        PermissionDecision::Allow(widened) => tui_permits_path(axis(&widened), full_path),
-        PermissionDecision::Deny => false,
+        PermissionDecision::Allow(widened) => {
+            tui_permits_path(axis(&widened), full_path).then_some(widened)
+        }
+        PermissionDecision::Deny => None,
+    }
+}
+
+/// The ONE decision whether `find`/`grep` may walk `full_str`: the root must be
+/// readable under the EFFECTIVE `fs_read` (the baseline, or what the operator
+/// granted when asked), and that scope must cover the whole workspace, because
+/// the walker reopens paths by name and cannot keep to a subtree (#2980).
+fn walker_read_gate(
+    tool: &str,
+    caveats: &crate::caveats::Caveats,
+    workspace: &str,
+    full_str: &str,
+    gate: &mut Option<&mut dyn PermissionGate>,
+) -> Result<(), String> {
+    let effective = if tui_permits_path(&caveats.fs_read, full_str) {
+        caveats.fs_read.clone()
+    } else {
+        gate.as_deref_mut()
+            .and_then(|g| fs_gate_widened(g, tool, DenialKind::FsRead, full_str, |c| &c.fs_read))
+            .map(|widened| widened.fs_read)
+            .ok_or_else(|| denied_fs_result("fs_read", full_str))?
+    };
+    if read_scope_covers_workspace(&effective, workspace) {
+        Ok(())
+    } else {
+        Err(SCOPE_NOT_WALKABLE.to_string())
     }
 }
 
@@ -3216,7 +3255,7 @@ fn find_walk(
             if is_dir {
                 0
             } else {
-                count_lines(entry.path())
+                count_lines(workspace_root, entry.path())
             }
         } else if want_size {
             entry.metadata().map(|m| m.len()).unwrap_or(0)
@@ -3235,16 +3274,23 @@ fn find_walk(
 /// evidence question and the walk is already bounded to a source workspace. The
 /// counting itself is factored into [`count_newlines`] so it stays unit-testable
 /// without touching the filesystem (the mocked tier).
-fn count_lines(path: &std::path::Path) -> u64 {
-    // A symlink entry is never followed: its target may lie outside the
-    // authorized tree (#2980).
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return 0;
-    }
-    match std::fs::read(path) {
-        Ok(bytes) => count_newlines(&bytes),
-        Err(_) => 0,
-    }
+fn count_lines(workspace_root: &std::path::Path, path: &std::path::Path) -> u64 {
+    use std::io::Read;
+    // One handle, opened beneath the workspace without following a final
+    // link: a leaf swapped for a symlink after the walk saw it fails the open
+    // instead of being read (#2980).
+    let counted = path
+        .strip_prefix(workspace_root)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        .and_then(|rel| {
+            crate::fs_cap::WorkspaceDir::open_root(workspace_root)?.open_regular(rel, true)
+        })
+        .and_then(|mut file| {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(count_newlines(&bytes))
+        });
+    counted.unwrap_or(0)
 }
 
 /// Pure `wc -l` newline count over raw bytes: the number of `\n` bytes, so a
@@ -5955,17 +6001,14 @@ async fn execute_authorized_tool(
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
                 return WORKSPACE_ONLY.to_string();
             }
-            if !tui_permits_path(&caveats.fs_read, &full_str) {
-                let allowed = permission_gate.is_some_and(|gate| {
-                    fs_gate_allows(gate, "find", DenialKind::FsRead, &full_str, |c| &c.fs_read)
-                });
-                if !allowed {
-                    return denied_fs_result("fs_read", &full_str);
-                }
-            } else if !read_scope_covers_workspace(&caveats.fs_read, workspace) {
-                // Lexically inside a narrower grant: the walk below cannot
-                // keep to it (a symlink can lead to a denied sibling).
-                return SCOPE_NOT_WALKABLE.to_string();
+            if let Err(refusal) = walker_read_gate(
+                "find",
+                caveats,
+                workspace,
+                &full_str,
+                &mut permission_gate,
+            ) {
+                return refusal;
             }
             // #1176: shadow-OCAP — record the search root under --full-access
             // (the fuzzer's "find the 10 largest files" is a canonical case).
@@ -6044,17 +6087,14 @@ async fn execute_authorized_tool(
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
                 return WORKSPACE_ONLY.to_string();
             }
-            if !tui_permits_path(&caveats.fs_read, &full_str) {
-                let allowed = permission_gate.is_some_and(|gate| {
-                    fs_gate_allows(gate, "grep", DenialKind::FsRead, &full_str, |c| &c.fs_read)
-                });
-                if !allowed {
-                    return denied_fs_result("fs_read", &full_str);
-                }
-            } else if !read_scope_covers_workspace(&caveats.fs_read, workspace) {
-                // Lexically inside a narrower grant: the walk below cannot
-                // keep to it (a symlink can lead to a denied sibling).
-                return SCOPE_NOT_WALKABLE.to_string();
+            if let Err(refusal) = walker_read_gate(
+                "grep",
+                caveats,
+                workspace,
+                &full_str,
+                &mut permission_gate,
+            ) {
+                return refusal;
             }
             // #1176: shadow-OCAP — record the search root under --full-access.
             if full_access_requested() {

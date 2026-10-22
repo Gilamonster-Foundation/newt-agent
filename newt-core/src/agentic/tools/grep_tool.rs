@@ -95,7 +95,13 @@ pub(crate) fn grep_search(
             continue;
         }
         sink.rel = rel;
-        search_one(&mut searcher, &matcher, entry.path(), &mut sink);
+        search_one(
+            &mut searcher,
+            &matcher,
+            workspace_root,
+            entry.path(),
+            &mut sink,
+        );
         if sink.out.truncated {
             break;
         }
@@ -109,11 +115,27 @@ pub(crate) fn grep_search(
 fn search_one(
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
+    workspace_root: &std::path::Path,
     path: &std::path::Path,
     sink: &mut Collect,
 ) {
     let (lines, hits, truncated) = (sink.out.lines.len(), sink.hits, sink.out.truncated);
-    if searcher.search_path(matcher, path, &mut *sink).is_err() {
+    // One handle opened beneath the workspace without following a final link:
+    // a file swapped for a symlink after the walk saw it fails the open
+    // instead of being read (#2980).
+    let searched = path
+        .strip_prefix(workspace_root)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        .and_then(|rel| {
+            crate::fs_cap::WorkspaceDir::open_root(workspace_root)?.open_regular(rel, true)
+        })
+        .map_err(|_| ())
+        .and_then(|file| {
+            searcher
+                .search_file(matcher, &file, &mut *sink)
+                .map_err(|_| ())
+        });
+    if searched.is_err() {
         sink.out.lines.truncate(lines);
         sink.hits = hits;
         sink.out.truncated = truncated;
