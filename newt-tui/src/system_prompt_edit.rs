@@ -398,7 +398,10 @@ mod tests {
             (Ok(Some("f")), true),     // bad -> good
             (Err("unreadable"), true), // good -> bad
         ] {
-            assert_eq!(refresh_override(&mut last, || now, || rebuilds += 1), expect);
+            assert_eq!(
+                refresh_override(&mut last, || now, || rebuilds += 1),
+                expect
+            );
         }
         assert_eq!(rebuilds, 4);
     }

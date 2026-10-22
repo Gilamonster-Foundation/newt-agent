@@ -198,7 +198,7 @@ async fn reset_beats_a_configured_file_and_an_unusable_file_is_refused() {
     let root_for_file = common::isolated_root();
     let file = root_for_file.path().join("configured.md");
     std::fs::write(&file, PRUNED).unwrap();
-    let (server, root, config) = fixture(&format!("\n[prompt]\nfile = {:?}\n", file)).await;
+    let (server, root, config) = fixture(&format!("\n[prompt]\nfile = {file:?}\n")).await;
     let (pty, mut child) = start(&root, &config);
 
     say(&pty, "TURN_ONE", "ECHO[TURN_ONE]");
