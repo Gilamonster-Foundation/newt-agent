@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "A verified, read-only follower of an agent-mesh flock for newt (the inbox's read side)."
+description = "Newt's side of an agent-mesh flock: a verified follower, with tasks, asks and signed replies."
 
 [dependencies]
 # Read side only: no `serve` / `emit`, so no server, no signing key.
