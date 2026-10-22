@@ -234,8 +234,12 @@ mod prefix;
 mod permissions_panel;
 #[cfg(feature = "rich-tui")]
 mod settings_panel;
+// #2932: the `/settings tools` checklist — edits the `[tool_exposure]` policy
+// through the settings form's one mutation path.
 #[cfg(feature = "rich-tui")]
 mod theme_panel;
+#[cfg(feature = "rich-tui")]
+mod tools_panel;
 // The backend chooser/editor panel (#1667) — same grammar, same gating; its
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]

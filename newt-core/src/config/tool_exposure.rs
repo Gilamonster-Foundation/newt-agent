@@ -81,6 +81,38 @@ impl Default for ToolExposureConfig {
     }
 }
 
+/// The `pi` preset (#2932): pi.dev's default coding-agent surface, the four
+/// tools a weak local model handles well. `allow_list = PI_PRESET_TOOLS`.
+pub const PI_PRESET_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "run_command"];
+
+impl ToolExposureConfig {
+    /// Whether `allow_list` is exactly the `pi` preset (order-insensitive).
+    pub fn is_pi_preset(&self) -> bool {
+        self.allow_list.as_deref().is_some_and(|list| {
+            list.len() == PI_PRESET_TOOLS.len()
+                && PI_PRESET_TOOLS.iter().all(|t| list.iter().any(|n| n == t))
+        })
+    }
+
+    /// The operator-facing summary of the tool surface for a status line:
+    /// `None` when the model sees the whole catalog (nothing to show),
+    /// otherwise `pi`, `read-only`, `pi · read-only`, `3 tools`, `no tools`.
+    pub fn status_label(&self) -> Option<String> {
+        let list = match &self.allow_list {
+            None => None,
+            Some(_) if self.is_pi_preset() => Some("pi".to_string()),
+            Some(l) if l.is_empty() => Some("no tools".to_string()),
+            Some(l) => Some(format!("{} tools", l.len())),
+        };
+        match (list, self.read_only) {
+            (None, false) => None,
+            (None, true) => Some("read-only".to_string()),
+            (Some(l), false) => Some(l),
+            (Some(l), true) => Some(format!("{l} · read-only")),
+        }
+    }
+}
+
 pub(crate) fn default_schema_budget_pct() -> u16 {
     15
 }
@@ -91,4 +123,46 @@ pub(crate) fn default_max_initial_tools() -> usize {
 
 pub(crate) fn default_supports_dynamic_catalog() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(list: Option<&[&str]>, read_only: bool) -> ToolExposureConfig {
+        ToolExposureConfig {
+            allow_list: list.map(|l| l.iter().map(|s| s.to_string()).collect()),
+            read_only,
+            ..Default::default()
+        }
+    }
+
+    /// #2932: the status line shows the active tool profile, and shows
+    /// nothing at all under the open default.
+    #[test]
+    fn status_label_names_the_preset_the_toggle_and_the_count() {
+        assert_eq!(with(None, false).status_label(), None);
+        assert_eq!(
+            with(None, true).status_label().as_deref(),
+            Some("read-only")
+        );
+        let pi: Vec<&str> = PI_PRESET_TOOLS.iter().rev().copied().collect();
+        assert!(with(Some(&pi), false).is_pi_preset(), "order-insensitive");
+        assert_eq!(with(Some(&pi), false).status_label().as_deref(), Some("pi"));
+        assert_eq!(
+            with(Some(&pi), true).status_label().as_deref(),
+            Some("pi · read-only")
+        );
+        assert_eq!(
+            with(Some(&["read_file", "find", "git"]), false)
+                .status_label()
+                .as_deref(),
+            Some("3 tools")
+        );
+        assert_eq!(
+            with(Some(&[]), false).status_label().as_deref(),
+            Some("no tools")
+        );
+        assert!(!with(Some(&["read_file"]), false).is_pi_preset());
+    }
 }

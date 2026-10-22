@@ -1002,13 +1002,21 @@ fn resolve_backend_choice_explicit_kind_skips_probe_flag() {
 struct ConfigDirPin {
     _dir: tempfile::TempDir,
     prev: Option<std::ffi::OsString>,
+    // The same process-env lock `GlobalSettingsGuard` holds, so a settings
+    // test cannot see NEWT_CONFIG_DIR move mid-write (#2981). Dropped last.
+    _env: newt_core::process_env::EnvGuard,
 }
 impl ConfigDirPin {
     fn new() -> Self {
+        let env = newt_core::process_env::lock();
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("NEWT_CONFIG_DIR");
         std::env::set_var("NEWT_CONFIG_DIR", dir.path());
-        Self { _dir: dir, prev }
+        Self {
+            _dir: dir,
+            prev,
+            _env: env,
+        }
     }
 }
 impl Drop for ConfigDirPin {

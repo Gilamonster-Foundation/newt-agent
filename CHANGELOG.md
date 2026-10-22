@@ -9,6 +9,12 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed
+
+- Per-PR CI now compiles every test target under the feature combinations the real-resource
+  tiers run (`newt-tui`: `native-permission-test`, `rich-tui`, `rich-tui,live-spill`;
+  `newt-core`: `ast`), so a struct change can no longer break a feature-gated test unseen (#2971).
+
 ### Fixed
 
 - `plan_approval_turn` no longer fails under a narrow terminal: the child runs in its

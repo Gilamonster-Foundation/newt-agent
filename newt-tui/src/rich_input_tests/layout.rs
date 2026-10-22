@@ -492,11 +492,32 @@ fn row_text(editor: &Editor) -> String {
 }
 
 fn footer_text(editor: &Editor, model: &str, endpoint: &str) -> String {
-    footer_line(editor, model, endpoint, None, true)
+    footer_line(editor, model, endpoint, None, "", true)
         .spans
         .iter()
         .map(|s| s.content.as_ref())
         .collect()
+}
+
+/// #2932: the footer names the tool profile only when the operator narrowed
+/// it — under the open default the row is byte-identical to before.
+#[test]
+fn footer_shows_the_tool_profile_only_when_narrowed() {
+    let ed = vi_editor();
+    let text = |tools: &str| -> String {
+        footer_line(&ed, "m", "e", None, tools, true)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    };
+    assert!(!text("").contains("tools"), "{}", text(""));
+    assert!(text("pi").contains(" [tools: pi]"), "{}", text("pi"));
+    assert!(
+        text("pi · read-only").contains("[tools: pi · read-only]"),
+        "{}",
+        text("pi · read-only")
+    );
 }
 
 fn header_text(session: &str, headline: &str) -> String {
@@ -569,7 +590,7 @@ fn no_region_draws_a_horizontal_rule() {
 fn header_shows_context_budget_gauge_when_known() {
     let ed = vi_editor();
     let text = |g| -> String {
-        footer_line(&ed, "m", "e", g, true)
+        footer_line(&ed, "m", "e", g, "", true)
             .spans
             .iter()
             .map(|s| s.content.as_ref())

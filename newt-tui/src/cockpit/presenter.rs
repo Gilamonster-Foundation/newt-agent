@@ -1085,6 +1085,10 @@ impl Presenter {
                 self.surface.set_background_jobs(jobs);
                 self.dirty = true;
             }
+            SurfaceRequest::SetToolPolicy(label) => {
+                self.surface.set_tool_policy(label);
+                self.dirty = true;
+            }
             #[cfg(feature = "live-spill")]
             SurfaceRequest::SetSpillArchive(archive) => {
                 archive.enable_inspection();
