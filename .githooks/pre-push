@@ -135,6 +135,7 @@
 #       newt-agent::personality_turn     real chat loop, 60 s
 #       newt-agent::migration_notices    real CLI startup, 20-30 s
 #       newt-agent::terminal_exit_pty    real PTY + CLI startup, 30 s budget
+#       newt-agent::context_request_preview  real chat loop x5, 90 s cap
 #   - two more real-resource lanes, same tier as the six above (#2663 named
 #     the six real-`newt`-session binaries but missed these -- measured in
 #     the push rejections of 2026-10-01/02):
@@ -468,6 +469,7 @@ NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-agent::personality_turn)
     and not binary_id(newt-agent::migration_notices)
     and not binary_id(newt-agent::terminal_exit_pty)
+    and not binary_id(newt-agent::context_request_preview)
     and not binary_id(newt-eval::mock_e2e)
     and not (binary_id(newt-tui) and test(=prompt_visibility_test::mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal))
     and not (binary_id(newt-tui) and test(=prompt_visibility_test::a_permission_prompt_is_visible_and_survives_a_live_spinner))'
