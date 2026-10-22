@@ -2459,6 +2459,8 @@ fn session_body(
     // Human `/cd` session working directory — SEPARATE from the
     // OCAP-load-bearing `workspace`. `/cd` moves it (confined below `workspace`),
     // the prompt shows it; it never mutates `workspace` or the process cwd.
+    // The last turn's usable context budget, for the preview's tool exposure.
+    let mut last_exposure_budget: Option<usize> = None;
     let mut session_cwd = workspace_settings
         .profile
         .as_ref()
@@ -5095,16 +5097,8 @@ fn session_body(
                                         verbose,
                                     );
                                 } else {
-                                    let mut semantic_cfg = cfg
-                                        .context
-                                        .as_ref()
-                                        .map(|c| c.semantic.clone())
-                                        .unwrap_or_default();
-                                    semantic_cfg.embedding_model_path =
-                                        effective_embedding_model_path(
-                                            semantic_cfg.embedding_model_path.take(),
-                                            newt_inference::palette::embed_model_dir_if_present(),
-                                        );
+                                    let semantic_cfg =
+                                        crate::turn_system::session_semantic_config(&cfg);
                                     if let Some(reason) =
                                         semantic_embedder_unavailable_reason(&semantic_cfg)
                                     {
@@ -5426,11 +5420,72 @@ fn session_body(
                                             is_clarification_answer: false,
                                         },
                                     );
+                                    // The same derivation the wire loops run, with each
+                                    // presence flag read from the same session state that
+                                    // fills the turn's `ChatCtx`.
+                                    let exposure =
+                                        newt_core::ExposureSettings::from(cfg.tool_exposure());
+                                    let features = context_features(
+                                        &cfg,
+                                        context_manager(&cfg, context_manager_override),
+                                        &context_features_override,
+                                        inf_kind,
+                                    );
+                                    let semantic =
+                                        crate::turn_system::session_semantic_config(&cfg);
+                                    let tools = newt_core::agentic::tool_set::exposed_tool_set(
+                                        &newt_core::agentic::tool_set::ToolSetInputs {
+                                            mcp: &mcp,
+                                            advertise: newt_core::agentic::tool_set::Advertise {
+                                                save_note: true,
+                                                recall: conversation_store.is_some(),
+                                                memory_fetch: true,
+                                                git_read_scope: None,
+                                                team: crew_runner.is_some()
+                                                    && exposure.operator_visible("crew"),
+                                                scratchpad: features.scratchpad,
+                                                code_search: features.semantic
+                                                    && semantic_embedder_unavailable_reason(
+                                                        &semantic,
+                                                    )
+                                                    .is_none(),
+                                                experiential: features.experiential,
+                                                scheduled: features.scheduled,
+                                                operating_mode: active_operating_mode
+                                                    == OperatingMode::Auto,
+                                                plan_mode: true,
+                                                plan_mode_active: conversation_mode_states
+                                                    .plan
+                                                    .is_active(),
+                                            },
+                                            command_budget,
+                                            shell_dialect,
+                                            persona_tools: active_persona
+                                                .as_ref()
+                                                .and_then(|p| p.profile.tools.as_deref()),
+                                            smart_harness: None,
+                                            disposition: newt_core::agentic::PromptDisposition::Act,
+                                            exposure: &exposure,
+                                            exposure_budget_tokens: last_exposure_budget,
+                                            estimation: cfg
+                                                .context
+                                                .as_ref()
+                                                .map(|c| c.estimation)
+                                                .unwrap_or_default(),
+                                            openai_compatible: inf_kind
+                                                == newt_core::BackendKind::Openai,
+                                        },
+                                    );
+                                    let tools = if inf_kind == newt_core::BackendKind::Anthropic {
+                                        newt_core::agentic::anthropic_wire::tools_to_anthropic(
+                                            &tools,
+                                        )
+                                    } else {
+                                        tools.as_array().cloned().unwrap_or_default()
+                                    };
                                     newt_core::agentic::request_preview::RequestSnapshot {
                                         system_texts: vec![turn.text],
-                                        tools: newt_core::agentic::tool_definitions()
-                                            .as_array()
-                                            .cloned(),
+                                        tools: Some(tools),
                                         notes: turn.notes,
                                     }
                                     .report()
@@ -5441,8 +5496,8 @@ fn session_body(
                                     print_newt(
                                         "next request (preview; nothing sent). Not shown: \
                                          per-turn head blocks (working memory, code evidence, \
-                                         experience, plan) and the exposure-filtered tool set — \
-                                         tools are the base catalog.",
+                                         experience, plan). Tools may differ only for: \
+                                         smart-harness changes and per-wire output reserves in a budget-clipped `auto` exposure.",
                                         color,
                                         verbose,
                                     );
@@ -8230,6 +8285,7 @@ fn session_body(
                     let eff_context_window = context_window.full_window;
                     let eff_safe_context = context_window.safe_context;
                     let eff_max_ok_input = context_window.max_ok_input;
+                    last_exposure_budget = eff_safe_context.map(|s| s as usize);
 
                     // Memory providers keep their history but follow the
                     // currently selected model's budget. Rebinding every turn

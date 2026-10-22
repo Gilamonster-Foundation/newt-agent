@@ -191,6 +191,7 @@ mod recall;
 pub mod request_preview;
 pub mod request_report;
 mod tool_args;
+pub mod tool_set;
 // #952/#1669: operator steering submitted mid-turn, drained at the next
 // round boundary as a genuine operator message.
 mod steering;
@@ -392,7 +393,9 @@ use send_budget::{
     recovered_input_budget, resolve_responses_budget, responses_context_remaining_report,
 };
 use std::io::{self, Write as _};
-use tools::{is_hallucination, merged_tool_definitions};
+use tools::is_hallucination;
+#[cfg(test)]
+use tools::merged_tool_definitions;
 use trim::{
     estimate_request_tokens, estimate_tokens, estimate_value_tokens, merge_round_usage,
     protected_prompt_head_len, PromptTracker,
@@ -1725,43 +1728,32 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
-    let tools = merged_tool_definitions(
+    let (mut tools, hidden_tools) = tool_set::derive_tool_set(&tool_set::ToolSetInputs {
         mcp,
-        advertise_save_note,
-        advertise_recall,
-        advertise_memory_fetch,
-        advertise_git.then_some(&caveats.fs_read),
-        advertise_team,
-        advertise_scratchpad,
-        advertise_code_search,
-        advertise_experiential,
-        advertise_scheduled,
-        advertise_operating_mode,
-        advertise_plan_mode,
-        advertise_plan_mode_active,
+        advertise: tool_set::Advertise {
+            save_note: advertise_save_note,
+            recall: advertise_recall,
+            memory_fetch: advertise_memory_fetch,
+            git_read_scope: advertise_git.then_some(&caveats.fs_read),
+            team: advertise_team,
+            scratchpad: advertise_scratchpad,
+            code_search: advertise_code_search,
+            experiential: advertise_experiential,
+            scheduled: advertise_scheduled,
+            operating_mode: advertise_operating_mode,
+            plan_mode: advertise_plan_mode,
+            plan_mode_active: advertise_plan_mode_active,
+        },
         command_budget,
         shell_dialect,
-    );
-    // Put the persona's preferred tools first without removing other tools.
-    // Dispatch separately checks explicit permissions and delegation authority.
-    let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(
-        smart_harness::advertise(tools, smart_harness),
-        prompt_disposition,
-    );
-    // #TEC Pass 1: the exposure stage. Clip the AUTHORIZED catalog to what the
-    // model's LIVE usable budget can afford (probed `safe_context` → send
-    // budget), never by model name. `ExposureProfile::Full` (the default) is
-    // identity, so this is bit-for-bit unchanged unless `[tool_exposure]` opts
-    // in. Applied before the token estimate so what we count equals what we
-    // send. Dispatch still authorizes on the full set — exposure ≠ authority.
-    let (mut tools, hidden_tools) = crate::agentic::tools::select_exposed(
-        tools,
-        &exposure,
-        exposure_budget_tokens(send_budget, safe_context),
-        &std::collections::BTreeSet::new(),
+        persona_tools,
+        smart_harness,
+        disposition: prompt_disposition,
+        exposure: &exposure,
+        exposure_budget_tokens: exposure_budget_tokens(send_budget, safe_context),
         estimation,
-    );
+        openai_compatible: false,
+    });
     let mut tool_tokens = estimate_value_tokens(&tools, estimation);
     // Price the stable tool catalog in real-token space. Reprice it whenever
     // usage or an overflow updates the session's calibration.
@@ -7113,46 +7105,33 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
-    let tools = merged_tool_definitions(
+    let (tools, hidden_tools) = tool_set::derive_tool_set(&tool_set::ToolSetInputs {
         mcp,
-        advertise_save_note,
-        advertise_recall,
-        advertise_memory_fetch,
-        advertise_git.then_some(&caveats.fs_read),
-        advertise_team,
-        advertise_scratchpad,
-        advertise_code_search,
-        advertise_experiential,
-        advertise_scheduled,
-        advertise_operating_mode,
-        advertise_plan_mode,
-        advertise_plan_mode_active,
+        advertise: tool_set::Advertise {
+            save_note: advertise_save_note,
+            recall: advertise_recall,
+            memory_fetch: advertise_memory_fetch,
+            git_read_scope: advertise_git.then_some(&caveats.fs_read),
+            team: advertise_team,
+            scratchpad: advertise_scratchpad,
+            code_search: advertise_code_search,
+            experiential: advertise_experiential,
+            scheduled: advertise_scheduled,
+            operating_mode: advertise_operating_mode,
+            plan_mode: advertise_plan_mode,
+            plan_mode_active: advertise_plan_mode_active,
+        },
         command_budget,
         shell_dialect,
-    );
-    // Put the persona's preferred tools first without removing other tools.
-    // Dispatch separately checks explicit permissions and delegation authority.
-    let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(
-        smart_harness::advertise(tools, smart_harness),
-        prompt_disposition,
-    );
-    // #TEC Pass 1: exposure stage — clip the authorized catalog to the live
-    // usable budget (identity under `ExposureProfile::Full`). See the Ollama
-    // path for the full rationale.
-    let (tools, hidden_tools) = crate::agentic::tools::select_exposed(
-        tools,
-        &exposure,
-        exposure_budget_tokens(send_budget, safe_context),
-        &std::collections::BTreeSet::new(),
+        persona_tools,
+        smart_harness,
+        disposition: prompt_disposition,
+        exposure: &exposure,
+        exposure_budget_tokens: exposure_budget_tokens(send_budget, safe_context),
         estimation,
-    );
-    // The endpoint speaks the OpenAI function-tool wire even when the serving
-    // model is hosted behind vLLM/LiteLLM/NIM. Enforce that wire's 128-function
-    // envelope after authorization + exposure, keeping Kernel tools ahead of
-    // optional MCP schemas. Retain omitted schemas in the same controller for
-    // exact-name activation without changing dispatch authority.
-    let mut tools = crate::agentic::tools::select_openai_compatible_tools(tools, &hidden_tools);
+        openai_compatible: true,
+    });
+    let mut tools = tools;
     let mut tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
@@ -10053,36 +10032,32 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
-    let tools = merged_tool_definitions(
+    let (mut tools, hidden_tools) = tool_set::derive_tool_set(&tool_set::ToolSetInputs {
         mcp,
-        advertise_save_note,
-        advertise_recall,
-        advertise_memory_fetch,
-        advertise_git.then_some(&caveats.fs_read),
-        advertise_team,
-        advertise_scratchpad,
-        advertise_code_search,
-        advertise_experiential,
-        advertise_scheduled,
-        advertise_operating_mode,
-        advertise_plan_mode,
-        advertise_plan_mode_active,
+        advertise: tool_set::Advertise {
+            save_note: advertise_save_note,
+            recall: advertise_recall,
+            memory_fetch: advertise_memory_fetch,
+            git_read_scope: advertise_git.then_some(&caveats.fs_read),
+            team: advertise_team,
+            scratchpad: advertise_scratchpad,
+            code_search: advertise_code_search,
+            experiential: advertise_experiential,
+            scheduled: advertise_scheduled,
+            operating_mode: advertise_operating_mode,
+            plan_mode: advertise_plan_mode,
+            plan_mode_active: advertise_plan_mode_active,
+        },
         command_budget,
         shell_dialect,
-    );
-    let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(
-        smart_harness::advertise(tools, smart_harness),
-        prompt_disposition,
-    );
-    // #TEC Pass 1: exposure stage — mirrors the OpenAI path.
-    let (mut tools, hidden_tools) = crate::agentic::tools::select_exposed(
-        tools,
-        &exposure,
-        exposure_budget_tokens(send_budget, safe_context),
-        &std::collections::BTreeSet::new(),
+        persona_tools,
+        smart_harness,
+        disposition: prompt_disposition,
+        exposure: &exposure,
+        exposure_budget_tokens: exposure_budget_tokens(send_budget, safe_context),
         estimation,
-    );
+        openai_compatible: false,
+    });
     // The Anthropic tool catalog, converted from the exposed catalog
     // (`input_schema` copied wholesale, no `function` nesting), and again only
     // when a hidden tool is promoted.
@@ -12664,30 +12639,6 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             input.insert(0, serde_json::json!({"role":"system", "content":text}));
         }
     }
-    let tools_chat = merged_tool_definitions(
-        mcp,
-        advertise_save_note,
-        advertise_recall,
-        advertise_memory_fetch,
-        advertise_git.then_some(&caveats.fs_read),
-        advertise_team,
-        advertise_scratchpad,
-        advertise_code_search,
-        advertise_experiential,
-        advertise_scheduled,
-        advertise_operating_mode,
-        advertise_plan_mode,
-        advertise_plan_mode_active,
-        command_budget,
-        shell_dialect,
-    );
-    // FR-1 part 2 (#997): scope the advertised catalog to the active persona
-    // (Responses wire). No-op when `persona_tools` is `None`.
-    let tools_chat = filter_advertised_tools(tools_chat, persona_tools);
-    let tools_chat = filter_tools_for_disposition(
-        smart_harness::advertise(tools_chat, smart_harness),
-        prompt_disposition,
-    );
     // #TEC Pass 1: exposure stage on the chat-shaped catalog before it is
     // projected to Responses tools, so the estimate and the wire agree.
     // Identity under `ExposureProfile::Full`. The send budget is computed just
@@ -12729,15 +12680,33 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         generation_policy.output_allowance,
     );
     observability::observe_output_allowance(&mut solve_obs, budget_state.output_reserve(), false);
-    let (tools_chat, hidden_tools) = crate::agentic::tools::select_exposed(
-        tools_chat,
-        &exposure,
-        budget_state.exposure_budget(),
-        &std::collections::BTreeSet::new(),
+    let (tools_chat, hidden_tools) = tool_set::derive_tool_set(&tool_set::ToolSetInputs {
+        mcp,
+        advertise: tool_set::Advertise {
+            save_note: advertise_save_note,
+            recall: advertise_recall,
+            memory_fetch: advertise_memory_fetch,
+            git_read_scope: advertise_git.then_some(&caveats.fs_read),
+            team: advertise_team,
+            scratchpad: advertise_scratchpad,
+            code_search: advertise_code_search,
+            experiential: advertise_experiential,
+            scheduled: advertise_scheduled,
+            operating_mode: advertise_operating_mode,
+            plan_mode: advertise_plan_mode,
+            plan_mode_active: advertise_plan_mode_active,
+        },
+        command_budget,
+        shell_dialect,
+        persona_tools,
+        smart_harness,
+        disposition: prompt_disposition,
+        exposure: &exposure,
+        exposure_budget_tokens: budget_state.exposure_budget(),
         estimation,
-    );
-    let mut tools_chat =
-        crate::agentic::tools::select_openai_compatible_tools(tools_chat, &hidden_tools);
+        openai_compatible: true,
+    });
+    let mut tools_chat = tools_chat;
     let mut tools = tools_to_responses(&tools_chat);
     let mut tools_for_estimate = serde_json::Value::Array(tools.clone());
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
@@ -14730,7 +14699,7 @@ mod guidance_policy_sweep;
 #[cfg(test)]
 pub(crate) fn builtin_catalog_tokens(disposition: PromptDisposition) -> usize {
     let tools = filter_tools_for_disposition(
-        merged_tool_definitions(
+        tools::merged_tool_definitions(
             &NoMcp,
             false,
             false,

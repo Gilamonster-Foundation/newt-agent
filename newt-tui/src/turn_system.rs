@@ -21,6 +21,22 @@ pub(crate) struct TurnSystem {
     pub notes: Vec<Annotation>,
 }
 
+/// The session's semantic config with the pulled default embedding model
+/// adopted (#1279). Shared by the live turn and the preview so both agree on
+/// whether `code_search` is advertised.
+pub(crate) fn session_semantic_config(cfg: &newt_core::Config) -> newt_core::SemanticConfig {
+    let mut semantic = cfg
+        .context
+        .as_ref()
+        .map(|c| c.semantic.clone())
+        .unwrap_or_default();
+    semantic.embedding_model_path = crate::effective_embedding_model_path(
+        semantic.embedding_model_path.take(),
+        newt_inference::palette::embed_model_dir_if_present(),
+    );
+    semantic
+}
+
 fn note(label: &str, source: &str, text: &str) -> Annotation {
     Annotation {
         label: label.into(),

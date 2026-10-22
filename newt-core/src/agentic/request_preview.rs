@@ -68,8 +68,11 @@ mod tests {
 
     /// #2959: a preview, successful or failed, leaves the session's report
     /// sink exactly as it was (last report, notes, armed capture) and sends no
-    /// inference request. Cancel has no path to test: the builder is
-    /// synchronous and is handed neither a sink nor a cancel flag.
+    /// inference request. There is no cancel case: `turn_cancel` is only
+    /// observed inside the interrupt watch around a dispatched turn, and the
+    /// TUI handler runs on the input loop between turns, outside it. The
+    /// builder is also synchronous and is handed neither a sink nor a cancel
+    /// flag, so no abort can reach it.
     #[tokio::test]
     async fn preview_leaves_session_state_untouched_and_sends_nothing() {
         let server = MockServer::start().await;

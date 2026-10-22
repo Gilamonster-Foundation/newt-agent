@@ -15,7 +15,9 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   without sending anything or touching the session (#2959). It builds from an
   owned `RequestSnapshot` through a builder that takes no sink, store or
   client, and shares the turn's system-message assembly with the live turn.
-  The preview omits the turn-head blocks and shows the base tool catalog.
+  The four wire loops and the preview derive the tool set through one function
+  (`tool_set::derive_tool_set`), so the preview shows the exposure-filtered tools
+  (allow list, read-only). It omits the turn-head blocks.
 
 ## [0.8.3] — 2026-10-20
 
