@@ -114,6 +114,7 @@ fn special_command_rendering_bang_height_uses_command_geometry_for_every_gutter(
         session: "",
         background_jobs: &[],
         tabs: &[],
+        tools: "",
     };
 
     // 153 exposes a non-1 continuation indent; 159 exposes gutter=0.

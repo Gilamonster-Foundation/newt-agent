@@ -1455,6 +1455,12 @@ pub(crate) trait InputSurface {
     /// Replace the harness-owned jobs whose live state the input surface may
     /// render. Default no-op keeps lean/headless output free of ephemeral UI.
     fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {}
+    /// #2932: the operator's tool-profile label for the footer (`pi`,
+    /// `read-only`, `3 tools`), or `None` when the model sees every tool and
+    /// there is nothing to show. Sent at each loop head beside
+    /// `set_runtime_context`, and again right after `/settings tools` changes
+    /// it. Default no-op: the lean prompt carries it as `$TOOLS` instead.
+    fn set_tool_policy(&mut self, _label: Option<String>) {}
     /// #1669 PR-B: the open tabs, projected for the bottom bar. Sent once per
     /// loop head beside `set_runtime_context`, so a `/rename`, a `/tab close`
     /// or a newly degraded pin is reflected on the next prompt.
@@ -3530,6 +3536,9 @@ fn session_body(
                     })
             };
             surface.set_runtime_context(&inf_model, &inf_url, token_gauge, &session_label);
+            // #2932: the tool profile rides the same refresh, from the same
+            // resolved config the turn will read its catalog from.
+            surface.set_tool_policy(cfg.tool_exposure().status_label());
             surface.set_background_jobs(
                 nav_warmup
                     .as_ref()
@@ -6835,6 +6844,65 @@ fn session_body(
                     // they had typed it — one commit path, not two.
                     #[cfg(feature = "rich-tui")]
                     let mut walked_to_backends = false;
+                    // #2932: the tool checklist. Opened by `/settings tools`
+                    // directly, or by Enter on the settings panel's `tools`
+                    // row. It REPORTS a choice; the write goes through
+                    // `settings_form::apply_and_record` — the one mutation
+                    // path, receipted — and then `cfg` is re-resolved so the
+                    // next turn's catalog, prompt and caveats all follow, and
+                    // the footer is told at once rather than at the next loop
+                    // head.
+                    #[cfg(feature = "rich-tui")]
+                    macro_rules! manage_tools {
+                        () => {{
+                            let window =
+                                surface.open_panel(PanelMode::Inline(crate::tools_panel::height()));
+                            let mut panel =
+                                crate::tools_panel::ToolsPanel::new(&cfg.tool_exposure());
+                            match crate::tools_panel::run(&mut panel, window) {
+                                Ok(Some(choice)) => {
+                                    let writes = choice
+                                        .tools
+                                        .map(|v| (crate::settings_form::Field::Tools, v))
+                                        .into_iter()
+                                        .chain(choice.read_only.map(|v| {
+                                            (crate::settings_form::Field::ReadOnly, v.to_string())
+                                        }));
+                                    for (field, value) in writes {
+                                        match crate::settings_form::apply_and_record(
+                                            field,
+                                            &value,
+                                            "/settings tools",
+                                        ) {
+                                            Ok(line) | Err(line) => {
+                                                print_newt(&line, color, verbose)
+                                            }
+                                        }
+                                    }
+                                    cfg = crate::resolve_runtime_or_default();
+                                    surface.set_tool_policy(cfg.tool_exposure().status_label());
+                                }
+                                Ok(None) => print_newt("tools: cancelled", color, verbose),
+                                Err(error) => print_newt(
+                                    &format!(
+                                        "tools panel unavailable ({error}); \
+                                         use /settings tools <all|pi|a,b,c>"
+                                    ),
+                                    color,
+                                    verbose,
+                                ),
+                            }
+                        }};
+                    }
+                    #[cfg(feature = "rich-tui")]
+                    if panel_tokens.as_slice() == ["settings", "tools"]
+                        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    {
+                        manage_tools!();
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
                     #[cfg(feature = "rich-tui")]
                     if panel_tokens.as_slice() == ["settings"]
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
@@ -6868,6 +6936,7 @@ fn session_body(
                             let mut walked_to_permissions = false;
                             let mut walked_to_workspaces = false;
                             let mut walked_to_mcp = false;
+                            let mut walked_to_tools = false;
                             let window = surface
                                 .open_panel(PanelMode::Inline(settings_panel::panel_height()));
                             // #2009 PR13: the Audit section's rows. The fs read
@@ -6896,6 +6965,10 @@ fn session_body(
                                         }
                                         settings_panel::Outcome::OpenMcp { lines, model } => {
                                             walked_to_mcp = true;
+                                            (lines, model)
+                                        }
+                                        settings_panel::Outcome::OpenTools { lines, model } => {
+                                            walked_to_tools = true;
                                             (lines, model)
                                         }
                                         settings_panel::Outcome::OpenPermissions {
@@ -6951,6 +7024,11 @@ fn session_body(
                                 }
                             }
                             cfg = crate::resolve_runtime_or_default();
+                            if walked_to_tools {
+                                manage_tools!();
+                                initial_section = Some('s');
+                                continue;
+                            }
                             if walked_to_workspaces {
                                 manage_workspaces!();
                                 initial_section = Some('w');

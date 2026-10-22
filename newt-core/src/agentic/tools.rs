@@ -115,6 +115,20 @@ use catalog::{
 };
 pub use exposure::ExposureSettings;
 pub(crate) use exposure::{select_exposed, select_openai_compatible_tools, HiddenTools};
+
+/// Every built-in tool newt can dispatch by name, in catalog order — the
+/// checklist `/settings tools` offers (#2932). Dynamic MCP `server__tool`
+/// names are not included; an allow list may still name them.
+pub fn builtin_tool_names() -> &'static [&'static str] {
+    &catalog::ALL_TOOL_NAMES
+}
+
+/// Whether `[tool_exposure] read_only` hides `name` — the same set the
+/// exposure filter uses, so the checklist cannot explain one list while the
+/// wire enforces another.
+pub fn read_only_hidden_tool(name: &str) -> bool {
+    exposure::WRITE_TOOL_NAMES.contains(&name)
+}
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///

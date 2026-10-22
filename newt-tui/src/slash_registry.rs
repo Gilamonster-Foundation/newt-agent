@@ -796,6 +796,26 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Keep,
         Receipt::Journal,
     ),
+    // #2932: the tool surface the model sees and the read-only toggle. Two
+    // VALUES, so two `/settings` fields rather than a `/harness tools` verb
+    // (the issue's working name predates the slash consolidation). On a rich
+    // TTY `/settings tools` opens the checklist; typed, it is one write.
+    cmd_on(
+        "tools",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
+        "read-only",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
     cmd(
         // Absorbed as `/settings detail` (#2009 PR7b) and still a
         // typed verb: `/detail` toggles, the field sets a count.

@@ -634,6 +634,7 @@ fn footer_line(
     model: &str,
     endpoint: &str,
     gauge: Option<(u32, Option<u32>)>,
+    tools: &str,
     active: bool,
 ) -> Line<'static> {
     // ONE accent, shared with the chevron: two constants for one signal is how
@@ -656,6 +657,10 @@ fn footer_line(
     }
     if let Some(opts) = status_options(model) {
         spans.push(Span::styled(format!(" [{opts}]"), dim));
+    }
+    // #2932: the active tool profile, only when the operator narrowed it.
+    if !tools.is_empty() {
+        spans.push(Span::styled(format!(" [tools: {tools}]"), dim));
     }
     // #2938: an operator-owned system prompt is on the wire.
     if let Some(badge) = crate::system_prompt_edit::status_badge() {
@@ -803,6 +808,9 @@ struct RichStatus<'a> {
     /// prose. Empty renders nothing rather than an empty bracket.
     headline: &'a str,
     background_jobs: &'a [BackgroundJob],
+    /// #2932: the tool-profile label the footer shows as `[tools: …]`; empty
+    /// → no bracket, so the open default is byte-identical to before.
+    tools: &'a str,
     /// The slash-command palette (#1674), rendered above the input row while
     /// open. `None`/closed → the layout is byte-identical to the pre-palette
     /// surface.
@@ -916,6 +924,7 @@ fn draw(
             status.model,
             status.endpoint,
             status.gauge,
+            status.tools,
             !empty && input_focused,
         )),
         footer_area,
@@ -1247,6 +1256,9 @@ pub(crate) struct RichSurface {
     gauge: Option<(u32, Option<u32>)>,
     /// Harness tasks rendered by this surface while their shared state is live.
     background_jobs: Vec<BackgroundJob>,
+    /// #2932: the tool-profile label for the footer; empty under the open
+    /// default so the bracket is omitted entirely.
+    tools: String,
     /// #1669 PR-B: the open tabs, refreshed each loop head. Fewer than two →
     /// the bar renders no row.
     tabs: Vec<crate::tab_bar::TabCell>,
@@ -1350,6 +1362,7 @@ impl RichSurface {
             endpoint: String::new(),
             gauge: None,
             background_jobs: Vec::new(),
+            tools: String::new(),
             tabs: Vec::new(),
             session: String::new(),
             vi: Cell::new(None),
@@ -1383,6 +1396,7 @@ impl RichSurface {
             // change would put a layout and a modal rewrite in one diff.
             modal: None,
             background_jobs: &self.background_jobs,
+            tools: &self.tools,
             tabs: &self.tabs,
         }
     }
@@ -1518,6 +1532,8 @@ pub(crate) struct Chrome<'a> {
     pub(crate) modal: Option<&'a [Line<'static>]>,
     pub(crate) background_jobs: &'a [BackgroundJob],
     pub(crate) tabs: &'a [crate::tab_bar::TabCell],
+    /// #2932: the tool-profile label, or empty for the open default.
+    pub(crate) tools: &'a str,
 }
 
 /// Where the editor's committed lines go — the scrollback above the input.
@@ -1666,6 +1682,10 @@ impl InputSurface for RichSurface {
 
     fn set_background_jobs(&mut self, jobs: Vec<BackgroundJob>) {
         self.background_jobs = jobs;
+    }
+
+    fn set_tool_policy(&mut self, label: Option<String>) {
+        self.tools = label.unwrap_or_default();
     }
 
     fn set_tabs(&mut self, tabs: Vec<crate::tab_bar::TabCell>) {
