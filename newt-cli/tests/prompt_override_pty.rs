@@ -127,6 +127,14 @@ async fn fixture(config_tail: &str) -> (MockServer, tempfile::TempDir, std::path
 }
 
 fn start(root: &tempfile::TempDir, config: &std::path::Path) -> (Pty, tokio::process::Child) {
+    start_with(root, config, &[])
+}
+
+fn start_with(
+    root: &tempfile::TempDir,
+    config: &std::path::Path,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> (Pty, tokio::process::Child) {
     let pty = Pty::open();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_newt"));
     common::isolate(&mut cmd, root.path());
@@ -141,6 +149,7 @@ fn start(root: &tempfile::TempDir, config: &std::path::Path) -> (Pty, tokio::pro
         .env("NEWT_FOOTER", "off")
         .env("NEWT_NO_COCKPIT", "1")
         .env("TERM", "xterm-256color")
+        .envs(env.iter().copied())
         .stdin(pty.slave_stdio())
         .stdout(pty.slave_stdio())
         .stderr(pty.slave_stdio())
@@ -232,5 +241,73 @@ async fn reset_beats_a_configured_file_and_an_unusable_file_is_refused() {
         std::fs::read_to_string(&file).unwrap(),
         PRUNED,
         "config file untouched"
+    );
+}
+
+/// After `reset`, `edit` opens the prompt being sent (the assembled one), not
+/// a leftover file at the save destination, and the next request after a
+/// changed save is exactly the saved file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(prompt_override_pty)]
+async fn edit_after_reset_is_seeded_from_the_assembled_prompt_not_the_old_file() {
+    use std::os::unix::fs::PermissionsExt;
+    const OLD: &str = "OLD INACTIVE OVERRIDE\n";
+    let (server, root, config) = fixture("").await;
+    // The save destination `edit` picks with no active override: beside the config.
+    let dest = root.path().join(".newt").join("system-prompt.md");
+    std::fs::write(&dest, OLD).unwrap();
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("\n[prompt]\nfile = {dest:?}\n"));
+    std::fs::write(&config, text).unwrap();
+    let editor = root.path().join("editor.sh");
+    let seen = root.path().join("seen.txt");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\ncp \"$1\" \"$SEEN_PATH\"\nprintf 'EDITED\\n' >> \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (pty, mut child) = start_with(
+        &root,
+        &config,
+        &[
+            ("VISUAL", editor.as_os_str()),
+            ("SEEN_PATH", seen.as_os_str()),
+        ],
+    );
+
+    say(&pty, "TURN_ONE", "ECHO[TURN_ONE]");
+    say(
+        &pty,
+        "/settings system-prompt reset",
+        "system prompt file: reset",
+    );
+    say(
+        &pty,
+        "/settings system-prompt edit",
+        "system prompt saved to",
+    );
+    say(&pty, "TURN_TWO", "ECHO[TURN_TWO]");
+    pty.type_in("/exit\r");
+    let _ = tokio::time::timeout(BUDGET, child.wait()).await;
+
+    let seeded = std::fs::read_to_string(&seen).expect("the editor ran");
+    assert!(
+        seeded.contains("Workspace: "),
+        "assembled prompt expected: {seeded:.300}"
+    );
+    assert!(
+        !seeded.contains("OLD INACTIVE"),
+        "seeded from the old file: {seeded:.300}"
+    );
+    assert_eq!(system_message_for(&server, "TURN_ONE").await, OLD);
+    assert_eq!(
+        system_message_for(&server, "TURN_TWO").await,
+        std::fs::read_to_string(&dest).unwrap(),
+        "after the save the request is exactly the saved file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dest).unwrap(),
+        format!("{seeded}EDITED\n")
     );
 }

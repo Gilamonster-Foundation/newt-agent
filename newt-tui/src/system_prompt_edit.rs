@@ -35,14 +35,13 @@ pub(crate) enum Outcome {
     Empty,
 }
 
-/// Edit `target`'s current contents, or `assembled` (what newt would send) when
-/// there is no override yet. The scratch file is discarded on every exit.
-pub(crate) fn run(io: &mut impl EditIo, target: &Path, assembled: &str) -> anyhow::Result<Outcome> {
-    let start = match io.read(target) {
-        Ok(text) if !text.trim().is_empty() => text,
-        _ => assembled.to_string(),
-    };
-    let outcome = edit_scratch(io, target, &start);
+/// Edit `current`, the system prompt the session is sending right now (the
+/// operator's file while an override is in force, else the assembled prompt),
+/// and save the result to `target`. The save destination is never the source:
+/// a leftover file at `target` that is not active must not seed the editor.
+/// The scratch file is discarded on every exit.
+pub(crate) fn run(io: &mut impl EditIo, target: &Path, current: &str) -> anyhow::Result<Outcome> {
+    let outcome = edit_scratch(io, target, current);
     io.discard();
     outcome
 }
@@ -260,14 +259,25 @@ mod tests {
     }
 
     #[test]
-    fn a_later_edit_starts_from_the_saved_override_not_the_assembled_prompt() {
+    fn the_editor_is_seeded_from_the_current_prompt_never_from_the_destination() {
+        // While an override is active the session's prompt IS the file's text.
         let mut io = fake(|t| {
             assert_eq!(t, "pruned\n");
             "pruned more\n".to_string()
         });
         io.files.insert(TARGET.into(), "pruned\n".into());
-        run(&mut io, Path::new(TARGET), "assembled").unwrap();
+        run(&mut io, Path::new(TARGET), "pruned\n").unwrap();
         assert_eq!(io.files[Path::new(TARGET)], "pruned more\n");
+
+        // After a reset the destination holds an old, inactive file: the
+        // editor still gets the assembled prompt.
+        let mut io = fake(|t| {
+            assert_eq!(t, "assembled\n", "seeded from the inactive old file");
+            "assembled, pruned\n".to_string()
+        });
+        io.files.insert(TARGET.into(), "old inactive\n".into());
+        run(&mut io, Path::new(TARGET), "assembled\n").unwrap();
+        assert_eq!(io.files[Path::new(TARGET)], "assembled, pruned\n");
     }
 
     #[test]
