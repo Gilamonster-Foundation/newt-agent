@@ -519,3 +519,27 @@ fn line_counts_and_grep_reads_do_not_cross_a_symlink_out_of_the_workspace() {
         "grep read through a link out of the workspace"
     );
 }
+
+/// Pins the platform dispatch of the `find`/`grep` content opener (#2980 r4):
+/// object-bound on Linux/macOS, the Windows route there, and a refusal — even
+/// for an ordinary file inside the workspace — on any other target.
+#[test]
+fn walk_open_route_is_explicit_and_unsupported_refuses() {
+    let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        WalkOpenRoute::ObjectBound
+    } else if cfg!(windows) {
+        WalkOpenRoute::PhysicalCheckReparseLeaf
+    } else {
+        WalkOpenRoute::Unsupported
+    };
+    assert_eq!(walk_open_route(), expected);
+
+    let ws = tempfile::TempDir::new().unwrap();
+    touch(ws.path(), "a.txt");
+    let refused = open_workspace_file_via(
+        WalkOpenRoute::Unsupported,
+        ws.path(),
+        &ws.path().join("a.txt"),
+    );
+    assert_eq!(refused.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+}

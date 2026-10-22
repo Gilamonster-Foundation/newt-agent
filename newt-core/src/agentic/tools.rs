@@ -3282,8 +3282,49 @@ pub(super) fn open_workspace_file(
     workspace_root: &std::path::Path,
     path: &std::path::Path,
 ) -> std::io::Result<std::fs::File> {
-    let scope = crate::caveats::Scope::only([workspace_root.to_string_lossy().into_owned()]);
-    file_capture::open_for_scope(&scope, path, true)
+    open_workspace_file_via(walk_open_route(), workspace_root, path)
+}
+
+/// Which opener a `find`/`grep` content read may use on this platform. Named
+/// so the choice is explicit and pinned by a test: a broader shared helper
+/// (`open_for_scope` falls back to a pathname open on every other Unix) must
+/// never silently set the policy here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkOpenRoute {
+    /// Linux/macOS: descriptor-relative open beneath the workspace.
+    ObjectBound,
+    /// Windows: physical containment check, then a reparse-point-aware leaf open.
+    PhysicalCheckReparseLeaf,
+    /// No race-safe opener: refuse.
+    Unsupported,
+}
+
+const fn walk_open_route() -> WalkOpenRoute {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        WalkOpenRoute::ObjectBound
+    } else if cfg!(windows) {
+        WalkOpenRoute::PhysicalCheckReparseLeaf
+    } else {
+        WalkOpenRoute::Unsupported
+    }
+}
+
+fn open_workspace_file_via(
+    route: WalkOpenRoute,
+    workspace_root: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    match route {
+        WalkOpenRoute::Unsupported => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no race-safe file opener on this platform",
+        )),
+        WalkOpenRoute::ObjectBound | WalkOpenRoute::PhysicalCheckReparseLeaf => {
+            let scope =
+                crate::caveats::Scope::only([workspace_root.to_string_lossy().into_owned()]);
+            file_capture::open_for_scope(&scope, path, true)
+        }
+    }
 }
 
 fn count_lines(workspace_root: &std::path::Path, path: &std::path::Path) -> u64 {
