@@ -57,7 +57,7 @@ pub use skills::SkillsConfig;
 pub(crate) use smart_harness::{normalize_path, resolve_uncreated_path, validate_stable_anchor};
 pub use smart_harness::{HarnessLaunch, SmartHarnessConfig};
 pub use summarizer::SummarizerConfig;
-pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
+pub use tool_exposure::{ExposureProfile, ToolExposureConfig, PI_PRESET_TOOLS};
 pub use tools::ToolsConfig;
 mod command_budget;
 pub use command_budget::RunCommandBudget;
@@ -2198,6 +2198,70 @@ impl Config {
             .as_table_mut()
             .ok_or_else(|| NewtError::Config("`tui` is not a table".to_string()))?;
         tui.insert(key, toml_edit::value(value));
+        Ok(doc.to_string())
+    }
+
+    /// Set `[tool_exposure] allow_list` (#2932) — `None` removes the key, so
+    /// the model sees the whole catalog again — preserving the rest of the
+    /// document exactly as [`with_tui_key`](Self::with_tui_key) does. PURE:
+    /// the caller owns the filesystem write.
+    pub fn with_tool_exposure_allow_list(
+        text: &str,
+        allow_list: Option<&[&str]>,
+    ) -> Result<String> {
+        Self::with_tool_exposure_item(
+            text,
+            "allow_list",
+            allow_list.map(|names| {
+                let mut array = toml_edit::Array::new();
+                for name in names {
+                    array.push(*name);
+                }
+                toml_edit::value(array)
+            }),
+        )
+    }
+
+    /// Set `[tool_exposure] read_only` (#2932), preserving the rest of the
+    /// document. PURE: the caller owns the filesystem write.
+    pub fn with_tool_exposure_read_only(text: &str, read_only: bool) -> Result<String> {
+        Self::with_tool_exposure_item(text, "read_only", Some(toml_edit::value(read_only)))
+    }
+
+    fn with_tool_exposure_item(
+        text: &str,
+        key: &str,
+        item: Option<toml_edit::Item>,
+    ) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("tool_exposure")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`tool_exposure` is not a table".to_string()))?;
+        match item {
+            Some(mut item) => {
+                // Keep the old value's trailing comment and spacing, as
+                // `with_default_backend` does.
+                if let (Some(new), Some(old)) = (
+                    item.as_value_mut(),
+                    table.get(key).and_then(toml_edit::Item::as_value),
+                ) {
+                    *new.decor_mut() = old.decor().clone();
+                }
+                table.insert(key, item);
+            }
+            None => {
+                table.remove(key);
+            }
+        }
         Ok(doc.to_string())
     }
 

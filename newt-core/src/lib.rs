@@ -255,7 +255,7 @@ pub use config::{
     ProbeObservation, ProbeWriteback, ProbedServing, ProfilePick, ProviderConfig, RequestMeter,
     RequestMode, ResolvedBackend, ResolvedConfig, RunCommandBudget, ScratchConfig, SemanticConfig,
     Serving, ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode,
-    ToolExposureConfig, ToolPermissions, TuiConfig,
+    ToolExposureConfig, ToolPermissions, TuiConfig, PI_PRESET_TOOLS,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,

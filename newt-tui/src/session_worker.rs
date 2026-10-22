@@ -108,6 +108,7 @@ pub(crate) enum SurfaceRequest {
         session: String,
     },
     SetBackgroundJobs(Vec<BackgroundJob>),
+    SetToolPolicy(Option<String>),
     SetTabs(Vec<crate::tab_bar::TabCell>),
     #[cfg(feature = "live-spill")]
     SetSpillArchive(std::sync::Arc<crate::completed_spill::CompletedSpillArchive>),
@@ -469,6 +470,10 @@ impl crate::chat::InputSurface for RemoteSurface {
         self.notify(SurfaceRequest::SetBackgroundJobs(jobs));
     }
 
+    fn set_tool_policy(&mut self, label: Option<String>) {
+        self.notify(SurfaceRequest::SetToolPolicy(label));
+    }
+
     fn set_tabs(&mut self, tabs: Vec<crate::tab_bar::TabCell>) {
         self.notify(SurfaceRequest::SetTabs(tabs));
     }
@@ -595,6 +600,7 @@ pub(crate) fn pump_surface(
                 session,
             } => surface.set_runtime_context(&model, &endpoint, gauge, &session),
             SurfaceRequest::SetBackgroundJobs(jobs) => surface.set_background_jobs(jobs),
+            SurfaceRequest::SetToolPolicy(label) => surface.set_tool_policy(label),
             SurfaceRequest::SetTabs(tabs) => surface.set_tabs(tabs),
             #[cfg(feature = "live-spill")]
             SurfaceRequest::SetSpillArchive(archive) => surface.set_spill_archive(archive),
@@ -954,6 +960,7 @@ mod tests {
             let mut surface = RemoteSurface::new(to_ui);
             surface.set_runtime_context("m", "http://h", Some((1, Some(2))), "s");
             surface.set_background_jobs(Vec::new());
+            surface.set_tool_policy(Some("pi".to_string()));
             surface.set_tabs(vec![a_cell(1, true)]);
             #[cfg(feature = "live-spill")]
             surface.set_spill_archive(Arc::new(
@@ -1134,6 +1141,7 @@ mod tests {
         reload: usize,
         runtime_context: usize,
         background_jobs: usize,
+        tool_policy: usize,
         tabs: usize,
         #[cfg(feature = "live-spill")]
         spill_archive: usize,
@@ -1152,7 +1160,7 @@ mod tests {
         /// the smaller number for both — a rich build that dropped a
         /// forwarding impl must still fail here.
         const METHODS: usize =
-            13 + cfg!(feature = "rich-tui") as usize + cfg!(feature = "live-spill") as usize;
+            14 + cfg!(feature = "rich-tui") as usize + cfg!(feature = "live-spill") as usize;
 
         fn each(&self) -> Vec<(&'static str, usize)> {
             [
@@ -1163,6 +1171,7 @@ mod tests {
                 ("reload", self.reload),
                 ("set_runtime_context", self.runtime_context),
                 ("set_background_jobs", self.background_jobs),
+                ("set_tool_policy", self.tool_policy),
                 ("set_tabs", self.tabs),
                 #[cfg(feature = "live-spill")]
                 ("set_spill_archive", self.spill_archive),
@@ -1263,6 +1272,9 @@ mod tests {
         }
         fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {
             self.background_jobs += 1;
+        }
+        fn set_tool_policy(&mut self, _label: Option<String>) {
+            self.tool_policy += 1;
         }
         #[cfg(feature = "live-spill")]
         fn set_spill_archive(

@@ -2,7 +2,12 @@ use super::*;
 use newt_core::{PermissionPreset, Scope};
 use std::collections::BTreeSet;
 
-struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+// The second field is the process-env lock (see `ConfigDirPin`, #2981).
+struct Environment(
+    Vec<(&'static str, Option<std::ffi::OsString>)>,
+    #[allow(dead_code)] // held for its lifetime, never read
+    newt_core::process_env::EnvGuard,
+);
 
 impl Environment {
     fn isolated(config: &Path) -> Self {
@@ -17,6 +22,7 @@ impl Environment {
             "NEWT_EXEC_PATHS",
             "NEWT_VENV",
         ];
+        let lock = newt_core::process_env::lock();
         let saved = names
             .into_iter()
             .map(|name| (name, std::env::var_os(name)))
@@ -25,7 +31,7 @@ impl Environment {
             std::env::remove_var(name);
         }
         std::env::set_var("NEWT_CONFIG_DIR", config);
-        Self(saved)
+        Self(saved, lock)
     }
 }
 
