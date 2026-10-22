@@ -57,6 +57,9 @@ pub struct RequestReport {
     /// True when the provider sent no tools field at all (distinct from an
     /// empty `[]` array).
     pub tools_omitted: bool,
+    /// `Some(what is missing)` marks a #2959 preview: not a request that was
+    /// sent, so the renderer never says "as sent" and totals read partial.
+    pub partial: Option<String>,
 }
 
 const UNATTRIBUTED: &str = "(unattributed)";
@@ -161,6 +164,7 @@ impl RequestReport {
             tools: tool_sizes,
             tools_array_chars,
             tools_omitted,
+            partial: None,
         }
     }
 
@@ -179,7 +183,15 @@ impl RequestReport {
     }
 
     pub fn to_markdown(&self) -> String {
-        let mut out = String::from("# Request prompt report\n\nSizes are characters (the backend reports tokens only after a request).\n");
+        let mut out = match &self.partial {
+            Some(omitted) => format!("# Request prompt report (preview, partial)\n\nNo request is dispatched. Sizes are characters. Not included: {omitted}\n"),
+            None => String::from("# Request prompt report\n\nSizes are characters (the backend reports tokens only after a request).\n"),
+        };
+        let sent = if self.partial.is_some() {
+            "previewed"
+        } else {
+            "as sent"
+        };
         for (i, m) in self.system.iter().enumerate() {
             out.push_str(&format!(
                 "\n## System message {} ({} chars)\n\n| component | source | chars |\n|---|---|---:|\n",
@@ -194,7 +206,7 @@ impl RequestReport {
             out.push_str("\n## Tools (omitted by provider — no tools field sent)\n\n");
         } else {
             out.push_str(&format!(
-                "\n## Tools ({} tools, {} chars as sent)\n\n| tool | chars |\n|---|---:|\n",
+                "\n## Tools ({} tools, {} chars {sent})\n\n| tool | chars |\n|---|---:|\n",
                 self.tools.len(),
                 self.tools_array_chars
             ));
@@ -205,7 +217,12 @@ impl RequestReport {
             }
         }
         out.push_str(&format!(
-            "\nTotal: system {} + tools {} = {} chars\n",
+            "\nTotal{}: system {} + tools {} = {} chars\n",
+            if self.partial.is_some() {
+                " (partial)"
+            } else {
+                ""
+            },
             self.system_chars(),
             self.tools_array_chars,
             self.system_chars() + self.tools_array_chars
@@ -219,7 +236,7 @@ impl RequestReport {
         }
         // Full schemas as dispatched — the central inspection requirement.
         if !self.tools.is_empty() {
-            out.push_str("\n## Tool schemas (as sent)\n");
+            out.push_str(&format!("\n## Tool schemas ({sent})\n"));
             for t in &self.tools {
                 out.push_str(&format!(
                     "\n### {}\n\n```json\n{}\n```\n",

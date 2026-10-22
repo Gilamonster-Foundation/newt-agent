@@ -50,6 +50,7 @@ NEXTEST_CI_ONLY = [
     "newt-agent::personality_turn",
     "newt-agent::migration_notices",
     "newt-agent::terminal_exit_pty",
+    "newt-agent::context_request_preview",
     "newt-eval::mock_e2e",
 ]
 # Same tier, but these two live as individual tests inside newt-tui's lib

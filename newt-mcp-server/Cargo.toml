@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Newt-Agent stdio MCP server — code.read / code.edit / code.search / goal.run"
+description = "Newt-Agent stdio MCP server — newt-core file tools, git, shell_run, web_fetch, goal_run"
 keywords = ["newt", "agent", "mcp", "model-context"]
 categories = ["api-bindings", "command-line-utilities"]
 
@@ -25,7 +25,6 @@ newt-core.workspace = true
 # surface), gated by GitCaveats derived from the granted leash.
 newt-git.workspace = true
 newt-inference.workspace = true
-newt-tools.workspace = true
 # #1021 PR 5.3: connects declared MCP servers (modulex, etc.) so a
 # `--persona`-activated session's tools/list can include them alongside the
 # built-in catalog below. Already a newt-core dependent, no new dependency
