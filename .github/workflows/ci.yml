@@ -127,6 +127,16 @@ jobs:
       # `--all-targets` clippy cannot see a production-only build break (#2973).
       - name: newt-flock production library builds
         run: cargo check -p newt-flock --lib --locked
+      # HOOK PARITY: CI-only; named in .githooks/pre-push. Compiles every test
+      # target under the feature combinations the real-resource tiers run
+      # (newt-tui-pty.yml, ci.yml test job), which the default-feature clippy
+      # and test steps never build. Running them stays in their tiers (#2971).
+      - name: feature-gated test targets compile (#2971)
+        run: |
+          cargo check -p newt-tui --tests --features native-permission-test
+          cargo check -p newt-tui --tests --features rich-tui
+          cargo check -p newt-tui --tests --features rich-tui,live-spill
+          cargo check -p newt-core --tests --features ast
       # OCAP security gates (pure-Python, no cargo deps). Mirrored by the
       # `ocap-check` + `spawn-inventory` recipes in the justfile.
       - name: OCAP register honesty (ocap-check)
