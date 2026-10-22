@@ -353,7 +353,7 @@ pub use resume::resume_context_tool_definition;
 pub use send_budget::{initial_context_input_budget, is_truncation_suspect};
 pub use steering::{ReplaceRejected, Rev, SessionSteeringInbox, SteeringInbox};
 pub use tools::{
-    builtin_tool_names, execute_tool, execute_tool_with_offload,
+    builtin_tool_names, execute_tool, execute_tool_quiet, execute_tool_with_offload,
     execute_tool_with_offload_and_prompt_and_artifacts, exit_plan_mode_result,
     filter_advertised_tools, filter_tools_for_disposition, full_access_requested, ocap_disabled,
     persona_tool_allowed, plan_phase_clamp, preserve_mcp_resource_url_affinity, read_only_clamp,
