@@ -867,7 +867,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /ocap propose save       - also write them, unsigned, to approve.toml (existing entries kept)",
         "  /workspace               - review and save workspace access for the next process launch",
         "  /settings workspaces     - open the same operator workspace editor",
-        "  /settings tools [all|pi|a,b,c] - which tools the model sees; bare opens the checklist on a rich TTY",
+        "  /settings tools [all|pi|none|a,b,c] - which tools the model sees; bare opens the checklist on a rich TTY",
         "  /settings read-only [on|off] - hide write_file/edit_file/delete_file and clamp fs_write with them",
         "  /status                  - session and environment summary (the default view)",
         "  /status <topic>          - config · version · workspace · loadout · byline · memory · models · info",

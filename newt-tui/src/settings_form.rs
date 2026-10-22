@@ -560,6 +560,11 @@ impl Field {
             // at all.
             ValueSpace::Text { release, .. } => {
                 let raw = crate::prompt::strip_one_quote_pair(value);
+                // `all` is the only release for tools; empty input reaches the
+                // parser, which refuses it by name.
+                if matches!(self, Self::Tools) && raw.trim().is_empty() {
+                    return Some(raw.to_string());
+                }
                 if raw.trim().eq_ignore_ascii_case(release) || raw.trim().is_empty() {
                     Some(release.to_string())
                 } else {
@@ -721,6 +726,9 @@ thread_local! {
 
 #[cfg(test)]
 fn effective_exposure() -> newt_core::ToolExposureConfig {
+    if std::env::var_os(config_fs::REAL_LAYERS).is_some() {
+        return tool_exposure_setting();
+    }
     SHADOWED_EXPOSURE
         .with(|s| s.borrow().clone())
         .unwrap_or_else(|| {
@@ -731,28 +739,71 @@ fn effective_exposure() -> newt_core::ToolExposureConfig {
         })
 }
 
-/// The write went to the operator's own config; a pinned `NEWT_CONFIG` or a
-/// project `[tool_exposure]` can still win over it. Re-resolve and refuse to
-/// call it applied when it did not take, naming the layer. The shadowing file
-/// is never edited.
+/// The write went to the operator's own config; a project `[tool_exposure]`
+/// or a pinned `NEWT_CONFIG` base can still win over it. Re-resolve and refuse
+/// to call it applied when it did not take, naming the layer that actually
+/// sets `key` to something else. The shadowing file is never edited.
 fn confirm_in_force(
-    took: impl FnOnce(&newt_core::ToolExposureConfig) -> bool,
+    key: &str,
+    took: impl Fn(&newt_core::ToolExposureConfig) -> bool,
     label: &str,
 ) -> Result<(), String> {
     if took(&effective_exposure()) {
         return Ok(());
     }
-    let layer = if newt_core::Config::pinned_config_path().is_some() {
-        "the config pinned by NEWT_CONFIG".to_string()
-    } else if let Some(project) = newt_core::Config::project_config_path() {
-        format!("the project config {}", project.display())
-    } else {
-        "another config layer".to_string()
-    };
+    let layer = overriding_layer(&layers_above_user_file(), key, &took)
+        .unwrap_or_else(|| "another config layer".to_string());
     Err(format!(
         "{label}: saved to your config, but {layer} overrides it, so it is NOT in force \
          — change it there"
     ))
+}
+
+/// Config layers that can outrank the operator's own file, highest first, as
+/// `(label, text)`: the project overlay, then a pinned `NEWT_CONFIG` base —
+/// the order `Config::resolve` merges them in.
+fn layers_above_user_file() -> Vec<(String, String)> {
+    let read = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+    let pinned = newt_core::Config::pinned_config_path();
+    let mut layers = Vec::new();
+    if let Some(project) =
+        newt_core::Config::project_config_path().filter(|p| Some(p) != pinned.as_ref())
+    {
+        layers.push((
+            format!("the project config {}", project.display()),
+            read(&project),
+        ));
+    }
+    if let Some(pinned) = pinned {
+        layers.push((
+            "the config pinned by NEWT_CONFIG".to_string(),
+            read(&pinned),
+        ));
+    }
+    layers
+}
+
+/// The first layer (highest priority first) whose `[tool_exposure] <key>` is
+/// set and does not satisfy `took` — the one editing which can fix it. A layer
+/// that does not mention the key, or already holds the asked value, is not
+/// the blocker. PURE, so precedence is tested without a filesystem.
+fn overriding_layer(
+    layers: &[(String, String)],
+    key: &str,
+    took: &dyn Fn(&newt_core::ToolExposureConfig) -> bool,
+) -> Option<String> {
+    layers.iter().find_map(|(label, text)| {
+        let sets_key = text
+            .parse::<toml::Table>()
+            .ok()?
+            .get("tool_exposure")?
+            .as_table()?
+            .contains_key(key);
+        let exposure = toml::from_str::<newt_core::Config>(text)
+            .ok()?
+            .tool_exposure();
+        (sets_key && !took(&exposure)).then(|| label.clone())
+    })
 }
 
 /// The `/settings tools` token for a policy: `all`, `pi`, or the list.
@@ -771,7 +822,8 @@ pub(crate) fn tools_token(exposure: &newt_core::ToolExposureConfig) -> String {
 /// built-in name is checked against the catalog; an MCP `server__tool` name
 /// is taken as written, since the catalog cannot know it.
 fn parse_tools_token(value: &str) -> Result<Option<Vec<String>>, String> {
-    match value.trim() {
+    match crate::prompt::strip_one_quote_pair(value).trim() {
+        "" => Err("no tools given — use `none` for no tools or `all` to clear the list".into()),
         "all" => Ok(None),
         "none" => Ok(Some(Vec::new())),
         "pi" => Ok(Some(
@@ -830,7 +882,14 @@ pub(crate) mod config_fs {
         static FILES: RefCell<Vec<(PathBuf, String)>> = const { RefCell::new(Vec::new()) };
     }
 
+    /// Set only in the child process of the layered-config regression, which
+    /// runs the production resolver against real files in a throwaway tree.
+    pub(crate) const REAL_LAYERS: &str = "NEWT_SETTINGS_REAL_LAYERS";
+
     pub(crate) fn read(path: &Path) -> String {
+        if std::env::var_os(REAL_LAYERS).is_some() {
+            return std::fs::read_to_string(path).unwrap_or_default();
+        }
         FILES.with(|files| {
             files
                 .borrow()
@@ -843,6 +902,9 @@ pub(crate) mod config_fs {
     }
 
     pub(crate) fn write(path: &Path, text: &str) -> std::io::Result<()> {
+        if std::env::var_os(REAL_LAYERS).is_some() {
+            return std::fs::write(path, text);
+        }
         FILES.with(|files| {
             files
                 .borrow_mut()
@@ -1039,13 +1101,17 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                     list.as_ref().map(|_| names.as_slice()),
                 )
             })?;
-            confirm_in_force(|now| now.allow_list == list, field.label())?;
+            confirm_in_force("allow_list", |now| now.allow_list == list, field.label())?;
         }
         Field::ReadOnly => {
             persist_config(|text| {
                 newt_core::Config::with_tool_exposure_read_only(text, value == "on")
             })?;
-            confirm_in_force(|now| now.read_only == (value == "on"), field.label())?;
+            confirm_in_force(
+                "read_only",
+                |now| now.read_only == (value == "on"),
+                field.label(),
+            )?;
         }
     }
     Ok(format!("{}: {value}", field.label()))
@@ -2179,6 +2245,165 @@ mod tests {
         let result = apply_and_record(Field::ReadOnly, "on", "/settings read-only");
         SHADOWED_EXPOSURE.with(|s| *s.borrow_mut() = None);
         assert!(result.unwrap_err().contains("NOT in force"));
+    }
+
+    /// #2981 round 2: `all` is the only release. Empty, whitespace-only and
+    /// quoted-empty input is refused by name through the whole validation
+    /// boundary, and nothing is written.
+    #[test]
+    fn empty_tools_input_is_refused_not_released() {
+        let _guard = settings_guard();
+        apply(Field::Tools, "read_file").unwrap();
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        let before = config_fs::read(&path);
+        for typed in ["", "  ", "\"\"", "\"  \""] {
+            let value = Field::Tools.accepts(typed).expect("reaches the parser");
+            let refused = apply(Field::Tools, &value).unwrap_err();
+            assert!(
+                refused.contains("`none`") && refused.contains("`all`"),
+                "{typed:?}: {refused}"
+            );
+        }
+        assert_eq!(
+            config_fs::read(&path),
+            before,
+            "a refused value writes nothing"
+        );
+        assert_eq!(Field::Tools.accepts("all").as_deref(), Some("all"));
+    }
+
+    /// #2981 round 2: the blamed layer is the one that sets the key to
+    /// something else, in resolver order — never "the pinned file exists".
+    #[test]
+    fn the_overriding_layer_is_the_one_that_sets_the_key() {
+        let layer = |label: &str, toml: &str| (label.to_string(), toml.to_string());
+        let wants_ro = |c: &newt_core::ToolExposureConfig| c.read_only;
+        let project = layer("project", "[tool_exposure]\nread_only = false\n");
+        let pinned_ok = layer("pinned", "[tool_exposure]\nread_only = true\n");
+        let pinned_bad = layer("pinned", "[tool_exposure]\nread_only = false\n");
+        let silent = layer("project", "[tool_exposure]\nallow_list = []\n");
+        let blame = |layers: &[(String, String)]| overriding_layer(layers, "read_only", &wants_ro);
+        assert_eq!(
+            blame(&[project.clone(), pinned_ok.clone()]).as_deref(),
+            Some("project")
+        );
+        assert_eq!(
+            blame(std::slice::from_ref(&pinned_bad)).as_deref(),
+            Some("pinned")
+        );
+        assert_eq!(
+            blame(&[silent, pinned_bad]).as_deref(),
+            Some("pinned"),
+            "a layer that does not set the key is not blamed"
+        );
+        assert_eq!(blame(&[pinned_ok]), None);
+        assert_eq!(blame(&[]), None);
+    }
+
+    /// #2981 round 2: the production resolver, real files, real receipt
+    /// journal. A child process per layout (the settings tests share process
+    /// env): user-only takes; project-only, pinned-only and pinned+project
+    /// refuse, name the layer that sets the key, leave the other files
+    /// byte-identical and write no receipt.
+    #[tokio::test]
+    async fn layered_config_names_the_winning_layer_through_the_real_resolver() {
+        const CHILD: &str = "NEWT_LAYER_CASE";
+        if let Ok(case) = std::env::var(CHILD) {
+            let _guard = settings_guard();
+            let receipts = std::env::current_dir().unwrap().join("receipts.jsonl");
+            std::env::set_var(newt_core::settings_receipt::RECEIPT_PATH_ENV, &receipts);
+            let outcome = apply_and_record(Field::ReadOnly, "on", "/settings read-only");
+            let wrote_receipt = receipts.exists();
+            match case.as_str() {
+                "user" => {
+                    outcome.expect("nothing shadows the user file");
+                    assert!(wrote_receipt, "a took write is receipted");
+                }
+                other => {
+                    let error = outcome.unwrap_err();
+                    assert!(error.contains("NOT in force"), "{error}");
+                    let blamed = if other == "pinned" {
+                        "pinned by NEWT_CONFIG"
+                    } else {
+                        "project config"
+                    };
+                    assert!(error.contains(blamed), "{other}: {error}");
+                    assert!(!wrote_receipt, "a refused write is not receipted");
+                }
+            }
+            return;
+        }
+        let off = "[tool_exposure]\nread_only = false\n";
+        let on = "[tool_exposure]\nread_only = true\n";
+        for (case, pinned, project) in [
+            ("user", None, None),
+            ("project", None, Some(off)),
+            ("pinned", Some(off), None),
+            ("pinned+project", Some(on), Some(off)),
+        ] {
+            let fx = tempfile::tempdir().unwrap();
+            let home = fx.path().join("home");
+            let cfg = home.join(".newt");
+            let work = fx.path().join("work");
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::create_dir_all(work.join(".newt")).unwrap();
+            let pinned_path = fx.path().join("pinned.toml");
+            let project_path = work.join(".newt/config.toml");
+            if let Some(text) = pinned {
+                std::fs::write(&pinned_path, text).unwrap();
+            }
+            if let Some(text) = project {
+                std::fs::write(&project_path, text).unwrap();
+            }
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("NEWT_") {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .args([
+                    "--exact",
+                    "settings_form::tests::layered_config_names_the_winning_layer_through_the_real_resolver",
+                    "--nocapture",
+                ])
+                .current_dir(&work)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("NEWT_CONFIG_DIR", &cfg)
+                .env(config_fs::REAL_LAYERS, "1")
+                .env(CHILD, if case == "pinned+project" { "project" } else { case })
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            if pinned.is_some() {
+                command.env("NEWT_CONFIG", &pinned_path);
+            }
+            let output = tokio::time::timeout(newt_core::test_guard::HANG_GUARD, command.output())
+                .await
+                .expect("layer fixture watchdog expired")
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if let Some(text) = pinned {
+                assert_eq!(
+                    std::fs::read_to_string(&pinned_path).unwrap(),
+                    text,
+                    "{case}: pinned untouched"
+                );
+            }
+            if let Some(text) = project {
+                assert_eq!(
+                    std::fs::read_to_string(&project_path).unwrap(),
+                    text,
+                    "{case}: project untouched"
+                );
+            }
+        }
     }
 
     #[test]
