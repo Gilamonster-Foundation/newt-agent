@@ -21,6 +21,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   system-prompt <path>` and `reset` set it for the session. The footer shows
   `[prompt: <file>]` while an override is in force.
 
+### Fixed
+
+- `plan_approval_turn` no longer fails under a narrow terminal: the child runs in its
+  own session, so crossterm cannot read the test runner's PTY width (#2972).
+
 ## [0.8.3] — 2026-10-20
 
 ### Security
