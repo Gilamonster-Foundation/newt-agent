@@ -129,11 +129,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    type Editor = Box<dyn Fn(&str) -> String>;
+
     #[derive(Default)]
     struct Fake {
         files: HashMap<PathBuf, String>,
         /// What the "editor" turns the scratch text into.
-        editor: Option<Box<dyn Fn(&str) -> String>>,
+        editor: Option<Editor>,
         editor_fails: bool,
     }
 
