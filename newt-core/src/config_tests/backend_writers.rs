@@ -220,3 +220,20 @@ fn with_tool_exposure_writers_edit_one_key_and_keep_the_rest() {
     );
     assert!(Config::with_tool_exposure_read_only("tool_exposure = 3\n", true).is_err());
 }
+
+/// #2981 review: replacing `read_only` / `allow_list` kept neither key's
+/// trailing comment, and a same-value write erased it too.
+#[test]
+fn with_tool_exposure_writers_keep_comments_on_the_edited_keys() {
+    let text = "[tool_exposure]\nread_only = false # keep this explanation\n\
+                allow_list = [\"read_file\"] # keep this list note\n";
+    for out in [
+        Config::with_tool_exposure_read_only(text, true).unwrap(),
+        Config::with_tool_exposure_read_only(text, false).unwrap(),
+        Config::with_tool_exposure_allow_list(text, Some(&["read_file"])).unwrap(),
+        Config::with_tool_exposure_allow_list(text, Some(&["find"])).unwrap(),
+    ] {
+        assert!(out.contains("# keep this explanation"), "{out}");
+        assert!(out.contains("# keep this list note"), "{out}");
+    }
+}

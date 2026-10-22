@@ -339,7 +339,7 @@ impl Field {
             // `all` releases the allow list (the whole catalog again).
             Self::Tools => ValueSpace::Text {
                 release: "all",
-                placeholder: "pi  or  read_file,run_command,find",
+                placeholder: "pi  or  none  or  read_file,run_command,find",
             },
             Self::ReadOnly => owned(&[
                 (
@@ -706,10 +706,61 @@ pub(crate) fn tool_exposure_setting() -> newt_core::ToolExposureConfig {
         .unwrap_or_default()
 }
 
+/// The `[tool_exposure]` policy that WINS, as the next turn will see it. The
+/// unit tier reads the mocked user file unless a test installs a shadow.
+#[cfg(not(test))]
+fn effective_exposure() -> newt_core::ToolExposureConfig {
+    tool_exposure_setting()
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SHADOWED_EXPOSURE: std::cell::RefCell<Option<newt_core::ToolExposureConfig>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn effective_exposure() -> newt_core::ToolExposureConfig {
+    SHADOWED_EXPOSURE
+        .with(|s| s.borrow().clone())
+        .unwrap_or_else(|| {
+            let path = newt_core::Config::user_config_path().expect("a config path");
+            toml::from_str::<newt_core::Config>(&config_fs::read(&path))
+                .map(|c| c.tool_exposure())
+                .unwrap_or_default()
+        })
+}
+
+/// The write went to the operator's own config; a pinned `NEWT_CONFIG` or a
+/// project `[tool_exposure]` can still win over it. Re-resolve and refuse to
+/// call it applied when it did not take, naming the layer. The shadowing file
+/// is never edited.
+fn confirm_in_force(
+    took: impl FnOnce(&newt_core::ToolExposureConfig) -> bool,
+    label: &str,
+) -> Result<(), String> {
+    if took(&effective_exposure()) {
+        return Ok(());
+    }
+    let layer = if newt_core::Config::pinned_config_path().is_some() {
+        "the config pinned by NEWT_CONFIG".to_string()
+    } else if let Some(project) = newt_core::Config::project_config_path() {
+        format!("the project config {}", project.display())
+    } else {
+        "another config layer".to_string()
+    };
+    Err(format!(
+        "{label}: saved to your config, but {layer} overrides it, so it is NOT in force \
+         — change it there"
+    ))
+}
+
 /// The `/settings tools` token for a policy: `all`, `pi`, or the list.
 pub(crate) fn tools_token(exposure: &newt_core::ToolExposureConfig) -> String {
     match &exposure.allow_list {
         None => "all".to_string(),
+        // An explicit `none` — an empty list would read as the release.
+        Some(list) if list.is_empty() => "none".to_string(),
         Some(_) if exposure.is_pi_preset() => "pi".to_string(),
         Some(list) => list.join(","),
     }
@@ -722,6 +773,7 @@ pub(crate) fn tools_token(exposure: &newt_core::ToolExposureConfig) -> String {
 fn parse_tools_token(value: &str) -> Result<Option<Vec<String>>, String> {
     match value.trim() {
         "all" => Ok(None),
+        "none" => Ok(Some(Vec::new())),
         "pi" => Ok(Some(
             newt_core::PI_PRESET_TOOLS
                 .iter()
@@ -735,6 +787,9 @@ fn parse_tools_token(value: &str) -> Result<Option<Vec<String>>, String> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
+            if names.is_empty() {
+                return Err("no tool names — use `none` for no tools, `all` for every tool".into());
+            }
             let known = newt_core::agentic::builtin_tool_names();
             let unknown: Vec<&str> = names
                 .iter()
@@ -984,11 +1039,13 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                     list.as_ref().map(|_| names.as_slice()),
                 )
             })?;
+            confirm_in_force(|now| now.allow_list == list, field.label())?;
         }
         Field::ReadOnly => {
             persist_config(|text| {
                 newt_core::Config::with_tool_exposure_read_only(text, value == "on")
             })?;
+            confirm_in_force(|now| now.read_only == (value == "on"), field.label())?;
         }
     }
     Ok(format!("{}: {value}", field.label()))
@@ -2000,8 +2057,10 @@ mod tests {
     #[test]
     fn the_tools_fields_persist_the_exposure_policy_and_refuse_unknown_names() {
         let _guard = settings_guard();
-        let path = newt_core::Config::user_config_path().expect("a config path");
+        // Re-derived per read: a sibling test pinning NEWT_CONFIG_DIR without
+        // the guard moved the path mid-test in CI (#2981, lean job).
         let saved_policy = || {
+            let path = newt_core::Config::user_config_path().expect("a config path");
             toml::from_str::<newt_core::Config>(&config_fs::read(&path))
                 .expect("valid TOML")
                 .tool_exposure()
@@ -2020,11 +2079,12 @@ mod tests {
         );
         assert_eq!(tools_token(&saved_policy()), "read_file,run_command,find");
 
+        let path = newt_core::Config::user_config_path().expect("a config path");
         let before = config_fs::read(&path);
         let refused = apply(Field::Tools, "read_file,frobnicate").unwrap_err();
         assert!(refused.contains("frobnicate"), "{refused}");
         assert_eq!(
-            config_fs::read(&path),
+            config_fs::read(&newt_core::Config::user_config_path().unwrap()),
             before,
             "a refused value writes nothing"
         );
@@ -2053,6 +2113,72 @@ mod tests {
         assert_eq!(saved_policy().allow_list, None);
         assert_eq!(tools_token(&saved_policy()), "all");
         assert_eq!(saved_policy().status_label(), None);
+    }
+
+    /// #2981 review: unticking the last checkbox is "no tools", not "all".
+    /// The panel's token must survive the Text release rule and persist as
+    /// an explicit empty list; `all` stays the only way to clear it.
+    #[test]
+    fn an_empty_selection_stays_no_tools_end_to_end() {
+        let _guard = settings_guard();
+        let saved = || {
+            let path = newt_core::Config::user_config_path().expect("a config path");
+            toml::from_str::<newt_core::Config>(&config_fs::read(&path))
+                .expect("valid TOML")
+                .tool_exposure()
+        };
+        apply(Field::Tools, "read_file").unwrap();
+        let panel = crate::settings_form::tools_token(&newt_core::ToolExposureConfig {
+            allow_list: Some(Vec::new()),
+            ..Default::default()
+        });
+        assert_eq!(panel, "none");
+        assert_eq!(Field::Tools.accepts(&panel).as_deref(), Some("none"));
+        apply(Field::Tools, &panel).unwrap();
+        assert_eq!(saved().allow_list, Some(Vec::new()));
+        assert_eq!(tools_token(&saved()), "none");
+        assert!(
+            apply(Field::Tools, ",").is_err(),
+            "a bare separator is not a list"
+        );
+        apply(Field::Tools, "all").unwrap();
+        assert_eq!(saved().allow_list, None);
+    }
+
+    /// #2981 review: a layer that wins over the operator's file must make the
+    /// write fail loudly, not print "applied". Nothing but the user file is
+    /// written, and no receipt-worthy success is returned.
+    #[test]
+    fn a_shadowed_exposure_write_is_refused_naming_the_layer() {
+        let _guard = settings_guard();
+        SHADOWED_EXPOSURE.with(|s| {
+            *s.borrow_mut() = Some(newt_core::ToolExposureConfig {
+                read_only: false,
+                allow_list: Some(vec!["write_file".into()]),
+                ..Default::default()
+            });
+        });
+        let ro = apply(Field::ReadOnly, "on").unwrap_err();
+        let list = apply(Field::Tools, "pi").unwrap_err();
+        for refused in [&ro, &list] {
+            assert!(refused.contains("NOT in force"), "{refused}");
+            assert!(refused.contains("overrides"), "{refused}");
+        }
+        // The change that does match the winning layer is not refused.
+        assert!(apply(Field::ReadOnly, "off").is_ok());
+        assert!(apply(Field::Tools, "write_file").is_ok());
+        SHADOWED_EXPOSURE.with(|s| *s.borrow_mut() = None);
+    }
+
+    /// The same, through the receipt boundary: a refused write journals nothing.
+    #[test]
+    fn a_shadowed_write_leaves_no_receipt() {
+        let _guard = settings_guard();
+        SHADOWED_EXPOSURE
+            .with(|s| *s.borrow_mut() = Some(newt_core::ToolExposureConfig::default()));
+        let result = apply_and_record(Field::ReadOnly, "on", "/settings read-only");
+        SHADOWED_EXPOSURE.with(|s| *s.borrow_mut() = None);
+        assert!(result.unwrap_err().contains("NOT in force"));
     }
 
     #[test]

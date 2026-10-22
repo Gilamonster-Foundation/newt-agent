@@ -2247,7 +2247,15 @@ impl Config {
             .as_table_mut()
             .ok_or_else(|| NewtError::Config("`tool_exposure` is not a table".to_string()))?;
         match item {
-            Some(item) => {
+            Some(mut item) => {
+                // Keep the old value's trailing comment and spacing, as
+                // `with_default_backend` does.
+                if let (Some(new), Some(old)) = (
+                    item.as_value_mut(),
+                    table.get(key).and_then(toml_edit::Item::as_value),
+                ) {
+                    *new.decor_mut() = old.decor().clone();
+                }
                 table.insert(key, item);
             }
             None => {
