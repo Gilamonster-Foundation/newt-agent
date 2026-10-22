@@ -166,3 +166,57 @@ fn with_tui_key_sets_one_scalar_and_keeps_subtables_and_comments() {
     );
     assert!(Config::with_tui_key("tui = 3\n", "prefix_key", "x").is_err());
 }
+
+/// #2932: the `/settings tools` and `/settings read-only` writers. The
+/// `[tool_exposure]` table is created when absent, an existing `profile` and
+/// the surrounding comments survive, `None` removes the allow list, and a
+/// second write replaces rather than duplicates.
+#[test]
+fn with_tool_exposure_writers_edit_one_key_and_keep_the_rest() {
+    let text = "# my config\n[tool_exposure]\nprofile = \"auto\" # keep me\n";
+    let listed =
+        Config::with_tool_exposure_allow_list(text, Some(&["read_file", "run_command"])).unwrap();
+    let parsed: Config = toml::from_str(&listed).unwrap();
+    let exposure = parsed.tool_exposure();
+    assert_eq!(exposure.profile, ExposureProfile::Auto);
+    assert_eq!(
+        exposure.allow_list.as_deref(),
+        Some(&["read_file".to_string(), "run_command".to_string()][..])
+    );
+    assert!(
+        listed.contains("# my config") && listed.contains("# keep me"),
+        "{listed}"
+    );
+
+    let ro = Config::with_tool_exposure_read_only(&listed, true).unwrap();
+    let ro_again = Config::with_tool_exposure_read_only(&ro, false).unwrap();
+    assert_eq!(ro_again.matches("read_only").count(), 1, "{ro_again}");
+    assert!(
+        !toml::from_str::<Config>(&ro_again)
+            .unwrap()
+            .tool_exposure()
+            .read_only
+    );
+    assert!(
+        toml::from_str::<Config>(&ro)
+            .unwrap()
+            .tool_exposure()
+            .read_only
+    );
+
+    let released = Config::with_tool_exposure_allow_list(&ro, None).unwrap();
+    let parsed: Config = toml::from_str(&released).unwrap();
+    assert_eq!(parsed.tool_exposure().allow_list, None);
+    assert!(
+        parsed.tool_exposure().read_only,
+        "releasing the list keeps the toggle"
+    );
+
+    // A fresh config gains the table; a scalar in its place is an error.
+    let fresh = Config::with_tool_exposure_read_only("", true).unwrap();
+    assert!(
+        fresh.contains("[tool_exposure]") && fresh.contains("read_only = true"),
+        "{fresh}"
+    );
+    assert!(Config::with_tool_exposure_read_only("tool_exposure = 3\n", true).is_err());
+}
