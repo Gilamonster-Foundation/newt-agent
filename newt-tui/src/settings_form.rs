@@ -760,9 +760,9 @@ fn confirm_in_force(
 }
 
 /// Config layers that can outrank the operator's own file, highest first, as
-/// `(label, text)`: the project overlay, then a pinned `NEWT_CONFIG` base —
-/// the order `Config::resolve` merges them in.
-fn layers_above_user_file() -> Vec<(String, String)> {
+/// `(label, text, is_base)`: the project overlay, then a pinned `NEWT_CONFIG`
+/// base — the order `Config::resolve` merges them in.
+fn layers_above_user_file() -> Vec<(String, String, bool)> {
     let read = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
     let pinned = newt_core::Config::pinned_config_path();
     let mut layers = Vec::new();
@@ -772,37 +772,41 @@ fn layers_above_user_file() -> Vec<(String, String)> {
         layers.push((
             format!("the project config {}", project.display()),
             read(&project),
+            false,
         ));
     }
     if let Some(pinned) = pinned {
         layers.push((
             "the config pinned by NEWT_CONFIG".to_string(),
             read(&pinned),
+            true,
         ));
     }
     layers
 }
 
-/// The first layer (highest priority first) whose `[tool_exposure] <key>` is
-/// set and does not satisfy `took` — the one editing which can fix it. A layer
-/// that does not mention the key, or already holds the asked value, is not
-/// the blocker. PURE, so precedence is tested without a filesystem.
+/// The first layer (highest priority first) that holds a value not satisfying
+/// `took` — the one editing which can fix it. An overlay counts only when it
+/// sets `[tool_exposure] <key>`; the selected base (`is_base`) REPLACES the
+/// user file rather than layering over it, so its defaults count when it omits
+/// the key or the section. A layer already holding the asked value is not the
+/// blocker. PURE, so precedence is tested without a filesystem.
 fn overriding_layer(
-    layers: &[(String, String)],
+    layers: &[(String, String, bool)],
     key: &str,
     took: &dyn Fn(&newt_core::ToolExposureConfig) -> bool,
 ) -> Option<String> {
-    layers.iter().find_map(|(label, text)| {
+    layers.iter().find_map(|(label, text, is_base)| {
         let sets_key = text
             .parse::<toml::Table>()
             .ok()?
-            .get("tool_exposure")?
-            .as_table()?
-            .contains_key(key);
+            .get("tool_exposure")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|t| t.contains_key(key));
         let exposure = toml::from_str::<newt_core::Config>(text)
             .ok()?
             .tool_exposure();
-        (sets_key && !took(&exposure)).then(|| label.clone())
+        ((sets_key || *is_base) && !took(&exposure)).then(|| label.clone())
     })
 }
 
@@ -2292,13 +2296,15 @@ mod tests {
     /// something else, in resolver order — never "the pinned file exists".
     #[test]
     fn the_overriding_layer_is_the_one_that_sets_the_key() {
-        let layer = |label: &str, toml: &str| (label.to_string(), toml.to_string());
+        let layer =
+            |label: &str, toml: &str| (label.to_string(), toml.to_string(), label == "pinned");
         let wants_ro = |c: &newt_core::ToolExposureConfig| c.read_only;
         let project = layer("project", "[tool_exposure]\nread_only = false\n");
         let pinned_ok = layer("pinned", "[tool_exposure]\nread_only = true\n");
         let pinned_bad = layer("pinned", "[tool_exposure]\nread_only = false\n");
         let silent = layer("project", "[tool_exposure]\nallow_list = []\n");
-        let blame = |layers: &[(String, String)]| overriding_layer(layers, "read_only", &wants_ro);
+        let blame =
+            |layers: &[(String, String, bool)]| overriding_layer(layers, "read_only", &wants_ro);
         assert_eq!(
             blame(&[project.clone(), pinned_ok.clone()]).as_deref(),
             Some("project")
@@ -2312,8 +2318,18 @@ mod tests {
             Some("pinned"),
             "a layer that does not set the key is not blamed"
         );
-        assert_eq!(blame(&[pinned_ok]), None);
+        assert_eq!(blame(std::slice::from_ref(&pinned_ok)), None);
         assert_eq!(blame(&[]), None);
+        // A pinned base that omits the key or the section still wins by default.
+        for omitted in ["", "[tui]\nx = 1\n", "[tool_exposure]\nallow_list = []\n"] {
+            assert_eq!(
+                blame(&[layer("pinned", omitted)]).as_deref(),
+                Some("pinned"),
+                "{omitted:?}"
+            );
+        }
+        // ...but an overlay that omits the key is still not blamed.
+        assert_eq!(blame(&[layer("project", "")]), None);
     }
 
     /// #2981 round 2: the production resolver, real files, real receipt
@@ -2328,34 +2344,46 @@ mod tests {
             let _guard = settings_guard();
             let receipts = std::env::current_dir().unwrap().join("receipts.jsonl");
             std::env::set_var(newt_core::settings_receipt::RECEIPT_PATH_ENV, &receipts);
-            let outcome = apply_and_record(Field::ReadOnly, "on", "/settings read-only");
-            let wrote_receipt = receipts.exists();
-            match case.as_str() {
-                "user" => {
-                    outcome.expect("nothing shadows the user file");
-                    assert!(wrote_receipt, "a took write is receipted");
-                }
-                other => {
-                    let error = outcome.unwrap_err();
-                    assert!(error.contains("NOT in force"), "{error}");
-                    let blamed = if other == "pinned" {
-                        "pinned by NEWT_CONFIG"
-                    } else {
-                        "project config"
-                    };
-                    assert!(error.contains(blamed), "{other}: {error}");
-                    assert!(!wrote_receipt, "a refused write is not receipted");
+            for (field, value, verb) in [
+                (Field::ReadOnly, "on", "/settings read-only"),
+                (Field::Tools, "none", "/settings tools"),
+            ] {
+                let outcome = apply_and_record(field, value, verb);
+                let wrote_receipt = receipts.exists();
+                match case.as_str() {
+                    "user" => {
+                        outcome.expect("nothing shadows the user file");
+                        assert!(wrote_receipt, "a took write is receipted");
+                    }
+                    other => {
+                        let error = outcome.unwrap_err();
+                        assert!(error.contains("NOT in force"), "{other}: {error}");
+                        let blamed = if other == "pinned" {
+                            "pinned by NEWT_CONFIG"
+                        } else {
+                            "project config"
+                        };
+                        assert!(error.contains(blamed), "{other} {verb}: {error}");
+                        assert!(!wrote_receipt, "a refused write is not receipted");
+                    }
                 }
             }
             return;
         }
-        let off = "[tool_exposure]\nread_only = false\n";
-        let on = "[tool_exposure]\nread_only = true\n";
+        let off = "[tool_exposure]\nread_only = false\nallow_list = [\"write_file\"]\n";
+        let on = "[tool_exposure]\nread_only = true\nallow_list = []\n";
         for (case, pinned, project) in [
             ("user", None, None),
             ("project", None, Some(off)),
             ("pinned", Some(off), None),
             ("pinned+project", Some(on), Some(off)),
+            (
+                "pinned",
+                Some("[tool_exposure]\nallow_list = [\"read_file\"]\n"),
+                None,
+            ),
+            ("pinned", Some("[tool_exposure]\nread_only = false\n"), None),
+            ("pinned", Some("[tui]\nverbose = true\n"), None),
         ] {
             let fx = tempfile::tempdir().unwrap();
             let home = fx.path().join("home");
