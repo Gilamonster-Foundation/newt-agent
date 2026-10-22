@@ -890,6 +890,17 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Journal,
     ),
     cmd_on(
+        // #2938: the operator's system prompt file, a `/settings` field that
+        // was never a verb. Journal, because the write goes through
+        // `apply_and_record`; `edit` opens it in $EDITOR.
+        "system-prompt",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
         // The meta prefix (ctrl+space by default): a `/settings` field that
         // was never a verb, like `compaction`. Journal, because the write
         // goes through `apply_and_record`; it also persists to config.

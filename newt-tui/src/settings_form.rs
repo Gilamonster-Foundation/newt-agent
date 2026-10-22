@@ -104,6 +104,7 @@ pub(crate) enum Field {
     Markdown,
     Mode,
     Prompt,
+    SystemPrompt,
     Compaction,
     Detail,
     Posture,
@@ -132,6 +133,7 @@ impl Field {
         Self::Markdown,
         Self::Mode,
         Self::Prompt,
+        Self::SystemPrompt,
         Self::Compaction,
         Self::Detail,
         Self::Posture,
@@ -158,6 +160,7 @@ impl Field {
             Self::Markdown => "markdown",
             Self::Mode => "mode",
             Self::Prompt => "prompt",
+            Self::SystemPrompt => "system-prompt",
             Self::Compaction => "compaction",
             Self::Detail => "detail",
             Self::Posture => "posture",
@@ -182,6 +185,7 @@ impl Field {
             Self::Markdown => "markdown rendering",
             Self::Mode => "operating mode",
             Self::Prompt => "input prompt template",
+            Self::SystemPrompt => "system prompt file",
             Self::Compaction => "automatic-compaction trigger",
             Self::Detail => "tool-output detail rows",
             Self::Posture => "permission posture",
@@ -334,6 +338,12 @@ impl Field {
                 release: "reset",
                 placeholder: "\"[$TIME] ❯ \"",
             },
+            // A path, or `edit` (handled by the session: it needs the
+            // terminal). `reset` returns to the assembled prompt (#2938).
+            Self::SystemPrompt => ValueSpace::Text {
+                release: "reset",
+                placeholder: "~/.newt/system-prompt.md | edit",
+            },
             // Free text, not a vocabulary: `pi` and `all` are words, but the
             // general value is a list of tool names the checklist assembles.
             // `all` releases the allow list (the whole catalog again).
@@ -448,6 +458,13 @@ impl Field {
             // The TEMPLATE, not the rendered preview: the setting is what this
             // form can change, and the preview is what resolution makes of it.
             Self::Prompt => crate::prompt::active_prompt_template(),
+            // The file in force, or `reset` when newt assembles its own.
+            Self::SystemPrompt => crate::migration_notices::read(|report| {
+                newt_core::Config::resolve_unpublished(report)
+            })
+            .ok()
+            .and_then(|cfg| cfg.system_prompt_file())
+            .map_or_else(|| "reset".to_string(), |p| p.display().to_string()),
             Self::Compaction => {
                 crate::migration_notices::read(newt_core::config::session_compaction_trigger_policy)
                     .keyword()
@@ -1030,6 +1047,20 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                 newt_core::process_env::set_var("NEWT_PROMPT", value);
             }
         }
+        // Session only; `[prompt] file` persists it. `edit` is the session's
+        // (it needs the terminal), so it never lands here as a path.
+        Field::SystemPrompt => match value {
+            "edit" => return Err("system-prompt edit needs the interactive session".to_string()),
+            // Blank, not removed: a removed twin would reveal `[prompt] file`.
+            "reset" => newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, ""),
+            path => {
+                // An unusable file is refused here, not reported as active.
+                newt_core::SystemPromptOverride::read_typed(path).map_err(|e| {
+                    format!("{e}; nothing changed, newt keeps sending its previous prompt")
+                })?;
+                newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, path);
+            }
+        },
         // The one field here that PERSISTS: a prefix you had to set again every
         // session would be a trap. `[tui] prefix_key`, through the
         // comment-preserving writer; and the session, so the next panel uses it

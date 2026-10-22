@@ -550,3 +550,31 @@ async fn no_soul_provider_context_providers_still_annotated_2937() {
         "no soul provider means no 'soul' label; got {labels:?}"
     );
 }
+
+/// #2938: with a system prompt file set, the session's prompt is that file's
+/// bytes and nothing of the assembled prompt; unset, it is assembled again.
+/// Grounds the mocked override tests in a real file read.
+#[serial_test::serial(real_fs)]
+#[test]
+fn a_system_prompt_file_replaces_the_assembled_prompt_2938() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_str().unwrap();
+    let file = tmp.path().join("pruned.md");
+    let pruned = "Be brief.\n\n  Keep this spacing.\n";
+    std::fs::write(&file, pruned).unwrap();
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::SoulProvider::new(None));
+
+    newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, file.to_str().unwrap());
+    let overridden = rebuild_system_prompt(workspace, &memory, None, "s", None);
+    newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, "");
+    let assembled = rebuild_system_prompt(workspace, &memory, None, "s", None);
+    newt_core::process_env::remove_var(newt_core::SYSTEM_PROMPT_FILE_ENV);
+
+    assert_eq!(overridden, pruned);
+    assert!(
+        assembled.contains("Workspace: "),
+        "unset, newt assembles its own: {assembled:.200}"
+    );
+}

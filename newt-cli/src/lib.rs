@@ -909,6 +909,11 @@ pub enum Command {
         /// in the TUI (#2937).
         #[arg(long, value_name = "FILE")]
         dump_request: Option<PathBuf>,
+        /// Use FILE's contents, byte for byte, as the system prompt in place
+        /// of the one newt assembles. Same as `[prompt] file`; this flag wins
+        /// (#2938).
+        #[arg(long, value_name = "FILE")]
+        system_prompt_file: Option<PathBuf>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
         /// otherwise starts a resumable frame; legacy headless keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
@@ -1888,6 +1893,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             output_allowance,
             run_allowance,
             dump_request,
+            system_prompt_file,
             hermetic,
             resume_from,
         } => {
@@ -1918,6 +1924,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 output_allowance,
                 run_allowance,
                 dump_request,
+                system_prompt_file,
                 launch,
             })
             .await?;

@@ -52,6 +52,7 @@ pub use profile::{
     BundleConfig, PickVia, ProfileConfig, ProfilePick, RetryKnobs, VerifyGateKnobs,
     KNOWN_TECHNIQUES,
 };
+pub use prompt::{PromptConfig, SystemPromptOverride, SYSTEM_PROMPT_FILE_ENV};
 pub use semantic::{OnEmbedFailure, SemanticConfig};
 pub use skills::SkillsConfig;
 pub(crate) use smart_harness::{normalize_path, resolve_uncreated_path, validate_stable_anchor};
@@ -73,6 +74,7 @@ mod memory;
 mod permissions;
 mod presentation;
 mod profile;
+mod prompt;
 mod redact;
 mod semantic;
 mod shell;
@@ -240,6 +242,11 @@ pub struct Config {
     /// authorized catalog). See [`ToolExposureConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_exposure: Option<ToolExposureConfig>,
+
+    /// `[prompt]` — `file` replaces the assembled system prompt entirely
+    /// (#2938). `None` → newt assembles its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<PromptConfig>,
 
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1381,6 +1388,7 @@ impl Default for Config {
             tools: None,
             initiative: None,
             tool_exposure: None,
+            prompt: None,
             pricing: None,
             memory: None,
             agents: AgentsConfig::default(),
