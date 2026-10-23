@@ -166,8 +166,21 @@ mod tests {
     use super::*;
     use crate::settings_form::{apply_and_record, config_fs, Field};
 
+    /// Restores `NEWT_CONFIG_DIR` when the test ends.
+    struct ConfigDirPin(Option<String>);
+    impl Drop for ConfigDirPin {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => {
+                    newt_core::process_env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v)
+                }
+                None => newt_core::process_env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+            }
+        }
+    }
+
     /// Two installed skills and a config that searches them, with decoration to keep.
-    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf, ConfigDirPin) {
         let dir = tempfile::tempdir().unwrap();
         for name in ["alpha", "beta"] {
             let skill = dir.path().join(name);
@@ -178,6 +191,13 @@ mod tests {
             )
             .unwrap();
         }
+        // Pin the config directory: the path is derived from the environment on every
+        // call, and the mocked file is keyed by it.
+        let pin = ConfigDirPin(std::env::var(newt_core::config::NEWT_CONFIG_DIR_ENV).ok());
+        newt_core::process_env::set_var(
+            newt_core::config::NEWT_CONFIG_DIR_ENV,
+            dir.path().join("cfg").to_str().unwrap(),
+        );
         let path = newt_core::Config::user_config_path().expect("a config path");
         config_fs::write(
             &path,
@@ -187,7 +207,7 @@ mod tests {
             ),
         )
         .unwrap();
-        (dir, path)
+        (dir, path, pin)
     }
 
     fn row(listing: &str) -> String {
@@ -212,7 +232,7 @@ mod tests {
     #[test]
     fn off_and_on_persist_keep_decoration_and_are_journalled() {
         let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
-        let (_dir, path) = fixture();
+        let (_dir, path, _pin) = fixture();
         let listing = apply("list", "").unwrap();
         assert!(row(&listing).contains("| on "), "{listing}");
 
@@ -244,7 +264,7 @@ mod tests {
     #[test]
     fn unknown_skills_and_unresolvable_config_refuse_without_writing() {
         let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
-        let (_dir, path) = fixture();
+        let (_dir, path, _pin) = fixture();
         let before = config_fs::read(&path);
         let err = apply("off", "nope").unwrap_err();
         assert!(
@@ -268,7 +288,7 @@ mod tests {
     /// The index the model sees drops an off skill (the builder's filter).
     #[test]
     fn the_prompt_index_drops_an_off_skill() {
-        let (dir, _path) = fixture();
+        let (dir, _path, _pin) = fixture();
         let dirs = [dir.path().to_path_buf()];
         let all = crate::skills_index_for_prompt(&dirs, &|_| false).unwrap();
         assert!(all.contains("alpha") && all.contains("beta"), "{all}");
