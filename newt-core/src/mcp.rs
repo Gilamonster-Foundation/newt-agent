@@ -577,6 +577,14 @@ pub struct McpServerEntry {
     )]
     pub request_timeout_secs: Option<u64>,
 
+    /// Static OAuth public-client ID. When present, `newt auth` authenticates
+    /// with this pre-registered public PKCE client instead of running dynamic
+    /// client registration. Claude Code spells it as a nested
+    /// `oauth.clientId`; newt TOML spells it `oauth_client_id`. Both are folded
+    /// into this flat field at their respective parse funnels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+
     /// Provenance / trust marker (#1301): whether this entry came from newt-owned
     /// config (TRUSTED — full secret resolution) or a borrowed Claude/project
     /// overlay (UNTRUSTED — literals verbatim, refs rejected). Set at discovery
@@ -690,6 +698,9 @@ pub(crate) fn entry_to_toml_table(
             crate::error::NewtError::Config(format!("request timeout {secs}s is out of range"))
         })?);
     }
+    if let Some(client_id) = &entry.oauth_client_id {
+        table["oauth_client_id"] = toml_edit::value(client_id);
+    }
     Ok(table)
 }
 
@@ -739,6 +750,8 @@ pub fn parse_claude_mcp(value: &serde_json::Value) -> Vec<McpServerEntry> {
             let mut parsed: McpServerEntry = serde_json::from_value(entry.clone()).ok()?;
             // The name lives in the map key, not the entry body.
             parsed.name = name.clone();
+            // Fold Claude's nested `oauth.clientId` into the flat field.
+            parsed.oauth_client_id = claude_oauth_client_id(entry);
             // A Claude/project overlay is borrowed, attacker-reachable config —
             // mark it UNTRUSTED at the single parse funnel so its secrets never
             // interpolate / execute a `${cmd:…}` or `{ cmd = … }` (#1301).
@@ -747,6 +760,21 @@ pub fn parse_claude_mcp(value: &serde_json::Value) -> Vec<McpServerEntry> {
             Some(parsed)
         })
         .collect()
+}
+
+/// Extract Claude Code's nested `oauth.clientId` (or `oauth.client_id`) from a
+/// raw `mcpServers` entry body, folding it into the flat `oauth_client_id`
+/// field. A public client ID is not a credential, so it crosses the trust
+/// boundary; only the identifier is taken, never a client secret or token.
+fn claude_oauth_client_id(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("oauth")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|oauth| oauth.get("clientId").or_else(|| oauth.get("client_id")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 /// A value-independent reason an entry in a borrowed MCP configuration cannot
@@ -921,6 +949,7 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
         "headers",
         "request_timeout_secs",
         "requestTimeoutSecs",
+        "oauth",
     ];
 
     let Some(servers) = value.get("mcpServers") else {
@@ -964,6 +993,8 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
         };
         entry.name = name.clone();
         entry.trust = McpTrust::Untrusted;
+        // Fold Claude's nested `oauth.clientId` into the flat field.
+        entry.oauth_client_id = claude_oauth_client_id(raw);
         let semantics_preserved = match entry.transport {
             TransportKind::Stdio => {
                 entry.command.is_some()
@@ -1055,6 +1086,7 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
         env_http_headers: Option<BTreeMap<String, String>>,
         env_vars: Option<Vec<CodexEnvVar>>,
         auth: Option<String>,
+        oauth_client_id: Option<String>,
         startup_timeout_sec: Option<u64>,
         tool_timeout_sec: Option<u64>,
         required: Option<bool>,
@@ -1085,6 +1117,7 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                 env_http_headers,
                 env_vars,
                 auth,
+                oauth_client_id,
                 startup_timeout_sec,
                 tool_timeout_sec,
                 required,
@@ -1162,6 +1195,7 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                         headers,
                         login_argv: Vec::new(),
                         request_timeout_secs: tool_timeout_sec,
+                        oauth_client_id,
                         trust: McpTrust::Untrusted,
                         origin: None,
                     })
@@ -1214,6 +1248,7 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                         headers: BTreeMap::new(),
                         login_argv: Vec::new(),
                         request_timeout_secs: tool_timeout_sec,
+                        oauth_client_id: None,
                         trust: McpTrust::Untrusted,
                         origin: None,
                     })

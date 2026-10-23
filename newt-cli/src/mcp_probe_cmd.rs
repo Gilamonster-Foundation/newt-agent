@@ -646,6 +646,7 @@ async fn probe_stdio(
             headers: BTreeMap::new(),
             login_argv: Vec::new(),
             request_timeout_secs: args.timeout_secs,
+            oauth_client_id: None,
             // Operator-typed on the CLI — newt-owned, trusted config.
             trust: McpTrust::Trusted,
             origin: None,
@@ -713,6 +714,7 @@ async fn probe_url(
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: args.timeout_secs,
+        oauth_client_id: None,
         // Operator-typed on the CLI — newt-owned, trusted config.
         trust: McpTrust::Trusted,
         origin: None,

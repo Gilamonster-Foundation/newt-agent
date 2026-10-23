@@ -605,6 +605,7 @@ fn build_entry(
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: timeout_secs,
+        oauth_client_id: None,
         // Operator-typed on the CLI — newt-owned, trusted config.
         trust: McpTrust::Trusted,
         origin: None,

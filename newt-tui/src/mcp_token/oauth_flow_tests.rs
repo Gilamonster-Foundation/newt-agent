@@ -45,6 +45,28 @@ fn management_cancelled_callback_releases_its_listener() {
 }
 
 #[test]
+fn static_public_client_builds_issuer_bound_public_pkce_client() {
+    let client = static_public_client("eci-prd-pub-abc123", "https://issuer.example").unwrap();
+    assert_eq!(client.client_id, "eci-prd-pub-abc123");
+    assert_eq!(client.issuer.as_deref(), Some("https://issuer.example"));
+    assert_eq!(client.redirect_uris.len(), 1);
+    assert!(client.redirect_uris[0].starts_with("http://127.0.0.1:0/callback/newt-"));
+    assert_eq!(
+        client
+            .extra
+            .get("token_endpoint_auth_method")
+            .and_then(serde_json::Value::as_str),
+        Some("none")
+    );
+    assert!(client_auth_is_usable(&client));
+}
+
+#[test]
+fn static_public_client_rejects_empty_id() {
+    assert!(static_public_client("  ", "https://issuer.example").is_err());
+}
+
+#[test]
 fn pkce_verifier_and_challenge_are_distinct() {
     let p = gen_pkce().unwrap();
     assert!(!p.verifier.is_empty());

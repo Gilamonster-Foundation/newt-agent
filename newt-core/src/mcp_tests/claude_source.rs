@@ -120,3 +120,36 @@ fn parse_claude_mcp_marks_every_entry_untrusted() {
     let got = parse_claude_mcp(&cfg);
     assert!(got.iter().all(|e| e.trust == McpTrust::Untrusted));
 }
+#[test]
+fn parse_claude_mcp_folds_nested_oauth_client_id() {
+    let cfg = serde_json::json!({
+        "mcpServers": {
+            "outlook": {
+                "type": "http",
+                "url": "https://maas.example/maas/outlook/mcp",
+                "oauth": { "clientId": "eci-prd-pub-abc123" }
+            }
+        }
+    });
+    let got = parse_claude_mcp(&cfg);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].oauth_client_id.as_deref(), Some("eci-prd-pub-abc123"));
+}
+#[test]
+fn strict_claude_import_accepts_oauth_client_id() {
+    let report = parse_claude_mcp_for_import(&serde_json::json!({
+        "mcpServers": {
+            "outlook": {
+                "type": "http",
+                "url": "https://maas.example/maas/outlook/mcp",
+                "oauth": { "clientId": "eci-prd-pub-abc123" }
+            }
+        }
+    }));
+    assert_eq!(report.rejected.len(), 0);
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(
+        report.entries[0].oauth_client_id.as_deref(),
+        Some("eci-prd-pub-abc123")
+    );
+}

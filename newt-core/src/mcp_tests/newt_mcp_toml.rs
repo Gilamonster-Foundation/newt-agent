@@ -65,6 +65,22 @@ url = "https://x/mcp"
     assert!(parse_newt_mcp_toml("other = 1").is_empty());
 }
 #[test]
+fn parse_newt_mcp_toml_reads_static_oauth_client_id() {
+    let text = r#"
+[[mcp_servers]]
+name = "outlook"
+type = "http"
+url = "https://maas.example/maas/outlook/mcp"
+oauth_client_id = "eci-prd-pub-abc123"
+"#;
+    let got = parse_newt_mcp_toml(text);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0].oauth_client_id.as_deref(),
+        Some("eci-prd-pub-abc123")
+    );
+}
+#[test]
 fn parse_newt_mcp_toml_reads_secret_refs_and_literals() {
     let text = r#"
 [[mcp_servers]]

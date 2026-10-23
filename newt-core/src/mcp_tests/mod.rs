@@ -12,6 +12,7 @@ fn stdio(name: &str, command: &str) -> McpServerEntry {
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
         trust: McpTrust::Trusted,
         origin: None,
     }

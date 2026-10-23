@@ -318,7 +318,10 @@ bearerTokenEnvVar = "TOKEN"
         .into_iter()
         .map(|server| server.name)
         .collect();
-    assert_eq!(names, ["good"]);
+    // `oauth_client_id` is now a supported field (static public-client ID),
+    // so the `oauth` entry survives; `oauth-resource` (unknown `oauth_resource`
+    // field) and the misspelled/widening entries are still dropped.
+    assert_eq!(names, ["good", "oauth"]);
 }
 #[test]
 fn codex_parser_drops_only_the_malformed_entry() {

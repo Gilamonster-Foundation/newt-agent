@@ -180,6 +180,7 @@ fn mcp_entry(name: &str) -> crate::mcp::McpServerEntry {
         headers: std::collections::BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
         trust: crate::mcp::McpTrust::Trusted,
         origin: None,
     }

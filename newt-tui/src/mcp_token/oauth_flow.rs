@@ -1343,6 +1343,36 @@ fn issuer_redirect_uris(issuer: &str) -> Vec<String> {
     )]
 }
 
+/// Build a public PKCE [`ClientFile`] from an operator-supplied static client
+/// ID (Claude's `oauth.clientId`). No dynamic registration round-trip: the
+/// authorization server already knows this pre-registered public client. The
+/// redirect URI is the same issuer-bound loopback callback newt always serves.
+fn static_public_client(client_id: &str, issuer: &str) -> anyhow::Result<ClientFile> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        anyhow::bail!("static OAuth client ID is empty");
+    }
+    let mut extra = BTreeMap::new();
+    extra.insert(
+        "token_endpoint_auth_method".into(),
+        serde_json::Value::String("none".into()),
+    );
+    extra.insert(
+        "registration_method".into(),
+        serde_json::Value::String("static".into()),
+    );
+    let client = ClientFile {
+        client_id: client_id.to_string(),
+        redirect_uris: issuer_redirect_uris(issuer),
+        issuer: Some(issuer.to_string()),
+        extra,
+    };
+    if !client_auth_is_usable(&client) {
+        anyhow::bail!("static OAuth client ID is not usable as a public PKCE client");
+    }
+    Ok(client)
+}
+
 fn client_has_issuer_distinct_redirect(client: &ClientFile, issuer: &str) -> bool {
     let expected_path = issuer_callback_path(issuer);
     client.redirect_uris.iter().any(|redirect| {
@@ -1488,6 +1518,7 @@ fn build_authorization_url(
 pub async fn run_oauth_flow(
     server_name: &str,
     server_url: &str,
+    static_client_id: Option<&str>,
     policy: &OAuthHopPolicy,
 ) -> anyhow::Result<()> {
     run_oauth_flow_cancellable(server_name, server_url, policy, None).await
@@ -1600,14 +1631,26 @@ pub(crate) async fn run_oauth_flow_cancellable(
         extra: discovered.extra.clone(),
     };
     // ── 2. Client registration ────────────────────────────────────────────
-    let (client, _migrated) = resolve_client_registration(
-        stored_client,
-        &discovered,
-        requested_scope.as_deref(),
-        false,
-        policy,
-    )
-    .await?;
+    // A static public client ID supplied by the operator (e.g. Claude's
+    // `oauth.clientId`) short-circuits dynamic client registration: the
+    // authorization server already knows this pre-registered public PKCE
+    // client, so newt builds the client file directly and skips DCR.
+    let (client, _migrated) = match static_client_id {
+        Some(client_id) => {
+            let client = static_public_client(client_id, &discovered.issuer)?;
+            (client, true)
+        }
+        None => {
+            resolve_client_registration(
+                stored_client,
+                &discovered,
+                requested_scope.as_deref(),
+                false,
+                policy,
+            )
+            .await?
+        }
+    };
     let callback = callback_target(&client)?;
 
     // Bind the callback listener NOW (before opening the browser) so the port
