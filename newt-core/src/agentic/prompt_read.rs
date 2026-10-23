@@ -473,6 +473,11 @@ pub(crate) fn ensure_active_prompt_card(
     if exposure.verbatim_system {
         return;
     }
+    // `[prompt] components` switched `card` off (#2933); config load already
+    // checked that the tools which read it are hidden.
+    if exposure.omit_card {
+        return;
+    }
     let base_card = active_prompt_card(context, exposure);
     let card = match intake {
         Some(intake) => active_prompt_card_with_intake(base_card, intake),
@@ -1802,5 +1807,34 @@ mod tests {
         assert_eq!(previous_json["address"], original_id.to_string());
         assert_eq!(previous_json["origin"], "operator");
         assert_eq!(previous_json["model_text"], original_text);
+    }
+
+    /// #2933 PR5: `card` off removes the card and nothing else; on, it is added.
+    #[test]
+    fn omit_card_adds_no_card_and_the_default_adds_one() {
+        let context = PromptReadContext::new(None, "task", None);
+        let base = || {
+            vec![
+                serde_json::json!({"role":"system", "content":"base"}),
+                serde_json::json!({"role":"user", "content":"task"}),
+            ]
+        };
+        let mut with = base();
+        ensure_active_prompt_card(&mut with, context, None, &Default::default());
+        assert!(
+            with.iter().any(|m| m["role"] == "system"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(ACTIVE_PROMPT_PREFIX))),
+            "the card is inserted: {with:?}"
+        );
+
+        let mut without = base();
+        let omit = super::super::tools::ExposureSettings {
+            omit_card: true,
+            ..Default::default()
+        };
+        ensure_active_prompt_card(&mut without, context, None, &omit);
+        assert_eq!(without, base(), "no card: the messages are untouched");
     }
 }

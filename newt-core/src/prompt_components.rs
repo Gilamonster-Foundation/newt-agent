@@ -34,6 +34,19 @@ enum Body {
     Text(&'static str),
     /// The `You have tools:` sentence over the visible subset of [`NAMED_TOOLS`].
     Tools,
+    /// Text the harness produces each turn; the registry only names and gates it.
+    Owned,
+}
+
+/// Where in the request a component sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// The frozen system prompt's identity and rules.
+    Soul,
+    /// Rebuilt every turn into the turn's system message.
+    Turn,
+    /// Added by the agentic driver as its own system message.
+    Driver,
 }
 
 /// One rule of the soul.
@@ -47,6 +60,10 @@ pub struct Component {
     pub default_on: bool,
     /// Rules under `## How to work`; the identity lines sit above it.
     under_heading: bool,
+    pub layer: Layer,
+    /// Describes a fence the harness enforces elsewhere. Switching it off only stops
+    /// telling the model about the fence; enforcement does not read this.
+    pub fence: bool,
     body: Body,
 }
 
@@ -54,6 +71,7 @@ impl Component {
     fn render(&self, visible: &dyn Fn(&str) -> bool) -> String {
         match self.body {
             Body::Text(text) => text.to_owned(),
+            Body::Owned => String::new(),
             Body::Tools => {
                 let names: Vec<&str> = NAMED_TOOLS.iter().copied().filter(|t| visible(t)).collect();
                 format!("{TOOL_LINE_PREFIX}{}.", names.join(", "))
@@ -161,6 +179,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &[],
         default_on: true,
         under_heading: false,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(IDENTITY),
     },
     Component {
@@ -169,6 +189,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &[],
         default_on: true,
         under_heading: false,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Tools,
     },
     Component {
@@ -177,6 +199,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &[],
         default_on: true,
         under_heading: false,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(DISPOSITION),
     },
     Component {
@@ -185,6 +209,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &[],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(ONE_CHANGE),
     },
     Component {
@@ -193,6 +219,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &[],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(READ_MINIMUM),
     },
     Component {
@@ -201,6 +229,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &["edit_file", "write_file"],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(PREFER_EDIT),
     },
     Component {
@@ -209,6 +239,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &[],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(STOP_WHEN_BLOCKED),
     },
     Component {
@@ -217,6 +249,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &[],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(GROUND_TRUTH),
     },
     Component {
@@ -225,6 +259,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &["git"],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(COMMIT_ATTRIBUTION),
     },
     Component {
@@ -233,6 +269,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &["edit_file", "write_file"],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(ACT_NOT_DESCRIBE),
     },
     Component {
@@ -241,6 +279,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &["render_report"],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(PRESENT_FINDINGS),
     },
     Component {
@@ -249,6 +289,8 @@ pub const SOUL: &[Component] = &[
         requires_tools: &["list_dir", "read_file", "edit_file", "write_file"],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(EXPLORE_BUDGET),
     },
     Component {
@@ -257,9 +299,89 @@ pub const SOUL: &[Component] = &[
         requires_tools: &[],
         default_on: true,
         under_heading: true,
+        layer: Layer::Soul,
+        fence: false,
         body: Body::Text(THREE_CS),
     },
 ];
+
+/// The harness-produced pieces of the per-turn system message and the driver's
+/// active-prompt card (#2933). Their text is built where the session state lives;
+/// the registry names them, describes them and gates them.
+const fn owned(
+    id: &'static str,
+    description: &'static str,
+    layer: Layer,
+    fence: bool,
+) -> Component {
+    Component {
+        id,
+        description,
+        requires_tools: &[],
+        default_on: true,
+        under_heading: false,
+        layer,
+        fence,
+        body: Body::Owned,
+    }
+}
+
+/// The per-turn pieces, in the order the turn's system message carries them.
+pub const TURN: &[Component] = &[
+    owned(
+        "workspace-state",
+        "Branch, dirty files and recent commits, refreshed every turn.",
+        Layer::Turn,
+        false,
+    ),
+    owned(
+        "environment",
+        "Harness version, model, backend, date and the rule to never invent an identity.",
+        Layer::Turn,
+        false,
+    ),
+    owned(
+        "runtime-authority",
+        "Tells the model when a runtime authority (e.g. full access) is active.",
+        Layer::Turn,
+        true,
+    ),
+    owned(
+        "git-identity",
+        "The configured Git identity and how commit attribution is recorded.",
+        Layer::Turn,
+        false,
+    ),
+    owned(
+        "fs-confinement",
+        "Tells the model which paths it can read and write.",
+        Layer::Turn,
+        true,
+    ),
+    owned(
+        "operating-mode",
+        "The session's operating mode and permission posture.",
+        Layer::Turn,
+        false,
+    ),
+];
+
+/// The driver's own pieces. `card` may be off only while the tools that read it are
+/// hidden from the model ([`ComponentSet::check_card`]).
+pub const DRIVER: &[Component] = &[owned(
+    "card",
+    "The protected active-prompt card the model re-reads with prompt_read / artifact_read.",
+    Layer::Driver,
+    false,
+)];
+
+/// The tools that read the active-prompt card.
+pub const CARD_TOOLS: &[&str] = &["prompt_read", "artifact_read"];
+
+/// Every component, soul first, then the turn's pieces, then the driver's.
+pub fn all() -> impl Iterator<Item = &'static Component> {
+    SOUL.iter().chain(TURN).chain(DRIVER)
+}
 
 /// The soul with the components `enabled` selects and the rules whose tools are all
 /// `visible`. Lines above the heading are joined by a space, rules by a blank line.
@@ -315,7 +437,7 @@ pub const PRESETS: &[&str] = &["default"];
 /// Every component id, in prompt order.
 #[must_use]
 pub fn ids() -> Vec<&'static str> {
-    SOUL.iter().map(|c| c.id).collect()
+    all().map(|c| c.id).collect()
 }
 
 /// Which components are on: a preset's defaults with the operator's deltas applied.
@@ -328,11 +450,7 @@ impl Default for ComponentSet {
     /// The `default` preset: everything whose `default_on` is set.
     fn default() -> Self {
         Self {
-            off: SOUL
-                .iter()
-                .filter(|c| !c.default_on)
-                .map(|c| c.id)
-                .collect(),
+            off: all().filter(|c| !c.default_on).map(|c| c.id).collect(),
         }
     }
 }
@@ -361,7 +479,7 @@ impl ComponentSet {
             }
         }
         let known = |id: &str| -> Result<&'static str, String> {
-            SOUL.iter().map(|c| c.id).find(|c| *c == id).ok_or_else(|| {
+            all().map(|c| c.id).find(|c| *c == id).ok_or_else(|| {
                 format!(
                     "unknown [prompt] component `{id}`; components: {}",
                     ids().join(", ")
@@ -388,6 +506,12 @@ impl ComponentSet {
         !self.off.contains(c.id)
     }
 
+    /// [`is_on`](Self::is_on) by id; an unknown id reads as on.
+    #[must_use]
+    pub fn is_on_id(&self, id: &str) -> bool {
+        !self.off.contains(id)
+    }
+
     /// Whether this is the `default` preset untouched, i.e. today's bytes.
     #[must_use]
     pub fn is_default(&self) -> bool {
@@ -400,8 +524,12 @@ impl ComponentSet {
 pub struct Row {
     pub id: &'static str,
     pub on: bool,
-    /// Characters it adds to the prompt when on (0 when its tools are hidden).
-    pub chars: usize,
+    /// Characters it adds to the prompt when on (0 when its tools are hidden);
+    /// `None` for a piece the harness builds each turn, whose size varies.
+    pub chars: Option<usize>,
+    pub layer: Layer,
+    /// Describes an enforced fence: off only stops telling the model.
+    pub fence: bool,
     pub description: &'static str,
     /// The first required tool that is hidden, which keeps the rule out.
     pub needs: Option<&'static str>,
@@ -410,21 +538,24 @@ pub struct Row {
 /// The listing `/settings system-prompt components` shows.
 #[must_use]
 pub fn rows(set: &ComponentSet, visible: &dyn Fn(&str) -> bool) -> Vec<Row> {
-    SOUL.iter()
+    all()
         .map(|c| {
             let needs = c.requires_tools.iter().copied().find(|t| !visible(t));
             let chars = if needs.is_some() {
-                0
+                Some(0)
             } else {
                 match c.body {
-                    Body::Text(t) => t.chars().count(),
-                    Body::Tools => c.render(visible).chars().count(),
+                    Body::Text(t) => Some(t.chars().count()),
+                    Body::Tools => Some(c.render(visible).chars().count()),
+                    Body::Owned => None,
                 }
             };
             Row {
                 id: c.id,
                 on: set.is_on(c),
                 chars,
+                layer: c.layer,
+                fence: c.fence,
                 description: c.description,
                 needs,
             }
@@ -435,8 +566,7 @@ pub fn rows(set: &ComponentSet, visible: &dyn Fn(&str) -> bool) -> Vec<Row> {
 impl ComponentSet {
     /// The set with `id` switched on or off. Refuses an unknown id, naming the valid ones.
     pub fn with(&self, id: &str, on: bool) -> Result<Self, String> {
-        let known = SOUL
-            .iter()
+        let known = all()
             .find(|c| c.id == id)
             .ok_or_else(|| format!("unknown component `{id}`; components: {}", ids().join(", ")))?;
         let mut next = self.clone();
@@ -453,12 +583,31 @@ impl ComponentSet {
     pub fn deltas(&self) -> (Vec<&'static str>, Vec<&'static str>) {
         let base = Self::default();
         let pick = |want_on: bool| {
-            SOUL.iter()
+            all()
                 .filter(|c| self.is_on(c) == want_on && base.is_on(c) != want_on)
                 .map(|c| c.id)
                 .collect()
         };
         (pick(true), pick(false))
+    }
+
+    /// `card` may be off only while every tool that reads it is hidden from the model:
+    /// otherwise the model is offered `prompt_read` for a card it was never shown.
+    /// There is no implicit coupling; the fix is the operator's, in `/settings tools`.
+    pub fn check_card(&self, visible: &dyn Fn(&str) -> bool) -> Result<(), String> {
+        let card_off = DRIVER.iter().any(|c| c.id == "card" && !self.is_on(c));
+        let exposed: Vec<&str> = CARD_TOOLS.iter().copied().filter(|t| visible(t)).collect();
+        if card_off && !exposed.is_empty() {
+            return Err(format!(
+                "component `card` can be off only while {} are hidden from the model, but {} \
+                 {} visible; hide them with `/settings tools` (for example `/settings tools pi`) \
+                 or keep `card` on",
+                CARD_TOOLS.join(" and "),
+                exposed.join(" and "),
+                if exposed.len() == 1 { "is" } else { "are" },
+            ));
+        }
+        Ok(())
     }
 
     /// `default` or `custom (N off)`, for the status line and footer.
@@ -491,7 +640,7 @@ mod tests {
     #[test]
     fn ids_are_unique_described_and_kebab_case() {
         let mut seen = std::collections::BTreeSet::new();
-        for c in SOUL {
+        for c in super::all() {
             assert!(seen.insert(c.id), "duplicate id `{}`", c.id);
             assert!(
                 !c.description.trim().is_empty(),
@@ -505,11 +654,12 @@ mod tests {
             );
         }
         assert_eq!(SOUL.len(), 13);
+        assert_eq!(super::all().count(), 20);
     }
 
     #[test]
     fn every_component_is_on_by_default() {
-        assert!(SOUL.iter().all(|c| c.default_on));
+        assert!(super::all().all(|c| c.default_on));
     }
 
     #[test]
@@ -551,9 +701,9 @@ mod tests {
         let set = ComponentSet::default().with("three-cs", false).unwrap();
         let rows = rows(&set, &|t| t != "render_report");
         let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap().clone();
-        assert!(!row("three-cs").on && row("three-cs").chars > 400);
+        assert!(!row("three-cs").on && row("three-cs").chars > Some(400));
         assert_eq!(row("habit-present-findings").needs, Some("render_report"));
-        assert_eq!(row("habit-present-findings").chars, 0);
+        assert_eq!(row("habit-present-findings").chars, Some(0));
         assert_eq!(row("identity").needs, None);
     }
 
@@ -632,5 +782,55 @@ mod tests {
         assert!(ComponentSet::resolve(None, &both, &both)
             .unwrap_err()
             .contains("both"));
+    }
+
+    #[test]
+    fn the_turn_and_driver_pieces_are_named_with_their_layers() {
+        let ids: Vec<(&str, Layer)> = TURN.iter().chain(DRIVER).map(|c| (c.id, c.layer)).collect();
+        assert_eq!(
+            ids,
+            [
+                ("workspace-state", Layer::Turn),
+                ("environment", Layer::Turn),
+                ("runtime-authority", Layer::Turn),
+                ("git-identity", Layer::Turn),
+                ("fs-confinement", Layer::Turn),
+                ("operating-mode", Layer::Turn),
+                ("card", Layer::Driver),
+            ]
+        );
+        let fences: Vec<&str> = super::all().filter(|c| c.fence).map(|c| c.id).collect();
+        assert_eq!(fences, ["runtime-authority", "fs-confinement"]);
+        let rows = rows(&ComponentSet::default(), &all_visible);
+        assert!(rows
+            .iter()
+            .filter(|r| r.layer != Layer::Soul)
+            .all(|r| r.chars.is_none()));
+    }
+
+    fn all_visible(_: &str) -> bool {
+        true
+    }
+
+    /// #2933 PR5: `card` is refused off while a tool that reads it is visible.
+    #[test]
+    fn card_may_be_off_only_while_its_tools_are_hidden() {
+        let off = ComponentSet::default().with("card", false).unwrap();
+        let err = off.check_card(&all_visible).unwrap_err();
+        assert!(
+            err.contains("/settings tools") && err.contains("prompt_read and artifact_read"),
+            "{err}"
+        );
+        let one = off.check_card(&|t| t == "artifact_read").unwrap_err();
+        assert!(one.contains("artifact_read is visible"), "{one}");
+        assert!(off
+            .check_card(&|t| t != "prompt_read" && t != "artifact_read")
+            .is_ok());
+        // On is always fine, and so is any other component off.
+        assert!(ComponentSet::default().check_card(&all_visible).is_ok());
+        let other = ComponentSet::default()
+            .with("fs-confinement", false)
+            .unwrap();
+        assert!(other.check_card(&all_visible).is_ok());
     }
 }

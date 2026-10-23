@@ -62,7 +62,16 @@ impl ComponentsPanel {
                 value: format!("[{}] {}", if *on { "x" } else { " " }, row.id),
                 provenance: match row.needs {
                     Some(tool) if *on => format!("off (needs {tool}) · {}", row.description),
-                    _ => format!("{} chars · {}", row.chars, row.description),
+                    _ => format!(
+                        "{} · {}{}",
+                        crate::prompt_components_form::size_label(row.chars),
+                        row.description,
+                        if row.fence {
+                            crate::prompt_components_form::FENCE_NOTE
+                        } else {
+                            ""
+                        }
+                    ),
                 },
                 selected: at == i,
                 editable: true,
@@ -144,7 +153,11 @@ mod tests {
     #[test]
     fn toggling_reports_exactly_what_moved_as_ids() {
         let mut panel = open();
-        panel.cursor.end();
+        let at = panel.rows.iter().position(|r| r.id == "three-cs").unwrap();
+        panel.cursor.home();
+        for _ in 0..at {
+            panel.key(Key::Down);
+        }
         panel.key(Key::Char(' '));
         panel.cursor.home();
         panel.key(Key::Right);

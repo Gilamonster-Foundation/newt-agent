@@ -146,6 +146,8 @@
 #       newt-agent::context_request_preview  real chat loop x5, 90 s cap
 #       newt-agent::prompt_config_refusal  real CLI x4 against a recording
 #                                         provider (#2933), 60 s deadline each
+#       newt-agent::prompt_component_fence  real chat loop x5 + a recording
+#                                         provider (#2933), 60 s deadline each
 #       newt-agent::prompt_component_refresh  real CLI + real PTY against a
 #                                         recording provider (#2933), 60 s budget
 #   - two more real-resource lanes, same tier as the six above (#2663 named
@@ -485,6 +487,7 @@ NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-agent::headless_prompt_override)
     and not binary_id(newt-agent::context_request_preview)
     and not binary_id(newt-agent::prompt_config_refusal)
+    and not binary_id(newt-agent::prompt_component_fence)
     and not binary_id(newt-agent::prompt_component_refresh)
     and not binary_id(newt-eval::mock_e2e)
     and not (binary_id(newt-tui) and test(=prompt_visibility_test::mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal))

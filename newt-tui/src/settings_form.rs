@@ -742,7 +742,7 @@ pub(crate) fn tool_exposure_setting() -> newt_core::ToolExposureConfig {
 /// The `[tool_exposure]` policy that WINS, as the next turn will see it. The
 /// unit tier reads the mocked user file unless a test installs a shadow.
 #[cfg(not(test))]
-fn effective_exposure() -> newt_core::ToolExposureConfig {
+pub(crate) fn effective_exposure() -> newt_core::ToolExposureConfig {
     tool_exposure_setting()
 }
 
@@ -753,7 +753,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn effective_exposure() -> newt_core::ToolExposureConfig {
+pub(crate) fn effective_exposure() -> newt_core::ToolExposureConfig {
     if std::env::var_os(config_fs::REAL_LAYERS).is_some() {
         return tool_exposure_setting();
     }
@@ -1144,6 +1144,17 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // nothing.
         Field::Tools => {
             let list = parse_tools_token(value)?;
+            // `card` is off only while prompt_read / artifact_read are hidden: a list
+            // that shows them again would leave the model a card it was never sent.
+            crate::prompt_components_form::current()
+                .map_err(|e| format!("tools: nothing changed; {e}"))?
+                .check_card(&|tool| list.as_ref().is_none_or(|l| l.iter().any(|n| n == tool)))
+                .map_err(|_| {
+                    "tools: the system prompt component `card` is off, which needs prompt_read \
+                     and artifact_read hidden; nothing changed. Turn it back on first with \
+                     `/settings system-prompt on card`, or leave those two tools out of the list"
+                        .to_string()
+                })?;
             let names: Vec<&str> = list.iter().flatten().map(String::as_str).collect();
             persist_config(|text| {
                 newt_core::Config::with_tool_exposure_allow_list(
@@ -2304,6 +2315,59 @@ mod tests {
             .value_now()
             .to_string()
             .contains("components: default"));
+    }
+
+    /// #2933 PR5: `card` off is refused unless prompt_read and artifact_read are
+    /// hidden; the refusal names `/settings tools`, writes nothing, and the tools
+    /// setter refuses to show them again while `card` is off.
+    #[test]
+    fn card_off_is_refused_unless_its_tools_are_hidden_and_tools_cannot_undo_it() {
+        let _guard = settings_guard();
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        let saved = || config_fs::read(&path);
+        let sp = |v: &str| apply(Field::SystemPrompt, v);
+
+        let before = saved();
+        let refused = sp("off card").unwrap_err();
+        assert!(refused.contains("/settings tools"), "{refused}");
+        assert_eq!(saved(), before, "a refused card toggle writes nothing");
+
+        apply(Field::Tools, "pi").unwrap();
+        let ok = sp("off card").unwrap();
+        assert!(ok.contains("presentation only"), "{ok}");
+        assert!(saved().contains("\"card\""), "{}", saved());
+
+        let widened = apply(Field::Tools, "all").unwrap_err();
+        assert!(widened.contains("system-prompt on card"), "{widened}");
+        assert!(apply(Field::Tools, "read_file,run_command").is_ok());
+        let still = saved();
+        assert!(apply(Field::Tools, "read_file,prompt_read").is_err());
+        assert_eq!(saved(), still, "a refused list writes nothing");
+
+        sp("on card").unwrap();
+        assert!(apply(Field::Tools, "all").is_ok());
+    }
+
+    /// #2933 PR5: the two fence components say, in the reply and the listing, that
+    /// off only stops telling the model.
+    #[test]
+    fn the_fence_components_say_off_only_stops_the_telling() {
+        let _guard = settings_guard();
+        let sp = |v: &str| apply(Field::SystemPrompt, v);
+        for id in ["fs-confinement", "runtime-authority"] {
+            let reply = sp(&format!("off {id}")).unwrap();
+            assert!(
+                reply.contains("the fence still holds") && reply.contains("presentation only"),
+                "{reply}"
+            );
+            let on = sp(&format!("on {id}")).unwrap();
+            assert!(!on.contains("fence still holds"), "{on}");
+        }
+        let other = sp("off environment").unwrap();
+        assert!(!other.contains("fence"), "{other}");
+        let listing = sp("components").unwrap();
+        assert!(listing.contains("the fence still holds"), "{listing}");
+        assert!(listing.contains("per turn"), "{listing}");
     }
 
     /// #2991 review: a config that does not resolve is an error, not a default set.

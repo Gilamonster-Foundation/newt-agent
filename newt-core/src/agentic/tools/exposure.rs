@@ -163,6 +163,9 @@ pub struct ExposureSettings {
     /// carries that text as the only system message, so the harness adds none
     /// of its own (active-prompt card, observed facts, output planning).
     pub verbatim_system: bool,
+    /// `[prompt] components` switched `card` off (#2933): the driver adds no
+    /// active-prompt card, and only that; the rest of the harness text stays.
+    pub omit_card: bool,
 }
 
 impl Default for ExposureSettings {
@@ -174,6 +177,7 @@ impl Default for ExposureSettings {
             allow_list: None,
             read_only: false,
             verbatim_system: false,
+            omit_card: false,
         }
     }
 }
@@ -187,6 +191,7 @@ impl From<crate::config::ToolExposureConfig> for ExposureSettings {
             allow_list: c.allow_list,
             read_only: c.read_only,
             verbatim_system: false,
+            omit_card: false,
         }
     }
 }

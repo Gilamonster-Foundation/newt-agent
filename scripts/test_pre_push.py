@@ -54,6 +54,7 @@ NEXTEST_CI_ONLY = [
     "newt-agent::headless_prompt_override",
     "newt-agent::context_request_preview",
     "newt-agent::prompt_config_refusal",
+    "newt-agent::prompt_component_fence",
     "newt-agent::prompt_component_refresh",
     "newt-eval::mock_e2e",
 ]

@@ -70,7 +70,12 @@ impl Config {
             return Ok(Default::default());
         };
         let d = p.components.clone().unwrap_or_default();
-        crate::prompt_components::ComponentSet::resolve(p.preset.as_deref(), &d.on, &d.off)
+        let set =
+            crate::prompt_components::ComponentSet::resolve(p.preset.as_deref(), &d.on, &d.off)?;
+        // `card` off is valid only while the tools that read it are hidden.
+        let exposure = crate::ExposureSettings::from(self.tool_exposure());
+        set.check_card(&|tool| exposure.operator_visible(tool))?;
+        Ok(set)
     }
 
     /// The override file in force: the session env twin, else `[prompt] file`.
@@ -137,6 +142,19 @@ mod tests {
         let c = cfg("");
         assert!(c.prompt.is_none());
         assert_eq!(c.system_prompt_file_with(None), None);
+    }
+
+    /// #2933 PR5: `card` off needs the card's tools hidden, checked at load.
+    #[test]
+    fn card_off_is_refused_at_load_unless_its_tools_are_hidden() {
+        let visible = cfg("[prompt]\ncomponents = { off = [\"card\"] }\n");
+        let err = visible.prompt_components().unwrap_err();
+        assert!(err.contains("/settings tools"), "{err}");
+        assert!(visible.prepare_runtime().is_err());
+        let hidden = cfg(
+            "[tool_exposure]\nallow_list = [\"read_file\"]\n[prompt]\ncomponents = { off = [\"card\"] }\n",
+        );
+        assert!(!hidden.prompt_components().unwrap().is_default());
     }
 
     #[test]
