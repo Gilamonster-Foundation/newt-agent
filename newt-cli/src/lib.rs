@@ -647,6 +647,31 @@ fn parse_serving(s: &str) -> Result<newt_core::config::Serving, String> {
     }
 }
 
+/// The headless flags that choose WHICH system prompt is sent. Grouped, and boxed
+/// in [`Command::Headless`], so the variant stays within clippy's
+/// `large_enum_variant` margin on Windows (a larger `PathBuf`), without allowing the
+/// lint.
+#[derive(clap::Args, Debug)]
+pub struct HeadlessPromptArgs {
+    /// Write the final system message(s) and tools array of the first
+    /// request, each component sized in characters, to FILE (markdown) and
+    /// stop before anything is sent. The same report as `/context request`
+    /// in the TUI (#2937).
+    #[arg(long, value_name = "FILE")]
+    dump_request: Option<PathBuf>,
+    /// Use FILE's contents, byte for byte, as the system prompt in place
+    /// of the one newt assembles. Same as `[prompt] file`; this flag wins
+    /// (#2938).
+    #[arg(long, value_name = "FILE")]
+    system_prompt_file: Option<PathBuf>,
+    /// Name of the prompt preset. Headless sends the bare `Workspace root:`
+    /// message, the `headless` preset, and that is the only one it knows yet;
+    /// `default` (the TUI's assembled prompt) and `pi` are refused until
+    /// headless can assemble them (#2933).
+    #[arg(long, value_name = "NAME")]
+    prompt_preset: Option<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Standalone TUI coder.
@@ -903,17 +928,8 @@ pub enum Command {
         /// been made.
         #[arg(long, value_name = "CALLS")]
         run_allowance: Option<u32>,
-        /// Write the final system message(s) and tools array of the first
-        /// request, each component sized in characters, to FILE (markdown) and
-        /// stop before anything is sent. The same report as `/context request`
-        /// in the TUI (#2937).
-        #[arg(long, value_name = "FILE")]
-        dump_request: Option<PathBuf>,
-        /// Use FILE's contents, byte for byte, as the system prompt in place
-        /// of the one newt assembles. Same as `[prompt] file`; this flag wins
-        /// (#2938).
-        #[arg(long, value_name = "FILE")]
-        system_prompt_file: Option<PathBuf>,
+        #[command(flatten)]
+        prompt: Box<HeadlessPromptArgs>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
         /// otherwise starts a resumable frame; legacy headless keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
@@ -1892,8 +1908,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             require_feature,
             output_allowance,
             run_allowance,
-            dump_request,
-            system_prompt_file,
+            prompt,
             hermetic,
             resume_from,
         } => {
@@ -1923,8 +1938,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 require_feature,
                 output_allowance,
                 run_allowance,
-                dump_request,
-                system_prompt_file,
+                dump_request: prompt.dump_request,
+                system_prompt_file: prompt.system_prompt_file,
+                prompt_preset: prompt.prompt_preset,
                 launch,
             })
             .await?;

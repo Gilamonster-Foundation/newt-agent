@@ -293,6 +293,93 @@ pub fn default_soul(visible: &dyn Fn(&str) -> bool) -> String {
     render_soul(&|c| c.default_on, visible)
 }
 
+/// Presets `[prompt] preset` accepts. `pi` arrives with the measured pi-like
+/// preset; `headless` is the headless-only bare message, not a TUI preset.
+pub const PRESETS: &[&str] = &["default"];
+
+/// Every component id, in prompt order.
+#[must_use]
+pub fn ids() -> Vec<&'static str> {
+    SOUL.iter().map(|c| c.id).collect()
+}
+
+/// Which components are on: a preset's defaults with the operator's deltas applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentSet {
+    off: std::collections::BTreeSet<&'static str>,
+}
+
+impl Default for ComponentSet {
+    /// The `default` preset: everything whose `default_on` is set.
+    fn default() -> Self {
+        Self {
+            off: SOUL
+                .iter()
+                .filter(|c| !c.default_on)
+                .map(|c| c.id)
+                .collect(),
+        }
+    }
+}
+
+impl ComponentSet {
+    /// `preset` (absent = `default`) plus `[prompt] components` deltas. Refuses an
+    /// unknown preset or id, naming the valid ones, and an id in both lists.
+    pub fn resolve(preset: Option<&str>, on: &[String], off: &[String]) -> Result<Self, String> {
+        match preset.map(str::trim) {
+            None | Some("default") => {}
+            Some("pi") => {
+                return Err("[prompt] preset `pi` is not available yet; presets: default".into())
+            }
+            Some("headless") => {
+                return Err(
+                    "`headless` is the headless-only preset (`newt headless --prompt-preset`), \
+                     not a [prompt] preset; presets: default"
+                        .into(),
+                )
+            }
+            Some(other) => {
+                return Err(format!(
+                    "unknown [prompt] preset `{other}`; presets: {}",
+                    PRESETS.join(", ")
+                ))
+            }
+        }
+        let known = |id: &str| -> Result<&'static str, String> {
+            SOUL.iter().map(|c| c.id).find(|c| *c == id).ok_or_else(|| {
+                format!(
+                    "unknown [prompt] component `{id}`; components: {}",
+                    ids().join(", ")
+                )
+            })
+        };
+        let mut set = Self::default();
+        for id in off {
+            if on.contains(id) {
+                return Err(format!(
+                    "[prompt] component `{id}` is in both `on` and `off`"
+                ));
+            }
+            set.off.insert(known(id)?);
+        }
+        for id in on {
+            set.off.remove(known(id)?);
+        }
+        Ok(set)
+    }
+
+    #[must_use]
+    pub fn is_on(&self, c: &Component) -> bool {
+        !self.off.contains(c.id)
+    }
+
+    /// Whether this is the `default` preset untouched, i.e. today's bytes.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +438,66 @@ mod tests {
         let text = default_soul(&|t| t != "render_report");
         assert!(!text.contains("Present findings"));
         assert!(text.contains("Prefer edit_file"));
+    }
+
+    fn strings(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn no_config_is_the_default_set() {
+        let set = ComponentSet::resolve(None, &[], &[]).unwrap();
+        assert!(set.is_default());
+        assert_eq!(render_soul(&|c| set.is_on(c), &all), crate::DEFAULT_SOUL);
+    }
+
+    /// #2933 PR3: `off = ["three-cs"]` removes exactly that paragraph.
+    #[test]
+    fn off_three_cs_drops_exactly_that_paragraph() {
+        let set = ComponentSet::resolve(None, &[], &strings(&["three-cs"])).unwrap();
+        let text = render_soul(&|c| set.is_on(c), &all);
+        let (paragraph_start, _) = crate::DEFAULT_SOUL
+            .match_indices("**Working code first")
+            .next()
+            .unwrap();
+        let expected = crate::DEFAULT_SOUL[..paragraph_start]
+            .trim_end_matches('\n')
+            .to_owned();
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn on_wins_over_the_preset_and_off_composes() {
+        let set = ComponentSet::resolve(
+            Some("default"),
+            &strings(&["identity"]),
+            &strings(&["tools"]),
+        )
+        .unwrap();
+        assert!(!set.is_default());
+        let text = render_soul(&|c| set.is_on(c), &all);
+        assert!(text.starts_with(
+            "You are newt, a free, friendly, local agentic coder. Be concise and direct. Follow"
+        ));
+    }
+
+    #[test]
+    fn unknown_ids_and_presets_are_refused_naming_the_valid_ones() {
+        let err = ComponentSet::resolve(None, &[], &strings(&["nope"])).unwrap_err();
+        assert!(err.contains("`nope`") && err.contains("three-cs"), "{err}");
+        let err = ComponentSet::resolve(None, &strings(&["nope"]), &[]).unwrap_err();
+        assert!(err.contains("`nope`"), "{err}");
+        let err = ComponentSet::resolve(Some("fancy"), &[], &[]).unwrap_err();
+        assert!(err.contains("presets: default"), "{err}");
+        assert!(ComponentSet::resolve(Some("pi"), &[], &[])
+            .unwrap_err()
+            .contains("not available yet"));
+        assert!(ComponentSet::resolve(Some("headless"), &[], &[])
+            .unwrap_err()
+            .contains("headless-only"));
+        let both = strings(&["three-cs"]);
+        assert!(ComponentSet::resolve(None, &both, &both)
+            .unwrap_err()
+            .contains("both"));
     }
 }

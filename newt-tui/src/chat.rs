@@ -12,6 +12,25 @@ use background_warmup::{
     resolved_source_extensions, spawn_nav_warmup, spawn_semantic_indexing, SemanticIndexWarmup,
 };
 
+/// Re-read the config after a command that may have changed it. A config that no
+/// longer resolves keeps the one the session already accepted, and says so: falling
+/// back to defaults would drop the operator's `[tool_exposure]` and the rest.
+pub(crate) fn reresolve(cfg: &mut newt_core::ResolvedConfig, color: bool, verbose: bool) {
+    match crate::migration_notices::read(|report| {
+        newt_core::Config::resolve_runtime_unpublished(report)
+    }) {
+        Ok(next) => *cfg = next,
+        Err(e) => print_newt(
+            &format!(
+                "config resolution failed: {e:#} — keeping the last accepted configuration; \
+                 fix the file"
+            ),
+            color,
+            verbose,
+        ),
+    }
+}
+
 fn memory_fetch_source<'a>(
     notes: Option<&'a newt_core::NoteStore>,
     store: Option<&'a newt_core::ConversationStore>,
@@ -1859,19 +1878,14 @@ fn session_body(
     // intentional refresh point — config.toml may have changed on disk.
     // UNPUBLISHED resolution: process-globals land only after the typed
     // backend choice below ACCEPTS — a refused startup publishes nothing.
-    // A resolution failure is visible, then the session runs on defaults.
+    // A resolution failure refuses the session.
     let mut cfg = match crate::migration_notices::read(|report| {
         newt_core::Config::resolve_runtime_unpublished(report)
     }) {
         Ok(cfg) => cfg,
-        Err(e) => {
-            print_newt(
-                &format!("config resolution failed: {e:#} — running on built-in defaults"),
-                color,
-                verbose,
-            );
-            newt_core::ResolvedConfig::unrequested(newt_core::Config::default())
-        }
+        // Fail closed: built-in defaults would drop `[tool_exposure]` and every
+        // other restriction the operator wrote, and the session would go on.
+        Err(e) => anyhow::bail!("config resolution failed: {e:#}; no session was started"),
     };
     // The active profile is resolved just below, AFTER the model is known — a
     // `--bundle`/inferred bundle picks its profile from the model id.
@@ -2832,11 +2846,12 @@ fn session_body(
     );
 
     // Build system prompt now that SoulProvider has loaded its soul file.
-    system = rebuild_system_prompt(
+    system = rebuild_system_prompt_for(
         workspace,
         &memory,
         active_persona.as_ref(),
         &active_conversation_id,
+        &cfg,
         Some(&*report_sink),
     );
     // #2938: the operator's system prompt file as the session last built its
@@ -2849,11 +2864,12 @@ fn session_body(
                 &mut last_override,
                 crate::try_system_prompt_override,
                 || {
-                    system = rebuild_system_prompt(
+                    system = rebuild_system_prompt_for(
                         workspace,
                         &memory,
                         active_persona.as_ref(),
                         &active_conversation_id,
+                        &cfg,
                         Some(&*report_sink),
                     );
                 },
@@ -2996,6 +3012,7 @@ fn session_body(
     let mut resumed_at_start = false;
     if let Some(store) = conversation_store.as_ref() {
         let mut resume_ctx = ConversationCommandContext {
+            cfg: &cfg,
             store,
             persona_store: &persona_store,
             workspace,
@@ -3109,6 +3126,7 @@ fn session_body(
                     verbose,
                 );
                 let mut reset_ctx = ConversationResetContext {
+                    cfg: &cfg,
                     memory: &mut memory,
                     system: &mut system,
                     conversation_id: &mut active_conversation_id,
@@ -3782,7 +3800,7 @@ fn session_body(
                     #[cfg(feature = "rich-tui")]
                     macro_rules! manage_mcp {
                         () => {{
-                            cfg = crate::resolve_runtime_or_default();
+                            reresolve(&mut cfg, color, verbose);
                             let cancel =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let exit = std::sync::atomic::AtomicBool::new(false);
@@ -4428,7 +4446,7 @@ fn session_body(
                                     verbose,
                                 ),
                             }
-                            cfg = crate::resolve_runtime_or_default();
+                            reresolve(&mut cfg, color, verbose);
                             surface.save_history();
                             println!();
                             continue;
@@ -5770,6 +5788,7 @@ fn session_body(
                         }
                         turns_this_conversation = 0;
                         let mut reset_ctx = ConversationResetContext {
+                            cfg: &cfg,
                             memory: &mut memory,
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
@@ -6090,6 +6109,7 @@ fn session_body(
                         match conversation_store.as_ref() {
                             Some(store) => {
                                 let mut conversation_ctx = ConversationCommandContext {
+                                    cfg: &cfg,
                                     store,
                                     persona_store: &persona_store,
                                     workspace,
@@ -6429,6 +6449,7 @@ fn session_body(
                                                     let _ = store.release(&outgoing);
                                                 }
                                                 let mut resume_ctx = ConversationCommandContext {
+                                                    cfg: &cfg,
                                                     store,
                                                     persona_store: &persona_store,
                                                     workspace,
@@ -6673,6 +6694,7 @@ fn session_body(
                                                             active_conversation_id.clone();
                                                         let _ = store.release(&outgoing);
                                                         let mut ctx = ConversationCommandContext {
+                                                            cfg: &cfg,
                                                             store,
                                                             persona_store: &persona_store,
                                                             workspace,
@@ -6802,6 +6824,7 @@ fn session_body(
                         let persona_name_before = active_persona.as_ref().map(|p| p.name.clone());
                         let conversation_id_before = active_conversation_id.clone();
                         let mut reset_ctx = ConversationResetContext {
+                            cfg: &cfg,
                             memory: &mut memory,
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
@@ -7073,7 +7096,7 @@ fn session_body(
                                             }
                                         }
                                     }
-                                    cfg = crate::resolve_runtime_or_default();
+                                    reresolve(&mut cfg, color, verbose);
                                     surface.set_tool_policy(cfg.tool_exposure().status_label());
                                 }
                                 Ok(None) => print_newt("tools: cancelled", color, verbose),
@@ -7217,7 +7240,7 @@ fn session_body(
                                     }
                                 }
                             }
-                            cfg = crate::resolve_runtime_or_default();
+                            reresolve(&mut cfg, color, verbose);
                             if walked_to_tools {
                                 manage_tools!();
                                 initial_section = Some('s');
@@ -7268,7 +7291,7 @@ fn session_body(
                                         verbose,
                                     ),
                                 }
-                                cfg = crate::resolve_runtime_or_default();
+                                reresolve(&mut cfg, color, verbose);
                                 initial_section = Some('p');
                                 continue;
                             }
@@ -7464,6 +7487,7 @@ fn session_body(
                                         }
                                         let conversation_id_before = active_conversation_id.clone();
                                         let mut reset_ctx = ConversationResetContext {
+                                            cfg: &cfg,
                                             memory: &mut memory,
                                             system: &mut system,
                                             conversation_id: &mut active_conversation_id,
@@ -7548,7 +7572,7 @@ fn session_body(
                                     // independently-mutated sources and could pair
                                     // the operator's provider with a persona
                                     // backend's model.
-                                    cfg = crate::resolve_runtime_or_default();
+                                    reresolve(&mut cfg, color, verbose);
                                     let _ = refresh_backend(
                                         &cfg,
                                         &mut choice,
@@ -7625,7 +7649,7 @@ fn session_body(
                     if models_panel::requested(panel_tokens.as_slice())
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
                     {
-                        let cfg_now = crate::resolve_runtime_or_default();
+                        let cfg_now = cfg.clone();
                         if let Ok(panel_choice) = crate::resolve_backend_choice(&cfg_now) {
                             let panel_window =
                                 surface.open_panel(PanelMode::Inline(models_panel::panel_height()));
@@ -7648,7 +7672,7 @@ fn session_body(
                                     // This panel returns before the normal
                                     // post-slash refresh. Repoint the live
                                     // session as well as the saved choice.
-                                    cfg = crate::resolve_runtime_or_default();
+                                    reresolve(&mut cfg, color, verbose);
                                     let _ = refresh_backend(
                                         &cfg,
                                         &mut choice,
@@ -7784,7 +7808,7 @@ fn session_body(
                             // re-probe telemetry only when the URL changed
                             // (verbose-only; dropping the old receiver stops
                             // the previous background sampler, #412/#414).
-                            cfg = crate::resolve_runtime_or_default();
+                            reresolve(&mut cfg, color, verbose);
                             let url_changed = refresh_backend(
                                 &cfg,
                                 &mut choice,
@@ -7866,7 +7890,7 @@ fn session_body(
                     // session picks up edits, then derive everything from it.
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
-                    cfg = crate::resolve_runtime_or_default();
+                    reresolve(&mut cfg, color, verbose);
                     refresh_prompt_override!();
                     // Ephemeral is a session-wide decision (17.7): a config
                     // refresh never re-grows a store handle mid-session.

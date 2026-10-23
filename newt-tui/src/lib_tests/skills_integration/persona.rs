@@ -266,6 +266,7 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
 
     let message = {
         let mut ctx = ConversationResetContext {
+            cfg: &crate::test_session_config(),
             memory: &mut memory,
             system: &mut system,
             conversation_id: &mut active_conversation_id,
@@ -350,6 +351,7 @@ async fn new_conversation_preserves_active_persona() {
         .unwrap();
     newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
     let mut ctx = ConversationResetContext {
+        cfg: &crate::test_session_config(),
         memory: &mut memory,
         system: &mut system,
         conversation_id: &mut active_conversation_id,

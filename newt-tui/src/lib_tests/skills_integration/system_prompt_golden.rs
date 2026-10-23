@@ -102,3 +102,81 @@ fn goldens_pin_the_assembled_prompt() {
         &assembled("", "You are a Django expert.", None),
     );
 }
+
+/// #2933 PR3: `[prompt] components.off = ["three-cs"]` removes that paragraph and
+/// nothing else from the assembled prompt.
+#[serial_test::serial(real_fs)]
+#[test]
+fn switching_a_component_off_drops_exactly_its_paragraph() {
+    let doer = newt_core::DEFAULT_SOUL;
+    let base = assembled("", doer, None);
+    let off = assembled(
+        "[prompt]\ncomponents = { off = [\"three-cs\"] }\n",
+        doer,
+        None,
+    );
+    let start = base.find("**Working code first").unwrap();
+    let end = base.find("\n\n## AGENTS.md").unwrap_or_else(|| {
+        panic!("project context follows the soul:\n{base}");
+    });
+    let expected = format!("{}{}", base[..start].trim_end_matches('\n'), &base[end..]);
+    assert_eq!(off, expected);
+}
+
+/// #2990 round 2: the prompt follows the session's last ACCEPTED config. Accept a
+/// newer config through the chat loop's `reresolve`, break the file, then `/new`:
+/// the rebuilt prompt renders from the newer config, not from the first one nor
+/// from defaults.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn a_failed_refresh_then_new_renders_from_the_newer_accepted_config() {
+    let root = tempfile::TempDir::new().unwrap();
+    let ws = root.path().join("ws");
+    let config_dir = root.path().join("config");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("config.toml");
+    let _env = newt_core::process_env::lock();
+    let _sandbox = SkillRootSandbox::enter(&config_dir, &ws);
+
+    let first = "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\"]\n[prompt]\ncomponents = { off = [\"three-cs\"] }\n";
+    let newer = "[tool_exposure]\nallow_list = [\"read_file\"]\n";
+    let broken = "[tool_exposure]\nallow_list = [\"read_file\"]\n[prompt]\ncomponents = { off = [\"nope\"] }\n";
+
+    fs::write(&config, first).unwrap();
+    let mut cfg = crate::resolve_runtime_or_default();
+    fs::write(&config, newer).unwrap();
+    crate::chat::reresolve(&mut cfg, false, false);
+    fs::write(&config, broken).unwrap();
+    crate::chat::reresolve(&mut cfg, false, false);
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::SoulProvider::new(None));
+    memory
+        .initialize_all(&newt_core::SessionContext {
+            workspace: ws.to_string_lossy().into_owned(),
+            session_id: "s".into(),
+        })
+        .await;
+    let mut system = String::new();
+    let mut conversation_id = String::from("s");
+    let mode_states = ConversationModeStates::default();
+    let mut ctx = ConversationResetContext {
+        cfg: &cfg,
+        memory: &mut memory,
+        system: &mut system,
+        conversation_id: &mut conversation_id,
+        mode_states: &mode_states,
+        sink: None,
+    };
+    reset_conversation(ws.to_str().unwrap(), None, &mut ctx);
+
+    assert!(
+        system.contains("You have tools: read_file."),
+        "the newer allow list names one tool:\n{system}"
+    );
+    assert!(
+        system.contains("Working code first"),
+        "the newer config has three-cs on:\n{system}"
+    );
+}

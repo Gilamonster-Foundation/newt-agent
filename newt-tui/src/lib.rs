@@ -691,9 +691,12 @@ pub fn run_code(
     // (issue #527). Config is folded in here, where a session reads it; the
     // `color_supported_with` shim (used pre-config, e.g. the wizard) stays Auto.
     let mut migration_notices = crate::migration_notices::Pending::default();
+    // An invalid config refuses the session here, before any splash, wizard or
+    // inference: a default config would drop `[tool_exposure]` and the rest of what
+    // the operator restricted (#2933 review of #2990).
     let cfg_color = newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
-        .ok()
-        .and_then(|c| c.tui)
+        .map_err(|e| anyhow::anyhow!("config resolution failed: {e:#}; nothing was started"))?
+        .tui
         .map(|t| t.color)
         .unwrap_or_default();
     let color = color_enabled_for(
@@ -725,7 +728,7 @@ pub fn run_code(
         let unconfigured =
             newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
                 .map(|c| c.is_unconfigured())
-                .unwrap_or(true);
+                .map_err(|e| anyhow::anyhow!("config resolution failed: {e:#}"))?;
         let context = if unconfigured || setup.is_some() {
             "initial setup"
         } else {
@@ -5896,12 +5899,36 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
 /// notes, memory index, project map).  It follows the identity whatever the
 /// altitude, so coach altitude, which replaces the soul/identity with
 /// `COACH_SOUL`, never silently drops project-specific instructions (#2934).
+/// The unit tier resolves the config from disk, as the builder used to.
+#[cfg(test)]
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: &str,
     context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    let cfg = test_session_config();
+    build_system_prompt_for(workspace, soul, context, persona, plan_path, &cfg, sink)
+}
+
+/// The config of a test session: what the sandbox's files resolve to.
+#[cfg(test)]
+pub(crate) fn test_session_config() -> Box<newt_core::Config> {
+    Box::new(newt_core::Config::clone(&resolve_runtime_or_default()))
+}
+
+/// Render the system prompt from the SESSION's accepted config (`cfg`), never from
+/// a fresh read of the file: a refresh that failed keeps the session's last accepted
+/// config, and the prompt must follow it, not the file on disk.
+fn build_system_prompt_for(
+    workspace: &str,
+    soul: &str,
+    context: Option<&str>,
+    persona: Option<&Persona>,
+    plan_path: &str,
+    cfg: &newt_core::Config,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     // FR-5 (#999): the active persona's ALTITUDE selects the base identity. A
@@ -5918,33 +5945,26 @@ fn build_system_prompt_with_persona(
         newt_core::Altitude::Coach => newt_core::COACH_SOUL,
         newt_core::Altitude::Doer => soul,
     };
-    // Resolved once and shared with the skills index below; the ratchet in
-    // newt-core/tests/resolve_publishes_ratchet.rs pins the publishing resolve
-    // count per file.
-    let cfg = crate::migration_notices::read(|report| newt_core::Config::resolve(report));
     // #2932: the identity names only the tools the operator lets the model
     // see — the same `[tool_exposure]` policy that selects the catalog, so the
     // prompt cannot steer the model at a tool the wire never carries.
-    let exposure = cfg
-        .as_ref()
-        .ok()
-        .map(|c| newt_core::ExposureSettings::from(c.tool_exposure()))
-        .unwrap_or_default();
-    let identity = exposure.render_identity(identity);
+    let exposure = newt_core::ExposureSettings::from(cfg.tool_exposure());
+    // The accepted config was validated when it was resolved, so this holds.
+    let components = cfg.prompt_components().unwrap_or_else(|e| {
+        debug_assert!(false, "accepted config has invalid components: {e}");
+        Default::default()
+    });
+    let identity = exposure.render_identity_with(identity, &components);
     // `[tui] narration_intent_line` (opt-in): every identity gets it and no
     // soul text carries it.
-    let intent = cfg
-        .as_ref()
-        .ok()
-        .and_then(|c| c.tui.as_ref())
-        .is_some_and(|t| t.narration_intent_line);
+    let intent = cfg.tui.as_ref().is_some_and(|t| t.narration_intent_line);
     // Progressive disclosure: inject ONLY the skills index (one
     // `name: description (when to use: …)` line per installed skill) — never
     // the bodies. Bodies load on demand when the model calls the `use_skill`
     // tool. Skills come from the one resolver `use_skill` also reads (#2331):
     // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
     // missing dir contributes nothing.
-    let skills_dirs = cfg.map(|c| c.skill_search_dirs()).unwrap_or_default();
+    let skills_dirs = cfg.skill_search_dirs();
     let skills_index = skills_index_for_prompt(&skills_dirs);
     // Top-level names only; the assembler drops hidden ones and caps the list.
     let file_names: Option<Vec<String>> = std::fs::read_dir(workspace).ok().map(|entries| {
@@ -6016,11 +6036,25 @@ pub(crate) fn try_system_prompt_override() -> Result<Option<newt_core::SystemPro
         .system_prompt_override()
 }
 
+/// [`rebuild_system_prompt_for`] over the sandbox's config, for the unit tier.
+#[cfg(test)]
 fn rebuild_system_prompt(
     workspace: &str,
     memory: &newt_core::MemoryManager,
     persona: Option<&Persona>,
     conversation_id: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    let cfg = test_session_config();
+    rebuild_system_prompt_for(workspace, memory, persona, conversation_id, &cfg, sink)
+}
+
+fn rebuild_system_prompt_for(
+    workspace: &str,
+    memory: &newt_core::MemoryManager,
+    persona: Option<&Persona>,
+    conversation_id: &str,
+    cfg: &newt_core::Config,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     // #2938: the operator's file REPLACES the assembled prompt entirely.
@@ -6055,13 +6089,14 @@ fn rebuild_system_prompt(
     }
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
-    build_system_prompt_with_persona(
+    build_system_prompt_for(
         workspace,
         // No soul provider means no soul; the builder never invents one (#2935).
         soul_text.as_deref().unwrap_or_default(),
         context_ref,
         persona,
         &plan_path.to_string_lossy(),
+        cfg,
         sink,
     )
 }
@@ -6281,6 +6316,8 @@ fn persona_list(store: &PersonaStore) -> anyhow::Result<String> {
 }
 
 struct ConversationResetContext<'a> {
+    /// The session's accepted config, which the rebuilt prompt renders from.
+    cfg: &'a newt_core::Config,
     memory: &'a mut newt_core::MemoryManager,
     system: &'a mut String,
     conversation_id: &'a mut String,
@@ -6299,11 +6336,12 @@ fn reset_conversation(
     // survive any of those paths.
     ctx.mode_states.clear();
     ctx.memory.reset_all();
-    *ctx.system = rebuild_system_prompt(
+    *ctx.system = rebuild_system_prompt_for(
         workspace,
         ctx.memory,
         active_persona,
         ctx.conversation_id,
+        ctx.cfg,
         ctx.sink,
     );
 }
@@ -6896,6 +6934,8 @@ fn conversation_show_message(record: &newt_core::ConversationRecord) -> String {
 }
 
 struct ConversationCommandContext<'a> {
+    /// The session's accepted config, which the rebuilt prompt renders from.
+    cfg: &'a newt_core::Config,
     store: &'a newt_core::ConversationStore,
     persona_store: &'a PersonaStore,
     workspace: &'a str,
@@ -7106,6 +7146,7 @@ pub(crate) fn prepare_conversation_restore(
 /// Every field here is one `ConversationCommandContext` already owns; this is a
 /// narrowing reborrow, not a second source of truth.
 pub(crate) struct CommitContext<'a> {
+    pub cfg: &'a newt_core::Config,
     pub workspace: &'a str,
     pub memory: &'a mut newt_core::MemoryManager,
     pub system: &'a mut String,
@@ -7123,6 +7164,7 @@ impl<'a> ConversationCommandContext<'a> {
     /// Narrow to what commit may touch — dropping the two stores.
     pub(crate) fn commit_context(&mut self) -> CommitContext<'_> {
         CommitContext {
+            cfg: self.cfg,
             workspace: self.workspace,
             memory: self.memory,
             system: self.system,
@@ -7218,11 +7260,12 @@ fn commit_prepared(
     seat_persona_dials(ctx.active_persona.as_ref());
     ctx.compress_state.reset();
     *ctx.active_conversation_id = record.id.clone();
-    *ctx.system = rebuild_system_prompt(
+    *ctx.system = rebuild_system_prompt_for(
         ctx.workspace,
         ctx.memory,
         ctx.active_persona.as_ref(),
         ctx.active_conversation_id,
+        ctx.cfg,
         ctx.sink,
     );
     (record, warning)
@@ -7849,11 +7892,12 @@ fn handle_persona_command(
                 // Persistent-actor swap: rebuild the system prompt for the new
                 // role WITHOUT discarding the conversation history — same
                 // conversation, same plan file.
-                *ctx.system = rebuild_system_prompt(
+                *ctx.system = rebuild_system_prompt_for(
                     workspace,
                     ctx.memory,
                     active_persona.as_ref(),
                     ctx.conversation_id,
+                    ctx.cfg,
                     ctx.sink,
                 );
                 Ok(persona_swap_kept_context_message(active_persona.as_ref()))

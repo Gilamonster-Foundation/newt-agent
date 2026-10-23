@@ -123,6 +123,18 @@ pub struct HeadlessArgs {
     /// `--system-prompt-file`: this file's bytes replace the system prompt
     /// entirely, over `[prompt] file` (#2938).
     pub system_prompt_file: Option<PathBuf>,
+    /// `--prompt-preset`: only `headless` (the default) is known yet (#2933).
+    pub prompt_preset: Option<String>,
+}
+
+/// The one headless preset: the bare `Workspace root:` message (an eval baseline).
+fn check_headless_preset(name: Option<&str>) -> Result<(), String> {
+    match name.map(str::trim) {
+        None | Some("headless") => Ok(()),
+        Some(other) => Err(format!(
+            "headless does not support prompt preset `{other}` yet; presets: headless"
+        )),
+    }
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -333,6 +345,7 @@ fn projected_cognition(
 /// pass/fail is Terminal-Bench's job via the task's own verification — this exit
 /// code is only "did the agent run cleanly".)
 pub async fn run(args: HeadlessArgs) -> Result<i32> {
+    check_headless_preset(args.prompt_preset.as_deref()).map_err(anyhow::Error::msg)?;
     // 0. The explicit scratchpad seed is admitted before anything else runs.
     let scratchpad = match &args.scratchpad_state {
         Some(path) => Some(seed_scratchpad(
@@ -1851,6 +1864,19 @@ mod tests {
     /// F16 (red first): the seeded message names the real root and is a
     /// `system` message, so it precedes the task in the wire transcript
     /// exactly like newt-tui's `Workspace: {path}` line.
+    #[test]
+    fn only_the_headless_preset_is_known() {
+        assert!(check_headless_preset(None).is_ok());
+        assert!(check_headless_preset(Some("headless")).is_ok());
+        for other in ["default", "pi", "nope"] {
+            let err = check_headless_preset(Some(other)).unwrap_err();
+            assert!(
+                err.contains(other) && err.contains("presets: headless"),
+                "{err}"
+            );
+        }
+    }
+
     #[test]
     fn workspace_root_system_message_names_the_real_root() {
         let msg = workspace_root_system_message("/home/dev/proj", None);

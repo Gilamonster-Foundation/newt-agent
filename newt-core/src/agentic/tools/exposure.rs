@@ -228,13 +228,29 @@ impl ExposureSettings {
     /// operator filter is returned unchanged.
     #[must_use]
     pub fn render_identity<'a>(&self, identity: &'a str) -> std::borrow::Cow<'a, str> {
+        self.render_identity_with(identity, &crate::prompt_components::ComponentSet::default())
+    }
+
+    /// [`render_identity`](Self::render_identity) with `[prompt] components` applied.
+    /// Components shape the default soul; any other identity (a custom `soul.md`,
+    /// the coach soul) is filtered as text.
+    #[must_use]
+    pub fn render_identity_with<'a>(
+        &self,
+        identity: &'a str,
+        components: &crate::prompt_components::ComponentSet,
+    ) -> std::borrow::Cow<'a, str> {
+        if identity == crate::DEFAULT_SOUL {
+            if !self.has_operator_filter() && components.is_default() {
+                return std::borrow::Cow::Borrowed(identity);
+            }
+            return std::borrow::Cow::Owned(crate::prompt_components::render_soul(
+                &|c| components.is_on(c),
+                &|tool| self.operator_visible(tool),
+            ));
+        }
         if !self.has_operator_filter() {
             return std::borrow::Cow::Borrowed(identity);
-        }
-        if identity == crate::DEFAULT_SOUL {
-            return std::borrow::Cow::Owned(crate::prompt_components::default_soul(&|tool| {
-                self.operator_visible(tool)
-            }));
         }
         self.render_text_identity(identity)
     }
