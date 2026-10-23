@@ -143,30 +143,56 @@ impl<F: FnMut(&str) -> anyhow::Result<()>> EditIo for RealIo<F> {
     }
 }
 
-/// The override the session last built its system prompt from, for the status
-/// line: what is on the wire, not what the config says. Set by every rebuild.
-static ACTIVE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-
-pub(crate) fn set_active(path: Option<PathBuf>) {
-    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = path;
+/// The status-line badge state. Process-wide in a session. Per thread under test, so a test that rebuilds a
+/// prompt or flips the badge never leaks into a parallel test's footer.
+#[derive(Default)]
+struct Badge {
+    /// The override the session last built its system prompt from: what is
+    /// on the wire, not what the config says. Set by every rebuild.
+    active: Option<PathBuf>,
+    /// Whether the prompt the session last built dropped components (#2933).
+    custom_components: bool,
 }
 
-/// Whether the prompt the session last built dropped components (#2933).
-static CUSTOM_COMPONENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(not(test))]
+static BADGE: std::sync::Mutex<Badge> = std::sync::Mutex::new(Badge {
+    active: None,
+    custom_components: false,
+});
+
+#[cfg(test)]
+thread_local! {
+    static BADGE: std::cell::RefCell<Badge> = std::cell::RefCell::new(Badge::default());
+}
+
+fn with_badge<R>(f: impl FnOnce(&mut Badge) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut BADGE.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    #[cfg(test)]
+    {
+        BADGE.with(|b| f(&mut b.borrow_mut()))
+    }
+}
+
+pub(crate) fn set_active(path: Option<PathBuf>) {
+    with_badge(|b| b.active = path);
+}
 
 pub(crate) fn set_custom_components(custom: bool) {
-    CUSTOM_COMPONENTS.store(custom, std::sync::atomic::Ordering::Relaxed);
+    with_badge(|b| b.custom_components = custom);
 }
 
 /// `[prompt: <file name>]` while an override file is in force, else
 /// `[prompt: custom]` while components are switched off.
 #[cfg(feature = "rich-tui")]
 pub(crate) fn status_badge() -> Option<String> {
-    let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    active.as_deref().map(badge_for).or_else(|| {
-        CUSTOM_COMPONENTS
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .then(|| "[prompt: custom]".to_string())
+    with_badge(|b| {
+        b.active
+            .as_deref()
+            .map(badge_for)
+            .or_else(|| b.custom_components.then(|| "[prompt: custom]".to_string()))
     })
 }
 
