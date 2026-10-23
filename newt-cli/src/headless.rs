@@ -123,18 +123,37 @@ pub struct HeadlessArgs {
     /// `--system-prompt-file`: this file's bytes replace the system prompt
     /// entirely, over `[prompt] file` (#2938).
     pub system_prompt_file: Option<PathBuf>,
-    /// `--prompt-preset`: only `headless` (the default) is known yet (#2933).
+    /// `--prompt-preset`: a `[prompt] preset` name, or `headless` for the bare
+    /// `Workspace root:` message (an eval baseline). Absent, the config's preset
+    /// (else `default`) builds the same prompt the TUI sends (#2933).
     pub prompt_preset: Option<String>,
 }
 
-/// The one headless preset: the bare `Workspace root:` message (an eval baseline).
-fn check_headless_preset(name: Option<&str>) -> Result<(), String> {
-    match name.map(str::trim) {
-        None | Some("headless") => Ok(()),
-        Some(other) => Err(format!(
-            "headless does not support prompt preset `{other}` yet; presets: headless"
-        )),
+/// The one name that is not a `[prompt] preset`: the bare `Workspace root:` message.
+const BARE_PRESET: &str = "headless";
+
+/// `cfg` with `--prompt-preset` applied over `[prompt] preset`, and the components
+/// it resolves to. `None` for the bare preset, which has none.
+fn prompt_components_for(
+    cfg: &newt_core::Config,
+    preset: Option<&str>,
+) -> Result<
+    Option<(
+        newt_core::Config,
+        newt_core::prompt_components::ComponentSet,
+    )>,
+    String,
+> {
+    let preset = preset.map(str::trim);
+    if preset == Some(BARE_PRESET) {
+        return Ok(None);
     }
+    let mut cfg = cfg.clone();
+    if let Some(name) = preset {
+        cfg.prompt.get_or_insert_with(Default::default).preset = Some(name.to_string());
+    }
+    let components = cfg.prompt_components()?;
+    Ok(Some((cfg, components)))
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -345,7 +364,6 @@ fn projected_cognition(
 /// pass/fail is Terminal-Bench's job via the task's own verification — this exit
 /// code is only "did the agent run cleanly".)
 pub async fn run(args: HeadlessArgs) -> Result<i32> {
-    check_headless_preset(args.prompt_preset.as_deref()).map_err(anyhow::Error::msg)?;
     // 0. The explicit scratchpad seed is admitted before anything else runs.
     let scratchpad = match &args.scratchpad_state {
         Some(path) => Some(seed_scratchpad(
@@ -372,6 +390,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         })
         .context("resolving config")?,
     };
+    // A preset or component the config (or `--prompt-preset`) cannot resolve is refused
+    // before any backend work, never defaulted (#2933).
+    prompt_components_for(&cfg, args.prompt_preset.as_deref()).map_err(anyhow::Error::msg)?;
     // NOTHING is published yet: the process-global settings land only after
     // the backend pick + capability sidecar VALIDATE below — a refused
     // selection or an unknown card must not leave half-published globals.
@@ -705,12 +726,23 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     .transpose()
     .map_err(anyhow::Error::msg)?;
     dc.exposure.verbatim_system = prompt_override.is_some();
-    let sys_msg = {
-        let sink_ref = dc.report_sink.as_deref();
-        match prompt_override {
-            Some(o) => override_system_message(o, sink_ref),
-            None => workspace_root_system_message(&workspace, sink_ref),
-        }
+    // The same component-built prompt the TUI sends for this config; the bare
+    // `Workspace root:` message only when asked for (`--prompt-preset headless`).
+    let components = if prompt_override.is_some() {
+        None
+    } else {
+        prompt_components_for(&cfg, args.prompt_preset.as_deref()).map_err(anyhow::Error::msg)?
+    };
+    if let Some((_, set)) = &components {
+        dc.exposure.omit_card = !set.is_on_id("card");
+    }
+    let sys_msg = match (prompt_override, components) {
+        (Some(o), _) => override_system_message(o, dc.report_sink.as_deref()),
+        (None, Some((prompt_cfg, _))) => newt_core::MemMessage::system(
+            newt_tui::headless_system_prompt(&workspace, &prompt_cfg, dc.report_sink.as_deref())
+                .await,
+        ),
+        (None, None) => workspace_root_system_message(&workspace, dc.report_sink.as_deref()),
     };
     let mut driver = TurnDriver::with_transcript(dc, vec![sys_msg])
         .with_cognition(runtime.cognition)
@@ -1865,16 +1897,20 @@ mod tests {
     /// `system` message, so it precedes the task in the wire transcript
     /// exactly like newt-tui's `Workspace: {path}` line.
     #[test]
-    fn only_the_headless_preset_is_known() {
-        assert!(check_headless_preset(None).is_ok());
-        assert!(check_headless_preset(Some("headless")).is_ok());
-        for other in ["default", "pi", "nope"] {
-            let err = check_headless_preset(Some(other)).unwrap_err();
-            assert!(
-                err.contains(other) && err.contains("presets: headless"),
-                "{err}"
-            );
+    fn every_preset_resolves_and_headless_is_the_bare_one() {
+        let cfg = newt_core::Config::default();
+        assert!(prompt_components_for(&cfg, Some("headless"))
+            .unwrap()
+            .is_none());
+        for name in [None, Some("default")] {
+            let (prompt_cfg, set) = prompt_components_for(&cfg, name).unwrap().unwrap();
+            assert_eq!(prompt_cfg.prompt_components().unwrap(), set);
         }
+        // `pi` is a real preset here: it is refused only for the card tools it leaves visible.
+        let err = prompt_components_for(&cfg, Some("pi")).unwrap_err();
+        assert!(err.contains("`card`"), "{err}");
+        let err = prompt_components_for(&cfg, Some("nope")).unwrap_err();
+        assert!(err.contains("nope") && err.contains("presets:"), "{err}");
     }
 
     #[test]

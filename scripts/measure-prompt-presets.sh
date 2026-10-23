@@ -102,6 +102,32 @@ measure() { # name, extra-config
     "$name" "$sys" "$tools" "$tchars" "$body" "${preview:-?}"
 }
 
+measure_headless() { # name, extra-config, extra headless args
+  local name=$1 extra=$2 slug
+  shift 2
+  slug=$(printf 'headless %s' "$name" | tr -c 'A-Za-z0-9\n' '-')
+  local home=$ROOT/home-$slug wire=$ROOT/wire-$slug
+  mkdir -p "$home/.newt" "$wire"
+  python3 -I "$HERE/measure_prompt_wire.py" serve "$wire" &
+  PROVIDER_PID=$!
+  local i
+  for i in $(seq 1 50); do [ -s "$wire/port" ] && break; sleep 0.1; done
+  local port
+  port=$(cat "$wire/port")
+  printf 'default_backend = "fixture"\n\n[[backends]]\nname = "fixture"\nendpoint = "http://127.0.0.1:%s"\nmodel = "measure-fixture"\nkind = "openai"\n\n%s\n' \
+    "$port" "$extra" >"$home/.newt/config.toml"
+  printf '%s\n' "$MARKER" >"$ROOT/instruction-$slug.md"
+  (cd "$WS" && HOME=$home NEWT_CONFIG_DIR=$home/.newt NEWT_CONFIG=$home/.newt/config.toml NEWT_NO_MODEL_PULL=1 \
+    "$BIN" headless --cwd "$WS" --instruction-file "$ROOT/instruction-$slug.md" --max-rounds 1 "$@" >/dev/null 2>&1)
+  local wired sys tools tchars body
+  wired=$(python3 -I "$HERE/measure_prompt_wire.py" report "$wire" "$MARKER" 2>/dev/null) || wired=""
+  kill "$PROVIDER_PID" 2>/dev/null || true
+  PROVIDER_PID=""
+  read -r sys tools tchars body <<<"${wired:-? ? ? ?}"
+  printf '| %-26s | %12s | %5s | %11s | %10s | %22s |\n' \
+    "headless $name" "$sys" "$tools" "$tchars" "$body" "-"
+}
+
 echo "| case                       | system chars | tools | tools chars | body chars | preview total (partial) |"
 echo "|----------------------------|-------------:|------:|------------:|-----------:|------------------------:|"
 measure "default" ""
@@ -110,6 +136,12 @@ preset = "pi"
 components = { on = ["card"] }
 '
 measure "pi + /settings tools pi" "$PI_TOOLS
+[prompt]
+preset = \"pi\"
+"
+measure_headless "bare (--prompt-preset headless)" "" --prompt-preset headless
+measure_headless "default (= the TUI's)" ""
+measure_headless "pi + tools pi" "$PI_TOOLS
 [prompt]
 preset = \"pi\"
 "

@@ -6156,6 +6156,21 @@ fn rebuild_system_prompt_for(
         }
         return found.text;
     }
+    assemble_session_prompt(workspace, memory, persona, conversation_id, cfg, sink)
+}
+
+/// The assembled prompt (no `[prompt] file` override) from the session's providers
+/// and accepted config. The TUI and `newt headless` both build it here, so the same
+/// config yields the same system text.
+fn assemble_session_prompt(
+    workspace: &str,
+    memory: &newt_core::MemoryManager,
+    persona: Option<&Persona>,
+    conversation_id: &str,
+    cfg: &newt_core::Config,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    let components = cfg.prompt_components().unwrap_or_default();
     // #2934: separate the soul/identity from the project-context additions so
     // that coach altitude can replace the soul with COACH_SOUL without
     // silently dropping AGENTS.md, notes, and the project map.
@@ -6188,6 +6203,38 @@ fn rebuild_system_prompt_for(
         cfg,
         sink,
     )
+}
+
+/// `AGENTS.md` / `CLAUDE.md` as the session reads it: `NEWT_NO_AGENTS_FILE` forces it
+/// off, `NEWT_AGENTS_FILE` forces it on (and names the file), else `[agents]`.
+pub(crate) fn project_instructions_provider(cfg: &newt_core::Config) -> newt_core::AgentsProvider {
+    let enabled = std::env::var("NEWT_NO_AGENTS_FILE").is_err()
+        && (cfg.agents.enabled || std::env::var("NEWT_AGENTS_FILE").is_ok());
+    let path = std::env::var("NEWT_AGENTS_FILE")
+        .ok()
+        .or_else(|| cfg.agents.path.clone());
+    newt_core::AgentsProvider::new(enabled, path)
+}
+
+/// The system prompt `newt headless` sends: the TUI's assembled prompt for the same
+/// config, from the project instructions alone (headless has no persona, notes or
+/// profile providers). `cfg`'s `[prompt]` is whatever the caller resolved, so a
+/// `--prompt-preset` is a `cfg` the caller already changed.
+pub async fn headless_system_prompt(
+    workspace: &str,
+    cfg: &newt_core::Config,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(project_instructions_provider(cfg));
+    let session = newt_core::lifecycle::new_session_id().to_string();
+    memory
+        .initialize_all(&newt_core::SessionContext {
+            workspace: workspace.to_string(),
+            session_id: session.clone(),
+        })
+        .await;
+    assemble_session_prompt(workspace, &memory, None, &session, cfg, sink)
 }
 
 fn handle_operating_mode_command(

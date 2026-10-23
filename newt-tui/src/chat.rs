@@ -2638,12 +2638,7 @@ fn session_body(
         // the frozen system prompt. CLI-env
         // overrides config: --no-agents-file forces off, --agents-file forces
         // on (and sets the search target); otherwise follow `[agents] enabled`.
-        let agents_enabled = std::env::var("NEWT_NO_AGENTS_FILE").is_err()
-            && (cfg.agents.enabled || std::env::var("NEWT_AGENTS_FILE").is_ok());
-        let agents_path = std::env::var("NEWT_AGENTS_FILE")
-            .ok()
-            .or_else(|| cfg.agents.path.clone());
-        mgr.add_provider(newt_core::AgentsProvider::new(agents_enabled, agents_path));
+        mgr.add_provider(crate::project_instructions_provider(&cfg));
         // Profile technique: knowledge_base (R1) — inject the authoritative PyO3
         // import surface into the system prompt when the active profile lists it.
         // Rides the provider seam (survives system-prompt rebuilds); a no-op on a
