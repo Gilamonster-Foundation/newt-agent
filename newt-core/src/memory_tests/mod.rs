@@ -95,6 +95,9 @@ mod memory_index;
 #[path = "note_routing.rs"]
 mod note_routing;
 #[cfg(test)]
+#[path = "report_labels.rs"]
+mod report_labels;
+#[cfg(test)]
 #[path = "rolling_window.rs"]
 mod rolling_window;
 #[cfg(test)]

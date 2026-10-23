@@ -226,6 +226,48 @@ async fn a_component_write_after_the_config_broke_refuses_and_keeps_the_accepted
     drop(f.server);
 }
 
+/// #2993 review: `/settings system-prompt off readme` edits a component, not the
+/// preset, so a decorated `preset = "default"` keeps its comments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_component_edit_leaves_a_decorated_default_preset_alone() {
+    let f = fixture(
+        "[prompt]\n# which prompt\npreset = \"default\" # explicit on purpose\n",
+        None,
+    )
+    .await;
+    let mut cmd = command(&f);
+    cmd.args(["--plain"])
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn the real CLI");
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(b"/settings system-prompt off readme\n/quit\n")
+        .await
+        .unwrap();
+    drop(input);
+    let output = tokio::time::timeout(BUDGET, child.wait_with_output())
+        .await
+        .expect("the chat exits")
+        .expect("output");
+    let shown = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        shown.contains("system-prompt component readme: off"),
+        "{shown}"
+    );
+    let saved = std::fs::read_to_string(f.config_dir.join("config.toml")).unwrap();
+    assert!(
+        saved.contains("# which prompt")
+            && saved.contains("preset = \"default\" # explicit on purpose")
+            && saved.contains("off = [\"readme\"]"),
+        "the edit must keep the preset line and its comments:\n{saved}"
+    );
+    drop(f.server);
+}
+
 /// #2933 PR7: `soul.md` is retired. A file in the user config directory is not read,
 /// the session says so once (naming `[prompt] file`), and the prompt is the one built
 /// from components.

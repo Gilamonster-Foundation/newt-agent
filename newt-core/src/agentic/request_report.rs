@@ -126,7 +126,7 @@ impl RequestReport {
         notes: &[Annotation],
     ) -> Self {
         let card = Annotation {
-            label: "active-prompt card".into(),
+            label: "card".into(),
             source: "agentic::prompt_read::active_prompt_card".into(),
             text: String::new(),
         };
@@ -337,6 +337,20 @@ impl ReportSink {
         });
     }
 
+    /// Like [`annotate`](Self::annotate), but one label may carry several spans:
+    /// an earlier note is replaced only when BOTH its label and its source match.
+    /// For pieces that share a component id yet come from different sources (the two
+    /// API providers, #2933), so none of them is attributed away.
+    pub fn annotate_span(&self, label: &str, source: &str, text: &str) {
+        let mut s = self.s();
+        s.notes.retain(|n| n.label != label || n.source != source);
+        s.notes.push(Annotation {
+            label: label.into(),
+            source: source.into(),
+            text: text.into(),
+        });
+    }
+
     /// Drop the annotation labelled `label`, for a caller that reports the same
     /// text under finer labels (the soul's components, #2933).
     pub fn forget(&self, label: &str) {
@@ -459,7 +473,7 @@ mod tests {
             .map(|c| c.label.as_str())
             .collect();
         assert_eq!(labels, ["identity", SEPARATOR, "workspace", UNATTRIBUTED]);
-        assert_eq!(r.system[1].components[0].label, "active-prompt card");
+        assert_eq!(r.system[1].components[0].label, "card");
         let tool_sum: usize = r.tools.iter().map(|t| t.chars).sum();
         assert_eq!(r.tools_array_chars, tool_sum + r.tools.len() + 1);
         assert_eq!(r.tools[1].name, "bb");

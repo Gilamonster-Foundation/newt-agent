@@ -7579,7 +7579,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 for msg in &messages {
                     if let Some(content) = msg["content"].as_str() {
                         if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
-                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            sink.annotate("card", "agentic::prompt_read", content);
                             break;
                         }
                     }
@@ -10471,7 +10471,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 for msg in &messages {
                     if let Some(content) = msg["content"].as_str() {
                         if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
-                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            sink.annotate("card", "agentic::prompt_read", content);
                             break;
                         }
                     }
@@ -13016,7 +13016,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 for msg in &msgs_json {
                     if let Some(content) = msg["content"].as_str() {
                         if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
-                            sink.annotate("active-prompt card", "agentic::prompt_read", content);
+                            sink.annotate("card", "agentic::prompt_read", content);
                             break;
                         }
                     }

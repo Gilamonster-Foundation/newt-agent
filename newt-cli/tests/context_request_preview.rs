@@ -298,11 +298,7 @@ async fn preview_includes_the_active_prompt_card_and_is_labelled_partial() {
         "{}",
         s.transcript
     );
-    assert!(
-        s.transcript.contains("| active-prompt card |"),
-        "{}",
-        s.transcript
-    );
+    assert!(s.transcript.contains("| card |"), "{}", s.transcript);
     assert!(
         s.transcript.contains("(preview, partial)"),
         "{}",

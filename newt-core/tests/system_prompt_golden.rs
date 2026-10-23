@@ -220,7 +220,7 @@ fn every_byte_is_labelled() {
         // The caller's providers label the context blocks; stand in for them.
         let mut notes = built.notes.clone();
         notes.push(newt_core::agentic::request_report::Annotation {
-            label: "agents".into(),
+            label: "project-instructions".into(),
             source: "provider".into(),
             text: "## AGENTS.md\nUse four spaces.".into(),
         });
