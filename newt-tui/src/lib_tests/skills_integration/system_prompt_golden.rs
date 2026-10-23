@@ -172,3 +172,24 @@ fn the_request_report_names_components_by_id_with_nothing_unattributed() {
     assert!(!off.iter().any(|l| l == "three-cs"), "{off:?}");
     assert_eq!(gaps(&off), 1, "{off:?}");
 }
+
+/// #2990 review: a config that stops resolving mid-session keeps the settings the
+/// session last accepted. Falling back to defaults would widen the tool policy.
+#[serial_test::serial(real_fs)]
+#[test]
+fn a_config_that_stops_resolving_keeps_the_last_accepted_prompt_settings() {
+    let restricted: newt_core::Config = toml::from_str(
+        "[tool_exposure]\nallow_list = [\"read_file\"]\n[prompt]\ncomponents = { off = [\"three-cs\"] }\n",
+    )
+    .unwrap();
+    let (exposure, components) = accepted_prompt_config(Some(&restricted));
+    assert!(!exposure.operator_visible("write_file"));
+    assert!(!components.is_default());
+
+    let (kept_exposure, kept_components) = accepted_prompt_config(None);
+    assert!(
+        !kept_exposure.operator_visible("write_file"),
+        "the allow list must survive a failed re-resolve"
+    );
+    assert_eq!(kept_components, components);
+}

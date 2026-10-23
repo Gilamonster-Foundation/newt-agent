@@ -694,9 +694,12 @@ pub fn run_code(
     // (issue #527). Config is folded in here, where a session reads it; the
     // `color_supported_with` shim (used pre-config, e.g. the wizard) stays Auto.
     let mut migration_notices = crate::migration_notices::Pending::default();
+    // An invalid config refuses the session here, before any splash, wizard or
+    // inference: a default config would drop `[tool_exposure]` and the rest of what
+    // the operator restricted (#2933 review of #2990).
     let cfg_color = newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
-        .ok()
-        .and_then(|c| c.tui)
+        .map_err(|e| anyhow::anyhow!("config resolution failed: {e:#}; nothing was started"))?
+        .tui
         .map(|t| t.color)
         .unwrap_or_default();
     let color = color_enabled_for(
@@ -728,7 +731,7 @@ pub fn run_code(
         let unconfigured =
             newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
                 .map(|c| c.is_unconfigured())
-                .unwrap_or(true);
+                .map_err(|e| anyhow::anyhow!("config resolution failed: {e:#}"))?;
         let context = if unconfigured || setup.is_some() {
             "initial setup"
         } else {
@@ -5899,6 +5902,42 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
 /// notes, memory index, project map).  It follows the identity whatever the
 /// altitude, so coach altitude, which replaces the soul/identity with
 /// `COACH_SOUL`, never silently drops project-specific instructions (#2934).
+/// The prompt-shaping settings the session last resolved successfully.
+static ACCEPTED_PROMPT_CONFIG: std::sync::Mutex<
+    Option<(
+        newt_core::ExposureSettings,
+        newt_core::prompt_components::ComponentSet,
+    )>,
+> = std::sync::Mutex::new(None);
+
+/// `cfg`'s tool exposure and components, remembered as the last accepted pair;
+/// when `cfg` is absent (it no longer resolves) the remembered pair, and only
+/// then, with nothing remembered, the defaults of a session that never had any.
+fn accepted_prompt_config(
+    cfg: Option<&newt_core::Config>,
+) -> (
+    newt_core::ExposureSettings,
+    newt_core::prompt_components::ComponentSet,
+) {
+    let mut accepted = ACCEPTED_PROMPT_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = cfg {
+        if let Ok(components) = c.prompt_components() {
+            let pair = (
+                newt_core::ExposureSettings::from(c.tool_exposure()),
+                components,
+            );
+            *accepted = Some(pair.clone());
+            return pair;
+        }
+    }
+    tracing::error!(
+        "config no longer resolves — the system prompt keeps the last accepted settings"
+    );
+    accepted.clone().unwrap_or_default()
+}
+
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: &str,
@@ -5928,17 +5967,10 @@ fn build_system_prompt_with_persona(
     let cfg = crate::migration_notices::read(|report| newt_core::Config::resolve(report));
     // #2932: the identity names only the tools the operator lets the model
     // see — the same `[tool_exposure]` policy that selects the catalog, so the
-    // prompt cannot steer the model at a tool the wire never carries.
-    let exposure = cfg
-        .as_ref()
-        .ok()
-        .map(|c| newt_core::ExposureSettings::from(c.tool_exposure()))
-        .unwrap_or_default();
-    let components = cfg
-        .as_ref()
-        .ok()
-        .and_then(|c| c.prompt_components().ok())
-        .unwrap_or_default();
+    // prompt cannot steer the model at a tool the wire never carries. A config
+    // that no longer resolves keeps the policy the session last ACCEPTED; it
+    // never falls back to defaults, which would widen it.
+    let (exposure, components) = accepted_prompt_config(cfg.as_ref().ok());
     let identity = exposure.render_identity_with(identity, &components);
     // The doer soul is built from components; the report names each by id.
     let doer_soul = identity_source == newt_core::DEFAULT_SOUL;
