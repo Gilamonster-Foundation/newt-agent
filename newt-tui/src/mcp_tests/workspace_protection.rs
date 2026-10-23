@@ -35,6 +35,7 @@ async fn reconnect_preserves_the_sessions_operator_resource_protection() {
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
+        oauth_client_id: None,
     };
     let error = mcp
         .reconnect(&entry, &caveats, &[], &[], None)

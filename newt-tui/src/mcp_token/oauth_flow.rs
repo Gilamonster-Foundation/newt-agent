@@ -1521,13 +1521,14 @@ pub async fn run_oauth_flow(
     static_client_id: Option<&str>,
     policy: &OAuthHopPolicy,
 ) -> anyhow::Result<()> {
-    run_oauth_flow_cancellable(server_name, server_url, policy, None).await
+    run_oauth_flow_cancellable(server_name, server_url, static_client_id, policy, None).await
 }
 
 /// Interactive variant using the terminal owner's existing cancellation flag.
 pub(crate) async fn run_oauth_flow_cancellable(
     server_name: &str,
     server_url: &str,
+    static_client_id: Option<&str>,
     policy: &OAuthHopPolicy,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<()> {

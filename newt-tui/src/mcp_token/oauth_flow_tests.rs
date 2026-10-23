@@ -12,7 +12,7 @@ async fn management_cancelled_oauth_stops_before_configuration_or_network() {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::caveats::Scope::All, &[]);
     let error =
-        run_oauth_flow_cancellable("unregistered-test", "invalid-url", &policy, Some(cancel))
+        run_oauth_flow_cancellable("unregistered-test", "invalid-url", None, &policy, Some(cancel))
             .await
             .unwrap_err();
     assert_eq!(error.to_string(), "MCP login cancelled");
