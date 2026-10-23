@@ -22,6 +22,15 @@ fn golden_path(name: &str) -> std::path::PathBuf {
 
 /// One variant: the config the operator wrote, the soul, and the persona.
 fn assembled(config: &str, soul: &str, persona: Option<&Persona>) -> String {
+    assembled_reporting(config, soul, persona, None)
+}
+
+fn assembled_reporting(
+    config: &str,
+    soul: &str,
+    persona: Option<&Persona>,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
     let root = tempfile::TempDir::new().unwrap();
     let ws = root.path().join("ws");
     let config_dir = root.path().join("config");
@@ -47,7 +56,7 @@ fn assembled(config: &str, soul: &str, persona: Option<&Persona>) -> String {
         Some("## AGENTS.md\nUse four spaces."),
         persona,
         "plan.md",
-        None,
+        sink,
     )
     .replace(ws_str, "/ws")
 }
@@ -121,6 +130,47 @@ fn switching_a_component_off_drops_exactly_its_paragraph() {
     });
     let expected = format!("{}{}", base[..start].trim_end_matches('\n'), &base[end..]);
     assert_eq!(off, expected);
+}
+
+/// #2933 PR4: `/context request` names the soul by component id, and a component
+/// switched off is gone from the report as it is from the prompt.
+#[serial_test::serial(real_fs)]
+#[test]
+fn the_request_report_names_components_by_id_with_nothing_unattributed() {
+    let labels = |config: &str| {
+        let sink = newt_core::agentic::request_report::ReportSink::new();
+        // The soul and context providers label their own blocks in production,
+        // the soul as ONE block (which must not swallow its components).
+        sink.annotate("soul", "test", newt_core::DEFAULT_SOUL);
+        sink.annotate("agents", "test", "## AGENTS.md\nUse four spaces.");
+        let prompt = assembled_reporting(config, newt_core::DEFAULT_SOUL, None, Some(&sink));
+        sink.arm_capture_next();
+        let _ = sink.observe_request(&[&prompt], None);
+        let report = sink.last_report().expect("report captured");
+        report.system[0]
+            .components
+            .iter()
+            .map(|c| c.label.clone())
+            .collect::<Vec<_>>()
+    };
+    let all = labels("");
+    for id in [
+        "identity",
+        "tools",
+        "disposition",
+        "habit-one-change",
+        "three-cs",
+    ] {
+        assert!(all.iter().any(|l| l == id), "{id} missing from {all:?}");
+    }
+    assert!(!all.iter().any(|l| l == "soul"), "{all:?}");
+    // The one gap is the `Workspace:` header, which the memory provider labels in
+    // production (`registered_agents_provider_block_reaches_prompt`); no soul byte.
+    let gaps = |labels: &[String]| labels.iter().filter(|l| l.contains("unattributed")).count();
+    assert_eq!(gaps(&all), 1, "{all:?}");
+    let off = labels("[prompt]\ncomponents = { off = [\"three-cs\"] }\n");
+    assert!(!off.iter().any(|l| l == "three-cs"), "{off:?}");
+    assert_eq!(gaps(&off), 1, "{off:?}");
 }
 
 /// #2990 round 2: the prompt follows the session's last ACCEPTED config. Accept a

@@ -369,9 +369,14 @@ async fn provider_annotations_labeled_independently_doer_2937() {
         .map(|c| c.label.as_str())
         .collect();
 
+    // #2933: the doer soul is reported as its components, by id.
     assert!(
-        labels.contains(&"soul"),
-        "doer must have 'soul' label; got {labels:?}"
+        labels.contains(&"identity") && labels.contains(&"habit-one-change"),
+        "doer soul must be labelled by component id; got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"soul"),
+        "no whole-soul label; got {labels:?}"
     );
     assert!(
         labels.contains(&"agents"),

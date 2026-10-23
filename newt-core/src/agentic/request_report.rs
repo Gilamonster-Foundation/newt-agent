@@ -337,6 +337,12 @@ impl ReportSink {
         });
     }
 
+    /// Drop the annotation labelled `label`, for a caller that reports the same
+    /// text under finer labels (the soul's components, #2933).
+    pub fn forget(&self, label: &str) {
+        self.s().notes.retain(|n| n.label != label);
+    }
+
     /// Arm: print the report just before the next request is sent.
     pub fn arm_show_next(&self) {
         self.s().show_next = true;
@@ -464,6 +470,17 @@ mod tests {
 
     /// #2933: a bare `\n\n` between two labelled pieces is the join, named as
     /// such; only text nobody labelled is `(unattributed)`.
+    #[test]
+    fn forgetting_a_label_removes_only_that_note() {
+        let sink = ReportSink::new();
+        sink.annotate("a", "s", "one");
+        sink.annotate("b", "s", "two");
+        sink.forget("a");
+        sink.forget("missing");
+        let labels: Vec<String> = sink.snapshot_notes().into_iter().map(|n| n.label).collect();
+        assert_eq!(labels, ["b"]);
+    }
+
     #[test]
     fn a_bare_join_is_a_separator_and_stray_text_is_not() {
         let text = "one\n\ntwo\n\nstray\n\nthree";

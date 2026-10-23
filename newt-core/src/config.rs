@@ -2275,6 +2275,59 @@ impl Config {
         Ok(doc.to_string())
     }
 
+    /// Set `[prompt] components` (#2933) to the given deltas, dropping the key when
+    /// both are empty, preserving the rest of the document. PURE: the caller owns
+    /// the filesystem write.
+    pub fn with_prompt_components(text: &str, on: &[&str], off: &[&str]) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("prompt")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`prompt` is not a table".to_string()))?;
+        if on.is_empty() && off.is_empty() {
+            table.remove("components");
+        } else {
+            let list = |names: &[&str]| {
+                let mut array = toml_edit::Array::new();
+                for name in names {
+                    array.push(*name);
+                }
+                toml_edit::Value::Array(array)
+            };
+            let mut inline = toml_edit::InlineTable::new();
+            if !on.is_empty() {
+                inline.insert("on", list(on));
+            }
+            if !off.is_empty() {
+                inline.insert("off", list(off));
+            }
+            let mut item = toml_edit::value(inline);
+            // Keep the edited key and its value as the operator decorated them,
+            // changed or not: the key's own comment lives with the key, so replace
+            // the item in place instead of inserting a fresh key.
+            match table.get_mut("components") {
+                Some(existing) => {
+                    if let (Some(new), Some(old)) = (item.as_value_mut(), existing.as_value()) {
+                        *new.decor_mut() = old.decor().clone();
+                    }
+                    *existing = item;
+                }
+                None => {
+                    table.insert("components", item);
+                }
+            }
+        }
+        Ok(doc.to_string())
+    }
+
     /// Set `enabled` on the named `[[mcp_servers]]` entry, preserving comments
     /// and formatting (`/mcp enable|disable`, #1149). PURE (no I/O) like
     /// [`with_net_host`](Self::with_net_host); the caller does the read/write.

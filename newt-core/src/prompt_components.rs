@@ -264,27 +264,42 @@ pub const SOUL: &[Component] = &[
 /// The soul with the components `enabled` selects and the rules whose tools are all
 /// `visible`. Lines above the heading are joined by a space, rules by a blank line.
 pub fn render_soul(enabled: &dyn Fn(&Component) -> bool, visible: &dyn Fn(&str) -> bool) -> String {
-    let (mut lead, mut rules) = (Vec::new(), Vec::new());
+    let parts = soul_parts(enabled, visible);
+    let mut out = String::new();
+    for (n, (id, text)) in parts.iter().enumerate() {
+        if n > 0 {
+            out.push_str(if under_heading(id) { "\n\n" } else { " " });
+        }
+        out.push_str(text);
+    }
+    out
+}
+
+fn under_heading(id: &str) -> bool {
+    SOUL.iter().any(|c| c.id == id && c.under_heading)
+}
+
+/// The pieces [`render_soul`] joins, each with its component id, in order. The
+/// `## How to work` heading rides with the first rule, so every byte of the soul
+/// but the joins belongs to one component (the request report's attribution).
+pub fn soul_parts(
+    enabled: &dyn Fn(&Component) -> bool,
+    visible: &dyn Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
+    let mut parts: Vec<(&'static str, String)> = Vec::new();
+    let mut headed = false;
     for c in SOUL
         .iter()
         .filter(|c| enabled(c) && c.requires_tools.iter().all(|t| visible(t)))
     {
-        if c.under_heading {
-            rules.push(c.render(visible));
-        } else {
-            lead.push(c.render(visible));
+        let mut text = c.render(visible);
+        if c.under_heading && !headed {
+            headed = true;
+            text = format!("{HEADING}\n\n{text}");
         }
+        parts.push((c.id, text));
     }
-    let mut out = lead.join(" ");
-    if !rules.is_empty() {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(HEADING);
-        out.push_str("\n\n");
-        out.push_str(&rules.join("\n\n"));
-    }
-    out
+    parts
 }
 
 /// The default preset: every component whose `default_on` is set.
@@ -380,6 +395,84 @@ impl ComponentSet {
     }
 }
 
+/// One line of the component listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub id: &'static str,
+    pub on: bool,
+    /// Characters it adds to the prompt when on (0 when its tools are hidden).
+    pub chars: usize,
+    pub description: &'static str,
+    /// The first required tool that is hidden, which keeps the rule out.
+    pub needs: Option<&'static str>,
+}
+
+/// The listing `/settings system-prompt components` shows.
+#[must_use]
+pub fn rows(set: &ComponentSet, visible: &dyn Fn(&str) -> bool) -> Vec<Row> {
+    SOUL.iter()
+        .map(|c| {
+            let needs = c.requires_tools.iter().copied().find(|t| !visible(t));
+            let chars = if needs.is_some() {
+                0
+            } else {
+                match c.body {
+                    Body::Text(t) => t.chars().count(),
+                    Body::Tools => c.render(visible).chars().count(),
+                }
+            };
+            Row {
+                id: c.id,
+                on: set.is_on(c),
+                chars,
+                description: c.description,
+                needs,
+            }
+        })
+        .collect()
+}
+
+impl ComponentSet {
+    /// The set with `id` switched on or off. Refuses an unknown id, naming the valid ones.
+    pub fn with(&self, id: &str, on: bool) -> Result<Self, String> {
+        let known = SOUL
+            .iter()
+            .find(|c| c.id == id)
+            .ok_or_else(|| format!("unknown component `{id}`; components: {}", ids().join(", ")))?;
+        let mut next = self.clone();
+        if on {
+            next.off.remove(known.id);
+        } else {
+            next.off.insert(known.id);
+        }
+        Ok(next)
+    }
+
+    /// `(on, off)` relative to the `default` preset: what `[prompt] components` stores.
+    #[must_use]
+    pub fn deltas(&self) -> (Vec<&'static str>, Vec<&'static str>) {
+        let base = Self::default();
+        let pick = |want_on: bool| {
+            SOUL.iter()
+                .filter(|c| self.is_on(c) == want_on && base.is_on(c) != want_on)
+                .map(|c| c.id)
+                .collect()
+        };
+        (pick(true), pick(false))
+    }
+
+    /// `default` or `custom (N off)`, for the status line and footer.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let (on, off) = self.deltas();
+        if on.is_empty() && off.is_empty() {
+            "default".to_string()
+        } else {
+            format!("default, {} off", self.off.len())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +535,46 @@ mod tests {
 
     fn strings(ids: &[&str]) -> Vec<String> {
         ids.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn parts_join_to_the_soul_and_carry_the_heading_with_the_first_rule() {
+        let parts = soul_parts(&|c| c.default_on, &all);
+        assert_eq!(parts.len(), 13);
+        assert_eq!(parts[0].0, "identity");
+        assert!(parts[3].1.starts_with("## How to work\n\n**One change"));
+        assert_eq!(render_soul(&|c| c.default_on, &all), crate::DEFAULT_SOUL);
+    }
+
+    #[test]
+    fn rows_report_size_state_and_the_missing_tool() {
+        let set = ComponentSet::default().with("three-cs", false).unwrap();
+        let rows = rows(&set, &|t| t != "render_report");
+        let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap().clone();
+        assert!(!row("three-cs").on && row("three-cs").chars > 400);
+        assert_eq!(row("habit-present-findings").needs, Some("render_report"));
+        assert_eq!(row("habit-present-findings").chars, 0);
+        assert_eq!(row("identity").needs, None);
+    }
+
+    #[test]
+    fn deltas_and_summary_round_trip_through_resolve() {
+        let set = ComponentSet::default()
+            .with("three-cs", false)
+            .unwrap()
+            .with("commit-attribution", false)
+            .unwrap();
+        assert_eq!(set.summary(), "default, 2 off");
+        assert_eq!(ComponentSet::default().summary(), "default");
+        let (on, off) = set.deltas();
+        let again = ComponentSet::resolve(
+            None,
+            &on.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            &off.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(again, set);
+        assert!(set.with("nope", true).unwrap_err().contains("three-cs"));
     }
 
     #[test]

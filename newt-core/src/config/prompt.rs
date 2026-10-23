@@ -159,6 +159,49 @@ mod tests {
     }
 
     #[test]
+    fn with_prompt_components_keeps_the_rest_and_drops_the_key_when_empty() {
+        let text = "# mine\n[prompt]\nfile = \"/p.md\" # keep\n";
+        let out = Config::with_prompt_components(text, &[], &["three-cs"]).unwrap();
+        assert!(
+            out.contains("# mine") && out.contains("file = \"/p.md\" # keep"),
+            "{out}"
+        );
+        assert!(cfg(&out).prompt_components().unwrap().summary() == "default, 1 off");
+        let back = Config::with_prompt_components(&out, &[], &[]).unwrap();
+        assert!(
+            !back.contains("components") && back.contains("# keep"),
+            "{back}"
+        );
+        let fresh = Config::with_prompt_components("", &[], &["three-cs"]).unwrap();
+        assert!(cfg(&fresh).prompt_components().unwrap().summary() == "default, 1 off");
+    }
+
+    /// #2991 review: comments on the EDITED key survive, for a changed value and a
+    /// same-value write alike.
+    #[test]
+    fn with_prompt_components_keeps_the_edited_keys_comments() {
+        let text = "[prompt]\n# key comment\ncomponents = { off = [\"three-cs\"] } # keep trailing rationale\n";
+        let same = Config::with_prompt_components(text, &[], &["three-cs"]).unwrap();
+        assert!(
+            same.contains("# key comment") && same.contains("# keep trailing rationale"),
+            "{same}"
+        );
+        let changed =
+            Config::with_prompt_components(text, &[], &["three-cs", "commit-attribution"]).unwrap();
+        assert!(
+            changed.contains("# key comment")
+                && changed.contains("# keep trailing rationale")
+                && changed.contains("commit-attribution"),
+            "{changed}"
+        );
+        assert!(cfg(&changed)
+            .prompt_components()
+            .unwrap()
+            .summary()
+            .contains("2 off"));
+    }
+
+    #[test]
     fn the_session_twin_beats_the_config_file() {
         let c = cfg("[prompt]\nfile = \"/etc/p.md\"\n");
         assert_eq!(c.system_prompt_file_with(None), Some("/etc/p.md".into()));
