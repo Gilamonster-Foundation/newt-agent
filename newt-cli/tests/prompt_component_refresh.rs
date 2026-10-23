@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+#[cfg(feature = "rich-tui")]
 use tests_pty::Pty;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -28,6 +29,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const BUDGET: Duration = Duration::from_secs(60);
 const MODEL: &str = "refresh-fixture";
+#[cfg(feature = "rich-tui")]
 const READY: &str = "REFRESH_READY> ";
 /// A project layer whose `[prompt]` section does not resolve.
 const BROKEN_PROJECT: &str = "[prompt]\npreset = \"pi\"\n";
@@ -224,6 +226,7 @@ async fn a_component_write_after_the_config_broke_refuses_and_keeps_the_accepted
     drop(f.server);
 }
 
+#[cfg(feature = "rich-tui")]
 fn say(pty: &Pty, line: &str, expect: &str) {
     pty.type_in(&format!("{line}\r"));
     assert!(
@@ -238,6 +241,7 @@ fn say(pty: &Pty, line: &str, expect: &str) {
     );
 }
 
+#[cfg(feature = "rich-tui")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(prompt_component_refresh_pty)]
 async fn the_components_panel_keeps_the_accepted_config_when_it_breaks_mid_panel() {
