@@ -54,6 +54,7 @@ NEXTEST_CI_ONLY = [
     "newt-agent::headless_prompt_override",
     "newt-agent::context_request_preview",
     "newt-agent::prompt_config_refusal",
+    "newt-agent::prompt_component_refresh",
     "newt-eval::mock_e2e",
 ]
 # Same tier, but these two live as individual tests inside newt-tui's lib

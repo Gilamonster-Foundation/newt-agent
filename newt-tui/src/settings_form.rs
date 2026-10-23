@@ -2306,6 +2306,31 @@ mod tests {
             .contains("components: default"));
     }
 
+    /// #2991 review: a config that does not resolve is an error, not a default set.
+    /// No component write confirms against it, no listing is invented from it, and
+    /// nothing is written.
+    #[test]
+    fn a_config_that_does_not_resolve_confirms_nothing_and_writes_nothing() {
+        let _guard = settings_guard();
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        config_fs::write(&path, "[prompt]\npreset = \"pi\"\n").unwrap();
+        let broken = config_fs::read(&path);
+        let sp = |v: &str| apply(Field::SystemPrompt, v);
+        for command in [
+            "preset default",
+            "off three-cs",
+            "on three-cs",
+            "components",
+        ] {
+            let err = sp(command).unwrap_err();
+            assert!(err.contains("config does not resolve"), "{command}: {err}");
+            assert_eq!(config_fs::read(&path), broken, "{command} wrote");
+        }
+        let status = crate::prompt_components_form::status();
+        assert!(status.starts_with("components: unknown"), "{status}");
+        assert!(crate::prompt_components_form::current().is_err());
+    }
+
     /// #2981 review: unticking the last checkbox is "no tools", not "all".
     /// The panel's token must survive the Text release rule and persist as
     /// an explicit empty list; `all` stays the only way to clear it.
