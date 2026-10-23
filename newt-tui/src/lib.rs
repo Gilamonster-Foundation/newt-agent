@@ -6216,26 +6216,38 @@ pub(crate) fn project_instructions_provider(cfg: &newt_core::Config) -> newt_cor
     newt_core::AgentsProvider::new(enabled, path)
 }
 
+/// The route a headless run talks to: what the TUI's startup budget is derived from.
+pub struct HeadlessRoute<'a> {
+    pub kind: newt_core::BackendKind,
+    pub backend_name: &'a str,
+    pub serving: Option<newt_core::Serving>,
+    pub model: &'a str,
+    /// `--context-window`: the served window, when given.
+    pub served_window: Option<u32>,
+}
+
 /// The system prompt `newt headless` sends: the TUI's assembled prompt for the same
 /// config, from the same providers (project instructions, notes, the active profile's
 /// API surface, the memory index). Headless has no persona. `cfg`'s `[prompt]` is
 /// whatever the caller resolved, so a `--prompt-preset` is a `cfg` the caller already
-/// changed. `knowledge_base` is whether the active profile enables it; `window` is the
-/// context window in tokens (the API surface scales with it), as the TUI discovers it.
+/// changed. `knowledge_base` is whether the active profile enables it; `route`
+/// the route's context window (the API surface scales with it) is resolved by the TUI's own function.
 pub async fn headless_system_prompt(
     workspace: &str,
     cfg: &newt_core::Config,
     knowledge_base: bool,
-    window: Option<u32>,
+    route: &HeadlessRoute<'_>,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     let mut memory = newt_core::MemoryManager::new();
-    let budget = cfg
-        .memory
-        .as_ref()
-        .and_then(|m| m.context_tokens)
-        .or(window)
-        .unwrap_or(newt_core::DEFAULT_CONTEXT_TOKENS);
+    let budget = chat::headless_memory_budget(
+        cfg,
+        route.kind,
+        route.backend_name,
+        route.serving,
+        route.model,
+        route.served_window,
+    );
     chat::add_prompt_providers(&mut memory, cfg, workspace, knowledge_base, budget);
     let session = newt_core::lifecycle::new_session_id().to_string();
     memory

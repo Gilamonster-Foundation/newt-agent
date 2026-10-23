@@ -1569,6 +1569,57 @@ pub(crate) trait InputSurface {
     }
 }
 
+/// The context budget in tokens a session sizes its memory providers from (`[memory]
+/// context_tokens`, else the selected model's declared window, else the capability
+/// cache). The TUI at startup and `newt headless` both read it here (#2933), so the
+/// prompt providers see the same window in both.
+pub(crate) fn startup_memory_budget(
+    cfg: &newt_core::Config,
+    kind: newt_core::BackendKind,
+    model: &str,
+    served: Option<u32>,
+    entry: &probe::CapabilityEntry,
+    community: &newt_core::tuning::CommunityTunings,
+) -> u32 {
+    // The turn loop's own derivation (#2567), so the startup budget and the first turn
+    // cannot disagree about the window.
+    let declared_window = crate::context_window::resolve(crate::context_window::facts_for(
+        cfg, kind, model, served, entry, community, None, None,
+    ))
+    .full_window;
+    probe::resolve_memory_budget(
+        cfg.memory.as_ref().and_then(|m| m.context_tokens),
+        declared_window,
+        Some(entry),
+    )
+}
+
+/// The budget `newt headless` sizes the shared prompt providers with: the same
+/// derivation, over the cached capability evidence for the route, with the served
+/// window from `--context-window`.
+pub(crate) fn headless_memory_budget(
+    cfg: &newt_core::Config,
+    kind: newt_core::BackendKind,
+    backend_name: &str,
+    serving: Option<newt_core::Serving>,
+    model: &str,
+    served: Option<u32>,
+) -> u32 {
+    let cache = probe::load_cache();
+    let entry = cache
+        .get(&session_cap_id(serving, backend_name, model))
+        .cloned()
+        .unwrap_or_default();
+    startup_memory_budget(
+        cfg,
+        kind,
+        model,
+        served,
+        &entry,
+        &newt_core::tuning::load_community_tunings(),
+    )
+}
+
 /// The memory providers whose blocks land in the frozen system prompt: project
 /// instructions, the profile's API surface and project map, notes, and the memory
 /// index. The TUI registers them at startup and `newt headless` through
@@ -2673,27 +2724,18 @@ fn session_body(
                 inf_kind,
                 inf_key.as_deref(),
             );
-        // The turn loop's own derivation (#2567), so the startup budget and
-        // the first turn cannot disagree about the window.
-        let declared_window = crate::context_window::resolve(crate::context_window::facts_for(
+        let budget = startup_memory_budget(
             &cfg,
             inf_kind,
             &inf_model,
             inf_context_window,
             entry,
             &community_tunings,
-            None,
-            None,
-        ))
-        .full_window;
+        );
         if updated {
             probe::save_cache(&cap_cache);
         }
-        probe::resolve_memory_budget(
-            mem_cfg.context_tokens,
-            declared_window,
-            cap_cache.get(&cap_id),
-        )
+        budget
     };
     let mut smart_sessions = smart_sessions::Sessions::new(smart_startup_caveats);
     let mut memory = {

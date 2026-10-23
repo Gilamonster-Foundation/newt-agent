@@ -124,6 +124,7 @@ struct Parity {
     workspace: std::path::PathBuf,
     server: MockServer,
     seen: Arc<Mutex<Vec<serde_json::Value>>>,
+    env: Vec<(&'static str, &'static str)>,
 }
 
 async fn parity(config_tail: &str) -> Parity {
@@ -161,6 +162,7 @@ async fn parity(config_tail: &str) -> Parity {
         workspace,
         server,
         seen,
+        env: Vec::new(),
     }
 }
 
@@ -196,6 +198,7 @@ impl Parity {
             .env("NEWT_NO_COCKPIT", "1")
             .env("NEWT_NUDGE", "off")
             .env("NEWT_NO_AGENTS_FILE", "1")
+            .envs(self.env.iter().copied())
             .kill_on_drop(true);
         cmd
     }
@@ -424,4 +427,35 @@ async fn a_retired_soul_is_reported_once_per_headless_run() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(stderr.matches("ignoring").count(), 1, "{stderr}");
     assert!(!p.first_system().contains("Django"));
+}
+
+/// #2933 round 2: the API-surface provider is sized from the selected model's configured
+/// window in BOTH, so a big `[[model_tuning]] context_window` lists the same symbols in
+/// the TUI and headless (it used to truncate in headless only).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_sizes_the_api_surface_from_the_models_window_like_the_tui() {
+    let mut p = parity(
+        "[profiles.kb]\ntechniques = [\"knowledge_base\"]\n\n[[model_tuning]]\nmodel = \"fixture\"\ncontext_window = 100000\n",
+    )
+    .await;
+    p.env.push(("NEWT_PROFILE", "kb"));
+    for i in 0..180 {
+        std::fs::write(
+            p.workspace.join(format!("module_{i:03}.rs")),
+            format!("pub fn function_number_{i:03}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let tui = p.tui().await;
+    let headless = p.headless(&[]).await;
+    let (tui_symbols, headless_symbols) = (
+        tui.matches("function_number_").count(),
+        headless.matches("function_number_").count(),
+    );
+    assert!(
+        tui_symbols > 100,
+        "the surface reached the TUI prompt: {tui_symbols}"
+    );
+    assert_eq!(headless_symbols, tui_symbols, "same symbols listed");
+    assert!(tui.contains(assembled(&headless)), "same assembled prompt");
 }
