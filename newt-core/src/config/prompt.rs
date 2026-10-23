@@ -194,6 +194,31 @@ mod tests {
         assert!(cfg(&fresh).prompt_components().unwrap().summary() == "default, 1 off");
     }
 
+    /// #2991 review: comments on the EDITED key survive, for a changed value and a
+    /// same-value write alike.
+    #[test]
+    fn with_prompt_components_keeps_the_edited_keys_comments() {
+        let text = "[prompt]\n# key comment\ncomponents = { off = [\"three-cs\"] } # keep trailing rationale\n";
+        let same = Config::with_prompt_components(text, &[], &["three-cs"]).unwrap();
+        assert!(
+            same.contains("# key comment") && same.contains("# keep trailing rationale"),
+            "{same}"
+        );
+        let changed =
+            Config::with_prompt_components(text, &[], &["three-cs", "commit-attribution"]).unwrap();
+        assert!(
+            changed.contains("# key comment")
+                && changed.contains("# keep trailing rationale")
+                && changed.contains("commit-attribution"),
+            "{changed}"
+        );
+        assert!(cfg(&changed)
+            .prompt_components()
+            .unwrap()
+            .summary()
+            .contains("2 off"));
+    }
+
     #[test]
     fn the_session_twin_beats_the_config_file() {
         let c = cfg("[prompt]\nfile = \"/etc/p.md\"\n");

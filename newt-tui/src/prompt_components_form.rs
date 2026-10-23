@@ -35,29 +35,41 @@ pub(crate) fn parse(value: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// The components in force, as the next prompt will see them.
+/// The components in force, as the next prompt will see them. A config that does
+/// not resolve is an ERROR, never a default: a fabricated default set would satisfy
+/// a write's confirmation and put a false value in the receipt.
 #[cfg(not(test))]
-pub(crate) fn current() -> ComponentSet {
+pub(crate) fn current() -> Result<ComponentSet, String> {
     crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
-        .ok()
-        .and_then(|c| c.prompt_components().ok())
-        .unwrap_or_default()
+        .map_err(|e| format!("config does not resolve: {e:#}"))
+        .and_then(|c| {
+            c.prompt_components()
+                .map_err(|e| format!("config does not resolve: {e}"))
+        })
 }
 
-/// The unit tier reads the mocked user file, like the other persisted settings.
+/// The unit tier reads the mocked user file, like the other persisted settings, and
+/// judges it with the same checks the resolver applies (`Config::prompt_components`
+/// over a parsed `Config`); a file that does not parse is an error, as in production.
 #[cfg(test)]
-pub(crate) fn current() -> ComponentSet {
+pub(crate) fn current() -> Result<ComponentSet, String> {
     let path = newt_core::Config::user_config_path().unwrap_or_default();
     let text = crate::settings_form::config_fs::read(&path);
     toml::from_str::<newt_core::Config>(&text)
-        .ok()
-        .and_then(|c| c.prompt_components().ok())
-        .unwrap_or_default()
+        .map_err(|e| format!("config does not resolve: {e}"))
+        .and_then(|c| {
+            c.prompt_components()
+                .map_err(|e| format!("config does not resolve: {e}"))
+        })
 }
 
-/// `default` or `default, N off`.
+/// `components: default, N off`, or `components: unknown (...)` while the config does
+/// not resolve.
 pub(crate) fn status() -> String {
-    format!("components: {}", current().summary())
+    match current() {
+        Ok(set) => format!("components: {}", set.summary()),
+        Err(e) => format!("components: unknown ({e})"),
+    }
 }
 
 pub(crate) fn visible(tool: &str) -> bool {
@@ -66,8 +78,8 @@ pub(crate) fn visible(tool: &str) -> bool {
 }
 
 /// The listing: id, state, size, what it says, and what keeps it out.
-pub(crate) fn listing() -> String {
-    let set = current();
+pub(crate) fn listing() -> Result<String, String> {
+    let set = current()?;
     let mut out = format!(
         "system prompt components ({}); {PRESENTATION_ONLY}\n",
         set.summary()
@@ -99,7 +111,7 @@ pub(crate) fn listing() -> String {
         &rows,
     ));
     out.push_str("\n/settings system-prompt on|off <id> · preset default");
-    out
+    Ok(out)
 }
 
 /// Persist `set` and confirm it is the set in force (a project or pinned layer
@@ -109,7 +121,8 @@ fn persist(set: &ComponentSet) -> Result<(), String> {
     crate::settings_form::persist_config(|text| {
         newt_core::Config::with_prompt_components(text, &on, &off)
     })?;
-    if current() == *set {
+    // A config that does not resolve cannot confirm anything.
+    if current()? == *set {
         Ok(())
     } else {
         Err(
@@ -123,9 +136,11 @@ fn persist(set: &ComponentSet) -> Result<(), String> {
 /// Run one component command; the reply is what the operator reads.
 pub(crate) fn apply(word: &str, arg: &str) -> Result<String, String> {
     match word {
-        "components" => Ok(listing()),
+        "components" => listing(),
         "preset" => match arg {
             "default" => {
+                // Refuse before writing when the config does not resolve.
+                current()?;
                 persist(&ComponentSet::default())?;
                 Ok("system-prompt preset: default (every component on)".to_string())
             }
@@ -141,7 +156,7 @@ pub(crate) fn apply(word: &str, arg: &str) -> Result<String, String> {
                 ));
             }
             let on = word == "on";
-            let next = current().with(arg, on)?;
+            let next = current()?.with(arg, on)?;
             // `card` off needs its tools hidden; refuse before writing anything.
             next.check_card(&visible)?;
             persist(&next)?;

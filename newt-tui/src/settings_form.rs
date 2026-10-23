@@ -1147,6 +1147,7 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
             // `card` is off only while prompt_read / artifact_read are hidden: a list
             // that shows them again would leave the model a card it was never sent.
             crate::prompt_components_form::current()
+                .map_err(|e| format!("tools: nothing changed; {e}"))?
                 .check_card(&|tool| list.as_ref().is_none_or(|l| l.iter().any(|n| n == tool)))
                 .map_err(|_| {
                     "tools: the system prompt component `card` is off, which needs prompt_read \
@@ -2367,6 +2368,31 @@ mod tests {
         let listing = sp("components").unwrap();
         assert!(listing.contains("the fence still holds"), "{listing}");
         assert!(listing.contains("per turn"), "{listing}");
+    }
+
+    /// #2991 review: a config that does not resolve is an error, not a default set.
+    /// No component write confirms against it, no listing is invented from it, and
+    /// nothing is written.
+    #[test]
+    fn a_config_that_does_not_resolve_confirms_nothing_and_writes_nothing() {
+        let _guard = settings_guard();
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        config_fs::write(&path, "[prompt]\npreset = \"pi\"\n").unwrap();
+        let broken = config_fs::read(&path);
+        let sp = |v: &str| apply(Field::SystemPrompt, v);
+        for command in [
+            "preset default",
+            "off three-cs",
+            "on three-cs",
+            "components",
+        ] {
+            let err = sp(command).unwrap_err();
+            assert!(err.contains("config does not resolve"), "{command}: {err}");
+            assert_eq!(config_fs::read(&path), broken, "{command} wrote");
+        }
+        let status = crate::prompt_components_form::status();
+        assert!(status.starts_with("components: unknown"), "{status}");
+        assert!(crate::prompt_components_form::current().is_err());
     }
 
     /// #2981 review: unticking the last checkbox is "no tools", not "all".

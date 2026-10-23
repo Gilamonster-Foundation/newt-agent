@@ -2309,7 +2309,21 @@ impl Config {
             if !off.is_empty() {
                 inline.insert("off", list(off));
             }
-            table.insert("components", toml_edit::value(inline));
+            let mut item = toml_edit::value(inline);
+            // Keep the edited key and its value as the operator decorated them,
+            // changed or not: the key's own comment lives with the key, so replace
+            // the item in place instead of inserting a fresh key.
+            match table.get_mut("components") {
+                Some(existing) => {
+                    if let (Some(new), Some(old)) = (item.as_value_mut(), existing.as_value()) {
+                        *new.decor_mut() = old.decor().clone();
+                    }
+                    *existing = item;
+                }
+                None => {
+                    table.insert("components", item);
+                }
+            }
         }
         Ok(doc.to_string())
     }

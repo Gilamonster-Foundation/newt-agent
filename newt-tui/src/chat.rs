@@ -7144,8 +7144,20 @@ fn session_body(
                     {
                         let window = surface
                             .open_panel(PanelMode::Inline(crate::components_panel::height()));
+                        // A config that does not resolve has no components to show.
+                        let set = match crate::prompt_components_form::current() {
+                            Ok(set) => set,
+                            Err(e) => {
+                                print_newt(
+                                    &format!("components panel unavailable: {e}"),
+                                    color,
+                                    verbose,
+                                );
+                                continue;
+                            }
+                        };
                         let mut panel = crate::components_panel::ComponentsPanel::new(
-                            &crate::prompt_components_form::current(),
+                            &set,
                             &crate::prompt_components_form::visible,
                         );
                         match crate::components_panel::run(&mut panel, window) {
@@ -7160,7 +7172,9 @@ fn session_body(
                                         Ok(line) | Err(line) => print_newt(&line, color, verbose),
                                     }
                                 }
-                                cfg = crate::resolve_runtime_or_default();
+                                // The accepted-config path the Tools panel takes, also after
+                                // rejected writes: never defaults.
+                                reresolve(&mut cfg, color, verbose);
                                 refresh_prompt_override!();
                             }
                             Ok(None) => print_newt("components: cancelled", color, verbose),

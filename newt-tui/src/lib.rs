@@ -1159,6 +1159,7 @@ fn filesystem_authority_note() -> &'static str {
 /// prompt itself is frozen at conversation start). Without it the model has no
 /// way to know its identity and confabulates one (e.g. inventing a name for
 /// commit attribution). Kept short — it rides in every request.
+#[cfg(test)]
 fn runtime_context_block(
     model: &str,
     endpoint: &str,
@@ -1192,6 +1193,7 @@ impl RuntimeContextParts {
     }
 
     /// The pieces whose components are on, concatenated.
+    #[cfg(test)]
     pub(crate) fn render(&self, set: &newt_core::prompt_components::ComponentSet) -> String {
         self.pieces()
             .into_iter()
