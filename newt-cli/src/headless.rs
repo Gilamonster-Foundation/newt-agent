@@ -481,6 +481,8 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         .context("backend has no model (set model = in the [[backends]] entry)")?
         .to_string();
     let kind = backend.kind.unwrap_or(BackendKind::Openai);
+    let backend_name = backend.name.clone();
+    let backend_serving = backend.serving;
     let api_key = backend.resolve_api_key();
     let api = backend.api.unwrap_or_default();
     // The SAME capability sidecar + typed principal decision the TUI uses —
@@ -763,7 +765,13 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
                 &workspace,
                 &prompt_cfg,
                 knowledge_base,
-                args.context_window,
+                &newt_tui::HeadlessRoute {
+                    kind,
+                    backend_name: &backend_name,
+                    serving: backend_serving,
+                    model: &model,
+                    served_window: args.context_window,
+                },
                 dc.report_sink.as_deref(),
             )
             .await,
