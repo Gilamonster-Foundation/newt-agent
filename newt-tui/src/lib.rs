@@ -6240,16 +6240,26 @@ pub(crate) fn project_instructions_provider(cfg: &newt_core::Config) -> newt_cor
 }
 
 /// The system prompt `newt headless` sends: the TUI's assembled prompt for the same
-/// config, from the project instructions alone (headless has no persona, notes or
-/// profile providers). `cfg`'s `[prompt]` is whatever the caller resolved, so a
-/// `--prompt-preset` is a `cfg` the caller already changed.
+/// config, from the same providers (project instructions, notes, the active profile's
+/// API surface, the memory index). Headless has no persona. `cfg`'s `[prompt]` is
+/// whatever the caller resolved, so a `--prompt-preset` is a `cfg` the caller already
+/// changed. `knowledge_base` is whether the active profile enables it; `window` is the
+/// context window in tokens (the API surface scales with it), as the TUI discovers it.
 pub async fn headless_system_prompt(
     workspace: &str,
     cfg: &newt_core::Config,
+    knowledge_base: bool,
+    window: Option<u32>,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     let mut memory = newt_core::MemoryManager::new();
-    memory.add_provider(project_instructions_provider(cfg));
+    let budget = cfg
+        .memory
+        .as_ref()
+        .and_then(|m| m.context_tokens)
+        .or(window)
+        .unwrap_or(newt_core::DEFAULT_CONTEXT_TOKENS);
+    chat::add_prompt_providers(&mut memory, cfg, workspace, knowledge_base, budget);
     let session = newt_core::lifecycle::new_session_id().to_string();
     memory
         .initialize_all(&newt_core::SessionContext {
