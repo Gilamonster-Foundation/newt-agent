@@ -214,10 +214,7 @@ mod tests {
         let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
         let (_dir, path) = fixture();
         let listing = apply("list", "").unwrap();
-        assert!(
-            listing.contains("alpha") && listing.contains("2 of 2 on"),
-            "{listing}"
-        );
+        assert!(row(&listing).contains("| on "), "{listing}");
 
         let said = apply_and_record(Field::Skills, "off alpha", "/settings skills").unwrap();
         assert!(
