@@ -319,8 +319,10 @@ async fn preset_pi_sends_the_minimal_system_prompt_and_keeps_the_fence() {
             pi.system
         );
     }
+    // Beyond the registry's pieces: the cwd sentence, the working-memory hint and the
+    // driver's observed-facts text (not yet components).
     assert!(
-        pi.system.len() < 2_000,
+        pi.system.len() < 3_000,
         "{} chars:\n{}",
         pi.system.len(),
         pi.system
