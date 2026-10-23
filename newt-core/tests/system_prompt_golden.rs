@@ -2,10 +2,7 @@
 //! captured from the builder it was extracted from. Mocked: pure inputs only.
 //! `NEWT_GOLDEN_UPDATE=1` rewrites them, for a deliberate change only.
 
-use newt_core::{
-    assemble_system_prompt, ExposureSettings, PersonaPart, PromptParts, ReadmePart, COACH_SOUL,
-    DEFAULT_SOUL,
-};
+use newt_core::{assemble_system_prompt, ExposureSettings, PersonaPart, PromptParts, ReadmePart};
 
 const SKILLS: &str = "Available skills (call `use_skill` to load one):\n  fixture-skill: A fixture skill\nTo install a new skill from a local path, run via run_command: `newt skills install <path>` (add `--link` to symlink instead of copy).\n";
 
@@ -24,32 +21,17 @@ fn check(name: &str, actual: &str) {
     assert_eq!(expected, actual, "system prompt golden `{name}` drifted");
 }
 
+#[derive(Default)]
 struct Variant {
     exposure: ExposureSettings,
-    soul: &'static str,
     coach: bool,
     persona: Option<PersonaPart<'static>>,
     narration: Option<&'static str>,
     components: newt_core::prompt_components::ComponentSet,
 }
 
-impl Default for Variant {
-    fn default() -> Self {
-        Self {
-            exposure: ExposureSettings::default(),
-            soul: DEFAULT_SOUL,
-            coach: false,
-            persona: None,
-            narration: None,
-            components: newt_core::prompt_components::ComponentSet::default(),
-        }
-    }
-}
-
 fn assembled(v: &Variant) -> String {
-    let identity = v
-        .exposure
-        .render_identity_with(if v.coach { COACH_SOUL } else { v.soul }, &v.components);
+    let identity = v.exposure.render_soul(&v.components, v.coach);
     let files = ["Cargo.toml", ".git", "src", "README.md"].map(String::from);
     assemble_system_prompt(&PromptParts {
         components: &v.components,
@@ -163,15 +145,6 @@ fn pi() {
     check("pi", &assembled(&v));
 }
 
-#[test]
-fn custom_soul() {
-    let v = Variant {
-        soul: "You are a Django expert.",
-        ..Variant::default()
-    };
-    check("custom_soul", &assembled(&v));
-}
-
 /// Behaviour the goldens do not show: the listing is capped and sorted, the
 /// README is cut with a marker, and an unreadable directory adds no section.
 #[test]
@@ -225,9 +198,7 @@ fn every_byte_is_labelled() {
             ..Variant::default()
         },
     ] {
-        let identity = v
-            .exposure
-            .render_identity(if v.coach { COACH_SOUL } else { v.soul });
+        let identity = v.exposure.render_soul(&v.components, v.coach);
         let files = ["a".to_string()];
         let built = assemble_system_prompt(&PromptParts {
             components: &newt_core::prompt_components::ComponentSet::default(),

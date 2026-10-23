@@ -29,7 +29,7 @@ pub const SYSTEM_PROMPT_FILE_ENV: &str = "NEWT_SYSTEM_PROMPT_FILE";
 ///
 /// They are deltas on the preset, so a component added later is never silently
 /// off. Dropping one changes what the model is told, never what it may do. They
-/// shape the default soul only: a custom `soul.md` or the coach soul replaces it.
+/// shape the soul (doer or coach, chosen by the persona's altitude).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptConfig {

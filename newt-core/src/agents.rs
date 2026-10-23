@@ -1,7 +1,7 @@
 //! Project-instruction provider — loads `AGENTS.md` / `CLAUDE.md` from the
 //! workspace and injects them as a frozen system-prompt block.
 //!
-//! Modelled on [`crate::memory::SoulProvider`] (the soul provider), this is a
+//! Modelled on [`crate::memory::NoteStore`], this is a
 //! [`MemoryProvider`] that contributes only a `system_prompt_block()` — it
 //! manages no conversation history.
 //!

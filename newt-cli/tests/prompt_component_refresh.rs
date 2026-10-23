@@ -226,6 +226,46 @@ async fn a_component_write_after_the_config_broke_refuses_and_keeps_the_accepted
     drop(f.server);
 }
 
+/// #2933 PR7: `soul.md` is retired. A file in the user config directory is not read,
+/// the session says so once (naming `[prompt] file`), and the prompt is the one built
+/// from components.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_soul_md_is_ignored_with_a_notice_pointing_at_prompt_file() {
+    let f = fixture("", None).await;
+    std::fs::write(f.config_dir.join("soul.md"), "You are a Django expert.").unwrap();
+    let mut cmd = command(&f);
+    cmd.args(["--plain"])
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn the real CLI");
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(b"TURN_ONE\n/quit\n").await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(BUDGET, child.wait_with_output())
+        .await
+        .expect("the chat exits")
+        .expect("output");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        shown.contains("soul.md") && shown.contains("[prompt] file"),
+        "the retired soul gets a notice:\n{shown}"
+    );
+    let seen = f.seen.lock().unwrap().clone();
+    let one = turn(&seen, "TURN_ONE");
+    assert!(!one.system.contains("Django"), "{}", one.system);
+    assert!(one
+        .system
+        .contains("You are newt, a free, friendly, local agentic coder."));
+    drop(f.server);
+}
+
 #[cfg(feature = "rich-tui")]
 fn say(pty: &Pty, line: &str, expect: &str) {
     pty.type_in(&format!("{line}\r"));

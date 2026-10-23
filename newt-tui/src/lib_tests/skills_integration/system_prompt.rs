@@ -57,31 +57,21 @@ fn system_prompt_index_unions_search_path_first_dir_wins() {
     assert!(block.contains("judge: scoring"));
 }
 
-/// #2935: the identity comes from the `SoulProvider` the runtime always
-/// installs (`chat.rs`), so the prompt builder no longer carries its own
-/// `DEFAULT_SOUL` fallback. A memory manager with no soul provider yields a
-/// prompt with no soul — the builder never invents one.
-///
-/// Red before the removal: the `None` soul arm injected DEFAULT_SOUL.
+/// #2933 PR7: the soul is built from components, so a memory manager with NO
+/// providers still yields a prompt with its identity and no `soul.md` machinery.
 #[serial_test::serial(real_fs)]
 #[test]
-fn no_soul_provider_means_no_default_soul_2935() {
+fn the_soul_comes_from_components_not_a_provider() {
     let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
     let memory = newt_core::MemoryManager::new();
     let prompt = rebuild_system_prompt(tmp.path().to_str().unwrap(), &memory, None, "s", None);
-    let first_line = newt_core::DEFAULT_SOUL
-        .lines()
-        .find(|l| !l.is_empty())
-        .unwrap();
     assert!(
-        !prompt.contains(first_line),
-        "the builder must not inject DEFAULT_SOUL on its own; got: {prompt:.200}"
+        prompt.starts_with("You are newt, a free, friendly, local agentic coder."),
+        "{prompt:.200}"
     );
-    assert!(
-        prompt.contains("Workspace: "),
-        "the rest of the prompt is intact"
-    );
+    assert!(prompt.contains("## How to work"), "{prompt:.200}");
+    assert!(prompt.contains("Workspace: "), "{prompt:.200}");
 }
 
 #[serial_test::serial(real_fs)]
@@ -93,8 +83,7 @@ fn system_prompt_names_the_per_session_plan_path() {
     let ws = tmp.path().to_str().unwrap();
     let path_a = newt_core::session_plan_path("sess-aaaa");
     let path_a = path_a.to_string_lossy();
-    let prompt_a =
-        build_system_prompt_with_persona(ws, newt_core::DEFAULT_SOUL, None, None, &path_a, None);
+    let prompt_a = build_system_prompt_with_persona(ws, None, None, &path_a, None);
     assert!(
         prompt_a.contains(path_a.as_ref()),
         "prompt must name the session plan path"
@@ -106,14 +95,8 @@ fn system_prompt_names_the_per_session_plan_path() {
 
     // Two different sessions get two different plan paths — the collision fix.
     let path_b = newt_core::session_plan_path("sess-bbbb");
-    let prompt_b = build_system_prompt_with_persona(
-        ws,
-        newt_core::DEFAULT_SOUL,
-        None,
-        None,
-        &path_b.to_string_lossy(),
-        None,
-    );
+    let prompt_b =
+        build_system_prompt_with_persona(ws, None, None, &path_b.to_string_lossy(), None);
     assert!(prompt_b.contains(&*path_b.to_string_lossy()));
     assert!(
         !prompt_b.contains(path_a.as_ref()),
@@ -124,21 +107,20 @@ fn system_prompt_names_the_per_session_plan_path() {
 #[serial_test::serial(real_fs)]
 #[test]
 fn default_soul_no_longer_hardcodes_a_plan_path() {
-    // The plan path moved out of the const so it can be per-session and so
-    // custom souls also get the guidance (issue #220).
+    // The plan path moved out of the soul so it can be per-session (issue #220), and
+    // the soul has no custom-text arm any more (#2933): the injected block is the
+    // only place the path appears.
     assert!(!newt_core::DEFAULT_SOUL.contains("plan.md"));
-    // A custom soul (no plan text of its own) still gets the injected block.
     let tmp = tempfile::TempDir::new().unwrap();
     let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        "You are a custom agent.",
         None,
         None,
         ".scratch/sessions/xyz/plan.md",
         None,
     );
-    assert!(prompt.contains("You are a custom agent."));
     assert!(prompt.contains(".scratch/sessions/xyz/plan.md"));
+    assert_eq!(prompt.matches(".scratch/sessions/xyz/plan.md").count(), 1);
 }
 
 #[serial_test::serial(real_fs)]
@@ -292,8 +274,7 @@ async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
     let _sandbox = SkillRootSandbox::enter(&config_dir, &nested);
     let ws = nested.to_str().unwrap();
 
-    let prompt =
-        build_system_prompt_with_persona(ws, newt_core::DEFAULT_SOUL, None, None, "plan.md", None);
+    let prompt = build_system_prompt_with_persona(ws, None, None, "plan.md", None);
     assert!(
         prompt.contains("grounding-skill: Only in the bundled dir"),
         "the prompt index must list the bundled-only skill"
@@ -342,7 +323,6 @@ async fn provider_annotations_labeled_independently_doer_2937() {
     fs::write(&notes_path, "user: prefers vi\n§\n").unwrap();
 
     let mut memory = newt_core::MemoryManager::new();
-    memory.add_provider(newt_core::SoulProvider::new(None));
     memory.add_provider(newt_core::AgentsProvider::new(true, None));
     memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
     let ctx = newt_core::SessionContext {
@@ -419,7 +399,6 @@ async fn provider_annotations_labeled_independently_coach_2937() {
     fs::write(&notes_path, "project: uses just check\n§\n").unwrap();
 
     let mut memory = newt_core::MemoryManager::new();
-    memory.add_provider(newt_core::SoulProvider::new(None));
     memory.add_provider(newt_core::AgentsProvider::new(true, None));
     memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
     let ctx = newt_core::SessionContext {
@@ -454,8 +433,12 @@ async fn provider_annotations_labeled_independently_coach_2937() {
         .collect();
 
     assert!(
-        labels.contains(&"coach-soul"),
-        "coach must have 'coach-soul' label; got {labels:?}"
+        labels.contains(&"coach-identity") && labels.contains(&"coach-advise"),
+        "coach must have its component labels; got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"coach-soul"),
+        "no whole-soul label; got {labels:?}"
     );
     assert!(
         labels.contains(&"agents"),
@@ -496,7 +479,7 @@ async fn provider_annotations_labeled_independently_coach_2937() {
 // still receive individual annotations. No DEFAULT_SOUL must be invented.
 #[serial_test::serial(real_fs)]
 #[tokio::test]
-async fn no_soul_provider_context_providers_still_annotated_2937() {
+async fn context_providers_are_annotated_with_no_soul_provider_2937() {
     let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let dir = tempfile::TempDir::new().unwrap();
     let ws = dir.path();
@@ -504,7 +487,7 @@ async fn no_soul_provider_context_providers_still_annotated_2937() {
     let notes_path = ws.join("NOTES.md");
     fs::write(&notes_path, "user: uses rg not grep\n§\n").unwrap();
 
-    // No SoulProvider — soul_block() returns None.
+    // No soul provider exists any more: only the context providers.
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::AgentsProvider::new(true, None));
     memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
@@ -521,16 +504,6 @@ async fn no_soul_provider_context_providers_still_annotated_2937() {
         None,
         "sess-nosoul",
         Some(&sink),
-    );
-
-    // No DEFAULT_SOUL fallback — the builder never invents one (#2935).
-    let first_line = newt_core::DEFAULT_SOUL
-        .lines()
-        .find(|l| !l.is_empty())
-        .unwrap();
-    assert!(
-        !prompt.contains(first_line),
-        "builder must not inject DEFAULT_SOUL; got: {prompt:.200}"
     );
 
     sink.arm_capture_next();
@@ -568,8 +541,7 @@ fn a_system_prompt_file_replaces_the_assembled_prompt_2938() {
     let file = tmp.path().join("pruned.md");
     let pruned = "Be brief.\n\n  Keep this spacing.\n";
     std::fs::write(&file, pruned).unwrap();
-    let mut memory = newt_core::MemoryManager::new();
-    memory.add_provider(newt_core::SoulProvider::new(None));
+    let memory = newt_core::MemoryManager::new();
 
     newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, file.to_str().unwrap());
     let overridden = rebuild_system_prompt(workspace, &memory, None, "s", None);

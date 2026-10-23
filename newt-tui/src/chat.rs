@@ -2633,11 +2633,9 @@ fn session_body(
     let mut smart_sessions = smart_sessions::Sessions::new(smart_startup_caveats);
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
-        // Soul provider first — sets the frozen identity block.
-        let soul_override = mem_cfg.soul_file.as_ref().map(std::path::PathBuf::from);
-        mgr.add_provider(newt_core::SoulProvider::new(soul_override));
-        // Project instructions (AGENTS.md / CLAUDE.md) — compose right after
-        // the soul so the block lands in the frozen system prompt. CLI-env
+        // The soul is components now (#2933), built by the system prompt builder; no
+        // provider carries it. Project instructions (AGENTS.md / CLAUDE.md) land in
+        // the frozen system prompt. CLI-env
         // overrides config: --no-agents-file forces off, --agents-file forces
         // on (and sets the search target); otherwise follow `[agents] enabled`.
         let agents_enabled = std::env::var("NEWT_NO_AGENTS_FILE").is_err()
@@ -2845,7 +2843,7 @@ fn session_body(
         },
     );
 
-    // Build system prompt now that SoulProvider has loaded its soul file.
+    // Build the system prompt now that the memory providers have loaded.
     system = rebuild_system_prompt_for(
         workspace,
         &memory,

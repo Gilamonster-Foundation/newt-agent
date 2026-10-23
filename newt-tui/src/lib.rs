@@ -5959,14 +5959,13 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
 #[cfg(test)]
 fn build_system_prompt_with_persona(
     workspace: &str,
-    soul: &str,
     context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     let cfg = test_session_config();
-    build_system_prompt_for(workspace, soul, context, persona, plan_path, &cfg, sink)
+    build_system_prompt_for(workspace, context, persona, plan_path, &cfg, sink)
 }
 
 /// The config of a test session: what the sandbox's files resolve to.
@@ -5980,49 +5979,40 @@ pub(crate) fn test_session_config() -> Box<newt_core::Config> {
 /// config, and the prompt must follow it, not the file on disk.
 fn build_system_prompt_for(
     workspace: &str,
-    soul: &str,
     context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
     cfg: &newt_core::Config,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
-    // FR-5 (#999): the active persona's ALTITUDE selects the base identity. A
-    // `Coach` altitude REPLACES the identity with COACH_SOUL (and overrides a
-    // doer-flavored soul.md), so a coaching persona's overlay no longer sits on
-    // top of a contradictory doer soul. Doer (the default, and every persona
-    // that doesn't declare an altitude) keeps the soul it is given. That soul is
-    // resolved by `SoulProvider` (soul.md, else DEFAULT_SOUL); the builder has
-    // no fallback of its own (#2935). The `--altitude` flag rides here too — it
-    // seeds/overrides `active_persona`'s altitude at startup (see `run_code`),
-    // so it needs no separate plumbing through the session-management helpers.
-    let effective_altitude = persona.and_then(|p| p.profile.altitude).unwrap_or_default();
-    let identity = match effective_altitude {
-        newt_core::Altitude::Coach => newt_core::COACH_SOUL,
-        newt_core::Altitude::Doer => soul,
-    };
-    let identity_source = identity;
-    // #2932: the identity names only the tools the operator lets the model
-    // see — the same `[tool_exposure]` policy that selects the catalog, so the
-    // prompt cannot steer the model at a tool the wire never carries.
+    // FR-5 (#999): the active persona's ALTITUDE selects the soul's component SET:
+    // the doer's, or the coach's ADVISE-first one, so a coaching persona's overlay
+    // never sits on top of a contradictory doer soul. Doer is the default, and every
+    // persona that doesn't declare an altitude. The soul is built from components
+    // (#2933): there is no soul.md and no fallback text. The `--altitude` flag rides
+    // here too: it seeds/overrides `active_persona`'s altitude at startup (see
+    // `run_code`), so it needs no separate plumbing through the session helpers.
+    let coach = matches!(
+        persona.and_then(|p| p.profile.altitude).unwrap_or_default(),
+        newt_core::Altitude::Coach
+    );
+    // #2932: the soul names only the tools the operator lets the model see: the same
+    // `[tool_exposure]` policy that selects the catalog, so the prompt cannot steer
+    // the model at a tool the wire never carries.
     let exposure = newt_core::ExposureSettings::from(cfg.tool_exposure());
     // The accepted config was validated when it was resolved, so this holds.
     let components = cfg.prompt_components().unwrap_or_else(|e| {
         debug_assert!(false, "accepted config has invalid components: {e}");
         Default::default()
     });
-    let identity = exposure.render_identity_with(identity, &components);
-    // The doer soul is built from components; the report names each by id.
-    let doer_soul = identity_source == newt_core::DEFAULT_SOUL;
-    let soul_pieces = if doer_soul {
-        newt_core::prompt_components::soul_parts(
-            &|c| components.is_on(c),
-            &|t| exposure.operator_visible(t),
-            components.preset(),
-        )
-    } else {
-        Vec::new()
-    };
+    let identity = exposure.render_soul(&components, coach);
+    // The soul is built from components; the report names each by id.
+    let soul_pieces = newt_core::prompt_components::soul_parts(
+        &|c| components.is_on(c),
+        &|t| exposure.operator_visible(t),
+        components.preset(),
+        coach,
+    );
     // `[tui] narration_intent_line` (opt-in): every identity gets it and no
     // soul text carries it.
     let intent = cfg.tui.as_ref().is_some_and(|t| t.narration_intent_line);
@@ -6050,7 +6040,7 @@ fn build_system_prompt_for(
         });
     let assembled = newt_core::assemble_system_prompt(&newt_core::PromptParts {
         identity: &identity,
-        coach_identity: matches!(effective_altitude, newt_core::Altitude::Coach),
+        coach_identity: coach,
         context,
         workspace,
         persona: persona.map(|p| newt_core::PersonaPart {
@@ -6069,7 +6059,7 @@ fn build_system_prompt_for(
     });
     if let Some(s) = sink {
         for n in &assembled.notes {
-            if n.label == "soul" && doer_soul {
+            if matches!(n.label.as_str(), "soul" | "coach-soul") {
                 // #2933: the soul is reported as its components, by id. The soul
                 // provider labelled the whole block earlier; that note would
                 // swallow the pieces (and go stale once one is switched off).
@@ -6169,7 +6159,6 @@ fn rebuild_system_prompt_for(
     // #2934: separate the soul/identity from the project-context additions so
     // that coach altitude can replace the soul with COACH_SOUL without
     // silently dropping AGENTS.md, notes, and the project map.
-    let soul_text = memory.soul_block();
     // A provider's block is a component (`project-instructions`, `notes`, ...); one
     // that is off is neither sent nor reported.
     let keep_provider = |name: &str| {
@@ -6193,8 +6182,6 @@ fn rebuild_system_prompt_for(
     let plan_path = newt_core::session_plan_path(conversation_id);
     build_system_prompt_for(
         workspace,
-        // No soul provider means no soul; the builder never invents one (#2935).
-        soul_text.as_deref().unwrap_or_default(),
         context_ref,
         persona,
         &plan_path.to_string_lossy(),
