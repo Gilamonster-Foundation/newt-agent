@@ -566,12 +566,15 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     })?;
     let instruction = std::fs::read_to_string(&instruction_file)
         .with_context(|| format!("reading --instruction-file {}", instruction_file.display()))?;
-    // `dunce`: on Windows `std` canonicalizes to the verbatim `\\?\C:\..` form, which the
-    // TUI never shows the model; the same workspace must read the same in both (#2933).
-    let workspace = dunce::canonicalize(&args.cwd)
-        .unwrap_or_else(|_| args.cwd.clone())
+    // Canonicalized ONCE. Everything that compares or fences paths (the write fence, the
+    // build partitions, the confined launch) keeps this form, as before. The model is
+    // shown `prompt_workspace`: the same path without Windows' verbatim `\\?\` prefix,
+    // which is how the TUI names the workspace (#2933).
+    let canonical_workspace = args.cwd.canonicalize().unwrap_or_else(|_| args.cwd.clone());
+    let prompt_workspace = dunce::simplified(&canonical_workspace)
         .to_string_lossy()
         .into_owned();
+    let workspace = canonical_workspace.to_string_lossy().into_owned();
 
     // Herdr: report this headless run through the SAME lifecycle seam the TUI
     // uses (no surface-specific wiring). Inside a Herdr pane this installs the
@@ -762,7 +765,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         (Some(o), _) => override_system_message(o, dc.report_sink.as_deref()),
         (None, Some((prompt_cfg, _))) => newt_core::MemMessage::system(
             newt_tui::headless_system_prompt(
-                &workspace,
+                &prompt_workspace,
                 &prompt_cfg,
                 knowledge_base,
                 &newt_tui::HeadlessRoute {
