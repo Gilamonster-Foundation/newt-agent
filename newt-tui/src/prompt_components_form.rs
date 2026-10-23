@@ -269,13 +269,12 @@ mod tests {
         assert_eq!(skill.name, "commit-attribution");
         assert!(skill.body.contains("Co-authored-by:"));
         assert!(skill.body.contains("newt-agent GitHub App"));
+        let body = skill.body.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            skill
-                .body
-                .contains("Do not\n  add a second trailer by hand")
-                || skill.body.contains("second trailer"),
-            "this variant keeps B3 as the source of truth"
+            body.contains("Never add a second trailer by hand"),
+            "this variant keeps the runtime as the source of truth"
         );
+        assert!(body.contains("run_command"), "native commits are managed");
         let attribution = pc::all().find(|c| c.id == "commit-attribution").unwrap();
         assert!(!attribution.default_on, "the rule is a skill now");
     }
