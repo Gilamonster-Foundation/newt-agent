@@ -52,7 +52,7 @@ pub use profile::{
     BundleConfig, PickVia, ProfileConfig, ProfilePick, RetryKnobs, VerifyGateKnobs,
     KNOWN_TECHNIQUES,
 };
-pub use prompt::{PromptConfig, SystemPromptOverride, SYSTEM_PROMPT_FILE_ENV};
+pub use prompt::{ComponentDeltas, PromptConfig, SystemPromptOverride, SYSTEM_PROMPT_FILE_ENV};
 pub use semantic::{OnEmbedFailure, SemanticConfig};
 pub use skills::SkillsConfig;
 pub(crate) use smart_harness::{normalize_path, resolve_uncreated_path, validate_stable_anchor};
@@ -1661,6 +1661,7 @@ impl Config {
         let mut assembly =
             BackendAssembly::new(std::mem::take(&mut cfg.backends)).map_err(NewtError::Config)?;
         validate_provider_names(&cfg.providers).map_err(NewtError::Config)?;
+        cfg.prompt_components().map_err(NewtError::Config)?;
         if let Some(dir) = Self::user_config_dir() {
             assembly
                 .merge_dir(&dir.join("backends"))
@@ -1756,6 +1757,7 @@ impl Config {
         let mut assembly =
             BackendAssembly::new(std::mem::take(&mut self.backends)).map_err(NewtError::Config)?;
         validate_provider_names(&self.providers).map_err(NewtError::Config)?;
+        self.prompt_components().map_err(NewtError::Config)?;
         let default_backend = self.default_backend.clone();
         let over = cli_backend_override();
         let requested_slot = assembly

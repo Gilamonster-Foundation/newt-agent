@@ -5930,7 +5930,12 @@ fn build_system_prompt_with_persona(
         .ok()
         .map(|c| newt_core::ExposureSettings::from(c.tool_exposure()))
         .unwrap_or_default();
-    let identity = exposure.render_identity(identity);
+    let components = cfg
+        .as_ref()
+        .ok()
+        .and_then(|c| c.prompt_components().ok())
+        .unwrap_or_default();
+    let identity = exposure.render_identity_with(identity, &components);
     // `[tui] narration_intent_line` (opt-in): every identity gets it and no
     // soul text carries it.
     let intent = cfg

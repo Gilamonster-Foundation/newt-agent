@@ -18,12 +18,38 @@ pub const SYSTEM_PROMPT_FILE_ENV: &str = "NEWT_SYSTEM_PROMPT_FILE";
 /// [prompt]
 /// file = "~/.newt/system-prompt.md"
 /// ```
+///
+/// Without `file`, `preset` and `components` shape the assembled prompt (#2933):
+///
+/// ```toml
+/// [prompt]
+/// preset = "default"
+/// components = { off = ["three-cs"], on = [] }
+/// ```
+///
+/// They are deltas on the preset, so a component added later is never silently
+/// off. Dropping one changes what the model is told, never what it may do. They
+/// shape the default soul only: a custom `soul.md` or the coach soul replaces it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptConfig {
     /// Path of the replacement system prompt. `~/` is expanded to `$HOME`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Named set of components to start from; `default` is today's prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Component ids to switch on or off relative to the preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<ComponentDeltas>,
+}
+
+/// `[prompt] components = { on = [...], off = [...] }`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComponentDeltas {
+    pub on: Vec<String>,
+    pub off: Vec<String>,
 }
 
 /// A replacement system prompt read from disk.
@@ -35,6 +61,18 @@ pub struct SystemPromptOverride {
 }
 
 impl Config {
+    /// The components in force: `[prompt] preset` with its deltas applied.
+    ///
+    /// # Errors
+    /// An unknown preset or component id, naming the valid ones.
+    pub fn prompt_components(&self) -> Result<crate::prompt_components::ComponentSet, String> {
+        let Some(p) = &self.prompt else {
+            return Ok(Default::default());
+        };
+        let d = p.components.clone().unwrap_or_default();
+        crate::prompt_components::ComponentSet::resolve(p.preset.as_deref(), &d.on, &d.off)
+    }
+
     /// The override file in force: the session env twin, else `[prompt] file`.
     pub fn system_prompt_file(&self) -> Option<PathBuf> {
         self.system_prompt_file_with(std::env::var(SYSTEM_PROMPT_FILE_ENV).ok())
@@ -99,6 +137,25 @@ mod tests {
         let c = cfg("");
         assert!(c.prompt.is_none());
         assert_eq!(c.system_prompt_file_with(None), None);
+    }
+
+    #[test]
+    fn prompt_components_read_the_preset_and_deltas() {
+        assert!(cfg("").prompt_components().unwrap().is_default());
+        let c = cfg("[prompt]\npreset = \"default\"\ncomponents = { off = [\"three-cs\"] }\n");
+        assert!(!c.prompt_components().unwrap().is_default());
+        let bad = cfg("[prompt]\ncomponents = { off = [\"nope\"] }\n");
+        assert!(bad.prompt_components().unwrap_err().contains("`nope`"));
+    }
+
+    /// An unknown component id is refused when the config is prepared for a run,
+    /// naming the valid ids, not silently ignored.
+    #[test]
+    fn an_unknown_component_is_refused_at_load() {
+        let c = cfg("[prompt]\ncomponents = { off = [\"nope\"] }\n");
+        let err = c.prepare_runtime().expect_err("unknown id refused");
+        let msg = err.to_string();
+        assert!(msg.contains("`nope`") && msg.contains("three-cs"), "{msg}");
     }
 
     #[test]

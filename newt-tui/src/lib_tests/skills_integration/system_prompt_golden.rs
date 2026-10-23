@@ -102,3 +102,23 @@ fn goldens_pin_the_assembled_prompt() {
         &assembled("", "You are a Django expert.", None),
     );
 }
+
+/// #2933 PR3: `[prompt] components.off = ["three-cs"]` removes that paragraph and
+/// nothing else from the assembled prompt.
+#[serial_test::serial(real_fs)]
+#[test]
+fn switching_a_component_off_drops_exactly_its_paragraph() {
+    let doer = newt_core::DEFAULT_SOUL;
+    let base = assembled("", doer, None);
+    let off = assembled(
+        "[prompt]\ncomponents = { off = [\"three-cs\"] }\n",
+        doer,
+        None,
+    );
+    let start = base.find("**Working code first").unwrap();
+    let end = base.find("\n\n## AGENTS.md").unwrap_or_else(|| {
+        panic!("project context follows the soul:\n{base}");
+    });
+    let expected = format!("{}{}", base[..start].trim_end_matches('\n'), &base[end..]);
+    assert_eq!(off, expected);
+}

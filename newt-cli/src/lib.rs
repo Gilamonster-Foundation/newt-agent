@@ -914,6 +914,12 @@ pub enum Command {
         /// (#2938).
         #[arg(long, value_name = "FILE")]
         system_prompt_file: Option<PathBuf>,
+        /// Name of the prompt preset. Headless sends the bare `Workspace root:`
+        /// message, the `headless` preset, and that is the only one it knows yet;
+        /// `default` (the TUI's assembled prompt) and `pi` are refused until
+        /// headless can assemble them (#2933).
+        #[arg(long, value_name = "NAME")]
+        prompt_preset: Option<String>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
         /// otherwise starts a resumable frame; legacy headless keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
@@ -1894,6 +1900,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             run_allowance,
             dump_request,
             system_prompt_file,
+            prompt_preset,
             hermetic,
             resume_from,
         } => {
@@ -1925,6 +1932,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 run_allowance,
                 dump_request,
                 system_prompt_file,
+                prompt_preset,
                 launch,
             })
             .await?;
