@@ -179,18 +179,18 @@ mod tests {
     #[test]
     fn with_prompt_components_keeps_the_rest_and_drops_the_key_when_empty() {
         let text = "# mine\n[prompt]\nfile = \"/p.md\" # keep\n";
-        let out = Config::with_prompt_components(text, &[], &["three-cs"]).unwrap();
+        let out = Config::with_prompt_components(text, "default", &[], &["three-cs"]).unwrap();
         assert!(
             out.contains("# mine") && out.contains("file = \"/p.md\" # keep"),
             "{out}"
         );
         assert!(cfg(&out).prompt_components().unwrap().summary() == "default, 1 off");
-        let back = Config::with_prompt_components(&out, &[], &[]).unwrap();
+        let back = Config::with_prompt_components(&out, "default", &[], &[]).unwrap();
         assert!(
             !back.contains("components") && back.contains("# keep"),
             "{back}"
         );
-        let fresh = Config::with_prompt_components("", &[], &["three-cs"]).unwrap();
+        let fresh = Config::with_prompt_components("", "default", &[], &["three-cs"]).unwrap();
         assert!(cfg(&fresh).prompt_components().unwrap().summary() == "default, 1 off");
     }
 
@@ -199,13 +199,18 @@ mod tests {
     #[test]
     fn with_prompt_components_keeps_the_edited_keys_comments() {
         let text = "[prompt]\n# key comment\ncomponents = { off = [\"three-cs\"] } # keep trailing rationale\n";
-        let same = Config::with_prompt_components(text, &[], &["three-cs"]).unwrap();
+        let same = Config::with_prompt_components(text, "default", &[], &["three-cs"]).unwrap();
         assert!(
             same.contains("# key comment") && same.contains("# keep trailing rationale"),
             "{same}"
         );
-        let changed =
-            Config::with_prompt_components(text, &[], &["three-cs", "commit-attribution"]).unwrap();
+        let changed = Config::with_prompt_components(
+            text,
+            "default",
+            &[],
+            &["three-cs", "commit-attribution"],
+        )
+        .unwrap();
         assert!(
             changed.contains("# key comment")
                 && changed.contains("# keep trailing rationale")
@@ -217,6 +222,36 @@ mod tests {
             .unwrap()
             .summary()
             .contains("2 off"));
+    }
+
+    /// #2933 PR6: `preset` is written and read back, keeps its decoration, and is
+    /// dropped again for `default`.
+    #[test]
+    fn with_prompt_components_writes_the_preset_and_keeps_its_comments() {
+        let text = "[prompt]\n# which prompt\npreset = \"pi\" # minimal\n";
+        let same = Config::with_prompt_components(text, "pi", &[], &[]).unwrap();
+        assert!(
+            same.contains("# which prompt") && same.contains("# minimal"),
+            "{same}"
+        );
+        assert!(
+            cfg(&same).prompt_components().is_err(),
+            "pi needs the card tools hidden"
+        );
+        let tweaked = Config::with_prompt_components(
+            "[tool_exposure]\nallow_list = [\"read_file\"]\n",
+            "pi",
+            &["readme"],
+            &[],
+        )
+        .unwrap();
+        let set = cfg(&tweaked).prompt_components().unwrap();
+        assert_eq!(set.summary(), "pi, 1 changed");
+        let back = Config::with_prompt_components(&tweaked, "default", &[], &[]).unwrap();
+        assert!(
+            !back.contains("preset") && !back.contains("components"),
+            "{back}"
+        );
     }
 
     #[test]

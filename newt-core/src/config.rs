@@ -2275,10 +2275,15 @@ impl Config {
         Ok(doc.to_string())
     }
 
-    /// Set `[prompt] components` (#2933) to the given deltas, dropping the key when
-    /// both are empty, preserving the rest of the document. PURE: the caller owns
+    /// Set `[prompt] preset` and `components` (#2933) to the given preset and deltas,
+    /// dropping `preset` for `default` and `components` when both are empty, preserving the rest of the document. PURE: the caller owns
     /// the filesystem write.
-    pub fn with_prompt_components(text: &str, on: &[&str], off: &[&str]) -> Result<String> {
+    pub fn with_prompt_components(
+        text: &str,
+        preset: &str,
+        on: &[&str],
+        off: &[&str],
+    ) -> Result<String> {
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
             .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
@@ -2309,21 +2314,12 @@ impl Config {
             if !off.is_empty() {
                 inline.insert("off", list(off));
             }
-            let mut item = toml_edit::value(inline);
-            // Keep the edited key and its value as the operator decorated them,
-            // changed or not: the key's own comment lives with the key, so replace
-            // the item in place instead of inserting a fresh key.
-            match table.get_mut("components") {
-                Some(existing) => {
-                    if let (Some(new), Some(old)) = (item.as_value_mut(), existing.as_value()) {
-                        *new.decor_mut() = old.decor().clone();
-                    }
-                    *existing = item;
-                }
-                None => {
-                    table.insert("components", item);
-                }
-            }
+            replace_in_place(table, "components", toml_edit::value(inline));
+        }
+        if preset == "default" {
+            table.remove("preset");
+        } else {
+            replace_in_place(table, "preset", toml_edit::value(preset));
         }
         Ok(doc.to_string())
     }
@@ -2506,4 +2502,21 @@ fn dir_has_toml(dir: &Path) -> bool {
             .flatten()
             .any(|e| e.path().extension().is_some_and(|x| x == "toml"))
     })
+}
+
+/// Set `key` to `item`, keeping the key and the old value's decoration (comments,
+/// spacing) when the key already exists: the key's own comment lives with the key,
+/// so replace the item in place rather than inserting a fresh key.
+fn replace_in_place(table: &mut toml_edit::Table, key: &str, mut item: toml_edit::Item) {
+    match table.get_mut(key) {
+        Some(existing) => {
+            if let (Some(new), Some(old)) = (item.as_value_mut(), existing.as_value()) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *existing = item;
+        }
+        None => {
+            table.insert(key, item);
+        }
+    }
 }

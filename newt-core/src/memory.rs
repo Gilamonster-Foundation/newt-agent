@@ -331,7 +331,17 @@ impl MemoryManager {
         &self,
         sink: &crate::agentic::request_report::ReportSink,
     ) {
-        for p in &self.providers {
+        self.annotate_system_prompt_additions_where(sink, &|_| true);
+    }
+
+    /// [`annotate_system_prompt_additions`](Self::annotate_system_prompt_additions) for
+    /// the providers `keep` selects, so a block left out of the prompt is not reported.
+    pub fn annotate_system_prompt_additions_where(
+        &self,
+        sink: &crate::agentic::request_report::ReportSink,
+        keep: &dyn Fn(&str) -> bool,
+    ) {
+        for p in self.providers.iter().filter(|p| keep(p.name())) {
             if let Some(block) = p.system_prompt_block() {
                 if !block.is_empty() {
                     sink.annotate(p.name(), "memory::build_system_prompt_additions", &block);
@@ -357,9 +367,15 @@ impl MemoryManager {
     /// altitude, because they carry project-specific context that coach mode
     /// must not silently drop (#2934).
     pub fn context_additions(&self) -> String {
+        self.context_additions_where(&|_| true)
+    }
+
+    /// [`context_additions`](Self::context_additions) for the providers `keep` selects
+    /// by name (`[prompt] components` switches providers' blocks off, #2933).
+    pub fn context_additions_where(&self, keep: &dyn Fn(&str) -> bool) -> String {
         self.providers
             .iter()
-            .filter(|p| p.name() != "soul")
+            .filter(|p| p.name() != "soul" && keep(p.name()))
             .filter_map(|p| p.system_prompt_block())
             .collect::<Vec<_>>()
             .join("\n\n")

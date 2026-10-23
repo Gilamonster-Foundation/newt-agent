@@ -53,6 +53,8 @@ pub struct PromptParts<'a> {
     /// directory could not be read.
     pub file_names: Option<&'a [String]>,
     pub readme: Option<ReadmePart<'a>>,
+    /// `[prompt] components`: a piece whose component is off is left out.
+    pub components: &'a crate::prompt_components::ComponentSet,
 }
 
 /// The prompt and the label of each piece in it.
@@ -78,6 +80,7 @@ pub fn assemble_system_prompt(parts: &PromptParts<'_>) -> AssembledPrompt {
     // replaces the soul but must not drop project instructions (#2934). They
     // sit BEFORE the workspace line: historical notes must not redefine the
     // runtime root stated below.
+    let on = |id: &str| parts.components.is_on_id(id);
     let mut out = parts.identity.to_string();
     note(
         if parts.coach_identity {
@@ -91,18 +94,20 @@ pub fn assemble_system_prompt(parts: &PromptParts<'_>) -> AssembledPrompt {
         out.push_str("\n\n");
         out.push_str(context);
     }
-    let header_start = out.len();
-    out.push_str(&format!(
-        "\n\nWorkspace: {}\n\
-         This is the current runtime root. Relative tool paths resolve here; \
-         run_command starts here unless its cwd or command selects another directory. \
-         Other requested paths remain governed by the session's permissions. \
-         Historical notes do not redefine this root.\n",
-        parts.workspace
-    ));
-    note("workspace-header", &out[header_start..]);
+    if on("workspace-header") {
+        let header_start = out.len();
+        out.push_str(&format!(
+            "\n\nWorkspace: {}\n\
+             This is the current runtime root. Relative tool paths resolve here; \
+             run_command starts here unless its cwd or command selects another directory. \
+             Other requested paths remain governed by the session's permissions. \
+             Historical notes do not redefine this root.\n",
+            parts.workspace
+        ));
+        note("workspace-header", &out[header_start..]);
+    }
 
-    if let Some(persona) = parts.persona {
+    if let Some(persona) = parts.persona.filter(|_| on("persona")) {
         let start = out.len();
         out.push_str(&format!(
             "\nActive persona: {}\n{}\n",
@@ -114,41 +119,45 @@ pub fn assemble_system_prompt(parts: &PromptParts<'_>) -> AssembledPrompt {
              needed for the requested work. OCAP permissions, explicit postures, and \
              delegation limits still govern every action.\n",
         );
-        note("persona-overlay", &out[start..]);
+        note("persona", &out[start..]);
     }
 
     // Per-session plan instruction (issue #220), with the resolved per-session
     // path rather than baked into the soul: the path is dynamic AND a custom
     // soul still gets the guidance. The path is unique to this conversation, so
     // concurrent newt instances in one repo never clobber each other's plan.
-    let plan_start = out.len();
-    out.push_str(&format!(
-        "\n**Plan before coding.** For any task requiring more than one file \
-         change, write a plan to `{}` first (create it if it does not \
-         exist). List the concrete steps and check them off as you complete \
-         each one. This plan file is unique to this session — read it when \
-         resuming so you can pick up exactly where you left off without \
-         re-reading the whole codebase.\n",
-        parts.plan_path
-    ));
-    note("plan-before-coding instruction", &out[plan_start..]);
+    if on("plan-file") {
+        let plan_start = out.len();
+        out.push_str(&format!(
+            "\n**Plan before coding.** For any task requiring more than one file \
+             change, write a plan to `{}` first (create it if it does not \
+             exist). List the concrete steps and check them off as you complete \
+             each one. This plan file is unique to this session — read it when \
+             resuming so you can pick up exactly where you left off without \
+             re-reading the whole codebase.\n",
+            parts.plan_path
+        ));
+        note("plan-file", &out[plan_start..]);
+    }
 
-    note("refactor publish guidance", parts.publish_guidance);
-    out.push_str(parts.publish_guidance);
-    out.push('\n');
+    if on("publish-guidance") {
+        note("publish-guidance", parts.publish_guidance);
+        out.push_str(parts.publish_guidance);
+        out.push('\n');
+    }
 
     if let Some(line) = parts.narration_line {
         note("narration intent line", line);
         out.push_str(&format!("\n{line}\n"));
     }
 
-    if let Some(index) = parts.skills_index {
-        note("skills index", index);
+    if let Some(index) = parts.skills_index.filter(|_| on("skills-index")) {
+        note("skills-index", index);
         out.push('\n');
         out.push_str(index);
     }
 
-    if let Some(names) = parts.file_names {
+    if let Some(names) = parts.file_names.filter(|_| on("file-listing")) {
         let mut shown: Vec<&str> = names
             .iter()
             .map(String::as_str)
@@ -160,17 +169,17 @@ pub fn assemble_system_prompt(parts: &PromptParts<'_>) -> AssembledPrompt {
         for name in shown.iter().take(LISTING_LIMIT) {
             out.push_str(&format!("  {name}\n"));
         }
-        note("workspace file listing", &out[start..]);
+        note("file-listing", &out[start..]);
     }
 
-    if let Some(readme) = parts.readme {
+    if let Some(readme) = parts.readme.filter(|_| on("readme")) {
         let start = out.len();
         let excerpt: String = readme.text.chars().take(README_CHARS).collect();
         out.push_str(&format!("\n{}:\n{excerpt}\n", readme.file_name));
         if readme.text.len() > README_CHARS {
             out.push_str("...[truncated]\n");
         }
-        note("README excerpt", &out[start..]);
+        note("readme", &out[start..]);
     }
 
     AssembledPrompt { text: out, notes }

@@ -151,22 +151,24 @@ pub(crate) fn set_active(path: Option<PathBuf>) {
     *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = path;
 }
 
-/// Whether the prompt the session last built dropped components (#2933).
-static CUSTOM_COMPONENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The footer badge for the components the session last built from (#2933):
+/// `custom` or `pi`, none for the untouched default.
+static COMPONENTS_BADGE: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 
-pub(crate) fn set_custom_components(custom: bool) {
-    CUSTOM_COMPONENTS.store(custom, std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn set_components_badge(badge: Option<&'static str>) {
+    *COMPONENTS_BADGE.lock().unwrap_or_else(|e| e.into_inner()) = badge;
 }
 
 /// `[prompt: <file name>]` while an override file is in force, else
-/// `[prompt: custom]` while components are switched off.
+/// `[prompt: custom]` / `[prompt: pi]` for the components.
 #[cfg(feature = "rich-tui")]
 pub(crate) fn status_badge() -> Option<String> {
     let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     active.as_deref().map(badge_for).or_else(|| {
-        CUSTOM_COMPONENTS
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .then(|| "[prompt: custom]".to_string())
+        COMPONENTS_BADGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|badge| format!("[prompt: {badge}]"))
     })
 }
 

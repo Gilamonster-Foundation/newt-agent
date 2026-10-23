@@ -106,6 +106,15 @@ fn goldens_pin_the_assembled_prompt() {
         "narration",
         &assembled("[tui]\nnarration_intent_line = true\n", doer, None),
     );
+    // #2933 PR6: preset `pi` over the pi tool list, through the real builder.
+    check(
+        "pi",
+        &assembled(
+            "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\", \"run_command\"]\n[prompt]\npreset = \"pi\"\n",
+            doer,
+            Some(&persona("reviewer", false)),
+        ),
+    );
     check(
         "custom_soul",
         &assembled("", "You are a Django expert.", None),

@@ -43,6 +43,8 @@ enum Body {
 pub enum Layer {
     /// The frozen system prompt's identity and rules.
     Soul,
+    /// The rest of the frozen system prompt: project context, header, listings.
+    Frozen,
     /// Rebuilt every turn into the turn's system message.
     Turn,
     /// Added by the agentic driver as its own system message.
@@ -61,6 +63,8 @@ pub struct Component {
     /// Rules under `## How to work`; the identity lines sit above it.
     under_heading: bool,
     pub layer: Layer,
+    /// The text under preset `pi`, when it differs from `body`'s.
+    pi_text: Option<&'static str>,
     /// Describes a fence the harness enforces elsewhere. Switching it off only stops
     /// telling the model about the fence; enforcement does not read this.
     pub fence: bool,
@@ -68,9 +72,12 @@ pub struct Component {
 }
 
 impl Component {
-    fn render(&self, visible: &dyn Fn(&str) -> bool) -> String {
+    fn render(&self, visible: &dyn Fn(&str) -> bool, preset: Preset) -> String {
         match self.body {
-            Body::Text(text) => text.to_owned(),
+            Body::Text(text) => match (preset, self.pi_text) {
+                (Preset::Pi, Some(pi)) => pi.to_owned(),
+                _ => text.to_owned(),
+            },
             Body::Owned => String::new(),
             Body::Tools => {
                 let names: Vec<&str> = NAMED_TOOLS.iter().copied().filter(|t| visible(t)).collect();
@@ -79,6 +86,9 @@ impl Component {
         }
     }
 }
+
+/// The one identity line of preset `pi`.
+const PI_IDENTITY: &str = "You are newt, a coding agent.";
 
 const IDENTITY: &str =
     "You are newt, a free, friendly, local agentic coder. Be concise and direct.";
@@ -180,6 +190,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: false,
         layer: Layer::Soul,
+        pi_text: Some(PI_IDENTITY),
         fence: false,
         body: Body::Text(IDENTITY),
     },
@@ -190,6 +201,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: false,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Tools,
     },
@@ -200,6 +212,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: false,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(DISPOSITION),
     },
@@ -210,6 +223,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(ONE_CHANGE),
     },
@@ -220,6 +234,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(READ_MINIMUM),
     },
@@ -230,6 +245,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(PREFER_EDIT),
     },
@@ -240,6 +256,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(STOP_WHEN_BLOCKED),
     },
@@ -250,6 +267,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(GROUND_TRUTH),
     },
@@ -260,6 +278,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(COMMIT_ATTRIBUTION),
     },
@@ -270,6 +289,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(ACT_NOT_DESCRIBE),
     },
@@ -280,6 +300,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(PRESENT_FINDINGS),
     },
@@ -290,6 +311,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(EXPLORE_BUDGET),
     },
@@ -300,6 +322,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        pi_text: None,
         fence: false,
         body: Body::Text(THREE_CS),
     },
@@ -321,6 +344,7 @@ const fn owned(
         default_on: true,
         under_heading: false,
         layer,
+        pi_text: None,
         fence,
         body: Body::Owned,
     }
@@ -375,18 +399,153 @@ pub const DRIVER: &[Component] = &[owned(
     false,
 )];
 
+/// The rest of the frozen system prompt (#2933): project context, the workspace
+/// header, the session plan, the skills index and the directory listing. The text is
+/// gathered by the TUI and joined by [`crate::system_prompt`]; the registry names,
+/// describes and gates each piece.
+pub const FROZEN: &[Component] = &[
+    owned(
+        "project-instructions",
+        "The AGENTS.md / CLAUDE.md instructions block.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "notes",
+        "The agent's saved notes (`## Agent Notes`).",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "memory-index",
+        "The index of saved memories.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "project-map",
+        "A map of the project's files and symbols.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "api-surface",
+        "The public API / FFI surface of the project.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "persona",
+        "The active persona's overlay and its guidance sentence.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "workspace-header",
+        "The workspace root and how relative paths resolve.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "plan-file",
+        "The instruction to write a plan to the session's plan file.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "publish-guidance",
+        "Publish-early guidance for refactors (worktree, push, PR).",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "skills-index",
+        "One line per installed skill.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "file-listing",
+        "The workspace root's file listing.",
+        Layer::Frozen,
+        false,
+    ),
+    owned(
+        "readme",
+        "The first 3,000 characters of the README.",
+        Layer::Frozen,
+        false,
+    ),
+];
+
+/// The context provider whose block is the component of the same name, if any.
+#[must_use]
+pub fn provider_component(provider: &str) -> Option<&'static str> {
+    match provider {
+        "agents" => Some("project-instructions"),
+        "note_store" => Some("notes"),
+        "memory_index" => Some("memory-index"),
+        "project_map" => Some("project-map"),
+        "api_surface" | "knowledge_base" => Some("api-surface"),
+        _ => None,
+    }
+}
+
+/// A named set of components to start from (`[prompt] preset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preset {
+    /// Everything on: today's prompt.
+    #[default]
+    Default,
+    /// A pi-like minimum: one identity line, the tool list, the workspace header,
+    /// project instructions and the persona.
+    Pi,
+}
+
+impl Preset {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Pi => "pi",
+        }
+    }
+
+    /// The components that are on under this preset.
+    fn is_on(self, c: &Component) -> bool {
+        match self {
+            Self::Default => c.default_on,
+            Self::Pi => PI_ON.contains(&c.id),
+        }
+    }
+}
+
+/// What preset `pi` keeps; everything else is off, `card` included.
+pub const PI_ON: &[&str] = &[
+    "identity",
+    "tools",
+    "workspace-header",
+    "project-instructions",
+    "persona",
+];
+
 /// The tools that read the active-prompt card.
 pub const CARD_TOOLS: &[&str] = &["prompt_read", "artifact_read"];
 
-/// Every component, soul first, then the turn's pieces, then the driver's.
+/// Every component: the soul, the rest of the frozen prompt, the turn's pieces, then
+/// the driver's.
 pub fn all() -> impl Iterator<Item = &'static Component> {
-    SOUL.iter().chain(TURN).chain(DRIVER)
+    SOUL.iter().chain(FROZEN).chain(TURN).chain(DRIVER)
 }
 
 /// The soul with the components `enabled` selects and the rules whose tools are all
 /// `visible`. Lines above the heading are joined by a space, rules by a blank line.
-pub fn render_soul(enabled: &dyn Fn(&Component) -> bool, visible: &dyn Fn(&str) -> bool) -> String {
-    let parts = soul_parts(enabled, visible);
+pub fn render_soul(
+    enabled: &dyn Fn(&Component) -> bool,
+    visible: &dyn Fn(&str) -> bool,
+    preset: Preset,
+) -> String {
+    let parts = soul_parts(enabled, visible, preset);
     let mut out = String::new();
     for (n, (id, text)) in parts.iter().enumerate() {
         if n > 0 {
@@ -407,6 +566,7 @@ fn under_heading(id: &str) -> bool {
 pub fn soul_parts(
     enabled: &dyn Fn(&Component) -> bool,
     visible: &dyn Fn(&str) -> bool,
+    preset: Preset,
 ) -> Vec<(&'static str, String)> {
     let mut parts: Vec<(&'static str, String)> = Vec::new();
     let mut headed = false;
@@ -414,7 +574,7 @@ pub fn soul_parts(
         .iter()
         .filter(|c| enabled(c) && c.requires_tools.iter().all(|t| visible(t)))
     {
-        let mut text = c.render(visible);
+        let mut text = c.render(visible, preset);
         if c.under_heading && !headed {
             headed = true;
             text = format!("{HEADING}\n\n{text}");
@@ -427,12 +587,12 @@ pub fn soul_parts(
 /// The default preset: every component whose `default_on` is set.
 #[must_use]
 pub fn default_soul(visible: &dyn Fn(&str) -> bool) -> String {
-    render_soul(&|c| c.default_on, visible)
+    render_soul(&|c| c.default_on, visible, Preset::Default)
 }
 
-/// Presets `[prompt] preset` accepts. `pi` arrives with the measured pi-like
-/// preset; `headless` is the headless-only bare message, not a TUI preset.
-pub const PRESETS: &[&str] = &["default"];
+/// Presets `[prompt] preset` accepts. `headless` is the headless-only bare message,
+/// not a TUI preset.
+pub const PRESETS: &[&str] = &["default", "pi"];
 
 /// Every component id, in prompt order.
 #[must_use]
@@ -443,33 +603,45 @@ pub fn ids() -> Vec<&'static str> {
 /// Which components are on: a preset's defaults with the operator's deltas applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentSet {
+    preset: Preset,
     off: std::collections::BTreeSet<&'static str>,
 }
 
 impl Default for ComponentSet {
     /// The `default` preset: everything whose `default_on` is set.
     fn default() -> Self {
-        Self {
-            off: all().filter(|c| !c.default_on).map(|c| c.id).collect(),
-        }
+        Self::for_preset(Preset::Default)
     }
 }
 
 impl ComponentSet {
+    /// `preset` untouched.
+    #[must_use]
+    pub fn for_preset(preset: Preset) -> Self {
+        Self {
+            preset,
+            off: all().filter(|c| !preset.is_on(c)).map(|c| c.id).collect(),
+        }
+    }
+
+    /// The preset this set started from.
+    #[must_use]
+    pub fn preset(&self) -> Preset {
+        self.preset
+    }
+
     /// `preset` (absent = `default`) plus `[prompt] components` deltas. Refuses an
     /// unknown preset or id, naming the valid ones, and an id in both lists.
     pub fn resolve(preset: Option<&str>, on: &[String], off: &[String]) -> Result<Self, String> {
-        match preset.map(str::trim) {
-            None | Some("default") => {}
-            Some("pi") => {
-                return Err("[prompt] preset `pi` is not available yet; presets: default".into())
-            }
+        let preset = match preset.map(str::trim) {
+            None | Some("default") => Preset::Default,
+            Some("pi") => Preset::Pi,
             Some("headless") => {
-                return Err(
+                return Err(format!(
                     "`headless` is the headless-only preset (`newt headless --prompt-preset`), \
-                     not a [prompt] preset; presets: default"
-                        .into(),
-                )
+                     not a [prompt] preset; presets: {}",
+                    PRESETS.join(", ")
+                ))
             }
             Some(other) => {
                 return Err(format!(
@@ -477,7 +649,7 @@ impl ComponentSet {
                     PRESETS.join(", ")
                 ))
             }
-        }
+        };
         let known = |id: &str| -> Result<&'static str, String> {
             all().map(|c| c.id).find(|c| *c == id).ok_or_else(|| {
                 format!(
@@ -486,7 +658,7 @@ impl ComponentSet {
                 )
             })
         };
-        let mut set = Self::default();
+        let mut set = Self::for_preset(preset);
         for id in off {
             if on.contains(id) {
                 return Err(format!(
@@ -546,7 +718,7 @@ pub fn rows(set: &ComponentSet, visible: &dyn Fn(&str) -> bool) -> Vec<Row> {
             } else {
                 match c.body {
                     Body::Text(t) => Some(t.chars().count()),
-                    Body::Tools => Some(c.render(visible).chars().count()),
+                    Body::Tools => Some(c.render(visible, Preset::Default).chars().count()),
                     Body::Owned => None,
                 }
             };
@@ -578,10 +750,10 @@ impl ComponentSet {
         Ok(next)
     }
 
-    /// `(on, off)` relative to the `default` preset: what `[prompt] components` stores.
+    /// `(on, off)` relative to this set's own preset: what `[prompt] components` stores.
     #[must_use]
     pub fn deltas(&self) -> (Vec<&'static str>, Vec<&'static str>) {
-        let base = Self::default();
+        let base = Self::for_preset(self.preset);
         let pick = |want_on: bool| {
             all()
                 .filter(|c| self.is_on(c) == want_on && base.is_on(c) != want_on)
@@ -598,10 +770,15 @@ impl ComponentSet {
         let card_off = DRIVER.iter().any(|c| c.id == "card" && !self.is_on(c));
         let exposed: Vec<&str> = CARD_TOOLS.iter().copied().filter(|t| visible(t)).collect();
         if card_off && !exposed.is_empty() {
+            let why = if self.preset == Preset::Pi && !self.is_on_id("card") {
+                "preset `pi` turns the `card` component off, and "
+            } else {
+                ""
+            };
             return Err(format!(
-                "component `card` can be off only while {} are hidden from the model, but {} \
-                 {} visible; hide them with `/settings tools` (for example `/settings tools pi`) \
-                 or keep `card` on",
+                "{why}component `card` can be off only while {} are hidden from the model, \
+                 but {} {} visible; hide them with `/settings tools` (for example \
+                 `/settings tools pi`) or keep `card` on",
                 CARD_TOOLS.join(" and "),
                 exposed.join(" and "),
                 if exposed.len() == 1 { "is" } else { "are" },
@@ -610,14 +787,16 @@ impl ComponentSet {
         Ok(())
     }
 
-    /// `default` or `custom (N off)`, for the status line and footer.
+    /// The preset and what was changed from it, for the status line:
+    /// `default`, `default, 2 off`, `pi`, `pi, 1 changed`.
     #[must_use]
     pub fn summary(&self) -> String {
         let (on, off) = self.deltas();
-        if on.is_empty() && off.is_empty() {
-            "default".to_string()
-        } else {
-            format!("default, {} off", self.off.len())
+        match (self.preset, on.len() + off.len()) {
+            (Preset::Default, 0) => "default".to_string(),
+            (Preset::Default, _) => format!("default, {} off", off.len()),
+            (Preset::Pi, 0) => "pi".to_string(),
+            (Preset::Pi, n) => format!("pi, {n} changed"),
         }
     }
 }
@@ -625,6 +804,17 @@ impl ComponentSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_soul(enabled: &dyn Fn(&Component) -> bool, visible: &dyn Fn(&str) -> bool) -> String {
+        super::render_soul(enabled, visible, Preset::Default)
+    }
+
+    fn soul_parts(
+        enabled: &dyn Fn(&Component) -> bool,
+        visible: &dyn Fn(&str) -> bool,
+    ) -> Vec<(&'static str, String)> {
+        super::soul_parts(enabled, visible, Preset::Default)
+    }
 
     fn all(_: &str) -> bool {
         true
@@ -654,7 +844,7 @@ mod tests {
             );
         }
         assert_eq!(SOUL.len(), 13);
-        assert_eq!(super::all().count(), 20);
+        assert_eq!(super::all().count(), 32);
     }
 
     #[test]
@@ -771,10 +961,7 @@ mod tests {
         let err = ComponentSet::resolve(None, &strings(&["nope"]), &[]).unwrap_err();
         assert!(err.contains("`nope`"), "{err}");
         let err = ComponentSet::resolve(Some("fancy"), &[], &[]).unwrap_err();
-        assert!(err.contains("presets: default"), "{err}");
-        assert!(ComponentSet::resolve(Some("pi"), &[], &[])
-            .unwrap_err()
-            .contains("not available yet"));
+        assert!(err.contains("presets: default, pi"), "{err}");
         assert!(ComponentSet::resolve(Some("headless"), &[], &[])
             .unwrap_err()
             .contains("headless-only"));
@@ -832,5 +1019,89 @@ mod tests {
             .with("fs-confinement", false)
             .unwrap();
         assert!(other.check_card(&all_visible).is_ok());
+    }
+
+    /// #2933 PR6: preset `pi` keeps exactly identity, tools, workspace-header,
+    /// project-instructions and persona, and says `pi` until something is changed.
+    #[test]
+    fn preset_pi_keeps_five_components_and_turns_card_off() {
+        let pi = ComponentSet::resolve(Some("pi"), &[], &[]).unwrap();
+        assert_eq!(pi.preset(), Preset::Pi);
+        let on: Vec<&str> = super::all().filter(|c| pi.is_on(c)).map(|c| c.id).collect();
+        assert_eq!(
+            on,
+            [
+                "identity",
+                "tools",
+                "project-instructions",
+                "persona",
+                "workspace-header"
+            ]
+        );
+        assert!(!pi.is_on_id("card"));
+        assert!(!pi.is_default());
+        assert_eq!(pi.summary(), "pi");
+        assert_eq!(pi.deltas(), (Vec::new(), Vec::new()));
+        // Deltas are relative to the preset and round-trip through resolve.
+        let tweaked = pi
+            .with("readme", true)
+            .unwrap()
+            .with("persona", false)
+            .unwrap();
+        assert_eq!(tweaked.summary(), "pi, 2 changed");
+        let (on, off) = tweaked.deltas();
+        let strings = |v: Vec<&str>| v.into_iter().map(String::from).collect::<Vec<_>>();
+        let again = ComponentSet::resolve(Some("pi"), &strings(on), &strings(off)).unwrap();
+        assert_eq!(again, tweaked);
+    }
+
+    /// The pi soul is the one identity line and the tools line, nothing else.
+    #[test]
+    fn the_pi_soul_is_one_line_and_the_tool_list() {
+        let pi = ComponentSet::for_preset(Preset::Pi);
+        let soul = super::render_soul(
+            &|c| pi.is_on(c),
+            &|t| matches!(t, "read_file" | "run_command"),
+            Preset::Pi,
+        );
+        assert_eq!(
+            soul,
+            "You are newt, a coding agent. You have tools: run_command, read_file."
+        );
+        // Under the default preset the identity is the long one.
+        assert!(render_soul(&|c| c.id == "identity", &all).starts_with("You are newt, a free"));
+    }
+
+    /// Preset `pi` turns `card` off, so it needs the card's tools hidden, and says why.
+    #[test]
+    fn preset_pi_is_refused_unless_the_card_tools_are_hidden() {
+        let pi = ComponentSet::for_preset(Preset::Pi);
+        let err = pi.check_card(&all).unwrap_err();
+        assert!(
+            err.contains("preset `pi` turns the `card` component off")
+                && err.contains("/settings tools pi"),
+            "{err}"
+        );
+        assert!(pi
+            .check_card(&|t| t != "prompt_read" && t != "artifact_read")
+            .is_ok());
+        // Turning the card back on under pi is the explicit pairing-free way out.
+        assert!(pi.with("card", true).unwrap().check_card(&all).is_ok());
+    }
+
+    #[test]
+    fn provider_blocks_map_to_their_components() {
+        for (provider, id) in [
+            ("agents", "project-instructions"),
+            ("note_store", "notes"),
+            ("memory_index", "memory-index"),
+            ("project_map", "project-map"),
+            ("api_surface", "api-surface"),
+            ("knowledge_base", "api-surface"),
+        ] {
+            assert_eq!(provider_component(provider), Some(id));
+            assert!(super::all().any(|c| c.id == id));
+        }
+        assert_eq!(provider_component("soul"), None);
     }
 }

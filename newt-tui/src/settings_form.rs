@@ -1152,7 +1152,8 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                 .map_err(|_| {
                     "tools: the system prompt component `card` is off, which needs prompt_read \
                      and artifact_read hidden; nothing changed. Turn it back on first with \
-                     `/settings system-prompt on card`, or leave those two tools out of the list"
+                     `/settings system-prompt on card` (or `preset default`), or leave those two tools \
+                     out of the list"
                         .to_string()
                 })?;
             let names: Vec<&str> = list.iter().flatten().map(String::as_str).collect();
@@ -2294,7 +2295,7 @@ mod tests {
             "{refused}"
         );
         assert_eq!(saved(), before, "a refused id writes nothing");
-        assert!(sp("preset pi").unwrap_err().contains("not available yet"));
+        assert!(sp("preset pi").unwrap_err().contains("/settings tools pi"));
         assert_eq!(saved(), before);
 
         sp("on three-cs").unwrap();
@@ -2368,6 +2369,58 @@ mod tests {
         let listing = sp("components").unwrap();
         assert!(listing.contains("the fence still holds"), "{listing}");
         assert!(listing.contains("per turn"), "{listing}");
+    }
+
+    /// #2933 PR6: `preset pi` is refused until the card's tools are hidden (no
+    /// implicit coupling), then writes the preset; deltas ride on it; the footer
+    /// state reads `pi`; `preset default` returns.
+    #[test]
+    fn preset_pi_needs_the_tools_hidden_first_and_deltas_ride_on_it() {
+        let _guard = settings_guard();
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        let saved = || config_fs::read(&path);
+        let sp = |v: &str| apply(Field::SystemPrompt, v);
+
+        let before = saved();
+        let refused = sp("preset pi").unwrap_err();
+        assert!(
+            refused.contains("preset `pi` turns the `card` component off")
+                && refused.contains("/settings tools pi"),
+            "{refused}"
+        );
+        assert_eq!(saved(), before, "a refused preset writes nothing");
+
+        apply(Field::Tools, "pi").unwrap();
+        let ok = sp("preset pi").unwrap();
+        assert!(
+            ok.contains("preset: pi")
+                && ok.contains("presentation only")
+                && ok.contains("prompt_read"),
+            "{ok}"
+        );
+        assert!(saved().contains("preset = \"pi\""), "{}", saved());
+        assert_eq!(crate::prompt_components_form::status(), "components: pi");
+
+        sp("on readme").unwrap();
+        assert_eq!(
+            crate::prompt_components_form::status(),
+            "components: pi, 1 changed"
+        );
+        assert!(saved().contains("on = [\"readme\"]"), "{}", saved());
+        // The tools setter still refuses to expose the card's tools under pi.
+        let widened = apply(Field::Tools, "all").unwrap_err();
+        assert!(widened.contains("preset default"), "{widened}");
+
+        sp("preset default").unwrap();
+        assert!(
+            !saved().contains("preset") && !saved().contains("components"),
+            "{}",
+            saved()
+        );
+        assert_eq!(
+            crate::prompt_components_form::status(),
+            "components: default"
+        );
     }
 
     /// #2991 review: a config that does not resolve is an error, not a default set.
