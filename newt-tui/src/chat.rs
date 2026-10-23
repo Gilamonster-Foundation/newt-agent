@@ -3992,24 +3992,28 @@ fn session_body(
                                 }
                                 ("enable", n) | ("disable", n) if !n.is_empty() => {
                                     let on = verb == "enable";
-                                    match newt_core::Config::user_config_path()
-                                        .ok_or_else(|| anyhow::anyhow!("no config path"))
-                                        .and_then(|p| {
-                                            let text = std::fs::read_to_string(&p)?;
-                                            let out =
-                                                newt_core::Config::with_mcp_enabled(&text, n, on)
-                                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                            std::fs::write(&p, out)?;
-                                            Ok(())
-                                        }) {
-                                        Ok(()) if on => print_newt(
+                                    let updated_path = (|| -> anyhow::Result<std::path::PathBuf> {
+                                        let path = newt_core::Config::mcp_server_owner_path(n)?
+                                            .ok_or_else(|| {
+                                                anyhow::anyhow!(
+                                                    "no MCP server named `{n}` in the effective Newt config"
+                                                )
+                                            })?;
+                                        newt_core::Config::set_mcp_server_enabled_in_file(
+                                            &path, n, on,
+                                        )?;
+                                        Ok(path)
+                                    })();
+                                    match updated_path {
+                                        Ok(path) if on => print_newt(
                                             &format!(
-                                                "{n} enabled in config — choose Reconnect in /settings → MCP, or `/mcp on {n}` if already connected."
+                                                "{n} enabled in {} — choose Reconnect in /settings → MCP, or `/mcp on {n}` if already connected.",
+                                                path.display()
                                             ),
                                             color,
                                             verbose,
                                         ),
-                                        Ok(()) => {
+                                        Ok(path) => {
                                             // Drop the live server immediately (#1149):
                                             // its tools vanish from the surface now.
                                             mcp.drop_server(n);
@@ -4019,7 +4023,7 @@ fn session_body(
                                                 }
                                             }
                                             print_newt(
-                                                &format!("{n} disabled in config — tools removed from this session"),
+                                                &format!("{n} disabled in {} — tools removed from this session", path.display()),
                                                 color,
                                                 verbose,
                                             );

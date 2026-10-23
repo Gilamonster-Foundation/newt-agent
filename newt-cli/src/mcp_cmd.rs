@@ -526,40 +526,32 @@ fn write_back(destination: &ResolvedPath, text: &str) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", destination.as_path().display()))
 }
 
-/// Whether TOML `text` carries a `[[mcp_servers]]` entry named `name`.
-fn config_has_mcp_server(text: &str, name: &str) -> bool {
-    newt_core::mcp::parse_newt_mcp_toml(text)
-        .iter()
-        .any(|e| e.name == name)
-}
-
 /// Remove `name`, resolving the target the same way `add` does. An explicit
-/// target (`--project`/`--config`/`$NEWT_CONFIG`/`./newt.toml`) is acted on
-/// directly. At the user level the entry may live in either the broken-out
-/// `~/.newt/mcp.toml` or `~/.newt/config.toml`, so the first of those that
-/// actually contains the name is edited — a `remove` never fails just because
-/// the operator has broken some servers out and left others inline.
+/// target (`--project`/`--config`/`$NEWT_CONFIG`) is acted on directly. At the
+/// default scope, resolve the file that contributes the entry to the effective
+/// MCP list rather than guessing from file existence.
 fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
-    if let Some(explicit) = explicit_write_target(config_path, project)? {
+    if let Some(explicit) = strong_explicit_write_target(config_path, project)? {
         let (destination, _guard) = resolve_and_lock_write_target(&explicit)?;
         let text = read_config_text(destination.as_path())?;
         let updated = Config::with_mcp_server_removed(&text, name)?;
         write_back(&destination, &updated)?;
         return Ok(explicit);
     }
-    let dir =
-        Config::user_config_dir().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))?;
-    for candidate in [dir.join("mcp.toml"), dir.join("config.toml")] {
-        let (destination, _guard) = resolve_and_lock_write_target(&candidate)?;
-        if let Some(text) = read_optional(destination.as_path())? {
-            if config_has_mcp_server(&text, name) {
-                let updated = Config::with_mcp_server_removed(&text, name)?;
-                write_back(&destination, &updated)?;
-                return Ok(candidate);
-            }
-        }
+    let owner = Config::mcp_server_owner_path(name)?
+        .ok_or_else(|| anyhow!("no MCP server named `{name}` in the effective Newt config"))?;
+    let (destination, _guard) = resolve_and_lock_write_target(&owner)?;
+    let current_owner = Config::mcp_server_owner_path(name)?
+        .as_deref()
+        .map(ResolvedPath::resolve)
+        .transpose()?;
+    if current_owner.as_ref() != Some(&destination) {
+        bail!("MCP config ownership changed for `{name}`; no file was modified, retry the command");
     }
-    bail!("no MCP server named `{name}` in ~/.newt/mcp.toml or ~/.newt/config.toml");
+    let text = read_config_text(destination.as_path())?;
+    let updated = Config::with_mcp_server_removed(&text, name)?;
+    write_back(&destination, &updated)?;
+    Ok(owner)
 }
 
 /// Assemble a validated [`McpServerEntry`] from the `add` flags. Pure.
@@ -759,6 +751,7 @@ fn cmd_list(config_path: Option<&Path>, out: &mut dyn Write) -> anyhow::Result<(
     };
     let mcp_toml = Config::user_config_dir()
         .map(|d| load_newt_mcp_toml(&d.join("mcp.toml")))
+        .transpose()?
         .unwrap_or_default();
     let claude_user = crate::home_dir()
         .map(|h| load_claude_json(&h.join(".claude.json")))
@@ -780,14 +773,18 @@ fn load_claude_json(path: &Path) -> Vec<McpServerEntry> {
         .unwrap_or_default()
 }
 
-/// Best-effort read of a newt-owned `~/.newt/mcp.toml` (`[[mcp_servers]]`) —
-/// missing or malformed yields an empty list, the same contract as discovery.
-fn load_newt_mcp_toml(path: &Path) -> Vec<McpServerEntry> {
-    read_optional(path)
-        .ok()
-        .flatten()
-        .map(|text| newt_core::mcp::parse_newt_mcp_toml(&text))
-        .unwrap_or_default()
+/// Read a newt-owned `~/.newt/mcp.toml`. A missing file is empty; malformed
+/// TOML is a safe, path-specific error instead of an empty view.
+fn load_newt_mcp_toml(path: &Path) -> anyhow::Result<Vec<McpServerEntry>> {
+    let Some(text) = read_optional(path)? else {
+        return Ok(Vec::new());
+    };
+    parse_mcp_config(&text, path)
+}
+
+fn parse_mcp_config(text: &str, path: &Path) -> anyhow::Result<Vec<McpServerEntry>> {
+    newt_core::mcp::parse_newt_mcp_toml_checked(text)
+        .map_err(|error| anyhow!("{}: {error}", path.display()))
 }
 
 /// Where a resolved catalog entry came from — so an error about a broken
@@ -1662,9 +1659,9 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let strong_explicit_target =
         strong_explicit_write_target(request.config_path, request.project)?.is_some();
     let breakout_target = mcp_write_target(request.config_path, request.project, true)?;
-    let target =
+    let mut target =
         authoritative_import_target(&breakout_target, request.grant_net, strong_explicit_target)?;
-    let target_destination = ResolvedPath::resolve(&target)
+    let mut target_destination = ResolvedPath::resolve(&target)
         .with_context(|| format!("resolving MCP import target {}", target.display()))?;
     let breakout_destination = ResolvedPath::resolve(&breakout_target).with_context(|| {
         format!(
@@ -1681,6 +1678,40 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     )?;
     let _transaction_locks = acquire_import_target_locks(lock_targets)?;
     let held_locks: Vec<&LockGuard> = _transaction_locks.iter().collect();
+
+    // A default --force import updates the file that currently owns an entry.
+    // Keep a batch in one file so the existing atomic replacement remains the
+    // transaction boundary; borrowed project/system owners still require an
+    // explicit target.
+    if request.force && !request.grant_net && !strong_explicit_target {
+        let user_config = Config::user_config_path()
+            .map(|path| ResolvedPath::resolve(&path))
+            .transpose()?;
+        let mut owner_target: Option<ResolvedPath> = None;
+        for entry in &imported {
+            let Some(owner) = Config::mcp_server_owner_path(&entry.name)? else {
+                continue;
+            };
+            let owner = ResolvedPath::resolve(&owner)?;
+            if owner_target.as_ref().is_some_and(|target| target != &owner) {
+                bail!(
+                    "selected MCP servers have different owning files; split the import so each atomic update targets one file"
+                );
+            }
+            owner_target = Some(owner);
+        }
+        if let Some(owner) = owner_target.filter(|owner| owner != &breakout_destination) {
+            if user_config.as_ref() != Some(&owner) {
+                bail!(
+                    "selected MCP server is owned by {}; refusing to modify a project or system config during a user import. Re-run with an explicit --config target",
+                    owner.as_path().display()
+                );
+            }
+            target = owner.as_path().to_path_buf();
+            target_destination = owner;
+        }
+    }
+
     target_destination
         .cleanup_abandoned_stages()
         .with_context(|| format!("cleaning abandoned stages for {}", target.display()))?;
@@ -1712,19 +1743,20 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     if let Some(migration) = newt_core::psyche_import::migrate_config_text(&doc) {
         doc = migration.text;
     }
-    let existing: std::collections::BTreeSet<String> = newt_core::mcp::parse_newt_mcp_toml(&doc)
+    let existing: std::collections::BTreeSet<String> = parse_mcp_config(&doc, &target)?
         .into_iter()
-        .map(|e| e.name)
+        .map(|entry| entry.name)
         .collect();
     let breakout_existing: std::collections::BTreeSet<String> =
         if target_destination == breakout_destination {
             existing.clone()
         } else {
-            newt_core::mcp::parse_newt_mcp_toml(
+            parse_mcp_config(
                 read_optional(breakout_destination.as_path())?
                     .as_deref()
                     .unwrap_or_default(),
-            )
+                &breakout_target,
+            )?
             .into_iter()
             .map(|entry| entry.name)
             .collect()
@@ -1794,7 +1826,9 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     }
 
     let mut added = 0usize;
-    let mut overwritten = 0usize;
+    let mut replaced = 0usize;
+    let mut higher_precedence_replacements = 0usize;
+    let mut unchanged = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     let mut adopted = Vec::new();
     for entry in &imported {
@@ -1823,17 +1857,29 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             if request.force {
                 if target_destination != breakout_destination && exists_in_breakout {
                     bail!(
-                        "MCP server `{}` exists in {} but --grant-net writes atomically to {}; refusing a cross-file overwrite that would leave a dormant duplicate. Remove the existing server first, then re-run the import",
+                        "MCP server `{}` exists in {} but the import writes atomically to {}; refusing a cross-file overwrite that would leave a dormant duplicate. Remove the existing server first, then re-run the import",
                         entry.name,
                         breakout_target.display(),
                         target.display()
                     );
                 }
                 if exists_in_target {
-                    doc = Config::with_mcp_server_removed(&doc, &entry.name)?;
+                    let previous = doc.clone();
+                    doc = Config::with_mcp_server_merged(&doc, entry)?;
+                    if doc == previous {
+                        unchanged += 1;
+                    } else {
+                        replaced += 1;
+                    }
+                } else {
+                    doc = Config::with_mcp_server_added(&doc, entry)?;
+                    if exists_lower_precedence {
+                        replaced += 1;
+                        higher_precedence_replacements += 1;
+                    } else {
+                        added += 1;
+                    }
                 }
-                doc = Config::with_mcp_server_added(&doc, entry)?;
-                overwritten += 1;
                 adopted.push(entry.clone());
                 continue;
             }
@@ -1876,8 +1922,18 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         source.display(),
         target.display()
     )?;
-    if overwritten > 0 {
-        writeln!(out, "Overwrote {overwritten} existing server(s).")?;
+    let owner_replacements = replaced - higher_precedence_replacements;
+    if owner_replacements > 0 {
+        writeln!(
+            out,
+            "Overwrote {owner_replacements} existing server(s); local settings absent from the source were preserved."
+        )?;
+    }
+    if higher_precedence_replacements > 0 {
+        writeln!(
+            out,
+            "Replaced {higher_precedence_replacements} lower-precedence server(s) with higher-precedence entries; their original config entries were left intact."
+        )?;
     }
     if !skipped.is_empty() {
         writeln!(
@@ -1887,6 +1943,11 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             skipped.join(", ")
         )?;
     }
+    writeln!(
+        out,
+        "Results: {added} added, {replaced} replaced, {unchanged} unchanged, {} skipped.",
+        skipped.len()
+    )?;
     if !hosts.is_empty() {
         writeln!(
             out,

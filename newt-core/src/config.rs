@@ -2335,7 +2335,7 @@ impl Config {
     pub fn with_mcp_enabled(text: &str, name: &str, enabled: bool) -> Result<String> {
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+            .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
         let servers =
             doc.as_table_mut()
                 .entry("mcp_servers")
@@ -2370,7 +2370,7 @@ impl Config {
         crate::mcp::validate_entry_for_write(entry)?;
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+            .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
         let servers =
             doc.as_table_mut()
                 .entry("mcp_servers")
@@ -2394,13 +2394,56 @@ impl Config {
         Ok(doc.to_string())
     }
 
+    /// Replace the source-provided fields of a same-name `[[mcp_servers]]`
+    /// entry while retaining local fields the source did not provide. Appends
+    /// the entry when it is not already present. Pure; the caller owns locking
+    /// and durable writeback.
+    pub fn with_mcp_server_merged(
+        text: &str,
+        entry: &crate::mcp::McpServerEntry,
+    ) -> Result<String> {
+        crate::mcp::validate_entry_for_write(entry)?;
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
+        let Some(item) = doc.as_table_mut().get_mut("mcp_servers") else {
+            return Self::with_mcp_server_added(text, entry);
+        };
+        let servers = item.as_array_of_tables_mut().ok_or_else(|| {
+            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+        })?;
+        let Some(existing) = servers
+            .iter_mut()
+            .find(|table| table.get("name").and_then(|value| value.as_str()) == Some(&entry.name))
+        else {
+            return Self::with_mcp_server_added(text, entry);
+        };
+
+        for (key, value) in crate::mcp::entry_to_toml_table(entry, None)? {
+            existing.insert(&key, value);
+        }
+        match entry.transport {
+            crate::mcp::TransportKind::Stdio => {
+                let _ = existing.remove("type");
+                let _ = existing.remove("url");
+                let _ = existing.remove("headers");
+            }
+            crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
+                let _ = existing.remove("command");
+                let _ = existing.remove("args");
+                let _ = existing.remove("env");
+            }
+        }
+        Ok(doc.to_string())
+    }
+
     /// Remove the named `[[mcp_servers]]` entry from the TOML `text`, preserving
     /// comments and formatting (`newt mcp remove`). PURE (no I/O); the caller
     /// does the read/write. Errors when the server name isn't present.
     pub fn with_mcp_server_removed(text: &str, name: &str) -> Result<String> {
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+            .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
         // Distinguish "no section" (→ the entry is absent) from "a section this
         // writer cannot edit" (e.g. the inline-array form, which the serde
         // reader accepts) — misreporting the latter as absent would be a lie.
@@ -2419,6 +2462,126 @@ impl Config {
             )));
         }
         Ok(doc.to_string())
+    }
+
+    /// Find the first file that contributes `name` to the effective Newt MCP
+    /// list. A project array replaces the base by default; with `arrays =
+    /// "append"`, base entries retain precedence over project entries. The
+    /// dedicated user `mcp.toml` follows the resolved config layers.
+    pub fn mcp_server_owner_path(name: &str) -> anyhow::Result<Option<PathBuf>> {
+        let base = Self::candidate_paths()
+            .into_iter()
+            .find(|path| path.is_file());
+        let project = Self::project_config_path().filter(|project| {
+            base.as_ref().is_none_or(|base| {
+                match (
+                    crate::atomic_fs::ResolvedPath::resolve(project),
+                    crate::atomic_fs::ResolvedPath::resolve(base),
+                ) {
+                    (Ok(project), Ok(base)) => project != base,
+                    _ => project.as_path() != base.as_path(),
+                }
+            })
+        });
+
+        let base_value = base
+            .as_deref()
+            .map(Self::read_mcp_source_value)
+            .transpose()?;
+        let project_value = project
+            .as_deref()
+            .map(Self::read_mcp_source_value)
+            .transpose()?;
+        let project_declares_mcp = project_value
+            .as_ref()
+            .is_some_and(|value| value.get("mcp_servers").is_some());
+        let strategy = project_value
+            .as_ref()
+            .zip(base_value.as_ref())
+            .map(|(project, base)| layering::array_merge_strategy(project, base))
+            .unwrap_or_default();
+
+        if project_declares_mcp && strategy == ArrayMergeStrategy::Replace {
+            if let Some(path) = project.as_deref() {
+                if Self::mcp_file_contains(path, name)? {
+                    return Ok(Some(path.to_path_buf()));
+                }
+            }
+        } else {
+            if let Some(path) = base.as_deref() {
+                if Self::mcp_file_contains(path, name)? {
+                    return Ok(Some(path.to_path_buf()));
+                }
+            }
+            if let Some(path) = project.as_deref() {
+                if Self::mcp_file_contains(path, name)? {
+                    return Ok(Some(path.to_path_buf()));
+                }
+            }
+        }
+
+        if let Some(path) = Self::user_config_dir().map(|dir| dir.join("mcp.toml")) {
+            if path.is_file() && Self::mcp_file_contains(&path, name)? {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Change an MCP entry under the shared config lock and atomically replace
+    /// the file only if its contents still match the snapshot read under lock.
+    pub fn set_mcp_server_enabled_in_file(
+        path: &Path,
+        name: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        let destination = crate::atomic_fs::ResolvedPath::resolve(path).map_err(|error| {
+            anyhow::anyhow!("resolving MCP config {}: {error:#}", path.display())
+        })?;
+        let _guard = crate::atomic_fs::acquire_lock(&destination.lock_path())
+            .map_err(|error| anyhow::anyhow!("locking MCP config {}: {error:#}", path.display()))?;
+        let current_owner = Self::mcp_server_owner_path(name)?
+            .map(|owner| crate::atomic_fs::ResolvedPath::resolve(&owner))
+            .transpose()?;
+        if current_owner.as_ref() != Some(&destination) {
+            anyhow::bail!(
+                "MCP config ownership changed for `{name}`; no file was modified, retry the command"
+            );
+        }
+        let original = std::fs::read_to_string(destination.as_path())
+            .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
+        let updated = Self::with_mcp_enabled(&original, name, enabled)?;
+        if updated == original {
+            return Ok(());
+        }
+        let current = std::fs::read_to_string(destination.as_path()).map_err(|error| {
+            anyhow::anyhow!("rechecking MCP config {}: {error}", path.display())
+        })?;
+        if current != original {
+            anyhow::bail!(
+                "concurrent edit detected in MCP config {}; the newer contents were preserved",
+                path.display()
+            );
+        }
+        destination
+            .atomic_write(updated.as_bytes())
+            .map_err(|error| anyhow::anyhow!("writing MCP config {}: {error:#}", path.display()))
+    }
+
+    fn read_mcp_source_value(path: &Path) -> anyhow::Result<toml::Value> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
+        toml::from_str(&text).map_err(|_| {
+            anyhow::anyhow!("{}: {}", path.display(), crate::mcp::McpConfigSyntaxError)
+        })
+    }
+
+    fn mcp_file_contains(path: &Path, name: &str) -> anyhow::Result<bool> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
+        let entries = crate::mcp::parse_newt_mcp_toml_checked(&text)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+        Ok(entries.iter().any(|entry| entry.name == name))
     }
 
     /// Build the ordered list of candidate config file paths.

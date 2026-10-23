@@ -790,6 +790,20 @@ pub struct McpImportParseReport {
     pub rejected: Vec<McpImportRejection>,
 }
 
+/// A value-independent syntax error for a Newt-owned MCP TOML file.
+///
+/// TOML parser errors include the offending line, which may contain credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpConfigSyntaxError;
+
+impl std::fmt::Display for McpConfigSyntaxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid MCP TOML syntax")
+    }
+}
+
+impl std::error::Error for McpConfigSyntaxError {}
+
 /// Secret-safe syntax error for borrowed Codex TOML. The original TOML parser
 /// error embeds the complete offending line, so it must never cross the CLI
 /// diagnostic boundary.
@@ -1377,6 +1391,23 @@ pub fn parse_newt_mcp_toml(text: &str) -> Vec<McpServerEntry> {
     toml::from_str::<Doc>(text)
         .map(|d| d.mcp_servers)
         .unwrap_or_default()
+}
+
+/// Parse a Newt-owned MCP TOML document without discarding syntax or shape
+/// errors. Management commands use this instead of discovery's best-effort
+/// parser so malformed files cannot look empty and be overwritten.
+pub fn parse_newt_mcp_toml_checked(
+    text: &str,
+) -> std::result::Result<Vec<McpServerEntry>, McpConfigSyntaxError> {
+    #[derive(Deserialize, Default)]
+    struct Doc {
+        #[serde(default)]
+        mcp_servers: Vec<McpServerEntry>,
+    }
+
+    toml::from_str::<Doc>(text)
+        .map(|doc| doc.mcp_servers)
+        .map_err(|_| McpConfigSyntaxError)
 }
 
 /// Read + parse a newt-owned `~/.newt/mcp.toml`. Missing or malformed files
