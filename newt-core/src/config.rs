@@ -2624,6 +2624,11 @@ mod retired_soul_tests {
         std::fs::write(user.join("soul.md"), "mine too").unwrap();
         let found = retired_soul_sources(&cfg, Some(&project), None, Some(&user));
         assert_eq!(found.len(), 3, "{found:?}");
-        assert!(found[1].ends_with("proj/.newt/soul.md") && found[2].ends_with("user/soul.md"));
+        // Compared as paths: a Windows rendering separates with `\`.
+        assert!(
+            Path::new(&found[1]).ends_with(Path::new("proj").join(".newt").join("soul.md"))
+                && Path::new(&found[2]).ends_with(Path::new("user").join("soul.md")),
+            "{found:?}"
+        );
     }
 }
