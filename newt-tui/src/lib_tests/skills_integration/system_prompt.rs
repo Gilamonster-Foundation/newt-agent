@@ -1,6 +1,6 @@
 use super::*;
 
-fn write_skill(root: &std::path::Path, name: &str, desc: &str) {
+pub(super) fn write_skill(root: &std::path::Path, name: &str, desc: &str) {
     let dir = root.join(name);
     fs::create_dir_all(&dir).unwrap();
     fs::write(
@@ -224,13 +224,13 @@ async fn historical_notes_preserve_content_without_redefining_the_live_workspace
 /// Pins the process-wide inputs skill resolution reads — `NEWT_CONFIG`,
 /// `NEWT_CONFIG_DIR`, `HOME` and the cwd — restoring them on drop, so a
 /// failing assertion cannot leak a redirected root into the next test.
-struct SkillRootSandbox {
+pub(super) struct SkillRootSandbox {
     vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
     cwd: std::path::PathBuf,
 }
 
 impl SkillRootSandbox {
-    fn enter(config_dir: &std::path::Path, cwd: &std::path::Path) -> Self {
+    pub(super) fn enter(config_dir: &std::path::Path, cwd: &std::path::Path) -> Self {
         let keys = [
             "NEWT_CONFIG",
             newt_core::config::NEWT_CONFIG_DIR_ENV,
