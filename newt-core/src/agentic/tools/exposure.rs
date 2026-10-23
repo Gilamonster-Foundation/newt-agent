@@ -231,6 +231,17 @@ impl ExposureSettings {
         if !self.has_operator_filter() {
             return std::borrow::Cow::Borrowed(identity);
         }
+        if identity == crate::DEFAULT_SOUL {
+            return std::borrow::Cow::Owned(crate::prompt_components::default_soul(&|tool| {
+                self.operator_visible(tool)
+            }));
+        }
+        self.render_text_identity(identity)
+    }
+
+    /// The text-matching filter, for identities that are not the registry's soul
+    /// (a custom `soul.md`, the coach soul, a persona body).
+    fn render_text_identity<'a>(&self, identity: &'a str) -> std::borrow::Cow<'a, str> {
         let hidden_names = |text: &str| {
             super::catalog::ALL_TOOL_NAMES
                 .iter()
@@ -261,8 +272,7 @@ impl ExposureSettings {
     }
 }
 
-/// The sentence prefix an identity uses to enumerate its tools.
-const TOOL_LINE_PREFIX: &str = "You have tools: ";
+use crate::prompt_components::TOOL_LINE_PREFIX;
 
 /// Whether `text` names `tool` as a whole word (`edit_file`, not `edit_files`).
 fn mentions_tool(text: &str, tool: &str) -> bool {
@@ -1222,6 +1232,65 @@ mod tests {
         );
         assert!(!mentions_tool(&rendered, "render_report"));
         assert!(!mentions_tool(&rendered, "list_dir"));
+    }
+
+    /// #2933: the registry renders the default soul exactly as the text filter did,
+    /// for every operator filter the prompt can meet.
+    #[test]
+    fn registry_soul_matches_the_text_filter_under_every_filter() {
+        let soul = crate::DEFAULT_SOUL;
+        let filters = [
+            ExposureSettings::default(),
+            ExposureSettings {
+                read_only: true,
+                ..Default::default()
+            },
+            ExposureSettings {
+                allow_list: Some(
+                    ["read_file", "write_file", "edit_file", "run_command"]
+                        .map(String::from)
+                        .to_vec(),
+                ),
+                ..Default::default()
+            },
+            ExposureSettings {
+                allow_list: Some(vec!["read_file".to_string()]),
+                read_only: true,
+                ..Default::default()
+            },
+            ExposureSettings {
+                allow_list: Some(vec!["git".to_string()]),
+                ..Default::default()
+            },
+        ];
+        for settings in filters {
+            assert_eq!(
+                settings.render_identity(soul),
+                settings.render_text_identity(soul),
+                "{settings:?}"
+            );
+        }
+    }
+
+    /// #2933 ratchet: a component's `requires_tools` is exactly the built-in tools its
+    /// text names, so the declaration cannot drift from the words the model reads.
+    #[test]
+    fn component_requirements_are_the_tools_the_text_names() {
+        use crate::prompt_components::SOUL;
+        let all = |_: &str| true;
+        for c in SOUL.iter().filter(|c| c.id != "tools") {
+            let text = crate::prompt_components::render_soul(&|x| x.id == c.id, &all);
+            let named: Vec<&str> = super::super::catalog::ALL_TOOL_NAMES
+                .iter()
+                .copied()
+                .filter(|t| mentions_tool(&text, t))
+                .collect();
+            let mut declared = c.requires_tools.to_vec();
+            declared.sort_unstable();
+            let mut named_sorted = named.clone();
+            named_sorted.sort_unstable();
+            assert_eq!(declared, named_sorted, "component `{}`", c.id);
+        }
     }
 
     #[test]

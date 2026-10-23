@@ -122,6 +122,7 @@ pub mod progress;
 pub mod project_map;
 pub mod project_model;
 pub mod prompt;
+pub mod prompt_components;
 /// Hosted-provider presets (the wizard's roster; Hermes-compatible drop-ins) —
 /// distinct from `[[providers]]` subprocess plugins.
 pub mod provider_preset;
