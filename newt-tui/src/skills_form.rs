@@ -172,7 +172,7 @@ mod tests {
         fn drop(&mut self) {
             match &self.0 {
                 Some(v) => {
-                    newt_core::process_env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v)
+                    newt_core::process_env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v);
                 }
                 None => newt_core::process_env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
             }
