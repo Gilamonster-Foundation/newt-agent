@@ -4,6 +4,7 @@
 //! and its `mcp_token` ancestors' too — no re-export is needed for either.
 
 use super::*;
+use newt_mcp_client::HttpNetGrantRequired;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -16,6 +17,57 @@ async fn management_cancelled_oauth_stops_before_configuration_or_network() {
             .await
             .unwrap_err();
     assert_eq!(error.to_string(), "MCP login cancelled");
+}
+
+/// A host-denied OAuth hop must surface as the *typed* grant cause
+/// (`HttpNetGrantRequired`), not a flattened string, so the /mcp panel can
+/// offer the exact-host prompt. `login_http` downcasts on this error; a
+/// plain-string bail in `validate_discovery_hop_with_policy` would let it
+/// pass through untyped.
+#[tokio::test]
+async fn host_denied_oauth_hop_surfaces_as_typed_grant_cause() {
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
+    let error = validate_discovery_hop_with_policy(
+        "https://denied.example.test/token",
+        "token endpoint",
+        false,
+        &policy,
+    )
+    .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
+    assert!(
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
+    );
+    assert_eq!(
+        required.map(|r| r.host.as_str()),
+        Some("denied.example.test")
+    );
+    assert!(!required.map(|r| r.private).unwrap_or(false));
+}
+
+/// A missing login stays a distinct typed cause from a host denial.
+#[tokio::test]
+async fn missing_login_stays_distinct_from_host_denial() {
+    // A host denial produces the typed grant cause ...
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
+    let error = validate_discovery_hop_with_policy(
+        "https://denied.example.test/token",
+        "token endpoint",
+        false,
+        &policy,
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<HttpNetGrantRequired>().is_some());
+
+    // ... but an invalid-endpoint (missing-login-class) error stays a plain
+    // string — it must not be confused with the typed host-denial cause.
+    let error = validate_discovery_hop_with_policy("not-a-url", "token endpoint", false, &policy)
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<HttpNetGrantRequired>().is_none(),
+        "a plain invalid-URL error must not be the host-denial typed cause: {error:#}"
+    );
 }
 
 /// Grounds the UI cancellation flag against the real callback listener: cancelling
@@ -73,12 +125,14 @@ fn oauth_hops_consume_the_complete_network_scope() {
         false,
         &denied,
     )
-    .unwrap_err()
-    .to_string();
+    .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
     assert!(
-        error.contains("outside the session network capability"),
-        "{error}"
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
     );
+    assert_eq!(required.map(|r| r.host.as_str()), Some("auth.example.test"));
+    assert!(!required.map(|r| r.private).unwrap_or(false));
 
     let allowed = OAuthHopPolicy::new(&newt_core::Scope::only(["auth.example.test".to_string()]));
     assert!(validate_discovery_hop_with_policy(
@@ -132,12 +186,14 @@ fn oauth_hops_do_not_restore_durable_hosts_removed_from_the_active_scope() {
     assert!(!exact_host_is_approved(&issuer, &policy));
     let error =
         validate_discovery_hop_with_policy(issuer.as_str(), "token endpoint", false, &policy)
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
     assert!(
-        error.contains("outside the session network capability"),
-        "{error}"
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
     );
+    assert_eq!(required.map(|r| r.host.as_str()), Some("auth.example.test"));
+    assert!(!required.map(|r| r.private).unwrap_or(false));
 }
 
 #[test]
@@ -1772,4 +1828,31 @@ async fn dcr_rejects_a_response_that_omits_redirect_uris() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("omitted redirect_uris"), "{error}");
+}
+
+/// A host-denied OAuth hop surfaced during *metadata aggregation* must keep its
+/// typed `HttpNetGrantRequired` cause instead of being flattened into a
+/// plain-string aggregate error, so the /mcp panel can still offer the
+/// exact-host prompt (`mcp_management.rs` downcasts on this type).
+#[tokio::test]
+async fn host_denied_oauth_hop_survives_metadata_aggregation() {
+    // `fetch_authorization_server_meta` is the aggregation function called for
+    // each advertised issuer during discovery. It validates the issuer hop
+    // first (before any network call), so a host denial returns the typed
+    // cause without a mock server.
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
+    let error = fetch_authorization_server_meta("https://denied.example.test", false, &policy)
+        .await
+        .unwrap_err();
+
+    let required = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>();
+    assert!(
+        required.is_some(),
+        "expected typed HttpNetGrantRequired to survive aggregation, got: {error:#}"
+    );
+    assert_eq!(
+        required.map(|r| r.host.as_str()),
+        Some("denied.example.test")
+    );
+    assert!(!required.map(|r| r.private).unwrap_or(false));
 }
