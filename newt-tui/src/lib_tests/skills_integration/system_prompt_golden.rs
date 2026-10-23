@@ -110,18 +110,19 @@ fn goldens_pin_the_assembled_prompt() {
     );
 }
 
-/// #2933 PR3: `[prompt] components.off = ["three-cs"]` removes that paragraph and
+/// #2933 PR3: `[prompt] components.off = ["habit-ground-truth"]` removes that paragraph and
 /// nothing else from the assembled prompt.
 #[serial_test::serial(real_fs)]
 #[test]
 fn switching_a_component_off_drops_exactly_its_paragraph() {
     let base = assembled("", None);
-    let off = assembled("[prompt]\ncomponents = { off = [\"three-cs\"] }\n", None);
-    let start = base.find("**Working code first").unwrap();
-    let end = base.find("\n\n## AGENTS.md").unwrap_or_else(|| {
-        panic!("project context follows the soul:\n{base}");
-    });
-    let expected = format!("{}{}", base[..start].trim_end_matches('\n'), &base[end..]);
+    let off = assembled(
+        "[prompt]\ncomponents = { off = [\"habit-ground-truth\"] }\n",
+        None,
+    );
+    let start = base.find("**Seek ground truth.**").unwrap();
+    let end = start + base[start..].find("\n\n").unwrap() + 2;
+    let expected = format!("{}{}", &base[..start], &base[end..]);
     assert_eq!(off, expected);
 }
 
@@ -156,7 +157,7 @@ fn the_request_report_names_components_by_id_with_nothing_unattributed() {
         "tools",
         "disposition",
         "habit-one-change",
-        "three-cs",
+        "habit-ground-truth",
     ] {
         assert!(all.iter().any(|l| l == id), "{id} missing from {all:?}");
     }
@@ -165,8 +166,8 @@ fn the_request_report_names_components_by_id_with_nothing_unattributed() {
     // production (`registered_agents_provider_block_reaches_prompt`); no soul byte.
     let gaps = |labels: &[String]| labels.iter().filter(|l| l.contains("unattributed")).count();
     assert_eq!(gaps(&all), 1, "{all:?}");
-    let off = labels("[prompt]\ncomponents = { off = [\"three-cs\"] }\n");
-    assert!(!off.iter().any(|l| l == "three-cs"), "{off:?}");
+    let off = labels("[prompt]\ncomponents = { off = [\"habit-ground-truth\"] }\n");
+    assert!(!off.iter().any(|l| l == "habit-ground-truth"), "{off:?}");
     assert_eq!(gaps(&off), 1, "{off:?}");
 }
 
@@ -186,7 +187,7 @@ async fn a_failed_refresh_then_new_renders_from_the_newer_accepted_config() {
     let _env = newt_core::process_env::lock();
     let _sandbox = SkillRootSandbox::enter(&config_dir, &ws);
 
-    let first = "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\"]\n[prompt]\ncomponents = { off = [\"three-cs\"] }\n";
+    let first = "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\"]\n[prompt]\ncomponents = { off = [\"habit-ground-truth\"] }\n";
     let newer = "[tool_exposure]\nallow_list = [\"read_file\"]\n";
     let broken = "[tool_exposure]\nallow_list = [\"read_file\"]\n[prompt]\ncomponents = { off = [\"nope\"] }\n";
 
@@ -222,7 +223,7 @@ async fn a_failed_refresh_then_new_renders_from_the_newer_accepted_config() {
         "the newer allow list names one tool:\n{system}"
     );
     assert!(
-        system.contains("Working code first"),
-        "the newer config has three-cs on:\n{system}"
+        system.contains("Seek ground truth"),
+        "the newer config has habit-ground-truth on:\n{system}"
     );
 }

@@ -1034,8 +1034,8 @@ mod tests {
     fn the_heading_goes_with_the_first_rule_and_never_alone() {
         let lead_only = render_soul(&|c| c.id == "identity", &all);
         assert!(!lead_only.contains("## How to work"));
-        let one_rule = render_soul(&|c| c.id == "three-cs", &all);
-        assert!(one_rule.starts_with("## How to work\n\n**Working code first"));
+        let one_rule = render_soul(&|c| c.id == "habit-ground-truth", &all);
+        assert!(one_rule.starts_with("## How to work\n\n**Seek ground truth"));
     }
 
     #[test]
@@ -1082,17 +1082,19 @@ mod tests {
         assert_eq!(chars(&pi, "tools", &four), Some(line.chars().count()));
         // A text component that pi leaves alone has one size under both.
         assert_eq!(
-            chars(&default, "three-cs", &all),
-            chars(&pi, "three-cs", &all)
+            chars(&default, "habit-ground-truth", &all),
+            chars(&pi, "habit-ground-truth", &all)
         );
     }
 
     #[test]
     fn rows_report_size_state_and_the_missing_tool() {
-        let set = ComponentSet::default().with("three-cs", false).unwrap();
+        let set = ComponentSet::default()
+            .with("habit-ground-truth", false)
+            .unwrap();
         let rows = rows(&set, &|t| t != "render_report");
         let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap().clone();
-        assert!(!row("three-cs").on && row("three-cs").chars > Some(400));
+        assert!(!row("habit-ground-truth").on && row("habit-ground-truth").chars > Some(400));
         assert_eq!(row("habit-present-findings").needs, Some("render_report"));
         assert_eq!(row("habit-present-findings").chars, Some(0));
         assert_eq!(row("identity").needs, None);
@@ -1101,9 +1103,9 @@ mod tests {
     #[test]
     fn deltas_and_summary_round_trip_through_resolve() {
         let set = ComponentSet::default()
-            .with("three-cs", false)
+            .with("habit-ground-truth", false)
             .unwrap()
-            .with("commit-attribution", false)
+            .with("habit-read-minimum", false)
             .unwrap();
         assert_eq!(set.summary(), "default, 2 off");
         assert_eq!(ComponentSet::default().summary(), "default");
@@ -1115,7 +1117,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again, set);
-        assert!(set.with("nope", true).unwrap_err().contains("three-cs"));
+        assert!(set
+            .with("nope", true)
+            .unwrap_err()
+            .contains("habit-ground-truth"));
     }
 
     #[test]
@@ -1128,15 +1133,15 @@ mod tests {
         );
     }
 
-    /// #2933 PR3: `off = ["three-cs"]` removes exactly that paragraph.
+    /// #2933 PR3: `off = ["habit-ground-truth"]` removes exactly that paragraph.
     #[test]
-    fn off_three_cs_drops_exactly_that_paragraph() {
-        let set = ComponentSet::resolve(None, &[], &strings(&["three-cs"])).unwrap();
+    fn off_a_rule_drops_exactly_that_paragraph() {
+        let set = ComponentSet::resolve(None, &[], &strings(&["habit-ground-truth"])).unwrap();
         let text = render_soul(&|c| set.is_on(c), &all);
         let base = soul_without_present_findings();
-        let paragraph_start = base.find("**Working code first").unwrap();
-        let expected = base[..paragraph_start].trim_end_matches('\n').to_owned();
-        assert_eq!(text, expected);
+        let start = base.find("**Seek ground truth.**").unwrap();
+        let end = start + base[start..].find("\n\n").unwrap() + 2;
+        assert_eq!(text, format!("{}{}", &base[..start], &base[end..]));
     }
 
     #[test]
@@ -1157,7 +1162,10 @@ mod tests {
     #[test]
     fn unknown_ids_and_presets_are_refused_naming_the_valid_ones() {
         let err = ComponentSet::resolve(None, &[], &strings(&["nope"])).unwrap_err();
-        assert!(err.contains("`nope`") && err.contains("three-cs"), "{err}");
+        assert!(
+            err.contains("`nope`") && err.contains("habit-ground-truth"),
+            "{err}"
+        );
         let err = ComponentSet::resolve(None, &strings(&["nope"]), &[]).unwrap_err();
         assert!(err.contains("`nope`"), "{err}");
         let err = ComponentSet::resolve(Some("fancy"), &[], &[]).unwrap_err();
@@ -1165,7 +1173,7 @@ mod tests {
         assert!(ComponentSet::resolve(Some("headless"), &[], &[])
             .unwrap_err()
             .contains("headless-only"));
-        let both = strings(&["three-cs"]);
+        let both = strings(&["habit-ground-truth"]);
         assert!(ComponentSet::resolve(None, &both, &both)
             .unwrap_err()
             .contains("both"));

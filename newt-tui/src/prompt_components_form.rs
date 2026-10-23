@@ -208,7 +208,10 @@ mod tests {
 
     #[test]
     fn only_the_component_words_are_commands() {
-        assert_eq!(parse("on three-cs"), Some(("on", "three-cs")));
+        assert_eq!(
+            parse("on habit-ground-truth"),
+            Some(("on", "habit-ground-truth"))
+        );
         assert_eq!(parse(" components "), Some(("components", "")));
         assert_eq!(parse("preset default"), Some(("preset", "default")));
         for other in ["edit", "reset", "~/p.md", "./on", "onward x"] {
@@ -227,7 +230,7 @@ mod tests {
             assert!(page.contains(needle), "help lacks `{needle}`");
         }
         assert!(
-            pc::ids().contains(&"three-cs"),
+            pc::ids().contains(&"habit-ground-truth"),
             "the help example names a real id"
         );
     }
