@@ -418,3 +418,64 @@ async fn remote_tool_outside_allow_list_is_prompted_not_hard_vetoed() {
     );
     assert!(out.contains("permission"), "headless denial: {out}");
 }
+
+// -----------------------------------------------------------------------
+// #2995: `--full-access` is the operator's launch-time grant, so an MCP call
+// is not asked about again — but the decision is recorded, `--yolo` alone
+// grants nothing, and a headless run (no gate) is unchanged.
+// -----------------------------------------------------------------------
+
+async fn remote_call_under(
+    full_access: bool,
+    yolo: bool,
+    with_gate: bool,
+) -> (bool, usize, Vec<String>, String) {
+    let _authority = crate::launch_authority::ScopedAuthority::new(full_access, yolo);
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+    let mut mcp = OneRemoteTool::new("mail__search");
+    let mut gate = MockGate::new(true, &caveats);
+    let out = run_remote_gated(
+        "mail__search",
+        ws.path(),
+        &caveats,
+        None,
+        &mut mcp,
+        with_gate.then_some(&mut gate),
+    )
+    .await;
+    (mcp.called, gate.asks.len(), gate.full_access, out)
+}
+
+#[tokio::test]
+async fn full_access_runs_an_mcp_call_without_asking_and_records_it() {
+    let (called, asks, recorded, out) = remote_call_under(true, false, true).await;
+    assert!(called, "{out}");
+    assert_eq!(asks, 0, "the operator already answered at launch");
+    assert_eq!(recorded, ["remote_tool:mail__search"]);
+}
+
+#[tokio::test]
+async fn without_full_access_an_mcp_call_still_asks() {
+    let (called, asks, recorded, _) = remote_call_under(false, false, true).await;
+    assert!(called);
+    assert_eq!(asks, 1);
+    assert!(recorded.is_empty());
+}
+
+#[tokio::test]
+async fn yolo_alone_does_not_preapprove_an_mcp_call() {
+    let (called, asks, recorded, _) = remote_call_under(false, true, true).await;
+    assert!(called);
+    assert_eq!(asks, 1, "--yolo only changes the exec mechanism");
+    assert!(recorded.is_empty());
+}
+
+#[tokio::test]
+async fn full_access_without_a_gate_is_still_denied() {
+    let (called, asks, recorded, out) = remote_call_under(true, false, false).await;
+    assert!(!called, "headless stays fail-closed: {out}");
+    assert_eq!(asks, 0);
+    assert!(recorded.is_empty());
+    assert!(out.contains("no interactive permission gate"), "{out}");
+}

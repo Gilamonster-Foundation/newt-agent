@@ -3953,8 +3953,17 @@ async fn execute_authorized_tool(
             reason: "Approve this remote MCP operation. Persona preferences and server tool hints do not grant permission.".into(),
             harness_bound: false,
         };
-        let grant = matches!(gate.ask(&[request]), PermissionDecision::Allow(_))
-            .then_some(McpGrant::HumanApproved);
+        // #2995: `--full-access` is the operator's own launch-time grant of
+        // unrestricted authority (frozen `LaunchAuthority`, never config or a
+        // persona), so the gate is asked to skip the PROMPT, not its vetoes.
+        // Hints and personas still grant nothing.
+        let decision = if full_access_requested() {
+            gate.ask_full_access(&[request])
+        } else {
+            gate.ask(&[request])
+        };
+        let approved = matches!(decision, PermissionDecision::Allow(_));
+        let grant = approved.then_some(McpGrant::HumanApproved);
         return match leash_mcp_call(name, args, grant) {
             Ok(leased) => mcp.call(&leased).await,
             Err(_) => host_return(executed((
