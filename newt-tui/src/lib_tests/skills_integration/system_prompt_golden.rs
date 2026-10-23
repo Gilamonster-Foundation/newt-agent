@@ -35,6 +35,10 @@ fn assembled(config: &str, soul: &str, persona: Option<&Persona>) -> String {
         "A fixture skill",
     );
     fs::write(config_dir.join("config.toml"), config).unwrap();
+    // The sandbox rewrites HOME, NEWT_CONFIG* and the cwd: hold the process-environment
+    // lock (the one the settings and workspace tests take) from before the first
+    // write until after the restore. Declared first, so it drops last.
+    let _env = newt_core::process_env::lock();
     let _sandbox = SkillRootSandbox::enter(&config_dir, &ws);
     let ws_str = ws.to_str().unwrap();
     build_system_prompt_with_persona(
