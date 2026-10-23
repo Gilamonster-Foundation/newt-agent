@@ -1144,6 +1144,16 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // nothing.
         Field::Tools => {
             let list = parse_tools_token(value)?;
+            // `card` is off only while prompt_read / artifact_read are hidden: a list
+            // that shows them again would leave the model a card it was never sent.
+            crate::prompt_components_form::current()
+                .check_card(&|tool| list.as_ref().is_none_or(|l| l.iter().any(|n| n == tool)))
+                .map_err(|_| {
+                    "tools: the system prompt component `card` is off, which needs prompt_read \
+                     and artifact_read hidden; nothing changed. Turn it back on first with \
+                     `/settings system-prompt on card`, or leave those two tools out of the list"
+                        .to_string()
+                })?;
             let names: Vec<&str> = list.iter().flatten().map(String::as_str).collect();
             persist_config(|text| {
                 newt_core::Config::with_tool_exposure_allow_list(

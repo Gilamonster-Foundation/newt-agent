@@ -5497,9 +5497,10 @@ fn session_body(
                                         plan_active,
                                     );
                                     let disposition = intake.disposition();
+                                    let turn_components = cfg.prompt_components().unwrap_or_default();
                                     let ws_state =
                                         workspace_state_block(workspace, &caveats.fs_read);
-                                    let runtime_ctx = runtime_context_block(
+                                    let runtime_ctx = runtime_context_parts(
                                         &inf_model,
                                         &inf_url,
                                         inf_kind,
@@ -5525,7 +5526,8 @@ fn session_body(
                                         &crate::turn_system::TurnSystemParts {
                                             ws_state: &ws_state,
                                             session_cwd: &session_cwd,
-                                            runtime_ctx: &runtime_ctx,
+                                            runtime: &runtime_ctx,
+                            components: &turn_components,
                                             system: &system,
                                             session_controls: &controls,
                                             communication_style: &communication_style,
@@ -5594,11 +5596,17 @@ fn session_body(
                                         notes.retain(|k| k.label != n.label);
                                         notes.push(n);
                                     }
-                                    let card = newt_core::agentic::request_preview::active_prompt_card_preview(
-                                        &exposure, &intake,
-                                    );
+                                    // `card` off sends no second system message.
+                                    let mut system_texts = vec![turn.text];
+                                    if turn_components.is_on_id("card") {
+                                        system_texts.push(
+                                            newt_core::agentic::request_preview::active_prompt_card_preview(
+                                                &exposure, &intake,
+                                            ),
+                                        );
+                                    }
                                     newt_core::agentic::request_preview::RequestSnapshot {
-                                        system_texts: vec![turn.text, card],
+                                        system_texts,
                                         tools: newt_core::agentic::request_preview::wire_tools(
                                             inf_kind, choice.api, &tools,
                                         ),
@@ -8671,8 +8679,9 @@ fn session_body(
                     );
                     // #2937: name each piece so the request report can attribute it (TUI preview: #2959).
                     refresh_prompt_override!();
+                    let turn_components = cfg.prompt_components().unwrap_or_default();
                     let ws_state = workspace_state_block(workspace, &turn_caveats.fs_read);
-                    let runtime_ctx = runtime_context_block(
+                    let runtime_ctx = runtime_context_parts(
                         &inf_model,
                         &inf_url,
                         inf_kind,
@@ -8693,7 +8702,8 @@ fn session_body(
                         &crate::turn_system::TurnSystemParts {
                             ws_state: &ws_state,
                             session_cwd: &session_cwd,
-                            runtime_ctx: &runtime_ctx,
+                            runtime: &runtime_ctx,
+                            components: &turn_components,
                             system: &system,
                             session_controls: &session_controls,
                             communication_style: &communication_style,
@@ -9414,6 +9424,9 @@ fn session_body(
                                             // #2938: a system prompt file is the
                                             // whole system message.
                                             verbatim_system: matches!(last_override, Ok(Some(_))),
+                                            // `[prompt] components`: `card` off (config load
+                                            // checked its tools are hidden).
+                                            omit_card: !turn_components.is_on_id("card"),
                                             ..newt_core::ExposureSettings::from(cfg.tool_exposure())
                                         },
                                         // Step 26.6a (#585): the experiential store

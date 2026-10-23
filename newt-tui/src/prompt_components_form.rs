@@ -15,6 +15,14 @@ use newt_core::prompt_components::{self as pc, ComponentSet};
 pub(crate) const PRESENTATION_ONLY: &str =
     "presentation only: this changes what the model is told, not what it may do";
 
+/// For a component that describes an enforced fence: off stops the telling only.
+pub(crate) const FENCE_NOTE: &str = " (off only stops telling the model; the fence still holds)";
+
+/// A row's size: characters, or `per turn` for text the harness builds each turn.
+pub(crate) fn size_label(chars: Option<usize>) -> String {
+    chars.map_or_else(|| "per turn".to_string(), |n| format!("{n} chars"))
+}
+
 /// The component commands the `system-prompt` setting understands, as
 /// `(keyword, argument)`. `None` for anything else (a file path, `edit`, `reset`).
 pub(crate) fn parse(value: &str) -> Option<(&str, &str)> {
@@ -69,9 +77,13 @@ pub(crate) fn listing() -> String {
             (true, Some(tool)) => format!("off (needs {tool})"),
             (false, _) => "off".to_string(),
         };
+        let note = if r.fence { FENCE_NOTE } else { "" };
         out.push_str(&format!(
-            "  {:<24} {:<18} {:>5} chars  {}\n",
-            r.id, state, r.chars, r.description
+            "  {:<24} {:<18} {:>10}  {}{note}\n",
+            r.id,
+            state,
+            size_label(r.chars),
+            r.description
         ));
     }
     out.push_str("/settings system-prompt on|off <id> · preset default");
@@ -118,9 +130,20 @@ pub(crate) fn apply(word: &str, arg: &str) -> Result<String, String> {
             }
             let on = word == "on";
             let next = current().with(arg, on)?;
+            // `card` off needs its tools hidden; refuse before writing anything.
+            next.check_card(&visible)?;
             persist(&next)?;
+            let fence = if pc::all().any(|c| c.id == arg && c.fence) {
+                if on {
+                    ""
+                } else {
+                    FENCE_NOTE
+                }
+            } else {
+                ""
+            };
             Ok(format!(
-                "system-prompt component {arg}: {word} — {PRESENTATION_ONLY}; \
+                "system-prompt component {arg}: {word} — {PRESENTATION_ONLY}{fence}; \
                  the next request sends the rebuilt prompt"
             ))
         }

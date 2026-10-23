@@ -1166,6 +1166,48 @@ fn runtime_context_block(
     identity: &newt_core::AgentIdentity,
     disposition: newt_core::agentic::PromptDisposition,
 ) -> String {
+    runtime_context_parts(model, endpoint, kind, identity, disposition)
+        .render(&newt_core::prompt_components::ComponentSet::default())
+}
+
+/// The runtime context as the four pieces `[prompt] components` can switch off
+/// (#2933). Each ends where the next begins, so with all four on they concatenate to
+/// exactly the block this used to be.
+pub(crate) struct RuntimeContextParts {
+    pub environment: String,
+    pub runtime_authority: String,
+    pub git_identity: String,
+    pub fs_confinement: String,
+}
+
+impl RuntimeContextParts {
+    /// `(component id, text)` in the order the block carries them.
+    pub(crate) fn pieces(&self) -> [(&'static str, &str); 4] {
+        [
+            ("environment", &self.environment),
+            ("runtime-authority", &self.runtime_authority),
+            ("git-identity", &self.git_identity),
+            ("fs-confinement", &self.fs_confinement),
+        ]
+    }
+
+    /// The pieces whose components are on, concatenated.
+    pub(crate) fn render(&self, set: &newt_core::prompt_components::ComponentSet) -> String {
+        self.pieces()
+            .into_iter()
+            .filter(|(id, _)| set.is_on_id(id))
+            .map(|(_, text)| text)
+            .collect()
+    }
+}
+
+fn runtime_context_parts(
+    model: &str,
+    endpoint: &str,
+    kind: newt_core::BackendKind,
+    identity: &newt_core::AgentIdentity,
+    disposition: newt_core::agentic::PromptDisposition,
+) -> RuntimeContextParts {
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
@@ -1179,26 +1221,29 @@ fn runtime_context_block(
     let runtime_authority = runtime_authority_note(disposition)
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
-    let filesystem_authority = filesystem_authority_note();
-    format!(
-        "# Environment (refreshed every turn)\n\
-         Harness: newt-agent v{VERSION}\n\
-         Model: {model}\n\
-         Backend: {backend} @ {endpoint}\n\
-         Current date/time: {now}\n\
-         You are the model named above, running under the newt-agent harness. \
-         When asked who or what you are — and when attributing work (commit \
-         trailers, git notes, PR text) — use this real model name and harness; \
-         never invent or guess an identity.\n\
-         {runtime_authority}\
-         # Git commit identity\n\
-         Configured Git identity: `{author_name} <{author_email}>`. \
-         Use ordinary Git commands for repository work. Harness-managed commits \
-         record every contributing model/harness pair from the attribution ledger. \
-         Never invent an author identity or claim a commit or signature without \
-         a successful tool result.\n\
-         {filesystem_authority}"
-    )
+    RuntimeContextParts {
+        environment: format!(
+            "# Environment (refreshed every turn)\n\
+             Harness: newt-agent v{VERSION}\n\
+             Model: {model}\n\
+             Backend: {backend} @ {endpoint}\n\
+             Current date/time: {now}\n\
+             You are the model named above, running under the newt-agent harness. \
+             When asked who or what you are — and when attributing work (commit \
+             trailers, git notes, PR text) — use this real model name and harness; \
+             never invent or guess an identity.\n"
+        ),
+        runtime_authority,
+        git_identity: format!(
+            "# Git commit identity\n\
+             Configured Git identity: `{author_name} <{author_email}>`. \
+             Use ordinary Git commands for repository work. Harness-managed commits \
+             record every contributing model/harness pair from the attribution ledger. \
+             Never invent an author identity or claim a commit or signature without \
+             a successful tool result.\n"
+        ),
+        fs_confinement: filesystem_authority_note().to_string(),
+    }
 }
 
 /// Read-only enforcement caveats (read anything; no write/exec/net) — the safe
