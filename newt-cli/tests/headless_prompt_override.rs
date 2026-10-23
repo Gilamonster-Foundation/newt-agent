@@ -131,6 +131,8 @@ async fn parity(config_tail: &str) -> Parity {
     let root = common::isolated_root();
     let workspace = root.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
+    // The prompt names the canonical long form; a Windows runner's TEMP is the 8.3 short one.
+    let workspace = dunce::canonicalize(&workspace).unwrap();
     std::fs::write(workspace.join("README.md"), "# fixture\n").unwrap();
     let server = MockServer::start().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -219,7 +221,7 @@ impl Parity {
         let text = b_system(body);
         // Session-specific names: the temp workspace, and the plan file's session id.
         let text = text.replace(self.workspace.to_str().unwrap(), "WS");
-        regex::Regex::new(r"sessions/[^/]+/")
+        regex::Regex::new(r"sessions[/\\][^/\\]+[/\\]")
             .unwrap()
             .replace_all(&text, "sessions/ID/")
             .into_owned()
