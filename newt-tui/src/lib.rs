@@ -141,6 +141,7 @@ mod settings_form;
 mod settings_form_pty_test;
 #[cfg(feature = "rich-tui")]
 mod shell;
+mod skills_form;
 mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
@@ -5549,7 +5550,7 @@ fn missing_bound_skills(skills: &[String], search_dirs: &[std::path::PathBuf]) -
 /// skill that doesn't resolve under `search_dirs`.
 fn warn_on_missing_bound_skills(
     persona: Option<&Persona>,
-    search_dirs: &[std::path::PathBuf],
+    cfg: &newt_core::Config,
     color: bool,
     verbose: bool,
 ) {
@@ -5557,7 +5558,23 @@ fn warn_on_missing_bound_skills(
     let Some(skills) = &persona.profile.skills else {
         return;
     };
-    let missing = missing_bound_skills(skills, search_dirs);
+    let off: Vec<&str> = skills
+        .iter()
+        .map(String::as_str)
+        .filter(|s| cfg.skill_is_off(s))
+        .collect();
+    if !off.is_empty() {
+        print_newt(
+            &format!(
+                "warning: persona `{}` binds skill(s) you switched off: {} (`/settings skills on <name>`)",
+                persona.name,
+                off.join(", ")
+            ),
+            color,
+            verbose,
+        );
+    }
+    let missing = missing_bound_skills(skills, &cfg.skill_search_dirs());
     if !missing.is_empty() {
         print_newt(
             &format!(
@@ -5916,8 +5933,13 @@ fn parse_conversation_rest<'a>(
 /// first-directory-wins union as discovery. Split out from
 /// [`build_system_prompt_with_persona`] so the injection can be unit-tested against
 /// controlled directories without mutating the process-wide `$HOME`.
-fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String> {
-    newt_skills::index_block(&newt_skills::discover_paths(skills_dirs))
+fn skills_index_for_prompt(
+    skills_dirs: &[std::path::PathBuf],
+    off: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let mut skills = newt_skills::discover_paths(skills_dirs);
+    skills.retain(|s| !off(&s.name));
+    newt_skills::index_block(&skills)
 }
 
 /// FR-5 (#999): the minimal persona that carries ONLY an altitude, used when
@@ -6023,7 +6045,8 @@ fn build_system_prompt_for(
     // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
     // missing dir contributes nothing.
     let skills_dirs = cfg.skill_search_dirs();
-    let skills_index = skills_index_for_prompt(&skills_dirs);
+    // A skill the operator switched off (`[skills] off`) is not offered to the model.
+    let skills_index = skills_index_for_prompt(&skills_dirs, &|name| cfg.skill_is_off(name));
     // Top-level names only; the assembler drops hidden ones and caps the list.
     let file_names: Option<Vec<String>> = std::fs::read_dir(workspace).ok().map(|entries| {
         entries
@@ -6346,10 +6369,7 @@ fn handle_posture_command(arg: &str, cfg: &newt_core::Config, color: bool, verbo
     // Resolve + validate WITHOUT mutating. The skill loader reuses the SAME
     // `use_skill` path (`load_body_from` over the configured search dirs) —
     // skill dirs are config-rooted, exactly as the `use_skill` tool resolves.
-    let skills_dirs = cfg.skill_search_dirs();
-    let posture = build_posture(arg, cfg, |skill_name| {
-        newt_skills::load_body_from(&skills_dirs, skill_name)
-    });
+    let posture = build_posture(arg, cfg, |skill_name| cfg.load_skill_body(skill_name));
     let posture = match posture {
         Ok(posture) => posture,
         Err(e) => {

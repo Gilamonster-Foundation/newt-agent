@@ -19,6 +19,7 @@ fn triage_config(skills_dir: &std::path::Path) -> newt_core::Config {
         skills: Some(newt_core::SkillsConfig {
             search: vec![skills_dir.to_string_lossy().into_owned()],
             bundled_dir: String::new(),
+            ..Default::default()
         }),
         ..newt_core::Config::default()
     };

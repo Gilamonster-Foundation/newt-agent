@@ -49,6 +49,13 @@ pub enum SkillError {
     #[error("unknown skill: '{0}'")]
     UnknownSkill(String),
 
+    /// The operator switched the skill off (`[skills] off`): it is installed but not
+    /// to be loaded.
+    #[error(
+        "skill '{0}' is switched off ([skills] off); turn it on with `/settings skills on {0}`"
+    )]
+    Off(String),
+
     /// A filesystem operation failed, tagged with the path it failed on.
     #[error("{path}: {source}")]
     Io {
