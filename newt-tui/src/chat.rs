@@ -2843,8 +2843,22 @@ fn session_body(
     // prompt from it. A set, reset or edited file rebuilds the prompt on the
     // spot (and refreshes the footer), not at the next `/new`.
     let mut last_override = crate::try_system_prompt_override();
+    // #2933: likewise for `[prompt] components`, which shape the soul.
+    let mut last_components = cfg.prompt_components().unwrap_or_default();
     macro_rules! refresh_prompt_override {
         () => {
+            let components_now = cfg.prompt_components().unwrap_or_default();
+            if components_now != last_components {
+                last_components = components_now;
+                system = rebuild_system_prompt(
+                    workspace,
+                    &memory,
+                    active_persona.as_ref(),
+                    &active_conversation_id,
+                    Some(&*report_sink),
+                );
+                print_newt("system prompt rebuilt (components changed)", color, verbose);
+            }
             if crate::system_prompt_edit::refresh_override(
                 &mut last_override,
                 crate::try_system_prompt_override,
@@ -7087,6 +7101,49 @@ fn session_body(
                                 ),
                             }
                         }};
+                    }
+                    // #2933: the system prompt component checklist. Like the tools
+                    // panel it REPORTS a choice; each change is one `on|off <id>`
+                    // through the receipted settings path, then `cfg` is
+                    // re-resolved and the prompt rebuilt before the next turn.
+                    #[cfg(feature = "rich-tui")]
+                    if panel_tokens.as_slice() == ["settings", "system-prompt", "components"]
+                        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    {
+                        let window = surface
+                            .open_panel(PanelMode::Inline(crate::components_panel::height()));
+                        let mut panel = crate::components_panel::ComponentsPanel::new(
+                            &crate::prompt_components_form::current(),
+                            &crate::prompt_components_form::visible,
+                        );
+                        match crate::components_panel::run(&mut panel, window) {
+                            Ok(Some(choice)) => {
+                                for (id, on) in choice {
+                                    let value = format!("{} {id}", if on { "on" } else { "off" });
+                                    match crate::settings_form::apply_and_record(
+                                        crate::settings_form::Field::SystemPrompt,
+                                        &value,
+                                        "/settings system-prompt components",
+                                    ) {
+                                        Ok(line) | Err(line) => print_newt(&line, color, verbose),
+                                    }
+                                }
+                                cfg = crate::resolve_runtime_or_default();
+                                refresh_prompt_override!();
+                            }
+                            Ok(None) => print_newt("components: cancelled", color, verbose),
+                            Err(error) => print_newt(
+                                &format!(
+                                    "components panel unavailable ({error}); \
+                                     use /settings system-prompt on|off <id>"
+                                ),
+                                color,
+                                verbose,
+                            ),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
                     }
                     #[cfg(feature = "rich-tui")]
                     if panel_tokens.as_slice() == ["settings", "tools"]

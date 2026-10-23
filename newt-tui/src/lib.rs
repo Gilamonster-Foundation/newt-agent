@@ -126,6 +126,7 @@ mod prompt_visibility_test;
 // assertion is structural ("on screen while still running"), not a stopwatch.
 #[cfg(all(test, unix))]
 mod interrupt_ack_pty_test;
+mod prompt_components_form;
 #[cfg(any(feature = "rich-tui", feature = "live-spill"))]
 mod scrollbar;
 /// #1981: the ONE list of top-level slash commands. Three lists knew this
@@ -238,6 +239,8 @@ mod permissions_panel;
 mod settings_panel;
 // #2932: the `/settings tools` checklist — edits the `[tool_exposure]` policy
 // through the settings form's one mutation path.
+#[cfg(feature = "rich-tui")]
+mod components_panel;
 #[cfg(feature = "rich-tui")]
 mod theme_panel;
 #[cfg(feature = "rich-tui")]
@@ -5918,6 +5921,7 @@ fn build_system_prompt_with_persona(
         newt_core::Altitude::Coach => newt_core::COACH_SOUL,
         newt_core::Altitude::Doer => soul,
     };
+    let identity_source = identity;
     // Resolved once and shared with the skills index below; the ratchet in
     // newt-core/tests/resolve_publishes_ratchet.rs pins the publishing resolve
     // count per file.
@@ -5936,6 +5940,15 @@ fn build_system_prompt_with_persona(
         .and_then(|c| c.prompt_components().ok())
         .unwrap_or_default();
     let identity = exposure.render_identity_with(identity, &components);
+    // The doer soul is built from components; the report names each by id.
+    let doer_soul = identity_source == newt_core::DEFAULT_SOUL;
+    let soul_pieces = if doer_soul {
+        newt_core::prompt_components::soul_parts(&|c| components.is_on(c), &|t| {
+            exposure.operator_visible(t)
+        })
+    } else {
+        Vec::new()
+    };
     // `[tui] narration_intent_line` (opt-in): every identity gets it and no
     // soul text carries it.
     let intent = cfg
@@ -5985,7 +5998,17 @@ fn build_system_prompt_with_persona(
     });
     if let Some(s) = sink {
         for n in &assembled.notes {
-            s.annotate(&n.label, &n.source, &n.text);
+            if n.label == "soul" && doer_soul {
+                // #2933: the soul is reported as its components, by id. The soul
+                // provider labelled the whole block earlier; that note would
+                // swallow the pieces (and go stale once one is switched off).
+                s.forget("soul");
+                for (id, text) in &soul_pieces {
+                    s.annotate(id, "prompt_components::SOUL", text);
+                }
+            } else {
+                s.annotate(&n.label, &n.source, &n.text);
+            }
         }
     }
     assembled.text
@@ -6031,6 +6054,9 @@ fn rebuild_system_prompt(
     // #2938: the operator's file REPLACES the assembled prompt entirely.
     let found = system_prompt_override();
     system_prompt_edit::set_active(found.as_ref().map(|f| f.path.clone()));
+    system_prompt_edit::set_custom_components(
+        found.is_none() && !prompt_components_form::current().is_default(),
+    );
     if let Some(found) = found {
         if let Some(s) = sink {
             s.annotate(

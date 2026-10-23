@@ -598,6 +598,19 @@ fn footer_shows_an_active_system_prompt_override() {
     crate::system_prompt_edit::set_active(None);
     assert!(shown.contains("[prompt: system-prompt.md]"), "{shown}");
     assert!(!footer_text(&ed, "m", "e").contains("[prompt:"));
+    // #2933: dropped components read `custom`; a file override wins over them.
+    crate::system_prompt_edit::set_custom_components(true);
+    let custom = footer_text(&ed, "m", "e");
+    crate::system_prompt_edit::set_active(Some("/home/x/.newt/system-prompt.md".into()));
+    let both = footer_text(&ed, "m", "e");
+    crate::system_prompt_edit::set_active(None);
+    crate::system_prompt_edit::set_custom_components(false);
+    assert!(custom.contains("[prompt: custom]"), "{custom}");
+    assert!(
+        both.contains("[prompt: system-prompt.md]") && !both.contains("custom"),
+        "{both}"
+    );
+    assert!(!footer_text(&ed, "m", "e").contains("[prompt:"));
 }
 
 #[test]

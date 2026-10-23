@@ -342,7 +342,7 @@ impl Field {
             // terminal). `reset` returns to the assembled prompt (#2938).
             Self::SystemPrompt => ValueSpace::Text {
                 release: "reset",
-                placeholder: "~/.newt/system-prompt.md | edit",
+                placeholder: "~/.newt/system-prompt.md | edit | components | on <id> | off <id>",
             },
             // Free text, not a vocabulary: `pi` and `all` are words, but the
             // general value is a list of tool names the checklist assembles.
@@ -502,6 +502,12 @@ impl Field {
         match self {
             Self::Rounds => newt_core::tenacity::session_tool_round_limit()
                 .map_or_else(|| SettingValue::Token(self.current()), SettingValue::from),
+            // The components ride with the file so a switch is journalled.
+            Self::SystemPrompt => SettingValue::Token(format!(
+                "{}; {}",
+                self.current(),
+                crate::prompt_components_form::status()
+            )),
             _ => SettingValue::Token(self.current()),
         }
     }
@@ -662,12 +668,17 @@ pub(crate) fn field_menu() -> InteractionDefinition {
 /// The second step: which value for `field`.
 pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
     let current = field.current();
+    let shown = if field == Field::SystemPrompt {
+        format!("{current} · {}", crate::prompt_components_form::status())
+    } else {
+        current.clone()
+    };
     let ValueSpace::Choice(values) = field.value_space() else {
         // A number has no menu to pick from, so the form asks for it — still a
         // typed `InteractionDefinition`, so it still renders on the plain
         // scroller, the RichTUI and the web.
         return newt_core::interaction_form::text_field(
-            format!("{} — currently {current}", field.label()),
+            format!("{} — currently {shown}", field.label()),
             format!("{} · Esc cancels", field.accepts_hint()),
         );
     };
@@ -709,7 +720,7 @@ fn persist_tui_key(key: &str, value: &str) -> Result<(), String> {
 
 /// Read-modify-write the operator's config through one of `Config`'s pure,
 /// comment-preserving writers. The fs goes through the test seam.
-fn persist_config(
+pub(crate) fn persist_config(
     rewrite: impl FnOnce(&str) -> Result<String, newt_core::NewtError>,
 ) -> Result<(), String> {
     let path = newt_core::Config::user_config_path()
@@ -1050,6 +1061,10 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // Session only; `[prompt] file` persists it. `edit` is the session's
         // (it needs the terminal), so it never lands here as a path.
         Field::SystemPrompt => match value {
+            v if crate::prompt_components_form::parse(v).is_some() => {
+                let (word, arg) = crate::prompt_components_form::parse(v).unwrap_or_default();
+                return crate::prompt_components_form::apply(word, arg);
+            }
             "edit" => return Err("system-prompt edit needs the interactive session".to_string()),
             // Blank, not removed: a removed twin would reveal `[prompt] file`.
             "reset" => newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, ""),
@@ -2230,6 +2245,65 @@ mod tests {
         assert_eq!(saved_policy().allow_list, None);
         assert_eq!(tools_token(&saved_policy()), "all");
         assert_eq!(saved_policy().status_label(), None);
+    }
+
+    /// #2933 PR4: `/settings system-prompt on|off|preset|components` persist
+    /// `[prompt] components`, list the soul's pieces, refuse unknown ids writing
+    /// nothing, and journal the move.
+    #[test]
+    fn the_system_prompt_component_commands_persist_and_refuse_unknown_ids() {
+        let _guard = settings_guard();
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        let saved = || config_fs::read(&path);
+        let sp = |v: &str| apply(Field::SystemPrompt, v);
+
+        let listing = sp("components").unwrap();
+        assert!(
+            listing.contains("three-cs") && listing.contains("presentation only"),
+            "{listing}"
+        );
+        assert!(listing.contains("default"), "{listing}");
+
+        let off = sp("off three-cs").unwrap();
+        assert!(off.contains("presentation only"), "{off}");
+        assert!(saved().contains("off = [\"three-cs\"]"), "{}", saved());
+        assert_eq!(
+            crate::prompt_components_form::status(),
+            "components: default, 1 off"
+        );
+        assert!(
+            sp("components").unwrap().contains("off "),
+            "listing shows the off row"
+        );
+
+        let before = saved();
+        let refused = sp("off nope").unwrap_err();
+        assert!(
+            refused.contains("`nope`") && refused.contains("three-cs"),
+            "{refused}"
+        );
+        assert_eq!(saved(), before, "a refused id writes nothing");
+        assert!(sp("preset pi").unwrap_err().contains("not available yet"));
+        assert_eq!(saved(), before);
+
+        sp("on three-cs").unwrap();
+        assert!(
+            !saved().contains("components"),
+            "back to default drops the key: {}",
+            saved()
+        );
+        sp("off identity").unwrap();
+        sp("preset default").unwrap();
+        assert_eq!(
+            crate::prompt_components_form::status(),
+            "components: default"
+        );
+
+        // The journal sees a switch: the value now carries the components.
+        assert!(Field::SystemPrompt
+            .value_now()
+            .to_string()
+            .contains("components: default"));
     }
 
     /// #2981 review: unticking the last checkbox is "no tools", not "all".
