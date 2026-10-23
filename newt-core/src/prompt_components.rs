@@ -340,9 +340,9 @@ pub const SOUL: &[Component] = &[
     },
     Component {
         id: "three-cs",
-        description: "Working code first, then lift hardcoded knowledge into composed, configured data.",
+        description: "Working code first, then lift hardcoded knowledge into data (now the `three-cs` skill; off by default).",
         requires_tools: &[],
-        default_on: true,
+        default_on: false,
         under_heading: true,
         layer: Layer::Soul,
         coach: false,
@@ -974,10 +974,14 @@ mod tests {
     }
 
     /// The soul without the paragraphs that left the default prompt for skills
-    /// (`habit-present-findings`, `commit-attribution`): the default set renders to this.
+    /// (`habit-present-findings`, `commit-attribution`, `three-cs`): the default set renders to this.
     fn soul_without_present_findings() -> String {
         let mut text = crate::DEFAULT_SOUL.to_string();
-        for marker in ["**Present findings", "**Sign every commit"] {
+        for marker in [
+            "**Present findings",
+            "**Sign every commit",
+            "**Working code first",
+        ] {
             let start = text
                 .find(marker)
                 .expect("the oracle still has the paragraph");
@@ -1023,7 +1027,10 @@ mod tests {
             .filter(|c| !c.default_on)
             .map(|c| c.id)
             .collect();
-        assert_eq!(off, ["commit-attribution", "habit-present-findings"]);
+        assert_eq!(
+            off,
+            ["commit-attribution", "habit-present-findings", "three-cs"]
+        );
     }
 
     #[test]

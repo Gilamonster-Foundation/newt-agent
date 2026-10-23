@@ -279,4 +279,18 @@ mod tests {
         let attribution = pc::all().find(|c| c.id == "commit-attribution").unwrap();
         assert!(!attribution.default_on, "the rule is a skill now");
     }
+
+    /// The `three-cs` rule lives on as the bundled skill; the prompt component is off.
+    #[test]
+    fn three_cs_is_a_bundled_skill_and_off_by_default() {
+        let skill = newt_skills::Skill::parse(
+            include_str!("../../.newt/bundled-skills/three-cs/SKILL.md"),
+            ".newt/bundled-skills/three-cs",
+        )
+        .expect("the skill parses");
+        assert_eq!(skill.name, "three-cs");
+        assert!(skill.body.contains("Knowledge belongs in data, not logic"));
+        let three_cs = pc::all().find(|c| c.id == "three-cs").unwrap();
+        assert!(!three_cs.default_on, "the rule is a skill now");
+    }
 }
