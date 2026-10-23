@@ -168,15 +168,15 @@ mod tests {
 
     #[test]
     fn a_rule_whose_tool_is_hidden_says_what_it_needs() {
-        let panel = open();
+        let panel = ComponentsPanel::new(&ComponentSet::default(), &|t| t != "edit_file");
         let rows = panel.rows_view();
         let id = panel
             .rows
             .iter()
-            .position(|r| r.id == "habit-present-findings")
+            .position(|r| r.id == "habit-prefer-edit")
             .unwrap();
         assert!(
-            rows[id].provenance.contains("off (needs render_report)"),
+            rows[id].provenance.contains("off (needs edit_file)"),
             "{}",
             rows[id].provenance
         );

@@ -246,9 +246,6 @@ impl ExposureSettings {
         components: &crate::prompt_components::ComponentSet,
     ) -> std::borrow::Cow<'a, str> {
         if identity == crate::DEFAULT_SOUL {
-            if !self.has_operator_filter() && components.is_default() {
-                return std::borrow::Cow::Borrowed(identity);
-            }
             return std::borrow::Cow::Owned(crate::prompt_components::render_soul(
                 &|c| components.is_on(c),
                 &|tool| self.operator_visible(tool),
@@ -1215,11 +1212,12 @@ mod tests {
     #[test]
     fn identity_prompt_names_only_operator_visible_tools() {
         let soul = crate::DEFAULT_SOUL;
-        assert_eq!(
-            ExposureSettings::default().render_identity(soul),
-            soul,
-            "no operator filter → identity unchanged"
-        );
+        // No operator filter: the registry's default soul, which is the oracle
+        // minus the `present-findings` paragraph (a skill now).
+        let default = ExposureSettings::default().render_identity(soul);
+        assert_eq!(default, crate::prompt_components::default_soul(&|_| true));
+        assert!(!default.contains("**Present findings"));
+        assert!(soul.contains("**Present findings"));
 
         let read_only = ExposureSettings {
             read_only: true,
@@ -1286,8 +1284,13 @@ mod tests {
             },
         ];
         for settings in filters {
+            // The registry with every component on is what the text filter did to
+            // the whole oracle soul.
+            let everything = crate::prompt_components::ComponentSet::default()
+                .with("habit-present-findings", true)
+                .unwrap();
             assert_eq!(
-                settings.render_identity(soul),
+                settings.render_identity_with(soul, &everything),
                 settings.render_text_identity(soul),
                 "{settings:?}"
             );

@@ -231,4 +231,27 @@ mod tests {
             "the help example names a real id"
         );
     }
+
+    /// #2933 PR7: a rule that left the default prompt lives on as a bundled skill, with
+    /// its words, so switching the component off loses nothing.
+    #[test]
+    fn present_findings_moved_to_a_bundled_skill_with_its_text() {
+        let skill = newt_skills::Skill::parse(
+            include_str!("../../.newt/bundled-skills/present-findings/SKILL.md"),
+            ".newt/bundled-skills/present-findings",
+        )
+        .expect("the skill parses");
+        assert_eq!(skill.name, "present-findings");
+        for sentence in [
+            "your deliverable is a rendered report, not a one-line status",
+            "call `render_report` to present it",
+            "A failed data source is one degraded section, not a dead end",
+        ] {
+            assert!(skill.body.contains(sentence), "skill lacks `{sentence}`");
+        }
+        let present = pc::all()
+            .find(|c| c.id == "habit-present-findings")
+            .unwrap();
+        assert!(!present.default_on, "the rule is a skill now");
+    }
 }

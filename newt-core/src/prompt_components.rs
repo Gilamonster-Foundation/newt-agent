@@ -295,9 +295,9 @@ pub const SOUL: &[Component] = &[
     },
     Component {
         id: "habit-present-findings",
-        description: "Present gathered findings with render_report, degraded sections included.",
+        description: "Present gathered findings with render_report (now the `present-findings` skill; off by default).",
         requires_tools: &["render_report"],
-        default_on: true,
+        default_on: false,
         under_heading: true,
         layer: Layer::Soul,
         pi_text: None,
@@ -820,11 +820,26 @@ mod tests {
         true
     }
 
-    /// #2933: the default components ARE the soul. The const stays as the oracle until
-    /// the soul is retired.
+    /// The soul without its `habit-present-findings` paragraph, which is the
+    /// `present-findings` skill now and off by default.
+    fn soul_without_present_findings() -> String {
+        let start = crate::DEFAULT_SOUL
+            .find("**Present findings")
+            .expect("the oracle still has the paragraph");
+        let end = start + crate::DEFAULT_SOUL[start..].find("\n\n").expect("not last") + 2;
+        format!(
+            "{}{}",
+            &crate::DEFAULT_SOUL[..start],
+            &crate::DEFAULT_SOUL[end..]
+        )
+    }
+
+    /// #2933: ALL the components, switched on, ARE the oracle soul; the default set is
+    /// that soul minus exactly the `habit-present-findings` paragraph.
     #[test]
-    fn default_components_join_to_default_soul() {
-        assert_eq!(default_soul(&all), crate::DEFAULT_SOUL);
+    fn components_join_to_default_soul() {
+        assert_eq!(render_soul(&|_| true, &all), crate::DEFAULT_SOUL);
+        assert_eq!(default_soul(&all), soul_without_present_findings());
     }
 
     #[test]
@@ -848,8 +863,12 @@ mod tests {
     }
 
     #[test]
-    fn every_component_is_on_by_default() {
-        assert!(super::all().all(|c| c.default_on));
+    fn every_component_but_present_findings_is_on_by_default() {
+        let off: Vec<&str> = super::all()
+            .filter(|c| !c.default_on)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(off, ["habit-present-findings"]);
     }
 
     #[test]
@@ -879,11 +898,11 @@ mod tests {
 
     #[test]
     fn parts_join_to_the_soul_and_carry_the_heading_with_the_first_rule() {
-        let parts = soul_parts(&|c| c.default_on, &all);
+        let parts = soul_parts(&|_| true, &all);
         assert_eq!(parts.len(), 13);
         assert_eq!(parts[0].0, "identity");
         assert!(parts[3].1.starts_with("## How to work\n\n**One change"));
-        assert_eq!(render_soul(&|c| c.default_on, &all), crate::DEFAULT_SOUL);
+        assert_eq!(render_soul(&|_| true, &all), crate::DEFAULT_SOUL);
     }
 
     #[test]
@@ -921,7 +940,10 @@ mod tests {
     fn no_config_is_the_default_set() {
         let set = ComponentSet::resolve(None, &[], &[]).unwrap();
         assert!(set.is_default());
-        assert_eq!(render_soul(&|c| set.is_on(c), &all), crate::DEFAULT_SOUL);
+        assert_eq!(
+            render_soul(&|c| set.is_on(c), &all),
+            soul_without_present_findings()
+        );
     }
 
     /// #2933 PR3: `off = ["three-cs"]` removes exactly that paragraph.
@@ -929,13 +951,9 @@ mod tests {
     fn off_three_cs_drops_exactly_that_paragraph() {
         let set = ComponentSet::resolve(None, &[], &strings(&["three-cs"])).unwrap();
         let text = render_soul(&|c| set.is_on(c), &all);
-        let (paragraph_start, _) = crate::DEFAULT_SOUL
-            .match_indices("**Working code first")
-            .next()
-            .unwrap();
-        let expected = crate::DEFAULT_SOUL[..paragraph_start]
-            .trim_end_matches('\n')
-            .to_owned();
+        let base = soul_without_present_findings();
+        let paragraph_start = base.find("**Working code first").unwrap();
+        let expected = base[..paragraph_start].trim_end_matches('\n').to_owned();
         assert_eq!(text, expected);
     }
 
