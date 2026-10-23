@@ -25,6 +25,9 @@ pub const NAMED_TOOLS: &[&str] = &[
 /// The prefix of the sentence that enumerates the tools.
 pub const TOOL_LINE_PREFIX: &str = "You have tools: ";
 
+/// The coach altitude's heading, printed once before its first rule.
+const COACH_HEADING: &str = "## How to coach";
+
 /// Printed once, before the first rule that sits under it.
 const HEADING: &str = "## How to work";
 
@@ -63,6 +66,8 @@ pub struct Component {
     /// Rules under `## How to work`; the identity lines sit above it.
     under_heading: bool,
     pub layer: Layer,
+    /// Belongs to the coach altitude's soul, not the doer's.
+    coach: bool,
     /// The text under preset `pi`, when it differs from `body`'s.
     pi_text: Option<&'static str>,
     /// Describes a fence the harness enforces elsewhere. Switching it off only stops
@@ -72,6 +77,12 @@ pub struct Component {
 }
 
 impl Component {
+    /// Whether this belongs to the coach altitude's soul rather than the doer's.
+    #[must_use]
+    pub fn is_coach(&self) -> bool {
+        self.coach
+    }
+
     fn render(&self, visible: &dyn Fn(&str) -> bool, preset: Preset) -> String {
         match self.body {
             Body::Text(text) => match (preset, self.pi_text) {
@@ -190,6 +201,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: false,
         layer: Layer::Soul,
+        coach: false,
         pi_text: Some(PI_IDENTITY),
         fence: false,
         body: Body::Text(IDENTITY),
@@ -201,6 +213,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: false,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Tools,
@@ -212,6 +225,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: false,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(DISPOSITION),
@@ -223,6 +237,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(ONE_CHANGE),
@@ -234,6 +249,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(READ_MINIMUM),
@@ -245,6 +261,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(PREFER_EDIT),
@@ -256,6 +273,7 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(STOP_WHEN_BLOCKED),
@@ -267,17 +285,19 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(GROUND_TRUTH),
     },
     Component {
         id: "commit-attribution",
-        description: "Credit the model and harness in a Co-authored-by trailer on every commit.",
+        description: "Credit the model and harness in a Co-authored-by trailer (now the `commit-attribution` skill; off by default).",
         requires_tools: &["git"],
-        default_on: true,
+        default_on: false,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(COMMIT_ATTRIBUTION),
@@ -289,17 +309,19 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(ACT_NOT_DESCRIBE),
     },
     Component {
         id: "habit-present-findings",
-        description: "Present gathered findings with render_report, degraded sections included.",
+        description: "Present gathered findings with render_report (now the `present-findings` skill; off by default).",
         requires_tools: &["render_report"],
-        default_on: true,
+        default_on: false,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(PRESENT_FINDINGS),
@@ -311,20 +333,136 @@ pub const SOUL: &[Component] = &[
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        coach: false,
         pi_text: None,
         fence: false,
         body: Body::Text(EXPLORE_BUDGET),
     },
     Component {
         id: "three-cs",
-        description: "Working code first, then lift hardcoded knowledge into composed, configured data.",
+        description: "Working code first, then lift hardcoded knowledge into data (now the `three-cs` skill; off by default).",
+        requires_tools: &[],
+        default_on: false,
+        under_heading: true,
+        layer: Layer::Soul,
+        coach: false,
+        pi_text: None,
+        fence: false,
+        body: Body::Text(THREE_CS),
+    },
+];
+
+const COACH_IDENTITY: &str = "\
+You are newt in COACH mode: an advisor, not a doer. Be concise and direct. \
+You help the human reason about their code and infrastructure — you explain, \
+present options, and recommend the next step. You do NOT make the change \
+yourself.";
+
+const COACH_ADVISE: &str = "\
+**Advise; do not act.** Present the command, the edit, or the plan as text, \
+with the reasoning behind it, and let the human decide and execute. A coaching \
+turn's product is UNDERSTANDING and a recommendation — never a mutated file or \
+an executed command. Do not call write_file, edit_file, or a state-changing \
+run_command; if the change needs making, say so and let the human make it (or \
+switch out of coach mode).";
+
+const COACH_GROUND: &str = "\
+**Ground your advice in the real code.** Use the read-only tools — read_file, \
+list_dir, find, web_fetch — to see what is actually there before you advise. \
+Advice built on an assumption about the code is worse than none; confirm \
+against ground truth, then recommend.";
+
+const COACH_SHOW_COMMAND: &str = "\
+**Show the command, don't run it.** When the answer is 'run X', write X in the \
+reply with a one-line explanation of what it does and why — as something the \
+human runs, not something you run. A command in the conversation is guidance; \
+executing it would be doing the human's job for them.";
+
+const COACH_TEACH: &str = "\
+**Teach the reasoning, not just the answer.** Explain WHY, name the trade-offs, \
+and point at the one next step. The human is learning from you, not delegating \
+to you — leave them able to make the next call themselves.";
+
+const COACH_STOP_UNSURE: &str = "\
+**Stop when unsure.** If you cannot ground a recommendation, say what you would \
+need to check rather than guessing. One honest 'here is what I'd verify first' \
+beats a confident wrong answer.";
+
+/// The coach altitude's soul as components (#2933): chosen by the persona's altitude
+/// in place of the doer's, on the same rails (ids, `[prompt] components`, the listing).
+/// All on, they join to [`COACH_SOUL`](crate::COACH_SOUL), the oracle the tests keep.
+pub const COACH: &[Component] = &[
+    Component {
+        id: "coach-identity",
+        description: "Coach altitude: who the agent is (an advisor, not a doer).",
+        requires_tools: &[],
+        default_on: true,
+        under_heading: false,
+        layer: Layer::Soul,
+        coach: true,
+        pi_text: None,
+        fence: false,
+        body: Body::Text(COACH_IDENTITY),
+    },
+    Component {
+        id: "coach-advise",
+        description: "Coach altitude: advise, do not act; present the change as text.",
+        requires_tools: &["write_file", "edit_file", "run_command"],
+        default_on: true,
+        under_heading: true,
+        layer: Layer::Soul,
+        coach: true,
+        pi_text: None,
+        fence: false,
+        body: Body::Text(COACH_ADVISE),
+    },
+    Component {
+        id: "coach-ground",
+        description: "Coach altitude: ground the advice in the real code, with read-only tools.",
+        requires_tools: &["read_file", "list_dir", "find", "web_fetch"],
+        default_on: true,
+        under_heading: true,
+        layer: Layer::Soul,
+        coach: true,
+        pi_text: None,
+        fence: false,
+        body: Body::Text(COACH_GROUND),
+    },
+    Component {
+        id: "coach-show-command",
+        description: "Coach altitude: show the command, do not run it.",
         requires_tools: &[],
         default_on: true,
         under_heading: true,
         layer: Layer::Soul,
+        coach: true,
         pi_text: None,
         fence: false,
-        body: Body::Text(THREE_CS),
+        body: Body::Text(COACH_SHOW_COMMAND),
+    },
+    Component {
+        id: "coach-teach",
+        description: "Coach altitude: teach the reasoning, not just the answer.",
+        requires_tools: &[],
+        default_on: true,
+        under_heading: true,
+        layer: Layer::Soul,
+        coach: true,
+        pi_text: None,
+        fence: false,
+        body: Body::Text(COACH_TEACH),
+    },
+    Component {
+        id: "coach-stop-unsure",
+        description: "Coach altitude: stop and say what to verify when unsure.",
+        requires_tools: &[],
+        default_on: true,
+        under_heading: true,
+        layer: Layer::Soul,
+        coach: true,
+        pi_text: None,
+        fence: false,
+        body: Body::Text(COACH_STOP_UNSURE),
     },
 ];
 
@@ -344,6 +482,7 @@ const fn owned(
         default_on: true,
         under_heading: false,
         layer,
+        coach: false,
         pi_text: None,
         fence,
         body: Body::Owned,
@@ -523,6 +662,7 @@ impl Preset {
 /// What preset `pi` keeps; everything else is off, `card` included.
 pub const PI_ON: &[&str] = &[
     "identity",
+    "coach-identity",
     "tools",
     "workspace-header",
     "project-instructions",
@@ -535,7 +675,11 @@ pub const CARD_TOOLS: &[&str] = &["prompt_read", "artifact_read"];
 /// Every component: the soul, the rest of the frozen prompt, the turn's pieces, then
 /// the driver's.
 pub fn all() -> impl Iterator<Item = &'static Component> {
-    SOUL.iter().chain(FROZEN).chain(TURN).chain(DRIVER)
+    SOUL.iter()
+        .chain(COACH)
+        .chain(FROZEN)
+        .chain(TURN)
+        .chain(DRIVER)
 }
 
 /// The soul with the components `enabled` selects and the rules whose tools are all
@@ -544,8 +688,9 @@ pub fn render_soul(
     enabled: &dyn Fn(&Component) -> bool,
     visible: &dyn Fn(&str) -> bool,
     preset: Preset,
+    coach: bool,
 ) -> String {
-    let parts = soul_parts(enabled, visible, preset);
+    let parts = soul_parts(enabled, visible, preset, coach);
     let mut out = String::new();
     for (n, (id, text)) in parts.iter().enumerate() {
         if n > 0 {
@@ -557,7 +702,9 @@ pub fn render_soul(
 }
 
 fn under_heading(id: &str) -> bool {
-    SOUL.iter().any(|c| c.id == id && c.under_heading)
+    SOUL.iter()
+        .chain(COACH)
+        .any(|c| c.id == id && c.under_heading)
 }
 
 /// The pieces [`render_soul`] joins, each with its component id, in order. The
@@ -567,17 +714,21 @@ pub fn soul_parts(
     enabled: &dyn Fn(&Component) -> bool,
     visible: &dyn Fn(&str) -> bool,
     preset: Preset,
+    coach: bool,
 ) -> Vec<(&'static str, String)> {
     let mut parts: Vec<(&'static str, String)> = Vec::new();
     let mut headed = false;
+    let heading = if coach { COACH_HEADING } else { HEADING };
     for c in SOUL
         .iter()
+        .chain(COACH)
+        .filter(|c| c.coach == coach)
         .filter(|c| enabled(c) && c.requires_tools.iter().all(|t| visible(t)))
     {
         let mut text = c.render(visible, preset);
         if c.under_heading && !headed {
             headed = true;
-            text = format!("{HEADING}\n\n{text}");
+            text = format!("{heading}\n\n{text}");
         }
         parts.push((c.id, text));
     }
@@ -587,7 +738,7 @@ pub fn soul_parts(
 /// The default preset: every component whose `default_on` is set.
 #[must_use]
 pub fn default_soul(visible: &dyn Fn(&str) -> bool) -> String {
-    render_soul(&|c| c.default_on, visible, Preset::Default)
+    render_soul(&|c| c.default_on, visible, Preset::Default, false)
 }
 
 /// Presets `[prompt] preset` accepts. `headless` is the headless-only bare message,
@@ -808,25 +959,46 @@ mod tests {
     use super::*;
 
     fn render_soul(enabled: &dyn Fn(&Component) -> bool, visible: &dyn Fn(&str) -> bool) -> String {
-        super::render_soul(enabled, visible, Preset::Default)
+        super::render_soul(enabled, visible, Preset::Default, false)
     }
 
     fn soul_parts(
         enabled: &dyn Fn(&Component) -> bool,
         visible: &dyn Fn(&str) -> bool,
     ) -> Vec<(&'static str, String)> {
-        super::soul_parts(enabled, visible, Preset::Default)
+        super::soul_parts(enabled, visible, Preset::Default, false)
     }
 
     fn all(_: &str) -> bool {
         true
     }
 
-    /// #2933: the default components ARE the soul. The const stays as the oracle until
-    /// the soul is retired.
+    /// The soul without the paragraphs that left the default prompt for skills
+    /// (`habit-present-findings`, `commit-attribution`, `three-cs`): the default set renders to this.
+    fn soul_without_present_findings() -> String {
+        let mut text = crate::DEFAULT_SOUL.to_string();
+        for marker in [
+            "**Present findings",
+            "**Sign every commit",
+            "**Working code first",
+        ] {
+            let start = text
+                .find(marker)
+                .expect("the oracle still has the paragraph");
+            let end = text[start..]
+                .find("\n\n")
+                .map_or(text.len(), |n| start + n + 2);
+            text.replace_range(start..end, "");
+        }
+        text.trim_end_matches('\n').to_string()
+    }
+
+    /// #2933: ALL the components, switched on, ARE the oracle soul; the default set is
+    /// that soul minus exactly the `habit-present-findings` paragraph.
     #[test]
-    fn default_components_join_to_default_soul() {
-        assert_eq!(default_soul(&all), crate::DEFAULT_SOUL);
+    fn components_join_to_default_soul() {
+        assert_eq!(render_soul(&|_| true, &all), crate::DEFAULT_SOUL);
+        assert_eq!(default_soul(&all), soul_without_present_findings());
     }
 
     #[test]
@@ -846,12 +1018,19 @@ mod tests {
             );
         }
         assert_eq!(SOUL.len(), 13);
-        assert_eq!(super::all().count(), 32);
+        assert_eq!(super::all().count(), 38);
     }
 
     #[test]
-    fn every_component_is_on_by_default() {
-        assert!(super::all().all(|c| c.default_on));
+    fn every_component_but_the_skills_is_on_by_default() {
+        let off: Vec<&str> = super::all()
+            .filter(|c| !c.default_on)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            off,
+            ["commit-attribution", "habit-present-findings", "three-cs"]
+        );
     }
 
     #[test]
@@ -864,8 +1043,8 @@ mod tests {
     fn the_heading_goes_with_the_first_rule_and_never_alone() {
         let lead_only = render_soul(&|c| c.id == "identity", &all);
         assert!(!lead_only.contains("## How to work"));
-        let one_rule = render_soul(&|c| c.id == "three-cs", &all);
-        assert!(one_rule.starts_with("## How to work\n\n**Working code first"));
+        let one_rule = render_soul(&|c| c.id == "habit-ground-truth", &all);
+        assert!(one_rule.starts_with("## How to work\n\n**Seek ground truth"));
     }
 
     #[test]
@@ -881,11 +1060,11 @@ mod tests {
 
     #[test]
     fn parts_join_to_the_soul_and_carry_the_heading_with_the_first_rule() {
-        let parts = soul_parts(&|c| c.default_on, &all);
+        let parts = soul_parts(&|_| true, &all);
         assert_eq!(parts.len(), 13);
         assert_eq!(parts[0].0, "identity");
         assert!(parts[3].1.starts_with("## How to work\n\n**One change"));
-        assert_eq!(render_soul(&|c| c.default_on, &all), crate::DEFAULT_SOUL);
+        assert_eq!(render_soul(&|_| true, &all), crate::DEFAULT_SOUL);
     }
 
     /// #2993 review: the listing sizes a component from the selected preset's
@@ -912,17 +1091,19 @@ mod tests {
         assert_eq!(chars(&pi, "tools", &four), Some(line.chars().count()));
         // A text component that pi leaves alone has one size under both.
         assert_eq!(
-            chars(&default, "three-cs", &all),
-            chars(&pi, "three-cs", &all)
+            chars(&default, "habit-ground-truth", &all),
+            chars(&pi, "habit-ground-truth", &all)
         );
     }
 
     #[test]
     fn rows_report_size_state_and_the_missing_tool() {
-        let set = ComponentSet::default().with("three-cs", false).unwrap();
+        let set = ComponentSet::default()
+            .with("habit-ground-truth", false)
+            .unwrap();
         let rows = rows(&set, &|t| t != "render_report");
         let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap().clone();
-        assert!(!row("three-cs").on && row("three-cs").chars > Some(400));
+        assert!(!row("habit-ground-truth").on && row("habit-ground-truth").chars > Some(400));
         assert_eq!(row("habit-present-findings").needs, Some("render_report"));
         assert_eq!(row("habit-present-findings").chars, Some(0));
         assert_eq!(row("identity").needs, None);
@@ -931,9 +1112,9 @@ mod tests {
     #[test]
     fn deltas_and_summary_round_trip_through_resolve() {
         let set = ComponentSet::default()
-            .with("three-cs", false)
+            .with("habit-ground-truth", false)
             .unwrap()
-            .with("commit-attribution", false)
+            .with("habit-read-minimum", false)
             .unwrap();
         assert_eq!(set.summary(), "default, 2 off");
         assert_eq!(ComponentSet::default().summary(), "default");
@@ -945,29 +1126,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again, set);
-        assert!(set.with("nope", true).unwrap_err().contains("three-cs"));
+        assert!(set
+            .with("nope", true)
+            .unwrap_err()
+            .contains("habit-ground-truth"));
     }
 
     #[test]
     fn no_config_is_the_default_set() {
         let set = ComponentSet::resolve(None, &[], &[]).unwrap();
         assert!(set.is_default());
-        assert_eq!(render_soul(&|c| set.is_on(c), &all), crate::DEFAULT_SOUL);
+        assert_eq!(
+            render_soul(&|c| set.is_on(c), &all),
+            soul_without_present_findings()
+        );
     }
 
-    /// #2933 PR3: `off = ["three-cs"]` removes exactly that paragraph.
+    /// #2933 PR3: `off = ["habit-ground-truth"]` removes exactly that paragraph.
     #[test]
-    fn off_three_cs_drops_exactly_that_paragraph() {
-        let set = ComponentSet::resolve(None, &[], &strings(&["three-cs"])).unwrap();
+    fn off_a_rule_drops_exactly_that_paragraph() {
+        let set = ComponentSet::resolve(None, &[], &strings(&["habit-ground-truth"])).unwrap();
         let text = render_soul(&|c| set.is_on(c), &all);
-        let (paragraph_start, _) = crate::DEFAULT_SOUL
-            .match_indices("**Working code first")
-            .next()
-            .unwrap();
-        let expected = crate::DEFAULT_SOUL[..paragraph_start]
-            .trim_end_matches('\n')
-            .to_owned();
-        assert_eq!(text, expected);
+        let base = soul_without_present_findings();
+        let start = base.find("**Seek ground truth.**").unwrap();
+        let end = start + base[start..].find("\n\n").unwrap() + 2;
+        assert_eq!(text, format!("{}{}", &base[..start], &base[end..]));
     }
 
     #[test]
@@ -988,7 +1171,10 @@ mod tests {
     #[test]
     fn unknown_ids_and_presets_are_refused_naming_the_valid_ones() {
         let err = ComponentSet::resolve(None, &[], &strings(&["nope"])).unwrap_err();
-        assert!(err.contains("`nope`") && err.contains("three-cs"), "{err}");
+        assert!(
+            err.contains("`nope`") && err.contains("habit-ground-truth"),
+            "{err}"
+        );
         let err = ComponentSet::resolve(None, &strings(&["nope"]), &[]).unwrap_err();
         assert!(err.contains("`nope`"), "{err}");
         let err = ComponentSet::resolve(Some("fancy"), &[], &[]).unwrap_err();
@@ -996,7 +1182,7 @@ mod tests {
         assert!(ComponentSet::resolve(Some("headless"), &[], &[])
             .unwrap_err()
             .contains("headless-only"));
-        let both = strings(&["three-cs"]);
+        let both = strings(&["habit-ground-truth"]);
         assert!(ComponentSet::resolve(None, &both, &both)
             .unwrap_err()
             .contains("both"));
@@ -1055,7 +1241,7 @@ mod tests {
     /// #2933 PR6: preset `pi` keeps exactly identity, tools, workspace-header,
     /// project-instructions and persona, and says `pi` until something is changed.
     #[test]
-    fn preset_pi_keeps_five_components_and_turns_card_off() {
+    fn preset_pi_keeps_its_components_and_turns_card_off() {
         let pi = ComponentSet::resolve(Some("pi"), &[], &[]).unwrap();
         assert_eq!(pi.preset(), Preset::Pi);
         let on: Vec<&str> = super::all().filter(|c| pi.is_on(c)).map(|c| c.id).collect();
@@ -1064,6 +1250,7 @@ mod tests {
             [
                 "identity",
                 "tools",
+                "coach-identity",
                 "project-instructions",
                 "persona",
                 "workspace-header"
@@ -1094,6 +1281,7 @@ mod tests {
             &|c| pi.is_on(c),
             &|t| matches!(t, "read_file" | "run_command"),
             Preset::Pi,
+            false,
         );
         assert_eq!(
             soul,
@@ -1134,5 +1322,39 @@ mod tests {
             assert!(super::all().any(|c| c.id == id));
         }
         assert_eq!(provider_component("soul"), None);
+    }
+
+    /// #2933 PR7: the coach altitude's components are the coach oracle, all on.
+    #[test]
+    fn coach_components_join_to_coach_soul() {
+        let text = super::render_soul(&|_| true, &all, Preset::Default, true);
+        assert_eq!(text, crate::COACH_SOUL);
+        let parts = super::soul_parts(&|_| true, &all, Preset::Default, true);
+        let ids: Vec<&str> = parts.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            [
+                "coach-identity",
+                "coach-advise",
+                "coach-ground",
+                "coach-show-command",
+                "coach-teach",
+                "coach-stop-unsure"
+            ]
+        );
+        // The heading rides with the first rule, as the doer's does.
+        assert!(parts[1].1.starts_with("## How to coach\n\n**Advise;"));
+        // The two altitudes never mix.
+        let doer = super::render_soul(&|_| true, &all, Preset::Default, false);
+        assert!(!doer.contains("COACH mode") && !text.contains("agentic coder"));
+    }
+
+    /// Under pi a coach persona still gets its one identity paragraph.
+    #[test]
+    fn pi_keeps_only_the_coach_identity_at_coach_altitude() {
+        let pi = ComponentSet::for_preset(Preset::Pi);
+        let text = super::render_soul(&|c| pi.is_on(c), &all, Preset::Pi, true);
+        assert!(text.starts_with("You are newt in COACH mode"), "{text}");
+        assert!(!text.contains("## How to coach"));
     }
 }

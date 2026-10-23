@@ -33,7 +33,7 @@ const MODEL: &str = "refresh-fixture";
 const READY: &str = "REFRESH_READY> ";
 /// A project layer whose `[prompt]` section does not resolve.
 const BROKEN_PROJECT: &str = "[prompt]\npreset = \"nope\"\n";
-const THREE_CS: &str = "Working code first";
+const THREE_CS: &str = "Seek ground truth";
 
 /// One chat request as the provider saw it.
 #[derive(Clone, Debug)]
@@ -175,7 +175,7 @@ fn turn(seen: &[Seen], user: &str) -> Seen {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_component_write_after_the_config_broke_refuses_and_keeps_the_accepted_prompt() {
     let f = fixture(
-        "[prompt]\ncomponents = { off = [\"three-cs\"] }\n",
+        "[prompt]\ncomponents = { off = [\"habit-ground-truth\"] }\n",
         Some("TURN_ONE"),
     )
     .await;
@@ -217,7 +217,10 @@ async fn a_component_write_after_the_config_broke_refuses_and_keeps_the_accepted
     // The live prompt and the tool list are the accepted ones.
     let seen = f.seen.lock().unwrap().clone();
     let (one, two) = (turn(&seen, "TURN_ONE"), turn(&seen, "TURN_TWO"));
-    assert!(!one.system.contains(THREE_CS), "three-cs starts off");
+    assert!(
+        !one.system.contains(THREE_CS),
+        "habit-ground-truth starts off"
+    );
     assert!(
         !two.system.contains(THREE_CS),
         "still off after the refused write"
@@ -265,6 +268,55 @@ async fn a_component_edit_leaves_a_decorated_default_preset_alone() {
             && saved.contains("off = [\"readme\"]"),
         "the edit must keep the preset line and its comments:\n{saved}"
     );
+    drop(f.server);
+}
+
+/// #2933 PR7: `soul.md` is retired. A file in the user config directory is not read,
+/// the session says so once (naming `[prompt] file`), and the prompt is the one built
+/// from components.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_soul_md_is_ignored_with_a_notice_pointing_at_prompt_file() {
+    let f = fixture("", None).await;
+    std::fs::write(f.config_dir.join("soul.md"), "You are a Django expert.").unwrap();
+    let mut cmd = command(&f);
+    cmd.args(["--plain"])
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn the real CLI");
+    let mut input = child.stdin.take().unwrap();
+    // Several turns and a settings write (which re-resolves the config) in one session.
+    input
+        .write_all(b"TURN_ONE\n/settings system-prompt off readme\nTURN_TWO\n/quit\n")
+        .await
+        .unwrap();
+    drop(input);
+    let output = tokio::time::timeout(BUDGET, child.wait_with_output())
+        .await
+        .expect("the chat exits")
+        .expect("output");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        shown.contains("soul.md") && shown.contains("[prompt] file"),
+        "the retired soul gets a notice:\n{shown}"
+    );
+    assert_eq!(
+        shown.matches("ignoring").count(),
+        1,
+        "one notice per source per session, not one per config read:\n{shown}"
+    );
+    let seen = f.seen.lock().unwrap().clone();
+    let one = turn(&seen, "TURN_ONE");
+    assert!(!one.system.contains("Django"), "{}", one.system);
+    assert!(one
+        .system
+        .contains("You are newt, a free, friendly, local agentic coder."));
     drop(f.server);
 }
 

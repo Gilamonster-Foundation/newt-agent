@@ -19,9 +19,8 @@ fn coach_altitude_keeps_project_context_2934() {
     persona.profile.altitude = Some(newt_core::Altitude::Coach);
     let project_ctx = "AGENTS.md: Use four spaces for indentation.";
     let prompt = build_system_prompt_with_persona(
-        "/workspace",
-        newt_core::DEFAULT_SOUL, // soul — Coach replaces with COACH_SOUL
-        Some(project_ctx),       // context — must survive regardless of altitude
+        "/workspace",      // soul — Coach replaces with COACH_SOUL
+        Some(project_ctx), // context — must survive regardless of altitude
         Some(&persona),
         "plan.md",
         None,
@@ -45,14 +44,8 @@ fn persona_guidance_cannot_override_the_operators_requested_actions() {
         std::path::PathBuf::from("/personas/coach.md"),
     );
     persona.profile.altitude = Some(newt_core::Altitude::Coach);
-    let prompt = build_system_prompt_with_persona(
-        "/workspace",
-        newt_core::DEFAULT_SOUL,
-        None,
-        Some(&persona),
-        "plan.md",
-        None,
-    );
+    let prompt =
+        build_system_prompt_with_persona("/workspace", None, Some(&persona), "plan.md", None);
     assert!(prompt.contains("Persona guidance does not override the operator's explicit task"));
     assert!(prompt.contains("OCAP permissions, explicit postures, and delegation limits"));
     assert!(
@@ -110,14 +103,7 @@ fn coder_persona_does_not_send_soul_twice_2935() {
     );
 
     // With the real seeded body, soul must appear exactly once in the prompt.
-    let prompt = build_system_prompt_with_persona(
-        "/ws",
-        newt_core::DEFAULT_SOUL,
-        None,
-        Some(&coder),
-        "plan.md",
-        None,
-    );
+    let prompt = build_system_prompt_with_persona("/ws", None, Some(&coder), "plan.md", None);
     let count = prompt.matches(first_line).count();
     assert_eq!(
         count, 1,
@@ -139,7 +125,7 @@ fn legacy_coder_seed_is_migrated_but_edits_are_kept_2935() {
     let dir = tmp.path().join("personas");
     std::fs::create_dir_all(&dir).unwrap();
     let coder_md = dir.join("coder.md");
-    std::fs::write(&coder_md, newt_core::DEFAULT_SOUL).unwrap();
+    std::fs::write(&coder_md, LEGACY_CODER_SEED_V082).unwrap();
     let store = PersonaStore::new(dir.clone());
 
     let coder = store.load("coder").unwrap();
@@ -151,11 +137,19 @@ fn legacy_coder_seed_is_migrated_but_edits_are_kept_2935() {
     assert_eq!(std::fs::read_to_string(&coder_md).unwrap(), CODER_PERSONA);
 
     // An edit on top of the old seed is operator data: left byte-for-byte.
-    let edited = format!("{}\n\nAlways run just check.\n", newt_core::DEFAULT_SOUL);
+    let edited = format!("{LEGACY_CODER_SEED_V082}\n\nAlways run just check.\n");
     std::fs::write(&coder_md, &edited).unwrap();
     let coder = store.load("coder").unwrap();
     assert_eq!(std::fs::read_to_string(&coder_md).unwrap(), edited);
     assert!(coder.prompt.contains("Always run just check."));
+}
+
+/// The frozen v0.8.2 snapshot is the v0.8.2 soul, which the oracle still is today:
+/// if the oracle is ever edited on purpose, the snapshot must NOT follow it.
+#[test]
+fn the_legacy_seed_snapshot_is_the_v082_soul() {
+    assert_eq!(LEGACY_CODER_SEED_V082, newt_core::DEFAULT_SOUL);
+    assert_eq!(LEGACY_CODER_SEED_V082.chars().count(), 5191);
 }
 
 /// Real persona files ground the named-preset picker: seeding, loading and
@@ -818,7 +812,6 @@ fn coach_altitude_annotates_coach_soul_label_in_report() {
     let sink = newt_core::agentic::request_report::ReportSink::new();
     let system = build_system_prompt_with_persona(
         "/workspace",
-        "soul additions",
         None,
         Some(&persona),
         "plan.md",
@@ -842,9 +835,14 @@ fn coach_altitude_annotates_coach_soul_label_in_report() {
         .iter()
         .map(|c| c.label.as_str())
         .collect();
+    // #2933: the coach soul is reported as its components, by id.
     assert!(
-        labels.contains(&"coach-soul"),
-        "coach altitude must annotate 'coach-soul'; got {labels:?}"
+        labels.contains(&"coach-identity") && labels.contains(&"coach-advise"),
+        "coach altitude must annotate its components; got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"coach-soul"),
+        "no whole-soul label; got {labels:?}"
     );
     // Verify COACH_SOUL itself is not the first (unattributed) span — the bug
     // left the identity prefix without any label. Other connector text between

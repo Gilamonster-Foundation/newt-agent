@@ -56,7 +56,7 @@ fn capturing_summarizer(
 
 // --- Summarizing tests ---
 
-// --- SoulProvider tests ---
+// --- The soul oracles ---
 
 // --- Continuity: restore + delegation (Step 18.5, #247) ---
 

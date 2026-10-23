@@ -100,7 +100,7 @@ async fn an_invalid_prompt_setting_refuses_the_session_and_sends_nothing() {
         ("[prompt]\npreset = \"nope\"\n", "nope"),
         ("[prompt]\npreset = \"headless\"\n", "headless"),
         (
-            "[prompt]\ncomponents = { on = [\"three-cs\"], off = [\"three-cs\"] }\n",
+            "[prompt]\ncomponents = { on = [\"habit-ground-truth\"], off = [\"habit-ground-truth\"] }\n",
             "both",
         ),
     ] {
@@ -126,7 +126,8 @@ async fn an_invalid_prompt_setting_refuses_the_session_and_sends_nothing() {
 /// the refusal above is the setting's doing and not the fixture's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_valid_prompt_setting_starts_the_session() {
-    let (output, requests) = run("[prompt]\ncomponents = { off = [\"three-cs\"] }\n").await;
+    let (output, requests) =
+        run("[prompt]\ncomponents = { off = [\"habit-ground-truth\"] }\n").await;
     let shown = text(&output);
     assert!(output.status.success(), "{shown}");
     assert!(!shown.contains("config resolution failed"), "{shown}");

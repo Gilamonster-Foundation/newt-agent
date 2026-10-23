@@ -24,12 +24,12 @@ pub const SYSTEM_PROMPT_FILE_ENV: &str = "NEWT_SYSTEM_PROMPT_FILE";
 /// ```toml
 /// [prompt]
 /// preset = "default"
-/// components = { off = ["three-cs"], on = [] }
+/// components = { off = ["habit-ground-truth"], on = [] }
 /// ```
 ///
 /// They are deltas on the preset, so a component added later is never silently
 /// off. Dropping one changes what the model is told, never what it may do. They
-/// shape the default soul only: a custom `soul.md` or the coach soul replaces it.
+/// shape the soul (doer or coach, chosen by the persona's altitude).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptConfig {
@@ -160,7 +160,9 @@ mod tests {
     #[test]
     fn prompt_components_read_the_preset_and_deltas() {
         assert!(cfg("").prompt_components().unwrap().is_default());
-        let c = cfg("[prompt]\npreset = \"default\"\ncomponents = { off = [\"three-cs\"] }\n");
+        let c = cfg(
+            "[prompt]\npreset = \"default\"\ncomponents = { off = [\"habit-ground-truth\"] }\n",
+        );
         assert!(!c.prompt_components().unwrap().is_default());
         let bad = cfg("[prompt]\ncomponents = { off = [\"nope\"] }\n");
         assert!(bad.prompt_components().unwrap_err().contains("`nope`"));
@@ -173,13 +175,17 @@ mod tests {
         let c = cfg("[prompt]\ncomponents = { off = [\"nope\"] }\n");
         let err = c.prepare_runtime().expect_err("unknown id refused");
         let msg = err.to_string();
-        assert!(msg.contains("`nope`") && msg.contains("three-cs"), "{msg}");
+        assert!(
+            msg.contains("`nope`") && msg.contains("habit-ground-truth"),
+            "{msg}"
+        );
     }
 
     #[test]
     fn with_prompt_components_keeps_the_rest_and_drops_the_key_when_empty() {
         let text = "# mine\n[prompt]\nfile = \"/p.md\" # keep\n";
-        let out = Config::with_prompt_components(text, "default", &[], &["three-cs"]).unwrap();
+        let out =
+            Config::with_prompt_components(text, "default", &[], &["habit-ground-truth"]).unwrap();
         assert!(
             out.contains("# mine") && out.contains("file = \"/p.md\" # keep"),
             "{out}"
@@ -190,7 +196,8 @@ mod tests {
             !back.contains("components") && back.contains("# keep"),
             "{back}"
         );
-        let fresh = Config::with_prompt_components("", "default", &[], &["three-cs"]).unwrap();
+        let fresh =
+            Config::with_prompt_components("", "default", &[], &["habit-ground-truth"]).unwrap();
         assert!(cfg(&fresh).prompt_components().unwrap().summary() == "default, 1 off");
     }
 
@@ -198,8 +205,9 @@ mod tests {
     /// same-value write alike.
     #[test]
     fn with_prompt_components_keeps_the_edited_keys_comments() {
-        let text = "[prompt]\n# key comment\ncomponents = { off = [\"three-cs\"] } # keep trailing rationale\n";
-        let same = Config::with_prompt_components(text, "default", &[], &["three-cs"]).unwrap();
+        let text = "[prompt]\n# key comment\ncomponents = { off = [\"habit-ground-truth\"] } # keep trailing rationale\n";
+        let same =
+            Config::with_prompt_components(text, "default", &[], &["habit-ground-truth"]).unwrap();
         assert!(
             same.contains("# key comment") && same.contains("# keep trailing rationale"),
             "{same}"
@@ -208,13 +216,13 @@ mod tests {
             text,
             "default",
             &[],
-            &["three-cs", "commit-attribution"],
+            &["habit-ground-truth", "habit-read-minimum"],
         )
         .unwrap();
         assert!(
             changed.contains("# key comment")
                 && changed.contains("# keep trailing rationale")
-                && changed.contains("commit-attribution"),
+                && changed.contains("habit-read-minimum"),
             "{changed}"
         );
         assert!(cfg(&changed)

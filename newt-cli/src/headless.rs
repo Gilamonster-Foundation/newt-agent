@@ -123,18 +123,54 @@ pub struct HeadlessArgs {
     /// `--system-prompt-file`: this file's bytes replace the system prompt
     /// entirely, over `[prompt] file` (#2938).
     pub system_prompt_file: Option<PathBuf>,
-    /// `--prompt-preset`: only `headless` (the default) is known yet (#2933).
+    /// `--prompt-preset`: a `[prompt] preset` name, or `headless` for the bare
+    /// `Workspace root:` message (an eval baseline). Absent, the config's preset
+    /// (else `default`) builds the same prompt the TUI sends (#2933).
     pub prompt_preset: Option<String>,
 }
 
-/// The one headless preset: the bare `Workspace root:` message (an eval baseline).
-fn check_headless_preset(name: Option<&str>) -> Result<(), String> {
-    match name.map(str::trim) {
-        None | Some("headless") => Ok(()),
-        Some(other) => Err(format!(
-            "headless does not support prompt preset `{other}` yet; presets: headless"
-        )),
+/// The one name that is not a `[prompt] preset`: the bare `Workspace root:` message.
+const BARE_PRESET: &str = "headless";
+
+/// `cfg` with `--prompt-preset` applied over `[prompt] preset`, and the components
+/// it resolves to. `None` for the bare preset, which has none.
+fn prompt_components_for(
+    cfg: &newt_core::Config,
+    preset: Option<&str>,
+) -> Result<
+    Option<(
+        newt_core::Config,
+        newt_core::prompt_components::ComponentSet,
+    )>,
+    String,
+> {
+    let preset = preset.map(str::trim);
+    if preset == Some(BARE_PRESET) {
+        return Ok(None);
     }
+    let mut cfg = cfg.clone();
+    if let Some(name) = preset {
+        cfg.prompt.get_or_insert_with(Default::default).preset = Some(name.to_string());
+    }
+    let components = cfg.prompt_components()?;
+    Ok(Some((cfg, components)))
+}
+
+/// Does the profile the TUI would pick for this route enable `knowledge_base` (the API
+/// surface and project map in the frozen prompt)? The same pick, env selectors included.
+fn profile_enables_knowledge_base(cfg: &newt_core::Config, family: Option<&str>) -> Result<bool> {
+    let pick = cfg
+        .pick_active_profile(
+            std::env::var("NEWT_PROFILE").ok().as_deref(),
+            std::env::var("NEWT_BUNDLE").ok().as_deref(),
+            family,
+        )
+        .map_err(anyhow::Error::msg)?;
+    let Some(pick) = pick else { return Ok(false) };
+    let profile = cfg
+        .resolve_profile(&pick.name)
+        .map_err(|e| anyhow::anyhow!("profile '{}': {e}", pick.name))?;
+    Ok(profile.enables("knowledge_base"))
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -345,7 +381,6 @@ fn projected_cognition(
 /// pass/fail is Terminal-Bench's job via the task's own verification — this exit
 /// code is only "did the agent run cleanly".)
 pub async fn run(args: HeadlessArgs) -> Result<i32> {
-    check_headless_preset(args.prompt_preset.as_deref()).map_err(anyhow::Error::msg)?;
     // 0. The explicit scratchpad seed is admitted before anything else runs.
     let scratchpad = match &args.scratchpad_state {
         Some(path) => Some(seed_scratchpad(
@@ -372,6 +407,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         })
         .context("resolving config")?,
     };
+    // A preset or component the config (or `--prompt-preset`) cannot resolve is refused
+    // before any backend work, never defaulted (#2933).
+    prompt_components_for(&cfg, args.prompt_preset.as_deref()).map_err(anyhow::Error::msg)?;
     // NOTHING is published yet: the process-global settings land only after
     // the backend pick + capability sidecar VALIDATE below — a refused
     // selection or an unknown card must not leave half-published globals.
@@ -443,6 +481,8 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         .context("backend has no model (set model = in the [[backends]] entry)")?
         .to_string();
     let kind = backend.kind.unwrap_or(BackendKind::Openai);
+    let backend_name = backend.name.clone();
+    let backend_serving = backend.serving;
     let api_key = backend.resolve_api_key();
     let api = backend.api.unwrap_or_default();
     // The SAME capability sidecar + typed principal decision the TUI uses —
@@ -486,7 +526,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
     // contract's effective_config — the bench never re-derives it from a
     // profile (contract requirement 5).
-    let runtime = resolve_runtime_posture(&cfg, caps.family_for_route(&destination, principal));
+    let family = caps.family_for_route(&destination, principal);
+    let runtime = resolve_runtime_posture(&cfg, family);
+    // The profile the TUI would pick for this route: it decides which providers fill the prompt.
+    let knowledge_base = profile_enables_knowledge_base(&cfg, family)?;
     // #2314: a required feature this run cannot supply stops here, before the
     // instruction is read or anything reaches a backend.
     headless_contract::admit_required(&args.require_feature, |feature| match feature {
@@ -523,12 +566,15 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     })?;
     let instruction = std::fs::read_to_string(&instruction_file)
         .with_context(|| format!("reading --instruction-file {}", instruction_file.display()))?;
-    let workspace = args
-        .cwd
-        .canonicalize()
-        .unwrap_or_else(|_| args.cwd.clone())
+    // Canonicalized ONCE. Everything that compares or fences paths (the write fence, the
+    // build partitions, the confined launch) keeps this form, as before. The model is
+    // shown `prompt_workspace`: the same path without Windows' verbatim `\\?\` prefix,
+    // which is how the TUI names the workspace (#2933).
+    let canonical_workspace = args.cwd.canonicalize().unwrap_or_else(|_| args.cwd.clone());
+    let prompt_workspace = dunce::simplified(&canonical_workspace)
         .to_string_lossy()
         .into_owned();
+    let workspace = canonical_workspace.to_string_lossy().into_owned();
 
     // Herdr: report this headless run through the SAME lifecycle seam the TUI
     // uses (no surface-specific wiring). Inside a Herdr pane this installs the
@@ -705,12 +751,35 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     .transpose()
     .map_err(anyhow::Error::msg)?;
     dc.exposure.verbatim_system = prompt_override.is_some();
-    let sys_msg = {
-        let sink_ref = dc.report_sink.as_deref();
-        match prompt_override {
-            Some(o) => override_system_message(o, sink_ref),
-            None => workspace_root_system_message(&workspace, sink_ref),
-        }
+    // The same component-built prompt the TUI sends for this config; the bare
+    // `Workspace root:` message only when asked for (`--prompt-preset headless`).
+    let components = if prompt_override.is_some() {
+        None
+    } else {
+        prompt_components_for(&cfg, args.prompt_preset.as_deref()).map_err(anyhow::Error::msg)?
+    };
+    if let Some((_, set)) = &components {
+        dc.exposure.omit_card = !set.is_on_id("card");
+    }
+    let sys_msg = match (prompt_override, components) {
+        (Some(o), _) => override_system_message(o, dc.report_sink.as_deref()),
+        (None, Some((prompt_cfg, _))) => newt_core::MemMessage::system(
+            newt_tui::headless_system_prompt(
+                &prompt_workspace,
+                &prompt_cfg,
+                knowledge_base,
+                &newt_tui::HeadlessRoute {
+                    kind,
+                    backend_name: &backend_name,
+                    serving: backend_serving,
+                    model: &model,
+                    served_window: args.context_window,
+                },
+                dc.report_sink.as_deref(),
+            )
+            .await,
+        ),
+        (None, None) => workspace_root_system_message(&workspace, dc.report_sink.as_deref()),
     };
     let mut driver = TurnDriver::with_transcript(dc, vec![sys_msg])
         .with_cognition(runtime.cognition)
@@ -1865,16 +1934,20 @@ mod tests {
     /// `system` message, so it precedes the task in the wire transcript
     /// exactly like newt-tui's `Workspace: {path}` line.
     #[test]
-    fn only_the_headless_preset_is_known() {
-        assert!(check_headless_preset(None).is_ok());
-        assert!(check_headless_preset(Some("headless")).is_ok());
-        for other in ["default", "pi", "nope"] {
-            let err = check_headless_preset(Some(other)).unwrap_err();
-            assert!(
-                err.contains(other) && err.contains("presets: headless"),
-                "{err}"
-            );
+    fn every_preset_resolves_and_headless_is_the_bare_one() {
+        let cfg = newt_core::Config::default();
+        assert!(prompt_components_for(&cfg, Some("headless"))
+            .unwrap()
+            .is_none());
+        for name in [None, Some("default")] {
+            let (prompt_cfg, set) = prompt_components_for(&cfg, name).unwrap().unwrap();
+            assert_eq!(prompt_cfg.prompt_components().unwrap(), set);
         }
+        // `pi` is a real preset here: it is refused only for the card tools it leaves visible.
+        let err = prompt_components_for(&cfg, Some("pi")).unwrap_err();
+        assert!(err.contains("`card`"), "{err}");
+        let err = prompt_components_for(&cfg, Some("nope")).unwrap_err();
+        assert!(err.contains("nope") && err.contains("presets:"), "{err}");
     }
 
     #[test]

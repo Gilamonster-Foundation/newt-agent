@@ -354,17 +354,6 @@ impl MemoryManager {
         }
     }
 
-    /// Return only the soul provider's identity block — the text that altitude
-    /// selection may replace with `COACH_SOUL`.  Everything else (AGENTS.md,
-    /// notes, memory index, project map) is NOT included; use
-    /// [`context_additions`] for those.
-    pub fn soul_block(&self) -> Option<String> {
-        self.providers
-            .iter()
-            .find(|p| p.name() == "soul")
-            .and_then(|p| p.system_prompt_block())
-    }
-
     /// Return the system-prompt contributions of every provider except the
     /// soul — AGENTS.md/CLAUDE.md instructions, notes, the memory index, and
     /// the project map.  These must appear in the system prompt regardless of
@@ -934,7 +923,7 @@ pub const MEMORY_INDEX_BUDGET: usize = 12;
 /// **Additive and opt-in.** It is registered only under
 /// `[memory] disclosure = "index"` (default `frozen`), so with the default
 /// config it is never constructed and behavior is bit-for-bit unchanged. Like
-/// [`NoteStore`] and [`SoulProvider`] it is system-prompt-only —
+/// [`NoteStore`] it is system-prompt-only —
 /// `build_messages` returns `Vec::new()` so it never competes for the
 /// "first non-empty `build_messages`" slot in [`MemoryManager::build_messages`].
 ///
@@ -1032,7 +1021,7 @@ impl MemoryProvider for MemoryIndex {
     }
 
     fn build_messages(&self, _system_prompt: &str, _new_task: &str) -> Vec<MemMessage> {
-        // System-prompt-only (like NoteStore / SoulProvider) — never competes
+        // System-prompt-only (like NoteStore) — never competes
         // for the first-non-empty build_messages slot.
         Vec::new()
     }
@@ -1495,15 +1484,15 @@ impl MemoryProvider for Summarizing {
 }
 
 // ---------------------------------------------------------------------------
-// SoulProvider — built-in provider #5 (closes #111)
+// The soul, as test oracles (#2933)
 // ---------------------------------------------------------------------------
 
-/// Default agent identity injected when no soul file is found.
-///
-/// This is the single source of truth for the built-in identity — the TUI's
-/// system-prompt builder falls back to this same constant rather than keeping
-/// its own copy, so the tool list can't drift between the two paths again.
-/// Keep the tool list in sync with the tools the agent actually exposes.
+/// The doer soul as ONE string: the oracle the tests hold the soul components to
+/// (#2933). Production builds the soul from [`crate::prompt_components`]; with every
+/// doer component on, [`render_soul`](crate::prompt_components::render_soul) joins to
+/// exactly this text and a test pins it. Nothing reads it at runtime, and `soul.md` /
+/// `[memory] soul_file` no longer replace it: use `[prompt] file` for a prompt of
+/// your own.
 pub const DEFAULT_SOUL: &str = "\
 You are newt, a free, friendly, local agentic coder. \
 Be concise and direct. \
@@ -1588,13 +1577,10 @@ that is Composed, Configured, and Convention-driven, so a new case is config, \
 not code. Don't let this block shipping; do circle back and de-hardcode once it \
 works.";
 
-/// FR-5 (#999): the ADVISE-first identity installed when a persona's altitude is
-/// [`crate::Altitude::Coach`] (front-matter `altitude = "coach"`). It REPLACES
-/// [`DEFAULT_SOUL`] rather than layering over it — the doer soul ("never
-/// describe a change, make it") directly contradicts a coach, so appending a
-/// coach overlay onto the doer soul would ship two opposing identities in one
-/// prompt. This IS the whole base identity for a coaching turn; the persona's
-/// own markdown body still overlays on top, now without self-contradiction.
+/// The coach altitude's soul as ONE string: the oracle for the `coach-*` components
+/// (#2933), which join to exactly this text when all are on. A persona with
+/// `altitude = "coach"` selects that component set in place of the doer's (an
+/// ADVISE-first identity, FR-5 #999); nothing reads this constant at runtime.
 pub const COACH_SOUL: &str = "\
 You are newt in COACH mode: an advisor, not a doer. Be concise and direct. \
 You help the human reason about their code and infrastructure — you explain, \
@@ -1627,139 +1613,6 @@ to you — leave them able to make the next call themselves.\n\
 **Stop when unsure.** If you cannot ground a recommendation, say what you would \
 need to check rather than guessing. One honest 'here is what I'd verify first' \
 beats a confident wrong answer.";
-
-/// Loads an agent identity from a Markdown soul file and injects it as a
-/// frozen system-prompt block.
-///
-/// Resolution order (first non-empty file wins):
-/// 1. Explicit path in `[memory] soul_file = "..."` config
-/// 2. `.newt/soul.md` in the current workspace
-/// 3. `~/.newt/soul.md` (global user soul)
-/// 4. Built-in default identity
-///
-/// The soul is read **once** at `initialize()` and frozen — mid-session
-/// writes don't rebuild the system prompt (preserves the KV/prefix cache).
-pub struct SoulProvider {
-    /// The soul text after resolution — frozen at `initialize()`.
-    soul: String,
-    /// Resolved path of the soul that was actually loaded (for display).
-    pub source: SoulSource,
-    /// Explicit override path (from config).
-    override_path: Option<std::path::PathBuf>,
-}
-
-/// Where the soul was loaded from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SoulSource {
-    /// Built-in default identity.
-    Default,
-    /// `~/.newt/soul.md`
-    Global,
-    /// `.newt/soul.md` in the workspace.
-    Workspace,
-    /// Explicit path from `[memory] soul_file = "..."`.
-    Explicit(std::path::PathBuf),
-}
-
-impl std::fmt::Display for SoulSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Default => write!(f, "built-in default"),
-            Self::Global => write!(f, "~/.newt/soul.md"),
-            Self::Workspace => write!(f, ".newt/soul.md"),
-            Self::Explicit(p) => write!(f, "{}", p.display()),
-        }
-    }
-}
-
-impl SoulProvider {
-    /// Create with an optional explicit override path (from config).
-    pub fn new(override_path: Option<std::path::PathBuf>) -> Self {
-        Self {
-            soul: DEFAULT_SOUL.to_string(),
-            source: SoulSource::Default,
-            override_path,
-        }
-    }
-
-    /// Create from config, reading `[memory] soul_file` if present.
-    pub fn from_config(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Self {
-        let override_path = crate::Config::resolve_unpublished(report)
-            .ok()
-            .and_then(|c| c.memory)
-            .and_then(|m| m.soul_file)
-            .map(std::path::PathBuf::from);
-        Self::new(override_path)
-    }
-
-    fn try_load(path: &std::path::Path) -> Option<String> {
-        let text = std::fs::read_to_string(path).ok()?;
-        let trimmed = text.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    }
-
-    /// Resolve and load the soul for `workspace`. Called from `initialize`.
-    pub fn load(&mut self, workspace: &str) {
-        // 1. Explicit override.
-        if let Some(ref p) = self.override_path {
-            if let Some(text) = Self::try_load(p) {
-                self.soul = text;
-                self.source = SoulSource::Explicit(p.clone());
-                return;
-            }
-        }
-
-        // 2. Per-workspace soul.
-        let ws_soul = std::path::Path::new(workspace)
-            .join(".newt")
-            .join("soul.md");
-        if let Some(text) = Self::try_load(&ws_soul) {
-            self.soul = text;
-            self.source = SoulSource::Workspace;
-            return;
-        }
-
-        // 3. Global user soul.
-        if let Some(global) = crate::Config::user_config_path().map(|p| p.with_file_name("soul.md"))
-        {
-            if let Some(text) = Self::try_load(&global) {
-                self.soul = text;
-                self.source = SoulSource::Global;
-            }
-        }
-
-        // 4. Built-in default (already set in `new()` — nothing to do).
-    }
-}
-
-#[async_trait]
-impl MemoryProvider for SoulProvider {
-    fn name(&self) -> &str {
-        "soul"
-    }
-
-    async fn initialize(&mut self, ctx: &SessionContext) -> anyhow::Result<()> {
-        self.load(&ctx.workspace);
-        tracing::info!(source = %self.source, "soul loaded");
-        Ok(())
-    }
-
-    /// Return the frozen soul as the system prompt base.
-    fn system_prompt_block(&self) -> Option<String> {
-        Some(self.soul.clone())
-    }
-
-    fn build_messages(&self, _system_prompt: &str, _new_task: &str) -> Vec<MemMessage> {
-        // Soul is system-prompt-only; history is managed by other providers.
-        Vec::new()
-    }
-
-    async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}
-}
 
 // ---------------------------------------------------------------------------
 // Tests

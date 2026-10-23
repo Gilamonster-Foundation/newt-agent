@@ -227,76 +227,27 @@ impl ExposureSettings {
         }
     }
 
-    /// Render an identity prompt so it names only operator-visible tools: the
-    /// `You have tools: …` line is rewritten to the visible subset and any
-    /// paragraph that names a hidden built-in is dropped. Identity without an
-    /// operator filter is returned unchanged.
+    /// The system prompt's identity and rules, built from the components `components`
+    /// leaves on and naming only operator-visible tools (#2932, #2933): a component
+    /// whose tools are hidden is dropped and the tool line lists the visible ones.
+    /// `coach` selects the coach altitude's set instead of the doer's.
     #[must_use]
-    pub fn render_identity<'a>(&self, identity: &'a str) -> std::borrow::Cow<'a, str> {
-        self.render_identity_with(identity, &crate::prompt_components::ComponentSet::default())
-    }
-
-    /// [`render_identity`](Self::render_identity) with `[prompt] components` applied.
-    /// Components shape the default soul; any other identity (a custom `soul.md`,
-    /// the coach soul) is filtered as text.
-    #[must_use]
-    pub fn render_identity_with<'a>(
+    pub fn render_soul(
         &self,
-        identity: &'a str,
         components: &crate::prompt_components::ComponentSet,
-    ) -> std::borrow::Cow<'a, str> {
-        if identity == crate::DEFAULT_SOUL {
-            if !self.has_operator_filter() && components.is_default() {
-                return std::borrow::Cow::Borrowed(identity);
-            }
-            return std::borrow::Cow::Owned(crate::prompt_components::render_soul(
-                &|c| components.is_on(c),
-                &|tool| self.operator_visible(tool),
-                components.preset(),
-            ));
-        }
-        if !self.has_operator_filter() {
-            return std::borrow::Cow::Borrowed(identity);
-        }
-        self.render_text_identity(identity)
-    }
-
-    /// The text-matching filter, for identities that are not the registry's soul
-    /// (a custom `soul.md`, the coach soul, a persona body).
-    fn render_text_identity<'a>(&self, identity: &'a str) -> std::borrow::Cow<'a, str> {
-        let hidden_names = |text: &str| {
-            super::catalog::ALL_TOOL_NAMES
-                .iter()
-                .any(|name| !self.operator_visible(name) && mentions_tool(text, name))
-        };
-        let paragraphs: Vec<String> = identity
-            .split("\n\n")
-            .filter_map(|paragraph| {
-                // The tool sentence may sit mid-paragraph ("You are newt… You
-                // have tools: …"): rewrite it in place, then judge the rest.
-                let rewritten = match paragraph.find(TOOL_LINE_PREFIX) {
-                    Some(at) => {
-                        let (head, rest) = paragraph.split_at(at + TOOL_LINE_PREFIX.len());
-                        let (names, tail) = rest.split_once('.').unwrap_or((rest, ""));
-                        let kept: Vec<&str> = names
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|name| !name.is_empty() && self.operator_visible(name))
-                            .collect();
-                        format!("{head}{}.{tail}", kept.join(", "))
-                    }
-                    None => paragraph.to_owned(),
-                };
-                (!hidden_names(&rewritten)).then_some(rewritten)
-            })
-            .collect();
-        std::borrow::Cow::Owned(paragraphs.join("\n\n"))
+        coach: bool,
+    ) -> String {
+        crate::prompt_components::render_soul(
+            &|c| components.is_on(c),
+            &|tool| self.operator_visible(tool),
+            components.preset(),
+            coach,
+        )
     }
 }
 
-use crate::prompt_components::TOOL_LINE_PREFIX;
-
 /// Whether `text` names `tool` as a whole word (`edit_file`, not `edit_files`).
+#[cfg(test)]
 fn mentions_tool(text: &str, tool: &str) -> bool {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
     text.match_indices(tool).any(|(at, _)| {
@@ -1214,18 +1165,19 @@ mod tests {
     /// #2950 review 1: the identity prompt names only operator-visible tools.
     #[test]
     fn identity_prompt_names_only_operator_visible_tools() {
-        let soul = crate::DEFAULT_SOUL;
-        assert_eq!(
-            ExposureSettings::default().render_identity(soul),
-            soul,
-            "no operator filter → identity unchanged"
-        );
+        let components = crate::prompt_components::ComponentSet::default();
+        // No operator filter: the registry's default soul, whole oracle minus the
+        // `present-findings` paragraph (a skill now).
+        let default = ExposureSettings::default().render_soul(&components, false);
+        assert_eq!(default, crate::prompt_components::default_soul(&|_| true));
+        assert!(!default.contains("**Present findings"));
+        assert!(crate::DEFAULT_SOUL.contains("**Present findings"));
 
         let read_only = ExposureSettings {
             read_only: true,
             ..Default::default()
         };
-        let rendered = read_only.render_identity(soul);
+        let rendered = read_only.render_soul(&components, false);
         for hidden in WRITE_TOOL_NAMES {
             assert!(
                 !mentions_tool(&rendered, hidden),
@@ -1243,10 +1195,10 @@ mod tests {
             ),
             ..Default::default()
         };
-        let rendered = four.render_identity(soul);
+        let rendered = four.render_soul(&components, false);
         let line = rendered
             .lines()
-            .find(|l| l.contains(TOOL_LINE_PREFIX))
+            .find(|l| l.contains("You have tools: "))
             .expect("tool line survives");
         assert!(
             line.contains("You have tools: run_command, read_file, write_file, edit_file."),
@@ -1256,55 +1208,29 @@ mod tests {
         assert!(!mentions_tool(&rendered, "list_dir"));
     }
 
-    /// #2933: the registry renders the default soul exactly as the text filter did,
-    /// for every operator filter the prompt can meet.
+    /// The coach altitude's set is chosen by the flag, with its own heading, and is the
+    /// doer's neither in text nor in tools.
     #[test]
-    fn registry_soul_matches_the_text_filter_under_every_filter() {
-        let soul = crate::DEFAULT_SOUL;
-        let filters = [
-            ExposureSettings::default(),
-            ExposureSettings {
-                read_only: true,
-                ..Default::default()
-            },
-            ExposureSettings {
-                allow_list: Some(
-                    ["read_file", "write_file", "edit_file", "run_command"]
-                        .map(String::from)
-                        .to_vec(),
-                ),
-                ..Default::default()
-            },
-            ExposureSettings {
-                allow_list: Some(vec!["read_file".to_string()]),
-                read_only: true,
-                ..Default::default()
-            },
-            ExposureSettings {
-                allow_list: Some(vec!["git".to_string()]),
-                ..Default::default()
-            },
-        ];
-        for settings in filters {
-            assert_eq!(
-                settings.render_identity(soul),
-                settings.render_text_identity(soul),
-                "{settings:?}"
-            );
-        }
+    fn the_coach_soul_is_its_own_component_set() {
+        let components = crate::prompt_components::ComponentSet::default();
+        let coach = ExposureSettings::default().render_soul(&components, true);
+        assert_eq!(coach, crate::COACH_SOUL);
+        assert!(coach.contains("## How to coach") && !coach.contains("## How to work"));
+        assert!(!coach.contains("You have tools:"));
     }
 
     /// #2933 ratchet: a component's `requires_tools` is exactly the built-in tools its
     /// text names, so the declaration cannot drift from the words the model reads.
     #[test]
     fn component_requirements_are_the_tools_the_text_names() {
-        use crate::prompt_components::SOUL;
+        use crate::prompt_components::{COACH, SOUL};
         let all = |_: &str| true;
-        for c in SOUL.iter().filter(|c| c.id != "tools") {
+        for c in SOUL.iter().chain(COACH).filter(|c| c.id != "tools") {
             let text = crate::prompt_components::render_soul(
                 &|x| x.id == c.id,
                 &all,
                 crate::prompt_components::Preset::Default,
+                c.is_coach(),
             );
             let named: Vec<&str> = super::super::catalog::ALL_TOOL_NAMES
                 .iter()

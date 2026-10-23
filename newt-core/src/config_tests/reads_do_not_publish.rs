@@ -25,7 +25,7 @@ fn published_patient_rounds() -> Option<usize> {
 }
 
 /// The readers that only need a config value: the thinking mode (read every
-/// turn), the memory window, the soul-file override, the markdown mode and the
+/// turn), the memory window, the markdown mode and the
 /// compaction-trigger policy.
 #[test]
 fn value_readers_do_not_republish_runtime_settings() {
@@ -41,8 +41,6 @@ fn value_readers_do_not_republish_runtime_settings() {
     assert_eq!(published_patient_rounds(), Some(91), "thinking_mode");
     let _ = crate::memory::RollingWindow::from_config(&mut report);
     assert_eq!(published_patient_rounds(), Some(91), "memory window");
-    let _ = crate::memory::SoulProvider::from_config(&mut report);
-    assert_eq!(published_patient_rounds(), Some(91), "soul provider");
     let _ = crate::config::session_markdown_mode(&mut report);
     assert_eq!(published_patient_rounds(), Some(91), "markdown mode");
     let _ = crate::config::session_compaction_trigger_policy(&mut report);

@@ -2271,14 +2271,18 @@ mod tests {
 
         let listing = sp("components").unwrap();
         assert!(
-            listing.contains("three-cs") && listing.contains("presentation only"),
+            listing.contains("habit-ground-truth") && listing.contains("presentation only"),
             "{listing}"
         );
         assert!(listing.contains("default"), "{listing}");
 
-        let off = sp("off three-cs").unwrap();
+        let off = sp("off habit-ground-truth").unwrap();
         assert!(off.contains("presentation only"), "{off}");
-        assert!(saved().contains("off = [\"three-cs\"]"), "{}", saved());
+        assert!(
+            saved().contains("off = [\"habit-ground-truth\"]"),
+            "{}",
+            saved()
+        );
         assert_eq!(
             crate::prompt_components_form::status(),
             "components: default, 1 off"
@@ -2291,14 +2295,14 @@ mod tests {
         let before = saved();
         let refused = sp("off nope").unwrap_err();
         assert!(
-            refused.contains("`nope`") && refused.contains("three-cs"),
+            refused.contains("`nope`") && refused.contains("habit-ground-truth"),
             "{refused}"
         );
         assert_eq!(saved(), before, "a refused id writes nothing");
         assert!(sp("preset pi").unwrap_err().contains("/settings tools pi"));
         assert_eq!(saved(), before);
 
-        sp("on three-cs").unwrap();
+        sp("on habit-ground-truth").unwrap();
         assert!(
             !saved().contains("components"),
             "back to default drops the key: {}",
@@ -2435,8 +2439,8 @@ mod tests {
         let sp = |v: &str| apply(Field::SystemPrompt, v);
         for command in [
             "preset default",
-            "off three-cs",
-            "on three-cs",
+            "off habit-ground-truth",
+            "on habit-ground-truth",
             "components",
         ] {
             let err = sp(command).unwrap_err();

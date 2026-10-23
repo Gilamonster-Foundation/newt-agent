@@ -1569,6 +1569,122 @@ pub(crate) trait InputSurface {
     }
 }
 
+/// The context budget in tokens a session sizes its memory providers from (`[memory]
+/// context_tokens`, else the selected model's declared window, else the capability
+/// cache). The TUI at startup and `newt headless` both read it here (#2933), so the
+/// prompt providers see the same window in both.
+pub(crate) fn startup_memory_budget(
+    cfg: &newt_core::Config,
+    kind: newt_core::BackendKind,
+    model: &str,
+    served: Option<u32>,
+    entry: &probe::CapabilityEntry,
+    community: &newt_core::tuning::CommunityTunings,
+) -> u32 {
+    // The turn loop's own derivation (#2567), so the startup budget and the first turn
+    // cannot disagree about the window.
+    let declared_window = crate::context_window::resolve(crate::context_window::facts_for(
+        cfg, kind, model, served, entry, community, None, None,
+    ))
+    .full_window;
+    probe::resolve_memory_budget(
+        cfg.memory.as_ref().and_then(|m| m.context_tokens),
+        declared_window,
+        Some(entry),
+    )
+}
+
+/// The budget `newt headless` sizes the shared prompt providers with: the same
+/// derivation, over the cached capability evidence for the route, with the served
+/// window from `--context-window`.
+pub(crate) fn headless_memory_budget(
+    cfg: &newt_core::Config,
+    kind: newt_core::BackendKind,
+    backend_name: &str,
+    serving: Option<newt_core::Serving>,
+    model: &str,
+    served: Option<u32>,
+) -> u32 {
+    let cache = probe::load_cache();
+    let entry = cache
+        .get(&session_cap_id(serving, backend_name, model))
+        .cloned()
+        .unwrap_or_default();
+    startup_memory_budget(
+        cfg,
+        kind,
+        model,
+        served,
+        &entry,
+        &newt_core::tuning::load_community_tunings(),
+    )
+}
+
+/// The memory providers whose blocks land in the frozen system prompt: project
+/// instructions, the profile's API surface and project map, notes, and the memory
+/// index. The TUI registers them at startup and `newt headless` through
+/// `headless_system_prompt`, so the same config yields the same prompt (#2933).
+/// `mem_budget` is the context window in tokens the API surface scales with.
+pub(crate) fn add_prompt_providers(
+    mgr: &mut newt_core::MemoryManager,
+    cfg: &newt_core::Config,
+    workspace: &str,
+    knowledge_base: bool,
+    mem_budget: u32,
+) {
+    let mem_cfg = cfg.memory.clone().unwrap_or_default();
+    // `--no-agents-file` / `--agents-file` (via env) over `[agents] enabled`.
+    mgr.add_provider(crate::project_instructions_provider(cfg));
+    // Profile technique: knowledge_base (R1) — inject the authoritative PyO3
+    // import surface into the system prompt when the active profile lists it.
+    // Rides the provider seam (survives system-prompt rebuilds); a no-op on a
+    // non-PyO3 workspace. See docs/design/technique-library.md.
+    if knowledge_base {
+        // The PyO3/FFI import surface (#74) + the general workspace API
+        // surface (#669) — both stable bases in the protected system prompt.
+        mgr.add_provider(newt_core::FfiSurfaceProvider::new());
+        // Built-in language packs + any inline `[[context.api_surface.
+        // language_packs]]`. (Drop-in `~/.newt/language-packs/*.toml`
+        // auto-discovery uses the public load_packs_from_dir — wired next.)
+        let api_cfg = cfg
+            .context
+            .as_ref()
+            .map(|c| c.api_surface.clone())
+            .unwrap_or_default();
+        // #1283: the tier-2 surface budget scales with the discovered window
+        // (SC-L2), replacing the starved fixed 3000-char cap. `w` = the same
+        // resolved send budget the memory providers use (mem_budget); the
+        // ratio is the static `[context.estimation]` value, so `b` is a pure
+        // session-fixed function (never the live calibrated ratio).
+        let surface_cpt = cfg
+            .context
+            .as_ref()
+            .map(|c| c.estimation.chars_per_token)
+            .unwrap_or(4);
+        let surface_budget =
+            newt_core::resolve_surface_budget(mem_budget as usize, surface_cpt, &api_cfg);
+        let packs = resolved_language_packs(workspace, &api_cfg);
+        mgr.add_provider(
+            newt_core::ApiSurfaceProvider::new(packs, &api_cfg).with_budget(surface_budget),
+        );
+        // #1284: the untruncatable project map (crate/package units + curated
+        // purposes) — the navigation floor of the "IDE for LLMs" spine. A
+        // no-op on a non-project dir; drift-cached so a re-launch is cheap.
+        mgr.add_provider(newt_core::ProjectMapProvider::new());
+    }
+    // NoteStore is always active — manages system-prompt injection only.
+    mgr.add_provider(newt_core::NoteStore::default_path());
+    // Progressive-disclosure memory (Workstream A MVP, #319): under
+    // `[memory] disclosure = "index"` ONLY, add the budgeted MemoryIndex
+    // provider (note ids/titles in the prompt; bodies fetched on demand via
+    // `memory_fetch`). Default (`frozen`) registers nothing — bit-for-bit
+    // unchanged. System-prompt-only, so it never competes for the
+    // build_messages slot.
+    if mem_cfg.disclosure == newt_core::MemoryDisclosure::Index {
+        mgr.add_provider(newt_core::MemoryIndex::default_path());
+    }
+}
+
 /// M (#1819): re-derive the AUTOMATIC bundle/profile pick from the CURRENT
 /// typed card family at every refresh funnel, so switching families cannot
 /// leave family-A behavioral techniques active on model B. Explicit
@@ -2608,84 +2724,33 @@ fn session_body(
                 inf_kind,
                 inf_key.as_deref(),
             );
-        // The turn loop's own derivation (#2567), so the startup budget and
-        // the first turn cannot disagree about the window.
-        let declared_window = crate::context_window::resolve(crate::context_window::facts_for(
+        let budget = startup_memory_budget(
             &cfg,
             inf_kind,
             &inf_model,
             inf_context_window,
             entry,
             &community_tunings,
-            None,
-            None,
-        ))
-        .full_window;
+        );
         if updated {
             probe::save_cache(&cap_cache);
         }
-        probe::resolve_memory_budget(
-            mem_cfg.context_tokens,
-            declared_window,
-            cap_cache.get(&cap_id),
-        )
+        budget
     };
     let mut smart_sessions = smart_sessions::Sessions::new(smart_startup_caveats);
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
-        // Soul provider first — sets the frozen identity block.
-        let soul_override = mem_cfg.soul_file.as_ref().map(std::path::PathBuf::from);
-        mgr.add_provider(newt_core::SoulProvider::new(soul_override));
-        // Project instructions (AGENTS.md / CLAUDE.md) — compose right after
-        // the soul so the block lands in the frozen system prompt. CLI-env
-        // overrides config: --no-agents-file forces off, --agents-file forces
-        // on (and sets the search target); otherwise follow `[agents] enabled`.
-        let agents_enabled = std::env::var("NEWT_NO_AGENTS_FILE").is_err()
-            && (cfg.agents.enabled || std::env::var("NEWT_AGENTS_FILE").is_ok());
-        let agents_path = std::env::var("NEWT_AGENTS_FILE")
-            .ok()
-            .or_else(|| cfg.agents.path.clone());
-        mgr.add_provider(newt_core::AgentsProvider::new(agents_enabled, agents_path));
-        // Profile technique: knowledge_base (R1) — inject the authoritative PyO3
-        // import surface into the system prompt when the active profile lists it.
-        // Rides the provider seam (survives system-prompt rebuilds); a no-op on a
-        // non-PyO3 workspace. See docs/design/technique-library.md.
-        if active_profile
-            .as_ref()
-            .is_some_and(|p| p.enables("knowledge_base"))
-        {
-            // The PyO3/FFI import surface (#74) + the general workspace API
-            // surface (#669) — both stable bases in the protected system prompt.
-            mgr.add_provider(newt_core::FfiSurfaceProvider::new());
-            // Built-in language packs + any inline `[[context.api_surface.
-            // language_packs]]`. (Drop-in `~/.newt/language-packs/*.toml`
-            // auto-discovery uses the public load_packs_from_dir — wired next.)
-            let api_cfg = cfg
-                .context
+        // Providers whose blocks land in the frozen system prompt are registered by the
+        // one function `newt headless` also calls (#2933).
+        add_prompt_providers(
+            &mut mgr,
+            &cfg,
+            workspace,
+            active_profile
                 .as_ref()
-                .map(|c| c.api_surface.clone())
-                .unwrap_or_default();
-            // #1283: the tier-2 surface budget scales with the discovered window
-            // (SC-L2), replacing the starved fixed 3000-char cap. `w` = the same
-            // resolved send budget the memory providers use (mem_budget); the
-            // ratio is the static `[context.estimation]` value, so `b` is a pure
-            // session-fixed function (never the live calibrated ratio).
-            let surface_cpt = cfg
-                .context
-                .as_ref()
-                .map(|c| c.estimation.chars_per_token)
-                .unwrap_or(4);
-            let surface_budget =
-                newt_core::resolve_surface_budget(mem_budget as usize, surface_cpt, &api_cfg);
-            let packs = resolved_language_packs(workspace, &api_cfg);
-            mgr.add_provider(
-                newt_core::ApiSurfaceProvider::new(packs, &api_cfg).with_budget(surface_budget),
-            );
-            // #1284: the untruncatable project map (crate/package units + curated
-            // purposes) — the navigation floor of the "IDE for LLMs" spine. A
-            // no-op on a non-project dir; drift-cached so a re-launch is cheap.
-            mgr.add_provider(newt_core::ProjectMapProvider::new());
-        }
+                .is_some_and(|p| p.enables("knowledge_base")),
+            mem_budget,
+        );
         // Smart mode selects from retained originals at the frame boundary.
         if smart_config.is_some() {
             mgr.add_provider(newt_core::RollingWindow::new(usize::MAX));
@@ -2722,17 +2787,6 @@ fn session_body(
                     mgr.add_provider(newt_core::RollingWindow::new(mem_cfg.window));
                 }
             }
-        }
-        // NoteStore is always active — manages system-prompt injection only.
-        mgr.add_provider(newt_core::NoteStore::default_path());
-        // Progressive-disclosure memory (Workstream A MVP, #319): under
-        // `[memory] disclosure = "index"` ONLY, add the budgeted MemoryIndex
-        // provider (note ids/titles in the prompt; bodies fetched on demand via
-        // `memory_fetch`). Default (`frozen`) registers nothing — bit-for-bit
-        // unchanged. System-prompt-only, so it never competes for the
-        // build_messages slot.
-        if mem_cfg.disclosure == newt_core::MemoryDisclosure::Index {
-            mgr.add_provider(newt_core::MemoryIndex::default_path());
         }
         mgr
     };
@@ -2845,7 +2899,7 @@ fn session_body(
         },
     );
 
-    // Build system prompt now that SoulProvider has loaded its soul file.
+    // Build the system prompt now that the memory providers have loaded.
     system = rebuild_system_prompt_for(
         workspace,
         &memory,

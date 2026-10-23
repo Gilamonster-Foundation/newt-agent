@@ -21,13 +21,12 @@ fn golden_path(name: &str) -> std::path::PathBuf {
 }
 
 /// One variant: the config the operator wrote, the soul, and the persona.
-fn assembled(config: &str, soul: &str, persona: Option<&Persona>) -> String {
-    assembled_reporting(config, soul, persona, None)
+fn assembled(config: &str, persona: Option<&Persona>) -> String {
+    assembled_reporting(config, persona, None)
 }
 
 fn assembled_reporting(
     config: &str,
-    soul: &str,
     persona: Option<&Persona>,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
@@ -52,7 +51,6 @@ fn assembled_reporting(
     let ws_str = ws.to_str().unwrap();
     build_system_prompt_with_persona(
         ws_str,
-        soul,
         Some("## AGENTS.md\nUse four spaces."),
         persona,
         "plan.md",
@@ -90,54 +88,41 @@ const FOUR_TOOLS: &str = "[tool_exposure]\nallow_list = [\"read_file\", \"write_
 #[serial_test::serial(real_fs)]
 #[test]
 fn goldens_pin_the_assembled_prompt() {
-    let doer = newt_core::DEFAULT_SOUL;
-    check("doer", &assembled("", doer, None));
-    check("coach", &assembled("", doer, Some(&persona("coach", true))));
-    check(
-        "persona",
-        &assembled("", doer, Some(&persona("reviewer", false))),
-    );
+    check("doer", &assembled("", None));
+    check("coach", &assembled("", Some(&persona("coach", true))));
+    check("persona", &assembled("", Some(&persona("reviewer", false))));
     check(
         "read_only",
-        &assembled("[tool_exposure]\nread_only = true\n", doer, None),
+        &assembled("[tool_exposure]\nread_only = true\n", None),
     );
-    check("allow_list_four", &assembled(FOUR_TOOLS, doer, None));
+    check("allow_list_four", &assembled(FOUR_TOOLS, None));
     check(
         "narration",
-        &assembled("[tui]\nnarration_intent_line = true\n", doer, None),
+        &assembled("[tui]\nnarration_intent_line = true\n", None),
     );
     // #2933 PR6: preset `pi` over the pi tool list, through the real builder.
     check(
         "pi",
         &assembled(
             "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\", \"run_command\"]\n[prompt]\npreset = \"pi\"\n",
-            doer,
             Some(&persona("reviewer", false)),
         ),
     );
-    check(
-        "custom_soul",
-        &assembled("", "You are a Django expert.", None),
-    );
 }
 
-/// #2933 PR3: `[prompt] components.off = ["three-cs"]` removes that paragraph and
+/// #2933 PR3: `[prompt] components.off = ["habit-ground-truth"]` removes that paragraph and
 /// nothing else from the assembled prompt.
 #[serial_test::serial(real_fs)]
 #[test]
 fn switching_a_component_off_drops_exactly_its_paragraph() {
-    let doer = newt_core::DEFAULT_SOUL;
-    let base = assembled("", doer, None);
+    let base = assembled("", None);
     let off = assembled(
-        "[prompt]\ncomponents = { off = [\"three-cs\"] }\n",
-        doer,
+        "[prompt]\ncomponents = { off = [\"habit-ground-truth\"] }\n",
         None,
     );
-    let start = base.find("**Working code first").unwrap();
-    let end = base.find("\n\n## AGENTS.md").unwrap_or_else(|| {
-        panic!("project context follows the soul:\n{base}");
-    });
-    let expected = format!("{}{}", base[..start].trim_end_matches('\n'), &base[end..]);
+    let start = base.find("**Seek ground truth.**").unwrap();
+    let end = start + base[start..].find("\n\n").unwrap() + 2;
+    let expected = format!("{}{}", &base[..start], &base[end..]);
     assert_eq!(off, expected);
 }
 
@@ -156,7 +141,7 @@ fn the_request_report_names_components_by_id_with_nothing_unattributed() {
             "test",
             "## AGENTS.md\nUse four spaces.",
         );
-        let prompt = assembled_reporting(config, newt_core::DEFAULT_SOUL, None, Some(&sink));
+        let prompt = assembled_reporting(config, None, Some(&sink));
         sink.arm_capture_next();
         let _ = sink.observe_request(&[&prompt], None);
         let report = sink.last_report().expect("report captured");
@@ -172,7 +157,7 @@ fn the_request_report_names_components_by_id_with_nothing_unattributed() {
         "tools",
         "disposition",
         "habit-one-change",
-        "three-cs",
+        "habit-ground-truth",
     ] {
         assert!(all.iter().any(|l| l == id), "{id} missing from {all:?}");
     }
@@ -181,8 +166,8 @@ fn the_request_report_names_components_by_id_with_nothing_unattributed() {
     // production (`registered_agents_provider_block_reaches_prompt`); no soul byte.
     let gaps = |labels: &[String]| labels.iter().filter(|l| l.contains("unattributed")).count();
     assert_eq!(gaps(&all), 1, "{all:?}");
-    let off = labels("[prompt]\ncomponents = { off = [\"three-cs\"] }\n");
-    assert!(!off.iter().any(|l| l == "three-cs"), "{off:?}");
+    let off = labels("[prompt]\ncomponents = { off = [\"habit-ground-truth\"] }\n");
+    assert!(!off.iter().any(|l| l == "habit-ground-truth"), "{off:?}");
     assert_eq!(gaps(&off), 1, "{off:?}");
 }
 
@@ -202,7 +187,7 @@ async fn a_failed_refresh_then_new_renders_from_the_newer_accepted_config() {
     let _env = newt_core::process_env::lock();
     let _sandbox = SkillRootSandbox::enter(&config_dir, &ws);
 
-    let first = "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\"]\n[prompt]\ncomponents = { off = [\"three-cs\"] }\n";
+    let first = "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\"]\n[prompt]\ncomponents = { off = [\"habit-ground-truth\"] }\n";
     let newer = "[tool_exposure]\nallow_list = [\"read_file\"]\n";
     let broken = "[tool_exposure]\nallow_list = [\"read_file\"]\n[prompt]\ncomponents = { off = [\"nope\"] }\n";
 
@@ -214,7 +199,6 @@ async fn a_failed_refresh_then_new_renders_from_the_newer_accepted_config() {
     crate::chat::reresolve(&mut cfg, false, false);
 
     let mut memory = newt_core::MemoryManager::new();
-    memory.add_provider(newt_core::SoulProvider::new(None));
     memory
         .initialize_all(&newt_core::SessionContext {
             workspace: ws.to_string_lossy().into_owned(),
@@ -239,7 +223,7 @@ async fn a_failed_refresh_then_new_renders_from_the_newer_accepted_config() {
         "the newer allow list names one tool:\n{system}"
     );
     assert!(
-        system.contains("Working code first"),
-        "the newer config has three-cs on:\n{system}"
+        system.contains("Seek ground truth"),
+        "the newer config has habit-ground-truth on:\n{system}"
     );
 }

@@ -153,7 +153,11 @@ mod tests {
     #[test]
     fn toggling_reports_exactly_what_moved_as_ids() {
         let mut panel = open();
-        let at = panel.rows.iter().position(|r| r.id == "three-cs").unwrap();
+        let at = panel
+            .rows
+            .iter()
+            .position(|r| r.id == "habit-ground-truth")
+            .unwrap();
         panel.cursor.home();
         for _ in 0..at {
             panel.key(Key::Down);
@@ -163,20 +167,23 @@ mod tests {
         panel.key(Key::Right);
         panel.key(Key::Right);
         assert_eq!(panel.key(Key::Enter), Flow::Close(true));
-        assert_eq!(panel.take_choice(), Some(vec![("three-cs", false)]));
+        assert_eq!(
+            panel.take_choice(),
+            Some(vec![("habit-ground-truth", false)])
+        );
     }
 
     #[test]
     fn a_rule_whose_tool_is_hidden_says_what_it_needs() {
-        let panel = open();
+        let panel = ComponentsPanel::new(&ComponentSet::default(), &|t| t != "edit_file");
         let rows = panel.rows_view();
         let id = panel
             .rows
             .iter()
-            .position(|r| r.id == "habit-present-findings")
+            .position(|r| r.id == "habit-prefer-edit")
             .unwrap();
         assert!(
-            rows[id].provenance.contains("off (needs render_report)"),
+            rows[id].provenance.contains("off (needs edit_file)"),
             "{}",
             rows[id].provenance
         );

@@ -1668,6 +1668,7 @@ impl Config {
                 .map_err(NewtError::Config)?;
         }
         report_ignored_project_endpoint_dropins(report);
+        report_retired_soul(&cfg, report);
         // A successfully merged operator drop-in is operator-supplied
         // configuration — the resolved backend list is no longer the bare
         // compiled-in fallback (see `is_unconfigured`).
@@ -2500,6 +2501,79 @@ fn report_ignored_project_endpoint_dropins(report: &mut dyn FnMut(crate::tty::No
     }
 }
 
+/// One-release notice (#2933): the soul is components now. A `soul.md` in the project
+/// or the user config directory, or `[memory] soul_file`, is no longer read; say so
+/// once per source, and point at `[prompt] file`, which replaces the whole prompt.
+fn report_retired_soul(cfg: &Config, report: &mut dyn FnMut(crate::tty::Notice<'static>)) {
+    let cwd = std::env::current_dir().ok();
+    let user_dir = Config::user_config_dir();
+    for source in retired_soul_sources(
+        cfg,
+        cwd.as_deref(),
+        home_dir().as_deref(),
+        user_dir.as_deref(),
+    ) {
+        if !first_report_of(&source) {
+            continue;
+        }
+        report(crate::tty::Notice::new(
+            crate::tty::Level::Warn,
+            "",
+            format!(
+                "newt: warning: ignoring {}: the soul is built from components now. Tune it \
+                 with `[prompt] components` or `/settings system-prompt`; to keep a prompt of \
+                 your own, put it in a file and set `[prompt] file = \"<path>\"`. This notice \
+                 goes away next release.",
+                crate::notes_scan::neutralize_for_display(&source)
+            ),
+        ));
+    }
+}
+
+/// True the first time `source` is reported in this session. Config is re-resolved at
+/// startup and after every refresh, and a notice per read would repeat all session.
+/// (Thread-local under test, so parallel tests do not share the set.)
+fn first_report_of(source: &str) -> bool {
+    #[cfg(not(test))]
+    {
+        static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        SEEN.lock()
+            .map_or(true, |mut seen| seen.insert(source.to_string()))
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static SEEN: std::cell::RefCell<std::collections::BTreeSet<String>> =
+                const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+        }
+        SEEN.with(|seen| seen.borrow_mut().insert(source.to_string()))
+    }
+}
+
+/// What the retired soul mechanism left behind: `[memory] soul_file`, a project
+/// `.newt/soul.md`, and the user config directory's `soul.md`.
+fn retired_soul_sources(
+    cfg: &Config,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    user_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut sources: Vec<String> = Vec::new();
+    if let Some(path) = cfg.memory.as_ref().and_then(|m| m.soul_file.as_ref()) {
+        sources.push(format!("[memory] soul_file = {path:?}"));
+    }
+    if let Some(found) =
+        cwd.and_then(|cwd| layering::find_project_entry_from(cwd, home, "soul.md", Path::is_file))
+    {
+        sources.push(found.display().to_string());
+    }
+    if let Some(user) = user_dir.map(|d| d.join("soul.md")).filter(|p| p.is_file()) {
+        sources.push(user.display().to_string());
+    }
+    sources
+}
+
 fn dir_has_toml(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|entries| {
         entries
@@ -2522,5 +2596,39 @@ fn replace_in_place(table: &mut toml_edit::Table, key: &str, mut item: toml_edit
         None => {
             table.insert(key, item);
         }
+    }
+}
+
+#[cfg(test)]
+mod retired_soul_tests {
+    use super::*;
+
+    /// #2933 PR7: each leftover of the retired soul mechanism is named once.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn each_retired_soul_source_is_named() {
+        let root = tempfile::TempDir::new().unwrap();
+        let project = root.path().join("proj");
+        let user = root.path().join("user");
+        std::fs::create_dir_all(project.join(".newt")).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let cfg: Config = toml::from_str("[memory]\nsoul_file = \"/x/soul.md\"\n").unwrap();
+        let none: Config = toml::from_str("").unwrap();
+
+        assert!(retired_soul_sources(&none, Some(&project), None, Some(&user)).is_empty());
+        assert_eq!(
+            retired_soul_sources(&cfg, Some(&project), None, Some(&user)),
+            ["[memory] soul_file = \"/x/soul.md\""]
+        );
+        std::fs::write(project.join(".newt/soul.md"), "mine").unwrap();
+        std::fs::write(user.join("soul.md"), "mine too").unwrap();
+        let found = retired_soul_sources(&cfg, Some(&project), None, Some(&user));
+        assert_eq!(found.len(), 3, "{found:?}");
+        // Compared as paths: a Windows rendering separates with `\`.
+        assert!(
+            Path::new(&found[1]).ends_with(Path::new("proj").join(".newt").join("soul.md"))
+                && Path::new(&found[2]).ends_with(Path::new("user").join("soul.md")),
+            "{found:?}"
+        );
     }
 }

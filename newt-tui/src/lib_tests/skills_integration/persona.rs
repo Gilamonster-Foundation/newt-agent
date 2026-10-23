@@ -11,7 +11,6 @@ fn system_prompt_includes_active_persona_overlay() {
     );
     let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        newt_core::DEFAULT_SOUL,
         None,
         Some(&persona),
         "test-plan.md",
@@ -40,7 +39,6 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
     };
     let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        newt_core::DEFAULT_SOUL,
         None,
         Some(&coach),
         "test-plan.md",
@@ -63,7 +61,6 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
     let doer = test_persona("worker", "Do the work.", tmp.path().join("worker.md"));
     let doer_prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        newt_core::DEFAULT_SOUL,
         None,
         Some(&doer),
         "test-plan.md",

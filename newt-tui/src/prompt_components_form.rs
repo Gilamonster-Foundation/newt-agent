@@ -208,7 +208,10 @@ mod tests {
 
     #[test]
     fn only_the_component_words_are_commands() {
-        assert_eq!(parse("on three-cs"), Some(("on", "three-cs")));
+        assert_eq!(
+            parse("on habit-ground-truth"),
+            Some(("on", "habit-ground-truth"))
+        );
         assert_eq!(parse(" components "), Some(("components", "")));
         assert_eq!(parse("preset default"), Some(("preset", "default")));
         for other in ["edit", "reset", "~/p.md", "./on", "onward x"] {
@@ -227,8 +230,66 @@ mod tests {
             assert!(page.contains(needle), "help lacks `{needle}`");
         }
         assert!(
-            pc::ids().contains(&"three-cs"),
+            pc::ids().contains(&"habit-ground-truth"),
             "the help example names a real id"
         );
+    }
+
+    /// #2933 PR7: a rule that left the default prompt lives on as a bundled skill, with
+    /// its words, so switching the component off loses nothing.
+    #[test]
+    fn present_findings_moved_to_a_bundled_skill_with_its_text() {
+        let skill = newt_skills::Skill::parse(
+            include_str!("../../.newt/bundled-skills/present-findings/SKILL.md"),
+            ".newt/bundled-skills/present-findings",
+        )
+        .expect("the skill parses");
+        assert_eq!(skill.name, "present-findings");
+        for sentence in [
+            "your deliverable is a rendered report, not a one-line status",
+            "call `render_report` to present it",
+            "A failed data source is one degraded section, not a dead end",
+        ] {
+            assert!(skill.body.contains(sentence), "skill lacks `{sentence}`");
+        }
+        let present = pc::all()
+            .find(|c| c.id == "habit-present-findings")
+            .unwrap();
+        assert!(!present.default_on, "the rule is a skill now");
+    }
+
+    /// The `commit-attribution` rule lives on as the bundled skill; the component is off.
+    #[test]
+    fn commit_attribution_is_a_bundled_skill_and_off_by_default() {
+        let skill = newt_skills::Skill::parse(
+            include_str!("../../.newt/bundled-skills/commit-attribution/SKILL.md"),
+            ".newt/bundled-skills/commit-attribution",
+        )
+        .expect("the skill parses");
+        assert_eq!(skill.name, "commit-attribution");
+        assert!(skill.body.contains("Co-authored-by:"));
+        assert!(skill.body.contains("newt-agent GitHub App"));
+        let body = skill.body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            body.contains("Never add a second trailer by hand"),
+            "this variant keeps the runtime as the source of truth"
+        );
+        assert!(body.contains("run_command"), "native commits are managed");
+        let attribution = pc::all().find(|c| c.id == "commit-attribution").unwrap();
+        assert!(!attribution.default_on, "the rule is a skill now");
+    }
+
+    /// The `three-cs` rule lives on as the bundled skill; the prompt component is off.
+    #[test]
+    fn three_cs_is_a_bundled_skill_and_off_by_default() {
+        let skill = newt_skills::Skill::parse(
+            include_str!("../../.newt/bundled-skills/three-cs/SKILL.md"),
+            ".newt/bundled-skills/three-cs",
+        )
+        .expect("the skill parses");
+        assert_eq!(skill.name, "three-cs");
+        assert!(skill.body.contains("Knowledge belongs in data, not logic"));
+        let three_cs = pc::all().find(|c| c.id == "three-cs").unwrap();
+        assert!(!three_cs.default_on, "the rule is a skill now");
     }
 }

@@ -125,7 +125,7 @@ The text form works everywhere; bare /settings uses it outside a rich terminal:
   /settings tools a,b,c      an explicit allow list; `all` releases it (bare: checklist on a rich TTY)
   /settings read-only on     hide the write tools and clamp fs_write with them; the footer shows [tools: …]
   /settings system-prompt components   list the soul's rules: id, on/off, size (bare: checklist on a rich TTY)
-  /settings system-prompt off three-cs   drop one rule from the prompt (on <id> restores; preset default resets)
+  /settings system-prompt off habit-ground-truth   drop one rule from the prompt (on <id> restores; preset default resets)
                              presentation only: it changes what the model is told, never what it may do
 
 /model, /backends, /permissions, and /workspace remain direct shortcuts."

@@ -5495,14 +5495,20 @@ impl PersonaStore {
     /// file whose body is still exactly that seed is the untouched old seed,
     /// not an operator edit, so it is replaced like a missing default. Any
     /// other content is operator data and is left alone.
-    // ponytail: matches the live DEFAULT_SOUL; if #2933 rewrites the soul,
-    // snapshot the v0.8.2 text here so older installs still migrate.
+    ///
+    /// The comparison text is a frozen snapshot of the v0.8.2 soul, not the live
+    /// soul: the soul is components now (#2933) and may change without stranding
+    /// older installs.
     fn is_legacy_coder_seed(name: &str, path: &std::path::Path) -> bool {
         name == Self::DEFAULT_NAME
             && std::fs::read_to_string(path)
-                .is_ok_and(|body| body.trim() == newt_core::DEFAULT_SOUL.trim())
+                .is_ok_and(|body| body.trim() == LEGACY_CODER_SEED_V082.trim())
     }
 }
+
+/// What v0.8.2 seeded into `coder.md`: the whole default soul, verbatim (#2935).
+/// Frozen; see [`PersonaStore::is_legacy_coder_seed`].
+const LEGACY_CODER_SEED_V082: &str = include_str!("legacy_coder_seed_v0.8.2.txt");
 
 /// The default coder persona (#2935): a short placeholder the user can edit.
 /// Using DEFAULT_SOUL here would send the soul twice when `--persona coder` is
@@ -5953,14 +5959,13 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
 #[cfg(test)]
 fn build_system_prompt_with_persona(
     workspace: &str,
-    soul: &str,
     context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
     let cfg = test_session_config();
-    build_system_prompt_for(workspace, soul, context, persona, plan_path, &cfg, sink)
+    build_system_prompt_for(workspace, context, persona, plan_path, &cfg, sink)
 }
 
 /// The config of a test session: what the sandbox's files resolve to.
@@ -5974,49 +5979,40 @@ pub(crate) fn test_session_config() -> Box<newt_core::Config> {
 /// config, and the prompt must follow it, not the file on disk.
 fn build_system_prompt_for(
     workspace: &str,
-    soul: &str,
     context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
     cfg: &newt_core::Config,
     sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
-    // FR-5 (#999): the active persona's ALTITUDE selects the base identity. A
-    // `Coach` altitude REPLACES the identity with COACH_SOUL (and overrides a
-    // doer-flavored soul.md), so a coaching persona's overlay no longer sits on
-    // top of a contradictory doer soul. Doer (the default, and every persona
-    // that doesn't declare an altitude) keeps the soul it is given. That soul is
-    // resolved by `SoulProvider` (soul.md, else DEFAULT_SOUL); the builder has
-    // no fallback of its own (#2935). The `--altitude` flag rides here too — it
-    // seeds/overrides `active_persona`'s altitude at startup (see `run_code`),
-    // so it needs no separate plumbing through the session-management helpers.
-    let effective_altitude = persona.and_then(|p| p.profile.altitude).unwrap_or_default();
-    let identity = match effective_altitude {
-        newt_core::Altitude::Coach => newt_core::COACH_SOUL,
-        newt_core::Altitude::Doer => soul,
-    };
-    let identity_source = identity;
-    // #2932: the identity names only the tools the operator lets the model
-    // see — the same `[tool_exposure]` policy that selects the catalog, so the
-    // prompt cannot steer the model at a tool the wire never carries.
+    // FR-5 (#999): the active persona's ALTITUDE selects the soul's component SET:
+    // the doer's, or the coach's ADVISE-first one, so a coaching persona's overlay
+    // never sits on top of a contradictory doer soul. Doer is the default, and every
+    // persona that doesn't declare an altitude. The soul is built from components
+    // (#2933): there is no soul.md and no fallback text. The `--altitude` flag rides
+    // here too: it seeds/overrides `active_persona`'s altitude at startup (see
+    // `run_code`), so it needs no separate plumbing through the session helpers.
+    let coach = matches!(
+        persona.and_then(|p| p.profile.altitude).unwrap_or_default(),
+        newt_core::Altitude::Coach
+    );
+    // #2932: the soul names only the tools the operator lets the model see: the same
+    // `[tool_exposure]` policy that selects the catalog, so the prompt cannot steer
+    // the model at a tool the wire never carries.
     let exposure = newt_core::ExposureSettings::from(cfg.tool_exposure());
     // The accepted config was validated when it was resolved, so this holds.
     let components = cfg.prompt_components().unwrap_or_else(|e| {
         debug_assert!(false, "accepted config has invalid components: {e}");
         Default::default()
     });
-    let identity = exposure.render_identity_with(identity, &components);
-    // The doer soul is built from components; the report names each by id.
-    let doer_soul = identity_source == newt_core::DEFAULT_SOUL;
-    let soul_pieces = if doer_soul {
-        newt_core::prompt_components::soul_parts(
-            &|c| components.is_on(c),
-            &|t| exposure.operator_visible(t),
-            components.preset(),
-        )
-    } else {
-        Vec::new()
-    };
+    let identity = exposure.render_soul(&components, coach);
+    // The soul is built from components; the report names each by id.
+    let soul_pieces = newt_core::prompt_components::soul_parts(
+        &|c| components.is_on(c),
+        &|t| exposure.operator_visible(t),
+        components.preset(),
+        coach,
+    );
     // `[tui] narration_intent_line` (opt-in): every identity gets it and no
     // soul text carries it.
     let intent = cfg.tui.as_ref().is_some_and(|t| t.narration_intent_line);
@@ -6044,7 +6040,7 @@ fn build_system_prompt_for(
         });
     let assembled = newt_core::assemble_system_prompt(&newt_core::PromptParts {
         identity: &identity,
-        coach_identity: matches!(effective_altitude, newt_core::Altitude::Coach),
+        coach_identity: coach,
         context,
         workspace,
         persona: persona.map(|p| newt_core::PersonaPart {
@@ -6063,7 +6059,7 @@ fn build_system_prompt_for(
     });
     if let Some(s) = sink {
         for n in &assembled.notes {
-            if n.label == "soul" && doer_soul {
+            if matches!(n.label.as_str(), "soul" | "coach-soul") {
                 // #2933: the soul is reported as its components, by id. The soul
                 // provider labelled the whole block earlier; that note would
                 // swallow the pieces (and go stale once one is switched off).
@@ -6160,10 +6156,24 @@ fn rebuild_system_prompt_for(
         }
         return found.text;
     }
+    assemble_session_prompt(workspace, memory, persona, conversation_id, cfg, sink)
+}
+
+/// The assembled prompt (no `[prompt] file` override) from the session's providers
+/// and accepted config. The TUI and `newt headless` both build it here, so the same
+/// config yields the same system text.
+fn assemble_session_prompt(
+    workspace: &str,
+    memory: &newt_core::MemoryManager,
+    persona: Option<&Persona>,
+    conversation_id: &str,
+    cfg: &newt_core::Config,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    let components = cfg.prompt_components().unwrap_or_default();
     // #2934: separate the soul/identity from the project-context additions so
     // that coach altitude can replace the soul with COACH_SOUL without
     // silently dropping AGENTS.md, notes, and the project map.
-    let soul_text = memory.soul_block();
     // A provider's block is a component (`project-instructions`, `notes`, ...); one
     // that is off is neither sent nor reported.
     let keep_provider = |name: &str| {
@@ -6187,14 +6197,66 @@ fn rebuild_system_prompt_for(
     let plan_path = newt_core::session_plan_path(conversation_id);
     build_system_prompt_for(
         workspace,
-        // No soul provider means no soul; the builder never invents one (#2935).
-        soul_text.as_deref().unwrap_or_default(),
         context_ref,
         persona,
         &plan_path.to_string_lossy(),
         cfg,
         sink,
     )
+}
+
+/// `AGENTS.md` / `CLAUDE.md` as the session reads it: `NEWT_NO_AGENTS_FILE` forces it
+/// off, `NEWT_AGENTS_FILE` forces it on (and names the file), else `[agents]`.
+pub(crate) fn project_instructions_provider(cfg: &newt_core::Config) -> newt_core::AgentsProvider {
+    let enabled = std::env::var("NEWT_NO_AGENTS_FILE").is_err()
+        && (cfg.agents.enabled || std::env::var("NEWT_AGENTS_FILE").is_ok());
+    let path = std::env::var("NEWT_AGENTS_FILE")
+        .ok()
+        .or_else(|| cfg.agents.path.clone());
+    newt_core::AgentsProvider::new(enabled, path)
+}
+
+/// The route a headless run talks to: what the TUI's startup budget is derived from.
+pub struct HeadlessRoute<'a> {
+    pub kind: newt_core::BackendKind,
+    pub backend_name: &'a str,
+    pub serving: Option<newt_core::Serving>,
+    pub model: &'a str,
+    /// `--context-window`: the served window, when given.
+    pub served_window: Option<u32>,
+}
+
+/// The system prompt `newt headless` sends: the TUI's assembled prompt for the same
+/// config, from the same providers (project instructions, notes, the active profile's
+/// API surface, the memory index). Headless has no persona. `cfg`'s `[prompt]` is
+/// whatever the caller resolved, so a `--prompt-preset` is a `cfg` the caller already
+/// changed. `knowledge_base` is whether the active profile enables it; `route`
+/// the route's context window (the API surface scales with it) is resolved by the TUI's own function.
+pub async fn headless_system_prompt(
+    workspace: &str,
+    cfg: &newt_core::Config,
+    knowledge_base: bool,
+    route: &HeadlessRoute<'_>,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    let mut memory = newt_core::MemoryManager::new();
+    let budget = chat::headless_memory_budget(
+        cfg,
+        route.kind,
+        route.backend_name,
+        route.serving,
+        route.model,
+        route.served_window,
+    );
+    chat::add_prompt_providers(&mut memory, cfg, workspace, knowledge_base, budget);
+    let session = newt_core::lifecycle::new_session_id().to_string();
+    memory
+        .initialize_all(&newt_core::SessionContext {
+            workspace: workspace.to_string(),
+            session_id: session.clone(),
+        })
+        .await;
+    assemble_session_prompt(workspace, &memory, None, &session, cfg, sink)
 }
 
 fn handle_operating_mode_command(
