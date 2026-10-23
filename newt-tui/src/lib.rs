@@ -5495,14 +5495,20 @@ impl PersonaStore {
     /// file whose body is still exactly that seed is the untouched old seed,
     /// not an operator edit, so it is replaced like a missing default. Any
     /// other content is operator data and is left alone.
-    // ponytail: matches the live DEFAULT_SOUL; if #2933 rewrites the soul,
-    // snapshot the v0.8.2 text here so older installs still migrate.
+    ///
+    /// The comparison text is a frozen snapshot of the v0.8.2 soul, not the live
+    /// soul: the soul is components now (#2933) and may change without stranding
+    /// older installs.
     fn is_legacy_coder_seed(name: &str, path: &std::path::Path) -> bool {
         name == Self::DEFAULT_NAME
             && std::fs::read_to_string(path)
-                .is_ok_and(|body| body.trim() == newt_core::DEFAULT_SOUL.trim())
+                .is_ok_and(|body| body.trim() == LEGACY_CODER_SEED_V082.trim())
     }
 }
+
+/// What v0.8.2 seeded into `coder.md`: the whole default soul, verbatim (#2935).
+/// Frozen; see [`PersonaStore::is_legacy_coder_seed`].
+const LEGACY_CODER_SEED_V082: &str = include_str!("legacy_coder_seed_v0.8.2.txt");
 
 /// The default coder persona (#2935): a short placeholder the user can edit.
 /// Using DEFAULT_SOUL here would send the soul twice when `--persona coder` is

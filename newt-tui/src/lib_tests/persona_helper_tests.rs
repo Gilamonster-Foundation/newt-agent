@@ -139,7 +139,7 @@ fn legacy_coder_seed_is_migrated_but_edits_are_kept_2935() {
     let dir = tmp.path().join("personas");
     std::fs::create_dir_all(&dir).unwrap();
     let coder_md = dir.join("coder.md");
-    std::fs::write(&coder_md, newt_core::DEFAULT_SOUL).unwrap();
+    std::fs::write(&coder_md, LEGACY_CODER_SEED_V082).unwrap();
     let store = PersonaStore::new(dir.clone());
 
     let coder = store.load("coder").unwrap();
@@ -151,11 +151,19 @@ fn legacy_coder_seed_is_migrated_but_edits_are_kept_2935() {
     assert_eq!(std::fs::read_to_string(&coder_md).unwrap(), CODER_PERSONA);
 
     // An edit on top of the old seed is operator data: left byte-for-byte.
-    let edited = format!("{}\n\nAlways run just check.\n", newt_core::DEFAULT_SOUL);
+    let edited = format!("{}\n\nAlways run just check.\n", LEGACY_CODER_SEED_V082);
     std::fs::write(&coder_md, &edited).unwrap();
     let coder = store.load("coder").unwrap();
     assert_eq!(std::fs::read_to_string(&coder_md).unwrap(), edited);
     assert!(coder.prompt.contains("Always run just check."));
+}
+
+/// The frozen v0.8.2 snapshot is the v0.8.2 soul, which the oracle still is today:
+/// if the oracle is ever edited on purpose, the snapshot must NOT follow it.
+#[test]
+fn the_legacy_seed_snapshot_is_the_v082_soul() {
+    assert_eq!(LEGACY_CODER_SEED_V082, newt_core::DEFAULT_SOUL);
+    assert_eq!(LEGACY_CODER_SEED_V082.chars().count(), 5191);
 }
 
 /// Real persona files ground the named-preset picker: seeding, loading and
