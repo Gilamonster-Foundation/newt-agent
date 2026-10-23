@@ -86,7 +86,15 @@ RUST_COMMENT = re.compile(r"^\s*//")
 DOCS_PATH = re.compile(r"docs/[A-Za-z0-9._/-]+\.md")
 
 # Directories that never hold first-party references.
-EXCLUDED_DIRS = {".git", "target", "node_modules", ".venv", "venv", "__pycache__"}
+EXCLUDED_DIRS = {
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".worktrees",
+}
 
 
 def _is_excluded(path: Path) -> bool:
