@@ -292,9 +292,9 @@ pub const SOUL: &[Component] = &[
     },
     Component {
         id: "commit-attribution",
-        description: "Credit the model and harness in a Co-authored-by trailer on every commit.",
+        description: "Credit the model and harness in a Co-authored-by trailer (now the `commit-attribution` skill; off by default).",
         requires_tools: &["git"],
-        default_on: true,
+        default_on: false,
         under_heading: true,
         layer: Layer::Soul,
         coach: false,
@@ -973,18 +973,20 @@ mod tests {
         true
     }
 
-    /// The soul without its `habit-present-findings` paragraph, which is the
-    /// `present-findings` skill now and off by default.
+    /// The soul without the paragraphs that left the default prompt for skills
+    /// (`habit-present-findings`, `commit-attribution`): the default set renders to this.
     fn soul_without_present_findings() -> String {
-        let start = crate::DEFAULT_SOUL
-            .find("**Present findings")
-            .expect("the oracle still has the paragraph");
-        let end = start + crate::DEFAULT_SOUL[start..].find("\n\n").expect("not last") + 2;
-        format!(
-            "{}{}",
-            &crate::DEFAULT_SOUL[..start],
-            &crate::DEFAULT_SOUL[end..]
-        )
+        let mut text = crate::DEFAULT_SOUL.to_string();
+        for marker in ["**Present findings", "**Sign every commit"] {
+            let start = text
+                .find(marker)
+                .expect("the oracle still has the paragraph");
+            let end = text[start..]
+                .find("\n\n")
+                .map_or(text.len(), |n| start + n + 2);
+            text.replace_range(start..end, "");
+        }
+        text.trim_end_matches('\n').to_string()
     }
 
     /// #2933: ALL the components, switched on, ARE the oracle soul; the default set is
@@ -1016,12 +1018,12 @@ mod tests {
     }
 
     #[test]
-    fn every_component_but_present_findings_is_on_by_default() {
+    fn every_component_but_the_skills_is_on_by_default() {
         let off: Vec<&str> = super::all()
             .filter(|c| !c.default_on)
             .map(|c| c.id)
             .collect();
-        assert_eq!(off, ["habit-present-findings"]);
+        assert_eq!(off, ["commit-attribution", "habit-present-findings"]);
     }
 
     #[test]
