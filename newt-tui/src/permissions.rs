@@ -1963,7 +1963,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         &mut self,
         requests: &[newt_core::PermissionRequest],
     ) -> newt_core::PermissionDecision {
-        self.ask_scoped_with(&self.base.clone(), requests, false, true)
+        self.ask_scoped(&self.base.clone(), requests, false, true)
     }
 
     fn consume_pending_once(&mut self, kind: newt_core::DenialKind, target: &str) {
@@ -2058,7 +2058,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         baseline: &newt_core::Caveats,
         requests: &[newt_core::PermissionRequest],
     ) -> newt_core::PermissionDecision {
-        self.ask_scoped(baseline, requests, false)
+        self.ask_scoped(baseline, requests, false, false)
     }
 
     fn ask_dependency_fetch(
@@ -2066,7 +2066,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         prepared: &newt_core::Caveats,
         request: &newt_core::PermissionRequest,
     ) -> newt_core::PermissionDecision {
-        self.ask_scoped(prepared, std::slice::from_ref(request), true)
+        self.ask_scoped(prepared, std::slice::from_ref(request), true, false)
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
@@ -2145,18 +2145,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
 }
 
 impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermissionGate<'_, F> {
-    fn ask_scoped(
-        &mut self,
-        baseline: &newt_core::Caveats,
-        requests: &[newt_core::PermissionRequest],
-        operation_only: bool,
-    ) -> newt_core::PermissionDecision {
-        self.ask_scoped_with(baseline, requests, operation_only, false)
-    }
-
     /// `preapproved` (#2995, `--full-access`) skips only the prompt: every
     /// veto above it still runs, and the allow is recorded after they pass.
-    fn ask_scoped_with(
+    fn ask_scoped(
         &mut self,
         baseline: &newt_core::Caveats,
         requests: &[newt_core::PermissionRequest],
