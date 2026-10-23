@@ -63,16 +63,24 @@ pub(crate) fn assemble_turn_system(p: &TurnSystemParts<'_>) -> TurnSystem {
             p.session_controls,
         ),
     ];
-    let mut text = format!(
-        "{}\n\nCurrent command working directory: {}. \
+    let cwd_sentence = format!(
+        "Current command working directory: {}. \
          run_command without cwd starts here. Explicit relative cwd and \
          relative file-tool paths resolve from the workspace root. \
-         This does not change granted access.\n\n{}\n\n{}\n\n{}",
-        p.ws_state,
+         This does not change granted access.",
         serde_json::json!(p.session_cwd),
-        p.runtime_ctx,
-        p.system,
-        p.session_controls,
+    );
+    notes.insert(
+        1,
+        note(
+            "working directory",
+            "newt-tui assemble_turn_system",
+            &cwd_sentence,
+        ),
+    );
+    let mut text = format!(
+        "{}\n\n{cwd_sentence}\n\n{}\n\n{}\n\n{}",
+        p.ws_state, p.runtime_ctx, p.system, p.session_controls,
     );
     if !p.communication_style.is_empty() {
         notes.push(note(
@@ -116,10 +124,36 @@ mod tests {
             .text
             .starts_with("WS\n\nCurrent command working directory: \"/w\"."));
         assert!(t.text.ends_with("RT\n\nSYS\n\nCTL"));
-        assert_eq!(t.notes.len(), 3);
+        assert_eq!(t.notes.len(), 4);
         let t = assemble_turn_system(&parts("STYLE", false));
         assert!(t.text.ends_with("CTL\n\nSTYLE"));
         assert_eq!(t.notes.last().unwrap().label, "communication style");
+    }
+
+    /// #2933: the cwd sentence is a named piece, so a turn's report has no
+    /// unlabelled text; the joins between pieces are separators.
+    #[test]
+    fn every_byte_of_a_turn_is_labelled() {
+        use newt_core::agentic::request_report::RequestReport;
+        for (style, clar) in [("", false), ("STYLE", false), ("", true)] {
+            let t = assemble_turn_system(&parts(style, clar));
+            // The frozen system text is labelled by its own builder; stand in.
+            let mut notes = t.notes.clone();
+            notes.push(newt_core::agentic::request_report::Annotation {
+                label: "system".into(),
+                source: "test".into(),
+                text: "SYS".into(),
+            });
+            let report = RequestReport::build_from_parts(&[t.text.as_str()], None, &notes);
+            let labels: Vec<&str> = report.system[0]
+                .components
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect();
+            // The clarification wrapper is the one piece without a label.
+            let stray = labels.iter().filter(|l| **l == "(unattributed)").count();
+            assert_eq!(stray, usize::from(clar), "{labels:?}");
+        }
     }
 
     #[test]

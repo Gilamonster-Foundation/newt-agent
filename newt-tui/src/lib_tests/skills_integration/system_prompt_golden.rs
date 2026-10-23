@@ -29,7 +29,11 @@ fn assembled(config: &str, soul: &str, persona: Option<&Persona>) -> String {
     fs::create_dir_all(ws.join(".git")).unwrap();
     fs::write(ws.join("Cargo.toml"), "[package]\n").unwrap();
     fs::write(ws.join("README.md"), "# Fixture\nA tiny project.\n").unwrap();
-    write_skill(&config_dir.join("skills"), "fixture-skill", "A fixture skill");
+    write_skill(
+        &config_dir.join("skills"),
+        "fixture-skill",
+        "A fixture skill",
+    );
     fs::write(config_dir.join("config.toml"), config).unwrap();
     let _sandbox = SkillRootSandbox::enter(&config_dir, &ws);
     let ws_str = ws.to_str().unwrap();
@@ -76,7 +80,10 @@ fn goldens_pin_the_assembled_prompt() {
     let doer = newt_core::DEFAULT_SOUL;
     check("doer", &assembled("", doer, None));
     check("coach", &assembled("", doer, Some(&persona("coach", true))));
-    check("persona", &assembled("", doer, Some(&persona("reviewer", false))));
+    check(
+        "persona",
+        &assembled("", doer, Some(&persona("reviewer", false))),
+    );
     check(
         "read_only",
         &assembled("[tool_exposure]\nread_only = true\n", doer, None),

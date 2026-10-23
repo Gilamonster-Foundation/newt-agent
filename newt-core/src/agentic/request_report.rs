@@ -6,7 +6,8 @@
 //! request and cannot drift from it. Assemblers may [`ReportSink::annotate`]
 //! the pieces they join into a system message (label + source); the report
 //! locates each piece in the sent text and reports every remaining byte as an
-//! explicit `(unattributed)` component, so the component sizes always sum to
+//! explicit component (`(separator)` for a bare join, `(unattributed)` for
+//! text nobody labelled), so the component sizes always sum to
 //! the exact message length.
 //!
 //! Sizes are characters. Token counts are not shown: the backend reports
@@ -63,6 +64,8 @@ pub struct RequestReport {
 }
 
 const UNATTRIBUTED: &str = "(unattributed)";
+/// Whitespace between two labelled pieces: the join, not unlabelled text.
+const SEPARATOR: &str = "(separator)";
 
 fn chars(s: &str) -> usize {
     s.chars().count()
@@ -85,26 +88,27 @@ fn components_of(text: &str, notes: &[Annotation]) -> Vec<Component> {
             chars: chars(piece),
         });
     };
+    // A gap of only whitespace is the join between two pieces; anything else
+    // is text nobody labelled.
+    let gap = |push: &mut dyn FnMut(&str, &str, &str), piece: &str| {
+        if !piece.is_empty() && piece.trim().is_empty() {
+            push(SEPARATOR, "joins between components", piece);
+        } else {
+            push(UNATTRIBUTED, "unlabelled text", piece);
+        }
+    };
     for (at, len, note) in found {
         if at < cursor {
             continue; // overlaps a piece already placed
         }
         if at > cursor {
-            push(
-                UNATTRIBUTED,
-                "separators and unlabelled text",
-                &text[cursor..at],
-            );
+            gap(&mut push, &text[cursor..at]);
         }
         push(&note.label, &note.source, &text[at..at + len]);
         cursor = at + len;
     }
     if cursor < text.len() || text.is_empty() {
-        push(
-            UNATTRIBUTED,
-            "separators and unlabelled text",
-            &text[cursor..],
-        );
+        gap(&mut push, &text[cursor..]);
     }
     out
 }
@@ -448,10 +452,7 @@ mod tests {
             .iter()
             .map(|c| c.label.as_str())
             .collect();
-        assert_eq!(
-            labels,
-            ["identity", UNATTRIBUTED, "workspace", UNATTRIBUTED]
-        );
+        assert_eq!(labels, ["identity", SEPARATOR, "workspace", UNATTRIBUTED]);
         assert_eq!(r.system[1].components[0].label, "active-prompt card");
         let tool_sum: usize = r.tools.iter().map(|t| t.chars).sum();
         assert_eq!(r.tools_array_chars, tool_sum + r.tools.len() + 1);
@@ -459,6 +460,29 @@ mod tests {
         assert!(r.to_markdown().contains("| bb |"));
         // #2937: full schema must appear in the markdown output
         assert!(r.to_markdown().contains("\"name\": \"bb\""));
+    }
+
+    /// #2933: a bare `\n\n` between two labelled pieces is the join, named as
+    /// such; only text nobody labelled is `(unattributed)`.
+    #[test]
+    fn a_bare_join_is_a_separator_and_stray_text_is_not() {
+        let text = "one\n\ntwo\n\nstray\n\nthree";
+        let notes = [
+            note("one", "one"),
+            note("two", "two"),
+            note("three", "three"),
+        ];
+        let m = RequestReport::build_from_parts(&[text], None, &notes)
+            .system
+            .remove(0);
+        let labels: Vec<&str> = m.components.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["one", SEPARATOR, "two", UNATTRIBUTED, "three"],
+            "{:?}",
+            m.components
+        );
+        assert_eq!(m.components[3].chars, "\n\nstray\n\n".len());
     }
 
     #[test]

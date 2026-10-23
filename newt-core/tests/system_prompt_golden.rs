@@ -179,3 +179,57 @@ fn listing_and_readme_are_bounded() {
     .text;
     assert!(!none.contains("Files:") && !none.contains("readme.md"));
 }
+
+/// The report of an assembled prompt has no unlabelled text: every byte is a
+/// named piece or the join between two of them.
+#[test]
+fn every_byte_is_labelled() {
+    use newt_core::agentic::request_report::RequestReport;
+    for v in [
+        Variant::default(),
+        Variant {
+            coach: true,
+            persona: Some(PERSONA),
+            ..Variant::default()
+        },
+        Variant {
+            narration: Some("Say it."),
+            ..Variant::default()
+        },
+    ] {
+        let identity = v
+            .exposure
+            .render_identity(if v.coach { COACH_SOUL } else { v.soul });
+        let files = ["a".to_string()];
+        let built = assemble_system_prompt(&PromptParts {
+            identity: &identity,
+            coach_identity: v.coach,
+            context: Some("## AGENTS.md\nUse four spaces."),
+            workspace: "/ws",
+            persona: v.persona,
+            plan_path: "plan.md",
+            publish_guidance: newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE,
+            narration_line: v.narration,
+            skills_index: Some(SKILLS),
+            file_names: Some(&files),
+            readme: Some(ReadmePart {
+                file_name: "README.md",
+                text: "# R\n",
+            }),
+        });
+        // The caller's providers label the context blocks; stand in for them.
+        let mut notes = built.notes.clone();
+        notes.push(newt_core::agentic::request_report::Annotation {
+            label: "agents".into(),
+            source: "provider".into(),
+            text: "## AGENTS.md\nUse four spaces.".into(),
+        });
+        let report = RequestReport::build_from_parts(&[built.text.as_str()], None, &notes);
+        let stray: Vec<_> = report.system[0]
+            .components
+            .iter()
+            .filter(|c| c.label == "(unattributed)")
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}");
+    }
+}

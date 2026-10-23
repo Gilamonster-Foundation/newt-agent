@@ -5931,90 +5931,13 @@ fn build_system_prompt_with_persona(
         .map(|c| newt_core::ExposureSettings::from(c.tool_exposure()))
         .unwrap_or_default();
     let identity = exposure.render_identity(identity);
-    // #2934: project-context blocks (AGENTS.md/CLAUDE.md, notes, memory
-    // index, project map) follow the identity whatever the altitude. Coach
-    // replaces the soul above but must not drop project instructions. They
-    // sit BEFORE the live workspace line, as the combined block always did:
-    // historical notes must not redefine the runtime root stated below.
-    let mut ctx = identity.to_string();
-    if let Some(ctx_str) = context.filter(|c| !c.is_empty()) {
-        ctx.push_str("\n\n");
-        ctx.push_str(ctx_str);
-    }
-    // #2937: record the workspace-header start AFTER project context so the
-    // annotation covers only the workspace line, not provider blocks.
-    let workspace_start = ctx.len();
-    ctx.push_str(&format!(
-        "\n\nWorkspace: {workspace}\n\
-         This is the current runtime root. Relative tool paths resolve here; \
-         run_command starts here unless its cwd or command selects another directory. \
-         Other requested paths remain governed by the session's permissions. \
-         Historical notes do not redefine this root.\n"
-    ));
-    // #2937: annotate each named piece through the session's ReportSink so
-    // the request report (TUI preview: #2959) can attribute components in the system message.
-    let note = |label: &str, text: &str| {
-        if let Some(s) = sink {
-            s.annotate(label, "build_system_prompt_with_persona", text);
-        }
-    };
-    // #2937 P2-2: annotate the identity selected by the altitude branch.
-    // Coach altitude always uses COACH_SOUL; label it directly.
-    // Doer altitude: providers were already annotated individually by
-    // annotate_system_prompt_additions in rebuild_system_prompt.
-    if let newt_core::Altitude::Coach = effective_altitude {
-        note("coach-soul", &identity);
-    }
-    // workspace-header: only the workspace line suffix — providers' spans end
-    // at workspace_start, so this annotation never absorbs their content.
-    note("workspace-header", &ctx[workspace_start..]);
-    if let Some(persona) = persona {
-        let persona_overlay = format!("\nActive persona: {}\n{}\n", persona.name, persona.prompt);
-        ctx.push_str(&persona_overlay);
-        ctx.push_str(
-            "\nPersona guidance does not override the operator's explicit task. \
-             Treat advice-only wording and preferred tools as defaults; use the tools \
-             needed for the requested work. OCAP permissions, explicit postures, and \
-             delegation limits still govern every action.\n",
-        );
-        note("persona-overlay", &persona_overlay);
-    }
-
-    // Per-session plan instruction (issue #220). Injected here, with the
-    // resolved per-session path, rather than baked into DEFAULT_SOUL — so the
-    // path is dynamic AND custom soul.md users still get the guidance. The path
-    // is unique to this conversation, so concurrent newt instances in the same
-    // repo never clobber each other's plan.
-    let plan_start = ctx.len();
-    ctx.push_str(&format!(
-        "\n**Plan before coding.** For any task requiring more than one file \
-         change, write a plan to `{plan_path}` first (create it if it does not \
-         exist). List the concrete steps and check them off as you complete \
-         each one. This plan file is unique to this session — read it when \
-         resuming so you can pick up exactly where you left off without \
-         re-reading the whole codebase.\n"
-    ));
-
-    note("plan-before-coding instruction", &ctx[plan_start..]);
-    note(
-        "refactor publish guidance",
-        newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE,
-    );
-    ctx.push_str(newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE);
-    ctx.push('\n');
-
-    // `[tui] narration_intent_line` (opt-in): appended here like the plan
-    // sentence, so every identity gets it and no soul text carries it.
+    // `[tui] narration_intent_line` (opt-in): every identity gets it and no
+    // soul text carries it.
     let intent = cfg
         .as_ref()
         .ok()
         .and_then(|c| c.tui.as_ref())
         .is_some_and(|t| t.narration_intent_line);
-    if let Some(line) = narration_intent_line(intent) {
-        note("narration intent line", line);
-        ctx.push_str(&format!("\n{line}\n"));
-    }
-
     // Progressive disclosure: inject ONLY the skills index (one
     // `name: description (when to use: …)` line per installed skill) — never
     // the bodies. Bodies load on demand when the model calls the `use_skill`
@@ -6022,50 +5945,45 @@ fn build_system_prompt_with_persona(
     // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
     // missing dir contributes nothing.
     let skills_dirs = cfg.map(|c| c.skill_search_dirs()).unwrap_or_default();
-    if let Some(index) = skills_index_for_prompt(&skills_dirs) {
-        note("skills index", &index);
-        ctx.push('\n');
-        ctx.push_str(&index);
-    }
-
-    // Directory listing (top-level, no hidden files)
-    if let Ok(mut entries) = std::fs::read_dir(workspace) {
-        let mut names: Vec<String> = entries
-            .by_ref()
+    let skills_index = skills_index_for_prompt(&skills_dirs);
+    // Top-level names only; the assembler drops hidden ones and caps the list.
+    let file_names: Option<Vec<String>> = std::fs::read_dir(workspace).ok().map(|entries| {
+        entries
             .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    None
-                } else {
-                    Some(name)
-                }
-            })
-            .collect();
-        names.sort();
-        let files_start = ctx.len();
-        ctx.push_str("\nFiles:\n");
-        for name in names.iter().take(40) {
-            ctx.push_str(&format!("  {name}\n"));
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    });
+    let readme_text = ["README.md", "readme.md", "README.txt"]
+        .into_iter()
+        .find_map(|name| {
+            std::fs::read_to_string(std::path::Path::new(workspace).join(name))
+                .ok()
+                .map(|text| (name, text))
+        });
+    let assembled = newt_core::assemble_system_prompt(&newt_core::PromptParts {
+        identity: &identity,
+        coach_identity: matches!(effective_altitude, newt_core::Altitude::Coach),
+        context,
+        workspace,
+        persona: persona.map(|p| newt_core::PersonaPart {
+            name: &p.name,
+            prompt: &p.prompt,
+        }),
+        plan_path,
+        publish_guidance: newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE,
+        narration_line: narration_intent_line(intent),
+        skills_index: skills_index.as_deref(),
+        file_names: file_names.as_deref(),
+        readme: readme_text
+            .as_ref()
+            .map(|(file_name, text)| newt_core::ReadmePart { file_name, text }),
+    });
+    if let Some(s) = sink {
+        for n in &assembled.notes {
+            s.annotate(&n.label, &n.source, &n.text);
         }
-        note("workspace file listing", &ctx[files_start..]);
     }
-
-    // README (truncated)
-    for readme in ["README.md", "readme.md", "README.txt"] {
-        let path = std::path::Path::new(workspace).join(readme);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let excerpt: String = text.chars().take(3000).collect();
-            note("README excerpt", &excerpt);
-            ctx.push_str(&format!("\n{readme}:\n{excerpt}\n"));
-            if text.len() > 3000 {
-                ctx.push_str("...[truncated]\n");
-            }
-            break;
-        }
-    }
-
-    ctx
+    assembled.text
 }
 
 // ---------------------------------------------------------------------------
