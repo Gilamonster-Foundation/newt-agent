@@ -78,12 +78,20 @@ impl MockGate {
 }
 
 impl super::PermissionGate for MockGate {
-    fn record_full_access(&mut self, requests: &[super::PermissionRequest]) {
+    fn ask_full_access(
+        &mut self,
+        requests: &[super::PermissionRequest],
+    ) -> super::PermissionDecision {
         self.full_access.extend(
             requests
                 .iter()
                 .map(|r| format!("{}:{}", r.kind.as_str(), r.target)),
         );
+        let grants: Vec<_> = requests
+            .iter()
+            .map(|r| (r.kind, r.target.clone()))
+            .collect();
+        super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
     }
     fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
         for r in requests {

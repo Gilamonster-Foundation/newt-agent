@@ -430,18 +430,7 @@ async fn remote_call_under(
     yolo: bool,
     with_gate: bool,
 ) -> (bool, usize, Vec<String>, String) {
-    use super::disable_ocap_tests::EnvVar;
-    let _l = crate::process_env::lock();
-    let _fa = if full_access {
-        EnvVar::set("NEWT_FULL_ACCESS", "1")
-    } else {
-        EnvVar::unset("NEWT_FULL_ACCESS")
-    };
-    let _yolo = if yolo {
-        EnvVar::set("NEWT_DISABLE_OCAP", "1")
-    } else {
-        EnvVar::unset("NEWT_DISABLE_OCAP")
-    };
+    let _authority = crate::launch_authority::ScopedAuthority::new(full_access, yolo);
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = Caveats::top();
     let mut mcp = OneRemoteTool::new("mail__search");

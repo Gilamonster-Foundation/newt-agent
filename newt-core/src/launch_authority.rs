@@ -205,6 +205,34 @@ pub(crate) fn reset_for_test() {
     PROCESS_FROZEN.with(|c| c.set(None));
 }
 
+/// Test-only: pin the launch authority for THIS thread and restore the prior
+/// value on drop. Unlike publishing `NEWT_FULL_ACCESS`, nothing leaks to
+/// sibling tests, so tests that read [`current`] stay parallel-safe.
+#[cfg(test)]
+pub(crate) struct ScopedAuthority(Option<LaunchAuthority>);
+
+#[cfg(test)]
+impl ScopedAuthority {
+    pub(crate) fn new(full_access: bool, ocap_disabled: bool) -> Self {
+        let prior = PROCESS_FROZEN.with(std::cell::Cell::get);
+        PROCESS_FROZEN.with(|c| {
+            c.set(Some(LaunchAuthority {
+                full_access,
+                ocap_disabled,
+                ..LaunchAuthority::CONFINED
+            }));
+        });
+        Self(prior)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedAuthority {
+    fn drop(&mut self) {
+        PROCESS_FROZEN.with(|c| c.set(self.0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

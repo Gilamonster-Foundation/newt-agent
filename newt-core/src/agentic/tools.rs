@@ -3955,14 +3955,14 @@ async fn execute_authorized_tool(
         };
         // #2995: `--full-access` is the operator's own launch-time grant of
         // unrestricted authority (frozen `LaunchAuthority`, never config or a
-        // persona), so asking again repeats a question already answered. The
-        // decision is still recorded; hints and personas grant nothing.
-        let approved = if full_access_requested() {
-            gate.record_full_access(std::slice::from_ref(&request));
-            true
+        // persona), so the gate is asked to skip the PROMPT, not its vetoes.
+        // Hints and personas still grant nothing.
+        let decision = if full_access_requested() {
+            gate.ask_full_access(&[request])
         } else {
-            matches!(gate.ask(&[request]), PermissionDecision::Allow(_))
+            gate.ask(&[request])
         };
+        let approved = matches!(decision, PermissionDecision::Allow(_));
         let grant = approved.then_some(McpGrant::HumanApproved);
         return match leash_mcp_call(name, args, grant) {
             Ok(leased) => mcp.call(&leased).await,

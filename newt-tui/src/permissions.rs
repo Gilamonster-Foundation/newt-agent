@@ -1959,13 +1959,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         self.ask_with_caveats(&self.base.clone(), requests)
     }
 
-    fn record_full_access(&mut self, requests: &[newt_core::PermissionRequest]) {
-        for req in requests {
-            self.record(req, "allow", "session-full-access");
-            self.state
-                .session_grants
-                .insert((req.kind, req.target.clone()));
-        }
+    fn ask_full_access(
+        &mut self,
+        requests: &[newt_core::PermissionRequest],
+    ) -> newt_core::PermissionDecision {
+        self.ask_scoped_with(&self.base.clone(), requests, false, true)
     }
 
     fn consume_pending_once(&mut self, kind: newt_core::DenialKind, target: &str) {
@@ -2153,6 +2151,18 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         requests: &[newt_core::PermissionRequest],
         operation_only: bool,
     ) -> newt_core::PermissionDecision {
+        self.ask_scoped_with(baseline, requests, operation_only, false)
+    }
+
+    /// `preapproved` (#2995, `--full-access`) skips only the prompt: every
+    /// veto above it still runs, and the allow is recorded after they pass.
+    fn ask_scoped_with(
+        &mut self,
+        baseline: &newt_core::Caveats,
+        requests: &[newt_core::PermissionRequest],
+        operation_only: bool,
+        preapproved: bool,
+    ) -> newt_core::PermissionDecision {
         use newt_core::PermissionDecision::{Allow, Deny};
         if operation_only
             && (requests.len() != 1
@@ -2250,6 +2260,18 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             .any(|r| self.state.denied(r.kind, &r.target))
         {
             return Deny;
+        }
+        if preapproved {
+            let Ok(minted) = self.mint(baseline, &[]) else {
+                return Deny;
+            };
+            for req in requests {
+                self.record(req, "allow", "session-full-access");
+                self.state
+                    .session_grants
+                    .insert((req.kind, req.target.clone()));
+            }
+            return Allow(minted);
         }
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
         // dec1-build-grant round 2: a request covered by the Build-grant
