@@ -116,6 +116,8 @@ async fn an_unknown_preset_is_refused() {
     assert!(err.contains("nope") && err.contains("presets:"), "{err}");
 }
 
+const NOTE_CANARY: &str = "NOTE_CANARY_7391 prefer tabs in this project\n";
+
 /// One session's config and workspace, shared by a TUI run and a headless run.
 struct Parity {
     root: tempfile::TempDir,
@@ -144,6 +146,8 @@ async fn parity(config_tail: &str) -> Parity {
         .mount(&server)
         .await;
     std::fs::create_dir_all(root.path().join(".newt")).unwrap();
+    // A populated provider: the user's notes ride in the frozen prompt of both.
+    std::fs::write(root.path().join(".newt").join("NOTES.md"), NOTE_CANARY).unwrap();
     std::fs::write(
         root.path().join(".newt").join("config.toml"),
         format!(
@@ -251,6 +255,7 @@ impl Parity {
     async fn headless(&self, extra: &[&str]) -> String {
         let instruction = self.root.path().join("instruction.md");
         std::fs::write(&instruction, "hello\n").unwrap();
+        self.seen.lock().unwrap().clear();
         let mut cmd = self.command();
         cmd.args(["headless", "--cwd"])
             .arg(&self.workspace)
@@ -286,6 +291,15 @@ async fn headless_sends_the_prompt_the_tui_sends() {
         let headless = p.headless(&[]).await;
         let built = assembled(&headless);
         assert!(built.len() > 100, "{built}");
+        // The populated provider reached BOTH (`pi` leaves notes out of both).
+        let notes = !tail.contains("pi");
+        for (who, text) in [("headless", &headless), ("tui", &tui)] {
+            assert_eq!(
+                text.contains("NOTE_CANARY_7391"),
+                notes,
+                "{who}, config tail {tail:?}:\n{text}"
+            );
+        }
         assert!(
             tui.contains(built),
             "config tail {tail:?}\n--- headless ---\n{built}\n--- tui ---\n{tui}"
@@ -387,4 +401,27 @@ async fn the_file_is_the_only_system_message() {
     .await
     .unwrap();
     assert_eq!(all, vec![PRUNED.to_string()]);
+}
+
+/// The retired-soul notice is delivered once per run, not once per config read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_soul_is_reported_once_per_headless_run() {
+    let p = parity("").await;
+    std::fs::write(
+        p.root.path().join(".newt").join("soul.md"),
+        "You are a Django expert.",
+    )
+    .unwrap();
+    let instruction = p.root.path().join("instruction.md");
+    std::fs::write(&instruction, "hello\n").unwrap();
+    let mut cmd = p.command();
+    cmd.args(["headless", "--cwd"])
+        .arg(&p.workspace)
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .args(["--max-rounds", "1"]);
+    let out = cmd.output().await.expect("output");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("ignoring").count(), 1, "{stderr}");
+    assert!(!p.first_system().contains("Django"));
 }

@@ -2513,6 +2513,9 @@ fn report_retired_soul(cfg: &Config, report: &mut dyn FnMut(crate::tty::Notice<'
         home_dir().as_deref(),
         user_dir.as_deref(),
     ) {
+        if !first_report_of(&source) {
+            continue;
+        }
         report(crate::tty::Notice::new(
             crate::tty::Level::Warn,
             "",
@@ -2524,6 +2527,27 @@ fn report_retired_soul(cfg: &Config, report: &mut dyn FnMut(crate::tty::Notice<'
                 crate::notes_scan::neutralize_for_display(&source)
             ),
         ));
+    }
+}
+
+/// True the first time `source` is reported in this session. Config is re-resolved at
+/// startup and after every refresh, and a notice per read would repeat all session.
+/// (Thread-local under test, so parallel tests do not share the set.)
+fn first_report_of(source: &str) -> bool {
+    #[cfg(not(test))]
+    {
+        static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        SEEN.lock()
+            .map_or(true, |mut seen| seen.insert(source.to_string()))
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static SEEN: std::cell::RefCell<std::collections::BTreeSet<String>> =
+                const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+        }
+        SEEN.with(|seen| seen.borrow_mut().insert(source.to_string()))
     }
 }
 

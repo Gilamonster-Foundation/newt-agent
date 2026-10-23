@@ -156,6 +156,23 @@ fn prompt_components_for(
     Ok(Some((cfg, components)))
 }
 
+/// Does the profile the TUI would pick for this route enable `knowledge_base` (the API
+/// surface and project map in the frozen prompt)? The same pick, env selectors included.
+fn profile_enables_knowledge_base(cfg: &newt_core::Config, family: Option<&str>) -> Result<bool> {
+    let pick = cfg
+        .pick_active_profile(
+            std::env::var("NEWT_PROFILE").ok().as_deref(),
+            std::env::var("NEWT_BUNDLE").ok().as_deref(),
+            family,
+        )
+        .map_err(anyhow::Error::msg)?;
+    let Some(pick) = pick else { return Ok(false) };
+    let profile = cfg
+        .resolve_profile(&pick.name)
+        .map_err(|e| anyhow::anyhow!("profile '{}': {e}", pick.name))?;
+    Ok(profile.enables("knowledge_base"))
+}
+
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
 /// and the content id of the entries it actually holds — the receipt's `seed`.
 /// Refused here, before any backend work, when the JSON is not an object of
@@ -507,7 +524,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
     // contract's effective_config — the bench never re-derives it from a
     // profile (contract requirement 5).
-    let runtime = resolve_runtime_posture(&cfg, caps.family_for_route(&destination, principal));
+    let family = caps.family_for_route(&destination, principal);
+    let runtime = resolve_runtime_posture(&cfg, family);
+    // The profile the TUI would pick for this route: it decides which providers fill the prompt.
+    let knowledge_base = profile_enables_knowledge_base(&cfg, family)?;
     // #2314: a required feature this run cannot supply stops here, before the
     // instruction is read or anything reaches a backend.
     headless_contract::admit_required(&args.require_feature, |feature| match feature {
@@ -739,8 +759,14 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     let sys_msg = match (prompt_override, components) {
         (Some(o), _) => override_system_message(o, dc.report_sink.as_deref()),
         (None, Some((prompt_cfg, _))) => newt_core::MemMessage::system(
-            newt_tui::headless_system_prompt(&workspace, &prompt_cfg, dc.report_sink.as_deref())
-                .await,
+            newt_tui::headless_system_prompt(
+                &workspace,
+                &prompt_cfg,
+                knowledge_base,
+                args.context_window,
+                dc.report_sink.as_deref(),
+            )
+            .await,
         ),
         (None, None) => workspace_root_system_message(&workspace, dc.report_sink.as_deref()),
     };

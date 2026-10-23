@@ -287,7 +287,11 @@ async fn a_soul_md_is_ignored_with_a_notice_pointing_at_prompt_file() {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn the real CLI");
     let mut input = child.stdin.take().unwrap();
-    input.write_all(b"TURN_ONE\n/quit\n").await.unwrap();
+    // Several turns and a settings write (which re-resolves the config) in one session.
+    input
+        .write_all(b"TURN_ONE\n/settings system-prompt off readme\nTURN_TWO\n/quit\n")
+        .await
+        .unwrap();
     drop(input);
     let output = tokio::time::timeout(BUDGET, child.wait_with_output())
         .await
@@ -301,6 +305,11 @@ async fn a_soul_md_is_ignored_with_a_notice_pointing_at_prompt_file() {
     assert!(
         shown.contains("soul.md") && shown.contains("[prompt] file"),
         "the retired soul gets a notice:\n{shown}"
+    );
+    assert_eq!(
+        shown.matches("ignoring").count(),
+        1,
+        "one notice per source per session, not one per config read:\n{shown}"
     );
     let seen = f.seen.lock().unwrap().clone();
     let one = turn(&seen, "TURN_ONE");
