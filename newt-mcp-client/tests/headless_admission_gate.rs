@@ -56,6 +56,7 @@ async fn headless_planner_never_spawns_an_untrusted_server() {
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
         trust: McpTrust::Untrusted,
         origin: None,
     };

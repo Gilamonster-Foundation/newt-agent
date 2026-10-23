@@ -25,6 +25,7 @@ fn http_entry(url: String, headers: BTreeMap<String, SecretValue>) -> McpServerE
         headers,
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     }

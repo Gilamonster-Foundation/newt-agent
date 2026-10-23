@@ -14,6 +14,7 @@ fn exact_http_hosts_are_normalized_and_deduplicated() {
             headers: BTreeMap::new(),
             login_argv: Vec::new(),
             request_timeout_secs: None,
+            oauth_client_id: None,
             trust: McpTrust::Trusted,
             origin: None,
         },
@@ -33,6 +34,7 @@ fn exact_http_hosts_are_normalized_and_deduplicated() {
             headers: BTreeMap::new(),
             login_argv: Vec::new(),
             request_timeout_secs: None,
+            oauth_client_id: None,
             trust: McpTrust::Trusted,
             origin: None,
         },
@@ -58,6 +60,7 @@ fn http_url_is_canonicalized_once_for_persistence_and_grants() {
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
         trust: McpTrust::Trusted,
         origin: None,
     };
@@ -89,6 +92,7 @@ fn import_url_validation_is_independent_of_network_grants_and_rejects_fragments(
             headers: BTreeMap::new(),
             login_argv: Vec::new(),
             request_timeout_secs: None,
+            oauth_client_id: None,
             trust: McpTrust::Untrusted,
             origin: None,
         };
