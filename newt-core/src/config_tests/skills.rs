@@ -275,7 +275,10 @@ fn an_off_skill_is_neither_listed_nor_loadable() {
     );
     assert!(off.load_skill_body("beta").is_ok());
     let names: Vec<_> = off.skills_on().into_iter().map(|s| s.name).collect();
-    assert!(names.contains(&"beta".to_string()) && !names.contains(&"alpha".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"beta".to_string()) && !names.contains(&"alpha".to_string()),
+        "{names:?}"
+    );
 }
 
 /// The writer keeps comments and drops the key when nothing is off.
