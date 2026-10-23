@@ -257,4 +257,26 @@ mod tests {
             .unwrap();
         assert!(!present.default_on, "the rule is a skill now");
     }
+
+    /// The `commit-attribution` rule lives on as the bundled skill; the component is off.
+    #[test]
+    fn commit_attribution_is_a_bundled_skill_and_off_by_default() {
+        let skill = newt_skills::Skill::parse(
+            include_str!("../../.newt/bundled-skills/commit-attribution/SKILL.md"),
+            ".newt/bundled-skills/commit-attribution",
+        )
+        .expect("the skill parses");
+        assert_eq!(skill.name, "commit-attribution");
+        assert!(skill.body.contains("Co-authored-by:"));
+        assert!(skill.body.contains("newt-agent GitHub App"));
+        assert!(
+            skill
+                .body
+                .contains("Do not\n  add a second trailer by hand")
+                || skill.body.contains("second trailer"),
+            "this variant keeps B3 as the source of truth"
+        );
+        let attribution = pc::all().find(|c| c.id == "commit-attribution").unwrap();
+        assert!(!attribution.default_on, "the rule is a skill now");
+    }
 }
