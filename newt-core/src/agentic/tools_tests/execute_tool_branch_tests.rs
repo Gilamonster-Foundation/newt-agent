@@ -62,6 +62,8 @@ struct MockGate {
     allow: bool,
     base: Caveats,
     asks: Vec<(String, String)>,
+    /// `kind:target` of each request recorded as a full-access pre-approval.
+    full_access: Vec<String>,
 }
 
 impl MockGate {
@@ -70,11 +72,19 @@ impl MockGate {
             allow,
             base: base.clone(),
             asks: Vec::new(),
+            full_access: Vec::new(),
         }
     }
 }
 
 impl super::PermissionGate for MockGate {
+    fn record_full_access(&mut self, requests: &[super::PermissionRequest]) {
+        self.full_access.extend(
+            requests
+                .iter()
+                .map(|r| format!("{}:{}", r.kind.as_str(), r.target)),
+        );
+    }
     fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
         for r in requests {
             self.asks

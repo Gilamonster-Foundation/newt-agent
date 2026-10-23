@@ -326,6 +326,13 @@ pub trait PermissionGate {
     /// request was allowed; any single deny keeps the whole denial.
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision;
 
+    /// #2995: `--full-access` pre-approved these requests at launch, so the
+    /// caller skipped [`Self::ask`]. A gate that keeps a permission log and
+    /// session grants records them as an "allow for this session" answer
+    /// whose reason is full access, keeping the decision observable. Never
+    /// persisted. Default no-op: gates with no log have nothing to record.
+    fn record_full_access(&mut self, _requests: &[PermissionRequest]) {}
+
     /// #2636: a caller that just spent an `Allow(kind, target)` on an
     /// immediate, one-shot action — rather than leaving it for the model's
     /// own later retry — tells the gate so any proactive once-grant it

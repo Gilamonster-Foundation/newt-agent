@@ -1959,6 +1959,15 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         self.ask_with_caveats(&self.base.clone(), requests)
     }
 
+    fn record_full_access(&mut self, requests: &[newt_core::PermissionRequest]) {
+        for req in requests {
+            self.record(req, "allow", "session-full-access");
+            self.state
+                .session_grants
+                .insert((req.kind, req.target.clone()));
+        }
+    }
+
     fn consume_pending_once(&mut self, kind: newt_core::DenialKind, target: &str) {
         self.state
             .pending_once_grants
