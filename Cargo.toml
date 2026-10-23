@@ -145,7 +145,7 @@ crossterm = { path = "vendor/crossterm-0.28.1-patched" }
 # / mcp-under-leash / sod-proposer-not-worker / b1-os-isolation, toward "zero
 # deviations = full OCAP") accumulate on the still-open 0.8.0 line — no patch bump
 # until 0.8.0 actually ships.
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 # MSRV 1.90 -> 1.91 (2026-10-20, operator decision). The agent-mesh flock
 # crates newt's flock inbox depends on declare 1.91 (iroh 1.3). The CI `msrv`
@@ -172,9 +172,9 @@ homepage = "https://github.com/hartsock/newt-agent"
 authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 
 [workspace.dependencies]
-agent-frame = { path = "agent-frame", version = "=0.8.3" }
-agent-harness = { package = "newt-harness", path = "agent-harness", version = "=0.8.3" }
-agent-harness-py = { path = "agent-harness-py", version = "=0.8.3" }
+agent-frame = { path = "agent-frame", version = "=0.8.4" }
+agent-harness = { package = "newt-harness", path = "agent-harness", version = "=0.8.4" }
+agent-harness-py = { path = "agent-harness-py", version = "=0.8.4" }
 agent-toolchain = { path = "agent-toolchain", version = "=0.1.0" }
 # Core utilities
 anyhow = "1.0"
@@ -409,28 +409,28 @@ tests-pty = { path = "tests/pty" }
 agent-mesh-protocol = "0.7"
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.8.3" }
-newt-data         = { path = "newt-data",         version = "=0.8.3" }
-newt-flock        = { path = "newt-flock",        version = "=0.8.3" }
-newt-git          = { path = "newt-git",          version = "=0.8.3" }
-newt-inference    = { path = "newt-inference",    version = "=0.8.3" }
-newt-scheduler    = { path = "newt-scheduler",    version = "=0.8.3" }
-newt-tools        = { path = "newt-tools",        version = "=0.8.3" }
-newt-interaction  = { path = "newt-interaction",  version = "=0.8.3" }
-newt-skills       = { path = "newt-skills",       version = "=0.8.3" }
-newt-tui          = { path = "newt-tui",          version = "=0.8.3" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.8.3" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.8.3" }
-newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.8.3" }
-newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.8.3" }
-newt-coder        = { path = "newt-coder",        version = "=0.8.3" }
-newt-identity     = { path = "newt-identity",     version = "=0.8.3" }
-newt-tuner        = { path = "crates/newt-tuner", version = "=0.8.3" }
+newt-core         = { path = "newt-core",         version = "=0.8.4" }
+newt-data         = { path = "newt-data",         version = "=0.8.4" }
+newt-flock        = { path = "newt-flock",        version = "=0.8.4" }
+newt-git          = { path = "newt-git",          version = "=0.8.4" }
+newt-inference    = { path = "newt-inference",    version = "=0.8.4" }
+newt-scheduler    = { path = "newt-scheduler",    version = "=0.8.4" }
+newt-tools        = { path = "newt-tools",        version = "=0.8.4" }
+newt-interaction  = { path = "newt-interaction",  version = "=0.8.4" }
+newt-skills       = { path = "newt-skills",       version = "=0.8.4" }
+newt-tui          = { path = "newt-tui",          version = "=0.8.4" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.8.4" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.8.4" }
+newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.8.4" }
+newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.8.4" }
+newt-coder        = { path = "newt-coder",        version = "=0.8.4" }
+newt-identity     = { path = "newt-identity",     version = "=0.8.4" }
+newt-tuner        = { path = "crates/newt-tuner", version = "=0.8.4" }
 # Pinned to its own rc, not the workspace 0.8.0: this crate tracks a separate
 # lifecycle toward 0.0.1 and has an external consumer (pyO3). Bump as rcs land.
 newt-launch       = { path = "crates/newt-launch", version = "=0.0.1-rc.1" }
-newt-eval         = { path = "newt-eval",         version = "=0.8.3" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.8.3" }
+newt-eval         = { path = "newt-eval",         version = "=0.8.4" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.8.4" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level

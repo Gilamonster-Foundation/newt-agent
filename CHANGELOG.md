@@ -9,8 +9,41 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-10-22
+
+### Added
+
+- `/settings tools` and `/settings read-only` (#2932): choose which tools the
+  model sees (checklist panel on a rich TTY, `all|pi|none|a,b,c` typed), with a
+  `[tools: …]` footer segment and a `$TOOLS` prompt token. A write that a
+  pinned `NEWT_CONFIG` or project overlay overrides is refused, naming the layer.
+- TUI `/context request` previews the next request's system messages and tools
+  without sending anything or touching the session (#2959). It resolves the
+  working style and disposition as an ordinary turn would (so `/mode plan`, an
+  allow list and read-only narrow the preview like the request). The report is
+  labelled partial: it omits the turn-head blocks and the observed-report text.
+- A system prompt you can prune by hand (#2938). `[prompt] file = "…"` (or
+  `newt headless --system-prompt-file FILE`, which wins) makes that file's
+  bytes the whole system message: newt builds no prompt of its own and adds no
+  active-prompt card or observed-facts note behind it. A missing or empty file
+  fails a headless run; the TUI says so and sends its own prompt. In the TUI,
+  `/settings system-prompt edit` opens the prompt newt would send (or your
+  file) in `$VISUAL`/`$EDITOR` and saves what you change; `/settings
+  system-prompt <path>` and `reset` set it for the session. The footer shows
+  `[prompt: <file>]` while an override is in force.
+
 ### Changed
 
+- One file-tool implementation (#2956). The MCP server now serves newt-core's
+  `read_file` / `write_file` / `edit_file` / `list_dir` / `find` / `grep`,
+  with newt-core's schemas, through its governed executor under the granted
+  `[caveats]` leash. Before, `code_read` / `code_edit` / `code_search` /
+  `fs_list` ran unconfined `newt-tools` primitives; those tools and the
+  `newt_agent.tools.read` / `edit` / `search` Python bindings are removed.
+  `find` / `grep` now refuse (rather than walk) a read scope narrower than the
+  workspace, and `find show_lines` no longer follows a symlink to count lines.
+  MCP file tools print nothing on stdout (it is the JSON-RPC wire) and report
+  refusals such as `user declined to write` as tool errors.
 - Per-PR CI now compiles every test target under the feature combinations the real-resource
   tiers run (`newt-tui`: `native-permission-test`, `rich-tui`, `rich-tui,live-spill`;
   `newt-core`: `ast`), so a struct change can no longer break a feature-gated test unseen (#2971).
