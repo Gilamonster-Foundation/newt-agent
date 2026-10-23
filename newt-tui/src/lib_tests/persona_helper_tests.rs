@@ -491,6 +491,7 @@ async fn handle_persona_command_show_and_clear() {
     // show: reports the active persona, does not reset anything.
     let msg = {
         let mut ctx = ConversationResetContext {
+            cfg: &crate::test_session_config(),
             memory: &mut memory,
             system: &mut system,
             conversation_id: &mut active_conversation_id,
@@ -505,6 +506,7 @@ async fn handle_persona_command_show_and_clear() {
     // clear: drops the persona and starts a fresh conversation.
     let msg = {
         let mut ctx = ConversationResetContext {
+            cfg: &crate::test_session_config(),
             memory: &mut memory,
             system: &mut system,
             conversation_id: &mut active_conversation_id,
@@ -641,6 +643,7 @@ async fn persona_set_keep_context_preserves_history() {
 
     let msg = {
         let mut ctx = ConversationResetContext {
+            cfg: &crate::test_session_config(),
             memory: &mut memory,
             system: &mut system,
             conversation_id: &mut active_conversation_id,
@@ -668,6 +671,7 @@ async fn persona_set_keep_context_preserves_history() {
     // Without the flag, the same swap resets the conversation.
     {
         let mut ctx = ConversationResetContext {
+            cfg: &crate::test_session_config(),
             memory: &mut memory,
             system: &mut system,
             conversation_id: &mut active_conversation_id,
