@@ -155,6 +155,7 @@ pub mod ssh_caveats;
 pub mod stack;
 pub mod store;
 pub mod symbols;
+pub mod system_prompt;
 pub mod templates;
 pub mod tenacity;
 /// A shared RAII guard for tests that touch the process-global operator settings
@@ -277,6 +278,9 @@ pub use project_map::ProjectMapProvider;
 pub use runtime::{
     BackendAxisAction, BackendState, OperatorPreferencePin, PreferenceActions, PreferenceApplyPlan,
     PreferenceAxes, RouteModel, RuntimeSettingsSnapshot,
+};
+pub use system_prompt::{
+    assemble_system_prompt, AssembledPrompt, PersonaPart, PromptParts, ReadmePart,
 };
 pub use tenacity::Tenacity;
 pub use where_is::{
