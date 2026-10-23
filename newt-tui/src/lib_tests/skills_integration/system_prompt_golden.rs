@@ -173,23 +173,60 @@ fn the_request_report_names_components_by_id_with_nothing_unattributed() {
     assert_eq!(gaps(&off), 1, "{off:?}");
 }
 
-/// #2990 review: a config that stops resolving mid-session keeps the settings the
-/// session last accepted. Falling back to defaults would widen the tool policy.
+/// #2990 round 2: the prompt follows the session's last ACCEPTED config. Accept a
+/// newer config through the chat loop's `reresolve`, break the file, then `/new`:
+/// the rebuilt prompt renders from the newer config, not from the first one nor
+/// from defaults.
 #[serial_test::serial(real_fs)]
-#[test]
-fn a_config_that_stops_resolving_keeps_the_last_accepted_prompt_settings() {
-    let restricted: newt_core::Config = toml::from_str(
-        "[tool_exposure]\nallow_list = [\"read_file\"]\n[prompt]\ncomponents = { off = [\"three-cs\"] }\n",
-    )
-    .unwrap();
-    let (exposure, components) = accepted_prompt_config(Some(&restricted));
-    assert!(!exposure.operator_visible("write_file"));
-    assert!(!components.is_default());
+#[tokio::test]
+async fn a_failed_refresh_then_new_renders_from_the_newer_accepted_config() {
+    let root = tempfile::TempDir::new().unwrap();
+    let ws = root.path().join("ws");
+    let config_dir = root.path().join("config");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("config.toml");
+    let _env = newt_core::process_env::lock();
+    let _sandbox = SkillRootSandbox::enter(&config_dir, &ws);
 
-    let (kept_exposure, kept_components) = accepted_prompt_config(None);
+    let first = "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\"]\n[prompt]\ncomponents = { off = [\"three-cs\"] }\n";
+    let newer = "[tool_exposure]\nallow_list = [\"read_file\"]\n";
+    let broken = "[tool_exposure]\nallow_list = [\"read_file\"]\n[prompt]\ncomponents = { off = [\"nope\"] }\n";
+
+    fs::write(&config, first).unwrap();
+    let mut cfg = crate::resolve_runtime_or_default();
+    fs::write(&config, newer).unwrap();
+    crate::chat::reresolve(&mut cfg, false, false);
+    fs::write(&config, broken).unwrap();
+    crate::chat::reresolve(&mut cfg, false, false);
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::SoulProvider::new(None));
+    memory
+        .initialize_all(&newt_core::SessionContext {
+            workspace: ws.to_string_lossy().into_owned(),
+            session_id: "s".into(),
+        })
+        .await;
+    let mut system = String::new();
+    let mut conversation_id = String::from("s");
+    let mode_states = ConversationModeStates::default();
+    let mut ctx = ConversationResetContext {
+        cfg: &cfg,
+        memory: &mut memory,
+        system: &mut system,
+        conversation_id: &mut conversation_id,
+        mode_states: &mode_states,
+        sink: None,
+    };
+    reset_conversation(ws.to_str().unwrap(), None, &mut ctx);
+
     assert!(
-        !kept_exposure.operator_visible("write_file"),
-        "the allow list must survive a failed re-resolve"
+        system.contains("You have tools: read_file."),
+        "the newer allow list names one tool:\n{system}"
     );
-    assert_eq!(kept_components, components);
+    assert!(
+        system.contains("Working code first"),
+        "the newer config has three-cs on:\n{system}"
+    );
 }

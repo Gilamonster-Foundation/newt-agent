@@ -15,7 +15,7 @@ use background_warmup::{
 /// Re-read the config after a command that may have changed it. A config that no
 /// longer resolves keeps the one the session already accepted, and says so: falling
 /// back to defaults would drop the operator's `[tool_exposure]` and the rest.
-fn reresolve(cfg: &mut newt_core::ResolvedConfig, color: bool, verbose: bool) {
+pub(crate) fn reresolve(cfg: &mut newt_core::ResolvedConfig, color: bool, verbose: bool) {
     match crate::migration_notices::read(|report| {
         newt_core::Config::resolve_runtime_unpublished(report)
     }) {
@@ -2846,11 +2846,12 @@ fn session_body(
     );
 
     // Build system prompt now that SoulProvider has loaded its soul file.
-    system = rebuild_system_prompt(
+    system = rebuild_system_prompt_for(
         workspace,
         &memory,
         active_persona.as_ref(),
         &active_conversation_id,
+        &cfg,
         Some(&*report_sink),
     );
     // #2938: the operator's system prompt file as the session last built its
@@ -2864,11 +2865,12 @@ fn session_body(
             let components_now = cfg.prompt_components().unwrap_or_default();
             if components_now != last_components {
                 last_components = components_now;
-                system = rebuild_system_prompt(
+                system = rebuild_system_prompt_for(
                     workspace,
                     &memory,
                     active_persona.as_ref(),
                     &active_conversation_id,
+                    &cfg,
                     Some(&*report_sink),
                 );
                 print_newt("system prompt rebuilt (components changed)", color, verbose);
@@ -2877,11 +2879,12 @@ fn session_body(
                 &mut last_override,
                 crate::try_system_prompt_override,
                 || {
-                    system = rebuild_system_prompt(
+                    system = rebuild_system_prompt_for(
                         workspace,
                         &memory,
                         active_persona.as_ref(),
                         &active_conversation_id,
+                        &cfg,
                         Some(&*report_sink),
                     );
                 },
@@ -3024,6 +3027,7 @@ fn session_body(
     let mut resumed_at_start = false;
     if let Some(store) = conversation_store.as_ref() {
         let mut resume_ctx = ConversationCommandContext {
+            cfg: &cfg,
             store,
             persona_store: &persona_store,
             workspace,
@@ -3137,6 +3141,7 @@ fn session_body(
                     verbose,
                 );
                 let mut reset_ctx = ConversationResetContext {
+                    cfg: &cfg,
                     memory: &mut memory,
                     system: &mut system,
                     conversation_id: &mut active_conversation_id,
@@ -5798,6 +5803,7 @@ fn session_body(
                         }
                         turns_this_conversation = 0;
                         let mut reset_ctx = ConversationResetContext {
+                            cfg: &cfg,
                             memory: &mut memory,
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
@@ -6118,6 +6124,7 @@ fn session_body(
                         match conversation_store.as_ref() {
                             Some(store) => {
                                 let mut conversation_ctx = ConversationCommandContext {
+                                    cfg: &cfg,
                                     store,
                                     persona_store: &persona_store,
                                     workspace,
@@ -6457,6 +6464,7 @@ fn session_body(
                                                     let _ = store.release(&outgoing);
                                                 }
                                                 let mut resume_ctx = ConversationCommandContext {
+                                                    cfg: &cfg,
                                                     store,
                                                     persona_store: &persona_store,
                                                     workspace,
@@ -6701,6 +6709,7 @@ fn session_body(
                                                             active_conversation_id.clone();
                                                         let _ = store.release(&outgoing);
                                                         let mut ctx = ConversationCommandContext {
+                                                            cfg: &cfg,
                                                             store,
                                                             persona_store: &persona_store,
                                                             workspace,
@@ -6830,6 +6839,7 @@ fn session_body(
                         let persona_name_before = active_persona.as_ref().map(|p| p.name.clone());
                         let conversation_id_before = active_conversation_id.clone();
                         let mut reset_ctx = ConversationResetContext {
+                            cfg: &cfg,
                             memory: &mut memory,
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
@@ -7535,6 +7545,7 @@ fn session_body(
                                         }
                                         let conversation_id_before = active_conversation_id.clone();
                                         let mut reset_ctx = ConversationResetContext {
+                                            cfg: &cfg,
                                             memory: &mut memory,
                                             system: &mut system,
                                             conversation_id: &mut active_conversation_id,
