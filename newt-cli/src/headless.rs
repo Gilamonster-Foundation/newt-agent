@@ -566,9 +566,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     })?;
     let instruction = std::fs::read_to_string(&instruction_file)
         .with_context(|| format!("reading --instruction-file {}", instruction_file.display()))?;
-    let workspace = args
-        .cwd
-        .canonicalize()
+    // `dunce`: on Windows `std` canonicalizes to the verbatim `\\?\C:\..` form, which the
+    // TUI never shows the model; the same workspace must read the same in both (#2933).
+    let workspace = dunce::canonicalize(&args.cwd)
         .unwrap_or_else(|_| args.cwd.clone())
         .to_string_lossy()
         .into_owned();
