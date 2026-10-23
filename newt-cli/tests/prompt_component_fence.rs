@@ -284,3 +284,67 @@ async fn card_off_with_its_tools_visible_refuses_the_session() {
         run.system
     );
 }
+
+/// #2933 PR6: preset `pi` over the pi tool list sends the minimum: one identity
+/// line and the tool list, the workspace header, and no card; the fence is the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preset_pi_sends_the_minimal_system_prompt_and_keeps_the_fence() {
+    let pi = run(
+        "[tool_exposure]\nallow_list = [\"read_file\", \"write_file\", \"edit_file\", \"run_command\"]\n[prompt]\npreset = \"pi\"\n",
+    )
+    .await;
+    assert!(
+        pi.system.contains("You are newt, a coding agent."),
+        "{}",
+        pi.system
+    );
+    assert!(pi
+        .system
+        .contains("You have tools: run_command, read_file, write_file, edit_file."));
+    assert!(pi.system.contains("Workspace: "), "{}", pi.system);
+    for gone in [
+        "## How to work",
+        "Plan before coding",
+        "Available skills",
+        "# Environment",
+        "# Git commit identity",
+        "# Filesystem confinement",
+        "<workspace_state>",
+        "<operating_mode>",
+        "[NEWT ACTIVE PROMPT v1]",
+    ] {
+        assert!(
+            !pi.system.contains(gone),
+            "pi must not send `{gone}`:\n{}",
+            pi.system
+        );
+    }
+    // Beyond the registry's pieces: the cwd sentence, the working-memory hint and the
+    // driver's observed-facts text (not yet components).
+    assert!(
+        pi.system.len() < 3_000,
+        "{} chars:\n{}",
+        pi.system.len(),
+        pi.system
+    );
+    // Not telling the model about the fence does not lift it.
+    assert!(pi.inside && !pi.outside);
+    assert!(pi
+        .tool_results
+        .iter()
+        .any(|t| t.contains("capability denied")));
+}
+
+/// Preset `pi` over the full tool list is refused at startup, naming the pairing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preset_pi_with_the_full_tool_list_refuses_the_session() {
+    let (output, run) = session("[prompt]\npreset = \"pi\"\n").await;
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{shown}");
+    assert!(shown.contains("/settings tools pi"), "{shown}");
+    assert!(run.system.is_empty(), "no inference request was made");
+}

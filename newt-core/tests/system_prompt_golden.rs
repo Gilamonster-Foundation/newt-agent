@@ -30,6 +30,7 @@ struct Variant {
     coach: bool,
     persona: Option<PersonaPart<'static>>,
     narration: Option<&'static str>,
+    components: newt_core::prompt_components::ComponentSet,
 }
 
 impl Default for Variant {
@@ -40,6 +41,7 @@ impl Default for Variant {
             coach: false,
             persona: None,
             narration: None,
+            components: newt_core::prompt_components::ComponentSet::default(),
         }
     }
 }
@@ -47,9 +49,10 @@ impl Default for Variant {
 fn assembled(v: &Variant) -> String {
     let identity = v
         .exposure
-        .render_identity(if v.coach { COACH_SOUL } else { v.soul });
+        .render_identity_with(if v.coach { COACH_SOUL } else { v.soul }, &v.components);
     let files = ["Cargo.toml", ".git", "src", "README.md"].map(String::from);
     assemble_system_prompt(&PromptParts {
+        components: &v.components,
         identity: &identity,
         coach_identity: v.coach,
         context: Some("## AGENTS.md\nUse four spaces."),
@@ -137,6 +140,29 @@ fn narration() {
     check("narration", &assembled(&v));
 }
 
+/// #2933 PR6: preset `pi` over the pi tool list: one identity line, the tools line,
+/// the project instructions, the workspace header and the persona; nothing else.
+#[test]
+fn pi() {
+    let v = Variant {
+        exposure: ExposureSettings {
+            allow_list: Some(
+                newt_core::PI_PRESET_TOOLS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
+            ..Default::default()
+        },
+        persona: Some(PERSONA),
+        components: newt_core::prompt_components::ComponentSet::for_preset(
+            newt_core::prompt_components::Preset::Pi,
+        ),
+        ..Variant::default()
+    };
+    check("pi", &assembled(&v));
+}
+
 #[test]
 fn custom_soul() {
     let v = Variant {
@@ -153,6 +179,7 @@ fn listing_and_readme_are_bounded() {
     let names: Vec<String> = (0..50).map(|i| format!("f{i:02}")).collect();
     let long = "x".repeat(3001);
     let base = PromptParts {
+        components: &newt_core::prompt_components::ComponentSet::default(),
         identity: "id",
         coach_identity: false,
         context: None,
@@ -172,6 +199,7 @@ fn listing_and_readme_are_bounded() {
     assert!(text.contains("  f39\n") && !text.contains("  f40\n"));
     assert!(text.ends_with(&format!("{}\n...[truncated]\n", "x".repeat(3000))));
     let none = assemble_system_prompt(&PromptParts {
+        components: &newt_core::prompt_components::ComponentSet::default(),
         file_names: None,
         readme: None,
         ..base
@@ -202,6 +230,7 @@ fn every_byte_is_labelled() {
             .render_identity(if v.coach { COACH_SOUL } else { v.soul });
         let files = ["a".to_string()];
         let built = assemble_system_prompt(&PromptParts {
+            components: &newt_core::prompt_components::ComponentSet::default(),
             identity: &identity,
             coach_identity: v.coach,
             context: Some("## AGENTS.md\nUse four spaces."),
@@ -220,7 +249,7 @@ fn every_byte_is_labelled() {
         // The caller's providers label the context blocks; stand in for them.
         let mut notes = built.notes.clone();
         notes.push(newt_core::agentic::request_report::Annotation {
-            label: "agents".into(),
+            label: "project-instructions".into(),
             source: "provider".into(),
             text: "## AGENTS.md\nUse four spaces.".into(),
         });

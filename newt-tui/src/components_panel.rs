@@ -64,7 +64,7 @@ impl ComponentsPanel {
                     Some(tool) if *on => format!("off (needs {tool}) · {}", row.description),
                     _ => format!(
                         "{} · {}{}",
-                        crate::prompt_components_form::size_label(row.chars),
+                        crate::prompt_components_form::size_label(row.chars, row.layer),
                         row.description,
                         if row.fence {
                             crate::prompt_components_form::FENCE_NOTE

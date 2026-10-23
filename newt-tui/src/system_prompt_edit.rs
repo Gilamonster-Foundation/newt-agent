@@ -150,14 +150,15 @@ struct Badge {
     /// The override the session last built its system prompt from: what is
     /// on the wire, not what the config says. Set by every rebuild.
     active: Option<PathBuf>,
-    /// Whether the prompt the session last built dropped components (#2933).
-    custom_components: bool,
+    /// The footer badge for the components the session last built from (#2933):
+    /// `custom` or `pi`, none for the untouched default.
+    components_badge: Option<&'static str>,
 }
 
 #[cfg(not(test))]
 static BADGE: std::sync::Mutex<Badge> = std::sync::Mutex::new(Badge {
     active: None,
-    custom_components: false,
+    components_badge: None,
 });
 
 #[cfg(test)]
@@ -180,19 +181,19 @@ pub(crate) fn set_active(path: Option<PathBuf>) {
     with_badge(|b| b.active = path);
 }
 
-pub(crate) fn set_custom_components(custom: bool) {
-    with_badge(|b| b.custom_components = custom);
+pub(crate) fn set_components_badge(badge: Option<&'static str>) {
+    with_badge(|b| b.components_badge = badge);
 }
 
 /// `[prompt: <file name>]` while an override file is in force, else
-/// `[prompt: custom]` while components are switched off.
+/// `[prompt: custom]` / `[prompt: pi]` for the components.
 #[cfg(feature = "rich-tui")]
 pub(crate) fn status_badge() -> Option<String> {
     with_badge(|b| {
         b.active
             .as_deref()
             .map(badge_for)
-            .or_else(|| b.custom_components.then(|| "[prompt: custom]".to_string()))
+            .or_else(|| b.components_badge.map(|badge| format!("[prompt: {badge}]")))
     })
 }
 

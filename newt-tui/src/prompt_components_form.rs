@@ -10,7 +10,7 @@
 //! elsewhere and do not read this.
 
 use newt_core::markup::table::{render_table, Align, Column};
-use newt_core::prompt_components::{self as pc, ComponentSet};
+use newt_core::prompt_components::{self as pc, ComponentSet, Preset};
 
 /// What the model is not told by a component, and what that does not change.
 pub(crate) const PRESENTATION_ONLY: &str =
@@ -19,9 +19,14 @@ pub(crate) const PRESENTATION_ONLY: &str =
 /// For a component that describes an enforced fence: off stops the telling only.
 pub(crate) const FENCE_NOTE: &str = " (off only stops telling the model; the fence still holds)";
 
-/// A row's size: characters, or `per turn` for text the harness builds each turn.
-pub(crate) fn size_label(chars: Option<usize>) -> String {
-    chars.map_or_else(|| "per turn".to_string(), |n| format!("{n} chars"))
+/// A row's size: characters, `per turn` for text the harness builds each turn, or
+/// `varies` for the frozen prompt's project-dependent pieces.
+pub(crate) fn size_label(chars: Option<usize>, layer: pc::Layer) -> String {
+    match (chars, layer) {
+        (Some(n), _) => format!("{n} chars"),
+        (None, pc::Layer::Frozen) => "varies".to_string(),
+        (None, _) => "per turn".to_string(),
+    }
 }
 
 /// The component commands the `system-prompt` setting understands, as
@@ -96,7 +101,7 @@ pub(crate) fn listing() -> Result<String, String> {
             vec![
                 r.id.to_string(),
                 state,
-                size_label(r.chars),
+                size_label(r.chars, r.layer),
                 format!("{}{fence}", r.description),
             ]
         })
@@ -119,7 +124,7 @@ pub(crate) fn listing() -> Result<String, String> {
 fn persist(set: &ComponentSet) -> Result<(), String> {
     let (on, off) = set.deltas();
     crate::settings_form::persist_config(|text| {
-        newt_core::Config::with_prompt_components(text, &on, &off)
+        newt_core::Config::with_prompt_components(text, set.preset().name(), &on, &off)
     })?;
     // A config that does not resolve cannot confirm anything.
     if current()? == *set {
@@ -141,12 +146,31 @@ pub(crate) fn apply(word: &str, arg: &str) -> Result<String, String> {
             "default" => {
                 // Refuse before writing when the config does not resolve.
                 current()?;
-                persist(&ComponentSet::default())?;
+                persist(&ComponentSet::for_preset(Preset::Default))?;
                 Ok("system-prompt preset: default (every component on)".to_string())
+            }
+            "pi" => {
+                current()?;
+                let pi = ComponentSet::for_preset(Preset::Pi);
+                // The pairing is explicit, never implied: pi turns `card` off, which needs
+                // the card's tools hidden. Refuse, naming `/settings tools pi`.
+                pi.check_card(&visible)?;
+                persist(&pi)?;
+                Ok(format!(
+                    "system-prompt preset: pi (identity line, tool list, workspace header, \
+                     project instructions, persona; `card` off because {} are hidden) — \
+                     {PRESENTATION_ONLY}; the next request sends the rebuilt prompt",
+                    pc::CARD_TOOLS.join(" and ")
+                ))
             }
             other => Err(ComponentSet::resolve(Some(other), &[], &[])
                 .err()
-                .unwrap_or_else(|| format!("unknown preset `{other}`; presets: default"))),
+                .unwrap_or_else(|| {
+                    format!(
+                        "unknown preset `{other}`; presets: {}",
+                        pc::PRESETS.join(", ")
+                    )
+                })),
         },
         "on" | "off" => {
             if arg.is_empty() {

@@ -6009,9 +6009,11 @@ fn build_system_prompt_for(
     // The doer soul is built from components; the report names each by id.
     let doer_soul = identity_source == newt_core::DEFAULT_SOUL;
     let soul_pieces = if doer_soul {
-        newt_core::prompt_components::soul_parts(&|c| components.is_on(c), &|t| {
-            exposure.operator_visible(t)
-        })
+        newt_core::prompt_components::soul_parts(
+            &|c| components.is_on(c),
+            &|t| exposure.operator_visible(t),
+            components.preset(),
+        )
     } else {
         Vec::new()
     };
@@ -6057,6 +6059,7 @@ fn build_system_prompt_for(
         readme: readme_text
             .as_ref()
             .map(|(file_name, text)| newt_core::ReadmePart { file_name, text }),
+        components: &components,
     });
     if let Some(s) = sink {
         for n in &assembled.notes {
@@ -6119,6 +6122,17 @@ fn rebuild_system_prompt(
     rebuild_system_prompt_for(workspace, memory, persona, conversation_id, &cfg, sink)
 }
 
+/// The footer badge for the components in force: `pi` for the untouched preset,
+/// `custom` for any change from a preset, none for the untouched default.
+fn components_badge(set: &newt_core::prompt_components::ComponentSet) -> Option<&'static str> {
+    use newt_core::prompt_components::Preset;
+    match (set.preset(), set.is_default()) {
+        (_, true) => None,
+        (Preset::Pi, false) if set.deltas() == (Vec::new(), Vec::new()) => Some("pi"),
+        _ => Some("custom"),
+    }
+}
+
 fn rebuild_system_prompt_for(
     workspace: &str,
     memory: &newt_core::MemoryManager,
@@ -6130,9 +6144,12 @@ fn rebuild_system_prompt_for(
     // #2938: the operator's file REPLACES the assembled prompt entirely.
     let found = system_prompt_override();
     system_prompt_edit::set_active(found.as_ref().map(|f| f.path.clone()));
-    system_prompt_edit::set_custom_components(
-        found.is_none() && !cfg.prompt_components().unwrap_or_default().is_default(),
-    );
+    let components = cfg.prompt_components().unwrap_or_default();
+    system_prompt_edit::set_components_badge(if found.is_some() {
+        None
+    } else {
+        components_badge(&components)
+    });
     if let Some(found) = found {
         if let Some(s) = sink {
             s.annotate(
@@ -6147,7 +6164,13 @@ fn rebuild_system_prompt_for(
     // that coach altitude can replace the soul with COACH_SOUL without
     // silently dropping AGENTS.md, notes, and the project map.
     let soul_text = memory.soul_block();
-    let context = memory.context_additions();
+    // A provider's block is a component (`project-instructions`, `notes`, ...); one
+    // that is off is neither sent nor reported.
+    let keep_provider = |name: &str| {
+        newt_core::prompt_components::provider_component(name)
+            .is_none_or(|id| components.is_on_id(id))
+    };
+    let context = memory.context_additions_where(&keep_provider);
     let context_ref = if context.is_empty() {
         None
     } else {
@@ -6158,7 +6181,7 @@ fn rebuild_system_prompt_for(
     // Call unconditionally when a sink exists — the method skips empty blocks itself,
     // and context providers (AGENTS.md, notes) need annotation even when soul is absent.
     if let Some(s) = sink {
-        memory.annotate_system_prompt_additions(s);
+        memory.annotate_system_prompt_additions_where(s, &keep_provider);
     }
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);

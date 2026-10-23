@@ -97,7 +97,8 @@ fn text(output: &std::process::Output) -> String {
 async fn an_invalid_prompt_setting_refuses_the_session_and_sends_nothing() {
     for (tail, named) in [
         ("[prompt]\ncomponents = { off = [\"nope\"] }\n", "nope"),
-        ("[prompt]\npreset = \"pi\"\n", "pi"),
+        ("[prompt]\npreset = \"nope\"\n", "nope"),
+        ("[prompt]\npreset = \"headless\"\n", "headless"),
         (
             "[prompt]\ncomponents = { on = [\"three-cs\"], off = [\"three-cs\"] }\n",
             "both",

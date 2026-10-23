@@ -252,6 +252,7 @@ impl ExposureSettings {
             return std::borrow::Cow::Owned(crate::prompt_components::render_soul(
                 &|c| components.is_on(c),
                 &|tool| self.operator_visible(tool),
+                components.preset(),
             ));
         }
         if !self.has_operator_filter() {
@@ -1300,7 +1301,11 @@ mod tests {
         use crate::prompt_components::SOUL;
         let all = |_: &str| true;
         for c in SOUL.iter().filter(|c| c.id != "tools") {
-            let text = crate::prompt_components::render_soul(&|x| x.id == c.id, &all);
+            let text = crate::prompt_components::render_soul(
+                &|x| x.id == c.id,
+                &all,
+                crate::prompt_components::Preset::Default,
+            );
             let named: Vec<&str> = super::super::catalog::ALL_TOOL_NAMES
                 .iter()
                 .copied()
