@@ -133,7 +133,10 @@ fn parse_claude_mcp_folds_nested_oauth_client_id() {
     });
     let got = parse_claude_mcp(&cfg);
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].oauth_client_id.as_deref(), Some("eci-prd-pub-abc123"));
+    assert_eq!(
+        got[0].oauth_client_id.as_deref(),
+        Some("eci-prd-pub-abc123")
+    );
 }
 #[test]
 fn strict_claude_import_accepts_oauth_client_id() {
