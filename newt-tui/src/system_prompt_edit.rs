@@ -143,32 +143,57 @@ impl<F: FnMut(&str) -> anyhow::Result<()>> EditIo for RealIo<F> {
     }
 }
 
-/// The override the session last built its system prompt from, for the status
-/// line: what is on the wire, not what the config says. Set by every rebuild.
-static ACTIVE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-
-pub(crate) fn set_active(path: Option<PathBuf>) {
-    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = path;
+/// The status-line badge state. Process-wide in a session. Per thread under test, so a test that rebuilds a
+/// prompt or flips the badge never leaks into a parallel test's footer.
+#[derive(Default)]
+struct Badge {
+    /// The override the session last built its system prompt from: what is
+    /// on the wire, not what the config says. Set by every rebuild.
+    active: Option<PathBuf>,
+    /// The footer badge for the components the session last built from (#2933):
+    /// `custom` or `pi`, none for the untouched default.
+    components_badge: Option<&'static str>,
 }
 
-/// The footer badge for the components the session last built from (#2933):
-/// `custom` or `pi`, none for the untouched default.
-static COMPONENTS_BADGE: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+#[cfg(not(test))]
+static BADGE: std::sync::Mutex<Badge> = std::sync::Mutex::new(Badge {
+    active: None,
+    components_badge: None,
+});
+
+#[cfg(test)]
+thread_local! {
+    static BADGE: std::cell::RefCell<Badge> = std::cell::RefCell::new(Badge::default());
+}
+
+fn with_badge<R>(f: impl FnOnce(&mut Badge) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut BADGE.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    #[cfg(test)]
+    {
+        BADGE.with(|b| f(&mut b.borrow_mut()))
+    }
+}
+
+pub(crate) fn set_active(path: Option<PathBuf>) {
+    with_badge(|b| b.active = path);
+}
 
 pub(crate) fn set_components_badge(badge: Option<&'static str>) {
-    *COMPONENTS_BADGE.lock().unwrap_or_else(|e| e.into_inner()) = badge;
+    with_badge(|b| b.components_badge = badge);
 }
 
 /// `[prompt: <file name>]` while an override file is in force, else
 /// `[prompt: custom]` / `[prompt: pi]` for the components.
 #[cfg(feature = "rich-tui")]
 pub(crate) fn status_badge() -> Option<String> {
-    let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    active.as_deref().map(badge_for).or_else(|| {
-        COMPONENTS_BADGE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .map(|badge| format!("[prompt: {badge}]"))
+    with_badge(|b| {
+        b.active
+            .as_deref()
+            .map(badge_for)
+            .or_else(|| b.components_badge.map(|badge| format!("[prompt: {badge}]")))
     })
 }
 
