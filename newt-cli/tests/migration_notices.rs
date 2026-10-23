@@ -200,7 +200,7 @@ fn migration_mcp_host_reports_persona_before_decode_and_keeps_wire_clean() {
         let config = config_root.join("config.toml");
         // Configured providers short-circuit ambient Ollama discovery. No goal
         // request is sent, so this inert provider is never launched.
-        std::fs::write(&config, "[[providers]]\nname = \"fixture\"\ncommand = \"unused-provider-fixture\"\nmodel = \"fixture\"\ntiers = [\"complex\"]\n").unwrap();
+        std::fs::write(&config, "[[providers]]\nname = \"fixture\"\ncommand = \"unused-provider-fixture\"\nmodel = \"fixture\"\ntiers = [\"COMPLEX\"]\n").unwrap();
         let persona = personas.join("migration-wire.md");
         let old = format!(
             "+++\ncognition = \"pondering\"\n{}+++\nMigration persona body.\n",
