@@ -9,6 +9,7 @@
 //! the model may do: permissions, the tool catalog and the fence are enforced
 //! elsewhere and do not read this.
 
+use newt_core::markup::table::{render_table, Align, Column};
 use newt_core::prompt_components::{self as pc, ComponentSet};
 
 /// What the model is not told by a component, and what that does not change.
@@ -60,7 +61,7 @@ pub(crate) fn status() -> String {
 }
 
 pub(crate) fn visible(tool: &str) -> bool {
-    newt_core::ExposureSettings::from(crate::settings_form::tool_exposure_setting())
+    newt_core::ExposureSettings::from(crate::settings_form::effective_exposure())
         .operator_visible(tool)
 }
 
@@ -71,22 +72,33 @@ pub(crate) fn listing() -> String {
         "system prompt components ({}); {PRESENTATION_ONLY}\n",
         set.summary()
     );
-    for r in pc::rows(&set, &visible) {
-        let state = match (r.on, r.needs) {
-            (true, None) => "on ".to_string(),
-            (true, Some(tool)) => format!("off (needs {tool})"),
-            (false, _) => "off".to_string(),
-        };
-        let note = if r.fence { FENCE_NOTE } else { "" };
-        out.push_str(&format!(
-            "  {:<24} {:<18} {:>10}  {}{note}\n",
-            r.id,
-            state,
-            size_label(r.chars),
-            r.description
-        ));
-    }
-    out.push_str("/settings system-prompt on|off <id> · preset default");
+    let rows: Vec<Vec<String>> = pc::rows(&set, &visible)
+        .into_iter()
+        .map(|r| {
+            let state = match (r.on, r.needs) {
+                (true, None) => "on".to_string(),
+                (true, Some(tool)) => format!("off (needs {tool})"),
+                (false, _) => "off".to_string(),
+            };
+            let fence = if r.fence { FENCE_NOTE } else { "" };
+            vec![
+                r.id.to_string(),
+                state,
+                size_label(r.chars),
+                format!("{}{fence}", r.description),
+            ]
+        })
+        .collect();
+    out.push_str(&render_table(
+        &[
+            Column::new("id"),
+            Column::new("state"),
+            Column::new("size").align(Align::Right),
+            Column::new("what it says"),
+        ],
+        &rows,
+    ));
+    out.push_str("\n/settings system-prompt on|off <id> · preset default");
     out
 }
 
