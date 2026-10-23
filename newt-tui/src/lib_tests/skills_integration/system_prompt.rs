@@ -379,12 +379,12 @@ async fn provider_annotations_labeled_independently_doer_2937() {
         "no whole-soul label; got {labels:?}"
     );
     assert!(
-        labels.contains(&"agents"),
-        "'agents' provider must be labeled; got {labels:?}"
+        labels.contains(&"project-instructions"),
+        "'project-instructions' (agents) provider must be labeled; got {labels:?}"
     );
     assert!(
-        labels.contains(&"note_store"),
-        "'note_store' provider must be labeled; got {labels:?}"
+        labels.contains(&"notes"),
+        "'notes' (note_store) provider must be labeled; got {labels:?}"
     );
     assert!(
         labels.contains(&"workspace-header"),
@@ -458,12 +458,12 @@ async fn provider_annotations_labeled_independently_coach_2937() {
         "coach must have 'coach-soul' label; got {labels:?}"
     );
     assert!(
-        labels.contains(&"agents"),
-        "'agents' provider must be labeled; got {labels:?}"
+        labels.contains(&"project-instructions"),
+        "'project-instructions' (agents) provider must be labeled; got {labels:?}"
     );
     assert!(
-        labels.contains(&"note_store"),
-        "'note_store' provider must be labeled; got {labels:?}"
+        labels.contains(&"notes"),
+        "'notes' (note_store) provider must be labeled; got {labels:?}"
     );
     assert!(
         labels.contains(&"workspace-header"),
@@ -543,11 +543,11 @@ async fn no_soul_provider_context_providers_still_annotated_2937() {
         .collect();
 
     assert!(
-        labels.contains(&"agents"),
-        "'agents' must be labeled even with no soul; got {labels:?}"
+        labels.contains(&"project-instructions"),
+        "'project-instructions' must be labeled even with no soul; got {labels:?}"
     );
     assert!(
-        labels.contains(&"note_store"),
+        labels.contains(&"notes"),
         "'note_store' must be labeled even with no soul; got {labels:?}"
     );
     assert!(

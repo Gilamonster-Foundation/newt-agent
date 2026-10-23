@@ -716,9 +716,11 @@ pub fn rows(set: &ComponentSet, visible: &dyn Fn(&str) -> bool) -> Vec<Row> {
             let chars = if needs.is_some() {
                 Some(0)
             } else {
+                // Sized from the selected preset's rendering, the one the prompt uses.
                 match c.body {
-                    Body::Text(t) => Some(t.chars().count()),
-                    Body::Tools => Some(c.render(visible, Preset::Default).chars().count()),
+                    Body::Text(_) | Body::Tools => {
+                        Some(c.render(visible, set.preset()).chars().count())
+                    }
                     Body::Owned => None,
                 }
             };
@@ -884,6 +886,35 @@ mod tests {
         assert_eq!(parts[0].0, "identity");
         assert!(parts[3].1.starts_with("## How to work\n\n**One change"));
         assert_eq!(render_soul(&|c| c.default_on, &all), crate::DEFAULT_SOUL);
+    }
+
+    /// #2993 review: the listing sizes a component from the selected preset's
+    /// rendering. The identity is 75 characters under `default` and 29 under `pi`;
+    /// the tools line follows the visible tools under both.
+    #[test]
+    fn sizes_follow_the_selected_preset() {
+        let chars = |set: &ComponentSet, id: &str, visible: &dyn Fn(&str) -> bool| {
+            rows(set, visible)
+                .into_iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .chars
+        };
+        let default = ComponentSet::default();
+        let pi = ComponentSet::for_preset(Preset::Pi);
+        assert_eq!(IDENTITY.chars().count(), 75);
+        assert_eq!(chars(&default, "identity", &all), Some(75));
+        assert_eq!(chars(&pi, "identity", &all), Some(29));
+        assert_eq!(PI_IDENTITY.chars().count(), 29);
+        let four = |t: &str| matches!(t, "read_file" | "write_file" | "edit_file" | "run_command");
+        let line = "You have tools: run_command, read_file, write_file, edit_file.";
+        assert_eq!(chars(&default, "tools", &four), Some(line.chars().count()));
+        assert_eq!(chars(&pi, "tools", &four), Some(line.chars().count()));
+        // A text component that pi leaves alone has one size under both.
+        assert_eq!(
+            chars(&default, "three-cs", &all),
+            chars(&pi, "three-cs", &all)
+        );
     }
 
     #[test]

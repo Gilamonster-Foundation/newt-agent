@@ -2317,7 +2317,11 @@ impl Config {
             replace_in_place(table, "components", toml_edit::value(inline));
         }
         if preset == "default" {
-            table.remove("preset");
+            // An existing `preset = "default"` is not ours to delete: a component edit
+            // leaves it, comments and all. Any other value is normalised away.
+            if table.get("preset").and_then(toml_edit::Item::as_str) != Some("default") {
+                table.remove("preset");
+            }
         } else {
             replace_in_place(table, "preset", toml_edit::value(preset));
         }

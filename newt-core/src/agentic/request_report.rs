@@ -126,7 +126,7 @@ impl RequestReport {
         notes: &[Annotation],
     ) -> Self {
         let card = Annotation {
-            label: "active-prompt card".into(),
+            label: "card".into(),
             source: "agentic::prompt_read::active_prompt_card".into(),
             text: String::new(),
         };
@@ -459,7 +459,7 @@ mod tests {
             .map(|c| c.label.as_str())
             .collect();
         assert_eq!(labels, ["identity", SEPARATOR, "workspace", UNATTRIBUTED]);
-        assert_eq!(r.system[1].components[0].label, "active-prompt card");
+        assert_eq!(r.system[1].components[0].label, "card");
         let tool_sum: usize = r.tools.iter().map(|t| t.chars).sum();
         assert_eq!(r.tools_array_chars, tool_sum + r.tools.len() + 1);
         assert_eq!(r.tools[1].name, "bb");

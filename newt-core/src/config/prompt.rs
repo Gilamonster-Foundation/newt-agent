@@ -254,6 +254,26 @@ mod tests {
         );
     }
 
+    /// #2993 review: an unrelated component edit leaves a decorated
+    /// `preset = "default"` alone; moving off another preset still drops the key.
+    #[test]
+    fn with_prompt_components_keeps_a_decorated_default_preset() {
+        let text = "[prompt]\n# which prompt\npreset = \"default\" # explicit on purpose\n";
+        let edited = Config::with_prompt_components(text, "default", &[], &["readme"]).unwrap();
+        assert!(
+            edited.contains("# which prompt")
+                && edited.contains("preset = \"default\" # explicit on purpose")
+                && edited.contains("readme"),
+            "{edited}"
+        );
+        let same = Config::with_prompt_components(text, "default", &[], &[]).unwrap();
+        assert!(same.contains("# explicit on purpose"), "{same}");
+        let from_pi =
+            Config::with_prompt_components("[prompt]\npreset = \"pi\"\n", "default", &[], &[])
+                .unwrap();
+        assert!(!from_pi.contains("preset"), "{from_pi}");
+    }
+
     #[test]
     fn the_session_twin_beats_the_config_file() {
         let c = cfg("[prompt]\nfile = \"/etc/p.md\"\n");

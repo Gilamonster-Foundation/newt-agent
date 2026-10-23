@@ -151,7 +151,11 @@ fn the_request_report_names_components_by_id_with_nothing_unattributed() {
         // The soul and context providers label their own blocks in production,
         // the soul as ONE block (which must not swallow its components).
         sink.annotate("soul", "test", newt_core::DEFAULT_SOUL);
-        sink.annotate("agents", "test", "## AGENTS.md\nUse four spaces.");
+        sink.annotate(
+            "project-instructions",
+            "test",
+            "## AGENTS.md\nUse four spaces.",
+        );
         let prompt = assembled_reporting(config, newt_core::DEFAULT_SOUL, None, Some(&sink));
         sink.arm_capture_next();
         let _ = sink.observe_request(&[&prompt], None);

@@ -344,7 +344,10 @@ impl MemoryManager {
         for p in self.providers.iter().filter(|p| keep(p.name())) {
             if let Some(block) = p.system_prompt_block() {
                 if !block.is_empty() {
-                    sink.annotate(p.name(), "memory::build_system_prompt_additions", &block);
+                    // The report names a block by its component id when it has one.
+                    let label = crate::prompt_components::provider_component(p.name())
+                        .unwrap_or_else(|| p.name());
+                    sink.annotate(label, "memory::build_system_prompt_additions", &block);
                 }
             }
         }
