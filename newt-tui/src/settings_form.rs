@@ -2430,7 +2430,7 @@ mod tests {
     fn a_config_that_does_not_resolve_confirms_nothing_and_writes_nothing() {
         let _guard = settings_guard();
         let path = newt_core::Config::user_config_path().expect("a config path");
-        config_fs::write(&path, "[prompt]\npreset = \"pi\"\n").unwrap();
+        config_fs::write(&path, "[prompt]\npreset = \"nope\"\n").unwrap();
         let broken = config_fs::read(&path);
         let sp = |v: &str| apply(Field::SystemPrompt, v);
         for command in [

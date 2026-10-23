@@ -32,7 +32,7 @@ const MODEL: &str = "refresh-fixture";
 #[cfg(feature = "rich-tui")]
 const READY: &str = "REFRESH_READY> ";
 /// A project layer whose `[prompt]` section does not resolve.
-const BROKEN_PROJECT: &str = "[prompt]\npreset = \"pi\"\n";
+const BROKEN_PROJECT: &str = "[prompt]\npreset = \"nope\"\n";
 const THREE_CS: &str = "Working code first";
 
 /// One chat request as the provider saw it.
