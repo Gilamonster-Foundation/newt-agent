@@ -337,6 +337,20 @@ impl ReportSink {
         });
     }
 
+    /// Like [`annotate`](Self::annotate), but one label may carry several spans:
+    /// an earlier note is replaced only when BOTH its label and its source match.
+    /// For pieces that share a component id yet come from different sources (the two
+    /// API providers, #2933), so none of them is attributed away.
+    pub fn annotate_span(&self, label: &str, source: &str, text: &str) {
+        let mut s = self.s();
+        s.notes.retain(|n| n.label != label || n.source != source);
+        s.notes.push(Annotation {
+            label: label.into(),
+            source: source.into(),
+            text: text.into(),
+        });
+    }
+
     /// Drop the annotation labelled `label`, for a caller that reports the same
     /// text under finer labels (the soul's components, #2933).
     pub fn forget(&self, label: &str) {

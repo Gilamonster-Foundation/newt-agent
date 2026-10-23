@@ -347,7 +347,8 @@ impl MemoryManager {
                     // The report names a block by its component id when it has one.
                     let label = crate::prompt_components::provider_component(p.name())
                         .unwrap_or_else(|| p.name());
-                    sink.annotate(label, "memory::build_system_prompt_additions", &block);
+                    // One span per provider: two providers may share a component id.
+                    sink.annotate_span(label, &format!("memory::{}", p.name()), &block);
                 }
             }
         }
