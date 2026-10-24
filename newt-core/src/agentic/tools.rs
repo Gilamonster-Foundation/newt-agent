@@ -68,7 +68,9 @@ pub(crate) mod output_budget;
 mod read_history;
 pub(crate) use read_history::ReadHistory;
 mod shell;
-pub use shell::{run_command_dialect_sentence, shell_dialect_sentence};
+pub use shell::{
+    run_command_dialect_sentence, run_command_dialect_sentence_for, shell_dialect_sentence,
+};
 /// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
 /// silent tool is never a blank row, and the first live byte takes the row
 /// for good. Unix-only — it needs a real pty pair.

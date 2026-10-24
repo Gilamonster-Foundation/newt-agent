@@ -17,6 +17,35 @@ use std::path::{Path, PathBuf};
 /// reads `~/.zshrc` / `~/.bashrc`, where aliases and functions live.
 const LOGIN_INTERACTIVE: &[&str] = &["bash", "zsh", "fish", "ksh"];
 
+// A file can exist and still not start (a missing interpreter in its shebang). Once a spawn
+// showed that, the rest of the process runs `/bin/sh` and says so. A process-wide flag in
+// production; thread-local under test so parallel tests do not share it.
+#[cfg(not(test))]
+static LOGIN_SHELL_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    static LOGIN_SHELL_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that the login shell could not be started, so dispatch, banner and guidance all
+/// treat it as `/bin/sh` from now on.
+pub fn mark_login_shell_failed() {
+    #[cfg(not(test))]
+    LOGIN_SHELL_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    LOGIN_SHELL_FAILED.with(|f| f.set(true));
+}
+
+/// Has a spawn shown the login shell cannot start?
+#[must_use]
+pub fn login_shell_failed() -> bool {
+    #[cfg(not(test))]
+    return LOGIN_SHELL_FAILED.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    LOGIN_SHELL_FAILED.with(std::cell::Cell::get)
+}
+
 /// What the model is told when `run_command` runs fish: not POSIX.
 pub const FISH_DIALECT: &str = "Commands run in the operator's fish shell, not a POSIX shell: use fish syntax (`set name value` and `$name`, `and`/`or` or `; and`, `(cmd)` for substitution), with no heredocs and no `${var:-default}`; run_command already returns the exit status.";
 
@@ -87,10 +116,16 @@ impl AmbientShell {
     }
 
     /// The shell this process would run for ambient `run_command`: `$SHELL`, checked
-    /// against the file system. The one resolution the dispatch, the banner and the
-    /// prompt guidance all use, so they cannot disagree.
+    /// against the file system, and demoted to `/bin/sh` for the rest of the process once a
+    /// spawn showed it cannot start (see [`mark_login_shell_failed`]). The one resolution
+    /// the dispatch, the banner and the prompt guidance all use, so they cannot disagree.
     #[must_use]
     pub fn resolve_host() -> Self {
+        if login_shell_failed() {
+            return Self::Fallback {
+                reason: "the login shell could not be started",
+            };
+        }
         Self::resolve_checked(std::env::var_os("SHELL").as_deref(), Path::is_file)
     }
 
@@ -174,6 +209,7 @@ mod tests {
         Some(OsString::from(s))
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_absolute_login_shell_runs_login_and_interactive() {
         for (shell, args, posix) in [
@@ -293,6 +329,7 @@ mod tests {
         assert_eq!(unix.len(), 4, "exact names elsewhere");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_login_shell_that_is_not_a_file_falls_back() {
         let got = AmbientShell::resolve_checked(Some("/no/such/zsh".as_ref()), |_| false);
@@ -306,6 +343,7 @@ mod tests {
         assert!(matches!(ok, AmbientShell::Login { .. }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_a_non_posix_login_shell_changes_the_dialect_guidance() {
         let fish = AmbientShell::resolve_checked(Some("/usr/bin/fish".as_ref()), |_| true);

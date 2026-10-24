@@ -673,14 +673,29 @@ fn assemble_env_grants(
     shell_env: &BTreeMap<String, String>,
     entry_env: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
+    assemble_env_grants_with(passthrough, shell_env, entry_env, cfg!(windows))
+}
+
+/// [`assemble_env_grants`] with the name identity chosen: Windows names are
+/// case-insensitive, so an inherited `Path` and an explicit server `PATH` are ONE variable
+/// and the later layer (the server entry) replaces the earlier one, spelling included.
+fn assemble_env_grants_with(
+    passthrough: &[(String, String)],
+    shell_env: &BTreeMap<String, String>,
+    entry_env: &BTreeMap<String, String>,
+    case_insensitive: bool,
+) -> Vec<(String, String)> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
-    for (k, v) in passthrough {
-        map.insert(k.clone(), v.clone());
-    }
-    for (k, v) in shell_env {
-        map.insert(k.clone(), v.clone());
-    }
-    for (k, v) in entry_env {
+    let layers = passthrough
+        .iter()
+        .map(|(k, v)| (k, v))
+        .chain(shell_env.iter())
+        .chain(entry_env.iter());
+    for (k, v) in layers {
+        // A lower layer's same-named variable (under the host's identity) is replaced.
+        map.retain(|existing, _| {
+            !newt_core::ambient_shell::same_env_key(existing, k, case_insensitive)
+        });
         map.insert(k.clone(), v.clone());
     }
     map.into_iter().collect()

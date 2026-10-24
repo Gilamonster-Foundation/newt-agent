@@ -176,3 +176,23 @@ fn windows_key_case_is_honored_in_both_passthroughs() {
     let exact = parent_passthrough_with(false, vars(), false);
     assert!(exact.is_empty(), "{exact:?}");
 }
+
+/// Windows names are case-insensitive: an inherited `Path`, a shell-env `path` and an explicit
+/// server `PATH` are one variable, and the server entry wins (its spelling too), so the
+/// grants the Windows spawn applies cannot let the parent's value overwrite the configured one.
+#[test]
+fn mixed_case_collisions_across_layers_resolve_to_the_entry() {
+    let parent = pairs(&[("Path", "parent-bin"), ("HOME", "/h")]);
+    let shell = BTreeMap::from([("path".to_string(), "shell-bin".to_string())]);
+    let entry = BTreeMap::from([("PATH".to_string(), "entry-bin".to_string())]);
+    let win = assemble_env_grants_with(&parent, &shell, &entry, true);
+    assert_eq!(win, pairs(&[("HOME", "/h"), ("PATH", "entry-bin")]));
+    // Without an entry value the shell-env layer beats the parent; with neither it is the parent's.
+    let win = assemble_env_grants_with(&parent, &shell, &BTreeMap::new(), true);
+    assert_eq!(win, pairs(&[("HOME", "/h"), ("path", "shell-bin")]));
+    let win = assemble_env_grants_with(&parent, &BTreeMap::new(), &BTreeMap::new(), true);
+    assert_eq!(win, pairs(&[("HOME", "/h"), ("Path", "parent-bin")]));
+    // Exact names elsewhere: three different variables.
+    let exact = assemble_env_grants_with(&parent, &shell, &entry, false);
+    assert_eq!(exact.len(), 4, "{exact:?}");
+}

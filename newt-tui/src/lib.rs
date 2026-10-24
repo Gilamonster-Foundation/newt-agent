@@ -2617,6 +2617,8 @@ mod ambient_banner_tests {
     use super::*;
     use newt_core::ambient_shell::AmbientShell;
 
+    // Unix absolute paths (`/usr/bin/zsh`) are not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn the_banner_lists_exactly_what_is_off_from_the_effective_decision() {
         use newt_core::launch_authority::LaunchAuthority;

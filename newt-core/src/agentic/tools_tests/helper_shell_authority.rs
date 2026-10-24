@@ -748,9 +748,68 @@ fn the_dialect_guidance_follows_the_ambient_login_shell() {
         sentence.contains("fish") && sentence.contains("not a POSIX shell"),
         "{sentence}"
     );
+    // A turn with an exec floor routes per command (an out-of-floor command stays confined):
+    // the confined default is advertised, never the login shell's dialect.
+    let floor = crate::caveats::Scope::only(["ls".to_string()]);
+    assert!(
+        crate::agentic::run_command_dialect_sentence_for(Some(&floor))
+            .contains("POSIX shell syntax"),
+        "a floor keeps the POSIX guidance"
+    );
+    assert!(crate::agentic::run_command_dialect_sentence_for(None).contains("fish"));
     crate::process_env::set_var("SHELL", "/bin/bash");
     assert!(crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"));
     // A login shell that does not exist falls back to /bin/sh: POSIX again.
     crate::process_env::set_var("SHELL", dir.path().join("zsh-missing").to_str().unwrap());
     assert!(crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"));
+}
+
+/// #978 review: a login shell that exists but cannot start (its interpreter is missing) is
+/// said out loud, the call still runs under `/bin/sh`, and from then on the shell, the
+/// banner's resolution and the model's guidance all say `/bin/sh` / POSIX.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn an_unstartable_login_shell_is_reported_and_demoted() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
+    let dir = tempfile::tempdir().unwrap();
+    let fish = dir.path().join("fish");
+    std::fs::write(&fish, "#!/no/such/interpreter\n").unwrap();
+    std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::process_env::set_var("SHELL", fish.to_str().unwrap());
+    let _pin = crate::launch_authority::ScopedAuthority::ambient_with_host_bypass();
+    assert!(
+        crate::agentic::run_command_dialect_sentence().contains("fish"),
+        "fish before the spawn"
+    );
+
+    let run = super::shell::host_shell_output_with_timeout(
+        super::shell::ShellRoute::BashSh,
+        "echo hi",
+        "/tmp",
+        None,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "hi\n",
+        "the call ran under /bin/sh"
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("could not start your login shell"),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(crate::ambient_shell::login_shell_failed());
+    assert!(matches!(
+        crate::ambient_shell::AmbientShell::resolve_host(),
+        crate::ambient_shell::AmbientShell::Fallback { .. }
+    ));
+    assert!(
+        crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"),
+        "guidance follows the demotion"
+    );
 }
