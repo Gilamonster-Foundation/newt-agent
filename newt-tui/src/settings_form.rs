@@ -119,6 +119,8 @@ pub(crate) enum Field {
     /// `[tool_exposure] read_only` (#2932): hide the write tools and clamp
     /// `fs_write` with them.
     ReadOnly,
+    /// `[skills] off` (#2933): which installed skills the model is offered.
+    Skills,
 }
 
 impl Field {
@@ -144,6 +146,7 @@ impl Field {
         Self::GitSigning,
         Self::Tools,
         Self::ReadOnly,
+        Self::Skills,
     ];
 
     /// The deep-link token: `/settings <name> [value]`. This is ALSO the
@@ -171,6 +174,7 @@ impl Field {
             Self::GitSigning => "git-signing",
             Self::Tools => "tools",
             Self::ReadOnly => "read-only",
+            Self::Skills => "skills",
         }
     }
 
@@ -196,6 +200,7 @@ impl Field {
             Self::GitSigning => "harness commit signing",
             Self::Tools => "tools the model sees",
             Self::ReadOnly => "hide the write tools",
+            Self::Skills => "skills the model is offered",
         }
     }
 
@@ -340,6 +345,11 @@ impl Field {
             },
             // A path, or `edit` (handled by the session: it needs the
             // terminal). `reset` returns to the assembled prompt (#2938).
+            // `list`, `on <name>`, `off <name>`.
+            Self::Skills => ValueSpace::Text {
+                release: "list",
+                placeholder: "list | on <name> | off <name>",
+            },
             Self::SystemPrompt => ValueSpace::Text {
                 release: "reset",
                 placeholder: "~/.newt/system-prompt.md | edit | components | on <id> | off <id>",
@@ -480,6 +490,7 @@ impl Field {
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
             Self::Tools => tools_token(&tool_exposure_setting()),
+            Self::Skills => crate::skills_form::status(),
             Self::ReadOnly => if tool_exposure_setting().read_only {
                 "on"
             } else {
@@ -725,9 +736,18 @@ pub(crate) fn persist_config(
 ) -> Result<(), String> {
     let path = newt_core::Config::user_config_path()
         .ok_or_else(|| "no config directory to save the setting in".to_string())?;
-    let text = config_fs::read(&path);
+    persist_config_at(&path, rewrite)
+}
+
+/// [`persist_config`] for a path the caller already resolved, so a multi-step command reads
+/// and writes ONE file whatever the environment does between steps.
+pub(crate) fn persist_config_at(
+    path: &std::path::Path,
+    rewrite: impl FnOnce(&str) -> Result<String, newt_core::NewtError>,
+) -> Result<(), String> {
+    let text = config_fs::read(path);
     let updated = rewrite(&text).map_err(|e| e.to_string())?;
-    config_fs::write(&path, &updated).map_err(|e| format!("saving config: {e}"))
+    config_fs::write(path, &updated).map_err(|e| format!("saving config: {e}"))
 }
 
 /// The `[tool_exposure]` policy in force (#2932), read from the resolved
@@ -1032,9 +1052,8 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                 let cfg =
                     crate::migration_notices::read(|report| newt_core::Config::resolve(report))
                         .map_err(|e| e.to_string())?;
-                let dirs = cfg.skill_search_dirs();
                 let posture = newt_core::posture::build_posture(value, &cfg, |skill| {
-                    newt_skills::load_body_from(&dirs, skill)
+                    cfg.load_skill_body(skill)
                 })
                 .map_err(|e| e.to_string())?;
                 newt_core::posture::set_active_posture(Some(posture));
@@ -1164,6 +1183,12 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                 )
             })?;
             confirm_in_force("allow_list", |now| now.allow_list == list, field.label())?;
+        }
+        // `list` is a read, `on|off <name>` one write; the chat loop re-resolves after.
+        Field::Skills => {
+            let (word, arg) = crate::skills_form::parse(value)
+                .ok_or_else(|| "skills: list, on <name> or off <name>".to_string())?;
+            return crate::skills_form::apply(word, arg);
         }
         Field::ReadOnly => {
             persist_config(|text| {
@@ -1534,6 +1559,11 @@ pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
 }
 
 fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
+    // Skills have no value to ask for: bare `/settings skills` lists them, and the next
+    // line the operator types is theirs, not an answer.
+    if field == Field::Skills {
+        return vec![crate::skills_form::listing().unwrap_or_else(|e| e)];
+    }
     ask_and_apply(ask, field, "/settings")
 }
 
@@ -1883,6 +1913,7 @@ mod tests {
             preset_name: "strict".to_string(),
             clamp: newt_core::Caveats::default(),
             clamp_summary: "deny writes".to_string(),
+            skill: None,
             skill_body: None,
             framing: None,
         }));
@@ -1980,6 +2011,7 @@ mod tests {
             preset_name: "strict".into(),
             clamp: newt_core::Caveats::default(),
             clamp_summary: "deny writes".into(),
+            skill: None,
             skill_body: None,
             framing: Some("Keep the existing guidance.".into()),
         };

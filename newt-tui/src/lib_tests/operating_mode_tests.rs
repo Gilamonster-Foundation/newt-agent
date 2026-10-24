@@ -491,6 +491,7 @@ fn live_session_control_prompt_composes_mode_and_posture_without_stale_state() {
         preset_name: "readonly-triage".to_string(),
         clamp: newt_core::Caveats::top(),
         clamp_summary: "readonly".to_string(),
+        skill: None,
         skill_body: Some("Inspect evidence before drawing conclusions.".to_string()),
         framing: Some("Treat this as an on-call incident.".to_string()),
     };

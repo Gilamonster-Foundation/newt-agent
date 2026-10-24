@@ -4118,6 +4118,7 @@ fn permissions_command_reflects_the_active_posture() {
         preset_name: "readonly-triage".to_string(),
         clamp: preset.clamp(),
         clamp_summary: preset.summary(),
+        skill: None,
         skill_body: None,
         framing: None,
     };

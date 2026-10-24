@@ -808,6 +808,15 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Journal,
         Surface::Native,
     ),
+    // #2933: which skills the model is offered. Typed: `/settings skills on|off <name>`.
+    cmd_on(
+        "skills",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
     cmd_on(
         "read-only",
         &[],

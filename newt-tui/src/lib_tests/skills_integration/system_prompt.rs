@@ -16,7 +16,8 @@ fn system_prompt_index_includes_discovered_skill_name_and_description() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_skill(tmp.path(), "commit-style", "How this repo writes commits");
 
-    let block = skills_index_for_prompt(&[tmp.path().to_path_buf()]).expect("an index block");
+    let block =
+        skills_index_for_prompt(&[tmp.path().to_path_buf()], &|_| false).expect("an index block");
     assert!(block.contains("Available skills (call `use_skill` to load one):"));
     assert!(block.contains("commit-style: How this repo writes commits"));
     // Progressive disclosure: the body must NOT appear in the index.
@@ -32,8 +33,8 @@ fn system_prompt_index_includes_discovered_skill_name_and_description() {
 #[test]
 fn system_prompt_index_carries_the_install_hint_when_no_skills() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let block =
-        skills_index_for_prompt(&[tmp.path().to_path_buf()]).expect("install hint survives");
+    let block = skills_index_for_prompt(&[tmp.path().to_path_buf()], &|_| false)
+        .expect("install hint survives");
     assert!(block.contains("newt skills install"));
     assert!(!block.contains("Available skills"));
 }
@@ -48,8 +49,10 @@ fn system_prompt_index_unions_search_path_first_dir_wins() {
     write_skill(b.path(), "commit-style", "claude copy");
     write_skill(b.path(), "judge", "scoring");
 
-    let block = skills_index_for_prompt(&[a.path().to_path_buf(), b.path().to_path_buf()])
-        .expect("an index block");
+    let block = skills_index_for_prompt(&[a.path().to_path_buf(), b.path().to_path_buf()], &|_| {
+        false
+    })
+    .expect("an index block");
     // First dir's description wins; second dir's same-named skill is shadowed.
     assert!(block.contains("commit-style: newt copy"));
     assert!(!block.contains("claude copy"));

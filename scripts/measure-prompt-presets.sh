@@ -139,6 +139,16 @@ measure "pi + /settings tools pi" "$PI_TOOLS
 [prompt]
 preset = \"pi\"
 "
+# Skills (#2933): the bundled skills' index in every request, all on versus all off.
+BUNDLED=$(cd "$HERE/../.newt/bundled-skills" && pwd)
+OFF_LIST=$(ls "$BUNDLED" | sed 's/.*/"&"/' | paste -sd, -)
+measure "default + bundled skills" "[skills]
+bundled_dir = \"$BUNDLED\"
+"
+measure "... all those skills off" "[skills]
+bundled_dir = \"$BUNDLED\"
+off = [$OFF_LIST]
+"
 measure_headless "bare (--prompt-preset headless)" "" --prompt-preset headless
 measure_headless "default (= the TUI's)" ""
 measure_headless "pi + tools pi" "$PI_TOOLS
