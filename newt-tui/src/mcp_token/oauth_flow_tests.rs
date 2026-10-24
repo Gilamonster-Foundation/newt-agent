@@ -1962,3 +1962,47 @@ async fn unusable_oauth_configuration_is_refused() {
         );
     }
 }
+
+/// PR #3000 review round 2 (P2): discovery judged a saved DCR client against
+/// the resource's advertised `files:read files:write` instead of the pinned
+/// `files:read`, so a saved read-only registration was refused as "not
+/// reusable" once the issuer stopped offering dynamic registration.
+#[tokio::test]
+async fn pinned_scopes_decide_saved_dcr_client_reuse() {
+    let (_resource_server, authorization_server, resource) = static_client_fixture(true).await;
+    let saved = ClientFile {
+        client_id: "saved-read-only-client".into(),
+        redirect_uris: vec!["http://127.0.0.1:0/callback".into()],
+        issuer: Some(authorization_server.uri()),
+        extra: BTreeMap::from([
+            ("registration_method".into(), serde_json::json!("dcr")),
+            (
+                "token_endpoint_auth_method".into(),
+                serde_json::json!("none"),
+            ),
+            (
+                "grant_types".into(),
+                serde_json::json!(["authorization_code", "refresh_token"]),
+            ),
+            ("response_types".into(), serde_json::json!(["code"])),
+            ("scope".into(), serde_json::json!("files:read")),
+        ]),
+    };
+    let (discovered, client, scope) = select_oauth_client(
+        &resource,
+        true,
+        Some(saved),
+        None,
+        None,
+        &ConfiguredOAuth {
+            scopes: Some("files:read".into()),
+            ..ConfiguredOAuth::default()
+        },
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap();
+    assert!(discovered.registration_endpoint.is_none());
+    assert_eq!(client.client_id, "saved-read-only-client");
+    assert_eq!(scope.as_deref(), Some("files:read"));
+}

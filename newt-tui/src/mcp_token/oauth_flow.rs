@@ -742,11 +742,15 @@ async fn discover_oauth_meta_within_budget(
         None,
         false,
         &OAuthHopPolicy::new(&newt_core::Scope::All),
+        None,
         budget,
     )
     .await
 }
 
+/// Unpinned discovery for a saved client; the flow itself goes through
+/// `select_oauth_client`, which supplies any pinned scopes.
+#[cfg(test)]
 async fn discover_oauth_meta_for_client_with_policy(
     server_url: &str,
     allow_test_loopback_http: bool,
@@ -760,6 +764,7 @@ async fn discover_oauth_meta_for_client_with_policy(
         client,
         allow_re_registration,
         policy,
+        None,
         &DiscoveryBudget::new(OAUTH_DISCOVERY_BUDGET),
     )
     .await
@@ -771,6 +776,7 @@ async fn discover_oauth_meta_within_budget_for_client(
     client: Option<&ClientFile>,
     allow_re_registration: bool,
     policy: &OAuthHopPolicy,
+    pinned_scope: Option<&str>,
     budget: &DiscoveryBudget,
 ) -> anyhow::Result<DiscoveredOAuthMeta> {
     let resource = validate_resource_url(server_url, allow_test_loopback_http)?;
@@ -789,8 +795,12 @@ async fn discover_oauth_meta_within_budget_for_client(
         client,
         allow_re_registration,
     )?;
-    let requested_scope = challenge_scope.clone().or_else(|| {
-        (!protected.scopes_supported.is_empty()).then(|| protected.scopes_supported.join(" "))
+    // Pinned scopes (Claude's `oauth.scopes`) are the request, so they — not
+    // the resource's advertisement — decide whether a saved client is reusable.
+    let requested_scope = pinned_scope.map(str::to_string).or_else(|| {
+        challenge_scope.clone().or_else(|| {
+            (!protected.scopes_supported.is_empty()).then(|| protected.scopes_supported.join(" "))
+        })
     });
     let mut errors = Vec::new();
     let mut selected = None;
@@ -1627,12 +1637,14 @@ async fn select_oauth_client(
     // ── 1. OAuth server metadata ──────────────────────────────────────────
     // Explicit authentication always rediscovers: RFC 9728 allows the resource
     // to change AS metadata, and stale cached issuer state must not silently win.
-    let discovered = discover_oauth_meta_for_client_with_policy(
+    let discovered = discover_oauth_meta_within_budget_for_client(
         server_url,
         allow_test_loopback_http,
         discovery_client,
         !is_static,
         policy,
+        configured.scopes.as_deref(),
+        &DiscoveryBudget::new(OAUTH_DISCOVERY_BUDGET),
     )
     .await?;
     // Pinned scopes (Claude's `oauth.scopes`) are the requested set, not a
