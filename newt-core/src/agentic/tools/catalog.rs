@@ -829,6 +829,12 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
         definition: request_user_input_tool_definition,
         gate: Gate::Always,
     },
+    // #144: degrades to "no operator to confirm" without a gate.
+    ToolSpec {
+        name: "propose_config_edit",
+        definition: super::config_edit::propose_config_edit_tool_definition,
+        gate: Gate::Always,
+    },
     ToolSpec {
         name: "lifecycle",
         definition: lifecycle_tool_definition,
