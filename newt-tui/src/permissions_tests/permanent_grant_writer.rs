@@ -198,6 +198,65 @@ fn exec_relative_path_is_refused_and_store_is_untouched() {
     assert!(!approve_path(&config).exists(), "nothing should be written");
 }
 
+/// #2995: a full-access pre-approval skips the prompt only. It is logged like
+/// a session allow, names full access as the reason, and never reaches the
+/// durable store. The prompt script is one `Deny`, so any prompt would deny.
+#[test]
+fn full_access_preapproval_is_recorded_as_a_session_grant_and_never_persisted() {
+    let (_dir, config, _key_path, _root) = fixture();
+    let mut state = PermissionPromptState::default();
+    let request = req(DenialKind::RemoteTool, "mail__search");
+    let decision = gate(&mut state, &config, None, None, PromptChoice::Deny)
+        .ask_full_access(std::slice::from_ref(&request));
+    assert!(matches!(decision, newt_core::PermissionDecision::Allow(_)));
+    let logged = state.decisions.last().unwrap();
+    assert_eq!(
+        (logged.decision.as_str(), logged.scope.as_str()),
+        ("allow", "session-full-access")
+    );
+    assert!(state
+        .session_grants
+        .contains(&(DenialKind::RemoteTool, "mail__search".to_string())));
+    assert!(state.durable_grants.is_empty());
+    assert!(!approve_path(&config).exists(), "nothing persisted");
+}
+
+/// #2995 round 1: full access must not bypass the gate's vetoes. A delegated
+/// session can never hold remote-tool authority, and a stored `remote_tool`
+/// denial still refuses: no allow, no session grant, no prompt.
+#[test]
+fn full_access_preapproval_still_honours_delegation_and_stored_denials() {
+    let (_dir, config, key_path, _root) = fixture();
+    let request = req(DenialKind::RemoteTool, "mail__search");
+
+    let delegation = crate::caveat_policy_tests::verified_delegation(open_caveats());
+    let mut state = PermissionPromptState::default();
+    let decision = gate(
+        &mut state,
+        &config,
+        Some(key_path),
+        Some(&delegation),
+        PromptChoice::AllowSession,
+    )
+    .ask_full_access(std::slice::from_ref(&request));
+    assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+    assert!(
+        state.session_grants.is_empty(),
+        "delegated: no session allow"
+    );
+    assert!(state.decisions.iter().all(|d| d.decision == "deny"));
+
+    let mut state = PermissionPromptState::default();
+    state
+        .session_denials
+        .insert((DenialKind::RemoteTool, "mail__search".to_string()));
+    let decision = gate(&mut state, &config, None, None, PromptChoice::AllowSession)
+        .ask_full_access(std::slice::from_ref(&request));
+    assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+    assert!(state.session_grants.is_empty(), "denied: no session allow");
+    assert!(state.decisions.is_empty());
+}
+
 /// A delegated session never establishes its own root: the grant stays
 /// session-only, the store is untouched, and the operator is told why.
 #[test]

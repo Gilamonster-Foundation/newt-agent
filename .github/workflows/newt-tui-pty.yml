@@ -72,6 +72,10 @@ on:
       - "newt-tui/src/live_spill.rs"
       - "newt-tui/src/live_spill_tests.rs"
       - "newt-tui/src/live_spill_pty_tests.rs"
+      # lib.rs holds run_code, which refuses an invalid config before the
+      # cockpit draws; #2990 changed it and broke the cockpit PTY fixtures
+      # without firing this tier (fixed by #2998).
+      - "newt-tui/src/lib.rs"
       # chat.rs is also reached by these tests but is deliberately left out: it
       # would fire this tier on nearly every PR (see the scoped-gate note above).
       # PR #2816: this existing macOS job also proves confined basename exec.

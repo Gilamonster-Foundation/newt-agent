@@ -326,6 +326,16 @@ pub trait PermissionGate {
     /// request was allowed; any single deny keeps the whole denial.
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision;
 
+    /// #2995: `--full-access` is the operator's launch-time grant, so the
+    /// caller wants the PROMPT skipped, not the gate. A gate that can honour
+    /// that runs its own non-interactive vetoes (inherited delegation ceiling,
+    /// stored denials), and only then records an "allow for this session"
+    /// naming full access as the reason, never persisted. The caller must
+    /// honour the returned decision. Default: no pre-approval path, so ask.
+    fn ask_full_access(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+        self.ask(requests)
+    }
+
     /// #2636: a caller that just spent an `Allow(kind, target)` on an
     /// immediate, one-shot action — rather than leaving it for the model's
     /// own later retry — tells the gate so any proactive once-grant it
