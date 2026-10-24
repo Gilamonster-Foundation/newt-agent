@@ -21,6 +21,17 @@ pub(crate) fn parse(value: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// The user config file this command reads and writes. Production: `Config::user_config_path`.
+/// The unit tier can pin one file per thread, so a test does not depend on the process
+/// environment staying put between the steps of a command.
+fn config_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = tests::PINNED.with(|p| p.borrow().clone()) {
+        return Some(path);
+    }
+    newt_core::Config::user_config_path()
+}
+
 /// The config in force. One that does not resolve is an ERROR, never a default: a
 /// fabricated default would let a write confirm itself against a config nobody has.
 #[cfg(not(test))]
@@ -33,7 +44,7 @@ pub(crate) fn current() -> Result<newt_core::Config, String> {
 /// The unit tier reads the mocked user file, like the other persisted settings.
 #[cfg(test)]
 pub(crate) fn current() -> Result<newt_core::Config, String> {
-    let path = newt_core::Config::user_config_path().unwrap_or_default();
+    let path = config_path().unwrap_or_default();
     let text = crate::settings_form::config_fs::read(&path);
     toml::from_str::<newt_core::Config>(&text).map_err(|e| format!("config does not resolve: {e}"))
 }
@@ -105,7 +116,11 @@ pub(crate) fn listing() -> Result<String, String> {
 /// override the operator's file).
 fn persist(off: &[String], name: &str, want_off: bool) -> Result<(), String> {
     let refs: Vec<&str> = off.iter().map(String::as_str).collect();
-    crate::settings_form::persist_config(|text| newt_core::Config::with_skills_off(text, &refs))?;
+    let path =
+        config_path().ok_or_else(|| "no config directory to save the setting in".to_string())?;
+    crate::settings_form::persist_config_at(&path, |text| {
+        newt_core::Config::with_skills_off(text, &refs)
+    })?;
     if current()?.skill_is_off(name) == want_off {
         Ok(())
     } else {
@@ -166,16 +181,17 @@ mod tests {
     use super::*;
     use crate::settings_form::{apply_and_record, config_fs, Field};
 
-    /// Restores `NEWT_CONFIG_DIR` when the test ends.
-    struct ConfigDirPin(Option<String>);
+    thread_local! {
+        /// The config file this thread's command reads and writes (see [`config_path`]).
+        pub(super) static PINNED: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Un-pins the file when the test ends.
+    struct ConfigDirPin;
     impl Drop for ConfigDirPin {
         fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => {
-                    newt_core::process_env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v);
-                }
-                None => newt_core::process_env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
-            }
+            PINNED.with(|p| *p.borrow_mut() = None);
         }
     }
 
@@ -191,14 +207,10 @@ mod tests {
             )
             .unwrap();
         }
-        // Pin the config directory: the path is derived from the environment on every
-        // call, and the mocked file is keyed by it.
-        let pin = ConfigDirPin(std::env::var(newt_core::config::NEWT_CONFIG_DIR_ENV).ok());
-        newt_core::process_env::set_var(
-            newt_core::config::NEWT_CONFIG_DIR_ENV,
-            dir.path().join("cfg").to_str().unwrap(),
-        );
-        let path = newt_core::Config::user_config_path().expect("a config path");
+        // Pin the file: no step of a command may depend on the environment staying put.
+        let path = dir.path().join("cfg").join("config.toml");
+        PINNED.with(|p| *p.borrow_mut() = Some(path.clone()));
+        let pin = ConfigDirPin;
         config_fs::write(
             &path,
             &format!(
@@ -362,5 +374,32 @@ mod tests {
             let back = newt_core::posture::active_posture().unwrap();
             assert!(back.skill_body.unwrap().contains("Body of alpha"), "{why}");
         }
+    }
+
+    /// The CI race, made deterministic: the process environment moves under a running
+    /// command (here: the config directory is repointed between its steps). The command
+    /// resolved its file once, so it still finds the skills and writes the file it read.
+    #[test]
+    fn a_command_does_not_depend_on_the_environment_between_its_steps() {
+        let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let (_dir, path, _pin) = fixture();
+        let saved = std::env::var(newt_core::config::NEWT_CONFIG_DIR_ENV).ok();
+        newt_core::process_env::set_var(
+            newt_core::config::NEWT_CONFIG_DIR_ENV,
+            "/nonexistent-root",
+        );
+        let off = apply("off", "alpha");
+        let on = apply("on", "alpha");
+        match saved {
+            Some(v) => newt_core::process_env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, &v),
+            None => newt_core::process_env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+        }
+        off.unwrap();
+        on.unwrap();
+        assert!(
+            !config_fs::read(&path).contains("off"),
+            "{}",
+            config_fs::read(&path)
+        );
     }
 }

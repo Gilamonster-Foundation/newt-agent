@@ -736,9 +736,18 @@ pub(crate) fn persist_config(
 ) -> Result<(), String> {
     let path = newt_core::Config::user_config_path()
         .ok_or_else(|| "no config directory to save the setting in".to_string())?;
-    let text = config_fs::read(&path);
+    persist_config_at(&path, rewrite)
+}
+
+/// [`persist_config`] for a path the caller already resolved, so a multi-step command reads
+/// and writes ONE file whatever the environment does between steps.
+pub(crate) fn persist_config_at(
+    path: &std::path::Path,
+    rewrite: impl FnOnce(&str) -> Result<String, newt_core::NewtError>,
+) -> Result<(), String> {
+    let text = config_fs::read(path);
     let updated = rewrite(&text).map_err(|e| e.to_string())?;
-    config_fs::write(&path, &updated).map_err(|e| format!("saving config: {e}"))
+    config_fs::write(path, &updated).map_err(|e| format!("saving config: {e}"))
 }
 
 /// The `[tool_exposure]` policy in force (#2932), read from the resolved
