@@ -724,7 +724,7 @@ impl ShellRoute {
 /// Capture the session-default route. Brokers, leases and exec floors are
 /// command-specific: execution re-evaluates them before dispatch.
 pub fn run_command_dialect_sentence() -> &'static str {
-    select_shell_route(
+    let route = select_shell_route(
         ocap_disabled(),
         false,
         false,
@@ -733,8 +733,17 @@ pub fn run_command_dialect_sentence() -> &'static str {
         crate::config::windows_cmd_enabled(),
         crate::ambient_brush::installed(),
         shell_engine(),
-    )
-    .sentence()
+    );
+    // `--ambient` runs the operator's login shell: a non-POSIX one (fish) changes what
+    // the model must write, so the guidance follows the shell that will run.
+    if route == ShellRoute::BashSh && crate::launch_authority::current().ambient() {
+        if let Some(sentence) =
+            crate::ambient_shell::AmbientShell::resolve_host().dialect_sentence()
+        {
+            return sentence;
+        }
+    }
+    route.sentence()
 }
 
 /// Pure session-default guidance with injected platform/authority and an installed runner.
@@ -2191,10 +2200,11 @@ pub(super) async fn host_shell_output(
 /// `--disable-ocap` lane is the operator's explicit "run with my ambient
 /// authority" opt-out, so provider credentials etc. are their deliberate grant;
 /// only newt's OWN control plane is excised.
-pub(super) const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
+pub const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
     "NEWT_DISABLE_OCAP",
     "NEWT_FULL_ACCESS",
     "NEWT_UNSAFE_HOST_EXEC",
+    "NEWT_AMBIENT",
     "NEWT_BENCH_OCAP",
     "NEWT_SHELL_ENGINE",
     "NEWT_WINDOWS_CMD",
@@ -2218,6 +2228,50 @@ pub(super) const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
 fn strip_child_authority_env(c: &mut tokio::process::Command) {
     for key in CHILD_STRIPPED_AUTHORITY_ENV {
         c.env_remove(key);
+    }
+}
+
+/// The program and argv of the `--ambient` shell for `cmd`: the operator's login shell
+/// (`-l -i -c` / `-l -c`), or `/bin/sh -c` when `$SHELL` cannot be trusted or the login
+/// shell was not found (`fallback`). The command text gets the portable `which` helper
+/// whenever the interpreter is POSIX.
+fn bash_sh_argv(
+    shell: &crate::ambient_shell::AmbientShell,
+    fallback: bool,
+    cmd: &str,
+) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    use crate::ambient_shell::AmbientShell;
+    let posix = |c: &str| agent_bridle_tool_shell::with_posix_command_discovery(c);
+    match shell {
+        AmbientShell::Login {
+            program,
+            args,
+            posix: is_posix,
+        } if !fallback => {
+            let mut argv: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+            argv.push(
+                if *is_posix {
+                    posix(cmd)
+                } else {
+                    cmd.to_string()
+                }
+                .into(),
+            );
+            (program.clone().into_os_string(), argv)
+        }
+        _ => ("/bin/sh".into(), vec!["-c".into(), posix(cmd).into()]),
+    }
+}
+
+/// Say once per process, on stderr, that `--ambient` could not use the login shell and
+/// `/bin/sh` runs instead (the startup banner says it too; this covers a `$SHELL` that
+/// changed or vanished since).
+fn note_ambient_fallback(shell: &crate::ambient_shell::AmbientShell) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if matches!(shell, crate::ambient_shell::AmbientShell::Fallback { .. })
+        && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!("--ambient: {}", shell.describe());
     }
 }
 
@@ -2266,8 +2320,19 @@ fn host_shell_command_at(
             ))
         }
     };
+    // `--ambient` (#978): the operator's login shell. Every other posture builds exactly
+    // the argv it always did.
+    let login =
+        (route == ShellRoute::BashSh && crate::launch_authority::current().ambient()).then(|| {
+            let shell = crate::ambient_shell::AmbientShell::resolve_host();
+            note_ambient_fallback(&shell);
+            bash_sh_argv(&shell, fallback, cmd)
+        });
+    let program = login.as_ref().map_or(program, |(p, _)| p.as_os_str());
     let mut c = tokio::process::Command::new(program);
-    if route != ShellRoute::AmbientBrush {
+    if let Some((_, args)) = &login {
+        c.args(args);
+    } else if route != ShellRoute::AmbientBrush {
         c.arg(flag);
     }
     if route == ShellRoute::AmbientBrush {
@@ -2293,6 +2358,8 @@ fn host_shell_command_at(
         }
         let path = std::env::join_paths(paths).map_err(std::io::Error::other)?;
         c.env("PATH", path);
+    } else if login.is_some() {
+        // Already in the argv above.
     } else if route == ShellRoute::BashSh {
         c.arg(agent_bridle_tool_shell::with_posix_command_discovery(cmd));
     } else {
@@ -2428,6 +2495,23 @@ where
 
 #[cfg(not(windows))]
 pub(super) async fn host_shell_output_with_timeout(
+    route: ShellRoute,
+    cmd: &str,
+    cwd: &str,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout: std::time::Duration,
+) -> std::io::Result<HostShellRun> {
+    let mut run = host_shell_output_raw(route, cmd, cwd, live, timeout).await?;
+    // `--ambient`: an interactive bash with no terminal announces itself on stderr
+    // every time; that is noise in the model's view, not the command's output.
+    if route == ShellRoute::BashSh && crate::launch_authority::current().ambient() {
+        run.stderr = crate::ambient_shell::strip_interactive_noise(&run.stderr);
+    }
+    Ok(run)
+}
+
+#[cfg(not(windows))]
+async fn host_shell_output_raw(
     route: ShellRoute,
     cmd: &str,
     cwd: &str,

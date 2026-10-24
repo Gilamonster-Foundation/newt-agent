@@ -81,6 +81,7 @@ pub mod interaction_surface;
 // and `--no-default-features` therefore did not COMPILE (#1890): an unresolved
 // `crate::markup::spans`, not merely a lint. The wyvern tier falls back to
 // `markup::plain`, which stays unconditional for exactly this reason.
+pub mod ambient_shell;
 #[cfg(feature = "markdown")]
 pub mod interaction_view;
 pub mod kit;

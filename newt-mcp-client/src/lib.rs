@@ -713,18 +713,53 @@ fn resolve_entry_secrets(
         .collect()
 }
 
+/// What the parent environment contributes to a stdio server's env: the closed allow-list,
+/// or, under `--ambient` (#978), the full environment minus newt's own control plane, so
+/// `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` reach a
+/// browser launch. Pure over `vars`.
+fn parent_passthrough(
+    ambient: bool,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    parent_passthrough_with(ambient, vars, cfg!(windows))
+}
+
+/// [`parent_passthrough`] with the name comparison chosen (Windows names are
+/// case-insensitive), so both behaviours are testable on any host.
+fn parent_passthrough_with(
+    ambient: bool,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    case_insensitive: bool,
+) -> Vec<(String, String)> {
+    if ambient {
+        return newt_core::ambient_shell::child_env_with(
+            vars,
+            newt_core::agentic::CHILD_STRIPPED_AUTHORITY_ENV,
+            case_insensitive,
+        );
+    }
+    let allowed = newt_core::mcp_stdio_env_passthrough();
+    vars.into_iter()
+        .filter_map(|(k, v)| {
+            let k = k.into_string().ok()?;
+            allowed
+                .iter()
+                .any(|a| newt_core::ambient_shell::same_env_key(a, &k, case_insensitive))
+                .then(|| (k, v.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
 /// Resolve the three env-grant sources from the live environment (parent env +
 /// the shell-env dir + the entry's own — now secret-resolved — env) and fold
 /// them via [`assemble_env_grants`]. The impure edge — kept tiny so the assembly
 /// logic itself stays pure/tested. Fails loudly if a configured secret reference
 /// cannot be resolved.
 fn resolve_env_grants(entry: &McpServerEntry) -> Result<Vec<(String, String)>> {
-    let passthrough: Vec<(String, String)> = newt_core::mcp_stdio_env_passthrough()
-        .iter()
-        .filter_map(|k| {
-            std::env::var_os(k).map(|v| (k.to_string(), v.to_string_lossy().into_owned()))
-        })
-        .collect();
+    let passthrough = parent_passthrough(
+        newt_core::launch_authority::current().ambient(),
+        std::env::vars_os(),
+    );
     let shell_env = newt_core::Config::user_config_path()
         .map(|p| newt_core::shell_env::from_config_dir(&p))
         .unwrap_or_default();

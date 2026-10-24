@@ -9,6 +9,23 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Added
+
+- `--ambient` (#978): the operator's login shell and full environment. Where `run_command`
+  runs on the host shell it runs your login shell (`$SHELL -l -i -c`, so zsh functions,
+  aliases and rc-set `PATH` work; an unset or relative `$SHELL` falls back to `/bin/sh` and
+  the banner says so), and child processes and stdio MCP servers get your full environment
+  (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` reach a
+  browser launch); newt's own secrets and switches are still withheld. Alone it changes only
+  that axis. Interactive `newt` / `newt code`, unix shells.
+
+### Changed
+
+- `--yolo` is now everything off: `--disable-ocap --full-access --ambient`, no longer an
+  alias of `--disable-ocap`. If you used `--yolo` for approvals-off alone, use
+  `--disable-ocap`; `--yolo` now also lifts confinement and runs your login shell with
+  your full environment, and its banner lists what is off.
+
 ## [0.8.4] — 2026-10-22
 
 ### Added

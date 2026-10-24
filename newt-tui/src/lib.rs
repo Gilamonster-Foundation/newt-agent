@@ -2563,6 +2563,36 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
     )
 }
 
+/// The session-start banner for the `--ambient` axis and for `--yolo`, which is all three
+/// (#978). It lists exactly what is off, from the effective decision rather than the flags:
+/// the login shell is claimed only where `run_command` actually runs on the host shell
+/// (`--disable-ocap` with `--full-access`), and `shell` is how `$SHELL` really resolved
+/// (the login shell, or why `/bin/sh` runs instead).
+fn ambient_banner(
+    authority: newt_core::launch_authority::LaunchAuthority,
+    shell: &newt_core::ambient_shell::AmbientShell,
+) -> String {
+    let children = "child processes and stdio MCP servers get your FULL environment \
+         (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); newt's own \
+         secrets and switches are still withheld";
+    let host = authority.ocap_disabled() && authority.full_access();
+    if host {
+        format!(
+            "⚠ YOLO (--yolo): approvals OFF (--disable-ocap), confinement OFF (--full-access), \
+             environment OFF (--ambient): run_command runs your {}, and {children}. Drop the \
+             flag to restore confinement.",
+            shell.describe()
+        )
+    } else {
+        format!(
+            "⚠ AMBIENT (--ambient): environment OFF: {children}. run_command keeps its current \
+             shell: your login shell applies only where it runs on the host shell, which needs \
+             --disable-ocap and --full-access (--yolo is all three). This flag alone leaves \
+             approvals and confinement as they are."
+        )
+    }
+}
+
 /// The unmissable session-start banner shown when the `--full-access` preset
 /// override is asserted (`NEWT_FULL_ACCESS=1`). The override itself lives in
 /// `policy_for`; this is the loud surfacing half of the contract, mirroring
@@ -2580,6 +2610,58 @@ fn full_access_banner() -> String {
      flag to restore Object-Capability authority restrictions. Private HTTP destinations \
      still require exact MCP net grants in [tui.permissions] net."
         .to_string()
+}
+
+#[cfg(test)]
+mod ambient_banner_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+
+    #[test]
+    fn the_banner_lists_exactly_what_is_off_from_the_effective_decision() {
+        use newt_core::launch_authority::LaunchAuthority;
+        let shell = AmbientShell::resolve(Some("/usr/bin/zsh".as_ref()));
+        let yolo = LaunchAuthority::from_parts_for_test(true, true, true);
+        let all = ambient_banner(yolo, &shell);
+        for needle in [
+            "YOLO (--yolo)",
+            "approvals OFF (--disable-ocap)",
+            "confinement OFF (--full-access)",
+            "environment OFF (--ambient)",
+            "login shell /usr/bin/zsh -l -i -c",
+            "FULL environment",
+        ] {
+            assert!(all.contains(needle), "missing `{needle}`: {all}");
+        }
+        // `--ambient` alone: run_command stays where it is, so no shell is claimed.
+        for authority in [
+            LaunchAuthority::AMBIENT,
+            LaunchAuthority::from_parts_for_test(true, false, true),
+        ] {
+            let alone = ambient_banner(authority, &shell);
+            assert!(
+                alone.contains("AMBIENT (--ambient): environment OFF"),
+                "{alone}"
+            );
+            assert!(
+                !alone.contains("login shell /usr/bin/zsh")
+                    && !alone.contains("run_command runs your"),
+                "must not claim a shell that does not run: {alone}"
+            );
+            assert!(
+                !alone.contains("approvals OFF") && !alone.contains("confinement OFF"),
+                "the ambient axis alone must not claim the others: {alone}"
+            );
+        }
+        // A login shell that cannot run is reported as the /bin/sh that does.
+        let missing = AmbientShell::resolve_checked(Some("/no/such/zsh".as_ref()), |_| false);
+        let fallback = ambient_banner(yolo, &missing);
+        assert!(
+            fallback.contains("$SHELL does not exist; using /bin/sh"),
+            "{fallback}"
+        );
+        assert!(!fallback.contains("/no/such/zsh"), "{fallback}");
+    }
 }
 
 /// The ONE `full-access` line written to the #263 permission log at session
