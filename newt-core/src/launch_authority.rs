@@ -55,6 +55,10 @@ pub struct LaunchAuthority {
     unsafe_host_exec: bool,
     /// Explicit directory-scoped startup choice; never inferred from the env.
     workspace_access: bool,
+    /// `--ambient` (`NEWT_AMBIENT=1`): the operator's login shell and full process
+    /// environment. Grants nothing by itself: [`LaunchAuthority::ambient`] also
+    /// needs the two bits above, which `--ambient` sets with it.
+    ambient: bool,
 }
 
 impl LaunchAuthority {
@@ -66,6 +70,7 @@ impl LaunchAuthority {
         full_access: false,
         unsafe_host_exec: false,
         workspace_access: false,
+        ambient: false,
     };
 
     /// Run commands with filesystem access confined to the selected workspace.
@@ -93,6 +98,7 @@ impl LaunchAuthority {
             full_access: Self::env_switch("NEWT_FULL_ACCESS"),
             unsafe_host_exec: Self::env_switch("NEWT_UNSAFE_HOST_EXEC"),
             workspace_access: false,
+            ambient: Self::env_switch("NEWT_AMBIENT"),
         }
     }
 
@@ -121,6 +127,24 @@ impl LaunchAuthority {
         self.workspace_access
     }
 
+    /// The ambient posture: `--ambient` asserted AND both authority bits it implies are
+    /// still on (a `meet` that cleared either also ends the posture). Under it,
+    /// `run_command` runs the operator's login shell and the child keeps the full
+    /// process environment, and so do stdio MCP servers. Everything else (confined,
+    /// `--yolo`, `--full-access`, `--yolo --full-access`, `--unsafe-host-exec`) is not it.
+    #[must_use]
+    pub const fn ambient(self) -> bool {
+        self.ambient && self.ocap_disabled && self.full_access
+    }
+
+    /// The authority `--ambient` asks for: OCAP off, full access, the ambient bit.
+    pub const AMBIENT: Self = Self {
+        ocap_disabled: true,
+        full_access: true,
+        ambient: true,
+        ..Self::CONFINED
+    };
+
     /// Attenuate: the per-bit `meet` (logical AND) of two authorities. A switch
     /// is on in the result only if it was on in BOTH — so `meet` can drop
     /// authority but never add it. This is how a later context lowers authority
@@ -132,6 +156,7 @@ impl LaunchAuthority {
             full_access: self.full_access && other.full_access,
             unsafe_host_exec: self.unsafe_host_exec && other.unsafe_host_exec,
             workspace_access: self.workspace_access && other.workspace_access,
+            ambient: self.ambient && other.ambient,
         }
     }
 }
@@ -293,6 +318,7 @@ mod tests {
             full_access: true,
             unsafe_host_exec: true,
             workspace_access: true,
+            ambient: true,
         };
         // meeting with CONFINED clears everything…
         assert_eq!(
@@ -372,6 +398,7 @@ mod tests {
             full_access: true,
             unsafe_host_exec: true,
             workspace_access: true,
+            ambient: true,
         });
         assert_eq!(
             current(),
@@ -379,5 +406,38 @@ mod tests {
             "the first (confined) freeze wins"
         );
         reset_for_test();
+    }
+
+    /// Only `--ambient` is the ambient posture: the pair `--yolo --full-access` and the
+    /// bench lane's `--unsafe-host-exec` are not, and the bit alone grants nothing.
+    #[test]
+    fn only_the_ambient_flag_is_the_ambient_posture() {
+        let _g = serial();
+        let _a = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let _b = EnvVar::set("NEWT_FULL_ACCESS", "1");
+        let _c = EnvVar::unset("NEWT_UNSAFE_HOST_EXEC");
+        let _d = EnvVar::unset("NEWT_AMBIENT");
+        assert!(
+            !LaunchAuthority::from_env().ambient(),
+            "--yolo --full-access is not --ambient"
+        );
+        let _e = EnvVar::set("NEWT_AMBIENT", "true");
+        assert!(!LaunchAuthority::from_env().ambient(), "only \"1\" enables");
+        let _f = EnvVar::set("NEWT_AMBIENT", "1");
+        assert!(LaunchAuthority::from_env().ambient());
+        assert!(LaunchAuthority::AMBIENT.ambient());
+        // The bit alone grants nothing, and attenuation ends the posture.
+        let bare = LaunchAuthority {
+            ambient: true,
+            ..LaunchAuthority::CONFINED
+        };
+        assert!(!bare.ambient());
+        assert!(!LaunchAuthority::AMBIENT.meet(LaunchAuthority::CONFINED).ambient());
+        let no_full_access = LaunchAuthority {
+            full_access: false,
+            ..LaunchAuthority::AMBIENT
+        };
+        assert!(!no_full_access.ambient());
+        assert!(!LaunchAuthority::default().ambient());
     }
 }

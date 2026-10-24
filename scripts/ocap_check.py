@@ -73,7 +73,7 @@ GATE_RE = re.compile(r"OCAP-GATE:\s*([a-z0-9-]+)")
 # deep library decides authority via `launch_authority::current()`. A stray deep
 # `env::var("NEWT_DISABLE_OCAP" | …)` re-opens the widen-mid-process hole.
 AUTHORITY_ENV_READ_RE = re.compile(
-    r'env::var(?:_os)?\s*\(\s*"(NEWT_DISABLE_OCAP|NEWT_FULL_ACCESS|NEWT_UNSAFE_HOST_EXEC)"'
+    r'env::var(?:_os)?\s*\(\s*"(NEWT_DISABLE_OCAP|NEWT_FULL_ACCESS|NEWT_UNSAFE_HOST_EXEC|NEWT_AMBIENT)"'
 )
 # The deep-library crate the ban applies to (entrypoint crates may still read the
 # twins at startup as the compatibility input, then freeze the resolved value).
@@ -184,7 +184,7 @@ def check_launch_authority_reads(res: Result):
     """`noninteractive-launch-policy`: no deep-library ambient authority read.
 
     In `newt-core/src`, `env::var("NEWT_DISABLE_OCAP" | "NEWT_FULL_ACCESS" |
-    "NEWT_UNSAFE_HOST_EXEC")` may appear ONLY in `launch_authority.rs` (the sole
+    "NEWT_UNSAFE_HOST_EXEC" | "NEWT_AMBIENT")` may appear ONLY in `launch_authority.rs` (the sole
     resolver). Any other deep read lets a later-appearing env var widen authority
     mid-process — the hole the frozen `LaunchAuthority` closes.
     """
