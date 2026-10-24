@@ -625,23 +625,32 @@ fn the_ambient_posture_runs_the_operators_login_shell() {
     let _env = crate::process_env::lock();
     let _shell = ShellVar::save();
     let _pin = crate::launch_authority::ScopedAuthority::ambient();
-    for (shell, flags) in [
-        ("/usr/bin/zsh", vec!["-l", "-i", "-c"]),
-        ("/bin/bash", vec!["-l", "-i", "-c"]),
-        ("/bin/dash", vec!["-l", "-c"]),
+    // The login shell must be a file on this host, so each one is a stand-in file.
+    let dir = tempfile::tempdir().unwrap();
+    let stand_in = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    for (name, flags) in [
+        ("zsh", vec!["-l", "-i", "-c"]),
+        ("bash", vec!["-l", "-i", "-c"]),
+        ("dash", vec!["-l", "-c"]),
     ] {
-        crate::process_env::set_var("SHELL", shell);
+        let shell = stand_in(name);
+        crate::process_env::set_var("SHELL", &shell);
         let (program, args) = host_argv(false);
         assert_eq!(program, shell);
         assert_eq!(args[..flags.len()], flags[..], "{shell}");
         assert!(args.last().unwrap().ends_with("\necho hi"), "{args:?}");
     }
     // fish is not POSIX: the command reaches it untouched.
-    crate::process_env::set_var("SHELL", "/usr/bin/fish");
+    let fish = stand_in("fish");
+    crate::process_env::set_var("SHELL", &fish);
     let (program, args) = host_argv(false);
     assert_eq!(
         (program.as_str(), args.last().unwrap().as_str()),
-        ("/usr/bin/fish", "echo hi")
+        (fish.as_str(), "echo hi")
     );
     // Not found: the existing retry runs /bin/sh -c.
     let (program, args) = host_argv(true);
