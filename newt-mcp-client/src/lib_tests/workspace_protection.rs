@@ -162,6 +162,8 @@ async fn protected_stdio_refuses_before_native_process_effects() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: McpTrust::Trusted,
         origin: None,
     };

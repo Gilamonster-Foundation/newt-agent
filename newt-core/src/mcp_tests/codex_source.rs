@@ -349,3 +349,21 @@ url = "https://mcp.example.test/after"
     assert!(parse_codex_mcp_toml("other = 1").is_empty());
     assert!(parse_codex_mcp_toml("mcp_servers = []").is_empty());
 }
+/// PR #3000 review: a malformed static client ID is refused, not adopted.
+#[test]
+fn codex_parser_drops_malformed_oauth_client_id() {
+    let text = r#"
+[mcp_servers.padded]
+url = "https://mcp.example.com/mcp"
+oauth_client_id = " padded "
+
+[mcp_servers.good]
+url = "https://mcp.example.com/mcp"
+oauth_client_id = "public-client"
+"#;
+    let names: Vec<_> = parse_codex_mcp_toml(text)
+        .into_iter()
+        .map(|server| server.name)
+        .collect();
+    assert_eq!(names, ["good"]);
+}

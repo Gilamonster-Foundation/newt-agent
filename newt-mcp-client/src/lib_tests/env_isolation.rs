@@ -21,6 +21,8 @@ async fn stdio_spawn_does_not_leak_secret_env() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -83,6 +85,8 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
         request_timeout_secs: None,
         login_argv: Vec::new(),
         oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -144,6 +148,8 @@ async fn stdio_spawn_under_net_none_does_not_l3_bound_refuse() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -187,6 +193,8 @@ async fn stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_
         login_argv: Vec::new(),
         request_timeout_secs: None,
         oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     };

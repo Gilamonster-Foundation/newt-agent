@@ -585,6 +585,18 @@ pub struct McpServerEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_client_id: Option<String>,
 
+    /// Pinned OAuth scopes (Claude's `oauth.scopes`): one RFC 6749 §3.3
+    /// space-separated string. When present, `newt auth` requests exactly
+    /// these scopes instead of the server-discovered set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_scopes: Option<String>,
+
+    /// Fixed loopback callback port for a static client (Claude's
+    /// `oauth.callbackPort`), matching a pre-registered redirect URI of the
+    /// form `http://localhost:PORT/callback`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_callback_port: Option<u16>,
+
     /// Provenance / trust marker (#1301): whether this entry came from newt-owned
     /// config (TRUSTED — full secret resolution) or a borrowed Claude/project
     /// overlay (UNTRUSTED — literals verbatim, refs rejected). Set at discovery
@@ -701,6 +713,12 @@ pub(crate) fn entry_to_toml_table(
     if let Some(client_id) = &entry.oauth_client_id {
         table["oauth_client_id"] = toml_edit::value(client_id);
     }
+    if let Some(scopes) = &entry.oauth_scopes {
+        table["oauth_scopes"] = toml_edit::value(scopes);
+    }
+    if let Some(port) = entry.oauth_callback_port {
+        table["oauth_callback_port"] = toml_edit::value(i64::from(port));
+    }
     Ok(table)
 }
 
@@ -750,8 +768,9 @@ pub fn parse_claude_mcp(value: &serde_json::Value) -> Vec<McpServerEntry> {
             let mut parsed: McpServerEntry = serde_json::from_value(entry.clone()).ok()?;
             // The name lives in the map key, not the entry body.
             parsed.name = name.clone();
-            // Fold Claude's nested `oauth.clientId` into the flat field.
-            parsed.oauth_client_id = claude_oauth_client_id(entry);
+            // Fold Claude's nested `oauth` object into the flat fields; an
+            // entry whose OAuth restrictions cannot be honoured is dropped.
+            parse_claude_oauth(entry).ok()?.apply(&mut parsed);
             // A Claude/project overlay is borrowed, attacker-reachable config —
             // mark it UNTRUSTED at the single parse funnel so its secrets never
             // interpolate / execute a `${cmd:…}` or `{ cmd = … }` (#1301).
@@ -762,19 +781,87 @@ pub fn parse_claude_mcp(value: &serde_json::Value) -> Vec<McpServerEntry> {
         .collect()
 }
 
-/// Extract Claude Code's nested `oauth.clientId` (or `oauth.client_id`) from a
-/// raw `mcpServers` entry body, folding it into the flat `oauth_client_id`
-/// field. A public client ID is not a credential, so it crosses the trust
-/// boundary; only the identifier is taken, never a client secret or token.
-fn claude_oauth_client_id(entry: &serde_json::Value) -> Option<String> {
-    entry
-        .get("oauth")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|oauth| oauth.get("clientId").or_else(|| oauth.get("client_id")))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
+/// Claude Code's nested `oauth` object, validated fail-closed. Only the
+/// fields newt can honour are accepted: `clientId` (a pre-registered public
+/// client), `scopes` (pinned requested scopes) and `callbackPort` (the fixed
+/// port of the pre-registered `http://localhost:PORT/callback`). Anything
+/// else — `authServerMetadataUrl`, a secret, an unknown key — refuses the
+/// entry rather than being silently dropped.
+#[derive(Default)]
+struct ClaudeOAuth {
+    client_id: Option<String>,
+    scopes: Option<String>,
+    callback_port: Option<u16>,
+}
+
+fn parse_claude_oauth(
+    entry: &serde_json::Value,
+) -> std::result::Result<ClaudeOAuth, McpImportIssue> {
+    let Some(raw) = entry.get("oauth") else {
+        return Ok(ClaudeOAuth::default());
+    };
+    let object = raw.as_object().ok_or(McpImportIssue::InvalidShape)?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "clientId" | "scopes" | "callbackPort"))
+    {
+        return Err(McpImportIssue::UnknownField);
+    }
+    let string = |key: &str, valid: fn(&str) -> bool| match object.get(key) {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) if valid(value) => Ok(Some(value.clone())),
+        Some(_) => Err(McpImportIssue::InvalidShape),
+    };
+    let client_id = string("clientId", valid_oauth_client_id)?;
+    let scopes = string("scopes", valid_oauth_scopes)?;
+    let callback_port = match object.get("callbackPort") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .ok_or(McpImportIssue::InvalidShape)?,
+        ),
+    };
+    if callback_port.is_some() && client_id.is_none() {
+        // Dynamic registration registers newt's own callback; a lone port
+        // would be ignored, so refuse rather than drop it.
+        return Err(McpImportIssue::UnsupportedSemantics);
+    }
+    Ok(ClaudeOAuth {
+        client_id,
+        scopes,
+        callback_port,
+    })
+}
+
+impl ClaudeOAuth {
+    fn apply(self, entry: &mut McpServerEntry) {
+        entry.oauth_client_id = self.client_id;
+        entry.oauth_scopes = self.scopes;
+        entry.oauth_callback_port = self.callback_port;
+    }
+}
+
+/// An OAuth `client_id` newt will send: non-empty visible ASCII (RFC 6749
+/// VSCHAR minus space), bounded. Padding or embedded whitespace is refused,
+/// not trimmed.
+#[must_use]
+pub fn valid_oauth_client_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// An RFC 6749 §3.3 scope string: one or more NQCHAR tokens separated by
+/// single spaces.
+#[must_use]
+pub fn valid_oauth_scopes(scopes: &str) -> bool {
+    scopes.split(' ').all(|token| {
+        !token.is_empty()
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\')
+    })
 }
 
 /// A value-independent reason an entry in a borrowed MCP configuration cannot
@@ -993,8 +1080,18 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
         };
         entry.name = name.clone();
         entry.trust = McpTrust::Untrusted;
-        // Fold Claude's nested `oauth.clientId` into the flat field.
-        entry.oauth_client_id = claude_oauth_client_id(raw);
+        // Fold Claude's nested `oauth` object into the flat fields, refusing
+        // the entry rather than dropping any restriction it carries.
+        match parse_claude_oauth(raw) {
+            Ok(oauth) => oauth.apply(&mut entry),
+            Err(issue) => {
+                report.rejected.push(McpImportRejection {
+                    name: Some(name.clone()),
+                    issue,
+                });
+                continue;
+            }
+        }
         let semantics_preserved = match entry.transport {
             TransportKind::Stdio => {
                 entry.command.is_some()
@@ -1107,6 +1204,13 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                 return None;
             }
             let parsed: CodexEntry = value.clone().try_into().ok()?;
+            if parsed
+                .oauth_client_id
+                .as_deref()
+                .is_some_and(|id| !valid_oauth_client_id(id))
+            {
+                return None;
+            }
             let CodexEntry {
                 url,
                 command,
@@ -1196,6 +1300,8 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                         login_argv: Vec::new(),
                         request_timeout_secs: tool_timeout_sec,
                         oauth_client_id,
+                        oauth_scopes: None,
+                        oauth_callback_port: None,
                         trust: McpTrust::Untrusted,
                         origin: None,
                     })
@@ -1249,6 +1355,8 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                         login_argv: Vec::new(),
                         request_timeout_secs: tool_timeout_sec,
                         oauth_client_id: None,
+                        oauth_scopes: None,
+                        oauth_callback_port: None,
                         trust: McpTrust::Untrusted,
                         origin: None,
                     })

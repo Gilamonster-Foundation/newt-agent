@@ -647,6 +647,8 @@ async fn probe_stdio(
             login_argv: Vec::new(),
             request_timeout_secs: args.timeout_secs,
             oauth_client_id: None,
+            oauth_scopes: None,
+            oauth_callback_port: None,
             // Operator-typed on the CLI — newt-owned, trusted config.
             trust: McpTrust::Trusted,
             origin: None,
@@ -715,6 +717,8 @@ async fn probe_url(
         login_argv: Vec::new(),
         request_timeout_secs: args.timeout_secs,
         oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         // Operator-typed on the CLI — newt-owned, trusted config.
         trust: McpTrust::Trusted,
         origin: None,
@@ -1088,6 +1092,8 @@ mod tests {
                 login_argv: Vec::new(),
                 request_timeout_secs: None,
                 oauth_client_id: None,
+                oauth_scopes: None,
+                oauth_callback_port: None,
                 trust: McpTrust::Trusted,
                 origin: None,
             },
