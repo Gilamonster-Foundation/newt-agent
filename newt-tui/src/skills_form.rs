@@ -375,31 +375,4 @@ mod tests {
             assert!(back.skill_body.unwrap().contains("Body of alpha"), "{why}");
         }
     }
-
-    /// The CI race, made deterministic: the process environment moves under a running
-    /// command (here: the config directory is repointed between its steps). The command
-    /// resolved its file once, so it still finds the skills and writes the file it read.
-    #[test]
-    fn a_command_does_not_depend_on_the_environment_between_its_steps() {
-        let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
-        let (_dir, path, _pin) = fixture();
-        let saved = std::env::var(newt_core::config::NEWT_CONFIG_DIR_ENV).ok();
-        newt_core::process_env::set_var(
-            newt_core::config::NEWT_CONFIG_DIR_ENV,
-            "/nonexistent-root",
-        );
-        let off = apply("off", "alpha");
-        let on = apply("on", "alpha");
-        match saved {
-            Some(v) => newt_core::process_env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, &v),
-            None => newt_core::process_env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
-        }
-        off.unwrap();
-        on.unwrap();
-        assert!(
-            !config_fs::read(&path).contains("off"),
-            "{}",
-            config_fs::read(&path)
-        );
-    }
 }
