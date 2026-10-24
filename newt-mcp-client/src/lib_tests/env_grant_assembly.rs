@@ -85,3 +85,56 @@ fn timezone_passthrough_preserves_empty_and_server_override() {
         "an explicit server UTC setting must override the parent"
     );
 }
+
+fn parent_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    [
+        ("HOME", "/h"),
+        ("PATH", "/usr/bin"),
+        ("DISPLAY", ":0"),
+        ("WAYLAND_DISPLAY", "wayland-0"),
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ("OPENAI_API_KEY", "sk-secret"),
+        ("NEWT_AGENT_KEY", "newt-secret"),
+    ]
+    .map(|(k, v)| (k.into(), v.into()))
+    .to_vec()
+}
+
+/// #978: outside `--ambient` the passthrough is the closed allow-list, unchanged: no
+/// display variable and no secret reaches a stdio server.
+#[test]
+fn the_default_passthrough_is_the_closed_allow_list() {
+    let got = parent_passthrough(false, parent_vars());
+    assert_eq!(got, pairs(&[("HOME", "/h"), ("PATH", "/usr/bin")]));
+}
+
+/// #978: under `--ambient` a stdio server gets the full environment (so a browser launch
+/// finds the display and the session bus), minus newt's own control plane.
+#[test]
+fn the_ambient_passthrough_is_the_full_env_minus_the_control_plane() {
+    let got: BTreeMap<String, String> = parent_passthrough(true, parent_vars())
+        .into_iter()
+        .collect();
+    for key in [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+        "HOME",
+        "PATH",
+    ] {
+        assert!(
+            got.contains_key(key),
+            "{key} must reach an ambient stdio server"
+        );
+    }
+    assert!(
+        got.contains_key("OPENAI_API_KEY"),
+        "the operator's own environment is the grant"
+    );
+    assert!(
+        !got.contains_key("NEWT_AGENT_KEY"),
+        "newt's secrets never are"
+    );
+}

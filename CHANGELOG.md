@@ -9,6 +9,18 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Added
+
+- `--ambient` (#978): the operator's own shell and environment for an interactive
+  session, with no confinement. `run_command` runs your login shell (`$SHELL -l -i -c`,
+  so zsh functions, aliases and rc-set `PATH` work; an unset or relative `$SHELL` falls
+  back to `/bin/sh` and the banner says so), and the child processes and stdio MCP servers
+  get your full environment (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`,
+  `XDG_RUNTIME_DIR` reach a browser launch). It implies `--yolo --full-access`; newt's own
+  secrets and switches are still withheld from children. `--yolo --full-access` alone, the
+  confined default and `--workspace-access` are unchanged. A banner states what it is.
+  Interactive `newt` / `newt code` only; unix shells only (Windows keeps its shell).
+
 ## [0.8.4] — 2026-10-22
 
 ### Added

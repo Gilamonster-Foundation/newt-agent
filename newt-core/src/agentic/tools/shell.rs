@@ -2308,10 +2308,8 @@ fn host_shell_command_at(
                 cmd,
             )
         });
-    let mut c = match &login {
-        Some((program, _)) => tokio::process::Command::new(program),
-        None => tokio::process::Command::new(program),
-    };
+    let program = login.as_ref().map_or(program, |(p, _)| p.as_os_str());
+    let mut c = tokio::process::Command::new(program);
     if let Some((_, args)) = &login {
         c.args(args);
     } else if route != ShellRoute::AmbientBrush {
@@ -2477,6 +2475,23 @@ where
 
 #[cfg(not(windows))]
 pub(super) async fn host_shell_output_with_timeout(
+    route: ShellRoute,
+    cmd: &str,
+    cwd: &str,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout: std::time::Duration,
+) -> std::io::Result<HostShellRun> {
+    let mut run = host_shell_output_raw(route, cmd, cwd, live, timeout).await?;
+    // `--ambient`: an interactive bash with no terminal announces itself on stderr
+    // every time; that is noise in the model's view, not the command's output.
+    if route == ShellRoute::BashSh && crate::launch_authority::current().ambient() {
+        run.stderr = crate::ambient_shell::strip_interactive_noise(&run.stderr);
+    }
+    Ok(run)
+}
+
+#[cfg(not(windows))]
+async fn host_shell_output_raw(
     route: ShellRoute,
     cmd: &str,
     cwd: &str,

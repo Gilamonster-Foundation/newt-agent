@@ -89,6 +89,28 @@ pub fn child_env(
     env
 }
 
+/// Drop the two lines an interactive bash prints when it has no controlling terminal
+/// (`cannot set terminal process group`, `no job control`): they come from the `-i` this
+/// posture asks for, not from the command, and would otherwise lead every result.
+/// Only those exact diagnostics, wherever they appear; every other byte is kept.
+#[must_use]
+pub fn strip_interactive_noise(stderr: &[u8]) -> Vec<u8> {
+    let noise = |line: &[u8]| {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end();
+        line == "bash: no job control in this shell"
+            || (line.starts_with("bash: cannot set terminal process group (")
+                && line.ends_with("): Inappropriate ioctl for device"))
+    };
+    let mut out = Vec::with_capacity(stderr.len());
+    for line in stderr.split_inclusive(|b| *b == b'\n') {
+        if !noise(line) {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +202,16 @@ mod tests {
             &[],
         );
         assert_eq!(env, [("GOOD".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn only_the_bash_job_control_diagnostics_are_stripped() {
+        let noisy = b"bash: cannot set terminal process group (1544202): Inappropriate ioctl for device\nbash: no job control in this shell\nreal error\nbash: no job control in this shell extra\n";
+        assert_eq!(
+            String::from_utf8(strip_interactive_noise(noisy)).unwrap(),
+            "real error\nbash: no job control in this shell extra\n"
+        );
+        assert_eq!(strip_interactive_noise(b""), b"");
+        assert_eq!(strip_interactive_noise(b"no newline"), b"no newline");
     }
 }

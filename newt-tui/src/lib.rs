@@ -2563,6 +2563,19 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
     )
 }
 
+/// The session-start banner for `--ambient` (#978): says plainly what it is. `shell`
+/// is how `$SHELL` resolved (the login shell, or why `/bin/sh` runs instead).
+fn ambient_banner(shell: &newt_core::ambient_shell::AmbientShell) -> String {
+    format!(
+        "⚠ AMBIENT (--ambient): run_command runs your {}, and the child processes and \
+         stdio MCP servers get your FULL environment (DISPLAY, DBUS_SESSION_BUS_ADDRESS, \
+         XDG_RUNTIME_DIR, tokens and all); no confinement. newt's own secrets and switches \
+         are still withheld. This is --yolo --full-access plus your shell and environment; \
+         drop the flag to restore confinement.",
+        shell.describe()
+    )
+}
+
 /// The unmissable session-start banner shown when the `--full-access` preset
 /// override is asserted (`NEWT_FULL_ACCESS=1`). The override itself lives in
 /// `policy_for`; this is the loud surfacing half of the contract, mirroring
@@ -2580,6 +2593,30 @@ fn full_access_banner() -> String {
      flag to restore Object-Capability authority restrictions. Private HTTP destinations \
      still require exact MCP net grants in [tui.permissions] net."
         .to_string()
+}
+
+#[cfg(test)]
+mod ambient_banner_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+
+    #[test]
+    fn the_banner_says_login_shell_full_environment_and_no_confinement() {
+        let login = ambient_banner(&AmbientShell::resolve(Some("/usr/bin/zsh".as_ref())));
+        for needle in [
+            "AMBIENT",
+            "login shell /usr/bin/zsh -l -i -c",
+            "FULL environment",
+            "no confinement",
+        ] {
+            assert!(login.contains(needle), "missing `{needle}`: {login}");
+        }
+        let fallback = ambient_banner(&AmbientShell::resolve(None));
+        assert!(
+            fallback.contains("$SHELL is not set; using /bin/sh"),
+            "{fallback}"
+        );
+    }
 }
 
 /// The ONE `full-access` line written to the #263 permission log at session

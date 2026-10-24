@@ -150,6 +150,8 @@
 #                                         provider (#2933), 60 s deadline each
 #       newt-agent::prompt_component_refresh  real CLI + real PTY against a
 #                                         recording provider (#2933), 60 s budget
+#       newt-agent::ambient_session       real chat loop x2 + a recording provider
+#                                         running one run_command (#978), 60 s budget
 #   - two more real-resource lanes, same tier as the six above (#2663 named
 #     the six original real-`newt`-session binaries but missed these -- measured in
 #     the push rejections of 2026-10-01/02):
@@ -489,6 +491,7 @@ NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-agent::prompt_config_refusal)
     and not binary_id(newt-agent::prompt_component_fence)
     and not binary_id(newt-agent::prompt_component_refresh)
+    and not binary_id(newt-agent::ambient_session)
     and not binary_id(newt-eval::mock_e2e)
     and not (binary_id(newt-tui) and test(=prompt_visibility_test::mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal))
     and not (binary_id(newt-tui) and test(=prompt_visibility_test::a_permission_prompt_is_visible_and_survives_a_live_spinner))

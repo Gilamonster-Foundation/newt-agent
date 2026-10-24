@@ -2467,6 +2467,13 @@ fn session_body(
         }
     }
 
+    // --ambient (#978): say plainly what this session is, after the two banners it implies.
+    if newt_core::launch_authority::current().ambient() {
+        let shell =
+            newt_core::ambient_shell::AmbientShell::resolve(std::env::var_os("SHELL").as_deref());
+        print_newt(&ambient_banner(&shell), color, verbose);
+    }
+
     // Connect to discovered MCP servers ONCE for the session (newt config +
     // Claude Code config). Failures are logged + skipped; their tools are added
     // to the agent's tool set, namespaced `server__tool`. `newt doctor` shows

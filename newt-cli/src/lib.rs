@@ -285,6 +285,21 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub full_access: bool,
 
+    /// The operator's own shell and environment for this interactive session, with NO
+    /// confinement: `run_command` runs your login shell (`$SHELL -l -i`, so zsh
+    /// functions, aliases and rc-set PATH work) and the child, and stdio MCP servers,
+    /// get your full environment (DISPLAY, WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS,
+    /// XDG_RUNTIME_DIR reach a browser launch). Implies `--yolo --full-access`; newt's
+    /// own secrets and switches are still withheld from children. Equivalent to
+    /// NEWT_AMBIENT=1 plus both; no config key, so it is asserted per invocation.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        conflicts_with = "workspace_access"
+    )]
+    pub ambient: bool,
+
     /// Full access inside the workspace for this interactive session: run
     /// commands and create, change, rename, or delete files below `code <DIR>`.
     /// Native filesystem confinement remains active; network access follows
@@ -1162,14 +1177,24 @@ fn validate_launch_options(cli: &Cli) -> anyhow::Result<()> {
         "--workspace-access is available for the interactive TUI: newt --workspace-access code <directory>"
     );
     anyhow::ensure!(
+        !cli.ambient || matches!(cli.command.as_ref(), None | Some(Command::Code { .. })),
+        "--ambient is available for the interactive TUI: newt --ambient code"
+    );
+    anyhow::ensure!(
         !cli.adopt_frame || matches!(cli.command.as_ref(), None | Some(Command::Code { .. })),
         "--adopt-frame is available only for the interactive TUI with --resume"
     );
     Ok(())
 }
 
-pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
     validate_launch_options(&cli)?;
+    // `--ambient` is `--yolo --full-access` plus the login shell and full environment:
+    // the same two switches, not a parallel posture (#978).
+    if cli.ambient {
+        cli.disable_ocap = true;
+        cli.full_access = true;
+    }
     if cli.windows_cmd {
         // Same startup-only publication seam as the other shell switches.
         unsafe { std::env::set_var("NEWT_WINDOWS_CMD", "1") };
@@ -1591,6 +1616,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // per-run override never persists to config.
             if cli.full_access {
                 unsafe { std::env::set_var("NEWT_FULL_ACCESS", "1") };
+            }
+            if cli.ambient {
+                unsafe { std::env::set_var("NEWT_AMBIENT", "1") };
             }
             // Freeze the launch authority now that the flags have set their env
             // twins. Deep libraries read this frozen value (never the live env),
@@ -2847,6 +2875,32 @@ mod tests {
         for incompatible in ["--full-access", "--yolo", "--disable-ocap"] {
             assert!(Cli::try_parse_from(["newt", "--workspace-access", incompatible]).is_err());
         }
+    }
+
+    /// #978: `--ambient` parses bare and under `code`, is OFF by default, excludes the
+    /// directory-scoped choice, and is refused outside the interactive TUI.
+    #[test]
+    fn ambient_is_one_explicit_flag_for_the_interactive_session() {
+        assert!(!Cli::try_parse_from(["newt"]).unwrap().ambient);
+        let cli = Cli::try_parse_from(["newt", "--ambient"]).unwrap();
+        assert!(cli.ambient);
+        assert!(validate_launch_options(&cli).is_ok());
+        let cli = Cli::try_parse_from(["newt", "--ambient", "code", "project"]).unwrap();
+        assert!(validate_launch_options(&cli).is_ok());
+        assert!(Cli::try_parse_from(["newt", "--ambient", "--workspace-access"]).is_err());
+        let cli = Cli::try_parse_from([
+            "newt",
+            "--ambient",
+            "headless",
+            "--instruction-file",
+            "i.md",
+        ])
+        .unwrap();
+        let err = validate_launch_options(&cli).unwrap_err().to_string();
+        assert!(
+            err.contains("--ambient") && err.contains("interactive"),
+            "{err}"
+        );
     }
 
     #[test]
