@@ -2575,12 +2575,8 @@ fn ambient_banner(
     let children = "child processes and stdio MCP servers get your FULL environment \
          (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); newt's own \
          secrets and switches are still withheld";
-    let runs = match shell {
-        newt_core::ambient_shell::AmbientShell::Login { .. } => {
-            format!("your {}", shell.describe())
-        }
-        newt_core::ambient_shell::AmbientShell::Fallback { .. } => shell.describe(),
-    };
+    // From the route dispatch selects, so each platform names what really runs.
+    let runs = newt_core::agentic::ambient_interpreter_description(shell);
     if authority.ocap_disabled() && authority.full_access() {
         format!(
             "⚠ YOLO (--yolo): approvals OFF (--disable-ocap), confinement OFF (--full-access), \
@@ -2625,6 +2621,21 @@ mod ambient_banner_tests {
     #[test]
     fn the_banner_lists_exactly_what_is_off_from_the_effective_decision() {
         use newt_core::launch_authority::LaunchAuthority;
+        // The interpreter is named from the route dispatch selects, which needs the host
+        // bypass on: the session this banner describes.
+        let _env = newt_core::process_env::lock();
+        let saved = std::env::var("NEWT_DISABLE_OCAP").ok();
+        newt_core::process_env::set_var("NEWT_DISABLE_OCAP", "1");
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => newt_core::process_env::set_var("NEWT_DISABLE_OCAP", v),
+                    None => newt_core::process_env::remove_var("NEWT_DISABLE_OCAP"),
+                }
+            }
+        }
+        let _restore = Restore(saved);
         let shell = AmbientShell::resolve(Some("/usr/bin/zsh".as_ref()));
         let yolo = LaunchAuthority::from_parts_for_test(true, true, true);
         let all = ambient_banner(yolo, &shell);
@@ -2675,6 +2686,33 @@ mod ambient_banner_tests {
             "{fish}"
         );
         assert!(!fish.contains("login shell /usr/bin/fish"), "{fish}");
+    }
+}
+
+/// On Windows the banner names the Brush/cmd shell that runs, not a unix `/bin/sh`.
+#[cfg(all(test, windows))]
+mod ambient_banner_windows_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+    use newt_core::launch_authority::LaunchAuthority;
+
+    #[test]
+    fn the_banner_names_the_shell_that_runs_on_windows() {
+        let _env = newt_core::process_env::lock();
+        let saved = std::env::var("NEWT_DISABLE_OCAP").ok();
+        newt_core::process_env::set_var("NEWT_DISABLE_OCAP", "1");
+        let banner = ambient_banner(
+            LaunchAuthority::from_parts_for_test(true, true, true),
+            &AmbientShell::resolve(None),
+        );
+        match saved {
+            Some(v) => newt_core::process_env::set_var("NEWT_DISABLE_OCAP", &v),
+            None => newt_core::process_env::remove_var("NEWT_DISABLE_OCAP"),
+        }
+        assert!(
+            banner.contains("unix-only") && !banner.contains("/bin/sh"),
+            "{banner}"
+        );
     }
 }
 

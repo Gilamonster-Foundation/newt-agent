@@ -724,6 +724,13 @@ impl ShellRoute {
 /// Capture the session-default route. Brokers, leases and exec floors are
 /// command-specific: execution re-evaluates them before dispatch.
 pub fn run_command_dialect_sentence() -> &'static str {
+    session_default_route().sentence()
+}
+
+/// The route `run_command` takes by default in this session (no broker, no lease, no exec
+/// floor): the one decision the dialect guidance and the `--ambient` banner both read, the
+/// same `select_shell_route` dispatch calls per command.
+fn session_default_route() -> ShellRoute {
     select_shell_route(
         ocap_disabled(),
         false,
@@ -734,7 +741,37 @@ pub fn run_command_dialect_sentence() -> &'static str {
         crate::ambient_brush::installed(),
         shell_engine(),
     )
-    .sentence()
+}
+
+/// What `run_command` actually runs under the ambient posture on this platform, for the
+/// session banner. Derived from the same route dispatch selects, so Windows names the
+/// Brush/cmd shell that runs rather than a unix `/bin/sh`.
+pub fn ambient_interpreter_description(shell: &crate::ambient_shell::AmbientShell) -> String {
+    interpreter_for(session_default_route(), shell)
+}
+
+pub(super) fn interpreter_for(
+    route: ShellRoute,
+    shell: &crate::ambient_shell::AmbientShell,
+) -> String {
+    use crate::ambient_shell::AmbientShell;
+    match route {
+        ShellRoute::BashSh => match shell {
+            AmbientShell::Login { .. } => format!("your {}", shell.describe()),
+            AmbientShell::Fallback { .. } => shell.describe(),
+        },
+        ShellRoute::AmbientBrush => {
+            "the carried Brush shell (the login shell is unix-only; it keeps your full environment)"
+                .to_string()
+        }
+        ShellRoute::Cmd => {
+            "cmd.exe /C (the login shell is unix-only; it keeps your full environment)".to_string()
+        }
+        ShellRoute::Bridled(_) => {
+            "the confined shell (the host shell, and so your login shell, applies only where the exec floor permits)"
+                .to_string()
+        }
+    }
 }
 
 /// Pure session-default guidance with injected platform/authority and an installed runner.

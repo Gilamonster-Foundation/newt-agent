@@ -267,7 +267,6 @@ impl ScopedAuthority {
 #[cfg(test)]
 impl ScopedAuthority {
     /// Pin `--yolo` (all three axes) for this thread.
-    #[cfg(not(windows))]
     pub(crate) fn ambient_with_host_bypass() -> Self {
         let prior = PROCESS_FROZEN.with(std::cell::Cell::get);
         PROCESS_FROZEN

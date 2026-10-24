@@ -753,3 +753,58 @@ async fn an_unstartable_login_shell_is_reported_and_falls_back_to_bin_sh() {
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+/// #978 review: the banner names the interpreter of the route dispatch selects, per route
+/// (pure, so every platform runs it).
+#[test]
+fn the_ambient_interpreter_is_named_from_the_route() {
+    use super::shell::{interpreter_for, ShellRoute};
+    use crate::ambient_shell::AmbientShell;
+    let fallback = AmbientShell::Fallback {
+        reason: "$SHELL is not set".into(),
+    };
+    let login = AmbientShell::Login {
+        program: std::path::PathBuf::from("/usr/bin/zsh"),
+        args: &["-l", "-i", "-c"],
+    };
+    let sh = interpreter_for(ShellRoute::BashSh, &fallback);
+    assert!(
+        sh.contains("/bin/sh -c") && sh.contains("$SHELL is not set"),
+        "{sh}"
+    );
+    assert!(
+        interpreter_for(ShellRoute::BashSh, &login).starts_with("your login shell /usr/bin/zsh")
+    );
+    for route in [ShellRoute::AmbientBrush, ShellRoute::Cmd] {
+        let text = interpreter_for(route, &login);
+        assert!(
+            text.contains("unix-only") && !text.contains("/bin/sh") && !text.contains("zsh"),
+            "{text}"
+        );
+    }
+    assert!(interpreter_for(ShellRoute::Cmd, &login).contains("cmd.exe /C"));
+    assert!(interpreter_for(ShellRoute::AmbientBrush, &login).contains("Brush"));
+    let confined = interpreter_for(ShellRoute::Bridled(crate::ShellEngine::SafeSubset), &login);
+    assert!(confined.contains("confined shell"), "{confined}");
+}
+
+/// The session's own route, per platform: unix names the login-shell / `/bin/sh` route,
+/// Windows names the Brush or cmd shell that actually runs.
+#[test]
+fn the_banner_interpreter_matches_this_platforms_route() {
+    let _pin = crate::launch_authority::ScopedAuthority::ambient_with_host_bypass();
+    let fallback = crate::ambient_shell::AmbientShell::Fallback {
+        reason: "$SHELL is not set".into(),
+    };
+    let text = crate::agentic::ambient_interpreter_description(&fallback);
+    #[cfg(unix)]
+    assert!(
+        text.contains("/bin/sh -c") && !text.contains("unix-only"),
+        "{text}"
+    );
+    #[cfg(windows)]
+    assert!(
+        text.contains("unix-only") && !text.contains("/bin/sh"),
+        "Windows must name Brush/cmd, not a unix shell: {text}"
+    );
+}
