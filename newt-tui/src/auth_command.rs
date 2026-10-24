@@ -126,7 +126,7 @@ pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
                     "Server `{name}` already has a configured Authorization credential; OAuth is not applicable unless that explicit header is removed"
                 );
             }
-            let url_oauth_client_id = url.oauth_client_id.clone();
+            let configured_oauth = mcp_token::ConfiguredOAuth::from_entry(url);
             let url = url.url.clone().ok_or_else(|| {
                 anyhow::anyhow!(
                     "Server `{name}` not found in discovered HTTP MCP servers.\n\
@@ -138,7 +138,7 @@ pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
                 tokio::runtime::Handle::current().block_on(mcp_token::run_oauth_flow(
                     name,
                     &url,
-                    url_oauth_client_id.as_deref(),
+                    &configured_oauth,
                     &oauth_policy,
                 ))
             })

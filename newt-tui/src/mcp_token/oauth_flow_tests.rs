@@ -14,7 +14,7 @@ async fn management_cancelled_oauth_stops_before_configuration_or_network() {
     let error = run_oauth_flow_cancellable(
         "unregistered-test",
         "invalid-url",
-        None,
+        &ConfiguredOAuth::default(),
         &policy,
         Some(cancel),
     )
@@ -47,28 +47,6 @@ fn management_cancelled_callback_releases_its_listener() {
         "MCP login cancelled"
     );
     assert!(std::net::TcpListener::bind(address).is_ok());
-}
-
-#[test]
-fn static_public_client_builds_issuer_bound_public_pkce_client() {
-    let client = static_public_client("eci-prd-pub-abc123", "https://issuer.example").unwrap();
-    assert_eq!(client.client_id, "eci-prd-pub-abc123");
-    assert_eq!(client.issuer.as_deref(), Some("https://issuer.example"));
-    assert_eq!(client.redirect_uris.len(), 1);
-    assert!(client.redirect_uris[0].starts_with("http://127.0.0.1:0/callback/newt-"));
-    assert_eq!(
-        client
-            .extra
-            .get("token_endpoint_auth_method")
-            .and_then(serde_json::Value::as_str),
-        Some("none")
-    );
-    assert!(client_auth_is_usable(&client));
-}
-
-#[test]
-fn static_public_client_rejects_empty_id() {
-    assert!(static_public_client("  ", "https://issuer.example").is_err());
 }
 
 #[test]
@@ -1799,4 +1777,188 @@ async fn dcr_rejects_a_response_that_omits_redirect_uris() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("omitted redirect_uris"), "{error}");
+}
+
+/// A protected resource whose authorization server has NO dynamic client
+/// registration endpoint and advertises `files:read files:write`.
+async fn static_client_fixture(iss_supported: bool) -> (MockServer, MockServer, String) {
+    let resource_server = MockServer::start().await;
+    let authorization_server = MockServer::start().await;
+    let resource = format!("{}/mcp", resource_server.uri());
+    let issuer = authorization_server.uri();
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&resource_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-protected-resource/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resource": resource,
+            "authorization_servers": [issuer],
+            "scopes_supported": ["files:read", "files:write"]
+        })))
+        .mount(&resource_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{}/authorize", authorization_server.uri()),
+            "token_endpoint": format!("{}/token", authorization_server.uri()),
+            "code_challenge_methods_supported": ["S256"],
+            "authorization_response_iss_parameter_supported": iss_supported
+        })))
+        .mount(&authorization_server)
+        .await;
+    (resource_server, authorization_server, resource)
+}
+
+fn static_config(scopes: Option<&str>, callback_port: Option<u16>) -> ConfiguredOAuth {
+    ConfiguredOAuth {
+        client_id: Some("public-client-abc123".into()),
+        scopes: scopes.map(str::to_string),
+        callback_port,
+    }
+}
+
+fn query_pairs(url: &str) -> BTreeMap<String, String> {
+    reqwest::Url::parse(url)
+        .unwrap()
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
+}
+
+/// PR #3000 review (P1): with fresh state, discovery rejected an issuer
+/// without a DCR endpoint before the static-client branch could run, so a
+/// configured static client ID never reached the authorization URL.
+#[tokio::test]
+async fn fresh_static_client_without_dcr_reaches_authorization_url() {
+    let (_resource_server, _authorization_server, resource) = static_client_fixture(true).await;
+    let (discovered, client, scope) = select_oauth_client(
+        &resource,
+        true,
+        None,
+        None,
+        None,
+        &static_config(None, None),
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap();
+    assert!(discovered.registration_endpoint.is_none());
+    assert!(discovered.authorization_endpoint.ends_with("/authorize"));
+    let callback = callback_target(&client).unwrap();
+    // The loopback fixture is plain HTTP; the URL builder (rightly) demands
+    // HTTPS, so build against an HTTPS endpoint of the same shape.
+    let url = build_authorization_url(
+        "https://auth.example.com/authorize",
+        &client.client_id,
+        &callback.redirect_uri,
+        "challenge",
+        &discovered.resource,
+        "state",
+        scope.as_deref(),
+    )
+    .unwrap();
+    let query = query_pairs(&url);
+    assert_eq!(query["client_id"], "public-client-abc123");
+    assert_eq!(query["code_challenge_method"], "S256");
+}
+
+/// PR #3000 review (P1): pinned `oauth.scopes` restrict the request; the
+/// discovered `files:write` must not be requested.
+#[tokio::test]
+async fn pinned_scopes_replace_discovered_scopes() {
+    let (_resource_server, _authorization_server, resource) = static_client_fixture(true).await;
+    let (_, _, scope) = select_oauth_client(
+        &resource,
+        true,
+        None,
+        None,
+        None,
+        &static_config(Some("files:read"), None),
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(scope.as_deref(), Some("files:read"));
+}
+
+/// PR #3000 review (P2): a static client uses its registered callback
+/// (`http://localhost:PORT/callback`, Claude's documented form), not an
+/// invented `/callback/newt-<hash>` path.
+#[tokio::test]
+async fn static_client_uses_registered_localhost_callback() {
+    let (_resource_server, _authorization_server, resource) = static_client_fixture(true).await;
+    let (_, client, _) = select_oauth_client(
+        &resource,
+        true,
+        None,
+        None,
+        None,
+        &static_config(None, Some(8080)),
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap();
+    let callback = callback_target(&client).unwrap();
+    assert_eq!(callback.redirect_uri, "http://localhost:8080/callback");
+    assert_eq!(callback.path, "/callback");
+    assert_eq!(
+        callback.bind_addr,
+        std::net::SocketAddr::from(([127, 0, 0, 1], 8080))
+    );
+}
+
+/// The shared `/callback` path is not issuer-distinct, so the RFC 9207 `iss`
+/// response parameter is the remaining mix-up defense: refuse without it.
+#[tokio::test]
+async fn static_client_requires_issuer_response_parameter() {
+    let (_resource_server, _authorization_server, resource) = static_client_fixture(false).await;
+    let error = select_oauth_client(
+        &resource,
+        true,
+        None,
+        None,
+        None,
+        &static_config(None, None),
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("RFC 9207"), "{error:#}");
+}
+
+/// Configuration the flow cannot honour is refused before any network I/O.
+#[tokio::test]
+async fn unusable_oauth_configuration_is_refused() {
+    for configured in [
+        ConfiguredOAuth {
+            callback_port: Some(8080),
+            ..ConfiguredOAuth::default()
+        },
+        ConfiguredOAuth {
+            client_id: Some("has space".into()),
+            ..ConfiguredOAuth::default()
+        },
+        static_config(Some("a  b"), None),
+    ] {
+        let error = select_oauth_client(
+            "https://mcp.example.com/mcp",
+            false,
+            None,
+            None,
+            None,
+            &configured,
+            &test_oauth_policy(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").starts_with("configured OAuth"),
+            "{error:#}"
+        );
+    }
 }
