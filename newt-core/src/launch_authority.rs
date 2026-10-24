@@ -254,6 +254,7 @@ impl ScopedAuthority {
 #[cfg(test)]
 impl ScopedAuthority {
     /// Pin the `--ambient` posture for this thread.
+    #[cfg(not(windows))]
     pub(crate) fn ambient() -> Self {
         let prior = PROCESS_FROZEN.with(std::cell::Cell::get);
         PROCESS_FROZEN.with(|c| c.set(Some(LaunchAuthority::AMBIENT)));

@@ -551,6 +551,25 @@ fn adoption_2759_notice_uses_only_blocked_write_denials() {
     assert!(shell::worktree_denial_notice(Some(&policy), &output, cwd).is_none());
 }
 
+/// Restores the process's `$SHELL` when a test that rewrites it ends, so no other test sees it.
+#[cfg(not(windows))]
+struct ShellVar(Option<String>);
+#[cfg(not(windows))]
+impl ShellVar {
+    fn save() -> Self {
+        Self(std::env::var("SHELL").ok())
+    }
+}
+#[cfg(not(windows))]
+impl Drop for ShellVar {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => crate::process_env::set_var("SHELL", v),
+            None => crate::process_env::remove_var("SHELL"),
+        }
+    }
+}
+
 /// The argv of the host-shell child as `(program, args)`.
 #[cfg(not(windows))]
 fn host_argv(fallback: bool) -> (String, Vec<String>) {
@@ -577,6 +596,7 @@ fn host_argv(fallback: bool) -> (String, Vec<String>) {
 #[test]
 fn non_ambient_postures_keep_bash_dash_c() {
     let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
     crate::process_env::set_var("SHELL", "/usr/bin/zsh");
     for pin in [
         crate::launch_authority::ScopedAuthority::new(false, false),
@@ -594,7 +614,6 @@ fn non_ambient_postures_keep_bash_dash_c() {
         assert_eq!((program.as_str(), args[0].as_str()), ("sh", "-c"));
         drop(pin);
     }
-    crate::process_env::remove_var("SHELL");
 }
 
 /// #978: under `--ambient`, `run_command` runs the operator's login shell, login and
@@ -603,6 +622,7 @@ fn non_ambient_postures_keep_bash_dash_c() {
 #[test]
 fn the_ambient_posture_runs_the_operators_login_shell() {
     let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
     let _pin = crate::launch_authority::ScopedAuthority::ambient();
     for (shell, flags) in [
         ("/usr/bin/zsh", vec!["-l", "-i", "-c"]),
@@ -625,7 +645,6 @@ fn the_ambient_posture_runs_the_operators_login_shell() {
     // Not found: the existing retry runs /bin/sh -c.
     let (program, args) = host_argv(true);
     assert_eq!((program.as_str(), args[0].as_str()), ("/bin/sh", "-c"));
-    crate::process_env::remove_var("SHELL");
 }
 
 /// #978 fail-closed: an unset or relative `$SHELL` under `--ambient` runs `/bin/sh -c`,
@@ -634,6 +653,7 @@ fn the_ambient_posture_runs_the_operators_login_shell() {
 #[test]
 fn the_ambient_posture_with_no_trustworthy_shell_runs_bin_sh() {
     let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
     let _pin = crate::launch_authority::ScopedAuthority::ambient();
     for shell in [None, Some(""), Some("zsh"), Some("./sh")] {
         match shell {
