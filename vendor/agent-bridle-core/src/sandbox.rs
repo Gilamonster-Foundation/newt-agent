@@ -2723,6 +2723,350 @@ pub(crate) mod landlock_impl {
     }
 
     #[cfg(test)]
+    mod git_exec_path_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn unique_dir(tag: &str) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let mut d = std::env::temp_dir();
+            d.push(format!(
+                "ab-2630-{}-{}-{}",
+                tag,
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn write_executable_marker_script(path: &std::path::Path, marker: &std::path::Path) {
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch \"{}\"\necho /nonexistent/hostile-exec-path\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// The real system `git` (if present) resolves into its own
+        /// `--exec-path`-equivalent directory purely from the fixed
+        /// trusted-dir/candidate-suffix convention, with every admitted path
+        /// actually living inside that one resolved directory.
+        #[test]
+        fn a_real_trusted_git_grant_admits_its_own_exec_path_helpers() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            assert!(
+                resolved.iter().any(|p| p == git),
+                "the git binary itself must still be admitted: {resolved:?}"
+            );
+            assert!(
+                resolved.len() > 1,
+                "git's own exec-path helpers must be folded in, not just the binary: {resolved:?}"
+            );
+        }
+
+        /// A `git`-named binary OUTSIDE [`GIT_TRUSTED_DIRS`] — a repo-local
+        /// `./tools/git`-style plant — gets NO extra helpers, and (the load-
+        /// bearing assertion) is never executed while resolution decides
+        /// that: a marker-writing stand-in script proves it was never run.
+        #[test]
+        fn a_git_outside_trusted_dirs_gets_no_helpers_and_is_never_executed() {
+            let dir = unique_dir("outside-trusted");
+            let marker = dir.join("was-executed");
+            let fake_git = dir.join("git");
+            write_executable_marker_script(&fake_git, &marker);
+
+            let resolved =
+                resolve_exec_paths(&Scope::only([fake_git.to_string_lossy().into_owned()]));
+
+            assert!(
+                !marker.exists(),
+                "a git outside the trusted dirs must NEVER be executed during resolution"
+            );
+            let canon_fake_git = fake_git.canonicalize().unwrap();
+            assert_eq!(
+                resolved,
+                vec![canon_fake_git.to_string_lossy().into_owned()],
+                "an untrusted git must admit only itself, no helpers: {resolved:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // An ambient, attacker-controlled `GIT_EXEC_PATH` is irrelevant by
+        // construction: neither `resolve_exec_paths` nor
+        // `git_exec_path_binaries` calls `std::env::var`/`var_os` anywhere —
+        // there is nothing in either function body that reads it. Round 2
+        // kept a behavioral test here that mutated process-global
+        // `GIT_EXEC_PATH`, which raced every other test in this binary with
+        // no synchronization (bridle PR #407 review, finding 4); dropped
+        // per the round-3 brief rather than moved to a child process, since
+        // the static fact above is already the whole proof. `PATH` itself
+        // is still read, for bare-name entries in the caller's own grant
+        // set — pre-existing, unrelated to `GIT_EXEC_PATH`, and exercised by
+        // `a_non_git_binary_elsewhere_is_not_admitted` below.
+
+        /// A binary sitting in a sibling directory to git's real exec-path
+        /// directory — never one of the fixed candidate suffixes — is not
+        /// admitted just because a `git` grant is present.
+        #[test]
+        fn a_non_git_binary_elsewhere_is_not_admitted() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            assert!(
+                !resolved
+                    .iter()
+                    .any(|p| p.contains("/elsewhere/") || p.contains("not-git-at-all")),
+                "only the fixed exec-path candidate directories may be admitted: {resolved:?}"
+            );
+        }
+
+        /// A directory that LOOKS like a git exec-path (matches a candidate
+        /// suffix under a trusted git's prefix) but is writable by non-root
+        /// must not be trusted — an attacker who can write there could plant
+        /// a helper the kernel would then be told to allow.
+        #[test]
+        fn a_group_writable_candidate_directory_is_not_trusted() {
+            let dir = unique_dir("writable-exec-dir");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                !ancestry_is_root_owned_and_unwritable(&dir),
+                "a world-writable directory must never be trusted, regardless of owner"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #2630 round 3 (P1-1): even the real trusted system git admits
+        /// ONLY `<exec-path>/git` — never a sibling helper such as
+        /// `git-shell`, `git-daemon`, a `git-remote-*`, or a packaging
+        /// script — despite all of them sitting in the same root-owned
+        /// exec-path directory. A root-owned directory authorizes the ONE
+        /// file the operator granted (git re-executing itself), not every
+        /// file that happens to live beside it.
+        #[test]
+        fn a_trusted_git_grant_admits_only_its_own_exec_path_alias_not_sibling_helpers() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            assert!(
+                resolved.iter().all(|p| std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    == Some("git")),
+                "every admitted path must be a `git`-named alias of the granted binary, \
+                 never an independent helper: {resolved:?}"
+            );
+            assert!(
+                resolved.len() <= 2,
+                "at most the granted binary plus its one same-image exec-path alias: {resolved:?}"
+            );
+        }
+
+        /// P1-2: a `git`-named file sitting in an OTHERWISE trusted exec-path
+        /// directory, but reached only via a symlink whose target escapes
+        /// that directory, must not be admitted — canonicalization alone
+        /// (which resolves the symlink) is not the same as authenticating
+        /// the ancestry of what it resolves to.
+        #[test]
+        fn an_exec_path_git_reached_via_an_escaping_symlink_is_not_trusted() {
+            let dir = unique_dir("escaping-symlink");
+            let outside = dir.join("outside.txt");
+            std::fs::write(&outside, b"not really git\n").unwrap();
+            let link = dir.join("git");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            // The escape is in what the ancestry check must catch even once
+            // canonicalized: `outside` itself is not root-owned (it lives in
+            // a plain tmp dir owned by the test's own uid), so the resolved
+            // target fails the ancestry check regardless of the symlink.
+            let canon = link.canonicalize().unwrap();
+            assert!(
+                !ancestry_is_root_owned_and_unwritable(&canon),
+                "a symlink resolving outside a root-owned, unwritable ancestry must not be trusted: {canon:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// P1-2: `ancestry_is_root_owned_and_unwritable` walks the FULL
+        /// ancestor chain, not just the immediate parent — a file can sit in
+        /// a root-owned, unwritable leaf directory while a GRANDPARENT is
+        /// attacker-writable, which round 2's single-directory check missed.
+        #[test]
+        fn a_writable_grandparent_defeats_trust_even_with_a_locked_down_leaf() {
+            let base = unique_dir("writable-grandparent");
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let leaf = base.join("locked-leaf");
+            std::fs::create_dir(&leaf).unwrap();
+            // The leaf itself may be arbitrarily locked down; it is still
+            // reachable through a writable ancestor, so the whole chain must
+            // fail closed. (uid checks are skipped when not running as an
+            // owner able to chown; the writable-ancestor bit alone already
+            // fails this on any uid.)
+            let file = leaf.join("git");
+            std::fs::write(&file, b"stand-in\n").unwrap();
+            assert!(
+                !ancestry_is_root_owned_and_unwritable(&file),
+                "a writable grandparent must defeat trust even when the leaf directory is locked down"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// [`same_image`] must reject two DIFFERENT `git`-named files even
+        /// when both would independently pass the ancestry check — content
+        /// equality is what proves "the same git re-executing itself", not
+        /// merely "also named git, also root-owned".
+        #[test]
+        fn same_image_rejects_distinct_content() {
+            let dir = unique_dir("distinct-content");
+            let a = dir.join("git-a");
+            let b = dir.join("git-b");
+            std::fs::write(&a, b"binary one\n").unwrap();
+            std::fs::write(&b, b"binary two, totally different\n").unwrap();
+            assert!(
+                !same_image(&a, &b),
+                "distinct content must never be treated as the same image"
+            );
+            std::fs::write(&b, b"binary one\n").unwrap();
+            assert!(
+                same_image(&a, &b),
+                "identical content (different inode) must be recognized as the same image"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// #2630 round 4 (bridle PR #407 review, round 3 finding 1): drives
+    /// [`ancestry_passes`] — the SAME traversal `ancestry_is_root_owned_and_
+    /// unwritable` runs in production — through a synthetic ownership map
+    /// instead of the real filesystem. Round 3's adversarial ancestry tests
+    /// built their fixtures from plain, user-owned tmp files/dirs, so the
+    /// leaf itself already failed the uid check before the walk ever
+    /// reached a parent; deleting the recursive call entirely left those
+    /// tests green. These tests hold every level but ONE constant between
+    /// the positive and negative cases, so only the traversal itself can
+    /// account for the difference.
+    #[cfg(test)]
+    mod ancestry_walk_tests {
+        use super::*;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn root_owned_unwritable() -> OwnerMode {
+            OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            }
+        }
+
+        /// `/`, `/a`, `/a/b`, `/a/b/git` — every level root-owned and
+        /// unwritable. The baseline every negative test below perturbs at
+        /// exactly one level.
+        fn all_protected_chain() -> HashMap<PathBuf, OwnerMode> {
+            [
+                PathBuf::from("/"),
+                PathBuf::from("/a"),
+                PathBuf::from("/a/b"),
+                PathBuf::from("/a/b/git"),
+            ]
+            .into_iter()
+            .map(|p| (p, root_owned_unwritable()))
+            .collect()
+        }
+
+        fn lookup_in(
+            map: &HashMap<PathBuf, OwnerMode>,
+        ) -> impl Fn(&std::path::Path) -> Option<OwnerMode> + '_ {
+            move |p: &std::path::Path| map.get(p).copied()
+        }
+
+        const LEAF: &str = "/a/b/git";
+
+        /// Positive control: an entirely root-owned, unwritable synthetic
+        /// chain from the leaf to `/` passes.
+        #[test]
+        fn an_all_protected_synthetic_chain_passes() {
+            let map = all_protected_chain();
+            assert!(ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// The leaf and its immediate parent (`/a/b`) are UNCHANGED from the
+        /// positive case; only the GRANDPARENT's owner differs. This can
+        /// only fail if the walk actually recurses past the immediate
+        /// parent — deleting the recursive call (round 3's gap) would leave
+        /// this green.
+        #[test]
+        fn a_grandparent_owned_by_a_non_root_uid_fails_the_walk() {
+            let mut map = all_protected_chain();
+            map.insert(
+                PathBuf::from("/a"),
+                OwnerMode {
+                    uid: 1000,
+                    ..root_owned_unwritable()
+                },
+            );
+            assert!(!ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// Same shape, but the grandparent differs ONLY in its write mode
+        /// (still uid 0) — isolates the mode half of the check from the uid
+        /// half, and again only fails if the walk reaches it.
+        #[test]
+        fn a_group_writable_grandparent_fails_the_walk() {
+            let mut map = all_protected_chain();
+            map.insert(
+                PathBuf::from("/a"),
+                OwnerMode {
+                    mode: 0o775,
+                    ..root_owned_unwritable()
+                },
+            );
+            assert!(!ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// A path with no entry in the lookup at all (object doesn't exist)
+        /// fails closed rather than defaulting to trusted.
+        #[test]
+        fn an_unresolvable_path_fails_closed() {
+            let map = all_protected_chain();
+            assert!(!ancestry_passes(
+                std::path::Path::new("/a/b/does-not-exist"),
+                &lookup_in(&map)
+            ));
+        }
+    }
+
+    #[cfg(test)]
     mod resolved_authority_tests {
         //! Adversarial tests for the Landlock conservative-bound projection: the
         //! confirmed escapes (E1 symlink root, E3 net:none io_uring) must resolve
@@ -3759,6 +4103,125 @@ mod seatbelt_impl {
                 )),
                 "a named grant must never collapse to ∅ nor remain Unknown"
             );
+            assert!(
+                profile.contains("(allow network-outbound (literal"),
+                "{profile}"
+            );
+            let _ = std::fs::remove_file(&sock);
+        }
+
+        /// A malformed grant refuses before any profile is built, and a grant
+        /// under a shape with no Mach floor (loopback) refuses rather than being
+        /// accepted as a no-op the fence would never act on.
+        #[test]
+        fn mach_grant_refuses_when_malformed_or_floorless() {
+            let bad = Caveats {
+                net: Scope::only(["mach:com.apple.*".to_string()]),
+                ..Caveats::top()
+            };
+            assert!(SeatbeltSandbox::new().command_prefix(&bad).is_err());
+            let floorless = Caveats {
+                net: Scope::only(["localhost".to_string(), "mach:com.apple.logd".to_string()]),
+                ..Caveats::top()
+            };
+            let err = SeatbeltSandbox::new()
+                .command_prefix(&floorless)
+                .expect_err("loopback leaves Mach ambient; a grant there is refused");
+            assert!(err.to_string().contains("network-denied"), "{err}");
+        }
+
+        /// Support remains held for shapes this audit never covered: loopback
+        /// and a general remote-host allowlist carry no Mach floor at all (no
+        /// `(deny mach-lookup)` is ever emitted for them — see
+        /// `seatbelt_profile_with`), so a complete deputy audit for the
+        /// deny-all shape says nothing about them. #405's acceptance criteria
+        /// ("named grants stay Unknown until each is audited" extends to
+        /// shapes with no floor to audit at all).
+        #[test]
+        fn loopback_and_remote_host_stay_unknown_even_with_a_complete_audit() {
+            for net in [
+                Scope::only(["127.0.0.1".to_string()]),
+                Scope::only(["example.com".to_string()]),
+            ] {
+                let cav = Caveats {
+                    net: net.clone(),
+                    ..Caveats::top()
+                };
+                assert_eq!(
+                    SeatbeltSandbox::new()
+                        .resolved_authority(&cav, crate::StdioPosture::Audited)
+                        .net,
+                    ResolvedScope::Unknown,
+                    "{net:?} has no Mach floor at all; the audit doesn't bound it"
+                );
+            }
+            assert_eq!(
+                SeatbeltSandbox::new()
+                    .resolved_authority(&Caveats::top(), crate::StdioPosture::Audited)
+                    .net,
+                ResolvedScope::Unbounded
+            );
+        }
+
+        /// agent-bridle#405/ADR 0015 amendment E6: the deputy audit is now
+        /// `Complete` (the full channel sweep closed, AppleEvents included).
+        /// `net:none` zero grants resolves to the bottom element `∅` — the
+        /// promotion this whole audit exists to back.
+        #[test]
+        fn net_none_resolves_bounded_empty_now_the_audit_is_complete() {
+            assert_eq!(MACH_DEPUTY_AUDIT, MachDeputyAudit::Complete);
+            let cav = Caveats {
+                net: Scope::only([
+                    "mach:com.apple.SecurityServer".to_string(),
+                    "mach:com.apple.logd".to_string(),
+                ]),
+                ..Caveats::top()
+            };
+            let net = seatbelt_net_projection(&cav, MachDeputyAudit::Complete);
+            assert_eq!(
+                net,
+                ResolvedScope::Bounded {
+                    concrete: BTreeSet::new(),
+                    classes: BTreeSet::from([
+                        "seatbelt-mach-service:com.apple.SecurityServer".to_string(),
+                        "seatbelt-mach-service:com.apple.logd".to_string(),
+                    ]),
+                },
+                "a grant must appear by name and never collapse to ∅"
+            );
+            // net:none with no grants is exactly ∅ under a complete audit.
+            let none = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new()
+                    .resolved_authority(&cav, crate::StdioPosture::Audited)
+                    .net,
+                ResolvedScope::empty(),
+                "net:none zero grants must resolve to the bottom element now the audit is complete"
+            );
+        }
+
+        /// A named `mach:` grant resolves to its own class, never to `∅` and
+        /// never to `Unknown` — the "never collapse to ∅" requirement from
+        /// #405's acceptance criteria, now exercised through the real
+        /// `resolved_authority`, not just the pure projection function.
+        #[test]
+        fn mach_grant_resolves_its_named_class_not_unknown_or_empty() {
+            let cav = Caveats {
+                net: Scope::only(["mach:com.apple.SecurityServer".to_string()]),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new()
+                    .resolved_authority(&cav, crate::StdioPosture::Audited)
+                    .net,
+                ResolvedScope::class(super::super::seatbelt_mach_service_class(
+                    "com.apple.SecurityServer"
+                )),
+                "a named grant must never collapse to ∅ nor remain Unknown"
+            );
         }
 
         /// Support remains held for shapes this audit never covered: loopback
@@ -4288,6 +4751,167 @@ mod tests {
         let s = NoopSandbox;
         assert_eq!(s.kind(), SandboxKind::None);
         assert!(s.apply(&Caveats::top()).is_ok());
+    }
+
+    // ── agent-bridle#405: `mach:` service grants are structural net tokens ──
+
+    fn with_net<I: IntoIterator<Item = &'static str>>(names: I) -> Caveats {
+        Caveats {
+            net: Scope::only(names.into_iter().map(str::to_string)),
+            ..Caveats::top()
+        }
+    }
+
+    /// The grant vocabulary is exact: launchd global-names only. A malformed
+    /// token refuses (fail-closed) rather than reaching the profile.
+    #[test]
+    fn mach_service_grants_validate_sort_and_dedup() {
+        assert_eq!(
+            mach_service_grants(&Caveats::top()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            mach_service_grants(&with_net([
+                "mach:com.apple.trustd.agent",
+                "mach:com.apple.SecurityServer",
+                "mach:com.apple.SecurityServer",
+                "unix:/private/tmp/s.sock",
+            ]))
+            .unwrap(),
+            vec![
+                "com.apple.SecurityServer".to_string(),
+                "com.apple.trustd.agent".to_string()
+            ]
+        );
+        for bad in [
+            "mach:",
+            "mach:com.apple.*",
+            "mach:a b",
+            "mach:x\"y",
+            "mach:é",
+        ] {
+            assert!(
+                mach_service_grants(&with_net([bad])).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+    }
+
+    /// A `mach:` token is structural, like `unix:`: it never becomes an egress
+    /// proxy host, and it does not stop a set from being direct-denied.
+    #[test]
+    fn mach_grants_are_structural_not_hosts() {
+        let m = "mach:com.apple.system.opendirectoryd.libinfo";
+        assert!(net_direct_denied(&with_net([m])));
+        assert!(net_direct_denied(&with_net([
+            m,
+            "unix:/private/tmp/s.sock"
+        ])));
+        assert!(net_direct_denied(&Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        }));
+        assert!(!net_direct_denied(&with_net([m, "localhost"])));
+        assert!(!net_direct_denied(&with_net(["example.com"])));
+        assert!(!net_fully_denied(&with_net([m])), "not the EMPTY set");
+        assert_eq!(net_egress_proxy_hosts(&with_net([m])), None);
+        assert_eq!(
+            net_egress_proxy_hosts(&with_net([m, "example.com"])),
+            Some(vec!["example.com".to_string()]),
+            "the grant never enters the proxy host list"
+        );
+        assert!(net_loopback_only(&with_net([m, "localhost"])));
+        assert!(
+            !net_loopback_full_interface(&with_net([m, "localhost"])),
+            "a mach grant is authority beyond the loopback interface"
+        );
+        // A mach-bearing remote-host scope has no proxy semantics: the loopback
+        // fence would erase the grant, so the planner refuses on EVERY backend,
+        // Seatbelt included (never a plan with the token silently dropped).
+        let mixed = with_net([m, "example.com"]);
+        assert!(
+            egress_proxy_plan_for(SandboxKind::Seatbelt, &mixed).is_none(),
+            "Seatbelt must not plan a proxy that drops the mach grant"
+        );
+        assert!(
+            !matches!(&loopback_fenced_caveats(&mixed).net, Scope::Only(set) if set.contains(m)),
+            "the fence does not carry the grant, which is why the plan is refused"
+        );
+        assert!(
+            egress_proxy_plan_for(SandboxKind::Landlock, &with_net([m, "example.com"])).is_none()
+        );
+        assert!(
+            egress_proxy_plan_for(SandboxKind::AppContainer, &with_net([m, "example.com"]))
+                .is_none()
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Seatbelt, &with_net([m])),
+            SandboxKind::Seatbelt
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &with_net([m])),
+            SandboxKind::None
+        );
+    }
+
+    /// The structured "service X denied" result: only a network-denied
+    /// Seatbelt run carries a Mach floor, so only it discloses; the grant is
+    /// listed by name and every other known candidate is listed as withheld.
+    #[test]
+    fn mach_service_disclosure_names_granted_and_withheld() {
+        let m = "mach:com.apple.SecurityServer";
+        let d = mach_service_disclosure(&with_net([m]), SandboxKind::Seatbelt)
+            .unwrap()
+            .expect("a network-denied Seatbelt run discloses");
+        assert_eq!(d.granted, vec!["com.apple.SecurityServer".to_string()]);
+        assert_eq!(d.withheld.len(), MACH_SERVICE_CANDIDATES.len() - 1);
+        assert!(!d.withheld.iter().any(|s| s == "com.apple.SecurityServer"));
+        assert!(d
+            .withheld
+            .iter()
+            .any(|s| s == "com.apple.system.opendirectoryd.libinfo"));
+
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let d = mach_service_disclosure(&none, SandboxKind::Seatbelt)
+            .unwrap()
+            .expect("net:none discloses");
+        assert!(d.granted.is_empty());
+        assert_eq!(
+            d.withheld.len(),
+            MACH_SERVICE_CANDIDATES.len(),
+            "zero floor: every candidate withheld"
+        );
+
+        // No floor ⇒ nothing to disclose: other backends, ambient net, loopback.
+        for kind in [
+            SandboxKind::Landlock,
+            SandboxKind::AppContainer,
+            SandboxKind::None,
+        ] {
+            assert_eq!(
+                mach_service_disclosure(&none, kind).unwrap(),
+                None,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            mach_service_disclosure(&Caveats::top(), SandboxKind::Seatbelt).unwrap(),
+            None
+        );
+        assert_eq!(
+            mach_service_disclosure(&with_net(["localhost"]), SandboxKind::Seatbelt).unwrap(),
+            None
+        );
+        assert!(
+            mach_service_disclosure(&with_net(["mach:bad name"]), SandboxKind::Seatbelt).is_err()
+        );
+        assert_eq!(
+            seatbelt_mach_service_class("com.apple.logd"),
+            "seatbelt-mach-service:com.apple.logd"
+        );
     }
 
     // ── agent-bridle#405: `mach:` service grants are structural net tokens ──
