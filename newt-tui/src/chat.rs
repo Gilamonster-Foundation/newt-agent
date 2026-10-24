@@ -9138,10 +9138,6 @@ fn session_body(
                     // posture preset (meet-only), so `/posture` only tightens
                     // it when a permission floor is actually configured.
                     let exec_floor = exec_floor_from(&turn_caveats.exec, preset_clamp.is_some());
-                    // The dialect the model is told follows this turn's floor: under one, dispatch
-                    // takes the host route per command, so the confined default is advertised.
-                    let turn_shell_dialect =
-                        newt_core::agentic::run_command_dialect_sentence_for(exec_floor.as_ref());
                     // Shared with the terminal thread under the cockpit, which
                     // trips them from Ctrl-C; the session reads them exactly as
                     // it always did.
@@ -9429,7 +9425,7 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
-                                        shell_dialect: turn_shell_dialect,
+                                        shell_dialect,
                                         command_budget,
                                         // #2313 b3: the session-scoped allowance
                                         // constructed above, shared with the

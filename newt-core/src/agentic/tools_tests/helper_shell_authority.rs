@@ -644,14 +644,11 @@ fn the_ambient_posture_runs_the_operators_login_shell() {
         assert_eq!(args[..flags.len()], flags[..], "{shell}");
         assert!(args.last().unwrap().ends_with("\necho hi"), "{args:?}");
     }
-    // fish is not POSIX: the command reaches it untouched.
+    // fish (or any non-POSIX shell) is not run: `/bin/sh -c`, like the POSIX guidance says.
     let fish = stand_in("fish");
     crate::process_env::set_var("SHELL", &fish);
     let (program, args) = host_argv(false);
-    assert_eq!(
-        (program.as_str(), args.last().unwrap().as_str()),
-        (fish.as_str(), "echo hi")
-    );
+    assert_eq!((program.as_str(), args[0].as_str()), ("/bin/sh", "-c"));
     // Not found: the existing retry runs /bin/sh -c.
     let (program, args) = host_argv(true);
     assert_eq!((program.as_str(), args[0].as_str()), ("/bin/sh", "-c"));
@@ -721,69 +718,21 @@ fn the_host_child_environment_is_the_inherited_one_minus_the_control_plane() {
     }
 }
 
-/// #978 review: the guidance follows the shell that will run. A fish login shell is
-/// not POSIX and the model is told so; bash/zsh/unset keep the POSIX sentence, and so does
-/// every posture that is not `--ambient` on the host route.
-#[cfg(not(windows))]
-#[test]
-fn the_dialect_guidance_follows_the_ambient_login_shell() {
-    let _env = crate::process_env::lock();
-    let _shell = ShellVar::save();
-    // `fish` must exist as a file for the shell to count; /bin/sh stands in for the path
-    // check by naming a real file called fish in a temp dir.
-    let dir = tempfile::tempdir().unwrap();
-    let fish = dir.path().join("fish");
-    std::fs::write(&fish, "#!/bin/sh\n").unwrap();
-    crate::process_env::set_var("SHELL", fish.to_str().unwrap());
-    let _bypass = crate::launch_authority::ScopedAuthority::new(true, true);
-    // `--yolo --full-access` pair without ambient: POSIX.
-    assert!(
-        crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"),
-        "no ambient, no change"
-    );
-    drop(_bypass);
-    let _amb = crate::launch_authority::ScopedAuthority::ambient_with_host_bypass();
-    let sentence = crate::agentic::run_command_dialect_sentence();
-    assert!(
-        sentence.contains("fish") && sentence.contains("not a POSIX shell"),
-        "{sentence}"
-    );
-    // A turn with an exec floor routes per command (an out-of-floor command stays confined):
-    // the confined default is advertised, never the login shell's dialect.
-    let floor = crate::caveats::Scope::only(["ls".to_string()]);
-    assert!(
-        crate::agentic::run_command_dialect_sentence_for(Some(&floor))
-            .contains("POSIX shell syntax"),
-        "a floor keeps the POSIX guidance"
-    );
-    assert!(crate::agentic::run_command_dialect_sentence_for(None).contains("fish"));
-    crate::process_env::set_var("SHELL", "/bin/bash");
-    assert!(crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"));
-    // A login shell that does not exist falls back to /bin/sh: POSIX again.
-    crate::process_env::set_var("SHELL", dir.path().join("zsh-missing").to_str().unwrap());
-    assert!(crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"));
-}
-
 /// #978 review: a login shell that exists but cannot start (its interpreter is missing) is
-/// said out loud, the call still runs under `/bin/sh`, and from then on the shell, the
-/// banner's resolution and the model's guidance all say `/bin/sh` / POSIX.
+/// said out loud in the result, and the call still runs under `/bin/sh` (POSIX, like the
+/// guidance the model always gets).
 #[cfg(not(windows))]
 #[tokio::test]
-async fn an_unstartable_login_shell_is_reported_and_demoted() {
+async fn an_unstartable_login_shell_is_reported_and_falls_back_to_bin_sh() {
     use std::os::unix::fs::PermissionsExt;
     let _env = crate::process_env::lock();
     let _shell = ShellVar::save();
     let dir = tempfile::tempdir().unwrap();
-    let fish = dir.path().join("fish");
-    std::fs::write(&fish, "#!/no/such/interpreter\n").unwrap();
-    std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
-    crate::process_env::set_var("SHELL", fish.to_str().unwrap());
+    let zsh = dir.path().join("zsh");
+    std::fs::write(&zsh, "#!/no/such/interpreter\n").unwrap();
+    std::fs::set_permissions(&zsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::process_env::set_var("SHELL", zsh.to_str().unwrap());
     let _pin = crate::launch_authority::ScopedAuthority::ambient_with_host_bypass();
-    assert!(
-        crate::agentic::run_command_dialect_sentence().contains("fish"),
-        "fish before the spawn"
-    );
-
     let run = super::shell::host_shell_output_with_timeout(
         super::shell::ShellRoute::BashSh,
         "echo hi",
@@ -802,14 +751,5 @@ async fn an_unstartable_login_shell_is_reported_and_demoted() {
         String::from_utf8_lossy(&run.stderr).contains("could not start your login shell"),
         "{}",
         String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(crate::ambient_shell::login_shell_failed());
-    assert!(matches!(
-        crate::ambient_shell::AmbientShell::resolve_host(),
-        crate::ambient_shell::AmbientShell::Fallback { .. }
-    ));
-    assert!(
-        crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"),
-        "guidance follows the demotion"
     );
 }

@@ -13,41 +13,17 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-/// Shells that take a combined login + interactive `-l -i -c <cmd>`: interactive is what
-/// reads `~/.zshrc` / `~/.bashrc`, where aliases and functions live.
-const LOGIN_INTERACTIVE: &[&str] = &["bash", "zsh", "fish", "ksh"];
-
-// A file can exist and still not start (a missing interpreter in its shebang). Once a spawn
-// showed that, the rest of the process runs `/bin/sh` and says so. A process-wide flag in
-// production; thread-local under test so parallel tests do not share it.
-#[cfg(not(test))]
-static LOGIN_SHELL_FAILED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-thread_local! {
-    static LOGIN_SHELL_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Record that the login shell could not be started, so dispatch, banner and guidance all
-/// treat it as `/bin/sh` from now on.
-pub fn mark_login_shell_failed() {
-    #[cfg(not(test))]
-    LOGIN_SHELL_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    LOGIN_SHELL_FAILED.with(|f| f.set(true));
-}
-
-/// Has a spawn shown the login shell cannot start?
-#[must_use]
-pub fn login_shell_failed() -> bool {
-    #[cfg(not(test))]
-    return LOGIN_SHELL_FAILED.load(std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    LOGIN_SHELL_FAILED.with(std::cell::Cell::get)
-}
-
-/// What the model is told when `run_command` runs fish: not POSIX.
-pub const FISH_DIALECT: &str = "Commands run in the operator's fish shell, not a POSIX shell: use fish syntax (`set name value` and `$name`, `and`/`or` or `; and`, `(cmd)` for substitution), with no heredocs and no `${var:-default}`; run_command already returns the exit status.";
+/// The login shells `--ambient` runs: POSIX-compatible ones only, so the POSIX guidance the
+/// model always gets is true. `(basename, interactive)`; interactive (`-i`) is what reads
+/// `~/.zshrc` / `~/.bashrc`, where aliases and functions live. Any other `$SHELL` (fish, nu,
+/// xonsh, ...) runs `/bin/sh -c` instead.
+const POSIX_LOGIN_SHELLS: &[(&str, bool)] = &[
+    ("sh", false),
+    ("dash", false),
+    ("bash", true),
+    ("zsh", true),
+    ("ksh", true),
+];
 
 /// Do two environment variable names name the same variable? Windows names are
 /// case-insensitive (and case-preserving); elsewhere they are exact.
@@ -67,39 +43,39 @@ pub enum AmbientShell {
     Login {
         program: PathBuf,
         args: &'static [&'static str],
-        /// Whether the command text is POSIX (fish's is not, so it is passed untouched).
-        posix: bool,
     },
-    /// `$SHELL` cannot be trusted; run `/bin/sh -c` and say why.
-    Fallback { reason: &'static str },
+    /// `$SHELL` cannot be used; run `/bin/sh -c` and say why.
+    Fallback { reason: String },
 }
 
 impl AmbientShell {
-    /// Resolve `$SHELL`. Unset, empty or not absolute fails closed to [`Self::Fallback`]:
-    /// a relative `$SHELL` would be resolved against the workspace the agent can write.
+    /// Resolve `$SHELL`. Unset, empty, relative (it would resolve against the workspace the
+    /// agent can write) or not a POSIX shell fails closed to [`Self::Fallback`].
     #[must_use]
     pub fn resolve(shell: Option<&OsStr>) -> Self {
+        let fallback = |reason: &str| Self::Fallback {
+            reason: reason.to_string(),
+        };
         let Some(shell) = shell.filter(|s| !s.is_empty()) else {
-            return Self::Fallback {
-                reason: "$SHELL is not set",
-            };
+            return fallback("$SHELL is not set");
         };
         let path = Path::new(shell);
         if !path.is_absolute() {
-            return Self::Fallback {
-                reason: "$SHELL is not an absolute path",
-            };
+            return fallback("$SHELL is not an absolute path");
         }
         let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
-        let interactive = LOGIN_INTERACTIVE.contains(&name);
-        Self::Login {
-            program: path.to_path_buf(),
-            args: if interactive {
-                &["-l", "-i", "-c"]
-            } else {
-                &["-l", "-c"]
+        match POSIX_LOGIN_SHELLS.iter().find(|(n, _)| *n == name) {
+            Some((_, interactive)) => Self::Login {
+                program: path.to_path_buf(),
+                args: if *interactive {
+                    &["-l", "-i", "-c"]
+                } else {
+                    &["-l", "-c"]
+                },
             },
-            posix: name != "fish",
+            None => Self::Fallback {
+                reason: format!("$SHELL is {name}, not a POSIX shell"),
+            },
         }
     }
 
@@ -109,44 +85,29 @@ impl AmbientShell {
     pub fn resolve_checked(shell: Option<&OsStr>, exists: impl Fn(&Path) -> bool) -> Self {
         match Self::resolve(shell) {
             Self::Login { program, .. } if !exists(&program) => Self::Fallback {
-                reason: "$SHELL does not exist",
+                reason: "$SHELL does not exist".to_string(),
             },
             other => other,
         }
     }
 
-    /// The shell this process would run for ambient `run_command`: `$SHELL`, checked
-    /// against the file system, and demoted to `/bin/sh` for the rest of the process once a
-    /// spawn showed it cannot start (see [`mark_login_shell_failed`]). The one resolution
-    /// the dispatch, the banner and the prompt guidance all use, so they cannot disagree.
+    /// The shell this process would run for ambient `run_command`: `$SHELL`, checked against
+    /// the file system. The one resolution the dispatch and the banner share.
     #[must_use]
     pub fn resolve_host() -> Self {
-        if login_shell_failed() {
-            return Self::Fallback {
-                reason: "the login shell could not be started",
-            };
-        }
         Self::resolve_checked(std::env::var_os("SHELL").as_deref(), Path::is_file)
     }
 
-    /// The model-facing dialect sentence when this shell is not POSIX (fish); `None` when
-    /// the default POSIX guidance is right.
-    #[must_use]
-    pub fn dialect_sentence(&self) -> Option<&'static str> {
-        match self {
-            Self::Login { posix: false, .. } => Some(FISH_DIALECT),
-            _ => None,
-        }
-    }
-
-    /// One line for the session banner: which shell runs, or why `/bin/sh` does.
+    /// What runs, for the session banner.
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
-            Self::Login { program, args, .. } => {
+            Self::Login { program, args } => {
                 format!("login shell {} {}", program.display(), args.join(" "))
             }
-            Self::Fallback { reason } => format!("{reason}; using /bin/sh"),
+            Self::Fallback { reason } => {
+                format!("/bin/sh -c ({reason}; ambient commands run /bin/sh -c with your full environment)")
+            }
         }
     }
 }
@@ -209,51 +170,7 @@ mod tests {
         Some(OsString::from(s))
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn an_absolute_login_shell_runs_login_and_interactive() {
-        for (shell, args, posix) in [
-            ("/usr/bin/zsh", &["-l", "-i", "-c"][..], true),
-            ("/bin/bash", &["-l", "-i", "-c"][..], true),
-            ("/usr/bin/fish", &["-l", "-i", "-c"][..], false),
-            ("/bin/dash", &["-l", "-c"][..], true),
-        ] {
-            let got = AmbientShell::resolve(os(shell).as_deref());
-            assert_eq!(
-                got,
-                AmbientShell::Login {
-                    program: PathBuf::from(shell),
-                    args: match args.len() {
-                        3 => &["-l", "-i", "-c"],
-                        _ => &["-l", "-c"],
-                    },
-                    posix,
-                },
-                "{shell}"
-            );
-        }
-    }
-
     /// Fail closed: nothing the agent could plant in a relative path runs as the shell.
-    #[test]
-    fn an_unset_empty_or_relative_shell_falls_back_and_says_why() {
-        for (shell, why) in [
-            (None, "$SHELL is not set"),
-            (os(""), "$SHELL is not set"),
-            (os("zsh"), "$SHELL is not an absolute path"),
-            (os("./sh"), "$SHELL is not an absolute path"),
-            (os("bin/zsh"), "$SHELL is not an absolute path"),
-        ] {
-            let got = AmbientShell::resolve(shell.as_deref());
-            assert_eq!(got, AmbientShell::Fallback { reason: why }, "{shell:?}");
-            assert!(
-                got.describe().ends_with("using /bin/sh"),
-                "{}",
-                got.describe()
-            );
-        }
-    }
-
     #[test]
     fn the_full_env_keeps_the_display_variables_and_drops_the_control_plane() {
         let vars = [
@@ -336,7 +253,7 @@ mod tests {
         assert_eq!(
             got,
             AmbientShell::Fallback {
-                reason: "$SHELL does not exist"
+                reason: "$SHELL does not exist".to_string()
             }
         );
         let ok = AmbientShell::resolve_checked(Some("/bin/sh".as_ref()), |_| true);
@@ -345,16 +262,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn only_a_non_posix_login_shell_changes_the_dialect_guidance() {
-        let fish = AmbientShell::resolve_checked(Some("/usr/bin/fish".as_ref()), |_| true);
-        assert_eq!(fish.dialect_sentence(), Some(FISH_DIALECT));
-        assert!(FISH_DIALECT.contains("not a POSIX shell") && FISH_DIALECT.contains("fish"));
-        for shell in ["/bin/bash", "/usr/bin/zsh"] {
+    fn a_posix_login_shell_runs_login_and_interactive_where_it_reads_its_rc() {
+        for (shell, args) in [
+            ("/usr/bin/zsh", &["-l", "-i", "-c"][..]),
+            ("/bin/bash", &["-l", "-i", "-c"][..]),
+            ("/usr/bin/ksh", &["-l", "-i", "-c"][..]),
+            ("/bin/dash", &["-l", "-c"][..]),
+            ("/bin/sh", &["-l", "-c"][..]),
+        ] {
+            match AmbientShell::resolve(os(shell).as_deref()) {
+                AmbientShell::Login { program, args: got } => {
+                    assert_eq!(program, PathBuf::from(shell));
+                    assert_eq!(got, args, "{shell}");
+                }
+                other => panic!("{shell}: {other:?}"),
+            }
+        }
+    }
+
+    /// Fail closed: unset, empty, relative or non-POSIX `$SHELL` runs /bin/sh and says why.
+    #[cfg(unix)]
+    #[test]
+    fn an_unusable_shell_falls_back_to_bin_sh_and_says_why() {
+        for (shell, why) in [
+            (None, "$SHELL is not set"),
+            (os(""), "$SHELL is not set"),
+            (os("zsh"), "$SHELL is not an absolute path"),
+            (os("./sh"), "$SHELL is not an absolute path"),
+            (os("/usr/bin/fish"), "$SHELL is fish, not a POSIX shell"),
+            (os("/usr/bin/nu"), "$SHELL is nu, not a POSIX shell"),
+        ] {
+            let got = AmbientShell::resolve(shell.as_deref());
             assert_eq!(
-                AmbientShell::resolve_checked(Some(shell.as_ref()), |_| true).dialect_sentence(),
-                None
+                got,
+                AmbientShell::Fallback {
+                    reason: why.to_string()
+                },
+                "{shell:?}"
+            );
+            assert!(
+                got.describe()
+                    .contains("ambient commands run /bin/sh -c with your full environment"),
+                "{}",
+                got.describe()
             );
         }
-        assert_eq!(AmbientShell::resolve(None).dialect_sentence(), None);
     }
 }

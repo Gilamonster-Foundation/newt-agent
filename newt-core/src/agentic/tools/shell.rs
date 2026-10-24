@@ -724,38 +724,17 @@ impl ShellRoute {
 /// Capture the session-default route. Brokers, leases and exec floors are
 /// command-specific: execution re-evaluates them before dispatch.
 pub fn run_command_dialect_sentence() -> &'static str {
-    run_command_dialect_sentence_for(None)
-}
-
-/// [`run_command_dialect_sentence`] for a turn whose exec floor is `exec_floor`. A floor makes
-/// the host route command-specific (a command outside it stays in the confined shell), so
-/// under one the guidance is the confined default, never the login shell's dialect; the
-/// login shell's dialect is advertised only where dispatch will take the host route for
-/// every command: [`ambient_login_shell`] is the one decision both use.
-pub fn run_command_dialect_sentence_for(
-    exec_floor: Option<&crate::caveats::Scope<String>>,
-) -> &'static str {
-    let route = select_shell_route(
+    select_shell_route(
         ocap_disabled(),
         false,
         false,
-        exec_floor.is_none(),
+        true,
         cfg!(windows),
         crate::config::windows_cmd_enabled(),
         crate::ambient_brush::installed(),
         shell_engine(),
-    );
-    if let Some(sentence) = ambient_login_shell(route).and_then(|s| s.dialect_sentence()) {
-        return sentence;
-    }
-    route.sentence()
-}
-
-/// The operator's login shell for `route`, if `--ambient` puts this route on it: the one
-/// decision the spawn and the model-facing guidance share (so they cannot disagree).
-fn ambient_login_shell(route: ShellRoute) -> Option<crate::ambient_shell::AmbientShell> {
-    (route == ShellRoute::BashSh && crate::launch_authority::current().ambient())
-        .then(crate::ambient_shell::AmbientShell::resolve_host)
+    )
+    .sentence()
 }
 
 /// Pure session-default guidance with injected platform/authority and an installed runner.
@@ -2244,34 +2223,22 @@ fn strip_child_authority_env(c: &mut tokio::process::Command) {
 }
 
 /// The program and argv of the `--ambient` shell for `cmd`: the operator's login shell
-/// (`-l -i -c` / `-l -c`), or `/bin/sh -c` when `$SHELL` cannot be trusted or the login
-/// shell was not found (`fallback`). The command text gets the portable `which` helper
-/// whenever the interpreter is POSIX.
+/// (`-l -i -c` / `-l -c`), or `/bin/sh -c` when `$SHELL` cannot be used or the login shell
+/// was not found (`fallback`). The command text gets the portable `which` helper.
 fn bash_sh_argv(
     shell: &crate::ambient_shell::AmbientShell,
     fallback: bool,
     cmd: &str,
 ) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
     use crate::ambient_shell::AmbientShell;
-    let posix = |c: &str| agent_bridle_tool_shell::with_posix_command_discovery(c);
+    let command = agent_bridle_tool_shell::with_posix_command_discovery(cmd);
     match shell {
-        AmbientShell::Login {
-            program,
-            args,
-            posix: is_posix,
-        } if !fallback => {
+        AmbientShell::Login { program, args } if !fallback => {
             let mut argv: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
-            argv.push(
-                if *is_posix {
-                    posix(cmd)
-                } else {
-                    cmd.to_string()
-                }
-                .into(),
-            );
+            argv.push(command.into());
             (program.clone().into_os_string(), argv)
         }
-        _ => ("/bin/sh".into(), vec!["-c".into(), posix(cmd).into()]),
+        _ => ("/bin/sh".into(), vec!["-c".into(), command.into()]),
     }
 }
 
@@ -2334,10 +2301,12 @@ fn host_shell_command_at(
     };
     // `--ambient` (#978): the operator's login shell. Every other posture builds exactly
     // the argv it always did.
-    let login = ambient_login_shell(route).map(|shell| {
-        note_ambient_fallback(&shell);
-        bash_sh_argv(&shell, fallback, cmd)
-    });
+    let login =
+        (route == ShellRoute::BashSh && crate::launch_authority::current().ambient()).then(|| {
+            let shell = crate::ambient_shell::AmbientShell::resolve_host();
+            note_ambient_fallback(&shell);
+            bash_sh_argv(&shell, fallback, cmd)
+        });
     let program = login.as_ref().map_or(program, |(p, _)| p.as_os_str());
     let mut c = tokio::process::Command::new(program);
     if let Some((_, args)) = &login {
@@ -2563,14 +2532,12 @@ async fn host_shell_output_raw(
         Ok(child) => run_one(child, live, timeout).await,
         Err(e) if route == ShellRoute::BashSh && e.kind() == std::io::ErrorKind::NotFound => {
             // `--ambient`: the login shell file exists but cannot start (a missing
-            // interpreter). Say so, run `/bin/sh` for this call, and demote the shell for
-            // the rest of the process so guidance and later calls agree.
-            let ambient = ambient_login_shell(route)
-                .is_some_and(|s| matches!(s, crate::ambient_shell::AmbientShell::Login { .. }));
-            if ambient {
-                crate::ambient_shell::mark_login_shell_failed();
-                tracing::warn!("--ambient: the login shell could not be started; using /bin/sh");
-            }
+            // interpreter). The call runs `/bin/sh` (still POSIX, like the guidance) and says so.
+            let ambient = crate::launch_authority::current().ambient()
+                && matches!(
+                    crate::ambient_shell::AmbientShell::resolve_host(),
+                    crate::ambient_shell::AmbientShell::Login { .. }
+                );
             let mut run = run_one(
                 host_shell_command(route, true, cmd, cwd)?.spawn()?,
                 live,
@@ -2578,6 +2545,7 @@ async fn host_shell_output_raw(
             )
             .await?;
             if ambient {
+                tracing::warn!("--ambient: the login shell could not be started; using /bin/sh");
                 run.stderr.extend_from_slice(
                     b"[newt: --ambient could not start your login shell; this command ran under /bin/sh -c]\n",
                 );

@@ -357,10 +357,10 @@ pub use tools::{
     execute_tool_with_offload_and_prompt_and_artifacts, exit_plan_mode_result,
     filter_advertised_tools, filter_tools_for_disposition, full_access_requested, ocap_disabled,
     persona_tool_allowed, plan_phase_clamp, preserve_mcp_resource_url_affinity, read_only_clamp,
-    read_only_hidden_tool, run_command_dialect_sentence, run_command_dialect_sentence_for,
-    set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
-    shell_dialect_sentence, tool_allowed, tool_definitions, venv_cmd_prefix, ExposureSettings,
-    CHILD_STRIPPED_AUTHORITY_ENV, MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    read_only_hidden_tool, run_command_dialect_sentence, set_max_output_tokens,
+    set_output_cap_chars_per_token, set_output_head_tokens, shell_dialect_sentence, tool_allowed,
+    tool_definitions, venv_cmd_prefix, ExposureSettings, CHILD_STRIPPED_AUTHORITY_ENV,
+    MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,

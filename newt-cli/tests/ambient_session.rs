@@ -268,11 +268,10 @@ async fn the_three_granular_flags_together_are_yolo() {
     assert!(shown.contains("YOLO (--yolo)"), "{shown}");
 }
 
-/// A login shell that is not POSIX gets guidance that says so, in the tool description the
-/// model actually receives; a POSIX one keeps the POSIX sentence. (A stand-in `fish` that
-/// hands the command to bash proves the dispatch; it is not a fish grammar test.)
+/// A `$SHELL` that is not POSIX (fish) is not run: the command runs `/bin/sh -c`, the banner
+/// says so plainly, and the model keeps the POSIX guidance it always gets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_guidance_follows_the_login_shell() {
+async fn a_non_posix_shell_runs_bin_sh_and_the_banner_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let fish = dir.path().join("fish");
     std::fs::write(
@@ -284,16 +283,19 @@ async fn the_guidance_follows_the_login_shell() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let (result, _shown, told) = session_with_shell(&["--yolo"], fish.to_str().unwrap()).await;
+    let (result, shown, told) = session_with_shell(&["--yolo"], fish.to_str().unwrap()).await;
     assert!(
-        result.contains("STANDIN-RAN"),
-        "the stand-in fish ran: {result}"
+        !result.contains("STANDIN-RAN"),
+        "fish must not run: {result}"
     );
     assert!(
-        told.contains("fish shell") && !told.contains("Commands use POSIX shell syntax"),
-        "the model was told POSIX syntax while fish runs:\n{told}"
+        result.contains("[sh][:77][]") || result.contains("[/bin/sh][:77][]"),
+        "{result}"
     );
-    let (_result, _shown, told) = session_with_shell(&["--yolo"], "/bin/bash").await;
+    assert!(
+        shown.contains("$SHELL is fish, not a POSIX shell; ambient commands run /bin/sh -c with your full environment"),
+        "{shown}"
+    );
     assert!(told.contains("Commands use POSIX shell syntax"), "{told}");
 }
 
@@ -307,38 +309,12 @@ async fn a_missing_login_shell_is_reported_as_the_bin_sh_that_runs() {
         "{result}"
     );
     assert!(
-        shown.contains("$SHELL does not exist; using /bin/sh"),
+        shown.contains(
+            "$SHELL does not exist; ambient commands run /bin/sh -c with your full environment"
+        ),
         "{shown}"
     );
     assert!(!shown.contains("login shell /no/such/zsh"), "{shown}");
-}
-
-/// Under an exec floor (here the workspace-edit preset's) the host route is per command, so
-/// the model is told the confined default, not the login shell's dialect, and the command
-/// stays confined (the stand-in fish never runs).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_floor_keeps_the_posix_guidance() {
-    let dir = tempfile::tempdir().unwrap();
-    let fish = dir.path().join("fish");
-    std::fs::write(
-        &fish,
-        "#!/bin/sh\necho STANDIN-RAN\nexec /bin/bash \"$@\"\n",
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let (result, _shown, told) =
-        session_with_shell(&["--disable-ocap", "--ambient"], fish.to_str().unwrap()).await;
-    assert!(
-        !result.contains("STANDIN-RAN"),
-        "the command stayed confined: {result}"
-    );
-    assert!(
-        told.contains("Commands use POSIX shell syntax") && !told.contains("fish shell"),
-        "guidance must match the route that runs:\n{told}"
-    );
 }
 
 /// A login shell that exists but cannot start (missing interpreter) is reported to the
@@ -346,13 +322,13 @@ async fn a_floor_keeps_the_posix_guidance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unstartable_login_shell_is_reported_in_the_result() {
     let dir = tempfile::tempdir().unwrap();
-    let fish = dir.path().join("fish");
-    std::fs::write(&fish, "#!/no/such/interpreter\n").unwrap();
+    let zsh = dir.path().join("zsh");
+    std::fs::write(&zsh, "#!/no/such/interpreter\n").unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&zsh, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let (result, _shown, _told) = session_with_shell(&["--yolo"], fish.to_str().unwrap()).await;
+    let (result, _shown, _told) = session_with_shell(&["--yolo"], zsh.to_str().unwrap()).await;
     assert!(
         result.contains("[sh][:77][]") || result.contains("[/bin/sh][:77][]"),
         "{result}"

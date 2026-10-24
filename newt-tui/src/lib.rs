@@ -2565,9 +2565,9 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
 
 /// The session-start banner for the `--ambient` axis and for `--yolo`, which is all three
 /// (#978). It lists exactly what is off, from the effective decision rather than the flags:
-/// the login shell is claimed only where `run_command` actually runs on the host shell
-/// (`--disable-ocap` with `--full-access`), and `shell` is how `$SHELL` really resolved
-/// (the login shell, or why `/bin/sh` runs instead).
+/// the shell is claimed only where `run_command` runs on the host shell (`--disable-ocap`
+/// with `--full-access`), and `shell` is how `$SHELL` really resolved (a POSIX login shell, or
+/// the `/bin/sh` that runs instead, with the reason).
 fn ambient_banner(
     authority: newt_core::launch_authority::LaunchAuthority,
     shell: &newt_core::ambient_shell::AmbientShell,
@@ -2575,20 +2575,24 @@ fn ambient_banner(
     let children = "child processes and stdio MCP servers get your FULL environment \
          (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); newt's own \
          secrets and switches are still withheld";
-    let host = authority.ocap_disabled() && authority.full_access();
-    if host {
+    let runs = match shell {
+        newt_core::ambient_shell::AmbientShell::Login { .. } => {
+            format!("your {}", shell.describe())
+        }
+        newt_core::ambient_shell::AmbientShell::Fallback { .. } => shell.describe(),
+    };
+    if authority.ocap_disabled() && authority.full_access() {
         format!(
             "⚠ YOLO (--yolo): approvals OFF (--disable-ocap), confinement OFF (--full-access), \
-             environment OFF (--ambient): run_command runs your {}, and {children}. Drop the \
-             flag to restore confinement.",
-            shell.describe()
+             environment OFF (--ambient): run_command runs {runs}, and {children}. Drop the \
+             flag to restore confinement."
         )
     } else {
         format!(
             "⚠ AMBIENT (--ambient): environment OFF: {children}. run_command keeps its current \
-             shell: your login shell applies only where it runs on the host shell, which needs \
-             --disable-ocap and --full-access (--yolo is all three). This flag alone leaves \
-             approvals and confinement as they are."
+             shell: the login shell applies only where it runs on the host shell, which needs \
+             --disable-ocap and an exec floor that permits the command (--yolo is all three). \
+             This flag alone leaves approvals and confinement as they are."
         )
     }
 }
@@ -2612,13 +2616,12 @@ fn full_access_banner() -> String {
         .to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod ambient_banner_tests {
     use super::*;
     use newt_core::ambient_shell::AmbientShell;
 
-    // Unix absolute paths (`/usr/bin/zsh`) are not absolute on Windows.
-    #[cfg(unix)]
+    // Unix absolute paths (`/usr/bin/zsh`) are not absolute on Windows: the module is unix-only.
     #[test]
     fn the_banner_lists_exactly_what_is_off_from_the_effective_decision() {
         use newt_core::launch_authority::LaunchAuthority;
@@ -2659,10 +2662,19 @@ mod ambient_banner_tests {
         let missing = AmbientShell::resolve_checked(Some("/no/such/zsh".as_ref()), |_| false);
         let fallback = ambient_banner(yolo, &missing);
         assert!(
-            fallback.contains("$SHELL does not exist; using /bin/sh"),
+            fallback.contains(
+                "$SHELL does not exist; ambient commands run /bin/sh -c with your full environment"
+            ),
             "{fallback}"
         );
         assert!(!fallback.contains("/no/such/zsh"), "{fallback}");
+        // A non-POSIX $SHELL runs /bin/sh, and the banner says so plainly.
+        let fish = ambient_banner(yolo, &AmbientShell::resolve(Some("/usr/bin/fish".as_ref())));
+        assert!(
+            fish.contains("$SHELL is fish, not a POSIX shell; ambient commands run /bin/sh -c with your full environment"),
+            "{fish}"
+        );
+        assert!(!fish.contains("login shell /usr/bin/fish"), "{fish}");
     }
 }
 
