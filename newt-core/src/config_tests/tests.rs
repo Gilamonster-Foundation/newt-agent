@@ -226,6 +226,10 @@ mod memory_tests;
 mod permissions_tests;
 
 #[cfg(test)]
+#[path = "self_edit.rs"]
+mod self_edit_tests;
+
+#[cfg(test)]
 #[path = "presentation.rs"]
 mod presentation_tests;
 

@@ -44,6 +44,7 @@ pub use output_budget::{
 
 mod build_shell;
 mod catalog;
+mod config_edit;
 mod dependency_fetch;
 mod dispatch;
 pub(super) mod file_capture;
@@ -3029,6 +3030,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "web_fetch" => string("url", ""),
         "request_permissions" => string("capability", ""),
         "request_user_input" => string("question", ""),
+        "propose_config_edit" => string("key", ""),
         "select_operating_mode" => string("mode", ""),
         "prompt_read" | "artifact_read" => string("address", "current"),
         "tool_search" | "recall" | "code_search" | "experience_recall" => string("query", ""),
@@ -4450,6 +4452,15 @@ async fn execute_authorized_tool(
         "request_user_input" => {
             execute_request_user_input(args, permission_gate, color, tool_output_lines)
         }
+
+        // #144: an edit to newt's own config, applied only on the operator's
+        // explicit `apply`. No gate (headless / eval / ACP) refuses.
+        "propose_config_edit" => config_edit::execute_propose_config_edit(
+            args,
+            permission_gate,
+            crate::Config::user_config_path().as_deref(),
+            crate::settings_receipt::receipt_path().as_deref(),
+        ),
 
         // #725: tool discovery — search THIS session's advertised catalog by
         // intent so a model that half-remembers a capability finds the real tool
