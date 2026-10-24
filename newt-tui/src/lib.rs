@@ -2563,17 +2563,30 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
     )
 }
 
-/// The session-start banner for `--ambient` (#978): says plainly what it is. `shell`
-/// is how `$SHELL` resolved (the login shell, or why `/bin/sh` runs instead).
-fn ambient_banner(shell: &newt_core::ambient_shell::AmbientShell) -> String {
-    format!(
-        "⚠ AMBIENT (--ambient): run_command runs your {}, and the child processes and \
-         stdio MCP servers get your FULL environment (DISPLAY, DBUS_SESSION_BUS_ADDRESS, \
-         XDG_RUNTIME_DIR, tokens and all); no confinement. newt's own secrets and switches \
-         are still withheld. This is --yolo --full-access plus your shell and environment; \
-         drop the flag to restore confinement.",
+/// The session-start banner for the `--ambient` axis and for `--yolo`, which is all three
+/// (#978). It lists exactly what is off. `shell` is how `$SHELL` resolved (the login shell,
+/// or why `/bin/sh` runs instead).
+fn ambient_banner(
+    authority: newt_core::launch_authority::LaunchAuthority,
+    shell: &newt_core::ambient_shell::AmbientShell,
+) -> String {
+    let environment = format!(
+        "run_command runs your {}, and child processes and stdio MCP servers get your FULL \
+         environment (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); \
+         newt's own secrets and switches are still withheld",
         shell.describe()
-    )
+    );
+    if authority.ocap_disabled() && authority.full_access() {
+        format!(
+            "⚠ YOLO (--yolo): approvals OFF (--disable-ocap), confinement OFF (--full-access), \
+             environment OFF (--ambient): {environment}. Drop the flag to restore confinement."
+        )
+    } else {
+        format!(
+            "⚠ AMBIENT (--ambient): environment OFF: {environment}. This flag alone leaves \
+             approvals and confinement as they are (--disable-ocap, --full-access; --yolo is all three)."
+        )
+    }
 }
 
 /// The unmissable session-start banner shown when the `--full-access` preset
@@ -2601,17 +2614,31 @@ mod ambient_banner_tests {
     use newt_core::ambient_shell::AmbientShell;
 
     #[test]
-    fn the_banner_says_login_shell_full_environment_and_no_confinement() {
-        let login = ambient_banner(&AmbientShell::resolve(Some("/usr/bin/zsh".as_ref())));
+    fn the_banner_lists_exactly_what_is_off() {
+        use newt_core::launch_authority::LaunchAuthority;
+        let shell = AmbientShell::resolve(Some("/usr/bin/zsh".as_ref()));
+        let yolo = LaunchAuthority::from_parts_for_test(true, true, true);
+        let all = ambient_banner(yolo, &shell);
         for needle in [
-            "AMBIENT",
+            "YOLO (--yolo)",
+            "approvals OFF (--disable-ocap)",
+            "confinement OFF (--full-access)",
+            "environment OFF (--ambient)",
             "login shell /usr/bin/zsh -l -i -c",
             "FULL environment",
-            "no confinement",
         ] {
-            assert!(login.contains(needle), "missing `{needle}`: {login}");
+            assert!(all.contains(needle), "missing `{needle}`: {all}");
         }
-        let fallback = ambient_banner(&AmbientShell::resolve(None));
+        let alone = ambient_banner(LaunchAuthority::AMBIENT, &shell);
+        assert!(
+            alone.contains("AMBIENT (--ambient): environment OFF"),
+            "{alone}"
+        );
+        assert!(
+            !alone.contains("approvals OFF") && !alone.contains("confinement OFF"),
+            "the ambient axis alone must not claim the others: {alone}"
+        );
+        let fallback = ambient_banner(LaunchAuthority::AMBIENT, &AmbientShell::resolve(None));
         assert!(
             fallback.contains("$SHELL is not set; using /bin/sh"),
             "{fallback}"

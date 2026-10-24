@@ -256,6 +256,20 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub no_prompt_for_permissions: bool,
 
+    /// Everything off, for THIS interactive session: `--yolo` is exactly
+    /// `--disable-ocap --full-access --ambient`. Approvals are off, the confinement
+    /// (fs fence, net leash, exec allowlist) is lifted, and `run_command` runs your
+    /// login shell with your full environment. The three granular flags keep their
+    /// narrow meanings on their own. Per invocation only (no config key); the session
+    /// banner lists what is off. (`--yolo` used to be an alias of `--disable-ocap`.)
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        conflicts_with = "workspace_access"
+    )]
+    pub yolo: bool,
+
     /// INTERIM (#297): disable the ocap confined shell for THIS invocation —
     /// run_command executes unconfined on the plain host shell (same venv/PATH
     /// handling, same output shape). fs tools keep the workspace fence and
@@ -264,7 +278,7 @@ pub struct Cli {
     /// the bypass must be asserted per invocation. Static Brush filters are
     /// integrated; native confinement and authenticated worker transport still
     /// need platform parity before this interim switch can be retired.
-    #[arg(long, visible_alias = "yolo", global = true, default_value_t = false)]
+    #[arg(long, global = true, default_value_t = false)]
     pub disable_ocap: bool,
 
     /// Use cmd.exe /C instead of Brush for Windows ambient commands.
@@ -276,22 +290,24 @@ pub struct Cli {
     /// for THIS invocation — session authority becomes unrestricted (fs fence,
     /// net leash, and exec allowlist all lifted; `write_file` behaves exactly
     /// as it does under the `full_access` preset). A DISTINCT switch from
-    /// `--disable-ocap`/`--yolo`: this widens *authority*, while `--yolo`
+    /// `--disable-ocap`: this widens *authority*, while `--disable-ocap`
     /// changes the exec *mechanism* (host shell vs confined shell) and still
-    /// honors the active exec floor. Combine them (`--yolo --full-access`)
-    /// for a fully unrestricted host shell. Equivalent to `NEWT_FULL_ACCESS=1`;
+    /// honors the active exec floor. Combine them (`--disable-ocap --full-access`)
+    /// for a fully unrestricted host shell, or use `--yolo` for those two plus
+    /// `--ambient`. Equivalent to `NEWT_FULL_ACCESS=1`;
     /// deliberately NO config-file key beyond the existing preset, so the
     /// per-run override can never silently persist.
     #[arg(long, global = true, default_value_t = false)]
     pub full_access: bool,
 
-    /// The operator's own shell and environment for this interactive session, with NO
-    /// confinement: `run_command` runs your login shell (`$SHELL -l -i`, so zsh
-    /// functions, aliases and rc-set PATH work) and the child, and stdio MCP servers,
-    /// get your full environment (DISPLAY, WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS,
-    /// XDG_RUNTIME_DIR reach a browser launch). Implies `--yolo --full-access`; newt's
-    /// own secrets and switches are still withheld from children. Equivalent to
-    /// NEWT_AMBIENT=1 plus both; no config key, so it is asserted per invocation.
+    /// The operator's own shell and environment for this interactive session: where
+    /// `run_command` runs on the host shell it runs your login shell (`$SHELL -l -i`, so
+    /// zsh functions, aliases and rc-set PATH work), and the child processes and stdio
+    /// MCP servers get your FULL environment (DISPLAY, WAYLAND_DISPLAY,
+    /// DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR reach a browser launch). On its own it
+    /// changes only that: it does not lift confinement or approvals (`--full-access`,
+    /// `--disable-ocap`); `--yolo` is all three. newt's own secrets and switches are
+    /// still withheld from children. Equivalent to NEWT_AMBIENT=1; no config key.
     #[arg(
         long,
         global = true,
@@ -305,7 +321,7 @@ pub struct Cli {
     /// Native filesystem confinement remains active; network access follows
     /// the independently configured permissions. This startup choice overrides
     /// the configured preset and inherited global-access/host-bypass switches.
-    #[arg(long, global = true, default_value_t = false, conflicts_with_all = ["full_access", "disable_ocap"])]
+    #[arg(long, global = true, default_value_t = false, conflicts_with_all = ["full_access", "disable_ocap", "ambient", "yolo"])]
     pub workspace_access: bool,
 
     /// Select the shell **engine** `run_command` uses for THIS invocation (the
@@ -326,7 +342,7 @@ pub struct Cli {
     /// original command on the normal exec path instead. Git commands always
     /// use native exec, with or without this switch. This is the L2
     /// convenience-OFF switch and is DELIBERATELY DISTINCT from `--disable-ocap`
-    /// /`--yolo`: it NEVER disables the L3 boundary — the confined shell still
+    /// and `--yolo`: it NEVER disables the L3 boundary — the confined shell still
     /// gates exec and the fs fence still governs reads. Equivalent to
     /// `NEWT_NO_ROUTE=1`; env-only, no config key, so it cannot silently persist.
     #[arg(long, global = true, default_value_t = false)]
@@ -1187,14 +1203,24 @@ fn validate_launch_options(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+impl Cli {
+    /// `(disable_ocap, full_access, ambient)` as asserted: `--yolo` asserts all three, each
+    /// granular flag only its own.
+    #[must_use]
+    pub fn switches(&self) -> (bool, bool, bool) {
+        (
+            self.disable_ocap || self.yolo,
+            self.full_access || self.yolo,
+            self.ambient || self.yolo,
+        )
+    }
+}
+
 pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
     validate_launch_options(&cli)?;
-    // `--ambient` is `--yolo --full-access` plus the login shell and full environment:
-    // the same two switches, not a parallel posture (#978).
-    if cli.ambient {
-        cli.disable_ocap = true;
-        cli.full_access = true;
-    }
+    // `--yolo` is the three granular switches at once; each granular flag alone keeps
+    // its own narrow meaning (#978).
+    (cli.disable_ocap, cli.full_access, cli.ambient) = cli.switches();
     if cli.windows_cmd {
         // Same startup-only publication seam as the other shell switches.
         unsafe { std::env::set_var("NEWT_WINDOWS_CMD", "1") };
@@ -1418,8 +1444,9 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
         Command::Code { path } => {
             let selected_workspace = newt_tui::resolve_code_workspace(path.as_deref())?;
             anyhow::ensure!(
-                !selected_workspace.has_profile || (!cli.full_access && !cli.disable_ocap),
-                "saved workspace settings require a confined launch; remove --full-access/--yolo or use another workspace"
+                !selected_workspace.has_profile
+                    || (!cli.full_access && !cli.disable_ocap && !cli.ambient),
+                "saved workspace settings require a confined launch; remove --full-access/--disable-ocap/--ambient/--yolo or use another workspace"
             );
             let path = selected_workspace.path;
             // --debug / --trace / --num-ctx set env vars so the TUI picks them up
@@ -2812,19 +2839,40 @@ mod tests {
     }
 
     #[test]
-    fn parses_disable_ocap_and_yolo_alias() {
-        // #297: works bare (default `code` command) and explicit, and the
-        // --yolo alias maps to the same field; OFF by default — no flag
-        // means the confined dispatch is unchanged.
+    fn parses_disable_ocap() {
+        // #297: works bare (default `code` command) and explicit; OFF by default — no
+        // flag means the confined dispatch is unchanged.
         let cli = Cli::try_parse_from(["newt", "--disable-ocap"]).unwrap();
         assert!(cli.disable_ocap);
-        let cli = Cli::try_parse_from(["newt", "--yolo"]).unwrap();
-        assert!(cli.disable_ocap);
-        let cli = Cli::try_parse_from(["newt", "code", "--yolo"]).unwrap();
+        let cli = Cli::try_parse_from(["newt", "code", "--disable-ocap"]).unwrap();
         assert!(cli.disable_ocap);
         assert!(matches!(cli.command, Some(Command::Code { .. })));
         let cli = Cli::try_parse_from(["newt"]).unwrap();
         assert!(!cli.disable_ocap);
+    }
+
+    /// #978: `--yolo` is all three switches; each granular flag asserts only its own axis;
+    /// no flag asserts none. (`--yolo` used to be an alias of `--disable-ocap`.)
+    #[test]
+    fn yolo_is_all_three_and_each_granular_flag_only_its_axis() {
+        let switches = |args: &[&str]| {
+            let mut argv = vec!["newt"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).unwrap().switches()
+        };
+        // (disable_ocap, full_access, ambient)
+        assert_eq!(switches(&[]), (false, false, false));
+        assert_eq!(switches(&["--yolo"]), (true, true, true));
+        assert_eq!(switches(&["code", "--yolo"]), (true, true, true));
+        assert_eq!(switches(&["--disable-ocap"]), (true, false, false));
+        assert_eq!(switches(&["--full-access"]), (false, true, false));
+        assert_eq!(switches(&["--ambient"]), (false, false, true));
+        assert_eq!(
+            switches(&["--disable-ocap", "--full-access"]),
+            (true, true, false),
+            "the old pair is not ambient"
+        );
+        assert!(Cli::try_parse_from(["newt", "--yolo", "--workspace-access"]).is_err());
     }
 
     /// facade P4 (#780): `--no-route` parses bare and under `code`, is OFF by
@@ -2842,8 +2890,10 @@ mod tests {
         // the routing flag: distinct mechanisms, never aliased.
         let cli = Cli::try_parse_from(["newt", "--no-route"]).unwrap();
         assert!(cli.no_route && !cli.disable_ocap);
-        let cli = Cli::try_parse_from(["newt", "--yolo"]).unwrap();
+        let cli = Cli::try_parse_from(["newt", "--disable-ocap"]).unwrap();
         assert!(cli.disable_ocap && !cli.no_route);
+        let cli = Cli::try_parse_from(["newt", "--yolo"]).unwrap();
+        assert!(cli.yolo && !cli.no_route);
     }
 
     /// `--full-access` parses bare and under `code`, is OFF by default, and is
@@ -2859,9 +2909,9 @@ mod tests {
         let cli = Cli::try_parse_from(["newt", "code", "--full-access"]).unwrap();
         assert!(cli.full_access);
         assert!(matches!(cli.command, Some(Command::Code { .. })));
-        let cli = Cli::try_parse_from(["newt", "--yolo"]).unwrap();
+        let cli = Cli::try_parse_from(["newt", "--disable-ocap"]).unwrap();
         assert!(cli.disable_ocap && !cli.full_access);
-        let cli = Cli::try_parse_from(["newt", "--yolo", "--full-access"]).unwrap();
+        let cli = Cli::try_parse_from(["newt", "--disable-ocap", "--full-access"]).unwrap();
         assert!(cli.disable_ocap && cli.full_access);
     }
 

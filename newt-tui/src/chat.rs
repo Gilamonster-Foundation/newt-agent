@@ -2467,11 +2467,12 @@ fn session_body(
         }
     }
 
-    // --ambient (#978): say plainly what this session is, after the two banners it implies.
-    if newt_core::launch_authority::current().ambient() {
+    // --ambient / --yolo (#978): say plainly what is off, after the per-axis banners above.
+    let authority = newt_core::launch_authority::current();
+    if authority.ambient() {
         let shell =
             newt_core::ambient_shell::AmbientShell::resolve(std::env::var_os("SHELL").as_deref());
-        print_newt(&ambient_banner(&shell), color, verbose);
+        print_newt(&ambient_banner(authority, &shell), color, verbose);
     }
 
     // Connect to discovered MCP servers ONCE for the session (newt config +

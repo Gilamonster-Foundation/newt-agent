@@ -4,8 +4,8 @@
 //!
 //! # Why this exists (`noninteractive-launch-policy` closure)
 //!
-//! The authority switches (`--disable-ocap`/`--yolo`, `--full-access`,
-//! `--unsafe-host-exec`) have env twins (`NEWT_DISABLE_OCAP`,
+//! The authority switches (`--disable-ocap`, `--full-access`, `--ambient`; `--yolo` asserts
+//! all three; and `--unsafe-host-exec`) have env twins (`NEWT_DISABLE_OCAP`,
 //! `NEWT_FULL_ACCESS`, `NEWT_UNSAFE_HOST_EXEC`) so a wrapper/pod can assert them.
 //! Historically deep libraries decided authority by reading those env vars
 //! *live* (`std::env::var(...)`) at the point of use — so a value that appeared
@@ -44,7 +44,7 @@
 /// [`meet`]: LaunchAuthority::meet
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LaunchAuthority {
-    /// `--disable-ocap` / `--yolo` (`NEWT_DISABLE_OCAP=1`): run `run_command`
+    /// `--disable-ocap` (and `--yolo`) (`NEWT_DISABLE_OCAP=1`): run `run_command`
     /// UNCONFINED on the host shell instead of the confined engine.
     ocap_disabled: bool,
     /// `--full-access` (`NEWT_FULL_ACCESS=1`): build the session policy from the
@@ -56,8 +56,8 @@ pub struct LaunchAuthority {
     /// Explicit directory-scoped startup choice; never inferred from the env.
     workspace_access: bool,
     /// `--ambient` (`NEWT_AMBIENT=1`): the operator's login shell and full process
-    /// environment. Grants nothing by itself: [`LaunchAuthority::ambient`] also
-    /// needs the two bits above, which `--ambient` sets with it.
+    /// environment. Its own axis: it lifts no confinement and no approvals (those are
+    /// the two bits above); `--yolo` asserts all three.
     ambient: bool,
 }
 
@@ -102,7 +102,7 @@ impl LaunchAuthority {
         }
     }
 
-    /// `--disable-ocap` / `--yolo` asserted for this process.
+    /// `--disable-ocap` (or `--yolo`) asserted for this process.
     #[must_use]
     pub const fn ocap_disabled(self) -> bool {
         self.ocap_disabled
@@ -127,20 +127,33 @@ impl LaunchAuthority {
         self.workspace_access
     }
 
-    /// The ambient posture: `--ambient` asserted AND both authority bits it implies are
-    /// still on (a `meet` that cleared either also ends the posture). Under it,
-    /// `run_command` runs the operator's login shell and the child keeps the full
-    /// process environment, and so do stdio MCP servers. Everything else (confined,
-    /// `--yolo`, `--full-access`, `--yolo --full-access`, `--unsafe-host-exec`) is not it.
+    /// `--ambient` asserted: `run_command`, where it runs on the host shell, runs the
+    /// operator's login shell, and the child and stdio MCP servers keep the full
+    /// process environment. Only this axis: `--yolo --full-access`,
+    /// `--unsafe-host-exec` and the confined default do not set it.
     #[must_use]
     pub const fn ambient(self) -> bool {
-        self.ambient && self.ocap_disabled && self.full_access
+        self.ambient
     }
 
-    /// The authority `--ambient` asks for: OCAP off, full access, the ambient bit.
+    /// The three axes as given, for tests in other crates (banner wording).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_parts_for_test(
+        ocap_disabled: bool,
+        full_access: bool,
+        ambient: bool,
+    ) -> Self {
+        Self {
+            ocap_disabled,
+            full_access,
+            ambient,
+            ..Self::CONFINED
+        }
+    }
+
+    /// Only the ambient axis (what `--ambient` alone asks for).
     pub const AMBIENT: Self = Self {
-        ocap_disabled: true,
-        full_access: true,
         ambient: true,
         ..Self::CONFINED
     };
@@ -419,10 +432,11 @@ mod tests {
         reset_for_test();
     }
 
-    /// Only `--ambient` is the ambient posture: the pair `--yolo --full-access` and the
-    /// bench lane's `--unsafe-host-exec` are not, and the bit alone grants nothing.
+    /// Only `--ambient` sets the ambient axis, and it sets only that axis: the pair
+    /// `--yolo --full-access` and the bench lane's `--unsafe-host-exec` are not it, and
+    /// attenuation clears it like the other bits.
     #[test]
-    fn only_the_ambient_flag_is_the_ambient_posture() {
+    fn only_the_ambient_flag_sets_the_ambient_axis() {
         let _g = serial();
         let _a = EnvVar::set("NEWT_DISABLE_OCAP", "1");
         let _b = EnvVar::set("NEWT_FULL_ACCESS", "1");
@@ -430,27 +444,24 @@ mod tests {
         let _d = EnvVar::unset("NEWT_AMBIENT");
         assert!(
             !LaunchAuthority::from_env().ambient(),
-            "--yolo --full-access is not --ambient"
+            "--disable-ocap --full-access is not --ambient"
         );
         let _e = EnvVar::set("NEWT_AMBIENT", "true");
         assert!(!LaunchAuthority::from_env().ambient(), "only \"1\" enables");
+        drop((_a, _b, _e));
         let _f = EnvVar::set("NEWT_AMBIENT", "1");
-        assert!(LaunchAuthority::from_env().ambient());
-        assert!(LaunchAuthority::AMBIENT.ambient());
-        // The bit alone grants nothing, and attenuation ends the posture.
-        let bare = LaunchAuthority {
-            ambient: true,
-            ..LaunchAuthority::CONFINED
-        };
-        assert!(!bare.ambient());
+        let _a = EnvVar::unset("NEWT_DISABLE_OCAP");
+        let _b = EnvVar::unset("NEWT_FULL_ACCESS");
+        let alone = LaunchAuthority::from_env();
+        assert!(alone.ambient());
+        assert!(
+            !alone.ocap_disabled() && !alone.full_access(),
+            "its own axis only"
+        );
+        assert_eq!(alone, LaunchAuthority::AMBIENT);
         assert!(!LaunchAuthority::AMBIENT
             .meet(LaunchAuthority::CONFINED)
             .ambient());
-        let no_full_access = LaunchAuthority {
-            full_access: false,
-            ..LaunchAuthority::AMBIENT
-        };
-        assert!(!no_full_access.ambient());
         assert!(!LaunchAuthority::default().ambient());
     }
 }

@@ -1,11 +1,12 @@
 //! #978: `--ambient` end to end. A real `newt` chat loop, a recording provider that asks
 //! for one `run_command`, and what the command printed as the witness:
 //!
-//! - under `--ambient` the command ran in the operator's login shell (`$SHELL`), saw the
-//!   operator's `DISPLAY`, and the interactive-shell noise did not reach the model;
-//! - under `--yolo --full-access` (the pair `--ambient` implies) the same command still
-//!   runs `bash -c`: nothing changes outside the new flag;
-//! - the session banner says plainly what `--ambient` is.
+//! - under `--yolo` (= `--disable-ocap --full-access --ambient`) the command ran in the
+//!   operator's login shell (`$SHELL`), saw the operator's `DISPLAY`, and the
+//!   interactive-shell noise did not reach the model; the banner lists what is off;
+//! - the granular flags keep their narrow meaning: `--disable-ocap --full-access` still
+//!   runs `bash -c` (no ambient banner), `--ambient` alone claims only its own axis, and
+//!   `--disable-ocap --ambient` composes the host shell with the login shell.
 //!
 //! Run: `cargo test -p newt-agent --test ambient_session`.
 
@@ -174,8 +175,8 @@ scheduled = false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ambient_runs_the_login_shell_with_the_operators_display() {
-    let (result, shown) = session(&["--ambient"]).await;
+async fn yolo_runs_the_login_shell_with_the_operators_display_and_lists_what_is_off() {
+    let (result, shown) = session(&["--yolo"]).await;
     assert!(
         result.contains("[/bin/bash][:77]"),
         "{result}\n--- session ---\n{shown}"
@@ -185,23 +186,61 @@ async fn ambient_runs_the_login_shell_with_the_operators_display() {
         "interactive-shell noise leaked to the model: {result}"
     );
     for needle in [
-        "AMBIENT",
+        "YOLO (--yolo)",
+        "approvals OFF (--disable-ocap)",
+        "confinement OFF (--full-access)",
+        "environment OFF (--ambient)",
         "login shell /bin/bash -l -i -c",
         "FULL environment",
-        "no confinement",
     ] {
         assert!(shown.contains(needle), "banner lacks `{needle}`:\n{shown}");
     }
 }
 
-/// `--yolo --full-access` is what `--ambient` implies, and it is unchanged: `bash -c`,
-/// no login shell, no ambient banner.
+/// `--disable-ocap --full-access` is two of the three, and unchanged: `bash -c`, no
+/// ambient banner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_yolo_full_access_pair_still_runs_bash_dash_c() {
-    let (result, shown) = session(&["--yolo", "--full-access"]).await;
+async fn the_granular_pair_still_runs_bash_dash_c() {
+    let (result, shown) = session(&["--disable-ocap", "--full-access"]).await;
     assert!(
         result.contains("[bash][:77]"),
         "{result}\n--- session ---\n{shown}"
     );
-    assert!(!shown.contains("AMBIENT (--ambient)"), "{shown}");
+    assert!(!shown.contains("(--ambient)"), "{shown}");
+}
+
+/// `--ambient` alone is its own axis: the banner names the environment and does not
+/// claim approvals or confinement are off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambient_alone_claims_only_the_environment() {
+    let (result, shown) = session(&["--ambient"]).await;
+    // Confinement is untouched: run_command still ran in the confined shell, which has
+    // neither the login shell nor the operator's display.
+    assert!(
+        !result.contains("/bin/bash") && !result.contains(":77"),
+        "{result}"
+    );
+    assert!(
+        shown.contains("AMBIENT (--ambient): environment OFF"),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("approvals OFF") && !shown.contains("confinement OFF"),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("ocap DISABLED") && !shown.contains("FULL ACCESS"),
+        "{shown}"
+    );
+}
+
+/// The three flags spelled out are `--yolo`: same login shell, same display.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_three_granular_flags_together_are_yolo() {
+    let (result, shown) = session(&["--disable-ocap", "--full-access", "--ambient"]).await;
+    assert!(
+        result.contains("[/bin/bash][:77]"),
+        "{result}\n--- session ---\n{shown}"
+    );
+    assert!(shown.contains("YOLO (--yolo)"), "{shown}");
 }

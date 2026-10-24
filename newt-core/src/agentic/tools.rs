@@ -383,7 +383,7 @@ pub(crate) fn validate_tool_call_batch(
 /// INTERIM (#297): is the ocap exec bypass asserted for this invocation?
 ///
 /// True only when `NEWT_DISABLE_OCAP=1` — set by the CLI's `--disable-ocap`
-/// flag (alias `--yolo`) or exported directly for harness/pod use. The value
+/// flag (`--yolo` sets it with the other two axes) or exported directly for harness/pod use. The value
 /// must be exactly `"1"`: a security bypass reads fail-closed, so anything
 /// else (including `true`) leaves confinement on. Deliberately env-only —
 /// there is NO config-file key, so the bypass can never silently persist; it
@@ -434,12 +434,12 @@ pub fn ocap_disabled() -> bool {
 /// widening switch reads fail-closed — and it is deliberately env-only, so
 /// the override can never silently persist.
 ///
-/// This is a DISTINCT switch from [`ocap_disabled`] (`--yolo`): the two
-/// compose but never alias. `--full-access` widens the session *authority*
+/// This is a DISTINCT switch from [`ocap_disabled`] (`--disable-ocap`): the two
+/// compose but never alias (`--yolo` asserts both, plus `--ambient`). `--full-access` widens the session *authority*
 /// (fs fence, net leash, exec allowlist → unrestricted, which also empties
-/// the #774 exec floor); `--yolo` changes the exec *mechanism* (host shell
+/// the #774 exec floor); `--disable-ocap` changes the exec *mechanism* (host shell
 /// instead of the confined shell) and still honors whatever floor is in
-/// force. `--yolo --full-access` together yield an unrestricted host shell.
+/// force. `--disable-ocap --full-access` together yield an unrestricted host shell.
 pub fn full_access_requested() -> bool {
     // Frozen `LaunchAuthority` (resolved once from `NEWT_FULL_ACCESS` at
     // startup), never the live env — a later-appearing switch cannot widen the
