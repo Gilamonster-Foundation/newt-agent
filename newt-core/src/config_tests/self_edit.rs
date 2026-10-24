@@ -104,3 +104,74 @@ fn apply_config_edit_holds_lock_and_refuses_stale_text() {
         changed
     );
 }
+
+/// PR #3004 review: `skip_serializing_if` drops a known key set to its empty
+/// value, so a serialize round trip alone mistook a reset for an unknown key.
+#[test]
+fn with_config_edit_accepts_reset_to_empty() {
+    let original = "[skills]\nsearch = [\"custom\"]\nbundled_dir = \"/opt/skills\"\n";
+    let reset = Config::with_config_edit(
+        original,
+        &edit("skills.search", serde_json::json!([]), false),
+    )
+    .unwrap();
+    let reset = Config::with_config_edit(
+        &reset,
+        &edit("skills.bundled_dir", serde_json::json!(""), false),
+    )
+    .unwrap();
+    let skills = toml::from_str::<Config>(&reset).unwrap().skills.unwrap();
+    assert!(skills.search.is_empty());
+    assert!(skills.bundled_dir.is_empty());
+}
+
+/// PR #3004 review: append compared TOML spelling, so `['PATH']` plus "PATH"
+/// duplicated the entry. An already-present value leaves the text untouched.
+#[test]
+fn with_config_edit_append_dedupes_by_value_not_spelling() {
+    for original in [
+        "[shell]\nenv_passthrough = ['PATH'] # literal\n",
+        "[shell]\nenv_passthrough = [\"PATH\"]\n",
+        "[shell]\nenv_passthrough = [\"\\u0050ATH\"]\n",
+    ] {
+        let same = Config::with_config_edit(
+            original,
+            &edit("shell.env_passthrough", serde_json::json!(["PATH"]), true),
+        )
+        .unwrap();
+        assert_eq!(same, original);
+    }
+}
+
+/// PR #3004 review: the backup must replace a `.bak` symlink or hard link as a
+/// directory entry, never write through it into an unrelated file.
+#[cfg(unix)]
+#[test]
+fn update_config_file_replaces_backup_links_without_touching_their_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let unrelated = dir.path().join("unrelated.txt");
+    for link in [
+        |target: &std::path::Path, bak: &std::path::Path| {
+            std::os::unix::fs::symlink(target, bak).unwrap();
+        },
+        |target: &std::path::Path, bak: &std::path::Path| {
+            std::fs::hard_link(target, bak).unwrap();
+        },
+    ] {
+        std::fs::write(&path, "model = \"old\"\n").unwrap();
+        std::fs::write(&unrelated, "marker").unwrap();
+        let _ = std::fs::remove_file(backup_path(&path));
+        link(&unrelated, &backup_path(&path));
+        Config::update_config_file(&path, |_| Ok("model = \"new\"\n".into())).unwrap();
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "marker");
+        assert!(!std::fs::symlink_metadata(backup_path(&path))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&path)).unwrap(),
+            "model = \"old\"\n"
+        );
+    }
+}

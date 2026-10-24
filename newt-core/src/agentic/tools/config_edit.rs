@@ -226,6 +226,32 @@ mod tests {
         assert!(!backup_path(&path).exists());
     }
 
+    /// PR #3004 review: a refusal before the operator is asked must not echo
+    /// config text, which TOML diagnostics quote, back to the model.
+    #[test]
+    fn propose_config_edit_errors_never_echo_config_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let wrong_type = serde_json::json!({
+            "key": "shell.env_passthrough", "value": 7, "reason": "r"
+        });
+        for (config, args) in [
+            (
+                "shell = { env_passthrough = [\"PATH\"], api_secret_note = \"SYNTHETIC_SECRET\" }\n",
+                wrong_type,
+            ),
+            ("note = = \"SYNTHETIC_SECRET\"\n", browser()),
+        ] {
+            std::fs::write(&path, config).unwrap();
+            let mut operator = gate(HumanQuestionOutcome::Answer("apply".into()));
+            let out = execute_propose_config_edit(&args, Some(&mut operator), Some(&path), None);
+            assert!(out.contains("config unchanged"), "{out}");
+            assert!(!out.contains("SYNTHETIC_SECRET"), "{out}");
+            assert!(operator.asked.is_empty());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), config);
+        }
+    }
+
     #[test]
     fn propose_config_edit_headless_refuses_without_writing() {
         let dir = tempfile::tempdir().unwrap();

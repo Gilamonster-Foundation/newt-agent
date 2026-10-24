@@ -37,55 +37,7 @@ impl Config {
                 edit.key
             )));
         }
-        let (last, parents) = segments.split_last().expect("split yields a segment");
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| invalid(format!("config is not valid TOML: {e}")))?;
-        let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
-        for segment in parents {
-            table = table
-                .entry(segment)
-                .or_insert_with(|| {
-                    let mut created = toml_edit::Table::new();
-                    created.set_implicit(true);
-                    toml_edit::Item::Table(created)
-                })
-                .as_table_like_mut()
-                .ok_or_else(|| invalid(format!("'{segment}' is not a table")))?;
-        }
-        let value = toml_value(&edit.value)?;
-        match table.get_mut(last) {
-            Some(item) if item.is_table_like() => {
-                return Err(invalid(format!(
-                    "'{}' is a table; name a key inside it",
-                    edit.key
-                )))
-            }
-            Some(item) if edit.append => {
-                let array = item
-                    .as_array_mut()
-                    .ok_or_else(|| invalid(format!("'{}' is not a list", edit.key)))?;
-                append_new(array, value);
-            }
-            Some(item) => {
-                let mut value = value;
-                if let Some(previous) = item.as_value() {
-                    *value.decor_mut() = previous.decor().clone();
-                }
-                *item = toml_edit::Item::Value(value);
-            }
-            None => {
-                let value = if edit.append {
-                    let mut array = toml_edit::Array::new();
-                    append_new(&mut array, value);
-                    array.into()
-                } else {
-                    value
-                };
-                table.insert(last, toml_edit::Item::Value(value));
-            }
-        }
-        let updated = doc.to_string();
+        let updated = edit_document(text, &segments, toml_value(&edit.value)?, edit.append)?;
         require_known_key(&updated, &segments)?;
         Ok(updated)
     }
@@ -132,10 +84,10 @@ impl Config {
             Err(error) => return Err(NewtError::Io(error)),
         };
         let updated = update(&text)?;
-        if destination.as_path().exists() {
-            // `copy` keeps the file mode, so a private config stays private.
-            std::fs::copy(destination.as_path(), backup_path(destination.as_path()))
-                .map_err(NewtError::Io)?;
+        if let Ok(metadata) = std::fs::metadata(destination.as_path()) {
+            write_backup(destination.as_path(), &text, &metadata.permissions()).map_err(
+                |error| NewtError::Config(format!("back up {}: {error:#}", path.display())),
+            )?;
         }
         destination
             .atomic_write(updated.as_bytes())
@@ -145,6 +97,79 @@ impl Config {
 
 fn invalid(message: String) -> NewtError {
     NewtError::Config(message)
+}
+
+/// Set or append `value` at `segments` in `text`. Errors carry no config text:
+/// a TOML diagnostic quotes the source, and the source can hold secrets.
+fn edit_document(
+    text: &str,
+    segments: &[&str],
+    value: toml_edit::Value,
+    append: bool,
+) -> Result<String> {
+    let key = segments.join(".");
+    let (last, parents) = segments.split_last().expect("split yields a segment");
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| invalid("config is not valid TOML".into()))?;
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    for segment in parents {
+        table = table
+            .entry(segment)
+            .or_insert_with(|| {
+                let mut created = toml_edit::Table::new();
+                created.set_implicit(true);
+                toml_edit::Item::Table(created)
+            })
+            .as_table_like_mut()
+            .ok_or_else(|| invalid(format!("'{segment}' is not a table")))?;
+    }
+    match table.get_mut(last) {
+        Some(item) if item.is_table_like() => {
+            return Err(invalid(format!("'{key}' is a table; name a key inside it")))
+        }
+        Some(item) if append => {
+            let array = item
+                .as_array_mut()
+                .ok_or_else(|| invalid(format!("'{key}' is not a list")))?;
+            append_new(array, value);
+        }
+        Some(item) => {
+            let mut value = value;
+            if let Some(previous) = item.as_value() {
+                *value.decor_mut() = previous.decor().clone();
+            }
+            *item = toml_edit::Item::Value(value);
+        }
+        None => {
+            let value = if append {
+                let mut array = toml_edit::Array::new();
+                append_new(&mut array, value);
+                array.into()
+            } else {
+                value
+            };
+            table.insert(last, toml_edit::Item::Value(value));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Write `<config>.bak` by staging a fresh file and renaming it over the
+/// entry, so an existing `.bak` symlink or hard link is replaced, never
+/// written through.
+fn write_backup(
+    config: &Path,
+    text: &str,
+    permissions: &std::fs::Permissions,
+) -> anyhow::Result<()> {
+    let backup = crate::atomic_fs::ResolvedPath::resolve_entry(&backup_path(config))?;
+    let staged = backup.stage_with_permissions(text.as_bytes(), Some(permissions), true)?;
+    if let Err(error) = backup.durable_replace(&staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 /// A JSON scalar or list as a TOML value. Objects and null have no edit
@@ -175,38 +200,69 @@ fn toml_value(json: &serde_json::Value) -> Result<toml_edit::Value> {
 }
 
 /// Push each entry of `value` (or `value` itself) not already in `array`.
+/// Entries compare by value, not spelling: `'PATH'` and `"PATH"` are one.
 fn append_new(array: &mut toml_edit::Array, value: toml_edit::Value) {
-    let bare = |value: &toml_edit::Value| {
-        let mut value = value.clone();
-        value.decor_mut().clear();
-        value.to_string()
-    };
     let items = match value {
         toml_edit::Value::Array(items) => items.into_iter().collect(),
         single => vec![single],
     };
     for item in items {
-        if !array.iter().any(|existing| bare(existing) == bare(&item)) {
+        if !array.iter().any(|existing| same_value(existing, &item)) {
             array.push(item);
         }
     }
 }
 
-/// The schema's own answer to "is this a key": the edited text must parse as
-/// `Config`, and the key must survive a serialize round trip. A key `Config`
-/// ignores is dropped by that trip.
-fn require_known_key(text: &str, segments: &[&str]) -> Result<()> {
-    let config: Config =
-        toml::from_str(text).map_err(|e| invalid(format!("edit makes config invalid: {e}")))?;
-    let mut value =
-        toml::Value::try_from(&config).map_err(|e| invalid(format!("serialize config: {e}")))?;
-    for segment in segments {
-        value = value
-            .get(segment)
-            .cloned()
-            .ok_or_else(|| invalid(format!("'{}' is not a config key", segments.join("."))))?;
+fn same_value(a: &toml_edit::Value, b: &toml_edit::Value) -> bool {
+    use toml_edit::Value as V;
+    match (a, b) {
+        (V::String(a), V::String(b)) => a.value() == b.value(),
+        (V::Integer(a), V::Integer(b)) => a.value() == b.value(),
+        (V::Float(a), V::Float(b)) => a.value() == b.value(),
+        (V::Boolean(a), V::Boolean(b)) => a.value() == b.value(),
+        (V::Array(a), V::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| same_value(a, b))
+        }
+        (a, b) => a.to_string().trim() == b.to_string().trim(),
     }
-    Ok(())
+}
+
+/// The schema's own answer to "is this a key". `Config` ignores unknown keys,
+/// so an unknown key parses with ANY value and never serializes back. A known
+/// key either serializes back, or rejects (or keeps) one of a few probe values
+/// of different types; probing makes the check independent of a value that
+/// `skip_serializing_if` drops, such as `[]` or `""`.
+fn require_known_key(text: &str, segments: &[&str]) -> Result<()> {
+    let key = segments.join(".");
+    let present = |text: &str| -> Option<()> {
+        let config: Config = toml::from_str(text).ok()?;
+        let mut value = toml::Value::try_from(&config).ok()?;
+        for segment in segments {
+            value = value.get(segment)?.clone();
+        }
+        Some(())
+    };
+    if toml::from_str::<Config>(text).is_err() {
+        return Err(invalid(format!(
+            "'{key}' would make the config invalid (wrong type or value)"
+        )));
+    }
+    if present(text).is_some() {
+        return Ok(());
+    }
+    let probes: [toml_edit::Value; 4] = [
+        "newt-probe".into(),
+        1.into(),
+        true.into(),
+        toml_edit::Array::from_iter(["newt-probe"]).into(),
+    ];
+    for probe in probes {
+        let probed = edit_document(text, segments, probe, false)?;
+        if toml::from_str::<Config>(&probed).is_err() || present(&probed).is_some() {
+            return Ok(());
+        }
+    }
+    Err(invalid(format!("'{key}' is not a config key")))
 }
 
 /// `<path>.bak`, beside the config it backs up.
