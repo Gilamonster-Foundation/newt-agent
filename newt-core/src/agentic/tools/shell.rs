@@ -724,7 +724,7 @@ impl ShellRoute {
 /// Capture the session-default route. Brokers, leases and exec floors are
 /// command-specific: execution re-evaluates them before dispatch.
 pub fn run_command_dialect_sentence() -> &'static str {
-    select_shell_route(
+    let route = select_shell_route(
         ocap_disabled(),
         false,
         false,
@@ -733,8 +733,17 @@ pub fn run_command_dialect_sentence() -> &'static str {
         crate::config::windows_cmd_enabled(),
         crate::ambient_brush::installed(),
         shell_engine(),
-    )
-    .sentence()
+    );
+    // `--ambient` runs the operator's login shell: a non-POSIX one (fish) changes what
+    // the model must write, so the guidance follows the shell that will run.
+    if route == ShellRoute::BashSh && crate::launch_authority::current().ambient() {
+        if let Some(sentence) =
+            crate::ambient_shell::AmbientShell::resolve_host().dialect_sentence()
+        {
+            return sentence;
+        }
+    }
+    route.sentence()
 }
 
 /// Pure session-default guidance with injected platform/authority and an installed runner.
@@ -2195,6 +2204,7 @@ pub const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
     "NEWT_DISABLE_OCAP",
     "NEWT_FULL_ACCESS",
     "NEWT_UNSAFE_HOST_EXEC",
+    "NEWT_AMBIENT",
     "NEWT_BENCH_OCAP",
     "NEWT_SHELL_ENGINE",
     "NEWT_WINDOWS_CMD",
@@ -2253,6 +2263,18 @@ fn bash_sh_argv(
     }
 }
 
+/// Say once per process, on stderr, that `--ambient` could not use the login shell and
+/// `/bin/sh` runs instead (the startup banner says it too; this covers a `$SHELL` that
+/// changed or vanished since).
+fn note_ambient_fallback(shell: &crate::ambient_shell::AmbientShell) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if matches!(shell, crate::ambient_shell::AmbientShell::Fallback { .. })
+        && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!("--ambient: {}", shell.describe());
+    }
+}
+
 /// Build the host-shell child command, stripping newt's whole control plane
 /// (authority switches, newt's own secrets, config redirects —
 /// [`strip_child_authority_env`]) so
@@ -2302,11 +2324,9 @@ fn host_shell_command_at(
     // the argv it always did.
     let login =
         (route == ShellRoute::BashSh && crate::launch_authority::current().ambient()).then(|| {
-            bash_sh_argv(
-                &crate::ambient_shell::AmbientShell::resolve(std::env::var_os("SHELL").as_deref()),
-                fallback,
-                cmd,
-            )
+            let shell = crate::ambient_shell::AmbientShell::resolve_host();
+            note_ambient_fallback(&shell);
+            bash_sh_argv(&shell, fallback, cmd)
         });
     let program = login.as_ref().map_or(program, |(p, _)| p.as_os_str());
     let mut c = tokio::process::Command::new(program);

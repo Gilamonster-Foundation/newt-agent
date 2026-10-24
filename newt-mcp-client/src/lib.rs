@@ -721,10 +721,21 @@ fn parent_passthrough(
     ambient: bool,
     vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(String, String)> {
+    parent_passthrough_with(ambient, vars, cfg!(windows))
+}
+
+/// [`parent_passthrough`] with the name comparison chosen (Windows names are
+/// case-insensitive), so both behaviours are testable on any host.
+fn parent_passthrough_with(
+    ambient: bool,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    case_insensitive: bool,
+) -> Vec<(String, String)> {
     if ambient {
-        return newt_core::ambient_shell::child_env(
+        return newt_core::ambient_shell::child_env_with(
             vars,
             newt_core::agentic::CHILD_STRIPPED_AUTHORITY_ENV,
+            case_insensitive,
         );
     }
     let allowed = newt_core::mcp_stdio_env_passthrough();
@@ -732,7 +743,8 @@ fn parent_passthrough(
         .filter_map(|(k, v)| {
             let k = k.into_string().ok()?;
             allowed
-                .contains(&k.as_str())
+                .iter()
+                .any(|a| newt_core::ambient_shell::same_env_key(a, &k, case_insensitive))
                 .then(|| (k, v.to_string_lossy().into_owned()))
         })
         .collect()

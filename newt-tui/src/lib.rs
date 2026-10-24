@@ -2564,27 +2564,31 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
 }
 
 /// The session-start banner for the `--ambient` axis and for `--yolo`, which is all three
-/// (#978). It lists exactly what is off. `shell` is how `$SHELL` resolved (the login shell,
-/// or why `/bin/sh` runs instead).
+/// (#978). It lists exactly what is off, from the effective decision rather than the flags:
+/// the login shell is claimed only where `run_command` actually runs on the host shell
+/// (`--disable-ocap` with `--full-access`), and `shell` is how `$SHELL` really resolved
+/// (the login shell, or why `/bin/sh` runs instead).
 fn ambient_banner(
     authority: newt_core::launch_authority::LaunchAuthority,
     shell: &newt_core::ambient_shell::AmbientShell,
 ) -> String {
-    let environment = format!(
-        "run_command runs your {}, and child processes and stdio MCP servers get your FULL \
-         environment (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); \
-         newt's own secrets and switches are still withheld",
-        shell.describe()
-    );
-    if authority.ocap_disabled() && authority.full_access() {
+    let children = "child processes and stdio MCP servers get your FULL environment \
+         (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); newt's own \
+         secrets and switches are still withheld";
+    let host = authority.ocap_disabled() && authority.full_access();
+    if host {
         format!(
             "⚠ YOLO (--yolo): approvals OFF (--disable-ocap), confinement OFF (--full-access), \
-             environment OFF (--ambient): {environment}. Drop the flag to restore confinement."
+             environment OFF (--ambient): run_command runs your {}, and {children}. Drop the \
+             flag to restore confinement.",
+            shell.describe()
         )
     } else {
         format!(
-            "⚠ AMBIENT (--ambient): environment OFF: {environment}. This flag alone leaves \
-             approvals and confinement as they are (--disable-ocap, --full-access; --yolo is all three)."
+            "⚠ AMBIENT (--ambient): environment OFF: {children}. run_command keeps its current \
+             shell: your login shell applies only where it runs on the host shell, which needs \
+             --disable-ocap and --full-access (--yolo is all three). This flag alone leaves \
+             approvals and confinement as they are."
         )
     }
 }
@@ -2614,7 +2618,7 @@ mod ambient_banner_tests {
     use newt_core::ambient_shell::AmbientShell;
 
     #[test]
-    fn the_banner_lists_exactly_what_is_off() {
+    fn the_banner_lists_exactly_what_is_off_from_the_effective_decision() {
         use newt_core::launch_authority::LaunchAuthority;
         let shell = AmbientShell::resolve(Some("/usr/bin/zsh".as_ref()));
         let yolo = LaunchAuthority::from_parts_for_test(true, true, true);
@@ -2629,20 +2633,34 @@ mod ambient_banner_tests {
         ] {
             assert!(all.contains(needle), "missing `{needle}`: {all}");
         }
-        let alone = ambient_banner(LaunchAuthority::AMBIENT, &shell);
+        // `--ambient` alone: run_command stays where it is, so no shell is claimed.
+        for authority in [
+            LaunchAuthority::AMBIENT,
+            LaunchAuthority::from_parts_for_test(true, false, true),
+        ] {
+            let alone = ambient_banner(authority, &shell);
+            assert!(
+                alone.contains("AMBIENT (--ambient): environment OFF"),
+                "{alone}"
+            );
+            assert!(
+                !alone.contains("login shell /usr/bin/zsh")
+                    && !alone.contains("run_command runs your"),
+                "must not claim a shell that does not run: {alone}"
+            );
+            assert!(
+                !alone.contains("approvals OFF") && !alone.contains("confinement OFF"),
+                "the ambient axis alone must not claim the others: {alone}"
+            );
+        }
+        // A login shell that cannot run is reported as the /bin/sh that does.
+        let missing = AmbientShell::resolve_checked(Some("/no/such/zsh".as_ref()), |_| false);
+        let fallback = ambient_banner(yolo, &missing);
         assert!(
-            alone.contains("AMBIENT (--ambient): environment OFF"),
-            "{alone}"
-        );
-        assert!(
-            !alone.contains("approvals OFF") && !alone.contains("confinement OFF"),
-            "the ambient axis alone must not claim the others: {alone}"
-        );
-        let fallback = ambient_banner(LaunchAuthority::AMBIENT, &AmbientShell::resolve(None));
-        assert!(
-            fallback.contains("$SHELL is not set; using /bin/sh"),
+            fallback.contains("$SHELL does not exist; using /bin/sh"),
             "{fallback}"
         );
+        assert!(!fallback.contains("/no/such/zsh"), "{fallback}");
     }
 }
 

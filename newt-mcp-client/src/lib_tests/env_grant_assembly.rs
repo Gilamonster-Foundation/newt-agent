@@ -96,6 +96,7 @@ fn parent_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
         ("XDG_RUNTIME_DIR", "/run/user/1000"),
         ("OPENAI_API_KEY", "sk-secret"),
         ("NEWT_AGENT_KEY", "newt-secret"),
+        ("NEWT_AMBIENT", "1"),
     ]
     .map(|(k, v)| (k.into(), v.into()))
     .to_vec()
@@ -137,4 +138,41 @@ fn the_ambient_passthrough_is_the_full_env_minus_the_control_plane() {
         !got.contains_key("NEWT_AGENT_KEY"),
         "newt's secrets never are"
     );
+}
+
+/// Windows names are case-insensitive: mixed-case copies of newt's secrets are still
+/// withheld under `--ambient`, and a `Path` still matches the `PATH` allow-list entry.
+#[test]
+fn windows_key_case_is_honored_in_both_passthroughs() {
+    let vars = || -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        [
+            ("Newt_Agent_Key", "s1"),
+            ("newt_operator_key", "s2"),
+            ("Newt_Token_Passphrase", "s3"),
+            ("Newt_Ambient", "1"),
+            ("Path", "C:\\bin"),
+            ("DisplayThing", "x"),
+        ]
+        .map(|(k, v)| (k.into(), v.into()))
+        .to_vec()
+    };
+    let ambient: BTreeMap<String, String> = parent_passthrough_with(true, vars(), true)
+        .into_iter()
+        .collect();
+    assert_eq!(
+        ambient.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["DisplayThing", "Path"],
+        "mixed-case control-plane names are stripped"
+    );
+    let default: BTreeMap<String, String> = parent_passthrough_with(false, vars(), true)
+        .into_iter()
+        .collect();
+    assert_eq!(
+        default.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["Path"],
+        "Path is PATH on Windows"
+    );
+    // Elsewhere names are exact: `Path` is not `PATH`, and the odd-case secrets are other variables.
+    let exact = parent_passthrough_with(false, vars(), false);
+    assert!(exact.is_empty(), "{exact:?}");
 }

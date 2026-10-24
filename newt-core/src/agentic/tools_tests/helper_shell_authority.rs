@@ -190,6 +190,7 @@ fn host_shell_command_strips_authority_env() {
     // intent is legible in the test, not just the loop.
     for critical in [
         "NEWT_UNSAFE_HOST_EXEC",
+        "NEWT_AMBIENT",
         "NEWT_AGENT_KEY",
         "NEWT_OPERATOR_KEY",
         "NEWT_TOKEN_PASSPHRASE",
@@ -709,4 +710,38 @@ fn the_host_child_environment_is_the_inherited_one_minus_the_control_plane() {
             );
         }
     }
+}
+
+/// #978 review: the guidance follows the shell that will run. A fish login shell is
+/// not POSIX and the model is told so; bash/zsh/unset keep the POSIX sentence, and so does
+/// every posture that is not `--ambient` on the host route.
+#[cfg(not(windows))]
+#[test]
+fn the_dialect_guidance_follows_the_ambient_login_shell() {
+    let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
+    // `fish` must exist as a file for the shell to count; /bin/sh stands in for the path
+    // check by naming a real file called fish in a temp dir.
+    let dir = tempfile::tempdir().unwrap();
+    let fish = dir.path().join("fish");
+    std::fs::write(&fish, "#!/bin/sh\n").unwrap();
+    crate::process_env::set_var("SHELL", fish.to_str().unwrap());
+    let _bypass = crate::launch_authority::ScopedAuthority::new(true, true);
+    // `--yolo --full-access` pair without ambient: POSIX.
+    assert!(
+        crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"),
+        "no ambient, no change"
+    );
+    drop(_bypass);
+    let _amb = crate::launch_authority::ScopedAuthority::ambient_with_host_bypass();
+    let sentence = crate::agentic::run_command_dialect_sentence();
+    assert!(
+        sentence.contains("fish") && sentence.contains("not a POSIX shell"),
+        "{sentence}"
+    );
+    crate::process_env::set_var("SHELL", "/bin/bash");
+    assert!(crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"));
+    // A login shell that does not exist falls back to /bin/sh: POSIX again.
+    crate::process_env::set_var("SHELL", dir.path().join("zsh-missing").to_str().unwrap());
+    assert!(crate::agentic::run_command_dialect_sentence().contains("POSIX shell syntax"));
 }

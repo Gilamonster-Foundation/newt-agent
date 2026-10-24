@@ -28,7 +28,8 @@ const MODEL: &str = "ambient-fixture";
 const TASK: &str = "Show your shell.";
 /// `$0` is how the shell was invoked: `bash` for the bypass lane's `bash -c`, the full
 /// `$SHELL` path for the login shell. `DISPLAY` is the operator's.
-const PROBE: &str = r#"printf '[%s][%s]' "$0" "$DISPLAY""#;
+/// `NEWT_AMBIENT` is newt's own posture bit: it must never reach the command.
+const PROBE: &str = r#"printf '[%s][%s][%s]' "$0" "$DISPLAY" "$NEWT_AMBIENT""#;
 
 fn answer(streaming: bool, content: &str) -> ResponseTemplate {
     if streaming {
@@ -49,6 +50,13 @@ fn answer(streaming: bool, content: &str) -> ResponseTemplate {
 /// One session with `flags`; returns (the run_command result the model saw, the chat's
 /// stdout).
 async fn session(flags: &[&str]) -> (String, String) {
+    let (result, shown, _guidance) = session_with_shell(flags, "/bin/bash").await;
+    (result, shown)
+}
+
+/// [`session`] with `$SHELL` chosen; also returns what the first request told the model
+/// about `run_command` (the tool description and the system text).
+async fn session_with_shell(flags: &[&str], shell: &str) -> (String, String, String) {
     let root = common::isolated_root();
     let config_dir = root.path().join(".newt");
     std::fs::create_dir_all(&config_dir).expect("isolated config dir");
@@ -62,6 +70,8 @@ async fn session(flags: &[&str]) -> (String, String) {
         .await;
     let result = Arc::new(Mutex::new(String::new()));
     let capture = Arc::clone(&result);
+    let guidance = Arc::new(Mutex::new(String::new()));
+    let guidance_capture = Arc::clone(&guidance);
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(move |request: &Request| {
@@ -80,6 +90,18 @@ async fn session(flags: &[&str]) -> (String, String) {
                 .filter_map(|m| m["content"].as_str())
                 .collect();
             if results.is_empty() {
+                let tool = body["tools"]
+                    .as_array()
+                    .and_then(|t| t.iter().find(|t| t["function"]["name"] == "run_command"))
+                    .map(|t| t["function"]["description"].to_string())
+                    .unwrap_or_default();
+                let system = messages
+                    .iter()
+                    .filter(|m| m["role"] == "system")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                *guidance_capture.lock().expect("capture lock") = format!("{tool}\n{system}");
                 return ResponseTemplate::new(200).set_body_json(json!({
                     "model": MODEL,
                     "choices": [{"message": {"role": "assistant", "content": null,
@@ -148,7 +170,7 @@ scheduled = false
         .env("NEWT_NO_MODEL_PULL", "1")
         .env("NEWT_NUDGE", "off")
         // The operator's login shell and display, as the real environment would have them.
-        .env("SHELL", "/bin/bash")
+        .env("SHELL", shell)
         .env("DISPLAY", ":77")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -171,14 +193,15 @@ scheduled = false
         String::from_utf8_lossy(&output.stderr)
     );
     let seen = result.lock().expect("capture lock").clone();
-    (seen, shown)
+    let told = guidance.lock().expect("capture lock").clone();
+    (seen, shown, told)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn yolo_runs_the_login_shell_with_the_operators_display_and_lists_what_is_off() {
     let (result, shown) = session(&["--yolo"]).await;
     assert!(
-        result.contains("[/bin/bash][:77]"),
+        result.contains("[/bin/bash][:77][]"),
         "{result}\n--- session ---\n{shown}"
     );
     assert!(
@@ -203,7 +226,7 @@ async fn yolo_runs_the_login_shell_with_the_operators_display_and_lists_what_is_
 async fn the_granular_pair_still_runs_bash_dash_c() {
     let (result, shown) = session(&["--disable-ocap", "--full-access"]).await;
     assert!(
-        result.contains("[bash][:77]"),
+        result.contains("[bash][:77][]"),
         "{result}\n--- session ---\n{shown}"
     );
     assert!(!shown.contains("(--ambient)"), "{shown}");
@@ -239,8 +262,53 @@ async fn ambient_alone_claims_only_the_environment() {
 async fn the_three_granular_flags_together_are_yolo() {
     let (result, shown) = session(&["--disable-ocap", "--full-access", "--ambient"]).await;
     assert!(
-        result.contains("[/bin/bash][:77]"),
+        result.contains("[/bin/bash][:77][]"),
         "{result}\n--- session ---\n{shown}"
     );
     assert!(shown.contains("YOLO (--yolo)"), "{shown}");
+}
+
+/// A login shell that is not POSIX gets guidance that says so, in the tool description the
+/// model actually receives; a POSIX one keeps the POSIX sentence. (A stand-in `fish` that
+/// hands the command to bash proves the dispatch; it is not a fish grammar test.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_guidance_follows_the_login_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let fish = dir.path().join("fish");
+    std::fs::write(
+        &fish,
+        "#!/bin/sh\necho STANDIN-RAN\nexec /bin/bash \"$@\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (result, _shown, told) = session_with_shell(&["--yolo"], fish.to_str().unwrap()).await;
+    assert!(
+        result.contains("STANDIN-RAN"),
+        "the stand-in fish ran: {result}"
+    );
+    assert!(
+        told.contains("fish shell") && !told.contains("Commands use POSIX shell syntax"),
+        "the model was told POSIX syntax while fish runs:\n{told}"
+    );
+    let (_result, _shown, told) = session_with_shell(&["--yolo"], "/bin/bash").await;
+    assert!(told.contains("Commands use POSIX shell syntax"), "{told}");
+}
+
+/// A `$SHELL` that does not exist runs `/bin/sh -c`, and the banner says so instead of
+/// advertising a login shell that did not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_login_shell_is_reported_as_the_bin_sh_that_runs() {
+    let (result, shown, _told) = session_with_shell(&["--yolo"], "/no/such/zsh").await;
+    assert!(
+        result.contains("[/bin/sh][:77][]") || result.contains("[sh][:77][]"),
+        "{result}"
+    );
+    assert!(
+        shown.contains("$SHELL does not exist; using /bin/sh"),
+        "{shown}"
+    );
+    assert!(!shown.contains("login shell /no/such/zsh"), "{shown}");
 }

@@ -17,6 +17,20 @@ use std::path::{Path, PathBuf};
 /// reads `~/.zshrc` / `~/.bashrc`, where aliases and functions live.
 const LOGIN_INTERACTIVE: &[&str] = &["bash", "zsh", "fish", "ksh"];
 
+/// What the model is told when `run_command` runs fish: not POSIX.
+pub const FISH_DIALECT: &str = "Commands run in the operator's fish shell, not a POSIX shell: use fish syntax (`set name value` and `$name`, `and`/`or` or `; and`, `(cmd)` for substitution), with no heredocs and no `${var:-default}`; run_command already returns the exit status.";
+
+/// Do two environment variable names name the same variable? Windows names are
+/// case-insensitive (and case-preserving); elsewhere they are exact.
+#[must_use]
+pub fn same_env_key(a: &str, b: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 /// What `$SHELL` resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmbientShell {
@@ -60,6 +74,36 @@ impl AmbientShell {
         }
     }
 
+    /// [`Self::resolve`], then fail closed when the login shell is not a file on this host:
+    /// a path that does not exist cannot run, and saying otherwise would mislead.
+    #[must_use]
+    pub fn resolve_checked(shell: Option<&OsStr>, exists: impl Fn(&Path) -> bool) -> Self {
+        match Self::resolve(shell) {
+            Self::Login { program, .. } if !exists(&program) => Self::Fallback {
+                reason: "$SHELL does not exist",
+            },
+            other => other,
+        }
+    }
+
+    /// The shell this process would run for ambient `run_command`: `$SHELL`, checked
+    /// against the file system. The one resolution the dispatch, the banner and the
+    /// prompt guidance all use, so they cannot disagree.
+    #[must_use]
+    pub fn resolve_host() -> Self {
+        Self::resolve_checked(std::env::var_os("SHELL").as_deref(), Path::is_file)
+    }
+
+    /// The model-facing dialect sentence when this shell is not POSIX (fish); `None` when
+    /// the default POSIX guidance is right.
+    #[must_use]
+    pub fn dialect_sentence(&self) -> Option<&'static str> {
+        match self {
+            Self::Login { posix: false, .. } => Some(FISH_DIALECT),
+            _ => None,
+        }
+    }
+
     /// One line for the session banner: which shell runs, or why `/bin/sh` does.
     #[must_use]
     pub fn describe(&self) -> String {
@@ -74,16 +118,27 @@ impl AmbientShell {
 
 /// The full process environment for an ambient child: every variable that is valid text,
 /// minus newt's own control plane (`strip`: authority switches, newt's secrets, config
-/// redirects), which no posture hands a child. Sorted by name.
+/// redirects), which no posture hands a child. Sorted by name. Names compare the way the
+/// host does (case-insensitively on Windows).
 #[must_use]
 pub fn child_env(
     vars: impl IntoIterator<Item = (OsString, OsString)>,
     strip: &[&str],
 ) -> Vec<(String, String)> {
+    child_env_with(vars, strip, cfg!(windows))
+}
+
+/// [`child_env`] with the name comparison chosen by the caller, so both can be tested anywhere.
+#[must_use]
+pub fn child_env_with(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+    strip: &[&str],
+    case_insensitive: bool,
+) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vars
         .into_iter()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .filter(|(k, _)| !strip.contains(&k.as_str()))
+        .filter(|(k, _)| !strip.iter().any(|s| same_env_key(s, k, case_insensitive)))
         .collect();
     env.sort();
     env
@@ -213,5 +268,55 @@ mod tests {
         );
         assert_eq!(strip_interactive_noise(b""), b"");
         assert_eq!(strip_interactive_noise(b"no newline"), b"no newline");
+    }
+
+    #[test]
+    fn windows_names_compare_case_insensitively_and_unix_names_exactly() {
+        let vars = || {
+            ["Newt_Agent_Key", "newt_operator_key", "Path", "KEEP"]
+                .map(|k| (OsString::from(k), OsString::from("v")))
+        };
+        let strip = ["NEWT_AGENT_KEY", "NEWT_OPERATOR_KEY"];
+        let windows: Vec<String> = child_env_with(vars(), &strip, true)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            windows,
+            ["KEEP", "Path"],
+            "mixed-case secrets are stripped on Windows"
+        );
+        let unix: Vec<String> = child_env_with(vars(), &strip, false)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(unix.len(), 4, "exact names elsewhere");
+    }
+
+    #[test]
+    fn a_login_shell_that_is_not_a_file_falls_back() {
+        let got = AmbientShell::resolve_checked(Some("/no/such/zsh".as_ref()), |_| false);
+        assert_eq!(
+            got,
+            AmbientShell::Fallback {
+                reason: "$SHELL does not exist"
+            }
+        );
+        let ok = AmbientShell::resolve_checked(Some("/bin/sh".as_ref()), |_| true);
+        assert!(matches!(ok, AmbientShell::Login { .. }));
+    }
+
+    #[test]
+    fn only_a_non_posix_login_shell_changes_the_dialect_guidance() {
+        let fish = AmbientShell::resolve_checked(Some("/usr/bin/fish".as_ref()), |_| true);
+        assert_eq!(fish.dialect_sentence(), Some(FISH_DIALECT));
+        assert!(FISH_DIALECT.contains("not a POSIX shell") && FISH_DIALECT.contains("fish"));
+        for shell in ["/bin/bash", "/usr/bin/zsh"] {
+            assert_eq!(
+                AmbientShell::resolve_checked(Some(shell.as_ref()), |_| true).dialect_sentence(),
+                None
+            );
+        }
+        assert_eq!(AmbientShell::resolve(None).dialect_sentence(), None);
     }
 }
