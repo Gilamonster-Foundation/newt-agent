@@ -1550,6 +1550,11 @@ pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
 }
 
 fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
+    // Skills have no value to ask for: bare `/settings skills` lists them, and the next
+    // line the operator types is theirs, not an answer.
+    if field == Field::Skills {
+        return vec![crate::skills_form::listing().unwrap_or_else(|e| e)];
+    }
     ask_and_apply(ask, field, "/settings")
 }
 

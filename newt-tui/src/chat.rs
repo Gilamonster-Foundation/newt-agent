@@ -2918,6 +2918,13 @@ fn session_body(
             let skills_now = skills_off(&cfg);
             if skills_now != last_skills_off {
                 last_skills_off = skills_now;
+                if reconcile_posture_skill(&cfg) {
+                    print_newt(
+                        "posture skill updated to match [skills] off",
+                        color,
+                        verbose,
+                    );
+                }
                 system = rebuild_system_prompt_for(
                     workspace,
                     &memory,

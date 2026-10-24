@@ -295,4 +295,23 @@ mod tests {
         let some = crate::skills_index_for_prompt(&dirs, &|n| n == "alpha").unwrap();
         assert!(!some.contains("alpha") && some.contains("beta"), "{some}");
     }
+
+    /// Bare `/settings skills` prints the listing and asks nothing: the next line the
+    /// operator types is not consumed as an answer.
+    #[test]
+    fn bare_settings_skills_lists_and_asks_nothing() {
+        let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let (_dir, _path, _pin) = fixture();
+        let asked = std::cell::Cell::new(0);
+        let ask = |_: &newt_core::interaction_surface::SurfaceInteraction| {
+            asked.set(asked.get() + 1);
+            newt_core::HumanQuestionOutcome::Cancelled
+        };
+        let out = crate::settings_form::run(&ask, "skills").join("\n");
+        assert_eq!(asked.get(), 0, "no question was asked");
+        assert!(
+            out.contains("| skill") && out.contains("alpha") && out.contains("beta"),
+            "{out}"
+        );
+    }
 }

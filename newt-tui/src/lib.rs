@@ -6282,6 +6282,33 @@ pub async fn headless_system_prompt(
     assemble_session_prompt(workspace, &memory, None, &session, cfg, sink)
 }
 
+/// Keep the active posture's preloaded skill in step with `[skills] off`: a posture binds
+/// its skill by the `skill` of its `[modes.<name>]` entry, and loaded the body once at
+/// `/posture`. Switching that skill off drops the body from the next turn; switching it on
+/// again reloads it. Returns whether the posture changed.
+pub(crate) fn reconcile_posture_skill(cfg: &newt_core::Config) -> bool {
+    let Some(mut posture) = newt_core::posture::active_posture() else {
+        return false;
+    };
+    let Some(skill) = cfg.modes.get(&posture.name).and_then(|m| m.skill.clone()) else {
+        return false;
+    };
+    if cfg.skill_is_off(&skill) {
+        if posture.skill_body.take().is_none() {
+            return false;
+        }
+    } else if posture.skill_body.is_none() {
+        match cfg.load_skill_body(&skill) {
+            Ok(body) => posture.skill_body = Some(body),
+            Err(_) => return false,
+        }
+    } else {
+        return false;
+    }
+    newt_core::posture::set_active_posture(Some(posture));
+    true
+}
+
 fn handle_operating_mode_command(
     arg: &str,
     active_mode: &mut OperatingMode,
