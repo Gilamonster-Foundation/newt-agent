@@ -166,6 +166,7 @@ pub fn strip_interactive_noise(stderr: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn os(s: &str) -> Option<OsString> {
         Some(OsString::from(s))
     }
