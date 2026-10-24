@@ -69,6 +69,7 @@ fn posture_status_lists_active_and_available_names() {
         preset_name: "readonly-triage".to_string(),
         clamp: newt_core::Caveats::top(),
         clamp_summary: "read-only".to_string(),
+        skill: None,
         skill_body: None,
         framing: None,
     };
@@ -224,6 +225,7 @@ fn effective_caveats_intersect_base_with_the_posture_clamp() {
         preset_name: "readonly-triage".to_string(),
         clamp_summary: "readonly".to_string(),
         clamp,
+        skill: None,
         skill_body: None,
         framing: None,
     };
@@ -322,6 +324,7 @@ fn posture_command_off_releases_a_settings_installed_binding() {
         preset_name: "strict".into(),
         clamp: newt_core::Caveats::default(),
         clamp_summary: "deny writes".into(),
+        skill: None,
         skill_body: None,
         framing: None,
     }));
@@ -347,6 +350,7 @@ fn posture_settings_guard_restores_the_permission_binding() {
         }
         .clamp(),
         clamp_summary: "deny writes".into(),
+        skill: None,
         skill_body: Some("Keep the existing skill body.".into()),
         framing: Some("Keep the existing framing.".into()),
     };
@@ -359,6 +363,7 @@ fn posture_settings_guard_restores_the_permission_binding() {
                 preset_name: String::new(),
                 clamp: newt_core::Caveats::top(),
                 clamp_summary: "unconstrained".into(),
+                skill: None,
                 skill_body: None,
                 framing: None,
             }));

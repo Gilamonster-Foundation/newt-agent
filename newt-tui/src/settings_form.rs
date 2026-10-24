@@ -1904,6 +1904,7 @@ mod tests {
             preset_name: "strict".to_string(),
             clamp: newt_core::Caveats::default(),
             clamp_summary: "deny writes".to_string(),
+            skill: None,
             skill_body: None,
             framing: None,
         }));
@@ -2001,6 +2002,7 @@ mod tests {
             preset_name: "strict".into(),
             clamp: newt_core::Caveats::default(),
             clamp_summary: "deny writes".into(),
+            skill: None,
             skill_body: None,
             framing: Some("Keep the existing guidance.".into()),
         };

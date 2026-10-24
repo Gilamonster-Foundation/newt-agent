@@ -314,4 +314,53 @@ mod tests {
             "{out}"
         );
     }
+
+    /// A posture follows the skill it was ACTIVATED with: editing its `[modes.<name>]` entry
+    /// afterwards (remapped to another skill, or the key removed) does not keep an off
+    /// skill's body injected.
+    #[test]
+    fn an_off_skill_leaves_the_posture_even_after_its_mode_is_edited() {
+        let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let (dir, _path, _pin) = fixture();
+        let toml = |mode: &str, off: &str| {
+            format!(
+                "[skills]\nsearch = [{:?}]\n{off}\n[modes.guided]\n{mode}\n",
+                dir.path().display().to_string()
+            )
+        };
+        let activate = |cfg: &newt_core::Config| {
+            let posture =
+                newt_core::posture::build_posture("guided", cfg, |s| cfg.load_skill_body(s))
+                    .unwrap();
+            assert_eq!(posture.skill.as_deref(), Some("alpha"));
+            assert!(posture
+                .skill_body
+                .as_deref()
+                .unwrap()
+                .contains("Body of alpha"));
+            newt_core::posture::set_active_posture(Some(posture));
+        };
+        let bound: newt_core::Config = toml::from_str(&toml("skill = \"alpha\"", "")).unwrap();
+        for (edited, why) in [
+            ("skill = \"beta\"", "remapped to beta"),
+            ("framing = \"x\"", "skill key removed"),
+        ] {
+            activate(&bound);
+            let now: newt_core::Config =
+                toml::from_str(&toml(edited, "off = [\"alpha\"]")).unwrap();
+            assert!(crate::reconcile_posture_skill(&now), "{why}");
+            let posture = newt_core::posture::active_posture().unwrap();
+            assert!(posture.skill_body.is_none(), "{why}: alpha's body is gone");
+            assert_eq!(
+                posture.skill.as_deref(),
+                Some("alpha"),
+                "{why}: the binding is kept"
+            );
+            // On again: the body comes back from the BOUND skill, not the edited mapping.
+            let on: newt_core::Config = toml::from_str(&toml(edited, "")).unwrap();
+            assert!(crate::reconcile_posture_skill(&on), "{why}");
+            let back = newt_core::posture::active_posture().unwrap();
+            assert!(back.skill_body.unwrap().contains("Body of alpha"), "{why}");
+        }
+    }
 }

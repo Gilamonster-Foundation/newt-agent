@@ -6290,7 +6290,8 @@ pub(crate) fn reconcile_posture_skill(cfg: &newt_core::Config) -> bool {
     let Some(mut posture) = newt_core::posture::active_posture() else {
         return false;
     };
-    let Some(skill) = cfg.modes.get(&posture.name).and_then(|m| m.skill.clone()) else {
+    // The skill bound AT ACTIVATION, not whatever the config maps the name to now.
+    let Some(skill) = posture.skill.clone() else {
         return false;
     };
     if cfg.skill_is_off(&skill) {
