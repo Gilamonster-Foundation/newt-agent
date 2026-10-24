@@ -153,6 +153,7 @@ impl Mcp {
             match crate::mcp_token::run_oauth_flow_cancellable(
                 &entry.name,
                 url,
+                &crate::mcp_token::ConfiguredOAuth::from_entry(entry),
                 &hop_policy,
                 Some(cancel.clone()),
             )

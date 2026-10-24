@@ -86,11 +86,24 @@ RUST_COMMENT = re.compile(r"^\s*//")
 DOCS_PATH = re.compile(r"docs/[A-Za-z0-9._/-]+\.md")
 
 # Directories that never hold first-party references.
-EXCLUDED_DIRS = {".git", "target", "node_modules", ".venv", "venv", "__pycache__"}
+EXCLUDED_DIRS = {
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".worktrees",
+}
 
 
-def _is_excluded(path: Path) -> bool:
-    return any(part in EXCLUDED_DIRS for part in path.parts)
+def _is_excluded(path: Path, root: Path = REPO) -> bool:
+    """Whether `path` sits in an excluded directory *below* `root`.
+
+    Repository-relative on purpose: a checkout that itself lives under
+    `.worktrees/` (or any other excluded name) must still scan its own files.
+    """
+    return any(part in EXCLUDED_DIRS for part in path.relative_to(root).parts)
 
 
 def prose_lines(text: str) -> list[str]:
@@ -284,6 +297,35 @@ def self_test() -> int:
             )
             failed += 1
 
+    # --- exclusions are repository-relative ---------------------------------
+    # A checkout that itself lives under `.worktrees/` (an active linked
+    # worktree) must still scan its own files; only a worktree NESTED inside
+    # the repository is foreign. Matching absolute components scanned nothing.
+    exclusion: list[tuple[str, Path, Path, bool]] = [
+        (
+            "an active worktree scans its own docs",
+            Path("/src/repo/.worktrees/lane"),
+            Path("/src/repo/.worktrees/lane/docs/a.md"),
+            False,
+        ),
+        (
+            "a worktree nested inside the repository is skipped",
+            Path("/src/repo"),
+            Path("/src/repo/.worktrees/lane/docs/a.md"),
+            True,
+        ),
+        (
+            "a build directory under an active worktree is still skipped",
+            Path("/src/repo/.worktrees/lane"),
+            Path("/src/repo/.worktrees/lane/target/x.rs"),
+            True,
+        ),
+    ]
+    for name, root, path, expected in exclusion:
+        if _is_excluded(path, root) != expected:
+            print(f"docs-check self-test FAIL: {name}", file=sys.stderr)
+            failed += 1
+
     # The line-number case must also report the correct line.
     lines = prose_lines("```\nfenced\n```\n[x](nope.md)\n")
     if len(lines) != 4 or "nope.md" not in lines[3]:
@@ -293,7 +335,8 @@ def self_test() -> int:
     if failed:
         print(f"docs-check: {failed} self-test failure(s)", file=sys.stderr)
         return 1
-    print(f"docs-check: {len(cases) + len(retirement) + 1} self-tests passed")
+    total = len(cases) + len(retirement) + len(exclusion) + 1
+    print(f"docs-check: {total} self-tests passed")
     return 0
 
 

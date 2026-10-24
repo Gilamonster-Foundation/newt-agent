@@ -11,6 +11,9 @@ fn admit_denies_untrusted_and_disabled_admits_trusted() {
     // A discovered (untrusted) STDIO overlay is refused — it may not spawn
     // without approval outside the repo; headless has no interactive path.
     let untrusted = McpServerEntry {
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: McpTrust::Untrusted,
         ..stdio("evil", "/bin/sh")
     };
@@ -21,6 +24,9 @@ fn admit_denies_untrusted_and_disabled_admits_trusted() {
 
     // Transport-agnostic: an untrusted HTTP overlay is refused too.
     let untrusted_http = McpServerEntry {
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: McpTrust::Untrusted,
         transport: TransportKind::Http,
         command: None,
@@ -45,6 +51,9 @@ fn admit_denies_untrusted_and_disabled_admits_trusted() {
 /// came from, rendered by the ONE `Display` (no per-caller string building).
 fn untrusted_from(name: &str, origin: Option<McpOrigin>) -> String {
     let entry = McpServerEntry {
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: McpTrust::Untrusted,
         origin,
         ..stdio(name, "/bin/sh")
