@@ -2191,7 +2191,7 @@ pub(super) async fn host_shell_output(
 /// `--disable-ocap` lane is the operator's explicit "run with my ambient
 /// authority" opt-out, so provider credentials etc. are their deliberate grant;
 /// only newt's OWN control plane is excised.
-pub(super) const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
+pub const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
     "NEWT_DISABLE_OCAP",
     "NEWT_FULL_ACCESS",
     "NEWT_UNSAFE_HOST_EXEC",
@@ -2218,6 +2218,38 @@ pub(super) const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
 fn strip_child_authority_env(c: &mut tokio::process::Command) {
     for key in CHILD_STRIPPED_AUTHORITY_ENV {
         c.env_remove(key);
+    }
+}
+
+/// The program and argv of the `--ambient` shell for `cmd`: the operator's login shell
+/// (`-l -i -c` / `-l -c`), or `/bin/sh -c` when `$SHELL` cannot be trusted or the login
+/// shell was not found (`fallback`). The command text gets the portable `which` helper
+/// whenever the interpreter is POSIX.
+fn bash_sh_argv(
+    shell: &crate::ambient_shell::AmbientShell,
+    fallback: bool,
+    cmd: &str,
+) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    use crate::ambient_shell::AmbientShell;
+    let posix = |c: &str| agent_bridle_tool_shell::with_posix_command_discovery(c);
+    match shell {
+        AmbientShell::Login {
+            program,
+            args,
+            posix: is_posix,
+        } if !fallback => {
+            let mut argv: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+            argv.push(
+                if *is_posix {
+                    posix(cmd)
+                } else {
+                    cmd.to_string()
+                }
+                .into(),
+            );
+            (program.clone().into_os_string(), argv)
+        }
+        _ => ("/bin/sh".into(), vec!["-c".into(), posix(cmd).into()]),
     }
 }
 
@@ -2266,8 +2298,23 @@ fn host_shell_command_at(
             ))
         }
     };
-    let mut c = tokio::process::Command::new(program);
-    if route != ShellRoute::AmbientBrush {
+    // `--ambient` (#978): the operator's login shell. Every other posture builds exactly
+    // the argv it always did.
+    let login =
+        (route == ShellRoute::BashSh && crate::launch_authority::current().ambient()).then(|| {
+            bash_sh_argv(
+                &crate::ambient_shell::AmbientShell::resolve(std::env::var_os("SHELL").as_deref()),
+                fallback,
+                cmd,
+            )
+        });
+    let mut c = match &login {
+        Some((program, _)) => tokio::process::Command::new(program),
+        None => tokio::process::Command::new(program),
+    };
+    if let Some((_, args)) = &login {
+        c.args(args);
+    } else if route != ShellRoute::AmbientBrush {
         c.arg(flag);
     }
     if route == ShellRoute::AmbientBrush {
@@ -2293,6 +2340,8 @@ fn host_shell_command_at(
         }
         let path = std::env::join_paths(paths).map_err(std::io::Error::other)?;
         c.env("PATH", path);
+    } else if login.is_some() {
+        // Already in the argv above.
     } else if route == ShellRoute::BashSh {
         c.arg(agent_bridle_tool_shell::with_posix_command_discovery(cmd));
     } else {

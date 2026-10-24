@@ -78,6 +78,9 @@ use live_output::LiveOutputSession;
 #[cfg(test)]
 pub(crate) use shell::absent_binary_refusal;
 pub use shell::venv_cmd_prefix;
+/// newt's control plane, which no host child receives (also what `--ambient` strips from
+/// the full environment it hands run_command and stdio MCP servers).
+pub use shell::CHILD_STRIPPED_AUTHORITY_ENV;
 #[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
@@ -90,10 +93,7 @@ use shell::{
     permits_filesystem_request, resolve_exec_cwd, split_leading_cd,
 };
 #[cfg(all(test, not(windows)))]
-use shell::{
-    host_shell_command, host_shell_output, host_shell_output_with_timeout,
-    CHILD_STRIPPED_AUTHORITY_ENV,
-};
+use shell::{host_shell_command, host_shell_output, host_shell_output_with_timeout};
 pub(crate) use shell::{ABSENT_BINARY_MARKER, NOT_ON_HOST_MARKER};
 
 #[cfg(test)]

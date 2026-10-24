@@ -252,6 +252,16 @@ impl ScopedAuthority {
 }
 
 #[cfg(test)]
+impl ScopedAuthority {
+    /// Pin the `--ambient` posture for this thread.
+    pub(crate) fn ambient() -> Self {
+        let prior = PROCESS_FROZEN.with(std::cell::Cell::get);
+        PROCESS_FROZEN.with(|c| c.set(Some(LaunchAuthority::AMBIENT)));
+        Self(prior)
+    }
+}
+
+#[cfg(test)]
 impl Drop for ScopedAuthority {
     fn drop(&mut self) {
         PROCESS_FROZEN.with(|c| c.set(self.0));
@@ -432,7 +442,9 @@ mod tests {
             ..LaunchAuthority::CONFINED
         };
         assert!(!bare.ambient());
-        assert!(!LaunchAuthority::AMBIENT.meet(LaunchAuthority::CONFINED).ambient());
+        assert!(!LaunchAuthority::AMBIENT
+            .meet(LaunchAuthority::CONFINED)
+            .ambient());
         let no_full_access = LaunchAuthority {
             full_access: false,
             ..LaunchAuthority::AMBIENT
