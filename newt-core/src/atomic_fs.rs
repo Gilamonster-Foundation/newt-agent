@@ -665,6 +665,22 @@ impl ResolvedPath {
         })
     }
 
+    /// Resolve `path`'s parent but not its last component, so a replace
+    /// swaps the directory entry itself, even a symlink, and never writes
+    /// through it.
+    pub fn resolve_entry(path: &Path) -> anyhow::Result<Self> {
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(Self {
+            path: std::fs::canonicalize(parent)?.join(name),
+        })
+    }
+
     #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.path

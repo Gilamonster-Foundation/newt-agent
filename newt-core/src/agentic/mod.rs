@@ -5030,6 +5030,7 @@ fn is_workspace_inert_tool(name: &str) -> bool {
             | "render_report"
             | "request_permissions"
             | "request_user_input"
+            | "propose_config_edit"
             | "select_operating_mode"
             | "enter_plan_mode"
             | "exit_plan_mode"

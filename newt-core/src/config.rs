@@ -76,6 +76,7 @@ mod presentation;
 mod profile;
 mod prompt;
 mod redact;
+mod self_edit;
 mod semantic;
 mod shell;
 mod skills;
@@ -91,6 +92,7 @@ use context::default_input_ceiling_pct;
 use layering::{array_merge_strategy, base_is_ambient_newt_toml, mark_project_mcp_untrusted};
 use presentation::{default_spill_lines, default_time_marker_secs, default_tool_output_lines};
 use redact::{redact_arg_secrets, redact_url_secrets};
+pub use self_edit::{backup_path, ConfigEdit};
 pub use shell::{
     confined_default_engine, full_access_default_engine, mcp_stdio_env_passthrough,
     ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
