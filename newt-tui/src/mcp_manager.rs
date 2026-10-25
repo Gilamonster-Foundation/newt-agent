@@ -160,6 +160,15 @@ fn confirm_login(
     surface.present_interaction(&SurfaceInteraction::blocking(definition))
 }
 
+/// The single exit for an operation outcome (#3013): the panel footer shows it
+/// until the next page change, and `emit` commits it to scrollback so a
+/// finished operation is distinguishable from a hung one once the panel closes.
+/// Every outcome goes through here; nothing sets `panel.message` directly.
+fn outcome(panel: &mut McpPanel, message: String, emit: &mut dyn FnMut(&str)) {
+    emit(&message);
+    panel.message = message;
+}
+
 pub(crate) fn run<F>(
     mcp: &mut Mcp,
     surface: &mut dyn InputSurface,
@@ -177,6 +186,8 @@ where
             .as_ref()
             .is_none_or(|tui| tui.sanitize_mcp_server_names),
     );
+    let (color, verbose) = (gate.color, gate.verbose);
+    let mut commit = |text: &str| crate::print_newt(text, color, verbose);
     loop {
         let window = surface.open_panel(crate::session_worker::PanelMode::Inline(24));
         crate::panel::drive(&mut panel, 24, window.as_ref())?;
@@ -190,14 +201,22 @@ where
             .iter()
             .find(|server| server.entry.name == action.server)
         else {
-            panel.message = "Server configuration changed; reopen MCP settings.".into();
+            outcome(
+                &mut panel,
+                "Server configuration changed; reopen MCP settings.".into(),
+                &mut commit,
+            );
             continue;
         };
         let entry = &server.entry;
         context.cancel.store(false, Ordering::Relaxed);
         if action.kind == ActionKind::Login && entry.transport == TransportKind::Stdio {
             let Some(argv) = entry.operator_login_argv() else {
-                panel.message = "No trusted login_argv configured. Log in using the server's CLI, then Reconnect.".into();
+                outcome(
+                    &mut panel,
+                    "No trusted login_argv configured. Log in using the server's CLI, then Reconnect.".into(),
+                    &mut commit,
+                );
                 continue;
             };
             match confirm_login(surface, entry) {
@@ -210,19 +229,26 @@ where
                     return Ok(());
                 }
                 _ => {
-                    panel.message = "Login cancelled".into();
+                    outcome(&mut panel, "Login cancelled".into(), &mut commit);
                     continue;
                 }
             }
             match surface.run_login_argv(argv, gate.color, gate.verbose) {
                 Ok(true) => {}
                 Ok(false) => {
-                    panel.message = "Login failed or was interrupted; connection unchanged.".into();
+                    outcome(
+                        &mut panel,
+                        "Login failed or was interrupted; connection unchanged.".into(),
+                        &mut commit,
+                    );
                     continue;
                 }
                 Err(_) => {
-                    panel.message =
-                        "Could not run the configured login; connection unchanged.".into();
+                    outcome(
+                        &mut panel,
+                        "Could not run the configured login; connection unchanged.".into(),
+                        &mut commit,
+                    );
                     continue;
                 }
             }
@@ -290,10 +316,11 @@ where
                 })
             });
         surface.turn_ended();
-        panel.message = match result {
+        let message = match result {
             Ok(count) => format!("Success · {count} tools available"),
             Err(error) => failure_message(&error),
         };
+        outcome(&mut panel, message, &mut commit);
         panel.refresh(views(mcp, &discovery(&context)));
         if gate.exit.is_some_and(|exit| exit.load(Ordering::Relaxed)) {
             return Ok(());
@@ -366,5 +393,28 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "MCP operation cancelled");
         assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn an_outcome_is_committed_to_scrollback_as_well_as_the_panel() {
+        let mut panel = McpPanel::new(Vec::new(), true);
+        let mut committed = Vec::new();
+        outcome(
+            &mut panel,
+            "Success · 3 tools available".into(),
+            &mut |text| committed.push(text.to_string()),
+        );
+        assert_eq!(panel.message, "Success · 3 tools available");
+        assert_eq!(committed, ["Success · 3 tools available"]);
+    }
+
+    /// #3013: an outcome that only sets `panel.message` is invisible once the
+    /// panel closes. The helper above is the one place allowed to do it.
+    #[test]
+    fn no_outcome_bypasses_the_commit_helper() {
+        let src = include_str!("mcp_manager.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        let direct = production.matches("panel.message =").count();
+        assert_eq!(direct, 1, "only `outcome` may assign panel.message");
     }
 }
