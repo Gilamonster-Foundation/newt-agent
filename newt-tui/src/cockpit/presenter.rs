@@ -583,7 +583,7 @@ impl Screen {
         let frame = self.term.draw(|f| editor.draw(f, chrome, chat_inactive))?;
         let area = frame.area;
         let placed = self.caret.load(Ordering::Relaxed);
-        self.caret_frame = (placed != NO_CARET).then(|| CaretFrame {
+        self.caret_frame = (placed != NO_CARET).then_some(CaretFrame {
             top: self.top,
             block_h: self.block_h,
             cols: self.cols,

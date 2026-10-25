@@ -40,12 +40,16 @@ pub struct TermiosSnapshot {
     pub line_discipline: libc::cc_t,
 }
 
+/// A model of a terminal's cursor: everything the child has painted so far in, 0-based
+/// `(row, col)` out.
+type CursorModel = Box<dyn FnMut(&str) -> (u16, u16) + Send>;
+
 /// How a [`Pty`] answers the child's cursor-position queries.
 enum CursorReply {
     /// The same reply every time.
     Fixed(String),
     /// Computed from everything the child has written so far.
-    Model(Box<dyn FnMut(&str) -> (u16, u16) + Send>),
+    Model(CursorModel),
 }
 
 /// A pty pair: we hold the master and read what the terminal was shown, while
