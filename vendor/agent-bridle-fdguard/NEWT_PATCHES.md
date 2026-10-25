@@ -1,6 +1,6 @@
 # Temporary Newt descriptor mechanism patch
 
-Base: exact crates.io `agent-bridle-fdguard` 0.8.0-rc.5; original metadata and
+Base: exact crates.io `agent-bridle-fdguard` 0.8.0-rc.6; original metadata and
 license notices are retained. This remains the existing isolated unsafe seam.
 
 `duplicate_control_socket` duplicates an explicitly supplied non-stdio fd with
