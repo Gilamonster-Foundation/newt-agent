@@ -103,10 +103,16 @@ struct FenceState {
     wrap_off: AtomicBool,
     /// A lent-out modal or panel is writing; keep autowrap off until released.
     held: AtomicBool,
+    /// An open frame (#3011): every clone's bytes collect here and reach the
+    /// terminal as ONE synchronized write, so no compositor can paint the
+    /// half-drawn state between `Hide` and ratatui's `Show`.
+    frame: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 const WRAP_OFF: &[u8] = b"\x1b[?7l";
 const WRAP_ON: &[u8] = b"\x1b[?7h";
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 impl<W: Write> WrapFence<W> {
     fn new(file: W) -> Self {
@@ -118,9 +124,39 @@ impl<W: Write> WrapFence<W> {
 
     fn turn_off(&mut self) -> io::Result<()> {
         if !self.state.wrap_off.swap(true, Ordering::Relaxed) {
-            self.file.write_all(WRAP_OFF)?;
+            self.emit(WRAP_OFF)?;
         }
         Ok(())
+    }
+
+    fn frame(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.state.frame.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn emit(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Disjoint fields: the lock borrows `state`, the write borrows `file`.
+        let mut frame = self.state.frame.lock().unwrap_or_else(|p| p.into_inner());
+        match frame.as_mut() {
+            Some(frame) => {
+                frame.extend_from_slice(bytes);
+                Ok(())
+            }
+            None => self.file.write_all(bytes),
+        }
+    }
+
+    fn begin_frame(&self) {
+        *self.frame() = Some(SYNC_BEGIN.to_vec());
+    }
+
+    /// Send the open frame in one write, then flush as any batch would.
+    fn end_frame(&mut self) -> io::Result<()> {
+        let Some(mut frame) = self.frame().take() else {
+            return Ok(());
+        };
+        frame.extend_from_slice(SYNC_END);
+        self.file.write_all(&frame)?;
+        self.flush()
     }
 
     fn hold(&mut self) -> io::Result<()> {
@@ -152,10 +188,18 @@ impl WrapFence {
 impl<W: Write> Write for WrapFence<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.turn_off()?;
+        if self.frame().is_some() {
+            self.emit(buf)?;
+            return Ok(buf.len());
+        }
         self.file.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if self.frame().is_some() {
+            // Deferred to `end_frame`, which flushes once for the whole frame.
+            return Ok(());
+        }
         if !self.state.held.load(Ordering::Relaxed)
             && self.state.wrap_off.swap(false, Ordering::Relaxed)
         {
@@ -442,9 +486,23 @@ impl Screen {
         self.rebuild_term()
     }
 
-    /// Paint the block: the status row (raw, clipped, with the queued chip at
-    /// the right edge), then the ratatui viewport.
+    /// Paint the block as one frame (#3011): status row and viewport reach the
+    /// terminal in a single synchronized write, sent even if drawing failed.
     fn draw(
+        &mut self,
+        editor: &MountedEditor,
+        chrome: Chrome<'_>,
+        chat_inactive: bool,
+    ) -> io::Result<()> {
+        self.tty.begin_frame();
+        let drawn = self.draw_frame(editor, chrome, chat_inactive);
+        let sent = self.tty.end_frame();
+        drawn.and(sent)
+    }
+
+    /// The status row (raw, clipped, with the queued chip at the right edge),
+    /// then the ratatui viewport.
+    fn draw_frame(
         &mut self,
         editor: &MountedEditor,
         chrome: Chrome<'_>,
@@ -1958,6 +2016,39 @@ mod tests {
         fence.flush().unwrap();
         fence.flush().unwrap();
         assert_eq!(fence.file, b"\x1b[?7lab\x1b[?7h");
+    }
+
+    /// #3011: a frame's writes and flushes, from any clone, reach the terminal
+    /// as one synchronized write, so a compositor never paints a half frame
+    /// (cursor hidden, caret not yet placed).
+    #[test]
+    fn a_frame_reaches_the_terminal_as_one_synchronized_write() {
+        let mut screen = WrapFence::new(Vec::new());
+        let mut backend = WrapFence {
+            file: Vec::new(),
+            state: Arc::clone(&screen.state),
+        };
+        screen.begin_frame();
+        screen.write_all(b"\x1b[?25lstatus").unwrap();
+        screen.flush().unwrap();
+        backend.write_all(b"cells").unwrap();
+        backend.flush().unwrap();
+        backend.write_all(b"\x1b[?25h").unwrap();
+        backend.flush().unwrap();
+        assert!(
+            screen.file.is_empty() && backend.file.is_empty(),
+            "nothing sent mid-frame"
+        );
+        screen.end_frame().unwrap();
+        assert_eq!(
+            screen.file,
+            b"\x1b[?2026h\x1b[?7l\x1b[?25lstatuscells\x1b[?25h\x1b[?2026l\x1b[?7h"
+        );
+        backend.write_all(b"after").unwrap();
+        assert_eq!(
+            backend.file, b"\x1b[?7lafter",
+            "outside a frame, writes go straight through"
+        );
     }
 
     #[test]
