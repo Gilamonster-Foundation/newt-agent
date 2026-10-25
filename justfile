@@ -200,6 +200,7 @@ check:
     npm --prefix npm test || rc=1
     python3 scripts/test_pre_push.py || rc=1
     python3 scripts/test_changed_scope.py || rc=1
+    python3 scripts/test_commit_identity.py || rc=1
     cargo fmt --all -- --check || rc=1
     cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings || rc=1
     # PIPELINE PARITY: mirrors ci.yml (see the note in `test`).
