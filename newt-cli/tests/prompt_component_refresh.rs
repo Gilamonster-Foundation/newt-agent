@@ -320,6 +320,134 @@ async fn a_soul_md_is_ignored_with_a_notice_pointing_at_prompt_file() {
     drop(f.server);
 }
 
+/// #2933 PR8: `/settings skills off <name>` writes `[skills] off`, and the very next
+/// request no longer offers that skill in its index; `on` offers it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_switched_off_leaves_the_next_requests_index() {
+    let skills = tempfile::tempdir().unwrap();
+    for name in ["zebra-skill", "yak-skill"] {
+        let dir = skills.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: the {name} fixture\n---\nBody.\n"),
+        )
+        .unwrap();
+    }
+    let f = fixture(
+        &format!(
+            "[skills]\nsearch = [{:?}]\n",
+            skills.path().display().to_string()
+        ),
+        None,
+    )
+    .await;
+    let mut cmd = command(&f);
+    cmd.args(["--plain"])
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn the real CLI");
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            b"TURN_ONE\n/settings skills off zebra-skill\nTURN_TWO\n/settings skills on zebra-skill\nTURN_THREE\n/quit\n",
+        )
+        .await
+        .unwrap();
+    drop(input);
+    let output = tokio::time::timeout(BUDGET, child.wait_with_output())
+        .await
+        .expect("the chat exits")
+        .expect("output");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen = f.seen.lock().unwrap().clone();
+    let (one, two, three) = (
+        turn(&seen, "TURN_ONE"),
+        turn(&seen, "TURN_TWO"),
+        turn(&seen, "TURN_THREE"),
+    );
+    assert!(one.system.contains("zebra-skill") && one.system.contains("yak-skill"));
+    assert!(
+        !two.system.contains("zebra-skill"),
+        "off skill still offered:\n{shown}"
+    );
+    assert!(two.system.contains("yak-skill"), "{shown}");
+    assert!(three.system.contains("zebra-skill"), "on again:\n{shown}");
+    drop(f.server);
+}
+
+/// #2933 PR8 round 2: a posture's preloaded skill body is dropped from the next turn when
+/// the skill is switched off, and bare `/settings skills` lists without eating the next input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_off_skill_leaves_the_active_posture_and_bare_skills_lists() {
+    let skills = tempfile::tempdir().unwrap();
+    let dir = skills.path().join("alpha");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: alpha\ndescription: the alpha fixture\n---\nALPHA_POSTURE_MARKER guidance.\n",
+    )
+    .unwrap();
+    let f = fixture(
+        &format!(
+            "[skills]\nsearch = [{:?}]\n\n[modes.guided]\nskill = \"alpha\"\n",
+            skills.path().display().to_string()
+        ),
+        None,
+    )
+    .await;
+    let mut cmd = command(&f);
+    cmd.args(["--plain"])
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn the real CLI");
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            b"/posture guided\nTURN_ONE\n/settings skills off alpha\nTURN_TWO\n/settings skills\nTURN_THREE\n/quit\n",
+        )
+        .await
+        .unwrap();
+    drop(input);
+    let output = tokio::time::timeout(BUDGET, child.wait_with_output())
+        .await
+        .expect("the chat exits")
+        .expect("output");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen = f.seen.lock().unwrap().clone();
+    let (one, two) = (turn(&seen, "TURN_ONE"), turn(&seen, "TURN_TWO"));
+    assert!(
+        one.system.contains("ALPHA_POSTURE_MARKER"),
+        "posture skill reached turn one:\n{shown}"
+    );
+    assert!(
+        !two.system.contains("ALPHA_POSTURE_MARKER"),
+        "off skill still injected:\n{shown}"
+    );
+    // Bare `/settings skills` printed the table and TURN_THREE was a message, not an answer.
+    assert!(
+        shown.contains("| skill") && shown.contains("alpha"),
+        "{shown}"
+    );
+    let three = turn(&seen, "TURN_THREE");
+    assert!(!three.system.contains("ALPHA_POSTURE_MARKER"));
+    drop(f.server);
+}
+
 #[cfg(feature = "rich-tui")]
 fn say(pty: &Pty, line: &str, expect: &str) {
     pty.type_in(&format!("{line}\r"));

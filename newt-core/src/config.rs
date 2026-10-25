@@ -2331,6 +2331,34 @@ impl Config {
         Ok(doc.to_string())
     }
 
+    /// Set `[skills] off` (`/settings skills on|off`), removing the key when `off` is
+    /// empty and preserving the rest of the document. PURE: the caller owns the write.
+    pub fn with_skills_off(text: &str, off: &[&str]) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("skills")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`skills` is not a table".to_string()))?;
+        if off.is_empty() {
+            table.remove("off");
+        } else {
+            let mut array = toml_edit::Array::new();
+            for name in off {
+                array.push(*name);
+            }
+            replace_in_place(table, "off", toml_edit::value(array));
+        }
+        Ok(doc.to_string())
+    }
+
     /// Set `enabled` on the named `[[mcp_servers]]` entry, preserving comments
     /// and formatting (`/mcp enable|disable`, #1149). PURE (no I/O) like
     /// [`with_net_host`](Self::with_net_host); the caller does the read/write.

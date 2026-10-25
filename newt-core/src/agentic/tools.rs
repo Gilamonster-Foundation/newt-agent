@@ -6246,12 +6246,13 @@ async fn execute_authorized_tool(
             // governed by the session caveats. The same first-directory-wins
             // precedence as the index means we load the copy the model was
             // actually shown.
-            let dirs = super::display::with_migration_notices(crate::Config::resolve_unpublished)
-                .map(|c| c.skill_search_dirs())
-                .unwrap_or_default();
-            match newt_skills::load_body_from(&dirs, skill_name) {
-                Ok(body) => body,
-                Err(e) => format!("error: {e}"),
+            // A skill the operator switched off (`[skills] off`) is refused here too.
+            match super::display::with_migration_notices(crate::Config::resolve_unpublished) {
+                Ok(cfg) => match cfg.load_skill_body(skill_name) {
+                    Ok(body) => body,
+                    Err(e) => format!("error: {e}"),
+                },
+                Err(e) => format!("error: config does not resolve: {e}"),
             }
         }
 
