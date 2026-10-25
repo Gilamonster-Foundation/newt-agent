@@ -2563,6 +2563,36 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
     )
 }
 
+/// The session-start banner for the `--ambient` axis and for `--yolo`, which is all three
+/// (#978). It lists exactly what is off, from the effective decision rather than the flags:
+/// the shell is claimed only where `run_command` runs on the host shell (`--disable-ocap`
+/// with `--full-access`), and `shell` is how `$SHELL` really resolved (a POSIX login shell, or
+/// the `/bin/sh` that runs instead, with the reason).
+fn ambient_banner(
+    authority: newt_core::launch_authority::LaunchAuthority,
+    shell: &newt_core::ambient_shell::AmbientShell,
+) -> String {
+    let children = "child processes and stdio MCP servers get your FULL environment \
+         (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); newt's own \
+         secrets and switches are still withheld";
+    // From the route dispatch selects, so each platform names what really runs.
+    let runs = newt_core::agentic::ambient_interpreter_description(shell);
+    if authority.ocap_disabled() && authority.full_access() {
+        format!(
+            "⚠ YOLO (--yolo): approvals OFF (--disable-ocap), confinement OFF (--full-access), \
+             environment OFF (--ambient): run_command runs {runs}, and {children}. Drop the \
+             flag to restore confinement."
+        )
+    } else {
+        format!(
+            "⚠ AMBIENT (--ambient): environment OFF: {children}. run_command keeps its current \
+             shell: the login shell applies only where it runs on the host shell, which needs \
+             --disable-ocap and an exec floor that permits the command (--yolo is all three). \
+             This flag alone leaves approvals and confinement as they are."
+        )
+    }
+}
+
 /// The unmissable session-start banner shown when the `--full-access` preset
 /// override is asserted (`NEWT_FULL_ACCESS=1`). The override itself lives in
 /// `policy_for`; this is the loud surfacing half of the contract, mirroring
@@ -2580,6 +2610,110 @@ fn full_access_banner() -> String {
      flag to restore Object-Capability authority restrictions. Private HTTP destinations \
      still require exact MCP net grants in [tui.permissions] net."
         .to_string()
+}
+
+#[cfg(all(test, unix))]
+mod ambient_banner_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+
+    // Unix absolute paths (`/usr/bin/zsh`) are not absolute on Windows: the module is unix-only.
+    #[test]
+    fn the_banner_lists_exactly_what_is_off_from_the_effective_decision() {
+        use newt_core::launch_authority::LaunchAuthority;
+        // The interpreter is named from the route dispatch selects, which needs the host
+        // bypass on: the session this banner describes.
+        let _env = newt_core::process_env::lock();
+        let saved = std::env::var("NEWT_DISABLE_OCAP").ok();
+        newt_core::process_env::set_var("NEWT_DISABLE_OCAP", "1");
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => newt_core::process_env::set_var("NEWT_DISABLE_OCAP", v),
+                    None => newt_core::process_env::remove_var("NEWT_DISABLE_OCAP"),
+                }
+            }
+        }
+        let _restore = Restore(saved);
+        let shell = AmbientShell::resolve(Some("/usr/bin/zsh".as_ref()));
+        let yolo = LaunchAuthority::from_parts_for_test(true, true, true);
+        let all = ambient_banner(yolo, &shell);
+        for needle in [
+            "YOLO (--yolo)",
+            "approvals OFF (--disable-ocap)",
+            "confinement OFF (--full-access)",
+            "environment OFF (--ambient)",
+            "login shell /usr/bin/zsh -l -i -c",
+            "FULL environment",
+        ] {
+            assert!(all.contains(needle), "missing `{needle}`: {all}");
+        }
+        // `--ambient` alone: run_command stays where it is, so no shell is claimed.
+        for authority in [
+            LaunchAuthority::AMBIENT,
+            LaunchAuthority::from_parts_for_test(true, false, true),
+        ] {
+            let alone = ambient_banner(authority, &shell);
+            assert!(
+                alone.contains("AMBIENT (--ambient): environment OFF"),
+                "{alone}"
+            );
+            assert!(
+                !alone.contains("login shell /usr/bin/zsh")
+                    && !alone.contains("run_command runs your"),
+                "must not claim a shell that does not run: {alone}"
+            );
+            assert!(
+                !alone.contains("approvals OFF") && !alone.contains("confinement OFF"),
+                "the ambient axis alone must not claim the others: {alone}"
+            );
+        }
+        // A login shell that cannot run is reported as the /bin/sh that does.
+        let missing = AmbientShell::resolve_checked(Some("/no/such/zsh".as_ref()), |_| false);
+        let fallback = ambient_banner(yolo, &missing);
+        assert!(
+            fallback.contains(
+                "$SHELL does not exist; ambient commands run /bin/sh -c with your full environment"
+            ),
+            "{fallback}"
+        );
+        assert!(!fallback.contains("/no/such/zsh"), "{fallback}");
+        // A non-POSIX $SHELL runs /bin/sh, and the banner says so plainly.
+        let fish = ambient_banner(yolo, &AmbientShell::resolve(Some("/usr/bin/fish".as_ref())));
+        assert!(
+            fish.contains("$SHELL is fish, not a POSIX shell; ambient commands run /bin/sh -c with your full environment"),
+            "{fish}"
+        );
+        assert!(!fish.contains("login shell /usr/bin/fish"), "{fish}");
+    }
+}
+
+/// On Windows the banner names the Brush/cmd shell that runs, not a unix `/bin/sh`.
+#[cfg(all(test, windows))]
+mod ambient_banner_windows_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+    use newt_core::launch_authority::LaunchAuthority;
+
+    #[test]
+    fn the_banner_names_the_shell_that_runs_on_windows() {
+        let _env = newt_core::process_env::lock();
+        let saved = std::env::var("NEWT_DISABLE_OCAP").ok();
+        newt_core::process_env::set_var("NEWT_DISABLE_OCAP", "1");
+        let banner = ambient_banner(
+            LaunchAuthority::from_parts_for_test(true, true, true),
+            &AmbientShell::resolve(None),
+        );
+        match saved {
+            Some(v) => newt_core::process_env::set_var("NEWT_DISABLE_OCAP", &v),
+            None => newt_core::process_env::remove_var("NEWT_DISABLE_OCAP"),
+        }
+        assert!(
+            banner.contains("unix-only") && !banner.contains("/bin/sh"),
+            "{banner}"
+        );
+    }
 }
 
 /// The ONE `full-access` line written to the #263 permission log at session

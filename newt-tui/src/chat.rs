@@ -2467,6 +2467,13 @@ fn session_body(
         }
     }
 
+    // --ambient / --yolo (#978): say plainly what is off, after the per-axis banners above.
+    let authority = newt_core::launch_authority::current();
+    if authority.ambient() {
+        let shell = newt_core::ambient_shell::AmbientShell::resolve_host();
+        print_newt(&ambient_banner(authority, &shell), color, verbose);
+    }
+
     // Connect to discovered MCP servers ONCE for the session (newt config +
     // Claude Code config). Failures are logged + skipped; their tools are added
     // to the agent's tool set, namespaced `server__tool`. `newt doctor` shows

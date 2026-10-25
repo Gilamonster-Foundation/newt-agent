@@ -190,6 +190,7 @@ fn host_shell_command_strips_authority_env() {
     // intent is legible in the test, not just the loop.
     for critical in [
         "NEWT_UNSAFE_HOST_EXEC",
+        "NEWT_AMBIENT",
         "NEWT_AGENT_KEY",
         "NEWT_OPERATOR_KEY",
         "NEWT_TOKEN_PASSPHRASE",
@@ -549,4 +550,261 @@ fn adoption_2759_notice_uses_only_blocked_write_denials() {
     }
     let output = serde_json::json!({"exit_code":1, "stdout":policy.notice(), "stderr":"denied: write of sentinel", "denials":[]});
     assert!(shell::worktree_denial_notice(Some(&policy), &output, cwd).is_none());
+}
+
+/// Restores the process's `$SHELL` when a test that rewrites it ends, so no other test sees it.
+#[cfg(not(windows))]
+struct ShellVar(Option<String>);
+#[cfg(not(windows))]
+impl ShellVar {
+    fn save() -> Self {
+        Self(std::env::var("SHELL").ok())
+    }
+}
+#[cfg(not(windows))]
+impl Drop for ShellVar {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => crate::process_env::set_var("SHELL", v),
+            None => crate::process_env::remove_var("SHELL"),
+        }
+    }
+}
+
+/// The argv of the host-shell child as `(program, args)`.
+#[cfg(not(windows))]
+fn host_argv(fallback: bool) -> (String, Vec<String>) {
+    let c = host_shell_command(
+        super::shell::ShellRoute::BashSh,
+        fallback,
+        "echo hi",
+        "/tmp",
+    )
+    .unwrap();
+    let c = c.as_std();
+    (
+        c.get_program().to_string_lossy().into_owned(),
+        c.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+/// #978: every posture but `--ambient` builds the argv it always did: `bash -c` (`sh -c`
+/// as the not-found fallback) with the portable `which` helper. `--yolo --full-access`
+/// and the unsafe-host-exec lane are among them, whatever `$SHELL` says.
+#[cfg(not(windows))]
+#[test]
+fn non_ambient_postures_keep_bash_dash_c() {
+    let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
+    crate::process_env::set_var("SHELL", "/usr/bin/zsh");
+    for pin in [
+        crate::launch_authority::ScopedAuthority::new(false, false),
+        crate::launch_authority::ScopedAuthority::new(true, false),
+        crate::launch_authority::ScopedAuthority::new(false, true),
+        // The pair is not `--ambient`.
+        crate::launch_authority::ScopedAuthority::new(true, true),
+    ] {
+        let (program, args) = host_argv(false);
+        assert_eq!(program, "bash");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-c");
+        assert!(args[1].ends_with("\necho hi"), "{args:?}");
+        let (program, args) = host_argv(true);
+        assert_eq!((program.as_str(), args[0].as_str()), ("sh", "-c"));
+        drop(pin);
+    }
+}
+
+/// #978: under `--ambient`, `run_command` runs the operator's login shell, login and
+/// interactive for the shells that read their rc there.
+#[cfg(not(windows))]
+#[test]
+fn the_ambient_posture_runs_the_operators_login_shell() {
+    let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
+    let _pin = crate::launch_authority::ScopedAuthority::ambient();
+    // The login shell must be a file on this host, so each one is a stand-in file.
+    let dir = tempfile::tempdir().unwrap();
+    let stand_in = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    for (name, flags) in [
+        ("zsh", vec!["-l", "-i", "-c"]),
+        ("bash", vec!["-l", "-i", "-c"]),
+        ("dash", vec!["-l", "-c"]),
+    ] {
+        let shell = stand_in(name);
+        crate::process_env::set_var("SHELL", &shell);
+        let (program, args) = host_argv(false);
+        assert_eq!(program, shell);
+        assert_eq!(args[..flags.len()], flags[..], "{shell}");
+        assert!(args.last().unwrap().ends_with("\necho hi"), "{args:?}");
+    }
+    // fish (or any non-POSIX shell) is not run: `/bin/sh -c`, like the POSIX guidance says.
+    let fish = stand_in("fish");
+    crate::process_env::set_var("SHELL", &fish);
+    let (program, args) = host_argv(false);
+    assert_eq!((program.as_str(), args[0].as_str()), ("/bin/sh", "-c"));
+    // Not found: the existing retry runs /bin/sh -c.
+    let (program, args) = host_argv(true);
+    assert_eq!((program.as_str(), args[0].as_str()), ("/bin/sh", "-c"));
+}
+
+/// #978 fail-closed: an unset or relative `$SHELL` under `--ambient` runs `/bin/sh -c`,
+/// never a path the agent could have planted in the workspace.
+#[cfg(not(windows))]
+#[test]
+fn the_ambient_posture_with_no_trustworthy_shell_runs_bin_sh() {
+    let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
+    let _pin = crate::launch_authority::ScopedAuthority::ambient();
+    for shell in [None, Some(""), Some("zsh"), Some("./sh")] {
+        match shell {
+            Some(v) => crate::process_env::set_var("SHELL", v),
+            None => crate::process_env::remove_var("SHELL"),
+        }
+        let (program, args) = host_argv(false);
+        assert_eq!(
+            (program.as_str(), args[0].as_str()),
+            ("/bin/sh", "-c"),
+            "{shell:?}"
+        );
+    }
+}
+
+/// #978: the host child keeps the full environment in every posture (only newt's own
+/// control plane is removed, exactly the list), so DISPLAY and friends reach it.
+#[cfg(not(windows))]
+#[test]
+fn the_host_child_environment_is_the_inherited_one_minus_the_control_plane() {
+    for ambient in [false, true] {
+        let _pin = if ambient {
+            crate::launch_authority::ScopedAuthority::ambient()
+        } else {
+            crate::launch_authority::ScopedAuthority::new(true, true)
+        };
+        let c =
+            host_shell_command(super::shell::ShellRoute::BashSh, false, "true", "/tmp").unwrap();
+        let mut removed: Vec<String> = c
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        removed.sort();
+        let mut want: Vec<String> = CHILD_STRIPPED_AUTHORITY_ENV
+            .iter()
+            .map(|k| (*k).to_string())
+            .collect();
+        want.sort();
+        assert_eq!(removed, want, "ambient={ambient}");
+        // Nothing is set or cleared beyond that: the child inherits the rest.
+        assert!(c.as_std().get_envs().all(|(_, v)| v.is_none()));
+        for key in [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+        ] {
+            assert!(
+                !removed.iter().any(|k| k == key),
+                "{key} must reach the child"
+            );
+        }
+    }
+}
+
+/// #978 review: a login shell that exists but cannot start (its interpreter is missing) is
+/// said out loud in the result, and the call still runs under `/bin/sh` (POSIX, like the
+/// guidance the model always gets).
+#[cfg(not(windows))]
+#[tokio::test]
+async fn an_unstartable_login_shell_is_reported_and_falls_back_to_bin_sh() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env = crate::process_env::lock();
+    let _shell = ShellVar::save();
+    let dir = tempfile::tempdir().unwrap();
+    let zsh = dir.path().join("zsh");
+    std::fs::write(&zsh, "#!/no/such/interpreter\n").unwrap();
+    std::fs::set_permissions(&zsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::process_env::set_var("SHELL", zsh.to_str().unwrap());
+    let _pin = crate::launch_authority::ScopedAuthority::ambient_with_host_bypass();
+    let run = super::shell::host_shell_output_with_timeout(
+        super::shell::ShellRoute::BashSh,
+        "echo hi",
+        "/tmp",
+        None,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "hi\n",
+        "the call ran under /bin/sh"
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("could not start your login shell"),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// #978 review: the banner names the interpreter of the route dispatch selects, per route
+/// (pure, so every platform runs it).
+#[test]
+fn the_ambient_interpreter_is_named_from_the_route() {
+    use super::shell::{interpreter_for, ShellRoute};
+    use crate::ambient_shell::AmbientShell;
+    let fallback = AmbientShell::Fallback {
+        reason: "$SHELL is not set".into(),
+    };
+    let login = AmbientShell::Login {
+        program: std::path::PathBuf::from("/usr/bin/zsh"),
+        args: &["-l", "-i", "-c"],
+    };
+    let sh = interpreter_for(ShellRoute::BashSh, &fallback);
+    assert!(
+        sh.contains("/bin/sh -c") && sh.contains("$SHELL is not set"),
+        "{sh}"
+    );
+    assert!(
+        interpreter_for(ShellRoute::BashSh, &login).starts_with("your login shell /usr/bin/zsh")
+    );
+    for route in [ShellRoute::AmbientBrush, ShellRoute::Cmd] {
+        let text = interpreter_for(route, &login);
+        assert!(
+            text.contains("unix-only") && !text.contains("/bin/sh") && !text.contains("zsh"),
+            "{text}"
+        );
+    }
+    assert!(interpreter_for(ShellRoute::Cmd, &login).contains("cmd.exe /C"));
+    assert!(interpreter_for(ShellRoute::AmbientBrush, &login).contains("Brush"));
+    let confined = interpreter_for(ShellRoute::Bridled(crate::ShellEngine::SafeSubset), &login);
+    assert!(confined.contains("confined shell"), "{confined}");
+}
+
+/// The session's own route, per platform: unix names the login-shell / `/bin/sh` route,
+/// Windows names the Brush or cmd shell that actually runs.
+#[test]
+fn the_banner_interpreter_matches_this_platforms_route() {
+    let _pin = crate::launch_authority::ScopedAuthority::ambient_with_host_bypass();
+    let fallback = crate::ambient_shell::AmbientShell::Fallback {
+        reason: "$SHELL is not set".into(),
+    };
+    let text = crate::agentic::ambient_interpreter_description(&fallback);
+    #[cfg(unix)]
+    assert!(
+        text.contains("/bin/sh -c") && !text.contains("unix-only"),
+        "{text}"
+    );
+    #[cfg(windows)]
+    assert!(
+        text.contains("unix-only") && !text.contains("/bin/sh"),
+        "Windows must name Brush/cmd, not a unix shell: {text}"
+    );
 }
