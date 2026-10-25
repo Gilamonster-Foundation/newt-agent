@@ -1152,7 +1152,8 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(stdout.matches(CLAIM).count(), 1, "{kind}: {stdout}");
-        assert_eq!(stdout.matches("## Observed").count(), 1, "{kind}: {stdout}");
+        // A non-repo fixture with no tool call is factless: no frame (#3009).
+        assert_eq!(stdout.matches("## Observed").count(), 0, "{kind}: {stdout}");
     }
 
     // The answer is shown before anything that can fail: an unwritable
@@ -1176,7 +1177,7 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
         !output.status.success(),
         "a directory is not an events file"
     );
-    assert_eq!(stdout.matches("▸  ## Observed").count(), 1, "{stdout}");
+    assert_eq!(stdout.matches("## Observed").count(), 0, "{stdout}");
     assert_eq!(stdout.matches(CLAIM).count(), 1, "{stdout}");
 }
 
