@@ -19,10 +19,13 @@ fn vi_unbound_normal_key_emits_a_hint() {
     let mut ta = new_textarea(Edit::Vi);
     type_chars(&mut ed, &mut ta, "hi");
     ed.input(special(KeyCode::Esc), &mut ta); // → NORMAL
-    let _ = ed.take_msg(); // drain anything prior
     ed.input(key('q'), &mut ta); // unbound in NORMAL
+
+    // #3015: the hint is transient footer chrome, not a scrollback note.
+    assert!(ed.take_msg().is_none(), "no scrollback note");
     let msg = ed
-        .take_msg()
+        .vi
+        .hint
         .expect("an unbound NORMAL key should surface a hint");
     assert!(msg.contains("insert"), "hint nudges toward insert: {msg:?}");
     assert_eq!(ta.lines(), &["hi"], "`q` still types nothing in NORMAL");
