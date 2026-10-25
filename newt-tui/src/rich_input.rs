@@ -647,6 +647,9 @@ fn footer_line(
         format!(" {}", editor.header_mode()),
         if active { accent } else { dim },
     ));
+    if let Some(hint) = editor.vi.hint {
+        spans.push(Span::styled(format!(" — {hint}"), accent));
+    }
     if !model.is_empty() {
         let loc = if endpoint.is_empty() {
             model.to_string()
