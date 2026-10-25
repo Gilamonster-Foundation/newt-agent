@@ -165,3 +165,37 @@ the granted binary. Nothing is executed to decide that, and nothing outside
 that one alias is admitted. Closes newt-agent#2630 (`git worktree add` under a
 `git`-only exec grant failed with `cannot exec 'branch'`). Remove this section
 when the vendored base moves to a release that contains the commit.
+
+## Descriptor-bound read roots (vendor-only; rc.6 has no `HeldReadRoot`)
+
+`HeldReadRoot`, `Sandbox::apply_with_held_roots` and
+`ConfinedCommand::held_read_roots`: a caller that already holds a read root as
+a descriptor (and has verified its identity) hands a duplicate to the spawn.
+The Landlock ruleset adds `PathBeneath` on that descriptor and drops the
+path-opened rule for the same root, so a swap at the pathname after the
+caller's check cannot re-point the fence. Admission is unchanged: the root is
+still spelled in `fs_read`; only how the rule is built changes. A wrapper
+backend (Seatbelt) refuses a non-empty set rather than fall back to the path.
+Newt's governed push uses this for the confined object copy.
+
+Invariants (#2674 P1), enforced, not documented preconditions:
+- `HeldReadRoot::bind` is the only constructor (private fields, no public
+  literal). It refuses unless `fd`'s `(dev, ino)` equals what `provenance`
+  names right now (`fstat(fd)` vs `stat(path)`; the path is never reopened), so
+  a falsely labelled `HeldReadRoot(A, fd(B))` cannot be built.
+- `ConfinedCommand::spawn` refuses any held root whose `provenance` is not a
+  member of the admitted `fs_read` scope, before the spawn thread starts, so a
+  genuinely bound but un-admitted `HeldReadRoot(B, fd(B))` cannot reach the
+  sandbox.
+- Landlock chooses ReadFile for non-directory objects and ReadFile|ReadDir for
+  directories from `fstat` of the held fd. A regular-file root never grants
+  its parent directory. A real Landlock regression holds a regular file across
+  replacement and checks that the original inode stays readable while the
+  replacement and a sibling remain denied.
+
+Newt #2835 extends the mechanism through `SandboxedWorker::held_read_roots`.
+The worker delegates the handles to its existing `ConfinedCommand`; admission
+and wrapper-backend refusal stay there. No handles or new fields are
+serialized into the worker protocol. Composing held roots with #419's worker
+binding keeps both original objects after their pathnames are replaced
+(#2692). Retire this section if the mechanism is upstreamed.
