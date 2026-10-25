@@ -1075,12 +1075,12 @@ fn cap_exit_handoff_keeps_one_plan_step_per_rendered_line() {
 
 /// Stage 1: even a cap fallback must include harness facts, not only model claims.
 #[test]
-fn observed_report_is_present_at_cap_finalization() {
+fn observed_report_is_omitted_when_the_turn_observed_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let claims = claim_check::TurnClaims::capture(root, &crate::Scope::All, None);
     let out = finalize_final_text(
-        cap_exit_fallback(1, None, 0, None).test_text(),
+        "Hello again!".to_string(),
         root,
         &crate::Scope::All,
         &capability_check::Evidence::default(),
@@ -1088,8 +1088,18 @@ fn observed_report_is_present_at_cap_finalization() {
         &claims,
         &self_verify::VerificationLedger::default(),
     );
-    assert!(out.starts_with("## Observed"), "{out}");
-    assert!(out.contains("unavailable"), "{out}");
+    assert_eq!(out, "Hello again!");
+}
+
+/// #3009: the honest reason replaces "incomplete or unauthorized" off-repo.
+#[test]
+fn observed_report_names_a_root_that_is_not_a_work_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let claims = claim_check::TurnClaims::capture(root, &crate::Scope::All, None);
+    let out = claims.observed_report(root, &crate::Scope::All, "");
+    assert!(out.contains("root is not a Git work tree"), "{out}");
+    assert!(observed_report::split_report(&out).is_some(), "{out}");
 }
 
 /// Live report regression: copied report envelopes in model prose must not
@@ -1109,8 +1119,9 @@ fn observed_report_finalization_removes_model_report_copies() {
         &claims,
         &self_verify::VerificationLedger::default(),
     );
-    assert_eq!(out.matches("## Observed").count(), 1, "{out}");
-    assert_eq!(out.matches("## Model explanation").count(), 1, "{out}");
+    // Copies are stripped, and a factless turn adds no frame of its own.
+    assert_eq!(out.matches("## Observed").count(), 0, "{out}");
+    assert_eq!(out.matches("## Model explanation").count(), 0, "{out}");
     assert!(out.contains("First explanation."));
     assert!(out.contains("Second explanation."));
 }

@@ -276,6 +276,27 @@ fn decorate_round_cap_reply(
     }
 }
 
+/// #3009: on a surface that collapses committed results, the harness report
+/// folds to one `Fold` marker. `retain` archives the body and returns its
+/// recovery handle; `None` (nothing retained) leaves the reply unfolded.
+#[cfg(feature = "live-spill")]
+fn fold_observed_report(
+    reply: &str,
+    retain: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    let (report, rest) = newt_core::agentic::split_observed_report(reply)?;
+    let handle = retain(report)?;
+    let fold = newt_core::agentic::Fold::lines(
+        report.lines().count(),
+        newt_core::agentic::Recovery::Command(&handle),
+    );
+    Some(format!("▸ Observed · {fold}\n\n{rest}"))
+}
+
+#[cfg(all(test, feature = "live-spill"))]
+#[path = "chat_tests/observed_fold.rs"]
+mod observed_fold_tests;
+
 #[cfg(test)]
 #[path = "chat_tests/origin_upgrade.rs"]
 mod origin_upgrade_tests;
@@ -9823,6 +9844,19 @@ fn session_body(
                                     turn_end_reason,
                                     turn_round_cap_hit,
                                 );
+                                // Same knob as tool output: `/spill summary`
+                                // folds the report, `/spill excerpt` shows it.
+                                #[cfg(feature = "live-spill")]
+                                let display_reply = newt_core::agentic::spill_summary()
+                                    .then(|| {
+                                        fold_observed_report(&display_reply, |report| {
+                                            use newt_core::agentic::CompletedSpillRenderer;
+                                            let id = completed_spills.retain(report);
+                                            Some(completed_spills.recovery_hint(id))
+                                        })
+                                    })
+                                    .flatten()
+                                    .unwrap_or(display_reply);
                                 if was_streamed && paused {
                                     // The model text was emitted incrementally;
                                     // only the deterministic footer remains to be
