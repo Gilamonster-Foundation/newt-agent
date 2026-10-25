@@ -670,6 +670,52 @@ fn closing_a_panel_leaves_the_transcript_above_it_and_none_of_the_panel() {
     crate::interaction_view_pty_test::drive_cockpit_panel_close();
 }
 
+/// #3014: the terminal tells the cockpit where the block is after a resize, and the cockpit
+/// believes it, whichever way the terminal moves things.
+///
+/// The harness plays two terminals by answering the cursor query from a model: one adds rows
+/// below on a grow (the cursor row does not change), one pulls scrollback down (the cursor
+/// row moves with the content). Neither is decided by a wall clock: the model is told what
+/// shift to apply before the resize is delivered.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_resize_re_anchors_the_block_where_the_terminal_put_it_3014() {
+    crate::interaction_view_pty_test::drive_cockpit_resize_anchor();
+}
+
+pub(crate) fn cockpit_resize_anchor_case() {
+    assert!(unsafe { libc::setsid() } >= 0);
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    // Enough history that the block sits on the bottom rows.
+    let history: Vec<Vec<u8>> = (0..40)
+        .map(|n| format!("HISTORY-{n:02}").into_bytes())
+        .collect();
+    cockpit.screen.insert_rows(history).unwrap();
+    cockpit.draw().unwrap();
+    let rows = cockpit.screen.rows;
+    println!("ANCHOR_READY rows={} top={}", rows, cockpit.screen.top);
+    cockpit.drain_pty().unwrap();
+    cockpit.draw().unwrap();
+    // Deliver the resize through the real event loop; bounded by count, not by time.
+    for _ in 0..1500 {
+        cockpit.poll_keys().unwrap();
+        if cockpit.screen.rows != rows {
+            break;
+        }
+    }
+    println!(
+        "ANCHOR_RESULT rows={} top={} block_h={}",
+        cockpit.screen.rows, cockpit.screen.top, cockpit.screen.block_h
+    );
+    cockpit.drain_pty().unwrap();
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+}
+
 pub(crate) fn cockpit_panel_loop_case() {
     // This disposable child owns the tty queried by Crossterm's geometry API.
     assert!(unsafe { libc::setsid() } >= 0);

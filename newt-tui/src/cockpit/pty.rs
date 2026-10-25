@@ -182,6 +182,47 @@ impl PtyCapture {
         Ok(n as usize)
     }
 
+    /// Ask the REAL terminal where its cursor is (#3014), without a second writer or a stray
+    /// byte in the transcript.
+    ///
+    /// crossterm's `cursor::position` writes its `ESC[6n` to *stdout*, which under the capture
+    /// is the pty, so the query would land in the transcript and never be answered. Here Rust's
+    /// stdout lock is held (no session thread's `println!` can run), the buffer is flushed,
+    /// fd 1 is pointed at the real terminal for the length of the query, and then put back.
+    /// The reply is read from stdin by crossterm's own reader, so no event is stolen.
+    /// Blocks for crossterm's own bound when the terminal never answers.
+    pub(crate) fn query_cursor(&self) -> io::Result<(u16, u16)> {
+        use std::io::Write as _;
+        let stdout = io::stdout();
+        let mut guard = stdout.lock();
+        guard.flush()?;
+        // SAFETY: dup/dup2 on descriptors this capture owns, restored before the lock drops.
+        let pty_out = unsafe { libc::dup(1) };
+        if pty_out < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        struct Restore(RawFd);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: puts fd 1 back on the pty and closes the spare.
+                unsafe {
+                    libc::dup2(self.0, 1);
+                    libc::close(self.0);
+                }
+            }
+        }
+        let _restore = Restore(pty_out);
+        // SAFETY: as above.
+        if unsafe { libc::dup2(self.tty.as_raw_fd(), 1) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let position = crossterm::cursor::position();
+        // The query was written through the locked handle; nothing may stay buffered for
+        // whichever fd 1 is next.
+        guard.flush()?;
+        position
+    }
+
     /// Tell the pty the terminal's new size, so a child's `ioctl(1,
     /// TIOCGWINSZ)` — and anything else that sizes by fd 1 — sees the truth.
     pub(crate) fn resize(&self, cols: u16, rows: u16) {
