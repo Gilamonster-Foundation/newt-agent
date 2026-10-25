@@ -1776,9 +1776,9 @@ fn token_has_exact_binding(token: &TokenFile, meta: &MetaFile) -> bool {
 mod oauth_flow;
 
 // `lib.rs` calls this as `mcp_token::run_oauth_flow`; the path is preserved.
-pub(crate) use oauth_flow::run_oauth_flow;
 #[cfg(feature = "rich-tui")]
 pub(crate) use oauth_flow::run_oauth_flow_cancellable;
+pub(crate) use oauth_flow::{run_oauth_flow, ConfiguredOAuth};
 // Reached by the sections above, which stayed behind.
 use oauth_flow::{
     fenced_client_for_url_with_policy, resource_matches, validate_discovery_hop_with_policy,

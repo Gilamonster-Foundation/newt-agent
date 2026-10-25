@@ -966,9 +966,18 @@ impl Tool for ShellTool {
             deadline: deadline.clone(),
         };
         // Disclosed on every envelope this run returns (ADR 0018 D5/D11 / I11).
+        // `mach_services` (agent-bridle#405): the zero-floor posture of a
+        // network-denied Seatbelt run — granted services by name, withheld
+        // candidates — so a host can offer an operator grant for a child that
+        // failed on a denied service. Computed from the SAME backend caveats the
+        // fence installs; a malformed `mach:` token refuses here, before spawn.
         let disclosure = Disclosure {
             unbridled,
             human_gate: human_gate(),
+            mach_services: agent_bridle_core::mach_service_disclosure(
+                &backend_caveats,
+                sandbox_kind,
+            )?,
             ..Disclosure::default()
         };
         // Host/operator-supplied environment (the env seam, newt #783): carried

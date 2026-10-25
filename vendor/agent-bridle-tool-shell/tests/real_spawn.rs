@@ -1292,9 +1292,22 @@ async fn real_seatbelt_confines_a_spawned_childs_own_read() {
     let _ = std::fs::remove_dir_all(&forbidden);
 }
 
-// Restricted Seatbelt net is unsupported until ambient Mach/XPC deputies are
-// faithfully bounded. End to end, CONFINED must refuse before any child starts;
-// direct socket-rule mechanism evidence lives below admission in core.
+// agent-bridle#416 round 3 (fix-first review): round 2's rename to
+// `..._admits_and_kernel_still_denies_egress` leaned on the SAME L3 gap this
+// round's fix closes — `SeatbeltSandbox::resolved_authority` ignored stdio,
+// so ANY net:none spawn (audited or not) resolved a named `Bounded(∅)` and
+// admitted under the DEFAULT floor. `ShellTool`'s per-stage pipeline builder
+// uses raw `std::process::Stdio` (file redirects, OS pipes), never
+// `agent_bridle_core::ConfinedStdio` — it is not, and never claimed to be,
+// the "only production caller with actual per-channel knowledge of what it
+// configured" that `StdioPosture::Audited` requires (see
+// `ConfinementMechanism::with_stdio_posture`'s doc comment;
+// `ConfinedCommand::spawn` is that caller — see
+// `agent_bridle_core::spawn::seatbelt_child_tests::
+// net_none_with_audited_stdio_admits_and_the_kernel_still_blocks_egress` for
+// the positive control through THAT path). So `ShellTool` correctly reverts
+// to refusing restricted net before any spawn — the ORIGINAL, pre-#405
+// behavior this test pinned, restored for the right reason this time.
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 #[tokio::test]
 async fn real_seatbelt_restricted_net_refuses_before_spawn() {
@@ -1305,34 +1318,32 @@ async fn real_seatbelt_restricted_net_refuses_before_spawn() {
         "macOS Seatbelt evidence requires /usr/bin/sandbox-exec"
     );
 
-    let marker = unique_temp("sb-net-refused");
+    let marker = unique_temp("sb-net-refuses");
     let _ = std::fs::remove_file(&marker);
-    // `touch` would create the marker if admission accidentally spawned it.
     let caveats = Caveats {
         exec: Scope::only(["touch".to_string()]),
         net: Scope::none(),
         ..Caveats::top()
     };
+
     let out = ShellTool::new()
         .invoke(
             serde_json::json!({ "cmd": format!("touch {}", marker.display()) }),
             &ctx(caveats),
         )
         .await
-        .expect("invoke");
-
+        .expect("backend admission refusal is a structured envelope");
     assert_eq!(
         out["denied"], true,
-        "restricted Seatbelt net must fail closed before spawn: {out}"
+        "a net:none spawn through ShellTool's unaudited stdio must fail closed: {out}"
     );
     assert_eq!(
         out["denials"][0]["kind"], "net",
-        "the refusal must identify the net axis: {out}"
+        "unexpected refusal: {out}"
     );
-    assert_eq!(out["enforcement"]["net"], "advisory", "{out}");
     assert!(
         !marker.exists(),
-        "the child must not spawn after the net-floor refusal: {out}"
+        "the marker proves ShellTool must not have spawned: {out}"
     );
 }
 
