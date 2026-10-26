@@ -1102,6 +1102,43 @@ fn observed_report_names_a_root_that_is_not_a_work_tree() {
     assert!(observed_report::split_report(&out).is_some(), "{out}");
 }
 
+/// #3009: "not a Git work tree" is claimed only on a positive negative. A
+/// repository subdirectory, a refused metadata probe and a repository root
+/// whose snapshot is merely unavailable all say "unavailable" instead.
+#[test]
+fn observed_report_claims_not_a_work_tree_only_on_a_positive_negative() {
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    };
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    let sub = repo.path().join("crate");
+    std::fs::create_dir(&sub).unwrap();
+    let report = |dir: &std::path::Path, scope: &crate::Scope<String>| {
+        let root = dir.to_str().unwrap();
+        claim_check::TurnClaims::capture(root, &crate::Scope::All, None)
+            .observed_report(root, scope, "")
+    };
+    let denied = report(repo.path(), &crate::Scope::none());
+    assert!(
+        !denied.contains("not a Git work tree") && denied.contains("incomplete or unauthorized"),
+        "a refused probe is unknown, not absence: {denied}"
+    );
+    let inside = report(&sub, &crate::Scope::All);
+    assert!(
+        !inside.contains("not a Git work tree"),
+        "a subdirectory of a repository is not outside one: {inside}"
+    );
+    let outside = tempfile::tempdir().unwrap();
+    assert!(report(outside.path(), &crate::Scope::All).contains("not a Git work tree"));
+}
+
 /// Live report regression: copied report envelopes in model prose must not
 /// impersonate a second harness report, including copies after ordinary prose.
 #[test]

@@ -224,7 +224,7 @@ impl State {
         ));
         let rows = match (&state.baseline, &current) {
             (Some(before), Some(after)) => files::changes(before, after),
-            _ if !crate::agentic::claim_check::is_workspace_repo_root(
+            _ if crate::agentic::claim_check::workspace_is_confirmed_not_a_repo(
                 &root.to_string_lossy(),
                 scope,
             ) =>
