@@ -280,7 +280,7 @@ fn a_panic_after_entry_still_restores_the_terminal() {
     assert_terminal_restored("panic after entry", &out);
 }
 
-/// #3016: F4 is a fold list. Space unfolds the selected item in place (the
+/// #3016: F4 is a fold list. Enter opens the selected spill; Space unfolds the selected item in place (the
 /// rows past the preview appear on the same screen), and `q` still hands the
 /// terminal back.
 #[cfg(feature = "live-spill")]

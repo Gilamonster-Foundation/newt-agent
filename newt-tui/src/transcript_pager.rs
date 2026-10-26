@@ -743,7 +743,7 @@ mod terminal {
                     &crate::modal::Chrome {
                         title: &title,
                         subtitle,
-                        hint: Some("Esc back · ↑↓ select · Space fold/unfold · PgUp/PgDn scroll · o inspect"),
+                        hint: Some("Esc back · ↑↓ select · Space fold/unfold · Enter open · PgUp/PgDn scroll"),
                     },
                 );
                 page_rows = usize::from(body.height.saturating_sub(1)).max(1);
@@ -799,10 +799,10 @@ mod terminal {
                 }
                 KeyCode::Up => folds.select_prev(),
                 KeyCode::Down => folds.select_next(),
-                KeyCode::Enter | KeyCode::Char(' ') => folds.toggle_selected(),
+                KeyCode::Char(' ') => folds.toggle_selected(),
                 KeyCode::PageUp => folds.scroll(-(page_rows as isize), width),
                 KeyCode::PageDown => folds.scroll(page_rows as isize, width),
-                KeyCode::Char('o') => {
+                KeyCode::Enter => {
                     if let Some(i) = spills
                         .iter()
                         .position(|s| Some(s.id().to_string().as_str()) == folds.selected_key())
