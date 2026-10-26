@@ -1107,10 +1107,10 @@ fn observed_report_names_a_root_that_is_not_a_work_tree() {
 /// whose snapshot is merely unavailable all say "unavailable" instead.
 #[test]
 fn observed_report_claims_not_a_work_tree_only_on_a_positive_negative() {
+    let home = tempfile::tempdir().unwrap();
     let git = |dir: &std::path::Path, args: &[&str]| {
-        assert!(std::process::Command::new("git")
+        assert!(hermetic_git(dir, home.path())
             .args(args)
-            .current_dir(dir)
             .output()
             .unwrap()
             .status
