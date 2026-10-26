@@ -2499,6 +2499,13 @@ fn session_body(
         }
     }
 
+    // --ambient / --yolo (#978): say plainly what is off, after the per-axis banners above.
+    let authority = newt_core::launch_authority::current();
+    if authority.ambient() {
+        let shell = newt_core::ambient_shell::AmbientShell::resolve_host();
+        print_newt(&ambient_banner(authority, &shell), color, verbose);
+    }
+
     // Connect to discovered MCP servers ONCE for the session (newt config +
     // Claude Code config). Failures are logged + skipped; their tools are added
     // to the agent's tool set, namespaced `server__tool`. `newt doctor` shows
@@ -2653,12 +2660,7 @@ fn session_body(
         Some(name) => Some(persona_store.load(name)?),
         None => None,
     };
-    warn_on_missing_bound_skills(
-        active_persona.as_ref(),
-        &cfg.skill_search_dirs(),
-        color,
-        verbose,
-    );
+    warn_on_missing_bound_skills(active_persona.as_ref(), &cfg, color, verbose);
     // FR-5 (#999): apply the `--altitude` flag. It rides on `active_persona`
     // (already threaded through every prompt rebuild), so an explicit flag either
     // overrides a loaded persona's altitude or — with no `--persona` — synthesizes
@@ -2946,9 +2948,32 @@ fn session_body(
     let mut last_override = crate::try_system_prompt_override();
     // #2933: likewise for `[prompt] components`, which shape the soul.
     let mut last_components = cfg.prompt_components().unwrap_or_default();
+    // `[skills] off` shapes the skill index the same way.
+    let skills_off = |cfg: &newt_core::Config| cfg.skills.as_ref().map(|s| s.off.clone());
+    let mut last_skills_off = skills_off(&cfg);
     macro_rules! refresh_prompt_override {
         () => {
             let components_now = cfg.prompt_components().unwrap_or_default();
+            let skills_now = skills_off(&cfg);
+            if skills_now != last_skills_off {
+                last_skills_off = skills_now;
+                if reconcile_posture_skill(&cfg) {
+                    print_newt(
+                        "posture skill updated to match [skills] off",
+                        color,
+                        verbose,
+                    );
+                }
+                system = rebuild_system_prompt_for(
+                    workspace,
+                    &memory,
+                    active_persona.as_ref(),
+                    &active_conversation_id,
+                    &cfg,
+                    Some(&*report_sink),
+                );
+                print_newt("system prompt rebuilt (skills changed)", color, verbose);
+            }
             if components_now != last_components {
                 last_components = components_now;
                 system = rebuild_system_prompt_for(
@@ -7008,7 +7033,7 @@ fn session_body(
                         {
                             warn_on_missing_bound_skills(
                                 active_persona.as_ref(),
-                                &cfg.skill_search_dirs(),
+                                &cfg,
                                 color,
                                 verbose,
                             );

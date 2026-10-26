@@ -100,6 +100,8 @@ fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
             // #728: advertised ALWAYS (a model must always be able to ask the
             // human; degrades honestly headless), pushed last.
             "request_user_input",
+            // #144: advertised ALWAYS; refuses without an operator gate.
+            "propose_config_edit",
             // #891: advertised ALWAYS (the model-facing lifecycle surface;
             // degrades honestly with "no command configured"), pushed after
             // request_user_input.

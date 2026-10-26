@@ -436,7 +436,7 @@ impl Config {
     /// is no longer called from the permanent-allow flow. A ratchet candidate
     /// for full removal once no config in the wild still relies on the read.
     pub fn append_permission_net_host(path: &Path, host: &str) -> Result<()> {
-        Self::update_permissions_file(path, |text| Self::with_net_host(text, host))
+        Self::update_config_file(path, |text| Self::with_net_host(text, host))
     }
 
     /// Save the operator's default for a terminal approval, without granting
@@ -453,7 +453,7 @@ impl Config {
                 "permission prompt default must be allow_once or deny".into(),
             ));
         }
-        Self::update_permissions_file(path, |text| {
+        Self::update_config_file(path, |text| {
             Self::update_permissions_text(text, |permissions| {
                 let mut value = toml_edit::Value::from(action.as_str());
                 if let Some(previous) = permissions
@@ -466,31 +466,5 @@ impl Config {
                 Ok(())
             })
         })
-    }
-
-    fn update_permissions_file(
-        path: &Path,
-        update: impl FnOnce(&str) -> Result<String>,
-    ) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
-        }
-        let destination = crate::atomic_fs::ResolvedPath::resolve(path).map_err(|error| {
-            NewtError::Config(format!(
-                "resolve config destination for {}: {error:#}",
-                path.display()
-            ))
-        })?;
-        let _lock = crate::atomic_fs::acquire_lock(&destination.lock_path())
-            .map_err(|error| NewtError::Config(format!("lock {}: {error:#}", path.display())))?;
-        let text = match std::fs::read_to_string(destination.as_path()) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(NewtError::Io(error)),
-        };
-        let updated = update(&text)?;
-        destination
-            .atomic_write(updated.as_bytes())
-            .map_err(|error| NewtError::Config(format!("write {}: {error:#}", path.display())))
     }
 }

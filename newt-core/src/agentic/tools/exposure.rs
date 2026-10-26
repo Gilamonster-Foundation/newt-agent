@@ -82,6 +82,7 @@ const EXPOSURE_CLASSES: &[(&str, ExposureClass)] = &[
     ("render_report", ExposureClass::RecoveryOnly),
     // ByIntent: loaded when the task points at them.
     ("lifecycle", ExposureClass::ByIntent),
+    ("propose_config_edit", ExposureClass::ByIntent),
     ("save_note", ExposureClass::ByIntent),
     ("recall", ExposureClass::ByIntent),
     ("git", ExposureClass::ByIntent),

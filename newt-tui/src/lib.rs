@@ -141,6 +141,7 @@ mod settings_form;
 mod settings_form_pty_test;
 #[cfg(feature = "rich-tui")]
 mod shell;
+mod skills_form;
 mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
@@ -2563,6 +2564,36 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
     )
 }
 
+/// The session-start banner for the `--ambient` axis and for `--yolo`, which is all three
+/// (#978). It lists exactly what is off, from the effective decision rather than the flags:
+/// the shell is claimed only where `run_command` runs on the host shell (`--disable-ocap`
+/// with `--full-access`), and `shell` is how `$SHELL` really resolved (a POSIX login shell, or
+/// the `/bin/sh` that runs instead, with the reason).
+fn ambient_banner(
+    authority: newt_core::launch_authority::LaunchAuthority,
+    shell: &newt_core::ambient_shell::AmbientShell,
+) -> String {
+    let children = "child processes and stdio MCP servers get your FULL environment \
+         (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); newt's own \
+         secrets and switches are still withheld";
+    // From the route dispatch selects, so each platform names what really runs.
+    let runs = newt_core::agentic::ambient_interpreter_description(shell);
+    if authority.ocap_disabled() && authority.full_access() {
+        format!(
+            "⚠ YOLO (--yolo): approvals OFF (--disable-ocap), confinement OFF (--full-access), \
+             environment OFF (--ambient): run_command runs {runs}, and {children}. Drop the \
+             flag to restore confinement."
+        )
+    } else {
+        format!(
+            "⚠ AMBIENT (--ambient): environment OFF: {children}. run_command keeps its current \
+             shell: the login shell applies only where it runs on the host shell, which needs \
+             --disable-ocap and an exec floor that permits the command (--yolo is all three). \
+             This flag alone leaves approvals and confinement as they are."
+        )
+    }
+}
+
 /// The unmissable session-start banner shown when the `--full-access` preset
 /// override is asserted (`NEWT_FULL_ACCESS=1`). The override itself lives in
 /// `policy_for`; this is the loud surfacing half of the contract, mirroring
@@ -2580,6 +2611,110 @@ fn full_access_banner() -> String {
      flag to restore Object-Capability authority restrictions. Private HTTP destinations \
      still require exact MCP net grants in [tui.permissions] net."
         .to_string()
+}
+
+#[cfg(all(test, unix))]
+mod ambient_banner_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+
+    // Unix absolute paths (`/usr/bin/zsh`) are not absolute on Windows: the module is unix-only.
+    #[test]
+    fn the_banner_lists_exactly_what_is_off_from_the_effective_decision() {
+        use newt_core::launch_authority::LaunchAuthority;
+        // The interpreter is named from the route dispatch selects, which needs the host
+        // bypass on: the session this banner describes.
+        let _env = newt_core::process_env::lock();
+        let saved = std::env::var("NEWT_DISABLE_OCAP").ok();
+        newt_core::process_env::set_var("NEWT_DISABLE_OCAP", "1");
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => newt_core::process_env::set_var("NEWT_DISABLE_OCAP", v),
+                    None => newt_core::process_env::remove_var("NEWT_DISABLE_OCAP"),
+                }
+            }
+        }
+        let _restore = Restore(saved);
+        let shell = AmbientShell::resolve(Some("/usr/bin/zsh".as_ref()));
+        let yolo = LaunchAuthority::from_parts_for_test(true, true, true);
+        let all = ambient_banner(yolo, &shell);
+        for needle in [
+            "YOLO (--yolo)",
+            "approvals OFF (--disable-ocap)",
+            "confinement OFF (--full-access)",
+            "environment OFF (--ambient)",
+            "login shell /usr/bin/zsh -l -i -c",
+            "FULL environment",
+        ] {
+            assert!(all.contains(needle), "missing `{needle}`: {all}");
+        }
+        // `--ambient` alone: run_command stays where it is, so no shell is claimed.
+        for authority in [
+            LaunchAuthority::AMBIENT,
+            LaunchAuthority::from_parts_for_test(true, false, true),
+        ] {
+            let alone = ambient_banner(authority, &shell);
+            assert!(
+                alone.contains("AMBIENT (--ambient): environment OFF"),
+                "{alone}"
+            );
+            assert!(
+                !alone.contains("login shell /usr/bin/zsh")
+                    && !alone.contains("run_command runs your"),
+                "must not claim a shell that does not run: {alone}"
+            );
+            assert!(
+                !alone.contains("approvals OFF") && !alone.contains("confinement OFF"),
+                "the ambient axis alone must not claim the others: {alone}"
+            );
+        }
+        // A login shell that cannot run is reported as the /bin/sh that does.
+        let missing = AmbientShell::resolve_checked(Some("/no/such/zsh".as_ref()), |_| false);
+        let fallback = ambient_banner(yolo, &missing);
+        assert!(
+            fallback.contains(
+                "$SHELL does not exist; ambient commands run /bin/sh -c with your full environment"
+            ),
+            "{fallback}"
+        );
+        assert!(!fallback.contains("/no/such/zsh"), "{fallback}");
+        // A non-POSIX $SHELL runs /bin/sh, and the banner says so plainly.
+        let fish = ambient_banner(yolo, &AmbientShell::resolve(Some("/usr/bin/fish".as_ref())));
+        assert!(
+            fish.contains("$SHELL is fish, not a POSIX shell; ambient commands run /bin/sh -c with your full environment"),
+            "{fish}"
+        );
+        assert!(!fish.contains("login shell /usr/bin/fish"), "{fish}");
+    }
+}
+
+/// On Windows the banner names the Brush/cmd shell that runs, not a unix `/bin/sh`.
+#[cfg(all(test, windows))]
+mod ambient_banner_windows_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+    use newt_core::launch_authority::LaunchAuthority;
+
+    #[test]
+    fn the_banner_names_the_shell_that_runs_on_windows() {
+        let _env = newt_core::process_env::lock();
+        let saved = std::env::var("NEWT_DISABLE_OCAP").ok();
+        newt_core::process_env::set_var("NEWT_DISABLE_OCAP", "1");
+        let banner = ambient_banner(
+            LaunchAuthority::from_parts_for_test(true, true, true),
+            &AmbientShell::resolve(None),
+        );
+        match saved {
+            Some(v) => newt_core::process_env::set_var("NEWT_DISABLE_OCAP", &v),
+            None => newt_core::process_env::remove_var("NEWT_DISABLE_OCAP"),
+        }
+        assert!(
+            banner.contains("unix-only") && !banner.contains("/bin/sh"),
+            "{banner}"
+        );
+    }
 }
 
 /// The ONE `full-access` line written to the #263 permission log at session
@@ -5549,7 +5684,7 @@ fn missing_bound_skills(skills: &[String], search_dirs: &[std::path::PathBuf]) -
 /// skill that doesn't resolve under `search_dirs`.
 fn warn_on_missing_bound_skills(
     persona: Option<&Persona>,
-    search_dirs: &[std::path::PathBuf],
+    cfg: &newt_core::Config,
     color: bool,
     verbose: bool,
 ) {
@@ -5557,7 +5692,23 @@ fn warn_on_missing_bound_skills(
     let Some(skills) = &persona.profile.skills else {
         return;
     };
-    let missing = missing_bound_skills(skills, search_dirs);
+    let off: Vec<&str> = skills
+        .iter()
+        .map(String::as_str)
+        .filter(|s| cfg.skill_is_off(s))
+        .collect();
+    if !off.is_empty() {
+        print_newt(
+            &format!(
+                "warning: persona `{}` binds skill(s) you switched off: {} (`/settings skills on <name>`)",
+                persona.name,
+                off.join(", ")
+            ),
+            color,
+            verbose,
+        );
+    }
+    let missing = missing_bound_skills(skills, &cfg.skill_search_dirs());
     if !missing.is_empty() {
         print_newt(
             &format!(
@@ -5916,8 +6067,13 @@ fn parse_conversation_rest<'a>(
 /// first-directory-wins union as discovery. Split out from
 /// [`build_system_prompt_with_persona`] so the injection can be unit-tested against
 /// controlled directories without mutating the process-wide `$HOME`.
-fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String> {
-    newt_skills::index_block(&newt_skills::discover_paths(skills_dirs))
+fn skills_index_for_prompt(
+    skills_dirs: &[std::path::PathBuf],
+    off: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let mut skills = newt_skills::discover_paths(skills_dirs);
+    skills.retain(|s| !off(&s.name));
+    newt_skills::index_block(&skills)
 }
 
 /// FR-5 (#999): the minimal persona that carries ONLY an altitude, used when
@@ -6023,7 +6179,8 @@ fn build_system_prompt_for(
     // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
     // missing dir contributes nothing.
     let skills_dirs = cfg.skill_search_dirs();
-    let skills_index = skills_index_for_prompt(&skills_dirs);
+    // A skill the operator switched off (`[skills] off`) is not offered to the model.
+    let skills_index = skills_index_for_prompt(&skills_dirs, &|name| cfg.skill_is_off(name));
     // Top-level names only; the assembler drops hidden ones and caps the list.
     let file_names: Option<Vec<String>> = std::fs::read_dir(workspace).ok().map(|entries| {
         entries
@@ -6259,6 +6416,34 @@ pub async fn headless_system_prompt(
     assemble_session_prompt(workspace, &memory, None, &session, cfg, sink)
 }
 
+/// Keep the active posture's preloaded skill in step with `[skills] off`: a posture binds
+/// its skill by the `skill` of its `[modes.<name>]` entry, and loaded the body once at
+/// `/posture`. Switching that skill off drops the body from the next turn; switching it on
+/// again reloads it. Returns whether the posture changed.
+pub(crate) fn reconcile_posture_skill(cfg: &newt_core::Config) -> bool {
+    let Some(mut posture) = newt_core::posture::active_posture() else {
+        return false;
+    };
+    // The skill bound AT ACTIVATION, not whatever the config maps the name to now.
+    let Some(skill) = posture.skill.clone() else {
+        return false;
+    };
+    if cfg.skill_is_off(&skill) {
+        if posture.skill_body.take().is_none() {
+            return false;
+        }
+    } else if posture.skill_body.is_none() {
+        match cfg.load_skill_body(&skill) {
+            Ok(body) => posture.skill_body = Some(body),
+            Err(_) => return false,
+        }
+    } else {
+        return false;
+    }
+    newt_core::posture::set_active_posture(Some(posture));
+    true
+}
+
 fn handle_operating_mode_command(
     arg: &str,
     active_mode: &mut OperatingMode,
@@ -6368,10 +6553,7 @@ fn handle_posture_command(arg: &str, cfg: &newt_core::Config, color: bool, verbo
     // Resolve + validate WITHOUT mutating. The skill loader reuses the SAME
     // `use_skill` path (`load_body_from` over the configured search dirs) —
     // skill dirs are config-rooted, exactly as the `use_skill` tool resolves.
-    let skills_dirs = cfg.skill_search_dirs();
-    let posture = build_posture(arg, cfg, |skill_name| {
-        newt_skills::load_body_from(&skills_dirs, skill_name)
-    });
+    let posture = build_posture(arg, cfg, |skill_name| cfg.load_skill_body(skill_name));
     let posture = match posture {
         Ok(posture) => posture,
         Err(e) => {

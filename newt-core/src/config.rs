@@ -76,6 +76,7 @@ mod presentation;
 mod profile;
 mod prompt;
 mod redact;
+mod self_edit;
 mod semantic;
 mod shell;
 mod skills;
@@ -91,6 +92,7 @@ use context::default_input_ceiling_pct;
 use layering::{array_merge_strategy, base_is_ambient_newt_toml, mark_project_mcp_untrusted};
 use presentation::{default_spill_lines, default_time_marker_secs, default_tool_output_lines};
 use redact::{redact_arg_secrets, redact_url_secrets};
+pub use self_edit::{backup_path, ConfigEdit};
 pub use shell::{
     confined_default_engine, full_access_default_engine, mcp_stdio_env_passthrough,
     ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
@@ -2325,6 +2327,34 @@ impl Config {
             }
         } else {
             replace_in_place(table, "preset", toml_edit::value(preset));
+        }
+        Ok(doc.to_string())
+    }
+
+    /// Set `[skills] off` (`/settings skills on|off`), removing the key when `off` is
+    /// empty and preserving the rest of the document. PURE: the caller owns the write.
+    pub fn with_skills_off(text: &str, off: &[&str]) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("skills")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`skills` is not a table".to_string()))?;
+        if off.is_empty() {
+            table.remove("off");
+        } else {
+            let mut array = toml_edit::Array::new();
+            for name in off {
+                array.push(*name);
+            }
+            replace_in_place(table, "off", toml_edit::value(array));
         }
         Ok(doc.to_string())
     }

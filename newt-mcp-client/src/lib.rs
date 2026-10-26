@@ -673,14 +673,29 @@ fn assemble_env_grants(
     shell_env: &BTreeMap<String, String>,
     entry_env: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
+    assemble_env_grants_with(passthrough, shell_env, entry_env, cfg!(windows))
+}
+
+/// [`assemble_env_grants`] with the name identity chosen: Windows names are
+/// case-insensitive, so an inherited `Path` and an explicit server `PATH` are ONE variable
+/// and the later layer (the server entry) replaces the earlier one, spelling included.
+fn assemble_env_grants_with(
+    passthrough: &[(String, String)],
+    shell_env: &BTreeMap<String, String>,
+    entry_env: &BTreeMap<String, String>,
+    case_insensitive: bool,
+) -> Vec<(String, String)> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
-    for (k, v) in passthrough {
-        map.insert(k.clone(), v.clone());
-    }
-    for (k, v) in shell_env {
-        map.insert(k.clone(), v.clone());
-    }
-    for (k, v) in entry_env {
+    let layers = passthrough
+        .iter()
+        .map(|(k, v)| (k, v))
+        .chain(shell_env.iter())
+        .chain(entry_env.iter());
+    for (k, v) in layers {
+        // A lower layer's same-named variable (under the host's identity) is replaced.
+        map.retain(|existing, _| {
+            !newt_core::ambient_shell::same_env_key(existing, k, case_insensitive)
+        });
         map.insert(k.clone(), v.clone());
     }
     map.into_iter().collect()
@@ -713,18 +728,53 @@ fn resolve_entry_secrets(
         .collect()
 }
 
+/// What the parent environment contributes to a stdio server's env: the closed allow-list,
+/// or, under `--ambient` (#978), the full environment minus newt's own control plane, so
+/// `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` reach a
+/// browser launch. Pure over `vars`.
+fn parent_passthrough(
+    ambient: bool,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    parent_passthrough_with(ambient, vars, cfg!(windows))
+}
+
+/// [`parent_passthrough`] with the name comparison chosen (Windows names are
+/// case-insensitive), so both behaviours are testable on any host.
+fn parent_passthrough_with(
+    ambient: bool,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    case_insensitive: bool,
+) -> Vec<(String, String)> {
+    if ambient {
+        return newt_core::ambient_shell::child_env_with(
+            vars,
+            newt_core::agentic::CHILD_STRIPPED_AUTHORITY_ENV,
+            case_insensitive,
+        );
+    }
+    let allowed = newt_core::mcp_stdio_env_passthrough();
+    vars.into_iter()
+        .filter_map(|(k, v)| {
+            let k = k.into_string().ok()?;
+            allowed
+                .iter()
+                .any(|a| newt_core::ambient_shell::same_env_key(a, &k, case_insensitive))
+                .then(|| (k, v.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
 /// Resolve the three env-grant sources from the live environment (parent env +
 /// the shell-env dir + the entry's own — now secret-resolved — env) and fold
 /// them via [`assemble_env_grants`]. The impure edge — kept tiny so the assembly
 /// logic itself stays pure/tested. Fails loudly if a configured secret reference
 /// cannot be resolved.
 fn resolve_env_grants(entry: &McpServerEntry) -> Result<Vec<(String, String)>> {
-    let passthrough: Vec<(String, String)> = newt_core::mcp_stdio_env_passthrough()
-        .iter()
-        .filter_map(|k| {
-            std::env::var_os(k).map(|v| (k.to_string(), v.to_string_lossy().into_owned()))
-        })
-        .collect();
+    let passthrough = parent_passthrough(
+        newt_core::launch_authority::current().ambient(),
+        std::env::vars_os(),
+    );
     let shell_env = newt_core::Config::user_config_path()
         .map(|p| newt_core::shell_env::from_config_dir(&p))
         .unwrap_or_default();

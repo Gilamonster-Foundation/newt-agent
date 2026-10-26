@@ -225,8 +225,8 @@ are independent of time-budget selection.
 ## Worktree adoption with ambient execution
 
 Verified task-worktree creation protects the original checkout in confined
-sessions. With OCAP explicitly disabled (`--yolo`, including
-`--full-access --yolo`), adoption does not arm that protection: the operator
+sessions. With OCAP explicitly disabled (`--disable-ocap`, and so `--yolo`,
+which includes it), adoption does not arm that protection: the operator
 receives a notice and existing permissions still apply. Full filesystem grants
 alone do not disable protection when execution remains confined.
 

@@ -44,6 +44,7 @@ pub use output_budget::{
 
 mod build_shell;
 mod catalog;
+mod config_edit;
 mod dependency_fetch;
 mod dispatch;
 pub(super) mod file_capture;
@@ -68,7 +69,9 @@ pub(crate) mod output_budget;
 mod read_history;
 pub(crate) use read_history::ReadHistory;
 mod shell;
-pub use shell::{run_command_dialect_sentence, shell_dialect_sentence};
+pub use shell::{
+    ambient_interpreter_description, run_command_dialect_sentence, shell_dialect_sentence,
+};
 /// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
 /// silent tool is never a blank row, and the first live byte takes the row
 /// for good. Unix-only — it needs a real pty pair.
@@ -78,6 +81,9 @@ use live_output::LiveOutputSession;
 #[cfg(test)]
 pub(crate) use shell::absent_binary_refusal;
 pub use shell::venv_cmd_prefix;
+/// newt's control plane, which no host child receives (also what `--ambient` strips from
+/// the full environment it hands run_command and stdio MCP servers).
+pub use shell::CHILD_STRIPPED_AUTHORITY_ENV;
 #[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
@@ -90,10 +96,7 @@ use shell::{
     permits_filesystem_request, resolve_exec_cwd, split_leading_cd,
 };
 #[cfg(all(test, not(windows)))]
-use shell::{
-    host_shell_command, host_shell_output, host_shell_output_with_timeout,
-    CHILD_STRIPPED_AUTHORITY_ENV,
-};
+use shell::{host_shell_command, host_shell_output, host_shell_output_with_timeout};
 pub(crate) use shell::{ABSENT_BINARY_MARKER, NOT_ON_HOST_MARKER};
 
 #[cfg(test)]
@@ -383,7 +386,7 @@ pub(crate) fn validate_tool_call_batch(
 /// INTERIM (#297): is the ocap exec bypass asserted for this invocation?
 ///
 /// True only when `NEWT_DISABLE_OCAP=1` — set by the CLI's `--disable-ocap`
-/// flag (alias `--yolo`) or exported directly for harness/pod use. The value
+/// flag (`--yolo` sets it with the other two axes) or exported directly for harness/pod use. The value
 /// must be exactly `"1"`: a security bypass reads fail-closed, so anything
 /// else (including `true`) leaves confinement on. Deliberately env-only —
 /// there is NO config-file key, so the bypass can never silently persist; it
@@ -434,12 +437,12 @@ pub fn ocap_disabled() -> bool {
 /// widening switch reads fail-closed — and it is deliberately env-only, so
 /// the override can never silently persist.
 ///
-/// This is a DISTINCT switch from [`ocap_disabled`] (`--yolo`): the two
-/// compose but never alias. `--full-access` widens the session *authority*
+/// This is a DISTINCT switch from [`ocap_disabled`] (`--disable-ocap`): the two
+/// compose but never alias (`--yolo` asserts both, plus `--ambient`). `--full-access` widens the session *authority*
 /// (fs fence, net leash, exec allowlist → unrestricted, which also empties
-/// the #774 exec floor); `--yolo` changes the exec *mechanism* (host shell
+/// the #774 exec floor); `--disable-ocap` changes the exec *mechanism* (host shell
 /// instead of the confined shell) and still honors whatever floor is in
-/// force. `--yolo --full-access` together yield an unrestricted host shell.
+/// force. `--disable-ocap --full-access` together yield an unrestricted host shell.
 pub fn full_access_requested() -> bool {
     // Frozen `LaunchAuthority` (resolved once from `NEWT_FULL_ACCESS` at
     // startup), never the live env — a later-appearing switch cannot widen the
@@ -3029,6 +3032,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "web_fetch" => string("url", ""),
         "request_permissions" => string("capability", ""),
         "request_user_input" => string("question", ""),
+        "propose_config_edit" => string("key", ""),
         "select_operating_mode" => string("mode", ""),
         "prompt_read" | "artifact_read" => string("address", "current"),
         "tool_search" | "recall" | "code_search" | "experience_recall" => string("query", ""),
@@ -4450,6 +4454,15 @@ async fn execute_authorized_tool(
         "request_user_input" => {
             execute_request_user_input(args, permission_gate, color, tool_output_lines)
         }
+
+        // #144: an edit to newt's own config, applied only on the operator's
+        // explicit `apply`. No gate (headless / eval / ACP) refuses.
+        "propose_config_edit" => config_edit::execute_propose_config_edit(
+            args,
+            permission_gate,
+            crate::Config::user_config_path().as_deref(),
+            crate::settings_receipt::receipt_path().as_deref(),
+        ),
 
         // #725: tool discovery — search THIS session's advertised catalog by
         // intent so a model that half-remembers a capability finds the real tool
@@ -6233,12 +6246,13 @@ async fn execute_authorized_tool(
             // governed by the session caveats. The same first-directory-wins
             // precedence as the index means we load the copy the model was
             // actually shown.
-            let dirs = super::display::with_migration_notices(crate::Config::resolve_unpublished)
-                .map(|c| c.skill_search_dirs())
-                .unwrap_or_default();
-            match newt_skills::load_body_from(&dirs, skill_name) {
-                Ok(body) => body,
-                Err(e) => format!("error: {e}"),
+            // A skill the operator switched off (`[skills] off`) is refused here too.
+            match super::display::with_migration_notices(crate::Config::resolve_unpublished) {
+                Ok(cfg) => match cfg.load_skill_body(skill_name) {
+                    Ok(body) => body,
+                    Err(e) => format!("error: {e}"),
+                },
+                Err(e) => format!("error: config does not resolve: {e}"),
             }
         }
 

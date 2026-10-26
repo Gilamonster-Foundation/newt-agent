@@ -1812,6 +1812,7 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
         preset_name: "strict".into(),
         clamp: newt_core::Caveats::default(),
         clamp_summary: "deny writes".into(),
+        skill: None,
         skill_body: Some("Inspect only.".into()),
         framing: Some("Keep the session clamp across conversations.".into()),
     }));
