@@ -124,6 +124,17 @@ struct Outcome {
     exited_cleanly: bool,
 }
 
+fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().expect("the test binary re-invokes itself"))
+        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+        .env("NEWT_TRANSCRIPT_PTY_CHILD", mode)
+        .stdin(pty.slave_stdio())
+        .stdout(pty.slave_stdio())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the pty child")
+}
+
 /// Drive one child lifecycle end to end.
 ///
 /// `keys` are typed once the child has provably reached the alternate screen;
@@ -132,16 +143,7 @@ struct Outcome {
 /// so gets no signal from `TIOCSWINSZ` alone).
 fn drive(mode: &str, keys: &str, resize: bool) -> Outcome {
     let pty = Pty::open();
-    let mut child = std::process::Command::new(
-        std::env::current_exe().expect("the test binary re-invokes itself"),
-    )
-    .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
-    .env("NEWT_TRANSCRIPT_PTY_CHILD", mode)
-    .stdin(pty.slave_stdio())
-    .stdout(pty.slave_stdio())
-    .stderr(std::process::Stdio::null())
-    .spawn()
-    .expect("spawn the pty child");
+    let mut child = spawn_child(&pty, mode);
 
     let mut screen = String::new();
     let reached = {
@@ -287,16 +289,7 @@ fn a_panic_after_entry_still_restores_the_terminal() {
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn space_unfolds_a_spill_in_place_in_the_f4_view() {
     let pty = Pty::open();
-    let mut child = std::process::Command::new(
-        std::env::current_exe().expect("the test binary re-invokes itself"),
-    )
-    .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
-    .env("NEWT_TRANSCRIPT_PTY_CHILD", "folds")
-    .stdin(pty.slave_stdio())
-    .stdout(pty.slave_stdio())
-    .stderr(std::process::Stdio::null())
-    .spawn()
-    .expect("spawn the pty child");
+    let mut child = spawn_child(&pty, "folds");
 
     // ratatui moves the cursor between words, so match one unbroken token.
     let drew = pty.wait_for_screen("expand]", REACH_TIMEOUT);
