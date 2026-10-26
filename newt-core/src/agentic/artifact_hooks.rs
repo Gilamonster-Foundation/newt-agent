@@ -1724,7 +1724,8 @@ mod tests {
     fn observed_report_outcome_artifact_preserves_composed_operator_report() {
         let sink = RecordingSink::default();
         let (_, _, context) = context();
-        let root = tempfile::tempdir().unwrap();
+        // A factless turn has no report (#3009); a work tree gives it facts.
+        let root = crate::agentic::observed_report::tests::fixture();
         let workspace = root.path().to_str().unwrap();
         let claims =
             crate::agentic::claim_check::TurnClaims::capture(workspace, &crate::Scope::All, None);

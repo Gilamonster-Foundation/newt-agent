@@ -674,17 +674,41 @@ fn closing_a_panel_leaves_the_transcript_above_it_and_none_of_the_panel() {
     crate::interaction_view_pty_test::drive_cockpit_panel_close();
 }
 
+/// #3012: closing an inline panel over a full transcript leaves no blank rows: the line
+/// printed after the close sits directly under the last history row.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn closing_a_panel_over_a_full_transcript_leaves_no_blank_rows_3012() {
+    crate::interaction_view_pty_test::drive_cockpit_panel_gap();
+}
+
 pub(crate) fn cockpit_panel_loop_case() {
+    panel_loop(0);
+}
+
+/// #3012: the same cockpit, with enough history that the block sits at the bottom of the
+/// screen, so the panel has to scroll transcript rows up to make room.
+pub(crate) fn cockpit_panel_gap_case() {
+    panel_loop(40);
+}
+
+fn panel_loop(fill_rows: usize) {
     // This disposable child owns the tty queried by Crossterm's geometry API.
     assert!(unsafe { libc::setsid() } >= 0);
     assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
     let before = termios_of(0);
     let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
     let mut cockpit = Presenter::open(surface).expect("cockpit");
-    cockpit
-        .screen
-        .insert_rows(vec![b"HISTORY_ABOVE_PANEL".to_vec()])
-        .unwrap();
+    // A full transcript puts the block at the bottom: a panel then scrolls transcript rows
+    // into scrollback, which is what releasing it must give back (#3012).
+    let mut history: Vec<Vec<u8>> = (0..fill_rows)
+        .map(|n| format!("FILL-{n:02}").into_bytes())
+        .collect();
+    history.push(b"HISTORY_ABOVE_PANEL".to_vec());
+    cockpit.screen.insert_rows(history).unwrap();
     cockpit
         .editor
         .on_event(
@@ -1072,9 +1096,21 @@ fn acceptance_case() {
         );
         assert_eq!(cockpit.editor.draft(), draft, "the chat draft survives");
         assert!(!cockpit.chat_inactive, "keyboard focus returns to chat");
+        // The reservation was planned from the pending layout's top (`expected_top`); releasing
+        // it moves the block back to where the transcript ended (#3012), not to the old top.
         assert_eq!(
-            cockpit.screen.top, expected_top,
+            expected_reservation.transcript_end,
+            expected_top.min(expected_reservation.start),
             "the pending layout is applied before modal reservation"
+        );
+        assert_eq!(
+            cockpit.screen.top,
+            reclaimed_top(
+                &expected_reservation,
+                cockpit.screen.block_h,
+                cockpit.screen.rows
+            ),
+            "closing the modal reclaims the rows it scrolled the transcript out of"
         );
         let provisional = tty.painted();
         let prompt_at = provisional

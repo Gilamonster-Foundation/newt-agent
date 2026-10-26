@@ -32,6 +32,7 @@ mod final_reply;
 pub(crate) mod observed_report;
 use final_reply::FinalReply;
 pub use observed_report::assistant_prose as model_reply_for_history;
+pub use observed_report::split_report as split_observed_report;
 mod selected_target;
 mod semantic_pins;
 pub use claim_check::{
@@ -256,8 +257,8 @@ pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, interactive_recovery, newt_line,
     print_harness_notice, print_list_item, print_newt, reply_cols, set_mouse_recovery,
-    set_spill_lines, set_spill_summary, set_time_marker_secs, Fold, GaugeLevel, Hidden, Recovery,
-    ThinkingFold, NEWT_ORANGE_CT, REPLY_MARKER,
+    set_spill_lines, set_spill_summary, set_time_marker_secs, spill_summary, Fold, GaugeLevel,
+    Hidden, Recovery, ThinkingFold, NEWT_ORANGE_CT, REPLY_MARKER,
 };
 pub use driver::{
     HeadlessCodeSearch, InstantiatedFeatures, TurnDriver, TurnDriverConfig, TurnDriverError,

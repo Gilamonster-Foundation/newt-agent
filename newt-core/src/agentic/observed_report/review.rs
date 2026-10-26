@@ -287,7 +287,13 @@ impl super::State {
             .take()
             .expect("render prepares review even without facts");
         if review.edits.is_empty() {
-            return format!("{report}{draft}");
+            // A turn that observed nothing gets no frame: eleven rows of
+            // "unavailable" ahead of a one-line answer is noise (#3009).
+            return if self.factless {
+                draft.into()
+            } else {
+                format!("{report}{draft}")
+            };
         }
         review.source_draft = source_draft.into();
         review.observation = self.pinned.as_ref().map(|(cid, _)| cid.to_string());

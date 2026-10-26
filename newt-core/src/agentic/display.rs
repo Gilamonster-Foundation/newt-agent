@@ -614,7 +614,7 @@ pub fn set_spill_summary(on: bool) {
 }
 
 /// Whether committed tool results collapse to a one-line summary.
-pub(crate) fn spill_summary() -> bool {
+pub fn spill_summary() -> bool {
     SPILL_SUMMARY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
