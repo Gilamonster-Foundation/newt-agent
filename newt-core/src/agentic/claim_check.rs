@@ -947,6 +947,35 @@ pub(crate) fn git_head(workspace: &str, read_scope: &crate::Scope<String>) -> Op
     git_in(workspace, &["rev-parse", "HEAD"], read_scope).map(|s| s.trim().to_string())
 }
 
+/// Whether `workspace` is POSITIVELY not in a Git work tree: the metadata probe
+/// was authorized, git ran, and said "not a git repository". Everything else
+/// (denied read authority, no git, a failed probe, a repository root or a
+/// subdirectory of one) is `false`, so a caller that wants to claim "not a
+/// work tree" never turns an inability to look into a statement about the
+/// tree (#3009). Unlike [`WorkspaceRepoLocation::NotARepo`], which includes
+/// refused probes, this is only the observed negative.
+#[must_use]
+pub fn workspace_is_confirmed_not_a_repo(
+    workspace: &str,
+    read_scope: &crate::Scope<String>,
+) -> bool {
+    let Ok(mut probe) = crate::git_hardening::metadata_git(
+        std::path::Path::new(workspace),
+        &["rev-parse", "--show-toplevel"],
+        read_scope,
+    ) else {
+        return false;
+    };
+    // Git's refusal text is localized; pin it so the match below is stable.
+    let Ok(out) = probe.env("LC_ALL", "C").output() else {
+        return false;
+    };
+    !out.status.success()
+        && String::from_utf8_lossy(&out.stderr)
+            .to_ascii_lowercase()
+            .contains("not a git repository")
+}
+
 /// Run a read-only git plumbing command in `workspace`; `None` on any failure.
 fn git_in(workspace: &str, args: &[&str], read_scope: &crate::Scope<String>) -> Option<String> {
     // Confused-deputy-safe: `workspace` may be a hostile repo whose `.git/config`

@@ -346,17 +346,13 @@ async fn anthropic_streamed_answers_do_not_hide_appended_evidence_warnings() {
         assert_eq!(body_json(&requests[0])["stream"], true);
         assert!(events.is_empty());
     }
-    // Even unchanged model prose now needs the harness report rendered.
+    // A factless turn appends no report (#3009), so streamed prose stands.
     let mut scenario = Scenario::new("anthropic", "The task remains unfinished.");
     scenario.streaming = true;
     scenario.cap = 1;
     let (reply, streamed, _, _) = run_with_stream_state(scenario).await;
-    assert_eq!(
-        crate::agentic::model_explanation(&reply),
-        "The task remains unfinished."
-    );
-    assert!(reply.starts_with("## Observed\n"));
-    assert!(!streamed, "the report was not streamed by the model");
+    assert_eq!(reply, "The task remains unfinished.");
+    assert!(!streamed, "the cap-exit summary is rendered by the caller");
 }
 
 #[tokio::test]
