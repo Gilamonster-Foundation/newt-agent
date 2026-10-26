@@ -111,10 +111,16 @@ struct FenceState {
     wrap_off: AtomicBool,
     /// A lent-out modal or panel is writing; keep autowrap off until released.
     held: AtomicBool,
+    /// An open frame (#3011): every clone's bytes collect here and reach the
+    /// terminal as ONE synchronized write, so no compositor can paint the
+    /// half-drawn state between `Hide` and ratatui's `Show`.
+    frame: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 const WRAP_OFF: &[u8] = b"\x1b[?7l";
 const WRAP_ON: &[u8] = b"\x1b[?7h";
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 impl<W: Write> WrapFence<W> {
     fn new(file: W) -> Self {
@@ -126,9 +132,39 @@ impl<W: Write> WrapFence<W> {
 
     fn turn_off(&mut self) -> io::Result<()> {
         if !self.state.wrap_off.swap(true, Ordering::Relaxed) {
-            self.file.write_all(WRAP_OFF)?;
+            self.emit(WRAP_OFF)?;
         }
         Ok(())
+    }
+
+    fn frame(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.state.frame.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn emit(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Disjoint fields: the lock borrows `state`, the write borrows `file`.
+        let mut frame = self.state.frame.lock().unwrap_or_else(|p| p.into_inner());
+        match frame.as_mut() {
+            Some(frame) => {
+                frame.extend_from_slice(bytes);
+                Ok(())
+            }
+            None => self.file.write_all(bytes),
+        }
+    }
+
+    fn begin_frame(&self) {
+        *self.frame() = Some(SYNC_BEGIN.to_vec());
+    }
+
+    /// Send the open frame in one write, then flush as any batch would.
+    fn end_frame(&mut self) -> io::Result<()> {
+        let Some(mut frame) = self.frame().take() else {
+            return Ok(());
+        };
+        frame.extend_from_slice(SYNC_END);
+        self.file.write_all(&frame)?;
+        self.flush()
     }
 
     fn hold(&mut self) -> io::Result<()> {
@@ -160,10 +196,18 @@ impl WrapFence {
 impl<W: Write> Write for WrapFence<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.turn_off()?;
+        if self.frame().is_some() {
+            self.emit(buf)?;
+            return Ok(buf.len());
+        }
         self.file.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if self.frame().is_some() {
+            // Deferred to `end_frame`, which flushes once for the whole frame.
+            return Ok(());
+        }
         if !self.state.held.load(Ordering::Relaxed)
             && self.state.wrap_off.swap(false, Ordering::Relaxed)
         {
@@ -186,12 +230,12 @@ const NO_CARET: u32 = u32::MAX;
 /// A backend that remembers where ratatui last put the caret (#3014). A resize needs the
 /// caret's row to turn the terminal's cursor reply back into the block's top, and ratatui
 /// keeps that position private; this is the one place every draw reports it.
-struct CaretBackend {
-    inner: CrosstermBackend<WrapFence>,
+struct CaretBackend<W: Write = File> {
+    inner: CrosstermBackend<WrapFence<W>>,
     caret: CaretCell,
 }
 
-impl Backend for CaretBackend {
+impl<W: Write> Backend for CaretBackend<W> {
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -252,9 +296,9 @@ struct CaretFrame {
 ///
 /// Split from [`Presenter`] so the editor can be handed `&mut Screen` as its
 /// [`ScrollbackSink`] while the presenter still borrows the editor.
-struct Screen {
-    tty: WrapFence,
-    term: Terminal<CaretBackend>,
+struct Screen<W: Write = File> {
+    tty: WrapFence<W>,
+    term: Terminal<CaretBackend<W>>,
     caret: CaretCell,
     /// The caret at the last complete draw; see [`CaretFrame`].
     caret_frame: Option<CaretFrame>,
@@ -547,9 +591,49 @@ impl Screen {
         self.rebuild_term()
     }
 
-    /// Paint the block: the status row (raw, clipped, with the queued chip at
-    /// the right edge), then the ratatui viewport.
+    /// Leave the terminal as a plain shell expects it: block erased, cursor
+    /// at the block's top-left, wrap and cooked mode restored.
+    fn shutdown(&mut self, trailing: &[u8]) -> io::Result<()> {
+        let mut buf = Vec::new();
+        queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
+        if !trailing.is_empty() {
+            buf.extend_from_slice(trailing);
+            buf.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        queue!(
+            buf,
+            EnableLineWrap,
+            crossterm::event::DisableBracketedPaste,
+            crossterm::cursor::Show
+        )?;
+        self.tty.write_all(&buf)?;
+        self.tty.flush()?;
+        // Raw mode is NOT released here. The session guard's doc already says
+        // "the MODES are this guard's job"; disabling here as well restored
+        // crossterm's global early, while the capture was still installed, and
+        // then the guard restored again. One owner, one restore (#1925).
+        Ok(())
+    }
+}
+
+impl<W: Write> Screen<W> {
+    /// Paint the block as one frame (#3011): status row and viewport reach the
+    /// terminal in a single synchronized write, sent even if drawing failed.
     fn draw(
+        &mut self,
+        editor: &MountedEditor,
+        chrome: Chrome<'_>,
+        chat_inactive: bool,
+    ) -> io::Result<()> {
+        self.tty.begin_frame();
+        let drawn = self.draw_frame(editor, chrome, chat_inactive);
+        let sent = self.tty.end_frame();
+        drawn.and(sent)
+    }
+
+    /// The status row (raw, clipped, with the queued chip at the right edge),
+    /// then the ratatui viewport.
+    fn draw_frame(
         &mut self,
         editor: &MountedEditor,
         chrome: Chrome<'_>,
@@ -613,30 +697,6 @@ impl Screen {
                 .map_or(0, |x| usize::from(x - area.left()) + 1)
         }));
         self.painted_widths = widths;
-        Ok(())
-    }
-
-    /// Leave the terminal as a plain shell expects it: block erased, cursor
-    /// at the block's top-left, wrap and cooked mode restored.
-    fn shutdown(&mut self, trailing: &[u8]) -> io::Result<()> {
-        let mut buf = Vec::new();
-        queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
-        if !trailing.is_empty() {
-            buf.extend_from_slice(trailing);
-            buf.extend_from_slice(b"\x1b[0m\r\n");
-        }
-        queue!(
-            buf,
-            EnableLineWrap,
-            crossterm::event::DisableBracketedPaste,
-            crossterm::cursor::Show
-        )?;
-        self.tty.write_all(&buf)?;
-        self.tty.flush()?;
-        // Raw mode is NOT released here. The session guard's doc already says
-        // "the MODES are this guard's job"; disabling here as well restored
-        // crossterm's global early, while the capture was still installed, and
-        // then the guard restored again. One owner, one restore (#1925).
         Ok(())
     }
 }
@@ -2167,6 +2227,166 @@ mod tests {
         fence.flush().unwrap();
         fence.flush().unwrap();
         assert_eq!(fence.file, b"\x1b[?7lab\x1b[?7h");
+    }
+
+    /// #3011: a frame's writes and flushes, from any clone, reach the terminal
+    /// as one synchronized write, so a compositor never paints a half frame
+    /// (cursor hidden, caret not yet placed).
+    #[test]
+    fn a_frame_reaches_the_terminal_as_one_synchronized_write() {
+        let mut screen = WrapFence::new(Vec::new());
+        let mut backend = WrapFence {
+            file: Vec::new(),
+            state: Arc::clone(&screen.state),
+        };
+        screen.begin_frame();
+        screen.write_all(b"\x1b[?25lstatus").unwrap();
+        screen.flush().unwrap();
+        backend.write_all(b"cells").unwrap();
+        backend.flush().unwrap();
+        backend.write_all(b"\x1b[?25h").unwrap();
+        backend.flush().unwrap();
+        assert!(
+            screen.file.is_empty() && backend.file.is_empty(),
+            "nothing sent mid-frame"
+        );
+        screen.end_frame().unwrap();
+        assert_eq!(
+            screen.file,
+            b"\x1b[?2026h\x1b[?7l\x1b[?25lstatuscells\x1b[?25h\x1b[?2026l\x1b[?7h"
+        );
+        backend.write_all(b"after").unwrap();
+        assert_eq!(
+            backend.file, b"\x1b[?7lafter",
+            "outside a frame, writes go straight through"
+        );
+    }
+
+    /// Records each `write` as its own entry, so a test sees WRITE BOUNDARIES
+    /// (a `Vec<u8>` keeps only the concatenation and cannot tell one write
+    /// from a thousand), and each `flush` as a marker.
+    #[derive(Clone, Default)]
+    struct Boundaries(Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>);
+
+    impl Write for Boundaries {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push(Some(buf.to_vec()));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push(None);
+            Ok(())
+        }
+    }
+
+    /// #3011: drives the PRODUCTION `Screen::draw` (status row, ratatui
+    /// viewport, caret) and asserts the whole synchronized frame (`?2026h`
+    /// through the caret's `Show`, to `?2026l`) crosses the writer as ONE
+    /// write, with nothing flushed or written before it. Removing the
+    /// `begin_frame`/`end_frame` wrapper, or splitting the payload into several
+    /// writes, fails here; the fence unit test above cannot see either.
+    #[test]
+    fn a_production_draw_reaches_the_writer_as_one_synchronized_write() {
+        let log = Boundaries::default();
+        let tty = WrapFence::new(log.clone());
+        let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(WrapFence {
+                file: log.clone(),
+                state: Arc::clone(&tty.state),
+            }),
+            caret: Arc::clone(&caret),
+        };
+        let (cols, top, block_h) = (40, 2, 4);
+        let term = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, top, cols, block_h)),
+            },
+        )
+        .unwrap();
+        let region = newt_core::tty::Terminal::lease_region(
+            block_region(top, block_h),
+            newt_core::tty::OnCollision::Refuse,
+        )
+        .expect("the test owns these rows");
+        let mut screen = Screen {
+            tty,
+            term,
+            caret,
+            caret_frame: None,
+            can_query_cursor: true,
+            cols,
+            rows: 10,
+            top,
+            block_h,
+            status_rows: 1,
+            status: b"working".to_vec(),
+            queued: 0,
+            region,
+            painted_widths: Vec::new(),
+        };
+        let editor = MountedEditor::new(crate::rich_input::Edit::Emacs, None, Vec::new(), "hi");
+        let chrome = crate::rich_input::Chrome {
+            model: "m",
+            endpoint: "e",
+            gauge: None,
+            session: "s",
+            headline: "",
+            modal: None,
+            background_jobs: &[],
+            tabs: &[],
+            tools: "",
+        };
+        screen.draw(&editor, chrome, false).unwrap();
+
+        let log = log.0.lock().unwrap();
+        let writes: Vec<&Vec<u8>> = log.iter().flatten().collect();
+        let frames: Vec<&&Vec<u8>> = writes
+            .iter()
+            .filter(|w| w.starts_with(SYNC_BEGIN))
+            .collect();
+        assert_eq!(frames.len(), 1, "exactly one synchronized frame: {log:?}");
+        let frame = frames[0];
+        assert!(
+            frame.ends_with(SYNC_END),
+            "the frame closes itself: {frame:?}"
+        );
+        let body = &frame[..frame.len() - SYNC_END.len()];
+        let text = String::from_utf8_lossy(body);
+        assert!(
+            text.contains("working"),
+            "status row in the frame: {text:?}"
+        );
+        assert!(text.contains("hi"), "viewport cells in the frame: {text:?}");
+        assert!(
+            text.contains("\x1b[?25l"),
+            "status hides the cursor inside the frame: {text:?}"
+        );
+        // The caret sits after "❯ hi" on the viewport's first row (1-based
+        // row 4, column 5): shown, then placed, last before SYNC_END.
+        assert!(
+            body.ends_with(b"\x1b[?25h\x1b[4;5H"),
+            "show cursor and caret position close the frame: {text:?}"
+        );
+        let first = log.iter().position(|e| e.is_some()).unwrap();
+        assert!(
+            log[first].as_ref().unwrap().starts_with(SYNC_BEGIN),
+            "nothing reaches the terminal before the frame: {log:?}"
+        );
+        // Everything after the frame is the single autowrap restore + flush.
+        let end = log
+            .iter()
+            .position(|e| e.as_ref().is_some_and(|w| w.ends_with(SYNC_END)))
+            .unwrap();
+        assert!(
+            log[end + 1..]
+                .iter()
+                .flatten()
+                .all(|w| w.as_slice() == WRAP_ON),
+            "only the autowrap restore follows the frame: {log:?}"
+        );
     }
 
     #[test]
