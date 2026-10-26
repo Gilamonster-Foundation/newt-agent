@@ -1072,7 +1072,20 @@ pub(crate) fn drive_cockpit_resize_anchor() {
             if rows != 34 {
                 return Err(format!("the cockpit saw {rows} rows, want 34"));
             }
-            let want = top + u16::try_from(shift.unwrap_or(0)).unwrap();
+            // Maintainer decision (#3014 item 2): a grow pins the block to the new bottom,
+            // whichever way this terminal moved its content.
+            let block_h: u16 = transcript
+                .rsplit("block_h=")
+                .next()
+                .and_then(|s| {
+                    s.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse()
+                        .ok()
+                })
+                .ok_or("no block_h in ANCHOR_RESULT")?;
+            let want = rows - block_h;
             if new_top != want {
                 return Err(format!(
                     "terminal that {name}: block top {new_top}, want {want} (was {top})"

@@ -19,7 +19,8 @@
 //! block's new top is MEASURED, by asking the real terminal where its cursor is
 //! ([`PtyCapture::query_cursor`] writes the query to the saved terminal handle, not fd 1) and
 //! subtracting where the caret sits in the block. No answer means the old guess
-//! ([`resize_new_top`]) and no second question. Two consequences follow and are enforced
+//! ([`resize_new_top`]) and no second question. (A grow pins the block to the new bottom either
+//! way; the measurement then tells the resize where the OLD block was, so it can erase it.) Two consequences follow and are enforced
 //! here rather than remembered:
 //! [`ScrollbackSink`] is implemented by hand (ratatui's `insert_before` is a
 //! silent no-op on `Fixed`), and autowrap is OFF while the cockpit owns the
@@ -498,10 +499,9 @@ impl Screen {
         self.rebuild_term()
     }
 
-    /// The terminal changed size: keep the block where the content actually
-    /// ends when it still fits there, and only fall back to the bottom
-    /// anchor when it doesn't. The transcript above is the terminal's to
-    /// reflow.
+    /// The terminal changed size: a grow pins the block to the new bottom
+    /// ([`resize_new_top`]); otherwise it stays where the content ends while it
+    /// still fits. The transcript above is the terminal's to reflow.
     fn resize(
         &mut self,
         cols: u16,
@@ -520,12 +520,13 @@ impl Screen {
         } else {
             0
         };
+        let old_rows = self.rows;
         self.cols = cols.max(1);
         self.rows = rows.max(1);
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
         self.block_h = new_h;
         self.status_rows = status_rows;
-        self.top = resized_top(measured_top, self.top, self.rows, new_h);
+        self.top = resized_top(measured_top, self.top, old_rows, self.rows, new_h);
         self.caret_frame = None;
         // FORCED: the TERMINAL resized; the block's new position is a
         // consequence, not a request.
@@ -727,34 +728,36 @@ fn restore_terminal_modes() {
     let _ = write_mode_restores(&mut io::stdout());
 }
 
-/// Where the block moves to on a resize event (#2441, #2632).
+/// Where the block moves to on a resize event (#2441, #2632, #3014).
 ///
-/// A terminal that GROWS does not pull the transcript down to meet a
-/// bottom-anchored block — most terminals add the new rows below existing
-/// content instead of scrolling it (confirmed against a real herdr pane
-/// grow, #2441 evidence) — so jumping straight to `new_rows - new_h` opens a
-/// blank canyon between the transcript, which stayed where it was, and the
-/// block, which jumped to the new bottom.
+/// **A terminal that GROWS pins the block to the new bottom** (maintainer decision on
+/// #3014 item 2). Terminals disagree on what a grow does to the transcript (some add rows
+/// below it, some pull it down), but the prompt stays where the operator's eyes and the
+/// keyboard are, the bottom row; the gap a bottom-adding terminal leaves above it is the
+/// accepted cost. This reverses the #2632 "stay under the content" rule for grows only.
 ///
-/// This holds for ANY resize event, not only a grow: a same-size
-/// notification (no content moved at all) and a height-only shrink that
-/// still leaves the block room both leave the transcript exactly where it
-/// was, so `old_top` is still correct ground truth there too. Move the block
-/// only when it no longer fits at `old_top` — the one case where the old
-/// position is not a valid answer — and fall back to the bottom anchor then.
-fn resize_new_top(old_top: u16, new_rows: u16, new_h: u16) -> u16 {
-    if old_top.saturating_add(new_h) <= new_rows {
+/// Every other resize (same size, or a shrink) leaves the transcript where it was, so
+/// `old_top` is still ground truth there. Move the block only when it no longer fits at
+/// `old_top`, and bottom-anchor it then.
+fn resize_new_top(old_top: u16, old_rows: u16, new_rows: u16, new_h: u16) -> u16 {
+    if new_rows <= old_rows && old_top.saturating_add(new_h) <= new_rows {
         old_top
     } else {
         new_rows.saturating_sub(new_h)
     }
 }
 
-/// The block's top after a resize: measured when the terminal told us where its cursor is
-/// (#3014), else [`resize_new_top`]'s guess from the old top. Either way the block must fit
-/// the new screen, so a measured top below the bottom is clamped up to it.
-fn resized_top(measured: Option<u16>, current_top: u16, new_rows: u16, new_h: u16) -> u16 {
-    resize_new_top(measured.unwrap_or(current_top), new_rows, new_h)
+/// The block's top after a resize: a grow pins it to the bottom; otherwise the position the
+/// terminal reported when it was measured (#3014), else [`resize_new_top`]'s guess from the
+/// old top. Either way the block must fit the new screen.
+fn resized_top(
+    measured: Option<u16>,
+    current_top: u16,
+    old_rows: u16,
+    new_rows: u16,
+    new_h: u16,
+) -> u16 {
+    resize_new_top(measured.unwrap_or(current_top), old_rows, new_rows, new_h)
 }
 
 /// The block's top, from the row the terminal says its cursor is on and where the caret sits
@@ -2072,27 +2075,31 @@ mod tests {
         );
     }
 
-    /// #3014 mocked tier: the block's top after a resize follows what the terminal says its
-    /// cursor is, not a guess. A terminal that adds rows below (the caret row does not
-    /// change) and one that pulls scrollback down (the caret row moves with the content)
-    /// both land the block where the content is.
+    /// #3014 mocked tier: the cursor the terminal reports locates the block it left behind
+    /// (what the resize must erase), and a GROW pins the block to the new bottom whatever
+    /// the terminal did (maintainer decision on item 2). Without a grow, the block's top
+    /// follows the measured position.
     #[test]
     fn a_resize_follows_the_cursor_the_terminal_reports_not_a_guess() {
         // A 24-row screen, a 4-row block at the bottom (top 20) with the caret on its
         // second row (offset 1), grown to 34 rows.
-        let (old_top, offset, new_rows, new_h) = (20u16, 1u16, 34u16, 4u16);
-        // Adds rows below: the cursor did not move, so the block did not.
+        let (old_top, offset, old_rows, new_rows, new_h) = (20u16, 1u16, 24u16, 34u16, 4u16);
         let below = block_top_from_reply(old_top + offset, offset);
         assert_eq!(below, Some(20));
-        assert_eq!(resized_top(below, old_top, new_rows, new_h), 20);
-        // Pulls scrollback down by 10: the cursor row moved with the content.
         let pulled = block_top_from_reply(old_top + offset + 10, offset);
         assert_eq!(pulled, Some(30));
-        assert_eq!(resized_top(pulled, old_top, new_rows, new_h), 30);
-        // No answer: the old guess stands.
-        assert_eq!(resized_top(None, old_top, new_rows, new_h), 20);
-        // A measured top that no longer fits the (shrunk) screen is clamped, never off it.
-        assert_eq!(resized_top(Some(30), 20, 24, 4), 20);
+        // A grow pins to the bottom (30) for a terminal that adds rows below, one that
+        // pulls scrollback down, and one that never answers.
+        for measured in [below, pulled, None] {
+            assert_eq!(
+                resized_top(measured, old_top, old_rows, new_rows, new_h),
+                30
+            );
+        }
+        // Not a grow: the measured position stands while it fits...
+        assert_eq!(resized_top(Some(12), 20, 34, 34, 4), 12);
+        // ...and a measured top that no longer fits the shrunk screen is clamped.
+        assert_eq!(resized_top(Some(30), 20, 34, 24, 4), 20);
         // A reply above the caret's own offset cannot be this block's.
         assert_eq!(block_top_from_reply(0, 3), None);
     }
@@ -2238,72 +2245,44 @@ mod tests {
         assert!(panel_erase_from(20, 8, 100, 118, 31, 8) > 0);
     }
 
-    /// #2441: a herdr pane grew from 30 to 63 rows with the block at top 27,
-    /// height 3. Before this fix the block jumped to `63 - 3 = 60`, opening a
-    /// 30-row blank canyon between the untouched transcript and the block —
-    /// exactly the "rows 27-60 blank" gap the evidence files captured. It
-    /// must stay put, directly under the existing content, instead.
+    /// #3014 item 2 (maintainer decision, reversing #2441/#2632 for grows): a herdr pane
+    /// grew from 30 to 63 rows with the block at top 27, height 3. The block is pinned to
+    /// the new bottom row, `63 - 3 = 60`, not left under the content.
     #[test]
-    fn growing_the_terminal_keeps_the_block_under_existing_content_2441() {
-        assert_eq!(resize_new_top(27, 63, 3), 27);
+    fn growing_the_terminal_pins_the_block_to_the_new_bottom_3014() {
+        assert_eq!(resize_new_top(27, 30, 63, 3), 60);
+        // Pinned already: a second grow moves it again, and a same-size notice does not.
+        assert_eq!(resize_new_top(60, 63, 90, 3), 87);
+        assert_eq!(resize_new_top(60, 63, 63, 3), 60);
     }
 
     #[test]
     fn a_shrinking_terminal_still_bottom_anchors_the_block() {
-        assert_eq!(resize_new_top(20, 10, 3), 7);
-    }
-
-    /// #2632 review finding 2: the old fallback test claimed to cover growth
-    /// but actually shrank (28 < 30 rows). Use a real grow that still doesn't
-    /// fit: old top 27 + height 5 would land on row 32, past the new 31-row
-    /// screen, so it must bottom-anchor instead of hanging off-screen.
-    #[test]
-    fn growth_too_small_for_the_block_to_fit_falls_back_to_the_bottom() {
-        assert_eq!(resize_new_top(27, 31, 5), 26);
+        assert_eq!(resize_new_top(20, 24, 10, 3), 7);
     }
 
     #[test]
-    fn equal_rows_keeps_the_existing_bottom_anchor_behavior() {
-        assert_eq!(resize_new_top(20, 24, 4), 20);
+    fn a_grow_by_one_row_pins_the_block_too_3014() {
+        assert_eq!(resize_new_top(27, 30, 31, 5), 26);
     }
 
-    /// #2632 review finding 1: a same-size notification (no rows added or
-    /// removed at all) used to fall through to the bottom-anchor branch and
-    /// silently move a block that was never bottom-anchored to begin with —
-    /// recreating the exact #2441 gap with no terminal movement. Repeated
-    /// same-size resizes, and repeated grows, must both keep the block at the
-    /// one position the content actually ends.
+    /// #2632 review finding 1, kept: a same-size notification (no rows added or removed)
+    /// must not move a block, so it cannot recreate a gap with no terminal movement.
     #[test]
-    fn repeated_same_size_resizes_do_not_recreate_the_gap_2632() {
-        // 30 -> 63 (grow, matches #2441) -> 63 (no-op notification).
-        let top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        let top = resize_new_top(top, 63, 3);
+    fn repeated_same_size_resizes_do_not_move_the_block_2632() {
+        assert_eq!(resize_new_top(20, 24, 24, 4), 20);
         assert_eq!(
-            top, 27,
-            "a same-size resize must not move a block that already fits"
+            resize_new_top(15, 24, 24, 4),
+            15,
+            "off the bottom, still fits"
         );
     }
 
-    #[test]
-    fn repeated_grows_keep_the_block_under_the_content_2632() {
-        let mut top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        top = resize_new_top(top, 90, 3);
-        assert_eq!(top, 27);
-    }
-
-    /// #2632 review finding 1: a height-only shrink that still leaves the
-    /// block room must not move it down to a new bottom anchor — the block
-    /// at its old, non-bottom position still fits, so it stays.
+    /// #2632 review finding 1, kept: a height-only shrink that still leaves the block room
+    /// must not re-anchor it.
     #[test]
     fn a_partial_shrink_that_still_fits_keeps_the_old_position_2632() {
-        // Grown to 63 with the block at 27 (matches #2441), then shrunk to
-        // 40: 27 + 3 = 30 <= 40, so the block still fits at 27.
-        let top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        let top = resize_new_top(top, 40, 3);
-        assert_eq!(top, 27, "old position still fits; must not re-anchor to 37");
+        assert_eq!(resize_new_top(27, 63, 40, 3), 27);
     }
 
     #[test]
