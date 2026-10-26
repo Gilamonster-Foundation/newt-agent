@@ -703,6 +703,17 @@ mod terminal {
     ) -> io::Result<()> {
         let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(&mut guard.out))?;
         terminal.clear()?;
+        let mut folds = crate::fold_list::FoldList::default();
+        if picker {
+            for s in spills {
+                folds.push_finished(
+                    s.id().to_string(),
+                    format!("spill {} · {} lines", s.id(), s.total_lines()),
+                    s.lines().iter().cloned(),
+                );
+            }
+        }
+        // The spill the open inspector shows (a picker's selection, or the one spill).
         let mut selected = 0usize;
         let mut view = if picker {
             None
@@ -711,6 +722,7 @@ mod terminal {
         };
         loop {
             let mut page_rows = 1usize;
+            let mut width = 1usize;
             terminal.draw(|f| {
                 let title = if view.is_some() {
                     format!("spill {}", spills[selected].id())
@@ -731,10 +743,12 @@ mod terminal {
                     &crate::modal::Chrome {
                         title: &title,
                         subtitle,
-                        hint: Some("Esc back · ↑↓ select · Enter inspect"),
+                        hint: Some("Esc back · ↑↓ select · Space fold/unfold · PgUp/PgDn scroll · o inspect"),
                     },
                 );
                 page_rows = usize::from(body.height.saturating_sub(1)).max(1);
+                // One column goes to the selection marker.
+                width = usize::from(body.width.saturating_sub(1)).max(1);
                 if let Some(view) = &mut view {
                     view.draw(f, body);
                 } else {
@@ -743,24 +757,15 @@ mod terminal {
                             "No output retained in this session. Older entries may have expired.",
                         )]
                     } else {
-                        let top = selected.saturating_sub(page_rows - 1);
-                        spills
-                            .iter()
-                            .enumerate()
-                            .skip(top)
-                            .take(page_rows)
-                            .map(|(i, s)| {
-                                let preview =
-                                    s.lines().first().map(String::as_str).unwrap_or("(empty)");
+                        let selected = folds.selected_item();
+                        folds
+                            .render(width, page_rows)
+                            .into_iter()
+                            .map(|r| {
+                                let on = r.header && r.item == selected;
                                 Line::styled(
-                                    format!(
-                                        "{} spill {} · {} lines · {}",
-                                        if i == selected { ">" } else { " " },
-                                        s.id(),
-                                        s.total_lines(),
-                                        preview
-                                    ),
-                                    if i == selected {
+                                    format!("{}{}", if on { ">" } else { " " }, r.text),
+                                    if on {
                                         Style::default().add_modifier(Modifier::REVERSED)
                                     } else {
                                         Style::default()
@@ -792,12 +797,19 @@ mod terminal {
                 KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(())
                 }
-                KeyCode::Up => selected = selected.saturating_sub(1),
-                KeyCode::Down => selected = (selected + 1).min(spills.len().saturating_sub(1)),
-                KeyCode::Enter => {
-                    view = spills
-                        .get(selected)
-                        .map(|s| super::OutputView::new(s.lines()));
+                KeyCode::Up => folds.select_prev(),
+                KeyCode::Down => folds.select_next(),
+                KeyCode::Enter | KeyCode::Char(' ') => folds.toggle_selected(),
+                KeyCode::PageUp => folds.scroll(-(page_rows as isize), width),
+                KeyCode::PageDown => folds.scroll(page_rows as isize, width),
+                KeyCode::Char('o') => {
+                    if let Some(i) = spills
+                        .iter()
+                        .position(|s| Some(s.id().to_string().as_str()) == folds.selected_key())
+                    {
+                        selected = i;
+                        view = Some(super::OutputView::new(spills[i].lines()));
+                    }
                 }
                 _ => {}
             }
