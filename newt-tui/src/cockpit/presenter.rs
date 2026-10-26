@@ -17,7 +17,7 @@
 //! [`Presenter::open`] before the capture is installed. The only later query is the one a
 //! terminal resize needs (#3014): terminals disagree on what a grow does to the screen, so the
 //! block's new top is MEASURED, by asking the real terminal where its cursor is
-//! ([`PtyCapture::query_cursor`] points fd 1 at the real terminal for that one query) and
+//! ([`PtyCapture::query_cursor`] writes the query to the saved terminal handle, not fd 1) and
 //! subtracting where the caret sits in the block. No answer means the old guess
 //! ([`resize_new_top`]) and no second question. Two consequences follow and are enforced
 //! here rather than remembered:
@@ -336,7 +336,16 @@ impl Screen {
         )
     }
 
+    /// Output other than a draw has moved, or is about to move, the cursor off the caret: the
+    /// last draw's [`CaretFrame`] no longer says where it is, and unchanged geometry does not
+    /// either (a full screen scrolls under `insert_rows` with `top` and `block_h` intact).
+    /// Only a fresh draw makes the frame trustworthy again (#3014).
+    fn moved_cursor(&mut self) {
+        self.caret_frame = None;
+    }
+
     fn rebuild_term(&mut self) -> io::Result<()> {
+        self.moved_cursor();
         let backend = CaretBackend {
             inner: CrosstermBackend::new(self.tty.fenced_clone()?),
             caret: Arc::clone(&self.caret),
@@ -362,6 +371,7 @@ impl Screen {
         requested: u16,
         erase_from: u16,
     ) -> io::Result<ModalReservation> {
+        self.moved_cursor();
         let plan = plan_modal_reservation(self.top, self.rows, requested);
         self.tty.hold()?;
         let mut buf = Vec::new();
@@ -390,6 +400,7 @@ impl Screen {
         occupied_top: u16,
         requested: u16,
     ) -> io::Result<ModalReservation> {
+        self.moved_cursor();
         let plan = plan_modal_reservation(self.top, self.rows, requested);
         self.tty.hold()?;
         let mut buf = Vec::new();
@@ -412,11 +423,13 @@ impl Screen {
     }
 
     fn place_cursor(&mut self, row: u16) -> io::Result<()> {
+        self.moved_cursor();
         execute!(self.tty, MoveTo(0, row))?;
         self.tty.flush()
     }
 
     fn cleanup_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
+        self.moved_cursor();
         if reservation.chat_visible {
             return Ok(());
         }
@@ -431,6 +444,7 @@ impl Screen {
     /// re-seats the block viewport at its new top. All arithmetic, no queries —
     /// see the module docs.
     fn insert_rows(&mut self, rows: Vec<Row>) -> io::Result<()> {
+        self.moved_cursor();
         let cols = self.cols as usize;
         let phys: Vec<Row> = rows.iter().flat_map(|r| wrap_row(r, cols)).collect();
         if phys.is_empty() || phys.len() > u16::MAX as usize {
@@ -458,6 +472,7 @@ impl Screen {
     /// Change the block's height (the editor grew, the status row appeared…).
     /// Scrolls the transcript up if the taller block would not fit below it.
     fn relayout(&mut self, editor_rows: u16, status_rows: u16) -> io::Result<()> {
+        self.moved_cursor();
         let new_h = (editor_rows + status_rows).clamp(1, self.rows.max(1));
         if new_h == self.block_h && status_rows == self.status_rows {
             return Ok(());

@@ -155,8 +155,10 @@ fn interaction_view_child() {
         "cockpit_panel_loop" => {
             crate::cockpit::presenter::cockpit_panel_loop_case();
         }
-        "cockpit_resize_anchor" => {
-            crate::cockpit::presenter::cockpit_resize_anchor_case();
+        "cockpit_resize_anchor" | "cockpit_resize_anchor_dirty" => {
+            crate::cockpit::presenter::cockpit_resize_anchor_case(
+                mode == "cockpit_resize_anchor_dirty",
+            );
         }
         "cockpit_acceptance" => {
             crate::cockpit::presenter::cockpit_acceptance_case();
@@ -420,6 +422,7 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
             | "cockpit_pager"
             | "cockpit_panel_loop"
             | "cockpit_resize_anchor"
+            | "cockpit_resize_anchor_dirty"
             | "cockpit_psyche"
     ) {
         child.env("NEWT_EDIT_MODE", "emacs");
@@ -1013,10 +1016,13 @@ fn marker_numbers(screen: &str, marker: &str) -> Option<(u16, u16)> {
 pub(crate) fn drive_cockpit_resize_anchor() {
     // `shift` is how far the terminal moves the content on the grow; `None` is a terminal
     // that never answers a cursor query, so the old arithmetic guess must stand.
-    for (name, shift) in [
-        ("adds rows below", Some(0i32)),
-        ("pulls scrollback down", Some(10)),
-        ("never answers a cursor query", None),
+    // `dirty`: output lands after the last draw and before the resize (#3014 review P2), so
+    // the cursor is not at the caret and must not be read as if it were.
+    for (name, shift, dirty) in [
+        ("adds rows below", Some(0i32), false),
+        ("pulls scrollback down", Some(10), false),
+        ("never answers a cursor query", None, false),
+        ("adds rows below after output landed", Some(0), true),
     ] {
         let state = std::sync::Arc::new(std::sync::Mutex::new((0i32, 24usize)));
         let model_state = state.clone();
@@ -1029,7 +1035,14 @@ pub(crate) fn drive_cockpit_resize_anchor() {
             None => Pty::open(),
         };
         pty.resize(24, 80);
-        let mut child = spawn_child(&pty, "cockpit_resize_anchor");
+        let mut child = spawn_child(
+            &pty,
+            if dirty {
+                "cockpit_resize_anchor_dirty"
+            } else {
+                "cockpit_resize_anchor"
+            },
+        );
         let mut transcript = String::new();
         let result = (|| -> Result<(), String> {
             if !pty.wait_for_screen("ANCHOR_READY", REACH_TIMEOUT) {

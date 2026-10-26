@@ -686,7 +686,7 @@ fn a_resize_re_anchors_the_block_where_the_terminal_put_it_3014() {
     crate::interaction_view_pty_test::drive_cockpit_resize_anchor();
 }
 
-pub(crate) fn cockpit_resize_anchor_case() {
+pub(crate) fn cockpit_resize_anchor_case(dirty: bool) {
     assert!(unsafe { libc::setsid() } >= 0);
     assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
     let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
@@ -701,6 +701,14 @@ pub(crate) fn cockpit_resize_anchor_case() {
     println!("ANCHOR_READY rows={} top={}", rows, cockpit.screen.top);
     cockpit.drain_pty().unwrap();
     cockpit.draw().unwrap();
+    if dirty {
+        // Output after the last draw: on a full screen it scrolls the transcript, leaves the
+        // block's geometry unchanged and parks the cursor on the clearing walk, not the caret.
+        cockpit
+            .screen
+            .insert_rows(vec![b"OUTPUT_BEFORE_RESIZE".to_vec()])
+            .unwrap();
+    }
     // Deliver the resize through the real event loop; bounded by count, not by time.
     for _ in 0..1500 {
         cockpit.poll_keys().unwrap();
