@@ -729,13 +729,21 @@ fn spill_commands_parse_expected_forms() {
         parse_spill_command("/spill last").unwrap(),
         SpillCommand::Last
     );
+    // #3016: content ids, not a session counter. A unique tail of >= 6
+    // base32 characters (or the whole id) opens; numbers never do.
     assert_eq!(
-        parse_spill_command("/spill open 17").unwrap(),
-        SpillCommand::Open(17)
+        parse_spill_command("/spill open ab2cde").unwrap(),
+        SpillCommand::Open("ab2cde".into())
+    );
+    assert_eq!(
+        parse_spill_command("/spill open BAFYR4IAB2CDE").unwrap(),
+        SpillCommand::Open("bafyr4iab2cde".into())
     );
     assert!(parse_spill_command("/spill open").is_err());
-    assert!(parse_spill_command("/spill open 0").is_err());
-    assert!(parse_spill_command("/spill open 3 extra").is_err());
+    assert!(parse_spill_command("/spill open 17").is_err());
+    assert!(parse_spill_command("/spill open 1234567").is_err());
+    assert!(parse_spill_command("/spill open ab2cd").is_err());
+    assert!(parse_spill_command("/spill open ab2cde extra").is_err());
     assert!(parse_spill_command("/spillage 7").is_err());
     assert!(parse_spill_command("/spill many").is_err());
 }

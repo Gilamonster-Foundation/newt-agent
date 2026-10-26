@@ -39,9 +39,13 @@ pub(crate) fn cockpit_pager_case() {
         let body = (0..50)
             .map(|i| format!("spill-row-{i:02}\n"))
             .collect::<String>();
-        let id = archive.retain(&body);
-        crate::transcript_pager::run_output_pager(&archive.get(id).unwrap(), &mut remote, true)
-            .unwrap();
+        let id = archive.retain(&body).unwrap();
+        crate::transcript_pager::run_output_pager(
+            &archive.find(&id.to_handle()).unwrap(),
+            &mut remote,
+            true,
+        )
+        .unwrap();
         println!("PAGER_RETURNED");
         match remote.read_line("after pager").unwrap() {
             ReadOutcome::Line(line) => assert_eq!(line, "after-view", "modal keys leaked"),

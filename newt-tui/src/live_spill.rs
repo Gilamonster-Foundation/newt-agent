@@ -1276,10 +1276,10 @@ impl LiveSpillRenderer {
 }
 
 impl CompletedSpillRenderer for LiveSpillRenderer {
-    fn retain_completed(&self, output: &str) -> Option<u64> {
+    fn retain_completed(&self, output: &str) -> Option<newt_core::agentic::SpillCid> {
         self.completed_archive
             .as_ref()
-            .map(|archive| archive.retain(output))
+            .and_then(|archive| archive.retain(output))
     }
 
     fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize {

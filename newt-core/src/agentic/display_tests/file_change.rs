@@ -95,9 +95,9 @@ struct Renderer {
     seen: Mutex<Vec<String>>,
 }
 impl CompletedSpillRenderer for Renderer {
-    fn retain_completed(&self, output: &str) -> Option<u64> {
+    fn retain_completed(&self, output: &str) -> Option<crate::agentic::SpillCid> {
         self.retained.lock().unwrap().push(output.into());
-        Some(9)
+        Some(crate::agentic::session_output_cid([7; 16], "fold").unwrap())
     }
     fn render_completed(&self, _: &str, _: usize, _: usize) -> usize {
         0

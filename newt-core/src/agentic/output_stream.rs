@@ -106,16 +106,16 @@ pub trait LiveToolOutput: Send + Sync {
 pub trait CompletedSpillRenderer: Send + Sync {
     /// Retain a completed result for an on-demand, session-scoped viewer.
     ///
-    /// Returns the stable session-local identifier that committed collapse
-    /// markers should name. The default preserves renderers that only provide
+    /// Returns the content-derived handle that committed collapse markers
+    /// should name (same bytes in a session, same handle). The default preserves renderers that only provide
     /// the transient inline viewport.
-    fn retain_completed(&self, _output: &str) -> Option<u64> {
+    fn retain_completed(&self, _output: &str) -> Option<super::SpillCid> {
         None
     }
 
     /// Host-supported inspection affordance, with the command fallback.
-    fn recovery_hint(&self, id: u64) -> String {
-        format!("/spill open {id}")
+    fn recovery_hint(&self, id: &super::SpillCid) -> String {
+        format!("/spill open {}", id.tail())
     }
 
     /// Render a completed tool result as an interactive spill viewport.

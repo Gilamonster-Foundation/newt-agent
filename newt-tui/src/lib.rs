@@ -8291,7 +8291,7 @@ fn time_marker_secs(cfg: &newt_core::Config) -> u64 {
     cfg.tui.as_ref().map(|t| t.time_marker_secs).unwrap_or(300)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SpillCommand {
     Status,
     Set(usize),
@@ -8302,8 +8302,8 @@ enum SpillCommand {
     Excerpt,
     /// Open the newest retained completed result.
     Last,
-    /// Open one stable, session-local retained result.
-    Open(u64),
+    /// Open one retained result by its content id or a unique tail of it.
+    Open(String),
 }
 
 /// Apply a parsed `/spill` command to the two session overrides. Pure and
@@ -8346,14 +8346,20 @@ fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
     let arg = rest.trim();
     let normalized = arg.to_ascii_lowercase();
     if let Some(value) = normalized.strip_prefix("open ") {
-        let id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("/spill open needs a positive result id"))?;
-        if id == 0 || value.split_whitespace().count() != 1 {
-            anyhow::bail!("/spill open needs one positive result id");
+        let tail = value.trim();
+        if tail.split_whitespace().count() != 1 {
+            anyhow::bail!("/spill open needs one result id");
         }
-        return Ok(SpillCommand::Open(id));
+        if tail.len() < newt_core::agentic::MIN_SPILL_TAIL_CHARS {
+            anyhow::bail!(
+                "/spill open needs at least {} characters of the result id",
+                newt_core::agentic::MIN_SPILL_TAIL_CHARS
+            );
+        }
+        if !tail.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')) {
+            anyhow::bail!("/spill open takes the base32 result id shown on the marker");
+        }
+        return Ok(SpillCommand::Open(tail.to_string()));
     }
     match normalized.as_str() {
         "" | "show" | "status" => Ok(SpillCommand::Status),

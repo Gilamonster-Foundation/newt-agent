@@ -247,8 +247,8 @@ pub use compress::{
     Summarizer, CONTINUATION_PREFIX, PLAN_APPROVAL_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use content_spill::{
-    SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1, SpillScope,
-    SpillStore,
+    session_output_cid, SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1,
+    SpillScope, SpillStore, MIN_SPILL_TAIL_CHARS,
 };
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
@@ -14450,7 +14450,7 @@ fn commit_reasoning_fold(
     let retained = retain.and_then(|r| r.retain_completed(fold.body()));
     let hint = retained
         .zip(retain)
-        .map(|(id, renderer)| renderer.recovery_hint(id));
+        .map(|(id, renderer)| renderer.recovery_hint(&id));
     let recovery = hint
         .as_deref()
         .map_or_else(display::Recovery::default, display::Recovery::Command);
@@ -14539,7 +14539,7 @@ fn emit_tool_round_narration(
     let retained = retain.and_then(|r| r.retain_completed(&body));
     let hint = retained
         .zip(retain)
-        .map(|(id, renderer)| renderer.recovery_hint(id));
+        .map(|(id, renderer)| renderer.recovery_hint(&id));
     let recovery = hint
         .as_deref()
         .map_or_else(display::Recovery::default, display::Recovery::Command);
@@ -14606,7 +14606,7 @@ impl ReasoningTrickle {
         let retained = retain.and_then(|r| r.retain_completed(self.fold.body()));
         let hint = retained
             .zip(retain)
-            .map(|(id, renderer)| renderer.recovery_hint(id));
+            .map(|(id, renderer)| renderer.recovery_hint(&id));
         let recovery = hint
             .as_deref()
             .map_or_else(display::Recovery::default, display::Recovery::Command);

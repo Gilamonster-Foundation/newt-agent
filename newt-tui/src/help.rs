@@ -592,7 +592,7 @@ The model and noninteractive surfaces cannot approve changes in this editor."
         }
         "spill" => {
             "\
-/spill [status|N|reset|summary|excerpt|last|open ID] — tool-output controls
+/spill [status|N|reset|summary|excerpt|last|open ID|TAIL] — tool-output controls
 
   /spill                 show the effective row count and live availability
   /spill <N>             set collapsed live and completed rows for later tools
@@ -601,7 +601,7 @@ The model and noninteractive surfaces cannot approve changes in this editor."
   /spill summary         collapse spilled results to one line (rich default)
   /spill excerpt         restore the multi-row excerpt for spilled results
   /spill last            open the newest retained result (rich, this session)
-  /spill open <ID>       open the retained result named by a collapse marker
+  /spill open <ID>       open a retained result by its marker id (≥6 trailing chars)
   F4 (cockpit)           choose retained output without submitting a prompt
   F4 (decision prompt)   inspect the pending request; Esc returns without answering
 
@@ -881,7 +881,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /psyche                  - effort dial panel: cognition, tenacity, initiative, persona (Esc exits; /psyche obsessive = max)",
         "  /mcp [on|off|enable|disable|auth] [name] - MCP manager; session mute (on/off) or durable config (enable/disable)",
-        "  /spill [status|N|reset|summary|excerpt|last|open ID] - tool output",
+        "  /spill [status|N|reset|summary|excerpt|last|open ID|TAIL] - tool output",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
         "  /vi  /emacs  /nano       - switch line-editor key bindings for this session",
