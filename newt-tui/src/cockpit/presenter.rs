@@ -1093,9 +1093,8 @@ impl Presenter {
             SurfaceRequest::SetSpillArchive(archive) => {
                 archive.enable_inspection();
                 self.spills = Some(archive);
-                self.screen.insert_rows(vec![
-                    b"F4 inspect retained output (including /spill open IDs)".to_vec(),
-                ])?;
+                self.screen
+                    .insert_rows(vec![b"F4 inspect retained output (or /spill open)".to_vec()])?;
             }
             SurfaceRequest::SetTabs(tabs) => {
                 self.surface.set_tabs(tabs);

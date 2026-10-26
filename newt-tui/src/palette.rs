@@ -148,6 +148,9 @@ pub(crate) fn corpus_entries() -> &'static [PaletteEntry] {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaletteState {
     entries: Vec<PaletteEntry>,
+    /// #3022: retained spill ids as `/spill open <tail>` rows, newest first;
+    /// they replace `entries` while the filter is `spill open …`.
+    spill_entries: Vec<PaletteEntry>,
     open: bool,
     filter: String,
     /// Indices into `entries`, prefix matches first (corpus order within tier).
@@ -165,6 +168,7 @@ impl PaletteState {
     pub(crate) fn new(entries: Vec<PaletteEntry>) -> Self {
         Self {
             entries,
+            spill_entries: Vec::new(),
             open: false,
             filter: String::new(),
             matched: Vec::new(),
@@ -177,6 +181,37 @@ impl PaletteState {
     /// Seed from the shared `help_lines()` corpus.
     pub(crate) fn from_corpus() -> Self {
         Self::new(corpus_entries().to_vec())
+    }
+
+    /// Offer the retained spills (`(id tail, label)`, newest first) as the
+    /// completions of `/spill open `. Empty keeps the plain usage row.
+    pub(crate) fn set_spill_choices(&mut self, choices: Vec<(String, String)>) {
+        self.spill_entries = choices
+            .into_iter()
+            .map(|(tail, label)| PaletteEntry {
+                cmd: format!("/spill open {tail}"),
+                args: String::new(),
+                desc: label,
+            })
+            .collect();
+    }
+
+    pub(crate) fn take_spill_entries(&mut self) -> Vec<PaletteEntry> {
+        std::mem::take(&mut self.spill_entries)
+    }
+
+    pub(crate) fn restore_spill_entries(&mut self, entries: Vec<PaletteEntry>) {
+        self.spill_entries = entries;
+    }
+
+    /// The rows the filter ranks over: the retained spills once the operator
+    /// has typed `/spill open `, otherwise the command corpus.
+    fn list(&self) -> &[PaletteEntry] {
+        if !self.spill_entries.is_empty() && self.filter.to_lowercase().starts_with("spill open ") {
+            &self.spill_entries
+        } else {
+            &self.entries
+        }
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -218,7 +253,7 @@ impl PaletteState {
     /// the palette is not open; the typed text is untouched.
     fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
-        self.matched = ranked_matches(&self.entries, filter);
+        self.matched = ranked_matches(self.list(), filter);
         self.highlight = 0;
         self.scroll = 0;
         if self.matched.is_empty() {
@@ -287,7 +322,7 @@ impl PaletteState {
         if !self.open {
             return None;
         }
-        let e = &self.entries[*self.matched.get(self.highlight)?];
+        let e = &self.list()[*self.matched.get(self.highlight)?];
         Some(if e.args.is_empty() {
             e.cmd.clone()
         } else {
@@ -425,7 +460,7 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
     let col = state
         .matched
         .iter()
-        .map(|&i| head_w(&state.entries[i]))
+        .map(|&i| head_w(&state.list()[i]))
         .max()
         .unwrap_or(0)
         .min(36);
@@ -439,7 +474,7 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
         .iter()
         .enumerate()
         .map(|(offset, &idx)| {
-            let e = &state.entries[idx];
+            let e = &state.list()[idx];
             let hl = state.scroll + offset == state.highlight;
             let (marker, cmd_style, desc_style) = if hl {
                 (
@@ -504,8 +539,58 @@ mod tests {
     fn matched_cmds(s: &PaletteState) -> Vec<&str> {
         s.matched
             .iter()
-            .map(|&i| s.entries[i].cmd.as_str())
+            .map(|&i| s.list()[i].cmd.as_str())
             .collect()
+    }
+
+    /// #3022: after `/spill open ` the palette lists the retained ids, newest
+    /// first, each labelled; Tab completes the highlighted id. Mocked choices —
+    /// the palette never sees the archive.
+    #[test]
+    fn spill_open_completes_retained_ids_newest_first() {
+        let mut s = PaletteState::new(vec![PaletteEntry {
+            cmd: "/spill open".into(),
+            args: "<ID>".into(),
+            desc: "open a retained result".into(),
+        }]);
+        s.set_spill_choices(vec![
+            ("newest22".into(), "run_command: cargo test".into()),
+            ("older333".into(), "read_file: src/lib.rs".into()),
+        ]);
+        s.on_buffer_change("", "/");
+        s.on_buffer_change("/", "/spill open ");
+        assert!(s.is_open());
+        assert_eq!(
+            matched_cmds(&s),
+            ["/spill open newest22", "/spill open older333"]
+        );
+        assert_eq!(s.list()[0].desc, "run_command: cargo test");
+        assert_eq!(
+            palette_step(&mut s, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            PaletteStep::CompleteTo("/spill open newest22".to_string())
+        );
+        // Typing narrows by the id the operator is spelling.
+        let mut s = PaletteState::new(fixture());
+        s.set_spill_choices(vec![
+            ("newest22".into(), "a".into()),
+            ("older333".into(), "b".into()),
+        ]);
+        s.on_buffer_change("", "/");
+        s.on_buffer_change("/", "/spill open ol");
+        assert_eq!(matched_cmds(&s), ["/spill open older333"]);
+    }
+
+    /// With nothing retained the palette keeps today's `/spill open <ID>` row.
+    #[test]
+    fn spill_open_without_retained_ids_shows_the_usage_row() {
+        let mut s = PaletteState::new(vec![PaletteEntry {
+            cmd: "/spill open".into(),
+            args: "<ID>".into(),
+            desc: "open".into(),
+        }]);
+        s.on_buffer_change("", "/");
+        s.on_buffer_change("/", "/spill open ");
+        assert_eq!(matched_cmds(&s), ["/spill open"]);
     }
 
     #[test]

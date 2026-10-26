@@ -1277,6 +1277,9 @@ pub(crate) struct RichSurface {
     /// loop runs behind `&self`. `Cell::take` needs only `Option`'s `Default`,
     /// so `Vi` stays non-`Clone`.
     vi: Cell<Option<Vi>>,
+    /// #3022: the retained-output archive, for `/spill open ` completion.
+    #[cfg(feature = "live-spill")]
+    spills: Option<std::sync::Arc<crate::completed_spill::CompletedSpillArchive>>,
 }
 
 /// RAII owner of the rich surface's terminal modes: raw mode **and** bracketed
@@ -1369,6 +1372,8 @@ impl RichSurface {
             tabs: Vec::new(),
             session: String::new(),
             vi: Cell::new(None),
+            #[cfg(feature = "live-spill")]
+            spills: None,
         })
     }
 
@@ -1469,6 +1474,10 @@ impl RichSurface {
         // jumplist and `;`-target are not. Adopt what the last read parked.
         if let Some(vi) = self.vi.take() {
             me.adopt_vi(vi);
+        }
+        #[cfg(feature = "live-spill")]
+        if let Some(spills) = &self.spills {
+            me.set_spill_choices(spills.choices());
         }
         let outcome = loop {
             let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -1693,6 +1702,14 @@ impl InputSurface for RichSurface {
 
     fn set_tabs(&mut self, tabs: Vec<crate::tab_bar::TabCell>) {
         self.tabs = tabs;
+    }
+
+    #[cfg(feature = "live-spill")]
+    fn set_spill_archive(
+        &mut self,
+        archive: std::sync::Arc<crate::completed_spill::CompletedSpillArchive>,
+    ) {
+        self.spills = Some(archive);
     }
 }
 

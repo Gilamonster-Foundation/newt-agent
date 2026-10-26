@@ -4924,12 +4924,12 @@ fn session_body(
                                     ))
                                 } else {
                                     let spill = match command {
-                                        SpillCommand::Open(tail) => {
-                                            completed_spills.find(&tail).map_err(anyhow::Error::from)
-                                        }
+                                        SpillCommand::Open(tail) => completed_spills
+                                            .find(&tail)
+                                            .map_err(anyhow::Error::from),
                                         _ => completed_spills.latest().ok_or_else(|| {
                                             anyhow::anyhow!(
-                                                "that spill is not retained in this bounded session archive"
+                                                "no spill is retained yet in this session"
                                             )
                                         }),
                                     };

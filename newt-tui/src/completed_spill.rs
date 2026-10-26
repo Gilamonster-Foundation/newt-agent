@@ -89,6 +89,14 @@ pub(crate) struct CompletedSpillArchive {
     max_entry_bytes: usize,
 }
 
+fn session_nonce() -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    // A nonce only has to differ between sessions; an entropy failure is
+    // vanishingly rare and would leave a predictable (still valid) handle.
+    let _ = getrandom::getrandom(&mut nonce);
+    nonce
+}
+
 impl Default for CompletedSpillArchive {
     fn default() -> Self {
         Self::with_limits(MAX_ENTRIES, MAX_TOTAL_BYTES, MAX_ENTRY_BYTES)
@@ -99,7 +107,7 @@ impl CompletedSpillArchive {
     fn with_limits(max_entries: usize, max_total_bytes: usize, max_entry_bytes: usize) -> Self {
         Self {
             state: Mutex::new(ArchiveState {
-                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                nonce: session_nonce(),
                 inspection_available: false,
                 bytes: 0,
                 entries: VecDeque::new(),
@@ -183,6 +191,26 @@ impl CompletedSpillArchive {
         }
     }
 
+    /// `/spill open` completions, newest first: `(id tail, label)` where the
+    /// label is the body's first line, cut short.
+    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+    pub(crate) fn choices(&self) -> Vec<(String, String)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .entries
+            .iter()
+            .rev()
+            .map(|spill| {
+                let first = spill.lines.iter().find(|l| !l.trim().is_empty());
+                let label: String = first.map_or("", |l| l.trim()).chars().take(40).collect();
+                (spill.id.tail(), label)
+            })
+            .collect()
+    }
+
     /// Called only once the cockpit has installed its operator action.
     #[cfg(all(unix, feature = "rich-tui"))]
     pub(crate) fn enable_inspection(&self) {
@@ -243,9 +271,9 @@ impl newt_core::agentic::CompletedSpillRenderer for CompletedSpillArchive {
             .unwrap_or_else(|p| p.into_inner())
             .inspection_available;
         if available {
-            format!("F4 inspect · /spill open {}", id.tail())
+            format!("F4 inspect · /spill open [{}]", id.tail())
         } else {
-            format!("/spill open {}", id.tail())
+            format!("/spill open [{}]", id.tail())
         }
     }
 
@@ -282,12 +310,37 @@ mod tests {
         let archive = CompletedSpillArchive::default();
         let id = cid(&archive, "one\n");
         let tail = id.tail();
-        assert_eq!(archive.recovery_hint(&id), format!("/spill open {tail}"));
+        assert_eq!(archive.recovery_hint(&id), format!("/spill open [{tail}]"));
         archive.enable_inspection();
         assert_eq!(
             archive.recovery_hint(&id),
-            format!("F4 inspect · /spill open {tail}")
+            format!("F4 inspect · /spill open [{tail}]")
         );
+    }
+
+    /// #3022: the completion list is the retained ids, newest first, each with
+    /// a short label from the body's first line.
+    #[test]
+    fn choices_are_newest_first_with_a_short_first_line_label() {
+        let archive = CompletedSpillArchive::default();
+        let first = cid(&archive, "first line\nmore\n");
+        let long = format!("{}\n", "x".repeat(200));
+        let second = cid(&archive, &long);
+        let choices = archive.choices();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].0, second.tail());
+        assert_eq!(choices[1], (first.tail(), "first line".to_string()));
+        assert!(choices[0].1.chars().count() <= 41, "{}", choices[0].1);
+    }
+
+    /// #3022: markers lead with F4 and the bare form; the id goes last.
+    #[test]
+    fn the_hint_leads_with_the_bare_form_and_ends_with_the_id() {
+        use newt_core::agentic::CompletedSpillRenderer;
+        let archive = CompletedSpillArchive::default();
+        let id = cid(&archive, "one\n");
+        let tail = id.tail();
+        assert_eq!(archive.recovery_hint(&id), format!("/spill open [{tail}]"));
     }
 
     #[test]

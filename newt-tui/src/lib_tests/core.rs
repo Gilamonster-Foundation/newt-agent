@@ -739,7 +739,15 @@ fn spill_commands_parse_expected_forms() {
         parse_spill_command("/spill open BAFYR4IAB2CDE").unwrap(),
         SpillCommand::Open("bafyr4iab2cde".into())
     );
-    assert!(parse_spill_command("/spill open").is_err());
+    // #3022: a bare `open` gestures at the newest retained spill.
+    assert_eq!(
+        parse_spill_command("/spill open").unwrap(),
+        SpillCommand::Last
+    );
+    assert_eq!(
+        parse_spill_command("/spill open  ").unwrap(),
+        SpillCommand::Last
+    );
     assert!(parse_spill_command("/spill open 17").is_err());
     assert!(parse_spill_command("/spill open 1234567").is_err());
     assert!(parse_spill_command("/spill open ab2cd").is_err());

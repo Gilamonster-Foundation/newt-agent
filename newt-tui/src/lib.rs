@@ -8345,8 +8345,15 @@ fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
 
     let arg = rest.trim();
     let normalized = arg.to_ascii_lowercase();
+    // #3022: a bare `open` gestures at the newest retained spill.
+    if normalized == "open" {
+        return Ok(SpillCommand::Last);
+    }
     if let Some(value) = normalized.strip_prefix("open ") {
         let tail = value.trim();
+        if tail.is_empty() {
+            return Ok(SpillCommand::Last);
+        }
         if tail.split_whitespace().count() != 1 {
             anyhow::bail!("/spill open needs one result id");
         }
@@ -8604,7 +8611,7 @@ impl SpillEligibility {
             Self::TermDumb => "live interaction unavailable: TERM=dumb disclaims cursor control",
             Self::TerminalOwnedByCockpit => {
                 "live interaction unavailable: the cockpit owns the terminal \
-                 (committed results stay full; /spill open <id> reopens one)"
+                 (committed results stay full; /spill open reopens the newest)"
             }
         }
     }
