@@ -9892,8 +9892,9 @@ fn session_body(
                                         .then(|| {
                                             fold_observed_report(&display_reply, |report| {
                                                 use newt_core::agentic::CompletedSpillRenderer;
-                                                let id = completed_spills.retain(report);
-                                                Some(completed_spills.recovery_hint(id))
+                                                completed_spills
+                                                    .retain(report)
+                                                    .map(|id| completed_spills.recovery_hint(&id))
                                             })
                                         })
                                         .flatten()
