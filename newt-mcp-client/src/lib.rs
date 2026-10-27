@@ -862,6 +862,36 @@ fn prepare_stdio_caveats(
     Ok(prepared)
 }
 
+/// The stdio a stdio MCP child is spawned with, declared BY NAME (#3033): a
+/// raw `std::process::Stdio` converts in as `ConfinedStdio::Other`, which is
+/// unaudited, so Seatbelt resolves `net:none` to `Unknown` and admission
+/// refuses every such spawn on macOS. Piped stdin/stdout carry JSON-RPC; stderr
+/// is discarded so server logging cannot corrupt the stream.
+#[cfg(unix)]
+fn mcp_child_stdio() -> [agent_bridle::ConfinedStdio; 3] {
+    [
+        agent_bridle::ConfinedStdio::Piped,
+        agent_bridle::ConfinedStdio::Piped,
+        agent_bridle::ConfinedStdio::Null,
+    ]
+}
+
+/// The context on a failed confined MCP spawn. A Seatbelt refusal names the
+/// precondition an operator can act on (#3033): bridle admits a `net:none`
+/// child only for an unprivileged caller, so newt running as root is refused
+/// even with audited stdio.
+#[cfg(unix)]
+fn spawn_failure_notice(name: &str, command: &str, seatbelt_refusal: bool) -> String {
+    let mut notice = format!("spawning MCP server `{name}` ({command}) confined");
+    if seatbelt_refusal {
+        notice.push_str(
+            "; on macOS a `net:none` stdio server is admitted only when newt runs as a \
+             non-root user",
+        );
+    }
+    notice
+}
+
 /// Log the confinement actually achieved — honest, never over-claimed.
 /// [`SandboxKind::None`] means the leash on this child is advisory only (no OS
 /// sandbox enforced it on this host). Surfacing this in `/mcp` is a follow-up.
@@ -1009,13 +1039,17 @@ impl StdioTransport {
         for (k, v) in &grants {
             cmd = cmd.env(k, v);
         }
+        let [stdin, stdout, stderr] = mcp_child_stdio();
         let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
             .spawn_tokio(&cx)
-            .with_context(|| {
-                format!("spawning MCP server `{}` ({command}) confined", entry.name)
+            .map_err(|e| {
+                let seatbelt_refusal = cfg!(target_os = "macos")
+                    && matches!(e, agent_bridle::ToolError::Denied { .. });
+                let notice = spawn_failure_notice(&entry.name, command, seatbelt_refusal);
+                anyhow::Error::new(e).context(notice)
             })?;
         let sandbox_kind = child.sandbox_kind;
         log_confinement(&entry.name, sandbox_kind);
