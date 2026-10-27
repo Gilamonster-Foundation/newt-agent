@@ -108,6 +108,19 @@ fn transcript_pager_child() {
             crate::transcript_pager::run_spill_picker(&archive.snapshot(), out)
                 .expect("fold list runs to a clean quit");
         }
+        // #3023: F4 before anything is retained shows the empty notice.
+        #[cfg(feature = "live-spill")]
+        "empty-folds" => {
+            use std::os::fd::AsFd as _;
+            let archive = crate::completed_spill::CompletedSpillArchive::default();
+            let out: std::fs::File = std::io::stdout()
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("dup the slave")
+                .into();
+            crate::transcript_pager::run_spill_picker(&archive.snapshot(), out)
+                .expect("the empty fold list runs to a clean quit");
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -316,6 +329,30 @@ fn space_unfolds_a_spill_in_place_in_the_f4_view() {
     assert!(
         status.is_some_and(|s| s.success()),
         "child did not quit cleanly"
+    );
+    assert!(!pty.is_raw(), "the terminal was left in raw mode");
+}
+
+/// #3023 review: PageDown on the empty F4 view panicked in `FoldList::scroll`.
+#[cfg(feature = "live-spill")]
+#[serial_test::serial(transcript_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn paging_the_empty_f4_view_does_not_panic() {
+    let pty = Pty::open();
+    let mut child = spawn_child(&pty, "empty-folds");
+    assert!(
+        pty.wait_for_screen("retained", REACH_TIMEOUT),
+        "the empty notice never drew; screen={:?}",
+        pty.screen()
+    );
+    pty.type_in("\x1b[6~");
+    pty.type_in("\x1b[5~");
+    pty.type_in("q");
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the empty F4 view did not survive paging and quit cleanly"
     );
     assert!(!pty.is_raw(), "the terminal was left in raw mode");
 }

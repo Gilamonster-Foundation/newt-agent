@@ -135,6 +135,9 @@ impl FoldList {
 
     /// Scroll the view by `delta` rendered lines (negative is up).
     pub(crate) fn scroll(&mut self, delta: isize, width: usize) {
+        if self.items.is_empty() {
+            return;
+        }
         for _ in 0..delta.unsigned_abs() {
             if delta > 0 {
                 let len = self.lines(self.offset_idx, width).len();
@@ -379,5 +382,15 @@ mod tests {
             !l.render(12, 20).is_empty(),
             "offset re-clamps after a collapse"
         );
+    }
+
+    /// PageDown/PageUp on the empty F4 view ("No output retained") indexed
+    /// `items[0]` and panicked (#3023 review).
+    #[test]
+    fn scrolling_an_empty_list_either_way_is_a_no_op() {
+        let mut l = FoldList::default();
+        l.scroll(20, 78);
+        l.scroll(-20, 78);
+        assert!(l.render(78, 20).is_empty());
     }
 }
