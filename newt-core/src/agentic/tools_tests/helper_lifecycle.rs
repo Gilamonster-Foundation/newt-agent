@@ -746,3 +746,73 @@ fn cold_cache_recovery_is_visible_to_model_and_operator() {
         );
     }
 }
+
+/// #3040: `lifecycle action=list` at a dual-manifest root, under `require_all`
+/// pack `pyo3`, with and without real PyO3 evidence. `list` keeps it
+/// subprocess-free.
+async fn lifecycle_list_at(cargo: &str, pyproject: &str) -> String {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("Cargo.toml"), cargo).unwrap();
+    std::fs::write(ws.path().join("pyproject.toml"), pyproject).unwrap();
+    execute_tool(
+        "lifecycle",
+        &serde_json::json!({ "phase": "test", "action": "list" }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &crate::caveats::Caveats::top(),
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// #3040: a Rust crate beside an unrelated Python package trips the compound
+/// `pyo3` pack silently. The session must see the match is only a
+/// dual-manifest coincidence; the picked command itself is unchanged.
+#[tokio::test]
+async fn lifecycle_flags_pyo3_pack_picked_by_dual_manifest_alone() {
+    let out = lifecycle_list_at(
+        "[package]\nname = \"plain\"\n",
+        "[project]\nname = \"tools\"\n",
+    )
+    .await;
+    assert!(out.contains("lifecycle test → cargo test"), "{out}");
+    assert!(out.contains("dual-manifest root"), "{out}");
+    assert!(out.contains("[lifecycle]"), "{out}");
+}
+
+/// #3040: a real PyO3 project (a `pyo3` dependency, or maturin as the build
+/// backend) is not annotated.
+#[tokio::test]
+async fn lifecycle_does_not_flag_a_real_pyo3_project() {
+    for (cargo, pyproject) in [
+        (
+            "[package]\nname = \"ext\"\n[dependencies]\npyo3 = \"0.28\"\n",
+            "[project]\nname = \"ext\"\n",
+        ),
+        (
+            "[workspace]\n[workspace.dependencies]\npyo3 = \"0.28\"\n",
+            "[project]\nname = \"ext\"\n",
+        ),
+        (
+            "[package]\nname = \"ext\"\n",
+            "[build-system]\nrequires = [\"maturin\"]\nbuild-backend = \"maturin\"\n",
+        ),
+    ] {
+        let out = lifecycle_list_at(cargo, pyproject).await;
+        assert_eq!(out, "lifecycle test → cargo test", "{cargo} / {pyproject}");
+    }
+}

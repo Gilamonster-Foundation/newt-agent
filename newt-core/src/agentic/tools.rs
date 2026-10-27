@@ -5141,6 +5141,11 @@ async fn execute_authorized_tool(
                 return crate::tooling::unconfigured_phase_message(phase, &nested);
             }
             let joined = cmds.join(" && ");
+            // #3040: a `pyo3` pick made only by coexisting manifests is said
+            // in-band on every outcome, so the session sees the misdetection.
+            let note = crate::tooling::detection_note(effective_path, phase)
+                .map(|note| format!("\n{note}"))
+                .unwrap_or_default();
             // Inspect exactly the retained source used by both execution lanes.
             // Never re-resolve mutable tooling configuration after this check.
             if action != "list"
@@ -5161,7 +5166,7 @@ async fn execute_authorized_tool(
             } else {
                 action
             };
-            match action {
+            let out = match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
                 "build" => {
                     let (program, argv) = build_check_argv(&joined);
@@ -5211,7 +5216,8 @@ async fn execute_authorized_tool(
                 other => format!(
                     "error: unknown lifecycle action '{other}'. Use 'run' (default), 'list', or 'build'."
                 ),
-            }
+            };
+            out + &note
         }
 
         // facade P4 build route (§4, `super::routing::build_lane_route`):

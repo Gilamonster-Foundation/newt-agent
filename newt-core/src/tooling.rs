@@ -329,6 +329,63 @@ fn matching_packs<'a>(repo_dir: &Path, packs: &'a [ToolingPack]) -> Vec<&'a Tool
         .collect()
 }
 
+/// #3040: the in-band note for a `pyo3` pick that only the two coexisting
+/// manifests made. The pick is unchanged; the note makes it visible.
+const DUAL_MANIFEST_NOTE: &str = "note: detected pyo3 pack — dual-manifest root (Cargo.toml and \
+     pyproject.toml, but no pyo3 dependency or maturin build backend); override with \
+     `[lifecycle]` in .newt/config.toml if unintended";
+
+/// #3040: `Some(note)` when `phase` at `repo_dir` resolves through the `pyo3`
+/// pack without real PyO3 evidence. A `[lifecycle]` override means no pack was
+/// used, so there is nothing to annotate.
+#[must_use]
+pub fn detection_note(repo_dir: &Path, phase: Phase) -> Option<&'static str> {
+    if LIFECYCLE_OVERRIDE
+        .get()
+        .and_then(|c| c.get(phase))
+        .is_some()
+    {
+        return None;
+    }
+    dual_manifest_note(repo_dir, &merged_packs())
+}
+
+/// Pure core of [`detection_note`]: the `pyo3` pack matched (after
+/// supersession) but neither manifest says the root is a PyO3 project.
+fn dual_manifest_note(repo_dir: &Path, packs: &[ToolingPack]) -> Option<&'static str> {
+    let picked = matching_packs(repo_dir, packs)
+        .iter()
+        .any(|p| p.name == "pyo3");
+    (picked && !has_pyo3_evidence(repo_dir)).then_some(DUAL_MANIFEST_NOTE)
+}
+
+/// What a real PyO3 root carries: a `pyo3` dependency in its Cargo.toml
+/// (package or `[workspace.dependencies]`), or maturin as its pyproject
+/// build backend. Unparseable manifests count as no evidence.
+fn has_pyo3_evidence(repo_dir: &Path) -> bool {
+    let read = |name: &str| {
+        std::fs::read_to_string(repo_dir.join(name))
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+    };
+    let cargo = read("Cargo.toml");
+    let dep = |table: Option<&toml::Value>| {
+        table
+            .and_then(|t| t.get("dependencies"))
+            .and_then(|d| d.get("pyo3"))
+            .is_some()
+    };
+    let backend = read("pyproject.toml").and_then(|p| {
+        p.get("build-system")?
+            .get("build-backend")?
+            .as_str()
+            .map(str::to_owned)
+    });
+    dep(cargo.as_ref())
+        || dep(cargo.as_ref().and_then(|c| c.get("workspace")))
+        || backend.as_deref() == Some("maturin")
+}
+
 /// The repo's `[lifecycle]` override, published once when runtime settings apply.
 static LIFECYCLE_OVERRIDE: OnceLock<PhaseCommands> = OnceLock::new();
 
