@@ -3925,7 +3925,10 @@ fn session_body(
                     }
                     #[cfg(feature = "rich-tui")]
                     macro_rules! manage_mcp {
-                        () => {{
+                        () => {
+                            manage_mcp!(crate::mcp_manager::run)
+                        };
+                        ($operation:path) => {{
                             reresolve(&mut cfg, color, verbose);
                             let cancel =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3970,7 +3973,7 @@ fn session_body(
                                         &newt_core::interaction_surface::SurfaceInteraction,
                                     ) -> PromptChoice,
                             };
-                            if let Err(error) = crate::mcp_manager::run(
+                            if let Err(error) = $operation(
                                 &mut mcp,
                                 surface.as_mut(),
                                 &mut gate,
@@ -4027,7 +4030,7 @@ fn session_body(
                                     }
                                     if !mcp.statuses.is_empty() {
                                         print_newt(
-                                            "usage: /mcp [on|off|enable|disable|auth] [name]",
+                                            "usage: /mcp [on|off|enable|disable|auth|login-all] [name]",
                                             color,
                                             verbose,
                                         );
@@ -4138,13 +4141,26 @@ fn session_body(
                                         Err(e) => print_newt(&format!("mcp {verb}: {e}"), color, verbose),
                                     }
                                 }
+                                // #3028: sign in to every server that needs it.
+                                ("login-all", "") => {
+                                    #[cfg(feature = "rich-tui")]
+                                    {
+                                        manage_mcp!(crate::mcp_manager::login_all);
+                                    }
+                                    #[cfg(not(feature = "rich-tui"))]
+                                    print_newt(
+                                        "run `newt auth --all` in a shell to sign in, then relaunch",
+                                        color,
+                                        verbose,
+                                    );
+                                }
                                 ("auth", n) if !n.is_empty() => print_newt(
                                     &format!("run `newt auth {n}` in a shell to (re)authenticate, then relaunch"),
                                     color,
                                     verbose,
                                 ),
                                 _ => print_newt(
-                                    "usage: /mcp [on|off|enable|disable|auth] [name]\n  on/off = this session (instant); enable/disable = config (durable)",
+                                    "usage: /mcp [on|off|enable|disable|auth|login-all] [name]\n  on/off = this session (instant); enable/disable = config (durable)",
                                     color,
                                     verbose,
                                 ),
