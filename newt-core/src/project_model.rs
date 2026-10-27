@@ -370,7 +370,7 @@ pub fn derive_cached(
     prev: &DriftCache<ProjectUnit>,
     markers: &std::collections::BTreeMap<String, String>,
 ) -> (ProjectModel, DriftCache<ProjectUnit>) {
-    let hashes: std::collections::BTreeMap<String, String> = markers
+    let hashes: std::collections::BTreeMap<String, content_addressable::RawContentId> = markers
         .iter()
         .map(|(dir, contents)| (dir.clone(), content_hash(contents.as_bytes())))
         .collect();
@@ -395,8 +395,8 @@ const PROJECT_MODEL_CACHE_VERSION: &str = "project-model.v1";
 /// Scan a project with the persistent drift-cache (#1282): an unchanged repo
 /// re-derives nothing; a touched unit re-derives only itself. The result equals
 /// [`scan_project`]'s units (PO-C). `config_dir` is where the cache lives
-/// (`<config_dir>/index/<repo-hash>/project-model.json`). Thin fs wrapper over
-/// [`derive_cached`].
+/// (`<config_dir>/index/<repo id>/project-model.<pack>.head` + its verified
+/// node). Thin fs wrapper over [`derive_cached`].
 #[must_use]
 pub fn scan_project_cached(
     root: &Path,
@@ -432,13 +432,24 @@ pub fn scan_project_cached(
         }
     }
 
-    let cache_path =
-        crate::drift_cache::store_path(config_dir, root, &format!("project-model.{}", pack.name));
-    let prev = crate::drift_cache::load::<ProjectUnit>(&cache_path, PROJECT_MODEL_CACHE_VERSION)
+    let dir = crate::drift_cache::store_dir(config_dir, root);
+    let name = format!("project-model.{}", pack.name);
+    let prev = crate::drift_cache::load::<ProjectUnit>(&dir, &name, PROJECT_MODEL_CACHE_VERSION)
         .unwrap_or_else(|| DriftCache::new(PROJECT_MODEL_CACHE_VERSION));
     let (model, next) = derive_cached(pack, &prev, &markers);
-    crate::drift_cache::save(&cache_path, &next);
+    if next != prev {
+        crate::drift_cache::save(&dir, &name, &next);
+    }
     Some(model)
+}
+
+/// [`scan_project_cached`] under the user config dir, else a plain
+/// [`scan_project`] when no config dir resolves.
+#[must_use]
+pub fn scan_project_persistent(root: &Path, packs: &[ProjectPack]) -> Option<ProjectModel> {
+    crate::Config::user_config_dir()
+        .and_then(|cfg| scan_project_cached(root, packs, &cfg))
+        .or_else(|| scan_project(root, packs))
 }
 
 #[cfg(test)]

@@ -164,3 +164,52 @@ async fn unfinished_warmup_is_left_running_and_the_turn_degrades() {
     finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
     assert!(warmup.is_none(), "the finished build is adopted next turn");
 }
+
+/// #3027: a second session start serves the project model from the persisted
+/// drift-cache instead of rescanning it. The stored value is tagged through
+/// the public store API; only a warm-up that READ the cache can return the
+/// tag (an unchanged unit is never re-derived). Pre-#3027 the warm-up called
+/// the uncached `scan_project`, so it never saw the tag.
+#[test]
+fn second_warmup_serves_the_project_model_from_the_cache() {
+    use newt_core::drift_cache;
+    let _env = newt_core::process_env::lock();
+    let config = tempfile::TempDir::new().unwrap();
+    let prev = std::env::var_os("NEWT_CONFIG_DIR");
+    std::env::set_var("NEWT_CONFIG_DIR", config.path());
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"warm\"\n",
+    )
+    .unwrap();
+    let ws = workspace.path().to_string_lossy().into_owned();
+    let warm = || {
+        let mut nav = newt_core::NavigatorSession::default();
+        ensure_nav_indexes(
+            &ws,
+            &newt_core::Config::default(),
+            &mut None,
+            &mut nav,
+            &newt_core::IndexStatus::default(),
+        );
+        nav.project.unwrap().units[0].name.clone()
+    };
+
+    assert_eq!(warm(), "warm", "cold start derives from the marker");
+    let dir = drift_cache::store_dir(config.path(), workspace.path());
+    let (name, version) = ("project-model.rust", "project-model.v1");
+    let mut cache = drift_cache::load::<newt_core::project_model::ProjectUnit>(&dir, name, version)
+        .expect("the cold start persisted the model");
+    for entry in cache.entries.values_mut() {
+        entry.value.name = "served-from-cache".into();
+    }
+    drift_cache::save(&dir, name, &cache);
+    let second = warm();
+
+    match prev {
+        Some(v) => std::env::set_var("NEWT_CONFIG_DIR", v),
+        None => std::env::remove_var("NEWT_CONFIG_DIR"),
+    }
+    assert_eq!(second, "served-from-cache");
+}
