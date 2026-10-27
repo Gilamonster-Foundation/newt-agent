@@ -136,9 +136,9 @@ async fn the_ollama_answer_follows_the_declared_reasoning_policy() {
 #[derive(Default)]
 struct FoldRecorder(std::sync::Mutex<Vec<String>>);
 impl CompletedSpillRenderer for FoldRecorder {
-    fn retain_completed(&self, output: &str) -> Option<u64> {
+    fn retain_completed(&self, output: &str) -> Option<crate::agentic::SpillCid> {
         self.0.lock().unwrap().push(output.to_string());
-        Some(1)
+        Some(crate::agentic::session_output_cid([7; 16], "fold").unwrap())
     }
     fn render_completed(&self, _output: &str, _width: usize, _max_height: usize) -> usize {
         0

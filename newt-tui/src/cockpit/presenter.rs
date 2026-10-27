@@ -1385,9 +1385,8 @@ impl Presenter {
             SurfaceRequest::SetSpillArchive(archive) => {
                 archive.enable_inspection();
                 self.spills = Some(archive);
-                self.screen.insert_rows(vec![
-                    b"F4 inspect retained output (including /spill open IDs)".to_vec(),
-                ])?;
+                self.screen
+                    .insert_rows(vec![b"F4 inspect retained output (or /spill open)".to_vec()])?;
             }
             SurfaceRequest::SetTabs(tabs) => {
                 self.surface.set_tabs(tabs);
@@ -1760,6 +1759,12 @@ impl Presenter {
             }
             Event::Key(key) if key.kind == KeyEventKind::Press && self.meta_key(&key)? => Ok(()),
             other => {
+                // #3022: `/spill open ` completes the ids retained so far. The
+                // archive grows after the editor mounts, so refresh per key.
+                #[cfg(feature = "live-spill")]
+                if let Some(spills) = &self.spills {
+                    self.editor.set_spill_choices(spills.choices());
+                }
                 let outcome = self.editor.on_event(other, &mut self.screen)?;
                 if let Some(outcome) = outcome {
                     self.on_outcome(outcome);

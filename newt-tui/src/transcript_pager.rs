@@ -725,7 +725,7 @@ mod terminal {
             let mut width = 1usize;
             terminal.draw(|f| {
                 let title = if view.is_some() {
-                    format!("spill {}", spills[selected].id())
+                    format!("spill {}", spills[selected].id().tail())
                 } else {
                     "inspect retained output".into()
                 };

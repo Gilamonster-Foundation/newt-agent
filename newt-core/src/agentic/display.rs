@@ -1599,7 +1599,7 @@ impl<W: Write> ToolDisplay<W> {
         // already frames it as the handle to reach for.
         let recovery_hint = retained_id
             .zip(self.completed_spill_renderer.as_ref())
-            .map(|(id, renderer)| renderer.recovery_hint(id));
+            .map(|(id, renderer)| renderer.recovery_hint(&id));
 
         if let Some((change, prefix, suffix)) = change {
             let rows = change.display_rows(&prefix, &suffix, self.cols.saturating_sub(2).max(1));

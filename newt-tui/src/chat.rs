@@ -4978,18 +4978,22 @@ fn session_body(
                                     ))
                                 } else {
                                     let spill = match command {
-                                        SpillCommand::Last => completed_spills.latest(),
-                                        SpillCommand::Open(id) => completed_spills.get(id),
-                                        _ => None,
+                                        SpillCommand::Open(tail) => completed_spills
+                                            .find(&tail)
+                                            .map_err(anyhow::Error::from),
+                                        _ => completed_spills.latest().ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "no spill is retained yet in this session"
+                                            )
+                                        }),
                                     };
-                                    spill.ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "that spill is not retained in this bounded session archive"
+                                    spill.and_then(|spill| {
+                                        crate::transcript_pager::run_output_pager(
+                                            &spill,
+                                            surface.as_mut(),
+                                            terminal_owns_turn,
                                         )
-                                    })
-                                    .and_then(|spill| {
-                                        crate::transcript_pager::run_output_pager(&spill, surface.as_mut(), terminal_owns_turn)
-                                            .map_err(anyhow::Error::from)
+                                        .map_err(anyhow::Error::from)
                                     })
                                 };
                                 #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
@@ -9918,8 +9922,9 @@ fn session_body(
                                         .then(|| {
                                             fold_observed_report(&display_reply, |report| {
                                                 use newt_core::agentic::CompletedSpillRenderer;
-                                                let id = completed_spills.retain(report);
-                                                Some(completed_spills.recovery_hint(id))
+                                                completed_spills
+                                                    .retain(report)
+                                                    .map(|id| completed_spills.recovery_hint(&id))
                                             })
                                         })
                                         .flatten()

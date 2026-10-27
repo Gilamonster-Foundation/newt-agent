@@ -67,7 +67,7 @@
   /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode
   /psyche                  - effort dial panel: cognition, tenacity, initiative, persona (Esc exits; /psyche obsessive = max)
   /mcp [on|off|enable|disable|auth|login-all] [name] - MCP manager; session mute (on/off), durable config (enable/disable), or sign in to every server (login-all)
-  /spill [status|N|reset|summary|excerpt|last|open ID] - tool output
+  /spill [status|N|reset|summary|excerpt|last|open [ID]] - tool output
   /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt
   /prompt set "<template>"  - set the prompt for this session; /prompt reset to revert
   /vi  /emacs  /nano       - switch line-editor key bindings for this session
