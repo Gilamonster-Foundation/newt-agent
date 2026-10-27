@@ -9,22 +9,69 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-10-27
+
 ### Added
 
-- `--ambient` (#978): the operator's login shell and full environment. Where `run_command`
+- `--ambient` (#978, #3005): the operator's login shell and full environment. Where `run_command`
   runs on the host shell it runs your login shell (`$SHELL -l -i -c`, so zsh functions,
   aliases and rc-set `PATH` work; an unset or relative `$SHELL` falls back to `/bin/sh` and
   the banner says so), and child processes and stdio MCP servers get your full environment
   (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` reach a
   browser launch); newt's own secrets and switches are still withheld. Alone it changes only
   that axis. Interactive `newt` / `newt code`, unix shells.
+- Prompt components (#2933): `[prompt] preset` (`default` or `pi`) and
+  `[prompt] components = { on = [...], off = [...] }`, with `/settings system-prompt
+  components | on <id> | off <id> | preset <name>` and a `[prompt: …]` footer badge
+  (#2989, #2990, #2991, #2992, #2993). `/context request` labels each piece by id.
+- `/settings skills [on|off <name>]` and `[skills] off` (#3002). An off skill is left out of
+  the skill index and refused by `use_skill`, postures and personas.
+- `propose_config_edit` (#3004): newt proposes a `config.toml` edit as a diff; only the
+  operator's `apply` writes it.
+- MCP servers with a static OAuth public client id (Claude `oauth.clientId`) can log in (#3000).
+- `newt auth --all` and `/mcp login-all` log in every HTTP server that needs it (#3030).
+- `[context] index = "off"` (and `/settings index on|off`) skips the navigator warm-up (#3029).
+- F4 opens a fold list of spills: Space toggles one in place, Enter opens the inspector (#3023).
 
 ### Changed
 
 - `--yolo` is now everything off: `--disable-ocap --full-access --ambient`, no longer an
-  alias of `--disable-ocap`. If you used `--yolo` for approvals-off alone, use
+  alias of `--disable-ocap` (#3005). If you used `--yolo` for approvals-off alone, use
   `--disable-ocap`; `--yolo` now also lifts confinement and runs your login shell with
   your full environment, and its banner lists what is off.
+- The soul is retired (#2997). `soul.md` and `[memory] soul_file` are ignored, with a
+  one-time notice pointing at `[prompt] file`. The `present-findings`, `commit-attribution`
+  and `three-cs` rules moved to bundled skills. `newt headless` now sends the TUI's
+  component prompt (`--prompt-preset headless` keeps the bare one), so headless
+  requests and eval baselines grow.
+- A config that does not resolve is refused at startup instead of falling back to
+  defaults (#2990).
+- `--full-access` pre-approves MCP tool calls for the session (#2996).
+- Spill handles are content ids: `/spill open <cid | tail>`; numeric ids are gone (#3022).
+- The drift cache uses content-addressable ids and atomic per-save writes, and the
+  navigator warm-up reads it (#3031).
+- A turn that observed nothing gets no Observed frame; on the Rich surface the report
+  folds behind `/spill` (#3010).
+- agent-bridle 0.8.0-rc.6 and agent-mesh 0.7.1 / 0.8.1 (RUSTSEC-2026-0387) (#3007).
+- CI and the commit-msg hook refuse placeholder commit identities such as `x@y` (#3008);
+  the real-PTY tier runs when `newt-tui/src/lib.rs` changes (#3001).
+
+### Fixed
+
+- `run_command` under `--ambient` / `--yolo` no longer hangs: host-shell children start in
+  a new session (#3025).
+- A resize measures where the terminal put the prompt block instead of guessing (#3021);
+  a narrow-then-widen resize no longer erases transcript rows (regression test #3044).
+- Each prompt-block frame is one synchronized write, so the cursor no longer flickers
+  out under a compositor (#3017).
+- Closing an inline panel reclaims the rows it scrolled out, leaving no blank band (#3020).
+- The navigator warm-up walk is bounded (50,000 entries) and reports itself incomplete (#3029).
+- MCP: a refused OAuth bearer is recorded so `newt auth --all` and `/mcp login-all` select
+  the server, and `invalid_grant` is typed (#3032); only a refused grant or a missing
+  refresh token records the rejection, not a transient failure (#3035).
+- `/mcp` Test, Reconnect and Login outcomes reach scrollback (#3018); the vi NORMAL hint
+  no longer stacks in scrollback (#3019).
+- The patched crossterm builds without warnings (#2994).
 
 ## [0.8.4] — 2026-10-22
 
