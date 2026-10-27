@@ -120,7 +120,7 @@ fn connection(server: &ServerView) -> String {
             if server.muted { " · muted" } else { "" }
         ),
         Some(McpStatus::Disabled) => "disabled".into(),
-        Some(McpStatus::Skipped(reason)) if crate::mcp::skip_is_auth_failure(reason) => {
+        Some(McpStatus::Rejected(_)) => {
             format!("login required · {}", crate::mcp::LOGIN_REMEDIATION)
         }
         Some(McpStatus::Skipped(_)) => "disconnected · reconnect to diagnose".into(),
@@ -611,17 +611,14 @@ mod tests {
     #[test]
     fn an_auth_rejected_server_points_at_login_and_login_all_3028() {
         let mut rejected = server("stale");
-        rejected.status = Some(McpStatus::Skipped(format!(
-            "{:#}",
-            anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
-                401,
-                "Unauthorized",
-                ""
-            ))
+        rejected.status = Some(McpStatus::from_error(&anyhow::Error::new(
+            newt_mcp_client::HttpStatusError::new(401, "Unauthorized", ""),
         )));
         assert!(connection(&rejected).contains("/mcp login-all"));
         let mut timeout = server("slow");
-        timeout.status = Some(McpStatus::Skipped("connect timeout".into()));
+        timeout.status = Some(McpStatus::from_error(&anyhow::anyhow!(
+            "connect timeout reaching https://idp.example.test/oauth/authorize"
+        )));
         assert_eq!(connection(&timeout), "disconnected · reconnect to diagnose");
     }
 }
