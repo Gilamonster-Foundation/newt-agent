@@ -140,6 +140,7 @@ fn cut_class_label(class: CutClass) -> &'static str {
     match class {
         CutClass::TooLarge => "too_large",
         CutClass::OverFileCap => "over_file_cap",
+        CutClass::WalkBudget => "walk_budget",
     }
 }
 
