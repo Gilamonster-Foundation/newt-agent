@@ -231,3 +231,36 @@ fn store_round_trips_and_rejects_a_version_mismatch() {
     assert_eq!(drift_cache::load::<String>(dir.path(), "model", "v2"), None);
     assert_eq!(drift_cache::load::<String>(dir.path(), "other", "v1"), None);
 }
+
+/// Review of #3031: the cached scan must gather exactly what the fresh scan
+/// does, cold and warm.
+fn assert_cached_gathers_like_fresh(members: &str, broken_b: bool) {
+    let root = workspace();
+    let cfg = tempfile::tempdir().unwrap();
+    let (root, cfg) = (root.path(), cfg.path());
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nmembers = {members}\n"),
+    )
+    .unwrap();
+    if broken_b {
+        std::fs::write(root.join("b").join("Cargo.toml"), "[package\n").unwrap();
+    }
+    for start in ["cold", "warm"] {
+        assert_eq!(cached(root, cfg).units, fresh(root).units, "{start}");
+    }
+}
+
+/// A malformed member marker is skipped by both scans. The cached path once
+/// kept it as a default-filled unit named after its dir.
+#[test]
+fn cached_scan_skips_a_malformed_member_like_the_fresh_scan() {
+    assert_cached_gathers_like_fresh(r#"["a", "b"]"#, true);
+}
+
+/// Units follow the declared member order in both scans. The cached path once
+/// returned them in BTreeMap order.
+#[test]
+fn cached_scan_keeps_the_declared_member_order() {
+    assert_cached_gathers_like_fresh(r#"["b", "a"]"#, false);
+}
