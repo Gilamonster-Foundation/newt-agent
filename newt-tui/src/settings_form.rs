@@ -106,6 +106,8 @@ pub(crate) enum Field {
     Prompt,
     SystemPrompt,
     Compaction,
+    /// `[context] index` (#3026): whether the navigator index warms.
+    Index,
     Detail,
     Posture,
     Rounds,
@@ -137,6 +139,7 @@ impl Field {
         Self::Prompt,
         Self::SystemPrompt,
         Self::Compaction,
+        Self::Index,
         Self::Detail,
         Self::Posture,
         Self::Rounds,
@@ -165,6 +168,7 @@ impl Field {
             Self::Prompt => "prompt",
             Self::SystemPrompt => "system-prompt",
             Self::Compaction => "compaction",
+            Self::Index => "index",
             Self::Detail => "detail",
             Self::Posture => "posture",
             Self::Rounds => "rounds",
@@ -191,6 +195,7 @@ impl Field {
             Self::Prompt => "input prompt template",
             Self::SystemPrompt => "system prompt file",
             Self::Compaction => "automatic-compaction trigger",
+            Self::Index => "repository navigator index",
             Self::Detail => "tool-output detail rows",
             Self::Posture => "permission posture",
             Self::Rounds => "tool-call round limit",
@@ -339,6 +344,10 @@ impl Field {
                     "compact whenever the message count exceeds its threshold".to_string(),
                 ),
             ]),
+            Self::Index => owned(&[
+                ("on", "warm the navigator index at start and /new (default)"),
+                ("off", "never walk the workspace; navigation uses the regex floor"),
+            ]),
             Self::Prompt => ValueSpace::Text {
                 release: "reset",
                 placeholder: "\"[$TIME] ❯ \"",
@@ -479,6 +488,19 @@ impl Field {
                 crate::migration_notices::read(newt_core::config::session_compaction_trigger_policy)
                     .keyword()
                     .to_string()
+            }
+            // Takes effect at the next warm-up (`/new`).
+            Self::Index => {
+                let cfg = crate::migration_notices::read(|report| {
+                    newt_core::Config::resolve_unpublished(report)
+                })
+                .unwrap_or_default();
+                if newt_core::config::context_index_enabled(&cfg) {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string()
             }
             // The OVERRIDE, like the dials: `auto` is a real choosable value
             // that resolution then fills in from `[tui] spill_lines`.
@@ -1069,6 +1091,9 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
             if let Some(policy) = newt_core::CompactionTriggerPolicy::from_keyword(value) {
                 newt_core::process_env::set_var("NEWT_COMPACTION_TRIGGER", policy.keyword());
             }
+        }
+        Field::Index => {
+            newt_core::process_env::set_var(newt_core::config::CONTEXT_INDEX_ENV, value);
         }
         Field::Prompt => {
             if value == "reset" {
@@ -2069,6 +2094,23 @@ mod tests {
         );
         assert_eq!(Field::Compaction.current(), "message_count");
         assert!(newt_core::config::compaction_trigger_is_session_pinned());
+    }
+
+    /// #3026: `/settings index off` writes the override the warm-up gate
+    /// reads, so the next `/new` skips the walk.
+    #[test]
+    fn the_index_field_turns_the_warmup_off_3026() {
+        let _guard = settings_guard();
+        newt_core::process_env::remove_var(newt_core::config::CONTEXT_INDEX_ENV);
+        assert_eq!(Field::Index.offered(), vec!["on", "off"]);
+        assert_eq!(
+            apply(Field::Index, "off"),
+            Ok("repository navigator index: off".to_string())
+        );
+        assert_eq!(Field::Index.current(), "off");
+        assert!(!newt_core::config::context_index_enabled(
+            &newt_core::Config::default()
+        ));
     }
 
     /// The field's vocabulary is the enum's, and only the enum's.

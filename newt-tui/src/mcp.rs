@@ -36,10 +36,31 @@ pub(crate) enum McpStatus {
         confinement: Confinement,
         net: NetGate,
     },
-    /// Skipped at launch (auth failure, timeout, spawn error, legacy SSE…).
+    /// Skipped at launch (timeout, spawn error, legacy SSE…).
     Skipped(String),
+    /// The server refused the credential: a typed HTTP 401 in the connection
+    /// error (#3028). The one skip that a fresh login fixes.
+    Rejected(String),
     /// `enabled = false` in config — not attempted.
     Disabled,
+}
+
+impl McpStatus {
+    /// The status a failed connection records. `Rejected` only on typed
+    /// evidence (the HTTP status carried in the error chain), never because
+    /// the error text happens to mention "auth" or "401".
+    pub(crate) fn from_error(error: &anyhow::Error) -> Self {
+        let reason = format!("{error:#}");
+        if newt_mcp_client::http_error_status(error) == Some(401)
+            || error
+                .downcast_ref::<crate::mcp_token::OAuthGrantRejected>()
+                .is_some()
+        {
+            Self::Rejected(reason)
+        } else {
+            Self::Skipped(reason)
+        }
+    }
 }
 
 /// The local confinement posture of a connected server, for the `/mcp` table
@@ -202,6 +223,18 @@ pub(crate) fn has_configured_authorization_header(entry: &McpServerEntry) -> boo
         .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
 }
 
+/// Any header whose value is a credential reference (`{ env | file | cmd }` or
+/// a whole `${VAR}`), whatever its name: such a server owns its own auth and is
+/// never sent to browser OAuth. A plain literal such as `Accept:
+/// application/json` is protocol, not a credential (#3028).
+pub(crate) fn has_credential_reference_header(entry: &McpServerEntry) -> bool {
+    entry.headers.values().any(authorization_is_reference)
+}
+
+/// The one recovery instruction for a rejected credential, shared by startup
+/// status, the panel and Reconnect failures (#3028).
+pub(crate) const LOGIN_REMEDIATION: &str = "choose Login, or run /mcp login-all";
+
 pub(crate) fn has_plaintext_authorization_header(entry: &McpServerEntry) -> bool {
     entry.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("authorization") && !authorization_is_reference(value)
@@ -284,10 +317,12 @@ pub fn classify_readiness(
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
 
-    let header_credential = has_auth_header
-        && entry.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("authorization") && header_is_credential(value, env_lookup)
-        });
+    // Any header carrying a resolvable env credential counts, not only
+    // `Authorization` (`X-API-Key = { env = ... }`, #3028).
+    let header_credential = entry
+        .headers
+        .values()
+        .any(|value| header_is_credential(value, env_lookup));
 
     // A valid saved OAuth login also counts as Authenticated, but only when
     // no explicit Authorization header is present. The store check is
@@ -447,13 +482,14 @@ async fn connect_http_entry(
     let entry = admitted.entry();
     let oauth_policy =
         crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(&caveats.net, explicit_net_hosts);
-    let token = if has_configured_authorization_header(entry) {
-        None
-    } else {
-        match entry.url.as_deref() {
-            Some(url) => crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy).await,
-            None => None,
+    let crate::mcp_token::LoadedBearer {
+        token,
+        grant_rejected,
+    } = match entry.url.as_deref() {
+        Some(url) if !has_configured_authorization_header(entry) => {
+            crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy).await
         }
+        _ => crate::mcp_token::LoadedBearer::default(),
     };
     let (token, insecure_authorization_allowed) =
         apply_transport_security(entry, token, allow_insecure_hosts);
@@ -470,13 +506,16 @@ async fn connect_http_entry(
         initial,
         token,
         || async {
-            crate::mcp_token::refresh_bearer_token(
-                &entry.name,
-                entry.url.as_deref()?,
-                rejected_bearer.as_deref()?,
-                &oauth_policy,
-            )
-            .await
+            let (Some(url), Some(rejected)) = (entry.url.as_deref(), rejected_bearer.as_deref())
+            else {
+                return Ok(None);
+            };
+            crate::mcp_token::refresh_bearer_token(&entry.name, url, rejected, &oauth_policy).await
+        },
+        |refreshed| {
+            if let Some(url) = entry.url.as_deref() {
+                crate::mcp_token::record_bearer_rejected(&entry.name, url, refreshed);
+            }
         },
         |refreshed| async move {
             let (retry_token, retry_insecure_allowed) =
@@ -492,6 +531,7 @@ async fn connect_http_entry(
         },
     )
     .await
+    .map_err(|error| attach_grant_rejection(error, grant_rejected))
     .map(|outcome| ReconnectableServer {
         live: outcome.value,
         http: Some(HttpReconnectState {
@@ -593,30 +633,60 @@ fn synchronize_http_reconnect_policy<Live>(
     }
 }
 
-struct HttpConnectOutcome<T> {
+pub(crate) struct HttpConnectOutcome<T> {
     value: T,
     bearer: Option<String>,
 }
 
-async fn retry_http_unauthorized_once<T, Refresh, RefreshFuture, Reconnect, ReconnectFuture>(
+/// A refused refresh grant explains whatever connection failure follows it —
+/// an anonymous connect, or a fallback bearer's 401 or non-401 failure.
+pub(crate) fn attach_grant_rejection(
+    error: anyhow::Error,
+    grant_rejected: Option<crate::mcp_token::OAuthGrantRejected>,
+) -> anyhow::Error {
+    match grant_rejected {
+        Some(rejected) => error.context(rejected),
+        None => error,
+    }
+}
+
+/// `reject` is told the replacement bearer when it, too, gets a 401, so the
+/// refusal is recorded against the token actually published (no second retry).
+pub(crate) async fn retry_http_unauthorized_once<
+    T,
+    Refresh,
+    RefreshFuture,
+    Reconnect,
+    ReconnectFuture,
+>(
     initial: anyhow::Result<T>,
     runtime_bearer: Option<String>,
     refresh: Refresh,
+    reject: impl FnOnce(&str),
     reconnect: Reconnect,
 ) -> anyhow::Result<HttpConnectOutcome<T>>
 where
     Refresh: FnOnce() -> RefreshFuture,
-    RefreshFuture: std::future::Future<Output = Option<String>>,
+    RefreshFuture:
+        std::future::Future<Output = Result<Option<String>, crate::mcp_token::OAuthGrantRejected>>,
     Reconnect: FnOnce(String) -> ReconnectFuture,
     ReconnectFuture: std::future::Future<Output = anyhow::Result<T>>,
 {
     if runtime_bearer.is_some() && initial.as_ref().is_err_and(is_http_unauthorized) {
-        if let Some(token) = refresh().await {
-            let value = reconnect(token.clone()).await?;
-            return Ok(HttpConnectOutcome {
-                value,
-                bearer: Some(token),
-            });
+        match refresh().await {
+            Ok(Some(token)) => {
+                let value = reconnect(token.clone()).await.inspect_err(|error| {
+                    if is_http_unauthorized(error) {
+                        reject(&token);
+                    }
+                })?;
+                return Ok(HttpConnectOutcome {
+                    value,
+                    bearer: Some(token),
+                });
+            }
+            Ok(None) => {}
+            Err(rejected) => return Err(initial.err().expect("checked above").context(rejected)),
         }
     }
     Ok(HttpConnectOutcome {
@@ -715,18 +785,10 @@ impl Mcp {
                         )
                     }
                 }
-                McpStatus::Skipped(r) => {
-                    // Network denials already name their config remediation;
-                    // an auth-related hostname must not turn one into a login hint.
-                    let hint = if r.contains("[tui.permissions] net") {
-                        String::new()
-                    } else if r.contains("401") || r.to_lowercase().contains("auth") {
-                        format!(" — `newt auth {n}` to re-authenticate")
-                    } else {
-                        String::new()
-                    };
-                    format!("  {n}  ✗ skipped: {r}{hint}")
-                }
+                McpStatus::Skipped(r) => format!("  {n}  ✗ skipped: {r}"),
+                McpStatus::Rejected(r) => format!(
+                    "  {n}  ✗ skipped: {r} — {LOGIN_REMEDIATION} (shell: `newt auth {n}`)"
+                ),
                 McpStatus::Disabled => {
                     format!("  {n}  ⏸ disabled in config (/mcp enable {n})")
                 }
@@ -883,7 +945,7 @@ impl Mcp {
                 }
                 Err(e) => {
                     tracing::warn!("MCP server `{}` skipped: {e:#}", entry.name);
-                    statuses.push((entry.name.clone(), McpStatus::Skipped(format!("{e:#}"))));
+                    statuses.push((entry.name.clone(), McpStatus::from_error(&e)));
                 }
             }
         }
@@ -1010,6 +1072,8 @@ impl Mcp {
                                 &policy,
                             )
                             .await
+                            .ok()
+                            .flatten()
                         }
                     },
                     move |bearer| {
@@ -1595,8 +1659,9 @@ mod tests {
             Some("rejected-token".to_string()),
             move || async move {
                 refresh_counter.fetch_add(1, Ordering::SeqCst);
-                Some("refreshed-token".to_string())
+                Ok(Some("refreshed-token".to_string()))
             },
+            |_| {},
             move |token| async move {
                 assert_eq!(token, "refreshed-token");
                 reconnect_counter.fetch_add(1, Ordering::SeqCst);
@@ -2010,25 +2075,28 @@ mod tests {
     #[test]
     fn status_lines_render_every_arm() {
         let mut mcp = Mcp::empty();
-        mcp.statuses = vec![
-            (
-                "github".to_string(),
-                McpStatus::Connected {
-                    tools: 12,
-                    confinement: Confinement::from_sandbox(None),
-                    net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
-                },
-            ),
-            (
-                "stale".to_string(),
-                McpStatus::Skipped("HTTP 401".to_string()),
-            ),
-            (
-                "other".to_string(),
-                McpStatus::Skipped("connect timeout".to_string()),
-            ),
-            ("off".to_string(), McpStatus::Disabled),
-        ];
+        mcp.statuses =
+            vec![
+                (
+                    "github".to_string(),
+                    McpStatus::Connected {
+                        tools: 12,
+                        confinement: Confinement::from_sandbox(None),
+                        net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
+                    },
+                ),
+                (
+                    "stale".to_string(),
+                    McpStatus::from_error(&anyhow::Error::new(
+                        newt_mcp_client::HttpStatusError::new(401, "Unauthorized", ""),
+                    )),
+                ),
+                (
+                    "other".to_string(),
+                    McpStatus::Skipped("connect timeout".to_string()),
+                ),
+                ("off".to_string(), McpStatus::Disabled),
+            ];
 
         let lines = mcp.status_lines();
         assert_eq!(lines[0], "MCP servers:");
@@ -2038,6 +2106,11 @@ mod tests {
         assert!(
             lines[2].contains("`newt auth stale`"),
             "the auth hint is the actionable half: {:?}",
+            lines[2]
+        );
+        assert!(
+            lines[2].contains("/mcp login-all"),
+            "#3028: startup names the bulk recovery too: {:?}",
             lines[2]
         );
         assert!(

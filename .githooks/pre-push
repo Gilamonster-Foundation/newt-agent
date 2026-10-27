@@ -71,6 +71,10 @@
 #   - interpreter grant/retry turn lifetime (#2823), newt-tui-pty.yml Linux/macOS:
 #     exec_grant_retry_loop runs explicitly with native-permission-test and
 #     --ignored. Real Brush worker plus scripted ChatCtx; net:none, no kernel skip.
+#   - host-shell session isolation (#3025), newt-tui-pty.yml Linux job:
+#     host_timeout_tree_tests runs with --include-ignored under a real pty;
+#     the mocked supervisor tests of that module stay in the scoped Rust tests;
+#     scripts/test_pty_tier_wiring.py checks the wiring in ci.yml's lint job.
 #   - macOS executable basename pins (PR #2816), newt-tui-pty.yml macOS job:
 #     installs gh when absent, stages a root-owned copy outside Homebrew,
 #     runs macos_exec_basenames explicitly with --ignored,

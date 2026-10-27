@@ -51,6 +51,7 @@ fn plan_gather_sorts_before_capping() {
     let caps = GatherCaps {
         max_files: 2,
         max_bytes: 1000,
+        ..GatherCaps::default()
     };
     let (kept, m) = plan_gather(&cand(&[("z.rs", 1), ("a.rs", 1), ("m.rs", 1)]), caps);
     assert_eq!(kept, vec!["a.rs".to_string(), "m.rs".to_string()]);
@@ -84,6 +85,7 @@ fn plan_gather_cuts_oversized_files_without_spending_the_file_budget() {
     let caps = GatherCaps {
         max_files: 1,
         max_bytes: 100,
+        ..GatherCaps::default()
     };
     let (kept, m) = plan_gather(&cand(&[("big.rs", 500), ("small.rs", 10)]), caps);
     assert_eq!(kept, vec!["small.rs".to_string()]);
@@ -101,6 +103,7 @@ fn cut_rollup_groups_by_top_dir() {
     let caps = GatherCaps {
         max_files: 0,
         max_bytes: 1000,
+        ..GatherCaps::default()
     };
     let (_, m) = plan_gather(
         &cand(&[("core/a.rs", 1), ("core/b.rs", 1), ("tui/c.rs", 1)]),
@@ -1054,4 +1057,51 @@ fn format_search_surfaces_include_kind_labels() {
         ..Default::default()
     };
     assert!(format_index_status(&status, &RetrievalSteer::default()).contains("index_id:"));
+}
+
+/// #3026: on a huge workspace (a ~1 TB folder of many repos) the warm-up
+/// walked every entry and opened every candidate just to read its size,
+/// though it keeps at most `max_files`. The walk now stops after
+/// `max_walk_entries` visited entries and records a `WalkBudget` cut, so the
+/// index reports itself incomplete and the navigator stays on its regex floor.
+#[test]
+fn gather_stops_at_the_walk_budget_and_records_the_cut_3026() {
+    let workspace = tempfile::tempdir().unwrap();
+    for i in 0..50 {
+        std::fs::write(workspace.path().join(format!("f{i:02}.rs")), "fn f() {}").unwrap();
+    }
+    let caps = GatherCaps {
+        max_walk_entries: 10,
+        ..GatherCaps::default()
+    };
+    let (files, manifest) =
+        gather_with_manifest(workspace.path().to_str().unwrap(), &["rs".into()], caps);
+    assert!(
+        manifest.candidate_count < 10,
+        "the walk must stop at the budget, saw {} candidates",
+        manifest.candidate_count
+    );
+    assert!(files.len() < 10);
+    assert!(
+        manifest
+            .cuts
+            .iter()
+            .any(|c| c.class == CutClass::WalkBudget),
+        "a budget-stopped walk must say so: {:?}",
+        manifest.cuts
+    );
+    let status = IndexStatus {
+        manifest: Some(manifest),
+        ..IndexStatus::default()
+    };
+    assert!(!status.complete(), "a cut walk is an incomplete index");
+
+    // A tree inside the budget is walked fully and records no walk cut.
+    let (_, full) = gather_with_manifest(
+        workspace.path().to_str().unwrap(),
+        &["rs".into()],
+        GatherCaps::default(),
+    );
+    assert_eq!(full.candidate_count, 50);
+    assert!(full.cuts.is_empty());
 }
