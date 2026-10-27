@@ -306,7 +306,7 @@ fn ambient_login_shell_under_a_controlling_tty_does_not_hang() {
     // SAFETY: only async-signal-safe libc calls between fork and exec.
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
