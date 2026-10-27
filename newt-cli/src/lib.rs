@@ -1096,6 +1096,10 @@ pub enum Command {
         /// Name of the MCP server to authenticate (e.g. `newt auth my-server`).
         /// Omit to list all servers and their current auth status.
         server: Option<String>,
+        /// Sign in to every admitted HTTP server that needs a login, one after
+        /// another; exits non-zero if any login fails.
+        #[arg(long, conflicts_with = "server")]
+        all: bool,
     },
     /// Inspect, export, import, and reset per-model context-window tuning data.
     ///
@@ -2031,7 +2035,7 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
             }
             None => newt_tui::run_setup(newt_tui::color_supported()),
         },
-        Command::Auth { server } => auth_cmd::run(server),
+        Command::Auth { server, all } => auth_cmd::run(server, all),
         Command::New {
             ecosystem,
             name,

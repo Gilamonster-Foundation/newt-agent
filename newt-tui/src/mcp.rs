@@ -36,10 +36,27 @@ pub(crate) enum McpStatus {
         confinement: Confinement,
         net: NetGate,
     },
-    /// Skipped at launch (auth failure, timeout, spawn error, legacy SSE…).
+    /// Skipped at launch (timeout, spawn error, legacy SSE…).
     Skipped(String),
+    /// The server refused the credential: a typed HTTP 401 in the connection
+    /// error (#3028). The one skip that a fresh login fixes.
+    Rejected(String),
     /// `enabled = false` in config — not attempted.
     Disabled,
+}
+
+impl McpStatus {
+    /// The status a failed connection records. `Rejected` only on typed
+    /// evidence (the HTTP status carried in the error chain), never because
+    /// the error text happens to mention "auth" or "401".
+    pub(crate) fn from_error(error: &anyhow::Error) -> Self {
+        let reason = format!("{error:#}");
+        if newt_mcp_client::http_error_status(error) == Some(401) {
+            Self::Rejected(reason)
+        } else {
+            Self::Skipped(reason)
+        }
+    }
 }
 
 /// The local confinement posture of a connected server, for the `/mcp` table
@@ -202,6 +219,18 @@ pub(crate) fn has_configured_authorization_header(entry: &McpServerEntry) -> boo
         .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
 }
 
+/// Any header whose value is a credential reference (`{ env | file | cmd }` or
+/// a whole `${VAR}`), whatever its name: such a server owns its own auth and is
+/// never sent to browser OAuth. A plain literal such as `Accept:
+/// application/json` is protocol, not a credential (#3028).
+pub(crate) fn has_credential_reference_header(entry: &McpServerEntry) -> bool {
+    entry.headers.values().any(authorization_is_reference)
+}
+
+/// The one recovery instruction for a rejected credential, shared by startup
+/// status, the panel and Reconnect failures (#3028).
+pub(crate) const LOGIN_REMEDIATION: &str = "choose Login, or run /mcp login-all";
+
 pub(crate) fn has_plaintext_authorization_header(entry: &McpServerEntry) -> bool {
     entry.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("authorization") && !authorization_is_reference(value)
@@ -284,10 +313,12 @@ pub fn classify_readiness(
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
 
-    let header_credential = has_auth_header
-        && entry.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("authorization") && header_is_credential(value, env_lookup)
-        });
+    // Any header carrying a resolvable env credential counts, not only
+    // `Authorization` (`X-API-Key = { env = ... }`, #3028).
+    let header_credential = entry
+        .headers
+        .values()
+        .any(|value| header_is_credential(value, env_lookup));
 
     // A valid saved OAuth login also counts as Authenticated, but only when
     // no explicit Authorization header is present. The store check is
@@ -673,6 +704,22 @@ impl Mcp {
     }
 
     /// Whether `name` is currently session-muted (`/mcp off`).
+    /// Whether a saved OAuth login still counts for `/mcp login-all`: only
+    /// while this session has not seen the server reject it (#3028). Expiry
+    /// alone cannot tell a revoked token from a good one.
+    #[cfg(feature = "rich-tui")]
+    pub(crate) fn saved_login_usable(
+        &self,
+        entry: &McpServerEntry,
+        saved_oauth_valid: &dyn Fn(&McpServerEntry) -> bool,
+    ) -> bool {
+        let rejected = self
+            .statuses
+            .iter()
+            .any(|(name, status)| name == &entry.name && matches!(status, McpStatus::Rejected(_)));
+        !rejected && saved_oauth_valid(entry)
+    }
+
     #[must_use]
     /// The `/mcp` status view, one line per server.
     ///
@@ -715,18 +762,10 @@ impl Mcp {
                         )
                     }
                 }
-                McpStatus::Skipped(r) => {
-                    // Network denials already name their config remediation;
-                    // an auth-related hostname must not turn one into a login hint.
-                    let hint = if r.contains("[tui.permissions] net") {
-                        String::new()
-                    } else if r.contains("401") || r.to_lowercase().contains("auth") {
-                        format!(" — `newt auth {n}` to re-authenticate")
-                    } else {
-                        String::new()
-                    };
-                    format!("  {n}  ✗ skipped: {r}{hint}")
-                }
+                McpStatus::Skipped(r) => format!("  {n}  ✗ skipped: {r}"),
+                McpStatus::Rejected(r) => format!(
+                    "  {n}  ✗ skipped: {r} — {LOGIN_REMEDIATION} (shell: `newt auth {n}`)"
+                ),
                 McpStatus::Disabled => {
                     format!("  {n}  ⏸ disabled in config (/mcp enable {n})")
                 }
@@ -883,7 +922,7 @@ impl Mcp {
                 }
                 Err(e) => {
                     tracing::warn!("MCP server `{}` skipped: {e:#}", entry.name);
-                    statuses.push((entry.name.clone(), McpStatus::Skipped(format!("{e:#}"))));
+                    statuses.push((entry.name.clone(), McpStatus::from_error(&e)));
                 }
             }
         }
@@ -2010,25 +2049,28 @@ mod tests {
     #[test]
     fn status_lines_render_every_arm() {
         let mut mcp = Mcp::empty();
-        mcp.statuses = vec![
-            (
-                "github".to_string(),
-                McpStatus::Connected {
-                    tools: 12,
-                    confinement: Confinement::from_sandbox(None),
-                    net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
-                },
-            ),
-            (
-                "stale".to_string(),
-                McpStatus::Skipped("HTTP 401".to_string()),
-            ),
-            (
-                "other".to_string(),
-                McpStatus::Skipped("connect timeout".to_string()),
-            ),
-            ("off".to_string(), McpStatus::Disabled),
-        ];
+        mcp.statuses =
+            vec![
+                (
+                    "github".to_string(),
+                    McpStatus::Connected {
+                        tools: 12,
+                        confinement: Confinement::from_sandbox(None),
+                        net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
+                    },
+                ),
+                (
+                    "stale".to_string(),
+                    McpStatus::from_error(&anyhow::Error::new(
+                        newt_mcp_client::HttpStatusError::new(401, "Unauthorized", ""),
+                    )),
+                ),
+                (
+                    "other".to_string(),
+                    McpStatus::Skipped("connect timeout".to_string()),
+                ),
+                ("off".to_string(), McpStatus::Disabled),
+            ];
 
         let lines = mcp.status_lines();
         assert_eq!(lines[0], "MCP servers:");
@@ -2041,11 +2083,63 @@ mod tests {
             lines[2]
         );
         assert!(
+            lines[2].contains("/mcp login-all"),
+            "#3028: startup names the bulk recovery too: {:?}",
+            lines[2]
+        );
+        assert!(
             !lines[3].contains("newt auth"),
             "a timeout is not an auth problem: {:?}",
             lines[3]
         );
         assert!(lines[4].contains("disabled in config"), "{:?}", lines[4]);
+    }
+
+    /// #3028 review: a server whose stored login the resource rejected (a
+    /// 401 on connect, after the forced refresh failed) is a login-all
+    /// target even though its token file still looks valid by expiry; a
+    /// connected server with the same saved login is not. A failure whose
+    /// TEXT merely mentions OAuth (a timeout reaching an `/oauth` URL) carries
+    /// no typed 401, so its still-valid login is not sent to the browser.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn a_rejected_saved_login_is_selected_by_login_all_3028() {
+        let mut mcp = Mcp::empty();
+        let rejected = anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+            401,
+            "Unauthorized",
+            "",
+        ))
+        .context("MCP initialize failed");
+        mcp.statuses = vec![
+            ("stale".into(), McpStatus::from_error(&rejected)),
+            (
+                "flaky".into(),
+                McpStatus::from_error(&anyhow::anyhow!(
+                    "connect timeout reaching https://idp.example.test/oauth/authorize (auth 401 wording)"
+                )),
+            ),
+            (
+                "fine".into(),
+                McpStatus::Connected {
+                    tools: 1,
+                    confinement: Confinement::from_sandbox(None),
+                    net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
+                },
+            ),
+        ];
+        let mut stale = http_entry("https://stale.example.test/mcp");
+        stale.name = "stale".into();
+        let mut fine = http_entry("https://fine.example.test/mcp");
+        fine.name = "fine".into();
+        let mut flaky = http_entry("https://flaky.example.test/mcp");
+        flaky.name = "flaky".into();
+        let entries = [stale, fine, flaky];
+        let targets = crate::auth_command::login_all_targets(&entries, &|_| None, &|entry| {
+            mcp.saved_login_usable(entry, &|_| true)
+        });
+        let names: Vec<&str> = targets.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["stale"]);
     }
 
     #[test]

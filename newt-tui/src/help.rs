@@ -524,6 +524,8 @@ Use /help for the in-session command list."
   /mcp disable <name>          durable: write enabled=false to config + drop now
   /mcp enable <name>           durable: write enabled=true; choose Reconnect in MCP
   /mcp auth <name>             how to (re)authenticate (`newt auth <name>`)
+  /mcp login-all               sign in to every server that needs a login, in
+                               turn (`newt auth --all`); Ctrl-C stops the run
 
 The same manager is under /settings → MCP. Enter opens server → tools → details;
 Up/Down navigates, Esc returns one level. Login reconnects after successful
@@ -880,7 +882,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /psyche                  - effort dial panel: cognition, tenacity, initiative, persona (Esc exits; /psyche obsessive = max)",
-        "  /mcp [on|off|enable|disable|auth] [name] - MCP manager; session mute (on/off) or durable config (enable/disable)",
+        "  /mcp [on|off|enable|disable|auth|login-all] [name] - MCP manager; session mute (on/off), durable config (enable/disable), or sign in to every server (login-all)",
         "  /spill [status|N|reset|summary|excerpt|last|open ID] - tool output",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
