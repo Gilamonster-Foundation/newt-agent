@@ -255,3 +255,73 @@ async fn real_host_timeout_leaves_no_survivor_in_the_group() {
         "process group {pgid} still has members after the timeout"
     );
 }
+
+/// The child half of [`ambient_login_shell_under_a_controlling_tty_does_not_hang`]:
+/// runs inside a process that HAS a controlling terminal.
+#[cfg(unix)]
+#[ignore = "child half of ambient_login_shell_under_a_controlling_tty_does_not_hang"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambient_login_shell_pty_child() {
+    let _pin = crate::launch_authority::ScopedAuthority::ambient();
+    let run = super::shell::host_shell_output_with_timeout(
+        super::shell::ShellRoute::BashSh,
+        "echo hi",
+        ".",
+        None,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    println!(
+        "RESULT timed_out={} exit={} stdout={:?} stderr={:?}",
+        run.timed_out,
+        run.exit_code,
+        super::shell::decode_shell_stream(&run.stdout),
+        super::shell::decode_shell_stream(&run.stderr),
+    );
+}
+
+/// #3005 regression: `--ambient` runs `bash -l -i -c`. In a background process group
+/// of the controlling terminal's session, an interactive bash SIGTTINs itself and
+/// stops, so every command hung to the host timeout. The child here is given a real
+/// controlling tty (`setsid` + `TIOCSCTTY`, as a terminal emulator does).
+#[cfg(unix)]
+#[ignore = "real pty + login shell; regression for the #3005 --ambient hang"]
+#[test]
+fn ambient_login_shell_under_a_controlling_tty_does_not_hang() {
+    use std::os::unix::process::CommandExt as _;
+    let pty = tests_pty::Pty::open();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "agentic::tools::host_timeout_tree_tests::ambient_login_shell_pty_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SHELL", "/bin/bash")
+        .stdin(pty.slave_stdio())
+        .stdout(pty.slave_stdio())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: only async-signal-safe libc calls between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn the pty child");
+    let started = std::time::Instant::now();
+    let status = child.wait().expect("wait for the pty child");
+    // A hung login shell may still hold the slave, so no EOF: read what was drained.
+    pty.wait_for_screen("RESULT", Duration::from_secs(3));
+    let screen = pty.screen();
+    assert!(status.success(), "child failed:\n{screen:?}");
+    assert!(
+        screen.contains("RESULT timed_out=false exit=0 stdout=\"hi\\n\" stderr=\"\""),
+        "echo hi must return cleanly with no job-control noise:\n{screen:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(8), "{screen:?}");
+}
