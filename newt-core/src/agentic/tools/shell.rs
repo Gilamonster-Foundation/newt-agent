@@ -2186,7 +2186,7 @@ async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
 /// shell ran, so [`venv_cmd_prefix`]'s `export …;` prefix works unchanged.
 ///
 /// Hardened (#297) so a hung child can never wedge the turn:
-/// - `kill_on_drop(true)` + `process_group(0)` (own process group); on every
+/// - `kill_on_drop(true)` + `setsid` (own session and process group); on every
 ///   exit but a normal finish [`supervise_host_child`] `killpg`s the whole
 ///   group, because `kill_on_drop` alone kills only the immediate `bash`
 ///   (#2882).
@@ -2297,7 +2297,7 @@ fn note_ambient_fallback(shell: &crate::ambient_shell::AmbientShell) {
 /// none can flow into the child and re-assert authority the session did not
 /// grant it or leak newt's credentials (#8 / step-7.1a, invariant 9). The child
 /// inherits the rest of the environment (the Yolo lane's explicit ambient-
-/// authority grant). Own process group (setsid-equivalent) + `kill_on_drop`.
+/// authority grant). Own session and process group (`setsid`) + `kill_on_drop`.
 /// `kill_on_drop` kills only the direct child: on unix the whole group is
 /// killed by [`supervise_host_child`]'s drop guard on every exit but a normal
 /// finish, and on Windows the ambient-Brush route's job object kills the tree
@@ -2390,8 +2390,21 @@ fn host_shell_command_at(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // A new SESSION, not just a process group (#3005): `process_group(0)` leaves the child
+    // in the terminal's session as a background group, so an interactive shell
+    // (`--ambient`'s `bash -l -i`) or a `/dev/tty` prompt (git, ssh) is stopped by SIGTTIN
+    // and the call hangs to the wall. The session leader's pgid is still its pid, so the
+    // group kill (#2882) is unchanged.
     #[cfg(not(windows))]
-    c.process_group(0);
+    // SAFETY: `setsid` is async-signal-safe and touches no memory the parent shares.
+    unsafe {
+        c.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     strip_child_authority_env(&mut c);
     Ok(c)
 }
@@ -2547,7 +2560,7 @@ async fn host_shell_output_raw(
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
-        // The child leads its own process group (`process_group(0)`), so its
+        // The child leads its own process group (`setsid`), so its
         // pid is the pgid every descendant inherits.
         let pgid = child.id();
         let wait = async {
