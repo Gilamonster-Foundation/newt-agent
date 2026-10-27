@@ -176,7 +176,8 @@ impl std::fmt::Display for OAuthGrantRejected {
 impl std::error::Error for OAuthGrantRejected {}
 
 /// A resource's durable refusal of one stored bearer (#3028 follow-up): a 401
-/// whose forced refresh then failed. Bound to the server (by path), the
+/// whose forced refresh was refused (`invalid_grant`) or impossible (no
+/// refresh token), or a 401 on the refreshed bearer itself. Bound to the server (by path), the
 /// resource and the token's [`newt_identity::RawContentId`] — never the
 /// token bytes. A replaced token no longer matches, so it is never poisoned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1741,9 +1742,11 @@ async fn load_bearer_token_inner(
 /// The same credential lock serializes this with proactive refresh and browser
 /// login; callers retry the MCP connection exactly once with the returned token.
 ///
-/// When the refresh fails, the resource's refusal of the still-active bearer
-/// is recorded durably, so `auth_status` reports NeedsFlow until a new token
-/// replaces it. `Err` when the token endpoint answered `invalid_grant`.
+/// When the grant is refused (`invalid_grant`) or there is no refresh token,
+/// the resource's refusal of the still-active bearer is recorded durably, so
+/// `auth_status` reports NeedsFlow until a new token replaces it. A transport
+/// or other transient refresh failure records nothing. `Err` when the token
+/// endpoint answered `invalid_grant`.
 pub async fn refresh_bearer_token(
     server_name: &str,
     resource_url: &str,
@@ -1785,8 +1788,11 @@ async fn refresh_bearer_token_from_dir(
         return Ok(concurrent_winner_bearer(&bundle, rejected_bearer, resource_url).ok());
     }
     let Ok(snapshot) = refresh_snapshot(dir, server_name, &bundle) else {
-        // No refresh grant to try: the refused bearer is final.
-        record_rejection(dir, server_name, resource_url, &bundle.token);
+        // No refresh grant to try: the refused bearer is final. Any other
+        // snapshot failure is local and transient, not a refusal.
+        if bundle.token.refresh_token.is_none() {
+            record_rejection(dir, server_name, resource_url, &bundle.token);
+        }
         return Ok(None);
     };
     drop(transaction);
@@ -1804,19 +1810,15 @@ async fn refresh_bearer_token_from_dir(
         Err(error) => error,
     };
     tracing::warn!("MCP OAuth forced refresh for `{server_name}` failed: {error:#}");
+    // Only a refused grant is a rejection: a network or other transient
+    // failure leaves the login as it was, to be retried later.
+    let Some(rejected) = error.downcast_ref::<OAuthGrantRejected>().copied() else {
+        return Ok(None);
+    };
     // Record only if the refused bearer is still the active one: a concurrent
     // login or refresh that replaced it must not be poisoned.
-    if let Ok(_transaction) = acquire_credential_lock(dir, server_name) {
-        if let Ok(Some(current)) = read_credential_bundle(dir, server_name) {
-            if current.token.access_token == rejected_bearer {
-                record_rejection(dir, server_name, resource_url, &current.token);
-            }
-        }
-    }
-    match error.downcast_ref::<OAuthGrantRejected>() {
-        Some(rejected) => Err(*rejected),
-        None => Ok(None),
-    }
+    record_bearer_rejected_in(dir, server_name, resource_url, rejected_bearer);
+    Err(rejected)
 }
 
 #[derive(Debug, PartialEq, Eq)]
