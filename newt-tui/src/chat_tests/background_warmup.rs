@@ -18,6 +18,7 @@ async fn repository_navigator_warms_in_background_and_joins_complete() {
         &workspace,
         &newt_core::Config::default(),
         &newt_core::IndexStatus::default(),
+        true,
     );
     let job = warmup.as_ref().unwrap().job.clone();
     let mut where_is = None;
@@ -170,8 +171,6 @@ async fn unfinished_warmup_is_left_running_and_the_turn_degrades() {
 /// a huge workspace is never walked and the navigator stays on its floor.
 #[tokio::test(flavor = "multi_thread")]
 async fn index_off_spawns_no_warmup_and_builds_nothing_3026() {
-    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
-    newt_core::process_env::remove_var(newt_core::config::CONTEXT_INDEX_ENV);
     let workspace = tempfile::TempDir::new().unwrap();
     std::fs::write(workspace.path().join("main.rs"), "pub fn m() {}\n").unwrap();
     let workspace = workspace.path().to_string_lossy().into_owned();
@@ -183,8 +182,20 @@ async fn index_off_spawns_no_warmup_and_builds_nothing_3026() {
         ..Default::default()
     };
     let rt = tokio::runtime::Handle::current();
+    // The session resolves the switch once and passes it down; the warm-up
+    // never reads the process environment.
+    let enabled =
+        newt_core::config::ContextIndex::resolve(None, &cfg) == newt_core::config::ContextIndex::On;
+    assert!(!enabled);
     assert!(
-        spawn_nav_warmup(&rt, &workspace, &cfg, &newt_core::IndexStatus::default()).is_none(),
+        spawn_nav_warmup(
+            &rt,
+            &workspace,
+            &cfg,
+            &newt_core::IndexStatus::default(),
+            enabled
+        )
+        .is_none(),
         "index off must not spawn the warm-up walk"
     );
     let mut where_is = None;
@@ -195,6 +206,7 @@ async fn index_off_spawns_no_warmup_and_builds_nothing_3026() {
         &mut where_is,
         &mut nav,
         &newt_core::IndexStatus::default(),
+        enabled,
     );
     assert!(where_is.is_none() && nav.files.is_empty() && nav.usage.is_none());
 }

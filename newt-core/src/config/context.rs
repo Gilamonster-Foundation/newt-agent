@@ -177,16 +177,24 @@ impl ContextIndex {
 /// The session override `/settings index` writes (#3026).
 pub const CONTEXT_INDEX_ENV: &str = "NEWT_CONTEXT_INDEX";
 
-/// Whether this session warms the navigator index: the `/settings` override,
-/// else `[context] index`, else on (#3026).
+impl ContextIndex {
+    /// The index setting in force: a valid session override (`/settings
+    /// index`), else `[context] index`, else on (#3026). Pure, so callers and
+    /// tests never race on the process environment.
+    #[must_use]
+    pub fn resolve(session_override: Option<&str>, cfg: &Config) -> Self {
+        session_override
+            .and_then(Self::from_keyword)
+            .unwrap_or_else(|| cfg.context.as_ref().map(|c| c.index).unwrap_or_default())
+    }
+}
+
+/// Whether this session warms the navigator index: [`ContextIndex::resolve`]
+/// over the live [`CONTEXT_INDEX_ENV`] override (#3026). Read once by the
+/// session loop and passed down, never inside the warm-up itself.
 #[must_use]
 pub fn context_index_enabled(cfg: &Config) -> bool {
-    std::env::var(CONTEXT_INDEX_ENV)
-        .ok()
-        .as_deref()
-        .and_then(ContextIndex::from_keyword)
-        .unwrap_or_else(|| cfg.context.as_ref().map(|c| c.index).unwrap_or_default())
-        == ContextIndex::On
+    ContextIndex::resolve(std::env::var(CONTEXT_INDEX_ENV).ok().as_deref(), cfg) == ContextIndex::On
 }
 
 /// The compaction trigger policy this session resolves to: the operator's

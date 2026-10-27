@@ -281,7 +281,17 @@ fn context_index_switch_defaults_on_and_round_trips_3026() {
     assert!(toml::from_str::<ContextConfig>("index = \"maybe\"").is_err());
 
     let mut cfg = Config::default();
-    assert!(context_index_enabled(&cfg), "no [context] → on");
+    assert_eq!(
+        ContextIndex::resolve(None, &cfg),
+        ContextIndex::On,
+        "no [context] → on"
+    );
     cfg.context = Some(parsed);
-    assert!(!context_index_enabled(&cfg));
+    assert_eq!(ContextIndex::resolve(None, &cfg), ContextIndex::Off);
+    // The session override wins over config; an invalid one is ignored.
+    assert_eq!(ContextIndex::resolve(Some("on"), &cfg), ContextIndex::On);
+    assert_eq!(
+        ContextIndex::resolve(Some("bogus"), &cfg),
+        ContextIndex::Off
+    );
 }
