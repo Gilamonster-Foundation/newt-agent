@@ -123,6 +123,21 @@ jobs:
           stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_refused
           -- --ignored --test-threads=1
 
+      # HOOK PARITY: CI-only (needs the macOS kernel); named in the
+      # `.githooks/pre-push` CI-only list. #3033 grounding test: an
+      # audited-stdio MCP child under net:none (and a narrowed host-list
+      # session net) is admitted under Seatbelt with net Kernel. The hosted
+      # runner is non-root, which the Seatbelt witness requires.
+      - name: Run stdio MCP net:none Seatbelt admission acceptance (#3033)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt
+          -p newt-mcp-client --lib
+          stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt
+          -- --ignored --test-threads=1
+
       - name: Run MCP HTTP transport acceptance suite
         shell: bash
         run: >-
