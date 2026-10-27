@@ -160,6 +160,9 @@ fn interaction_view_child() {
                 mode == "cockpit_resize_anchor_dirty",
             );
         }
+        "cockpit_panel_gap" => {
+            crate::cockpit::presenter::cockpit_panel_gap_case();
+        }
         "cockpit_acceptance" => {
             crate::cockpit::presenter::cockpit_acceptance_case();
         }
@@ -423,6 +426,7 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
             | "cockpit_panel_loop"
             | "cockpit_resize_anchor"
             | "cockpit_resize_anchor_dirty"
+            | "cockpit_panel_gap"
             | "cockpit_psyche"
     ) {
         child.env("NEWT_EDIT_MODE", "emacs");
@@ -1105,6 +1109,59 @@ pub(crate) fn drive_cockpit_resize_anchor() {
             "{name}: {status:?}: {transcript:?}"
         );
     }
+}
+
+/// #3012: close an inline panel over a full transcript and read the screen the way the
+/// operator does. The line printed after the close must sit directly under the last history
+/// row: the rows the panel scrolled the transcript out of are reclaimed, not left blank.
+pub(crate) fn drive_cockpit_panel_gap() {
+    let pty = Pty::open_with_cursor_reply(1, 1);
+    pty.resize(24, 80);
+    let mut child = spawn_child(&pty, "cockpit_panel_gap");
+    let mut transcript = String::new();
+    let result = (|| -> Result<(), String> {
+        if !pty.wait_for_screen_after("panel-row-00", "╯", REACH_TIMEOUT) {
+            return Err("the panel never painted".into());
+        }
+        transcript.push_str(&pty.screen());
+        pty.type_in("\x1b");
+        if !pty.wait_for_screen("PANEL_CLOSED", REACH_TIMEOUT) {
+            return Err("Esc did not close the panel".into());
+        }
+        transcript.push_str(&pty.screen());
+        let grid = erasing_grid(&transcript, 24);
+        let at = |needle: &str| grid.iter().position(|row| row.contains(needle));
+        let (Some(history), Some(closed)) = (at("HISTORY_ABOVE_PANEL"), at("PANEL_CLOSED")) else {
+            return Err(format!(
+                "history or the close marker is not on screen: {grid:?}"
+            ));
+        };
+        if closed != history + 1 {
+            return Err(format!(
+                "{} blank rows between the history and the next line: {grid:?}",
+                closed.saturating_sub(history + 1)
+            ));
+        }
+        if grid.iter().any(|row| row.contains("panel-row-")) {
+            return Err(format!("panel text left after close: {grid:?}"));
+        }
+        pty.type_in("\r");
+        if !pty.wait_for_screen("PANEL_LOOP_RESTORED", REACH_TIMEOUT) {
+            return Err("the draft was not handed back intact".into());
+        }
+        pty.type_in("\n");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    transcript.push_str(&pty.screen_to_eof());
+    assert!(result.is_ok(), "{result:?}: {transcript:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{status:?}: {transcript:?}"
+    );
 }
 
 pub(crate) fn drive_cockpit_bang() {

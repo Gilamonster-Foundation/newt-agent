@@ -337,20 +337,70 @@ fn block_region(top: u16, block_h: u16) -> newt_core::tty::Region {
     }
 }
 
+/// The rows a blocking window holds, bottom-anchored. It is a value the screen hands back
+/// only through [`Screen::release_modal`], which clears the panel's rows and reclaims the
+/// ones the panel scrolled the transcript out of in one step (#3012).
 #[derive(Debug, PartialEq, Eq)]
+#[must_use = "release a reservation with Screen::release_modal"]
 struct ModalReservation {
     start: u16,
     rows: u16,
     chat_visible: bool,
+    /// The first row below the transcript while the panel is up: the block's top when the
+    /// panel opened, or `start` if the panel scrolled the transcript up to make room.
+    /// Releasing moves the block back here, so the next transcript insert fills the rows
+    /// the panel covered instead of leaving them blank in scrollback.
+    transcript_end: u16,
 }
 
-fn plan_modal_reservation(_block_top: u16, screen_rows: u16, requested: u16) -> ModalReservation {
+/// Plan a bottom-anchored reservation of `requested` rows. `transcript_end` is the first row
+/// below the transcript before the reservation (the block's top when a panel opens).
+fn plan_modal_reservation(
+    transcript_end: u16,
+    screen_rows: u16,
+    requested: u16,
+) -> ModalReservation {
     let rows = requested.min(screen_rows);
+    let start = screen_rows.saturating_sub(rows);
     ModalReservation {
-        start: screen_rows.saturating_sub(rows),
+        start,
         rows,
         chat_visible: false,
+        transcript_end: transcript_end.min(start),
     }
+}
+
+/// Where the block's top returns to when a reservation is released: the end of the
+/// transcript, clamped so the block still fits.
+fn reclaimed_top(reservation: &ModalReservation, block_h: u16, screen_rows: u16) -> u16 {
+    reservation
+        .transcript_end
+        .min(screen_rows.saturating_sub(block_h))
+}
+
+/// The bytes that reserve `plan` for a panel: erase from the occupied rows down, scroll the
+/// transcript rows the plan covers (`transcript_end - plan.start`) into scrollback, and
+/// clear the panel's own rows.
+fn modal_reserve_bytes(
+    occupied_top: u16,
+    transcript_end: u16,
+    screen_rows: u16,
+    plan: &ModalReservation,
+) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    queue!(
+        buf,
+        crossterm::cursor::Hide,
+        MoveTo(0, occupied_top),
+        Clear(ClearType::FromCursorDown)
+    )?;
+    let covered_transcript = transcript_end.saturating_sub(plan.start);
+    if covered_transcript > 0 {
+        queue!(buf, MoveTo(0, screen_rows.saturating_sub(1)))?;
+        buf.extend(std::iter::repeat_n(b'\n', covered_transcript as usize));
+    }
+    queue!(buf, MoveTo(0, plan.start), Clear(ClearType::FromCursorDown))?;
+    Ok(buf)
 }
 
 /// Clear the window's whole reservation, including rows above the editor's
@@ -433,34 +483,23 @@ impl Screen {
     }
 
     fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
-        self.reserve_modal_rows_from(self.top, requested)
+        self.reserve_modal_rows_from(self.top, self.top, requested)
     }
 
-    /// Reserve `requested` rows for a modal whose rows today start at
-    /// `occupied_top` — the block's top when a modal opens, the panel's own top
-    /// when the operator sizes it (#2574). Only transcript rows the new plan
-    /// covers above `occupied_top` scroll into scrollback.
+    /// Reserve `requested` rows for a modal whose rows today start at `occupied_top` — the
+    /// block's top when a modal opens, the panel's own top when the operator sizes it
+    /// (#2574) — over a transcript that ends at `transcript_end`. Only transcript rows the
+    /// new plan covers scroll into scrollback.
     fn reserve_modal_rows_from(
         &mut self,
         occupied_top: u16,
+        transcript_end: u16,
         requested: u16,
     ) -> io::Result<ModalReservation> {
         self.moved_cursor();
-        let plan = plan_modal_reservation(self.top, self.rows, requested);
+        let plan = plan_modal_reservation(transcript_end, self.rows, requested);
         self.tty.hold()?;
-        let mut buf = Vec::new();
-        queue!(
-            buf,
-            crossterm::cursor::Hide,
-            MoveTo(0, occupied_top),
-            Clear(ClearType::FromCursorDown)
-        )?;
-        let covered_transcript = occupied_top.saturating_sub(plan.start);
-        if covered_transcript > 0 {
-            queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
-            buf.extend(std::iter::repeat_n(b'\n', covered_transcript as usize));
-        }
-        queue!(buf, MoveTo(0, plan.start), Clear(ClearType::FromCursorDown))?;
+        let buf = modal_reserve_bytes(occupied_top, transcript_end, self.rows, &plan)?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
         self.term.clear()?;
@@ -473,14 +512,36 @@ impl Screen {
         self.tty.flush()
     }
 
-    fn cleanup_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
+    /// Release a panel's rows: clear them, and move the block back to the end of the
+    /// transcript so the rows the panel scrolled the transcript out of are reclaimed rather
+    /// than left blank in scrollback (#3012). The only way to release a reservation.
+    fn release_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
         self.moved_cursor();
         if reservation.chat_visible {
             return Ok(());
         }
         self.tty
             .write_all(&modal_cleanup_bytes(reservation.start)?)?;
-        self.tty.flush()
+        self.tty.flush()?;
+        if self.reclaim_modal_rows(reservation) {
+            self.rebuild_term()?;
+        }
+        Ok(())
+    }
+
+    /// Move the block's top back to where the transcript ended. `true` when it moved.
+    fn reclaim_modal_rows(&mut self, reservation: &ModalReservation) -> bool {
+        let top = reclaimed_top(reservation, self.block_h, self.rows);
+        if top == self.top {
+            return false;
+        }
+        self.top = top;
+        // FORCED: the rows were already given back on the terminal.
+        self.region.relocate(
+            block_region(self.top, self.block_h),
+            newt_core::tty::OnCollision::SuspendHolder,
+        );
+        true
     }
 
     /// Insert finished rows into the transcript above the block.
@@ -1745,14 +1806,17 @@ impl Presenter {
         let (cols, rows) = self.screen.terminal_size()?;
         let resized = (cols, rows) != (self.screen.cols, self.screen.rows);
         // Measured before the presenter's own resize moves its geometry.
-        let old = reservation.as_ref().map(|r| (r.start, r.rows));
+        let old = reservation
+            .as_ref()
+            .map(|r| (r.start, r.rows, r.transcript_end));
         let old_cols = self.screen.cols;
         if resized {
             self.on_event(Event::Resize(cols, rows))?;
         }
         // An alternate-screen loan owns the whole screen and redraws it: the
         // presenter's own resize above is its whole resize contract (#2573).
-        let (PanelMode::Inline(requested), Some((old_start, old_rows))) = (mode, old) else {
+        let (PanelMode::Inline(requested), Some((old_start, old_rows, old_end))) = (mode, old)
+        else {
             return Ok(());
         };
         if resized {
@@ -1762,7 +1826,10 @@ impl Presenter {
             // The operator sized the panel (#2574): reserved from the panel's
             // own top, so a grow scrolls only the rows it newly covers into
             // scrollback and a shrink erases only the rows it gives back.
-            *reservation = Some(self.screen.reserve_modal_rows_from(old_start, requested)?);
+            *reservation = Some(
+                self.screen
+                    .reserve_modal_rows_from(old_start, old_end, requested)?,
+            );
         }
         Ok(())
     }
@@ -1781,13 +1848,15 @@ impl Presenter {
             // A narrower inline dialog may have expanded above its old top.
             // Alternate-screen loans never painted the primary buffer; only
             // inline dialogs need their old pixels cleared before resizing.
-            if reservation.is_some() {
+            if let Some(reservation) = reservation {
                 self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
                 self.screen.tty.flush()?;
+                // Reclaim before the resize re-anchors the block (it rebuilds the viewport).
+                self.screen.reclaim_modal_rows(reservation);
             }
             self.on_event(Event::Resize(cols, rows))
         } else if let Some(reservation) = reservation {
-            self.screen.cleanup_modal(reservation)
+            self.screen.release_modal(reservation)
         } else {
             Ok(())
         }
@@ -2127,6 +2196,7 @@ mod tests {
                 start: 19,
                 rows: 5,
                 chat_visible: false,
+                transcript_end: 19,
             }
         );
         assert_eq!(
@@ -2135,6 +2205,7 @@ mod tests {
                 start: 0,
                 rows: 7,
                 chat_visible: false,
+                transcript_end: 0,
             },
             "a short terminal gives the blocking modal the whole screen"
         );
@@ -2144,6 +2215,7 @@ mod tests {
                 start: 2,
                 rows: 2,
                 chat_visible: false,
+                transcript_end: 0,
             }
         );
     }
@@ -2284,6 +2356,105 @@ mod tests {
         let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], 22);
         screen.resize(40, 24, 2, 1, None).unwrap();
         assert_eq!(first_erase_row(log), 20);
+    }
+
+    /// The screen after a transcript of `lines` rows, a block of `block_h` rows under it, then a
+    /// panel reserved for each of `requests` in turn (the operator sizing it), then released and
+    /// one more transcript line inserted where the block now sits. Returns that screen.
+    #[cfg(feature = "rich-tui")]
+    fn panel_round_trip(rows: u16, lines: u16, block_h: u16, requests: &[u16]) -> Vec<String> {
+        let mut stream = String::new();
+        for n in 0..lines {
+            stream.push_str(&format!("\x1b[{};1HT{n:02}", n + 1));
+        }
+        let top = lines;
+        for b in 0..block_h {
+            stream.push_str(&format!("\x1b[{};1HBLOCK", top + b + 1));
+        }
+        let mut occupied_top = top;
+        let mut reservation = None::<ModalReservation>;
+        for &requested in requests {
+            let end = reservation.as_ref().map_or(top, |r| r.transcript_end);
+            let plan = plan_modal_reservation(end, rows, requested);
+            let bytes = modal_reserve_bytes(occupied_top, end, rows, &plan).unwrap();
+            stream.push_str(&String::from_utf8(bytes).unwrap());
+            for r in plan.start..rows {
+                stream.push_str(&format!("\x1b[{};1HPANEL", r + 1));
+            }
+            occupied_top = plan.start;
+            reservation = Some(plan);
+        }
+        let reservation = reservation.expect("at least one request");
+        stream
+            .push_str(&String::from_utf8(modal_cleanup_bytes(reservation.start).unwrap()).unwrap());
+        let new_top = reclaimed_top(&reservation, block_h, rows);
+        let (insert, _) = render_insert(new_top, block_h, rows, &[b"NEXT".to_vec()]).unwrap();
+        stream.push_str(&String::from_utf8(insert).unwrap());
+        crate::interaction_view_pty_test::erasing_grid(&stream, usize::from(rows))
+    }
+
+    /// The row index of the first line starting `prefix`.
+    #[cfg(feature = "rich-tui")]
+    fn row_of(grid: &[String], prefix: &str) -> usize {
+        grid.iter()
+            .position(|row| row.starts_with(prefix))
+            .unwrap_or_else(|| panic!("{prefix} is not on the screen: {grid:?}"))
+    }
+
+    /// #3012: a panel that covered transcript rows scrolled them into scrollback; releasing it
+    /// moves the block back, so the next transcript line lands directly under the last one
+    /// instead of below a permanent band of blank rows.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn closing_a_panel_over_a_full_transcript_leaves_no_blank_rows() {
+        // A 24-row screen, transcript T00..T20 above a 3-row block, a 10-row panel.
+        let grid = panel_round_trip(24, 21, 3, &[10]);
+        let (last, next) = (row_of(&grid, "T20"), row_of(&grid, "NEXT"));
+        assert_eq!(next, last + 1, "NEXT must follow T20 directly: {grid:?}");
+        assert!(
+            !grid.iter().any(|row| row.contains("PANEL")),
+            "panel text left behind: {grid:?}"
+        );
+    }
+
+    /// The same, when the operator sizes the panel taller and then shorter before closing: the
+    /// transcript ended where the LARGEST reservation scrolled it to.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn sizing_a_panel_then_closing_it_reclaims_exactly_what_it_scrolled() {
+        for requests in [&[6, 14][..], &[14, 6][..], &[6, 14, 8][..]] {
+            let grid = panel_round_trip(24, 21, 3, requests);
+            let (last, next) = (row_of(&grid, "T20"), row_of(&grid, "NEXT"));
+            assert_eq!(next, last + 1, "{requests:?}: {grid:?}");
+        }
+    }
+
+    /// A panel shorter than the block covers no transcript: nothing scrolled, and the block
+    /// does not move.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn closing_a_panel_that_covered_no_transcript_does_not_move_the_block() {
+        let plan = plan_modal_reservation(10, 24, 4);
+        assert_eq!(plan.transcript_end, 10);
+        assert_eq!(reclaimed_top(&plan, 3, 24), 10);
+        let grid = panel_round_trip(24, 10, 3, &[4]);
+        assert_eq!(row_of(&grid, "NEXT"), row_of(&grid, "T09") + 1, "{grid:?}");
+    }
+
+    /// Control: this is what the release did before #3012: redraw the block at its old top.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn the_old_release_left_the_gap_this_test_fails_to_hide() {
+        let rows = 24u16;
+        let plan = plan_modal_reservation(21, rows, 10);
+        // Old behaviour: the block's top was never moved back.
+        assert!(plan.start < 21, "the panel covered transcript rows");
+        assert_eq!(reclaimed_top(&plan, 3, rows), plan.start);
+        assert_ne!(
+            reclaimed_top(&plan, 3, rows),
+            21,
+            "21 would leave blank rows"
+        );
     }
 
     #[test]
@@ -2688,8 +2859,8 @@ pub(crate) use terminal_acceptance::cockpit_psyche_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
-    cockpit_clarification_input_case, cockpit_panel_loop_case, cockpit_resize_anchor_case,
-    panel_live_resize_case, panel_resize_case,
+    cockpit_clarification_input_case, cockpit_panel_gap_case, cockpit_panel_loop_case,
+    cockpit_resize_anchor_case, panel_live_resize_case, panel_resize_case,
 };
 
 #[cfg(test)]
