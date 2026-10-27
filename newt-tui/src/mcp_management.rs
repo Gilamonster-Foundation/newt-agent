@@ -12,7 +12,7 @@ pub(super) async fn connect_entry(
 ) -> anyhow::Result<ReconnectableServer> {
     anyhow::ensure!(entry.enabled, "server is disabled in configuration");
     let admitted = newt_core::mcp::admit(entry).map_err(|denied| anyhow::anyhow!("{denied}"))?;
-    match entry.transport {
+    let result = match entry.transport {
         TransportKind::Stdio => connect_stdio_with_protection(&admitted, caveats, protection)
             .await
             .map(|live| ReconnectableServer { live, http: None }),
@@ -23,6 +23,36 @@ pub(super) async fn connect_entry(
                 .await
         }
         TransportKind::Sse => anyhow::bail!("legacy SSE transport (use type = \"http\")"),
+    };
+    newt_core::flight_recorder::log_mcp_connect(
+        &entry.name,
+        connect_record(entry.transport, result.as_ref().err()),
+    );
+    result
+}
+
+/// The flight-recorder record for one connect (#3037), classified only from
+/// typed evidence: the [`McpStatus`] variant and the HTTP status carried in
+/// the error chain.
+pub(super) fn connect_record(
+    transport: TransportKind,
+    error: Option<&anyhow::Error>,
+) -> newt_core::flight_recorder::McpConnectRecord {
+    use newt_core::flight_recorder::McpConnectOutcome;
+    let (outcome, http_status) = match error {
+        None => (McpConnectOutcome::Connected, None),
+        Some(error) => (
+            match McpStatus::from_error(error) {
+                McpStatus::Rejected(_) => McpConnectOutcome::Rejected,
+                _ => McpConnectOutcome::Skipped,
+            },
+            newt_mcp_client::http_error_status(error),
+        ),
+    };
+    newt_core::flight_recorder::McpConnectRecord {
+        transport,
+        outcome,
+        http_status,
     }
 }
 
@@ -270,6 +300,35 @@ fn apply_login_net_grant(
 mod tests {
     use super::*;
     use newt_core::caveats::Scope;
+
+    /// #3037: the recorded connect outcome comes from typed evidence — a
+    /// typed 401 is `rejected` with its status; error text that merely says
+    /// "401 auth" is a plain `skipped` with no status.
+    #[test]
+    fn connect_record_classifies_from_typed_evidence_only_3037() {
+        use newt_core::flight_recorder::McpConnectOutcome;
+        let record = |error: Option<anyhow::Error>| {
+            let r = connect_record(TransportKind::Http, error.as_ref());
+            (r.outcome, r.http_status)
+        };
+        assert_eq!(record(None), (McpConnectOutcome::Connected, None));
+        assert_eq!(
+            record(Some(anyhow::Error::new(
+                newt_mcp_client::HttpStatusError::new(401, "Unauthorized", "")
+            ))),
+            (McpConnectOutcome::Rejected, Some(401))
+        );
+        assert_eq!(
+            record(Some(anyhow::Error::new(
+                newt_mcp_client::HttpStatusError::new(503, "", "")
+            ))),
+            (McpConnectOutcome::Skipped, Some(503))
+        );
+        assert_eq!(
+            record(Some(anyhow::anyhow!("server said 401 auth required"))),
+            (McpConnectOutcome::Skipped, None)
+        );
+    }
 
     #[test]
     fn management_oauth_once_then_session_does_not_promote_earlier_once_grant() {
