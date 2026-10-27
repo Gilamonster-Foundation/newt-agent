@@ -13,12 +13,13 @@ async fn repository_navigator_warms_in_background_and_joins_complete() {
     .unwrap();
     let workspace = workspace.path().to_string_lossy().into_owned();
     let rt = tokio::runtime::Handle::current();
-    let mut warmup = Some(spawn_nav_warmup(
+    let mut warmup = spawn_nav_warmup(
         &rt,
         &workspace,
         &newt_core::Config::default(),
         &newt_core::IndexStatus::default(),
-    ));
+        true,
+    );
     let job = warmup.as_ref().unwrap().job.clone();
     let mut where_is = None;
     let mut nav = newt_core::NavigatorSession::default();
@@ -163,4 +164,49 @@ async fn unfinished_warmup_is_left_running_and_the_turn_degrades() {
     }
     finish_nav_warmup(&rt, &mut warmup, &mut where_is, &mut nav);
     assert!(warmup.is_none(), "the finished build is adopted next turn");
+}
+
+/// #3026: `[context] index = "off"` skips the navigator warm-up entirely —
+/// no background walk is spawned, and the inline fallback builds nothing, so
+/// a huge workspace is never walked and the navigator stays on its floor.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_off_spawns_no_warmup_and_builds_nothing_3026() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("main.rs"), "pub fn m() {}\n").unwrap();
+    let workspace = workspace.path().to_string_lossy().into_owned();
+    let cfg = newt_core::Config {
+        context: Some(newt_core::ContextConfig {
+            index: newt_core::config::ContextIndex::Off,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Handle::current();
+    // The session resolves the switch once and passes it down; the warm-up
+    // never reads the process environment.
+    let enabled =
+        newt_core::config::ContextIndex::resolve(None, &cfg) == newt_core::config::ContextIndex::On;
+    assert!(!enabled);
+    assert!(
+        spawn_nav_warmup(
+            &rt,
+            &workspace,
+            &cfg,
+            &newt_core::IndexStatus::default(),
+            enabled
+        )
+        .is_none(),
+        "index off must not spawn the warm-up walk"
+    );
+    let mut where_is = None;
+    let mut nav = newt_core::NavigatorSession::default();
+    ensure_nav_indexes(
+        &workspace,
+        &cfg,
+        &mut where_is,
+        &mut nav,
+        &newt_core::IndexStatus::default(),
+        enabled,
+    );
+    assert!(where_is.is_none() && nav.files.is_empty() && nav.usage.is_none());
 }
