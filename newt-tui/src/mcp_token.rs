@@ -159,6 +159,78 @@ impl CredentialPaths {
 
 const CREDENTIAL_MANIFEST_VERSION: u32 = 2;
 
+/// The authorization server refused the stored refresh grant (OAuth
+/// `invalid_grant`): the saved login is dead and only a fresh login recovers.
+/// Typed so connection status, Reconnect and the panel can say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OAuthGrantRejected;
+
+impl std::fmt::Display for OAuthGrantRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "saved MCP login was refused by the authorization server (OAuth error `invalid_grant`)",
+        )
+    }
+}
+
+impl std::error::Error for OAuthGrantRejected {}
+
+/// A resource's durable refusal of one stored bearer (#3028 follow-up): a 401
+/// whose forced refresh then failed. Bound to the server (by path), the
+/// resource and the token's [`newt_identity::RawContentId`] — never the
+/// token bytes. A replaced token no longer matches, so it is never poisoned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RejectionRecord {
+    resource: String,
+    token: newt_identity::RawContentId,
+}
+
+impl RejectionRecord {
+    fn for_token(resource: &str, token: &TokenFile) -> Self {
+        Self {
+            resource: resource.to_owned(),
+            token: newt_identity::RawContentId::from_content(token.access_token.as_bytes()),
+        }
+    }
+
+    fn matches(&self, resource: &str, token: &TokenFile) -> bool {
+        resource_matches(&self.resource, resource)
+            && self.token
+                == newt_identity::RawContentId::from_content(token.access_token.as_bytes())
+    }
+}
+
+fn rejection_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(
+        ".newt-oauth-{}.rejected.json",
+        casefold_credential_key(name)
+    ))
+}
+
+/// Record that the resource refused `token`. Caller holds the credential lock.
+fn record_rejection(dir: &Path, name: &str, resource: &str, token: &TokenFile) {
+    let record = RejectionRecord::for_token(resource, token);
+    match write_token_file(&rejection_path(dir, name), &record) {
+        Ok(()) => {
+            tracing::warn!("MCP OAuth login for `{name}` was refused; a fresh login is required");
+        }
+        Err(error) => {
+            tracing::warn!("failed to record refused MCP OAuth login for `{name}`: {error:#}");
+        }
+    }
+}
+
+/// Whether the active token for `name` is the one a recorded rejection names.
+fn rejection_matches(dir: &Path, name: &str, resource: &str, token: Option<&TokenFile>) -> bool {
+    match (
+        read_json::<RejectionRecord>(&rejection_path(dir, name)),
+        token,
+    ) {
+        (Ok(Some(record)), Some(token)) => record.matches(resource, token),
+        _ => false,
+    }
+}
+
 /// Response body from a token endpoint (both refresh and code-exchange).
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -291,12 +363,14 @@ fn safe_oauth_error_code(code: &str) -> Option<&str> {
     .then_some(code)
 }
 
-fn safe_oauth_error(body: &[u8]) -> Option<String> {
+fn safe_oauth_error_code_of(body: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let object = value.as_object()?;
-    let code = object.get("error")?.as_str()?;
-    let code = safe_oauth_error_code(code)?;
-    Some(format!("OAuth error `{code}`"))
+    let code = value.as_object()?.get("error")?.as_str()?;
+    safe_oauth_error_code(code).map(str::to_owned)
+}
+
+fn safe_oauth_error(body: &[u8]) -> Option<String> {
+    safe_oauth_error_code_of(body).map(|code| format!("OAuth error `{code}`"))
 }
 
 fn apply_client_authentication(
@@ -1031,6 +1105,14 @@ fn publish_credential_generation_with_hook(
     let manifest = serde_json::to_vec_pretty(&manifest)?;
     manifest_destination.atomic_write_private(&manifest)?;
     after(PublishPhase::Manifest)?;
+    // A new token generation supersedes any rejection of an older token.
+    if let Ok(Some(record)) = read_json::<RejectionRecord>(&rejection_path(dir, name)) {
+        if !record.matches(&bundle.meta.resource, &bundle.token) {
+            if let Err(error) = std::fs::remove_file(rejection_path(dir, name)) {
+                tracing::warn!("failed to clear stale MCP OAuth rejection for `{name}`: {error}");
+            }
+        }
+    }
     if let Err(error) = cleanup_old_generations(dir, name, &generation) {
         // The manifest commit is already durable. Cleanup failure must not make
         // callers retry a committed token exchange, but stale secret material
@@ -1384,8 +1466,13 @@ async fn try_refresh(
         tracing::warn!("MCP OAuth token for `{name}` has a stale issuer/resource binding");
         anyhow::bail!("MCP OAuth token has a stale issuer/resource binding");
     }
-    let token_endpoint =
-        validate_discovery_hop_with_policy(&meta.token_endpoint, "token endpoint", false, policy)?;
+    // Test builds may point the token endpoint at a loopback mock.
+    let token_endpoint = validate_discovery_hop_with_policy(
+        &meta.token_endpoint,
+        "token endpoint",
+        cfg!(test),
+        policy,
+    )?;
     if reg.issuer.as_deref() != Some(meta.issuer.as_str()) {
         tracing::warn!(
             "MCP OAuth client registration for `{name}` is not bound to issuer `{}` — withholding",
@@ -1394,7 +1481,7 @@ async fn try_refresh(
         anyhow::bail!("MCP OAuth client registration does not match the selected issuer");
     }
 
-    let http = fenced_client_for_url_with_policy(&token_endpoint, false, policy)?;
+    let http = fenced_client_for_url_with_policy(&token_endpoint, cfg!(test), policy)?;
 
     let mut form = refresh_form(refresh_token, &meta.resource);
     let request = apply_client_authentication(http.post(token_endpoint.clone())?, reg, &mut form)?;
@@ -1407,6 +1494,9 @@ async fn try_refresh(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = bounded_response_body(resp).await.unwrap_or_default();
+        if safe_oauth_error_code_of(&body).as_deref() == Some("invalid_grant") {
+            return Err(OAuthGrantRejected.into());
+        }
         let detail = safe_oauth_error(&body)
             .map(|error| format!(" — {error}"))
             .unwrap_or_default();
@@ -1443,12 +1533,17 @@ async fn try_refresh(
 /// Return a Bearer token only when its stored resource binding matches the
 /// selected HTTPS MCP URL. A name-only token or a token for another path or
 /// origin is withheld rather than following a mutable config name.
+///
+/// `Err` only when an expired token's refresh grant was refused
+/// ([`OAuthGrantRejected`]); every other withheld case is `Ok(None)`.
 pub async fn load_bearer_token(
     server_name: &str,
     resource_url: &str,
     policy: &OAuthHopPolicy,
-) -> Option<String> {
-    let dir = hermes_token_dir()?;
+) -> Result<Option<String>, OAuthGrantRejected> {
+    let Some(dir) = hermes_token_dir() else {
+        return Ok(None);
+    };
     load_bearer_token_from_dir(server_name, resource_url, &dir, policy).await
 }
 
@@ -1457,6 +1552,22 @@ async fn load_bearer_token_from_dir(
     resource_url: &str,
     dir: &Path,
     policy: &OAuthHopPolicy,
+) -> Result<Option<String>, OAuthGrantRejected> {
+    let mut grant_rejected = false;
+    let token =
+        load_bearer_token_inner(server_name, resource_url, dir, policy, &mut grant_rejected).await;
+    match token {
+        None if grant_rejected => Err(OAuthGrantRejected),
+        token => Ok(token),
+    }
+}
+
+async fn load_bearer_token_inner(
+    server_name: &str,
+    resource_url: &str,
+    dir: &Path,
+    policy: &OAuthHopPolicy,
+    grant_rejected: &mut bool,
 ) -> Option<String> {
     validate_https_resource(resource_url).ok()?;
     let transaction = acquire_credential_lock(dir, server_name)
@@ -1570,6 +1681,7 @@ async fn load_bearer_token_from_dir(
             let refreshed = try_refresh(server_name, resource_url, &bundle, policy)
                 .await
                 .map_err(|error| {
+                    *grant_rejected = error.downcast_ref::<OAuthGrantRejected>().is_some();
                     tracing::warn!(
                         "MCP OAuth refresh for `{server_name}` failed safely: {error:#}"
                     );
@@ -1599,13 +1711,19 @@ async fn load_bearer_token_from_dir(
 /// Force one refresh after the MCP resource rejects a stored Bearer with 401.
 /// The same credential lock serializes this with proactive refresh and browser
 /// login; callers retry the MCP connection exactly once with the returned token.
+///
+/// When the refresh fails, the resource's refusal of the still-active bearer
+/// is recorded durably, so `auth_status` reports NeedsFlow until a new token
+/// replaces it. `Err` when the token endpoint answered `invalid_grant`.
 pub async fn refresh_bearer_token(
     server_name: &str,
     resource_url: &str,
     rejected_bearer: &str,
     policy: &OAuthHopPolicy,
-) -> Option<String> {
-    let dir = hermes_token_dir()?;
+) -> Result<Option<String>, OAuthGrantRejected> {
+    let Some(dir) = hermes_token_dir() else {
+        return Ok(None);
+    };
     refresh_bearer_token_from_dir(server_name, resource_url, rejected_bearer, &dir, policy).await
 }
 
@@ -1615,26 +1733,61 @@ async fn refresh_bearer_token_from_dir(
     rejected_bearer: &str,
     dir: &Path,
     policy: &OAuthHopPolicy,
-) -> Option<String> {
-    validate_https_resource(resource_url).ok()?;
-    let transaction = acquire_credential_lock(dir, server_name).ok()?;
-    migrate_legacy_credentials(dir, server_name, &transaction).ok()?;
-    let bundle = read_credential_bundle(dir, server_name).ok()??;
+) -> Result<Option<String>, OAuthGrantRejected> {
+    if validate_https_resource(resource_url).is_err() {
+        return Ok(None);
+    }
+    let Ok(transaction) = acquire_credential_lock(dir, server_name) else {
+        return Ok(None);
+    };
+    if migrate_legacy_credentials(dir, server_name, &transaction).is_err() {
+        return Ok(None);
+    }
+    let Ok(Some(bundle)) = read_credential_bundle(dir, server_name) else {
+        return Ok(None);
+    };
     if !resource_matches(bundle.meta.resource.as_str(), resource_url)
         || !registration_matches_meta(&bundle.client, &bundle.meta)
         || !token_matches_meta(&bundle.token, &bundle.meta)
     {
-        return None;
+        return Ok(None);
     }
     if bundle.token.access_token != rejected_bearer {
-        return concurrent_winner_bearer(&bundle, rejected_bearer, resource_url).ok();
+        return Ok(concurrent_winner_bearer(&bundle, rejected_bearer, resource_url).ok());
     }
-    let snapshot = refresh_snapshot(dir, server_name, &bundle).ok()?;
+    let Ok(snapshot) = refresh_snapshot(dir, server_name, &bundle) else {
+        // No refresh grant to try: the refused bearer is final.
+        record_rejection(dir, server_name, resource_url, &bundle.token);
+        return Ok(None);
+    };
     drop(transaction);
-    let refreshed = try_refresh(server_name, resource_url, &bundle, policy)
-        .await
-        .ok()?;
-    persist_refreshed_bundle(dir, server_name, &snapshot, &refreshed, resource_url).ok()
+    let error = match try_refresh(server_name, resource_url, &bundle, policy).await {
+        Ok(refreshed) => {
+            return Ok(persist_refreshed_bundle(
+                dir,
+                server_name,
+                &snapshot,
+                &refreshed,
+                resource_url,
+            )
+            .ok())
+        }
+        Err(error) => error,
+    };
+    tracing::warn!("MCP OAuth forced refresh for `{server_name}` failed: {error:#}");
+    // Record only if the refused bearer is still the active one: a concurrent
+    // login or refresh that replaced it must not be poisoned.
+    if let Ok(_transaction) = acquire_credential_lock(dir, server_name) {
+        if let Ok(Some(current)) = read_credential_bundle(dir, server_name) {
+            if current.token.access_token == rejected_bearer {
+                record_rejection(dir, server_name, resource_url, &current.token);
+            }
+        }
+    }
+    match error.downcast_ref::<OAuthGrantRejected>() {
+        Some(rejected) => Err(*rejected),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1702,16 +1855,23 @@ fn auth_status_from_dir(servers: &[(String, String)], dir: &Path) -> Vec<AuthSta
     servers
         .iter()
         .map(|(name, resource)| {
-            let records = acquire_credential_lock(dir, name)
-                .and_then(|_transaction| read_credential_records(dir, name));
+            let records = acquire_credential_lock(dir, name).and_then(|_transaction| {
+                let records = read_credential_records(dir, name)?;
+                let rejected = rejection_matches(dir, name, resource, records.token.as_ref());
+                Ok((records, rejected))
+            });
             let state = match records {
-                Ok(records) => classify_auth_state(
+                Ok((records, rejected)) => match classify_auth_state(
                     resource,
                     records.token.as_ref(),
                     records.meta.as_ref(),
                     records.client.as_ref(),
                     unix_now(),
-                ),
+                ) {
+                    // The resource refused this exact token: only a login helps.
+                    AuthState::Valid | AuthState::Expired if rejected => AuthState::NeedsFlow,
+                    state => state,
+                },
                 Err(_) => AuthState::NeedsMigration,
             };
             AuthStatus {

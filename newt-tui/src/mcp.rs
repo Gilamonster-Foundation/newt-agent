@@ -51,7 +51,11 @@ impl McpStatus {
     /// the error text happens to mention "auth" or "401".
     pub(crate) fn from_error(error: &anyhow::Error) -> Self {
         let reason = format!("{error:#}");
-        if newt_mcp_client::http_error_status(error) == Some(401) {
+        if newt_mcp_client::http_error_status(error) == Some(401)
+            || error
+                .downcast_ref::<crate::mcp_token::OAuthGrantRejected>()
+                .is_some()
+        {
             Self::Rejected(reason)
         } else {
             Self::Skipped(reason)
@@ -478,13 +482,14 @@ async fn connect_http_entry(
     let entry = admitted.entry();
     let oauth_policy =
         crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(&caveats.net, explicit_net_hosts);
-    let token = if has_configured_authorization_header(entry) {
-        None
-    } else {
-        match entry.url.as_deref() {
-            Some(url) => crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy).await,
-            None => None,
+    let (token, grant_rejected) = match entry.url.as_deref() {
+        Some(url) if !has_configured_authorization_header(entry) => {
+            match crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy).await {
+                Ok(token) => (token, None),
+                Err(rejected) => (None, Some(rejected)),
+            }
         }
+        _ => (None, None),
     };
     let (token, insecure_authorization_allowed) =
         apply_transport_security(entry, token, allow_insecure_hosts);
@@ -501,13 +506,11 @@ async fn connect_http_entry(
         initial,
         token,
         || async {
-            crate::mcp_token::refresh_bearer_token(
-                &entry.name,
-                entry.url.as_deref()?,
-                rejected_bearer.as_deref()?,
-                &oauth_policy,
-            )
-            .await
+            let (Some(url), Some(rejected)) = (entry.url.as_deref(), rejected_bearer.as_deref())
+            else {
+                return Ok(None);
+            };
+            crate::mcp_token::refresh_bearer_token(&entry.name, url, rejected, &oauth_policy).await
         },
         |refreshed| async move {
             let (retry_token, retry_insecure_allowed) =
@@ -523,6 +526,11 @@ async fn connect_http_entry(
         },
     )
     .await
+    // A refused refresh grant explains the failed (unauthenticated) connect.
+    .map_err(|error| match grant_rejected {
+        Some(rejected) => error.context(rejected),
+        None => error,
+    })
     .map(|outcome| ReconnectableServer {
         live: outcome.value,
         http: Some(HttpReconnectState {
@@ -624,12 +632,18 @@ fn synchronize_http_reconnect_policy<Live>(
     }
 }
 
-struct HttpConnectOutcome<T> {
+pub(crate) struct HttpConnectOutcome<T> {
     value: T,
     bearer: Option<String>,
 }
 
-async fn retry_http_unauthorized_once<T, Refresh, RefreshFuture, Reconnect, ReconnectFuture>(
+pub(crate) async fn retry_http_unauthorized_once<
+    T,
+    Refresh,
+    RefreshFuture,
+    Reconnect,
+    ReconnectFuture,
+>(
     initial: anyhow::Result<T>,
     runtime_bearer: Option<String>,
     refresh: Refresh,
@@ -637,17 +651,22 @@ async fn retry_http_unauthorized_once<T, Refresh, RefreshFuture, Reconnect, Reco
 ) -> anyhow::Result<HttpConnectOutcome<T>>
 where
     Refresh: FnOnce() -> RefreshFuture,
-    RefreshFuture: std::future::Future<Output = Option<String>>,
+    RefreshFuture:
+        std::future::Future<Output = Result<Option<String>, crate::mcp_token::OAuthGrantRejected>>,
     Reconnect: FnOnce(String) -> ReconnectFuture,
     ReconnectFuture: std::future::Future<Output = anyhow::Result<T>>,
 {
     if runtime_bearer.is_some() && initial.as_ref().is_err_and(is_http_unauthorized) {
-        if let Some(token) = refresh().await {
-            let value = reconnect(token.clone()).await?;
-            return Ok(HttpConnectOutcome {
-                value,
-                bearer: Some(token),
-            });
+        match refresh().await {
+            Ok(Some(token)) => {
+                let value = reconnect(token.clone()).await?;
+                return Ok(HttpConnectOutcome {
+                    value,
+                    bearer: Some(token),
+                });
+            }
+            Ok(None) => {}
+            Err(rejected) => return Err(initial.err().expect("checked above").context(rejected)),
         }
     }
     Ok(HttpConnectOutcome {
@@ -704,22 +723,6 @@ impl Mcp {
     }
 
     /// Whether `name` is currently session-muted (`/mcp off`).
-    /// Whether a saved OAuth login still counts for `/mcp login-all`: only
-    /// while this session has not seen the server reject it (#3028). Expiry
-    /// alone cannot tell a revoked token from a good one.
-    #[cfg(feature = "rich-tui")]
-    pub(crate) fn saved_login_usable(
-        &self,
-        entry: &McpServerEntry,
-        saved_oauth_valid: &dyn Fn(&McpServerEntry) -> bool,
-    ) -> bool {
-        let rejected = self
-            .statuses
-            .iter()
-            .any(|(name, status)| name == &entry.name && matches!(status, McpStatus::Rejected(_)));
-        !rejected && saved_oauth_valid(entry)
-    }
-
     #[must_use]
     /// The `/mcp` status view, one line per server.
     ///
@@ -1049,6 +1052,8 @@ impl Mcp {
                                 &policy,
                             )
                             .await
+                            .ok()
+                            .flatten()
                         }
                     },
                     move |bearer| {
@@ -1634,7 +1639,7 @@ mod tests {
             Some("rejected-token".to_string()),
             move || async move {
                 refresh_counter.fetch_add(1, Ordering::SeqCst);
-                Some("refreshed-token".to_string())
+                Ok(Some("refreshed-token".to_string()))
             },
             move |token| async move {
                 assert_eq!(token, "refreshed-token");
@@ -2093,53 +2098,6 @@ mod tests {
             lines[3]
         );
         assert!(lines[4].contains("disabled in config"), "{:?}", lines[4]);
-    }
-
-    /// #3028 review: a server whose stored login the resource rejected (a
-    /// 401 on connect, after the forced refresh failed) is a login-all
-    /// target even though its token file still looks valid by expiry; a
-    /// connected server with the same saved login is not. A failure whose
-    /// TEXT merely mentions OAuth (a timeout reaching an `/oauth` URL) carries
-    /// no typed 401, so its still-valid login is not sent to the browser.
-    #[cfg(feature = "rich-tui")]
-    #[test]
-    fn a_rejected_saved_login_is_selected_by_login_all_3028() {
-        let mut mcp = Mcp::empty();
-        let rejected = anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
-            401,
-            "Unauthorized",
-            "",
-        ))
-        .context("MCP initialize failed");
-        mcp.statuses = vec![
-            ("stale".into(), McpStatus::from_error(&rejected)),
-            (
-                "flaky".into(),
-                McpStatus::from_error(&anyhow::anyhow!(
-                    "connect timeout reaching https://idp.example.test/oauth/authorize (auth 401 wording)"
-                )),
-            ),
-            (
-                "fine".into(),
-                McpStatus::Connected {
-                    tools: 1,
-                    confinement: Confinement::from_sandbox(None),
-                    net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
-                },
-            ),
-        ];
-        let mut stale = http_entry("https://stale.example.test/mcp");
-        stale.name = "stale".into();
-        let mut fine = http_entry("https://fine.example.test/mcp");
-        fine.name = "fine".into();
-        let mut flaky = http_entry("https://flaky.example.test/mcp");
-        flaky.name = "flaky".into();
-        let entries = [stale, fine, flaky];
-        let targets = crate::auth_command::login_all_targets(&entries, &|_| None, &|entry| {
-            mcp.saved_login_usable(entry, &|_| true)
-        });
-        let names: Vec<&str> = targets.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["stale"]);
     }
 
     #[test]
