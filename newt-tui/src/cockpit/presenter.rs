@@ -2343,6 +2343,55 @@ mod tests {
         row.parse::<u16>().unwrap() - 1
     }
 
+    /// Every row (zero-based) the screen erased downward from, in order.
+    fn erase_rows(mut written: std::fs::File) -> Vec<u16> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut bytes = Vec::new();
+        written.seek(SeekFrom::Start(0)).unwrap();
+        written.read_to_end(&mut bytes).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        // The last cursor move before each erase; the wrap fence's own escapes interleave.
+        text.match_indices("\x1b[J")
+            .map(|(at, _)| {
+                let (row, _) = text[..at]
+                    .rsplit("\x1b[")
+                    .find_map(|m| m.strip_suffix('H')?.split_once(';'))
+                    .expect("a cursor move precedes the erase");
+                row.parse::<u16>().unwrap() - 1
+            })
+            .collect()
+    }
+
+    /// #3041: split (narrow), draw, close the split (widen), draw. A screen part-filled
+    /// with transcript keeps the block where it is through both reflows, so no erase may
+    /// start above row 10: rows 0..10 are transcript.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_narrow_then_widen_resize_never_erases_above_the_block() {
+        let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (60, 11));
+        // Narrow to 40: header and input each wrap once; the caret lands on row 13.
+        screen.resize(40, 24, 2, 1, Some(13 - 1)).unwrap();
+        assert_eq!(screen.top, 10, "the block did not move");
+        // The redraw at 40 columns.
+        screen.painted_widths = vec![40, 40, 10];
+        screen.caret_frame = Some(CaretFrame {
+            top: 10,
+            block_h: 3,
+            cols: 40,
+            rows: 24,
+            y: 11,
+            x: 20,
+        });
+        // Widen back to 80: nothing in the block wraps, the caret is still on row 11.
+        screen.resize(80, 24, 2, 1, Some(11 - 1)).unwrap();
+        assert_eq!(screen.top, 10, "the block did not move");
+        let erased = erase_rows(log);
+        assert!(
+            erased.iter().all(|&r| r >= 10),
+            "transcript erased: erase rows {erased:?}"
+        );
+    }
+
     /// #3021 review: a width shrink whose footer wraps BELOW the caret. The terminal's
     /// reply already includes the scroll that reflow caused (block top 20), so erasing
     /// from `20 - growth` deleted the last transcript row above the block.
