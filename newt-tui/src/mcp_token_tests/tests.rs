@@ -1055,7 +1055,13 @@ async fn token_endpoint_invalid_grant_reaches_the_status_message_3028() {
 
     let loaded =
         load_bearer_token_from_dir(name, &resource, temp.path(), &test_oauth_policy()).await;
-    assert_eq!(loaded, Err(OAuthGrantRejected));
+    assert_eq!(
+        loaded,
+        LoadedBearer {
+            token: None,
+            grant_rejected: Some(OAuthGrantRejected),
+        }
+    );
 
     // Reconnect path: a resource 401, then the forced refresh through the
     // real refresh function, refused with `invalid_grant`.
@@ -1073,6 +1079,7 @@ async fn token_endpoint_invalid_grant_reaches_the_status_message_3028() {
             refresh_bearer_token_from_dir(name, &resource, "current", &dir, &test_oauth_policy())
                 .await
         },
+        |_| {},
         |_| async { anyhow::Ok(()) },
     )
     .await
@@ -1083,4 +1090,98 @@ async fn token_endpoint_invalid_grant_reaches_the_status_message_3028() {
         panic!("a refused grant is a rejected credential: {status:?}");
     };
     assert!(reason.contains("invalid_grant"), "{reason}");
+}
+
+/// Review of #3032: a refresh that SUCCEEDS but whose replacement bearer the
+/// resource also refuses (401 → refresh → 401) is recorded against the
+/// replacement, so a fresh reader — `newt auth --all` — selects the server.
+#[tokio::test]
+#[ignore = "real filesystem; weekly/release mcp-import-real lane"]
+async fn a_refreshed_bearer_refused_again_is_selected_by_a_fresh_reader_3028() {
+    let temp = tempfile::tempdir().unwrap();
+    let name = "Review.Source";
+    let original = credential_test_bundle("current", false);
+    let resource = original.meta.resource.clone();
+    publish(temp.path(), name, &original);
+    let dir = temp.path().to_path_buf();
+
+    let result = crate::mcp::retry_http_unauthorized_once(
+        Err::<(), _>(anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+            401,
+            "Unauthorized",
+            "",
+        ))),
+        Some("current".to_string()),
+        // A successful refresh publishes the replacement, as persist does.
+        || async {
+            publish(&dir, name, &credential_test_bundle("refreshed", false));
+            Ok(Some("refreshed".to_string()))
+        },
+        |refused| record_bearer_rejected_in(&dir, name, &resource, refused),
+        |_| async {
+            Err(anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+                401,
+                "Unauthorized",
+                "",
+            )))
+        },
+    )
+    .await;
+    assert!(result.is_err(), "no second retry");
+
+    assert_eq!(state_of(temp.path(), name, &resource), AuthState::NeedsFlow);
+    let mut entry: newt_core::mcp::McpServerEntry = toml::from_str(&format!(
+        "name = '{name}'\ntype = 'http'\nurl = '{resource}'\n"
+    ))
+    .unwrap();
+    entry.trust = newt_core::mcp::McpTrust::Trusted;
+    let targets = crate::auth_command::login_all_targets(&[entry], &|_| None, &|entry| {
+        state_of(temp.path(), &entry.name, entry.url.as_deref().unwrap()) == AuthState::Valid
+    });
+    assert_eq!(targets.len(), 1);
+
+    // A concurrent replacement after the refusal is not poisoned.
+    publish(
+        temp.path(),
+        name,
+        &credential_test_bundle("other-login", false),
+    );
+    record_bearer_rejected_in(temp.path(), name, &resource, "refreshed");
+    assert_eq!(state_of(temp.path(), name, &resource), AuthState::Valid);
+}
+
+/// Review of #3032: an unknown-lifetime token whose proactive refresh is
+/// refused (`invalid_grant`) still falls back to the current bearer, and
+/// the refusal travels with it: a following NON-401 connection failure is
+/// reported Rejected, with the login remediation.
+#[tokio::test]
+#[ignore = "real filesystem; weekly/release mcp-import-real lane"]
+async fn a_fallback_bearer_carries_the_refused_grant_to_a_non_401_failure_3028() {
+    let temp = tempfile::tempdir().unwrap();
+    let name = "Review.Source";
+    let endpoint = invalid_grant_token_endpoint().await;
+    let bundle = bundle_with_token_endpoint("current", &format!("{}/token", endpoint.uri()));
+    assert!(bundle.token.expires_at.is_none() && bundle.token.refresh_token.is_some());
+    let resource = bundle.meta.resource.clone();
+    publish(temp.path(), name, &bundle);
+
+    let loaded =
+        load_bearer_token_from_dir(name, &resource, temp.path(), &test_oauth_policy()).await;
+    assert_eq!(
+        loaded,
+        LoadedBearer {
+            token: Some("current".to_string()),
+            grant_rejected: Some(OAuthGrantRejected),
+        }
+    );
+
+    let failure = crate::mcp::attach_grant_rejection(
+        anyhow::anyhow!("MCP initialize failed: connection reset"),
+        loaded.grant_rejected,
+    );
+    let mut mcp = crate::mcp::Mcp::empty();
+    mcp.statuses = vec![(name.into(), crate::mcp::McpStatus::from_error(&failure))];
+    let line = &mcp.status_lines()[1];
+    assert!(line.contains("invalid_grant"), "{line}");
+    assert!(line.contains(crate::mcp::LOGIN_REMEDIATION), "{line}");
 }

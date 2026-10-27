@@ -482,14 +482,14 @@ async fn connect_http_entry(
     let entry = admitted.entry();
     let oauth_policy =
         crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(&caveats.net, explicit_net_hosts);
-    let (token, grant_rejected) = match entry.url.as_deref() {
+    let crate::mcp_token::LoadedBearer {
+        token,
+        grant_rejected,
+    } = match entry.url.as_deref() {
         Some(url) if !has_configured_authorization_header(entry) => {
-            match crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy).await {
-                Ok(token) => (token, None),
-                Err(rejected) => (None, Some(rejected)),
-            }
+            crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy).await
         }
-        _ => (None, None),
+        _ => crate::mcp_token::LoadedBearer::default(),
     };
     let (token, insecure_authorization_allowed) =
         apply_transport_security(entry, token, allow_insecure_hosts);
@@ -512,6 +512,11 @@ async fn connect_http_entry(
             };
             crate::mcp_token::refresh_bearer_token(&entry.name, url, rejected, &oauth_policy).await
         },
+        |refreshed| {
+            if let Some(url) = entry.url.as_deref() {
+                crate::mcp_token::record_bearer_rejected(&entry.name, url, refreshed);
+            }
+        },
         |refreshed| async move {
             let (retry_token, retry_insecure_allowed) =
                 apply_transport_security(entry, Some(refreshed), allow_insecure_hosts);
@@ -526,11 +531,7 @@ async fn connect_http_entry(
         },
     )
     .await
-    // A refused refresh grant explains the failed (unauthenticated) connect.
-    .map_err(|error| match grant_rejected {
-        Some(rejected) => error.context(rejected),
-        None => error,
-    })
+    .map_err(|error| attach_grant_rejection(error, grant_rejected))
     .map(|outcome| ReconnectableServer {
         live: outcome.value,
         http: Some(HttpReconnectState {
@@ -637,6 +638,20 @@ pub(crate) struct HttpConnectOutcome<T> {
     bearer: Option<String>,
 }
 
+/// A refused refresh grant explains whatever connection failure follows it —
+/// an anonymous connect, or a fallback bearer's 401 or non-401 failure.
+pub(crate) fn attach_grant_rejection(
+    error: anyhow::Error,
+    grant_rejected: Option<crate::mcp_token::OAuthGrantRejected>,
+) -> anyhow::Error {
+    match grant_rejected {
+        Some(rejected) => error.context(rejected),
+        None => error,
+    }
+}
+
+/// `reject` is told the replacement bearer when it, too, gets a 401, so the
+/// refusal is recorded against the token actually published (no second retry).
 pub(crate) async fn retry_http_unauthorized_once<
     T,
     Refresh,
@@ -647,6 +662,7 @@ pub(crate) async fn retry_http_unauthorized_once<
     initial: anyhow::Result<T>,
     runtime_bearer: Option<String>,
     refresh: Refresh,
+    reject: impl FnOnce(&str),
     reconnect: Reconnect,
 ) -> anyhow::Result<HttpConnectOutcome<T>>
 where
@@ -659,7 +675,11 @@ where
     if runtime_bearer.is_some() && initial.as_ref().is_err_and(is_http_unauthorized) {
         match refresh().await {
             Ok(Some(token)) => {
-                let value = reconnect(token.clone()).await?;
+                let value = reconnect(token.clone()).await.inspect_err(|error| {
+                    if is_http_unauthorized(error) {
+                        reject(&token);
+                    }
+                })?;
                 return Ok(HttpConnectOutcome {
                     value,
                     bearer: Some(token),
@@ -1641,6 +1661,7 @@ mod tests {
                 refresh_counter.fetch_add(1, Ordering::SeqCst);
                 Ok(Some("refreshed-token".to_string()))
             },
+            |_| {},
             move |token| async move {
                 assert_eq!(token, "refreshed-token");
                 reconnect_counter.fetch_add(1, Ordering::SeqCst);

@@ -1533,18 +1533,24 @@ async fn try_refresh(
 /// Return a Bearer token only when its stored resource binding matches the
 /// selected HTTPS MCP URL. A name-only token or a token for another path or
 /// origin is withheld rather than following a mutable config name.
-///
-/// `Err` only when an expired token's refresh grant was refused
-/// ([`OAuthGrantRejected`]); every other withheld case is `Ok(None)`.
 pub async fn load_bearer_token(
     server_name: &str,
     resource_url: &str,
     policy: &OAuthHopPolicy,
-) -> Result<Option<String>, OAuthGrantRejected> {
+) -> LoadedBearer {
     let Some(dir) = hermes_token_dir() else {
-        return Ok(None);
+        return LoadedBearer::default();
     };
     load_bearer_token_from_dir(server_name, resource_url, &dir, policy).await
+}
+
+/// What loading found: the bearer to try (possibly an unknown-lifetime
+/// fallback) AND whether a refresh on the way was refused. Both travel, so a
+/// fallback bearer's later failure can still name the refused grant.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LoadedBearer {
+    pub token: Option<String>,
+    pub grant_rejected: Option<OAuthGrantRejected>,
 }
 
 async fn load_bearer_token_from_dir(
@@ -1552,13 +1558,35 @@ async fn load_bearer_token_from_dir(
     resource_url: &str,
     dir: &Path,
     policy: &OAuthHopPolicy,
-) -> Result<Option<String>, OAuthGrantRejected> {
+) -> LoadedBearer {
     let mut grant_rejected = false;
     let token =
         load_bearer_token_inner(server_name, resource_url, dir, policy, &mut grant_rejected).await;
-    match token {
-        None if grant_rejected => Err(OAuthGrantRejected),
-        token => Ok(token),
+    LoadedBearer {
+        token,
+        grant_rejected: grant_rejected.then_some(OAuthGrantRejected),
+    }
+}
+
+/// Record that the resource refused `bearer` (a 401 after a successful
+/// refresh): only if it is still the active token for `resource_url`, so a
+/// concurrent replacement is never poisoned. Never logs or stores the bytes.
+pub fn record_bearer_rejected(server_name: &str, resource_url: &str, bearer: &str) {
+    if let Some(dir) = hermes_token_dir() {
+        record_bearer_rejected_in(&dir, server_name, resource_url, bearer);
+    }
+}
+
+fn record_bearer_rejected_in(dir: &Path, server_name: &str, resource_url: &str, bearer: &str) {
+    let Ok(_transaction) = acquire_credential_lock(dir, server_name) else {
+        return;
+    };
+    if let Ok(Some(current)) = read_credential_bundle(dir, server_name) {
+        if current.token.access_token == bearer
+            && resource_matches(&current.meta.resource, resource_url)
+        {
+            record_rejection(dir, server_name, resource_url, &current.token);
+        }
     }
 }
 
@@ -1662,6 +1690,7 @@ async fn load_bearer_token_inner(
                     }
                 }
                 Err(error) => {
+                    *grant_rejected = error.downcast_ref::<OAuthGrantRejected>().is_some();
                     tracing::warn!(
                         "MCP OAuth refresh for `{server_name}` failed safely: {error:#}"
                     );
