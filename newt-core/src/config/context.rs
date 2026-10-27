@@ -144,6 +144,51 @@ impl CompactionTriggerPolicy {
     }
 }
 
+/// `[context] index` — whether the session warms the repository navigator
+/// index (#3026). `off` skips the warm-up walk entirely; the navigator then
+/// stays on its regex floor. Default `on`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextIndex {
+    #[default]
+    On,
+    Off,
+}
+
+impl ContextIndex {
+    /// Parse a config/command keyword (case-insensitive).
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The canonical keyword (round-trips `from_keyword` + serde).
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// The session override `/settings index` writes (#3026).
+pub const CONTEXT_INDEX_ENV: &str = "NEWT_CONTEXT_INDEX";
+
+/// Whether this session warms the navigator index: the `/settings` override,
+/// else `[context] index`, else on (#3026).
+#[must_use]
+pub fn context_index_enabled(cfg: &Config) -> bool {
+    std::env::var(CONTEXT_INDEX_ENV)
+        .ok()
+        .as_deref()
+        .and_then(ContextIndex::from_keyword)
+        .unwrap_or_else(|| cfg.context.as_ref().map(|c| c.index).unwrap_or_default())
+        == ContextIndex::On
+}
+
 /// The compaction trigger policy this session resolves to: the operator's
 /// session override, else `[context] compaction_trigger_policy`, else the
 /// default.
@@ -461,6 +506,10 @@ pub struct ContextConfig {
     /// to `0..=100`; `0` disables the nudge. See `agentic::budget` (#559).
     #[serde(default = "default_low_budget_pct")]
     pub low_budget_pct: usize,
+
+    /// `index = "off"` skips the navigator warm-up walk (#3026). Default `on`.
+    #[serde(default)]
+    pub index: ContextIndex,
 }
 
 fn default_summary_input_cap_floor_chars() -> usize {
@@ -516,6 +565,7 @@ impl Default for ContextConfig {
             api_surface: ApiSurfaceConfig::default(),
             input_ceiling_pct: default_input_ceiling_pct(),
             low_budget_pct: default_low_budget_pct(),
+            index: ContextIndex::default(),
         }
     }
 }

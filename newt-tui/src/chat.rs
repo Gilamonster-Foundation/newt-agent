@@ -2901,7 +2901,7 @@ fn session_body(
     // Warm the model-free repository navigator in parallel with the remaining
     // session startup. The first consumer joins this handle; a failed task
     // leaves the existing synchronous ensure path as the honest fallback.
-    let mut nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
+    let mut nav_warmup = spawn_nav_warmup(&rt, workspace, &cfg, &index_status);
     // Step 26.6a (#585): session-scoped experiential ledger. Unlike the others it
     // SURVIVES /new (cross-task reuse within the session) — see the /new handler.
     let experience_store = newt_core::SessionExperienceStore::default();
@@ -6050,7 +6050,7 @@ fn session_body(
                         if let Some(warmup) = nav_warmup.take() {
                             warmup.abort();
                         }
-                        nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
+                        nav_warmup = spawn_nav_warmup(&rt, workspace, &cfg, &index_status);
                         // Step 26.6a (#585): the experiential ledger is INTENTIONALLY
                         // NOT cleared here — it is cross-task by design (a later task
                         // reuses earlier lessons). It is dropped only at session end.

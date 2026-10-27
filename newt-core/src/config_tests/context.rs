@@ -263,3 +263,25 @@ fn base_for_defaults_tool_offload_on_and_local_assist_on_for_ollama() {
     assert!(!ov.apply_to(local).get(F::ToolOffload));
     assert!(ov.apply_to(local).get(F::Scratchpad)); // untouched feature stays on
 }
+
+/// #3026: `[context] index = "off"` skips the navigator warm-up walk. The
+/// default is on; the keyword round-trips through serde and `from_keyword`.
+#[test]
+fn context_index_switch_defaults_on_and_round_trips_3026() {
+    assert_eq!(ContextConfig::default().index, ContextIndex::On);
+    let parsed: ContextConfig = toml::from_str("index = \"off\"").unwrap();
+    assert_eq!(parsed.index, ContextIndex::Off);
+    let back: ContextConfig = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+    assert_eq!(back, parsed);
+    for mode in [ContextIndex::On, ContextIndex::Off] {
+        assert_eq!(ContextIndex::from_keyword(mode.keyword()), Some(mode));
+    }
+    assert_eq!(ContextIndex::from_keyword(" OFF "), Some(ContextIndex::Off));
+    assert_eq!(ContextIndex::from_keyword("maybe"), None);
+    assert!(toml::from_str::<ContextConfig>("index = \"maybe\"").is_err());
+
+    let mut cfg = Config::default();
+    assert!(context_index_enabled(&cfg), "no [context] → on");
+    cfg.context = Some(parsed);
+    assert!(!context_index_enabled(&cfg));
+}

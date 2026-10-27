@@ -21,6 +21,11 @@ pub(super) fn ensure_nav_indexes(
     index_status: &newt_core::IndexStatus,
 ) {
     use newt_core::{gather_with_manifest, GatherCaps};
+    // #3026: `[context] index = "off"` — never walk; the navigator stays on
+    // its regex floor.
+    if !newt_core::config::context_index_enabled(cfg) {
+        return;
+    }
     let api_cfg = cfg
         .context
         .as_ref()
@@ -122,12 +127,16 @@ impl NavWarmup {
     }
 }
 
+/// `None` when `[context] index = "off"` (#3026): no warm-up walk at all.
 pub(super) fn spawn_nav_warmup(
     rt: &tokio::runtime::Handle,
     workspace: &str,
     cfg: &newt_core::Config,
     index_status: &newt_core::IndexStatus,
-) -> NavWarmup {
+) -> Option<NavWarmup> {
+    if !newt_core::config::context_index_enabled(cfg) {
+        return None;
+    }
     let workspace = workspace.to_string();
     let cfg = cfg.clone();
     let index_status = index_status.clone();
@@ -140,7 +149,7 @@ pub(super) fn spawn_nav_warmup(
         ensure_nav_indexes(&workspace, &cfg, &mut where_is, &mut nav, &index_status);
         (where_is, nav)
     });
-    NavWarmup { handle, job }
+    Some(NavWarmup { handle, job })
 }
 
 /// Adopt the background navigator warm-up ONLY if it has already finished.

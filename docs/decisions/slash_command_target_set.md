@@ -214,6 +214,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/discuss` | `/chat` | `/` command | Session | keep — it performs | — read-only |
 | `/dock` | — | `/` command | Session | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/end` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/settings index` | — | field of `/settings` | Session | absorb → `/settings index` | `~/.newt/receipts.jsonl` |
 | `/mcp` | — | `/` command | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
 | `/new` | `/clear` | `/` command | Session | keep — it performs | **none — #1965** |
 | `/ocap` | — | `/` command | Session | keep — it performs | **none — #1965** |
@@ -253,6 +254,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 | `/settings tools` | — | field of `/settings` | Tuning | absorb → `/settings tools` | `~/.newt/receipts.jsonl` |
 
-**85 registered, 46 of them typed as `/` commands (57 tokens).** Absorb 24 · keep 57 · panel 4. Receipts: settings 23 · events 6 · workspace policies 1 · read-only 36 · **missing 19**.
+**86 registered, 46 of them typed as `/` commands (57 tokens).** Absorb 25 · keep 57 · panel 4. Receipts: settings 24 · events 6 · workspace policies 1 · read-only 36 · **missing 19**.
 
 <!-- END GENERATED -->
