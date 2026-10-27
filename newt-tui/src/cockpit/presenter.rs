@@ -554,16 +554,29 @@ impl Screen {
         status_rows: u16,
         measured_top: Option<u16>,
     ) -> io::Result<()> {
-        // Where the block WAS, once the terminal has had its say: measured when the terminal
-        // told us (#3014), else the old top, which is right only when nothing moved.
-        let old_top = measured_top.unwrap_or(self.top);
-        // Narrowing reflows any old block row wider than the new terminal onto
-        // extra rows, lifting the stale block above `old_top`.
-        let lifted = if cols.max(1) < self.cols {
-            reflow_growth(&self.painted_widths, cols.max(1))
-        } else {
-            0
+        // Narrowing reflows any old block row wider than the new terminal onto extra rows.
+        let growth = |widths: &[usize]| {
+            if cols.max(1) < self.cols {
+                reflow_growth(widths, cols.max(1))
+            } else {
+                0
+            }
         };
+        // Where the block WAS, once the terminal has had its say. Measured (#3014): the
+        // reply already includes where the reflow put the block, so only rows reflowed
+        // ABOVE the caret (between the block's first row and the row reported) are still
+        // unaccounted for; erasing a further `growth` rows up would eat transcript.
+        // Unmeasured: the old top is right only when nothing moved, and the whole reflow
+        // lifted the stale block above it.
+        let (old_top, lifted) = match (measured_top, self.caret_frame) {
+            (Some(top), Some(frame)) => {
+                let above = usize::from(frame.y.saturating_sub(frame.top));
+                let above = &self.painted_widths[..above.min(self.painted_widths.len())];
+                (top.saturating_sub(growth(above)), 0)
+            }
+            _ => (self.top, growth(&self.painted_widths)),
+        };
+        let measured_top = measured_top.map(|_| old_top);
         let old_rows = self.rows;
         self.cols = cols.max(1);
         self.rows = rows.max(1);
@@ -2162,6 +2175,115 @@ mod tests {
         assert_eq!(resized_top(Some(30), 20, 34, 24, 4), 20);
         // A reply above the caret's own offset cannot be this block's.
         assert_eq!(block_top_from_reply(0, 3), None);
+    }
+
+    /// A screen over a scratch file with a painted block, for driving `resize` and
+    /// reading the bytes it wrote.
+    fn screen_with_block(
+        cols: u16,
+        rows: u16,
+        top: u16,
+        block_h: u16,
+        widths: &[usize],
+        caret_y: u16,
+    ) -> (Screen, std::fs::File) {
+        let file = tempfile::tempfile().unwrap();
+        let reader = file.try_clone().unwrap();
+        let tty = WrapFence::new(file);
+        let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(tty.fenced_clone().unwrap()),
+            caret: Arc::clone(&caret),
+        };
+        let term = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, top, cols, block_h)),
+            },
+        )
+        .unwrap();
+        let region = newt_core::tty::Terminal::lease_region(
+            block_region(top, block_h),
+            newt_core::tty::OnCollision::Refuse,
+        )
+        .expect("the test owns these rows");
+        let screen = Screen {
+            tty,
+            term,
+            caret,
+            caret_frame: Some(CaretFrame {
+                top,
+                block_h,
+                cols,
+                rows,
+                y: caret_y,
+            }),
+            can_query_cursor: true,
+            cols,
+            rows,
+            top,
+            block_h,
+            status_rows: 1,
+            status: Vec::new(),
+            queued: 0,
+            region,
+            painted_widths: widths.to_vec(),
+        };
+        (screen, reader)
+    }
+
+    /// The first row (zero-based) the resize erased downward from.
+    fn first_erase_row(mut written: std::fs::File) -> u16 {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut bytes = Vec::new();
+        written.seek(SeekFrom::Start(0)).unwrap();
+        written.read_to_end(&mut bytes).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let at = text.find("\x1b[J").expect("resize erases downward");
+        let (row, _) = text[..at]
+            .rsplit_once("\x1b[")
+            .and_then(|(_, m)| m.strip_suffix('H'))
+            .and_then(|m| m.split_once(';'))
+            .expect("a cursor move precedes the erase");
+        row.parse::<u16>().unwrap() - 1
+    }
+
+    /// #3021 review: a width shrink whose footer wraps BELOW the caret. The terminal's
+    /// reply already includes the scroll that reflow caused (block top 20), so erasing
+    /// from `20 - growth` deleted the last transcript row above the block.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_does_not_erase_transcript_above_the_block() {
+        // 80x24, three-row block at row 21, caret on row 22; shrink to 40 wraps the
+        // 70-column footer (+1 row), scrolling the block to row 20.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], 22);
+        screen.resize(40, 24, 2, 1, Some(20)).unwrap();
+        assert_eq!(first_erase_row(log), 20, "row 19 is transcript");
+    }
+
+    /// The other side: a row ABOVE the caret wraps, pushing the caret down past the
+    /// block's own offset, so the measured top reads one row too low.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_with_a_wrapped_row_above_the_caret_erases_the_whole_block() {
+        // Header (70 cols) wraps to two rows: the block now starts at 20 with the
+        // caret on row 22, so `reply - offset` reads 21.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[70, 10, 10], 22);
+        screen.resize(40, 24, 2, 1, Some(21)).unwrap();
+        assert_eq!(
+            first_erase_row(log),
+            20,
+            "the wrapped header row is erased too"
+        );
+    }
+
+    /// Unmeasured, the guess still subtracts the whole reflow.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_unmeasured_width_shrink_still_lifts_by_the_whole_reflow() {
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], 22);
+        screen.resize(40, 24, 2, 1, None).unwrap();
+        assert_eq!(first_erase_row(log), 20);
     }
 
     #[test]
