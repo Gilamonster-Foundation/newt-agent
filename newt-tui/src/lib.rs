@@ -81,6 +81,8 @@ pub mod dgx_probe;
 /// #2085 PR-E2: where a non-setting state mutator's journal event is named,
 /// and the registry gate that decides whether it may be written at all.
 mod event_receipt;
+#[cfg(all(feature = "live-spill", feature = "rich-tui"))]
+mod fold_list;
 pub mod herdr;
 /// #1950: the ONE inline-viewport constructor, and the one answer to "where is
 /// the cursor?" when the terminal will not say.

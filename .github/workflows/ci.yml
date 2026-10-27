@@ -132,6 +132,8 @@ jobs:
       - name: Carried artifact cache contract (#2817)
         run: python3 scripts/test_carried_cache.py
       # HOOK PARITY: CI-only workflow contract; named in .githooks/pre-push.
+      - name: Real-PTY tier live-spill contract (#3023)
+        run: python3 scripts/test_pty_tier_live_spill.py
       - name: Real-PTY tier wiring contract (#3025)
         run: python3 scripts/test_pty_tier_wiring.py
       - name: push-hook reverse-dependent expansion regression

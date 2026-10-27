@@ -53,6 +53,7 @@ on:
       - "newt-tui/src/rich_input_pty_test.rs"
       - "newt-cli/tests/terminal_exit_pty.rs"
       - "newt-tui/src/transcript_pager.rs"
+      - "newt-tui/src/fold_list.rs"
       - "newt-tui/src/transcript_pager_pty_test.rs"
       - "newt-tui/src/permissions.rs"
       - "newt-tui/src/native_permission_test.rs"
@@ -141,7 +142,7 @@ jobs:
 
       - name: Run transcript pager real-PTY tests
         run: |
-          cargo test -p newt-tui --features rich-tui transcript_pager_pty_test \
+          cargo test -p newt-tui --features rich-tui,live-spill transcript_pager_pty_test \
             -- --ignored --test-threads=1
 
       # The panel driver on a real terminal with no cockpit (`panel::drive(..,
@@ -271,5 +272,5 @@ jobs:
 
       - name: Run transcript pager real-PTY tests
         run: |
-          cargo test -p newt-tui --features rich-tui transcript_pager_pty_test \
+          cargo test -p newt-tui --features rich-tui,live-spill transcript_pager_pty_test \
             -- --ignored --test-threads=1

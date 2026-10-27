@@ -65,6 +65,8 @@
 #   - pinned carried artifact caches + bounded retry downloads (#2817),
 #     .github/workflows/ci.yml Windows job (actions/cache requires CI), and
 #     scripts/test_carried_cache.py in its lint job (workflow contract).
+#   - live-spill PTY tests (#3023): scripts/test_pty_tier_live_spill.py in ci.yml's lint job
+#     checks newt-tui-pty.yml enables the feature (workflow contract).
 #     Cache hits still pass through Install-CarriedTools.ps1 SHA256 verification.
 #   - interpreter grant/retry turn lifetime (#2823), newt-tui-pty.yml Linux/macOS:
 #     exec_grant_retry_loop runs explicitly with native-permission-test and
