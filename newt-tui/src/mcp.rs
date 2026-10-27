@@ -906,6 +906,13 @@ impl Mcp {
             std::path::Path::new(workspace),
             sanitize_server_names,
         );
+        for warning in crate::auth_command::missing_auth_warnings(
+            &entries,
+            &|var| std::env::var(var).ok(),
+            &saved_oauth_valid,
+        ) {
+            tracing::warn!("{warning}");
+        }
         let mut servers = Vec::new();
         let mut connected_prefixes = std::collections::BTreeSet::new();
         let mut statuses: Vec<(String, McpStatus)> = Vec::new();
