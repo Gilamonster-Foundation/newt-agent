@@ -48,7 +48,7 @@ pub(super) fn ensure_nav_indexes(
     }
     if nav_session.project.is_none() {
         let root = std::path::Path::new(workspace);
-        nav_session.project = newt_core::project_model::scan_project(
+        nav_session.project = newt_core::project_model::scan_project_persistent(
             root,
             &newt_core::project_model::builtin_project_packs(),
         );
