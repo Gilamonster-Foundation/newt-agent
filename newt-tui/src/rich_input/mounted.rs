@@ -72,13 +72,13 @@ pub(crate) struct MountedEditor {
 }
 
 impl MountedEditor {
-    /// Nothing is typed.
     /// #3022: the retained spills `/spill open ` completes to.
     #[cfg(feature = "live-spill")]
     pub(crate) fn set_spill_choices(&mut self, choices: Vec<(String, String)>) {
         self.palette.set_spill_choices(choices);
     }
 
+    /// Nothing is typed.
     pub(crate) fn is_blank(&self) -> bool {
         self.textarea.lines().iter().all(|l| l.is_empty())
     }

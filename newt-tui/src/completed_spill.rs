@@ -73,7 +73,9 @@ impl std::fmt::Display for SpillLookupError {
 
 #[derive(Debug)]
 struct ArchiveState {
-    nonce: [u8; 16],
+    /// `None` when the platform refused entropy: nothing is retained then,
+    /// because a handle under a predictable scope would leak equality.
+    nonce: Option<[u8; 16]>,
     inspection_available: bool,
     bytes: usize,
     entries: VecDeque<CompletedSpill>,
@@ -89,12 +91,12 @@ pub(crate) struct CompletedSpillArchive {
     max_entry_bytes: usize,
 }
 
-fn session_nonce() -> [u8; 16] {
+/// The session scope for handles, or `None` if entropy is unavailable. A
+/// zeroed fallback would be one known scope shared by every such session, so
+/// equal output would get equal, computable handles across them (#3022).
+fn session_nonce() -> Option<[u8; 16]> {
     let mut nonce = [0u8; 16];
-    // A nonce only has to differ between sessions; an entropy failure is
-    // vanishingly rare and would leave a predictable (still valid) handle.
-    let _ = getrandom::getrandom(&mut nonce);
-    nonce
+    getrandom::getrandom(&mut nonce).ok().map(|()| nonce)
 }
 
 impl Default for CompletedSpillArchive {
@@ -142,7 +144,10 @@ impl CompletedSpillArchive {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let id = session_output_cid(state.nonce, &retained.join("\n")).ok()?;
+        // The id names the COMPLETE result, not the retained tail: two results
+        // with equal tails but different omitted prefixes are different
+        // records, and one must not rewrite what the other's marker claims.
+        let id = session_output_cid(state.nonce?, output).ok()?;
         // Same bytes, same handle: a repeat result moves to the newest slot
         // instead of leaving two entries that answer to one id.
         if let Some(at) = state.entries.iter().position(|spill| spill.id == id) {
@@ -193,7 +198,7 @@ impl CompletedSpillArchive {
 
     /// `/spill open` completions, newest first: `(id tail, label)` where the
     /// label is the body's first line, cut short.
-    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+    #[cfg(feature = "rich-tui")]
     pub(crate) fn choices(&self) -> Vec<(String, String)> {
         let state = self
             .state
@@ -320,6 +325,7 @@ mod tests {
 
     /// #3022: the completion list is the retained ids, newest first, each with
     /// a short label from the body's first line.
+    #[cfg(feature = "rich-tui")]
     #[test]
     fn choices_are_newest_first_with_a_short_first_line_label() {
         let archive = CompletedSpillArchive::default();
@@ -399,6 +405,31 @@ mod tests {
         assert!(first.to_handle().starts_with("bafy"), "{first}");
         assert_eq!(archive.find(&first.to_handle()).unwrap().id(), first);
         assert_eq!(archive.find(&second.tail()).unwrap().id(), second);
+    }
+
+    /// #3022 review: equal retained tails with different omitted prefixes
+    /// used to share one id, so the later result rewrote the earlier marker's
+    /// record (it then claimed nothing was dropped).
+    #[test]
+    fn equal_retained_tails_do_not_rewrite_an_older_record() {
+        let archive = CompletedSpillArchive::default();
+        let tail = "retained row\n".repeat(SANITIZE_HISTORY_LINES);
+        let first = cid(&archive, &format!("omitted prefix\n{tail}"));
+        assert_eq!(archive.find(&first.to_handle()).unwrap().dropped_lines(), 1);
+        let second = cid(&archive, &tail);
+        assert_ne!(first, second, "different results, different handles");
+        assert_eq!(archive.find(&first.to_handle()).unwrap().dropped_lines(), 1);
+        assert_eq!(archive.find(&second.to_handle()).unwrap().dropped_lines(), 0);
+    }
+
+    /// #3022 review: without entropy the archive retains nothing rather than
+    /// minting handles under a zero, cross-session-predictable scope.
+    #[test]
+    fn without_entropy_nothing_is_retained() {
+        let archive = CompletedSpillArchive::default();
+        archive.state.lock().unwrap().nonce = None;
+        assert!(archive.retain("secret\n").is_none());
+        assert!(archive.latest().is_none());
     }
 
     #[test]

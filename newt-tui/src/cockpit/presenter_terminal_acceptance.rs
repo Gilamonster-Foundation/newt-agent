@@ -201,7 +201,7 @@ fn buffered_input_case() {
         let archive = Arc::new(crate::completed_spill::CompletedSpillArchive::default());
         archive.retain("operator inspection payload");
         cockpit
-            .handle_request(SurfaceRequest::SetSpillArchive(archive))
+            .handle_request(SurfaceRequest::SetSpillArchive(Arc::clone(&archive)))
             .unwrap();
         let (reply, inspected) = std::sync::mpsc::sync_channel(1);
         cockpit
@@ -210,6 +210,22 @@ fn buffered_input_case() {
                 reply,
             })
             .unwrap();
+        use crossterm::event::{KeyCode, KeyEvent};
+        // #3022 review: `/spill open ` + Tab completes a result retained AFTER
+        // the cockpit mounted its editor (it once inserted spaces instead).
+        let newest = archive.retain("retained after mount").unwrap();
+        for c in "/spill open ".chars() {
+            cockpit
+                .on_event(Event::Key(KeyEvent::from(KeyCode::Char(c))))
+                .unwrap();
+        }
+        cockpit
+            .on_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
+            .unwrap();
+        assert_eq!(
+            cockpit.editor.draft(),
+            format!("/spill open {}", newest.tail())
+        );
         cockpit
             .on_event(Event::Paste("unsent draft".into()))
             .unwrap();

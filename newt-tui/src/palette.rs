@@ -185,8 +185,9 @@ impl PaletteState {
 
     /// Offer the retained spills (`(id tail, label)`, newest first) as the
     /// completions of `/spill open `. Empty keeps the plain usage row.
+    /// An open palette re-ranks, so its matches never index a stale list.
     pub(crate) fn set_spill_choices(&mut self, choices: Vec<(String, String)>) {
-        self.spill_entries = choices
+        let entries: Vec<PaletteEntry> = choices
             .into_iter()
             .map(|(tail, label)| PaletteEntry {
                 cmd: format!("/spill open {tail}"),
@@ -194,6 +195,13 @@ impl PaletteState {
                 desc: label,
             })
             .collect();
+        if entries != self.spill_entries {
+            self.spill_entries = entries;
+            if self.open {
+                let filter = std::mem::take(&mut self.filter);
+                self.set_filter(&filter);
+            }
+        }
     }
 
     pub(crate) fn take_spill_entries(&mut self) -> Vec<PaletteEntry> {
@@ -578,6 +586,30 @@ mod tests {
         s.on_buffer_change("", "/");
         s.on_buffer_change("/", "/spill open ol");
         assert_eq!(matched_cmds(&s), ["/spill open older333"]);
+    }
+
+    /// #3022: the cockpit refreshes choices on every key. A result retained
+    /// while the palette is open re-ranks it, so Tab completes the newest id
+    /// rather than whatever a stale index now points at.
+    #[test]
+    fn new_spill_choices_rerank_an_open_palette() {
+        let mut s = PaletteState::new(fixture());
+        s.set_spill_choices(vec![("older333".into(), "b".into())]);
+        s.on_buffer_change("", "/");
+        s.on_buffer_change("/", "/spill open ");
+        assert_eq!(matched_cmds(&s), ["/spill open older333"]);
+        s.set_spill_choices(vec![
+            ("newest22".into(), "a".into()),
+            ("older333".into(), "b".into()),
+        ]);
+        assert_eq!(
+            matched_cmds(&s),
+            ["/spill open newest22", "/spill open older333"]
+        );
+        assert_eq!(
+            palette_step(&mut s, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            PaletteStep::CompleteTo("/spill open newest22".to_string())
+        );
     }
 
     /// With nothing retained the palette keeps today's `/spill open <ID>` row.
