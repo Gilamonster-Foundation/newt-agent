@@ -116,9 +116,12 @@ fn failure_message(error: &anyhow::Error) -> String {
         return format!(
             "HTTP {status}{}",
             if status == 401 {
-                " · login required or credential rejected · choose Login, or run /mcp login-all"
+                format!(
+                    " · login required or credential rejected · {}",
+                    crate::mcp::LOGIN_REMEDIATION
+                )
             } else {
-                " · connection failed"
+                " · connection failed".into()
             }
         );
     }
@@ -127,8 +130,10 @@ fn failure_message(error: &anyhow::Error) -> String {
     }
     // A dead refresh token surfaces as the token endpoint's `invalid_grant`.
     if format!("{error:#}").contains("invalid_grant") {
-        return "Saved login was rejected (invalid_grant) · choose Login, or run /mcp login-all"
-            .into();
+        return format!(
+            "Saved login was rejected (invalid_grant) · {}",
+            crate::mcp::LOGIN_REMEDIATION
+        );
     }
     let reason = error.to_string();
     if reason.contains("cancelled") {
@@ -381,7 +386,7 @@ where
     let targets = crate::auth_command::login_all_targets(
         &entries,
         &|var| std::env::var(var).ok(),
-        &crate::mcp::saved_oauth_valid,
+        &|entry| mcp.saved_login_usable(entry, &crate::mcp::saved_oauth_valid),
     );
     let (color, verbose) = (gate.color, gate.verbose);
     context.cancel.store(false, Ordering::Relaxed);

@@ -25,9 +25,9 @@ fn oauth_policy_from_config(
 }
 
 /// The servers `newt auth --all` and `/mcp login-all` sign in to (#3028), in
-/// discovery order: admitted HTTP servers with no Authorization header (a
-/// configured header or env credential owns its own auth) and no valid saved
-/// OAuth login.
+/// discovery order: admitted HTTP servers with no Authorization header and no
+/// credential-reference header of any name (those own their auth) and no
+/// usable saved OAuth login.
 pub(crate) fn login_all_targets(
     entries: &[newt_core::mcp::McpServerEntry],
     env_lookup: &dyn Fn(&str) -> Option<String>,
@@ -38,10 +38,8 @@ pub(crate) fn login_all_targets(
         .filter(|entry| {
             entry.transport == newt_core::mcp::TransportKind::Http
                 && entry.url.is_some()
-                && !entry
-                    .headers
-                    .keys()
-                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+                && !mcp::has_configured_authorization_header(entry)
+                && !mcp::has_credential_reference_header(entry)
                 && classify_readiness(entry, env_lookup, saved_oauth_valid)
                     == McpReadiness::Configured
         })
@@ -407,6 +405,64 @@ mod tests {
         assert_eq!(
             out.last().unwrap(),
             "signed in to 1 of 3 server(s); stopped, 2 not attempted"
+        );
+    }
+
+    /// #3028 review: a server authenticated by a non-`Authorization`
+    /// credential reference (`X-API-Key = { env = ... }`, a `file` ref, or a
+    /// `${VAR}` literal) is not sent to browser OAuth; an ordinary protocol
+    /// header is not a credential and does not exempt a server.
+    #[test]
+    fn login_all_skips_servers_with_any_credential_reference_header_3028() {
+        use newt_core::agent_identity::SecretRef;
+        use newt_core::mcp::SecretValue;
+        let with_header = |name: &str, header: &str, value: SecretValue| {
+            let mut entry = http(name);
+            entry.headers.insert(header.into(), value);
+            entry
+        };
+        let entries = vec![
+            with_header(
+                "env-key",
+                "X-API-Key",
+                SecretValue::Ref(SecretRef {
+                    env: Some("MCP_REVIEW_KEY".into()),
+                    file: None,
+                    cmd: None,
+                }),
+            ),
+            with_header(
+                "file-key",
+                "X-API-Key",
+                SecretValue::Ref(SecretRef {
+                    env: None,
+                    file: Some("key.txt".into()),
+                    cmd: None,
+                }),
+            ),
+            with_header(
+                "literal-ref",
+                "X-Token",
+                SecretValue::Literal("${MCP_REVIEW_KEY}".into()),
+            ),
+            with_header(
+                "protocol-header",
+                "Accept",
+                SecretValue::Literal("application/json".into()),
+            ),
+        ];
+        let targets = login_all_targets(
+            &entries,
+            &|var| (var == "MCP_REVIEW_KEY").then(|| "k".to_string()),
+            &|_| false,
+        );
+        let names: Vec<&str> = targets.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["protocol-header"]);
+        // The shared classifier agrees: an env credential header is a
+        // configured credential whatever its name.
+        assert_eq!(
+            classify_readiness(&entries[0], &|_| Some("k".into()), &|_| false),
+            McpReadiness::Authenticated
         );
     }
 }
