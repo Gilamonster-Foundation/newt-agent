@@ -1861,6 +1861,15 @@ pub enum AuthState {
     Unregistered,
 }
 
+impl AuthState {
+    /// Whether the connect path can authenticate with this saved state without
+    /// a browser login: `Valid`, or `Expired` (a bound refresh token, #3038).
+    #[must_use]
+    pub fn usable_without_login(&self) -> bool {
+        matches!(self, Self::Valid | Self::Expired)
+    }
+}
+
 /// Scan `~/.hermes/mcp-tokens/` and report only state that the connection path
 /// can actually use for each configured `(name, resource URL)`.
 pub fn auth_status(servers: &[(String, String)]) -> Vec<AuthStatus> {

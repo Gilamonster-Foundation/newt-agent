@@ -161,6 +161,75 @@ fn auth_status_requires_resource_and_issuer_binding() {
     );
 }
 
+/// #3038 review: the load-time auth pass treats a saved login the connect
+/// path can use without a browser as an auth path. A bound, expired token with
+/// a refresh token classifies `Expired` and is usable (connect refreshes it);
+/// one without a refresh token, or a rejected login (`NeedsFlow`, #3032), is
+/// not, and the server is warned.
+#[test]
+fn a_refreshable_expired_login_is_an_auth_path_and_a_rejected_one_is_not_3038() {
+    let resource = "https://mcp.example/team-a";
+    let meta = MetaFile {
+        resource: resource.into(),
+        issuer: "https://auth.example".into(),
+        authorization_endpoint: Some("https://auth.example/authorize".into()),
+        token_endpoint: "https://auth.example/token".into(),
+        code_challenge_methods_supported: vec!["S256".into()],
+        authorization_response_iss_parameter_supported: false,
+        extra: BTreeMap::new(),
+    };
+    let client = ClientFile {
+        client_id: "client".into(),
+        redirect_uris: vec![],
+        issuer: Some(meta.issuer.clone()),
+        extra: BTreeMap::new(),
+    };
+    let expired = |refresh_token: Option<&str>| TokenFile {
+        access_token: "secret".into(),
+        refresh_token: refresh_token.map(str::to_string),
+        expires_at: Some(1_000.0),
+        resource: Some(meta.resource.clone()),
+        issuer: Some(meta.issuer.clone()),
+        extra: BTreeMap::new(),
+    };
+    let state = |token: &TokenFile| {
+        classify_auth_state(resource, Some(token), Some(&meta), Some(&client), 2_000.0)
+    };
+    let refreshable = state(&expired(Some("refresh")));
+    let spent = state(&expired(None));
+    assert_eq!(refreshable, AuthState::Expired);
+    assert_eq!(spent, AuthState::NeedsFlow);
+
+    let entry = |name: &str| {
+        let mut entry: newt_core::mcp::McpServerEntry = toml::from_str(&format!(
+            "name = '{name}'\ntype = 'http'\nurl = '{resource}'\n"
+        ))
+        .unwrap();
+        entry.trust = newt_core::mcp::McpTrust::Trusted;
+        entry
+    };
+    let states = [
+        ("valid", AuthState::Valid),
+        ("refreshable", refreshable),
+        ("spent", spent),
+        ("rejected", AuthState::NeedsFlow),
+        ("migrate", AuthState::NeedsMigration),
+        ("none", AuthState::Unregistered),
+    ];
+    let entries: Vec<_> = states.iter().map(|(name, _)| entry(name)).collect();
+    let warnings = newt_core::mcp::missing_auth_warnings(&entries, &|entry| {
+        states
+            .iter()
+            .any(|(name, state)| *name == entry.name && state.usable_without_login())
+    });
+    let warned: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .filter(|name| warnings.iter().any(|w| w.contains(&format!("`{name}`"))))
+        .collect();
+    assert_eq!(warned, ["spent", "rejected", "migrate", "none"]);
+}
+
 #[test]
 fn token_response_requires_nonempty_bearer_but_allows_unknown_expiry() {
     let token =

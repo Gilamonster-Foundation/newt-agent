@@ -2389,9 +2389,32 @@ impl McpToolset {
             std::path::Path::new(workspace),
             sanitize_server_names,
         );
+        Self::connect_discovered(
+            &entries,
+            sanitize_server_names,
+            caveats,
+            explicit_net_hosts,
+            &mut |warning| tracing::warn!("{warning}"),
+        )
+        .await
+    }
+
+    /// Connect already-discovered `entries`. `warn` receives the #3038 auth
+    /// completeness lines first, before any server is dialed. Headless loads no
+    /// saved OAuth login, so none counts as an auth path here.
+    async fn connect_discovered(
+        entries: &[McpServerEntry],
+        sanitize_server_names: bool,
+        caveats: &Caveats,
+        explicit_net_hosts: &[String],
+        warn: &mut (dyn FnMut(&str) + Send),
+    ) -> Self {
+        for warning in newt_core::mcp::missing_auth_warnings(entries, &|_| false) {
+            warn(&warning);
+        }
         let mut servers = Vec::new();
         let mut connected_prefixes = std::collections::BTreeSet::new();
-        for entry in &entries {
+        for entry in entries {
             // step-1.1: admission gate FIRST. Headless has no interactive
             // approval path, so an untrusted (repo-shipped `.mcp.json` /
             // `~/.claude.json` / project overlay) or disabled server is refused

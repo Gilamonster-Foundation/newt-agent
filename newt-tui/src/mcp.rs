@@ -15,6 +15,10 @@
 //!
 //! Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:53 EDT | Date: 2026-08-12
 
+pub(crate) use newt_core::mcp::{
+    authorization_is_reference, has_configured_authorization_header,
+    has_credential_reference_header,
+};
 use newt_core::mcp::{McpServerEntry, TransportKind};
 use newt_mcp_client::{
     connect_http_with_runtime_bearer, connect_stdio_with_protection, openai_tool_definition,
@@ -216,21 +220,6 @@ fn bearer_allowed_for_url(url: Option<&str>, allow_insecure_hosts: &[String]) ->
             .any(|h| newt_mcp_client::http_host_grant_matches(h, &host))
 }
 
-pub(crate) fn has_configured_authorization_header(entry: &McpServerEntry) -> bool {
-    entry
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-}
-
-/// Any header whose value is a credential reference (`{ env | file | cmd }` or
-/// a whole `${VAR}`), whatever its name: such a server owns its own auth and is
-/// never sent to browser OAuth. A plain literal such as `Accept:
-/// application/json` is protocol, not a credential (#3028).
-pub(crate) fn has_credential_reference_header(entry: &McpServerEntry) -> bool {
-    entry.headers.values().any(authorization_is_reference)
-}
-
 /// The one recovery instruction for a rejected credential, shared by startup
 /// status, the panel and Reconnect failures (#3028).
 pub(crate) const LOGIN_REMEDIATION: &str = "choose Login, or run /mcp login-all";
@@ -239,26 +228,6 @@ pub(crate) fn has_plaintext_authorization_header(entry: &McpServerEntry) -> bool
     entry.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("authorization") && !authorization_is_reference(value)
     })
-}
-
-/// Configured Authorization credentials must remain references at rest. A raw
-/// bearer string in TOML/borrowed JSON is easy to leak through audit, import,
-/// or repository history; the auto-loaded OAuth token is injected only after
-/// this check and is therefore unaffected.
-fn authorization_is_reference(value: &newt_core::mcp::SecretValue) -> bool {
-    match value {
-        newt_core::mcp::SecretValue::Ref(_) => true,
-        newt_core::mcp::SecretValue::Literal(value) => {
-            let candidate = value
-                .trim()
-                .strip_prefix("Bearer ")
-                .unwrap_or_else(|| value.trim());
-            candidate.len() > 3
-                && candidate.starts_with("${")
-                && candidate.ends_with('}')
-                && !candidate[2..candidate.len() - 1].contains(['{', '}'])
-        }
-    }
 }
 
 /// A single admission/auth readiness classification shared by import, doctor,
@@ -345,6 +314,18 @@ pub fn saved_oauth_valid(entry: &McpServerEntry) -> bool {
         crate::mcp_token::auth_status(&[(entry.name.clone(), url.to_string())])
             .iter()
             .any(|s| matches!(s.state, crate::mcp_token::AuthState::Valid))
+    })
+}
+
+/// Whether the token store holds a saved OAuth login the connect path can use
+/// without a browser flow (#3038): valid, or expired with a refresh token the
+/// connect path will spend. A login the resource rejected is not usable.
+/// Reads the store only; never refreshes.
+pub(crate) fn saved_oauth_usable(entry: &McpServerEntry) -> bool {
+    entry.url.as_deref().is_some_and(|url| {
+        crate::mcp_token::auth_status(&[(entry.name.clone(), url.to_string())])
+            .iter()
+            .any(|s| s.state.usable_without_login())
     })
 }
 
@@ -906,11 +887,7 @@ impl Mcp {
             std::path::Path::new(workspace),
             sanitize_server_names,
         );
-        for warning in crate::auth_command::missing_auth_warnings(
-            &entries,
-            &|var| std::env::var(var).ok(),
-            &saved_oauth_valid,
-        ) {
+        for warning in newt_core::mcp::missing_auth_warnings(&entries, &saved_oauth_usable) {
             tracing::warn!("{warning}");
         }
         let mut servers = Vec::new();

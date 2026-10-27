@@ -47,29 +47,6 @@ pub(crate) fn login_all_targets(
         .collect()
 }
 
-/// The load-time auth completeness pass (#3038): one warning line per server
-/// [`login_all_targets`] selects that also has no `oauth_client_id`, i.e. no
-/// viable auth path at session start. A missing `oauth_client_id` alone is not
-/// a gap: `newt auth` registers a client dynamically (RFC 7591) when the
-/// authorization server allows it, so a server with a saved login is not
-/// warned.
-pub(crate) fn missing_auth_warnings(
-    entries: &[newt_core::mcp::McpServerEntry],
-    env_lookup: &dyn Fn(&str) -> Option<String>,
-    saved_oauth_valid: &dyn Fn(&newt_core::mcp::McpServerEntry) -> bool,
-) -> Vec<String> {
-    login_all_targets(entries, env_lookup, saved_oauth_valid)
-        .iter()
-        .filter(|entry| entry.oauth_client_id.is_none())
-        .map(|entry| {
-            let name = &entry.name;
-            format!(
-                "MCP server `{name}` (http) has no auth: no `headers.Authorization`, no `oauth_client_id`, no saved login; run `newt auth {name}`, or set one of those keys"
-            )
-        })
-        .collect()
-}
-
 /// Sign in to each target in turn through `login` (#3028), writing a ✓/✗ line
 /// per server and a summary to `out`. `stop` (Ctrl-C) ends the run early;
 /// logins that already finished stay saved. An error when any login failed or
@@ -363,50 +340,6 @@ mod tests {
         );
         let names: Vec<&str> = targets.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["needs-a", "needs-b"]);
-    }
-
-    /// #3038: an HTTP server with no viable auth path is warned at load,
-    /// naming the missing keys and the fix. An Authorization header, a
-    /// credential-reference header of any name, or `oauth_client_id` is an
-    /// auth configuration; a saved (dynamically registered) login is a viable
-    /// path even without `oauth_client_id`.
-    #[test]
-    fn missing_auth_warnings_name_only_servers_with_no_auth_path_3038() {
-        use newt_core::agent_identity::SecretRef;
-        use newt_core::mcp::SecretValue;
-        let mut plaintext = http("plaintext");
-        plaintext.headers.insert(
-            "Authorization".into(),
-            SecretValue::Literal("Bearer abc".into()),
-        );
-        let mut api_key = http("api-key");
-        api_key.headers.insert(
-            "X-API-Key".into(),
-            SecretValue::Ref(SecretRef {
-                env: None,
-                file: Some("key.txt".into()),
-                cmd: None,
-            }),
-        );
-        let mut client_id = http("client-id");
-        client_id.oauth_client_id = Some("newt-public".into());
-        let mut stdio = http("stdio");
-        stdio.transport = newt_core::mcp::TransportKind::Stdio;
-        stdio.url = None;
-        let entries = vec![
-            http("bare"),
-            plaintext,
-            api_key,
-            client_id,
-            http("dcr-login"),
-            stdio,
-        ];
-        let warnings =
-            missing_auth_warnings(&entries, &|_| None, &|entry| entry.name == "dcr-login");
-        assert_eq!(
-            warnings,
-            ["MCP server `bare` (http) has no auth: no `headers.Authorization`, no `oauth_client_id`, no saved login; run `newt auth bare`, or set one of those keys"]
-        );
     }
 
     /// #3028: every target is attempted in order, each gets a ✓/✗ line, the
