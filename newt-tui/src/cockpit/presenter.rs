@@ -11,11 +11,17 @@
 //! when they push past the bottom the terminal scrolls them into history
 //! exactly as a plain `println!` would have.
 //!
-//! **No cursor queries after start.** Once fd 1 is on the pty, `ESC[6n` would
-//! go to the pty and its answer would never come — so the viewport is
-//! [`Viewport::Fixed`], placed by arithmetic, and the one position query
-//! happens in [`Presenter::open`] before the capture is installed. Two
-//! consequences follow and are enforced here rather than remembered:
+//! **One cursor query at start, one per resize.** Once fd 1 is on the pty, a plain
+//! `ESC[6n` would go to the pty and its answer would never come — so the viewport is
+//! [`Viewport::Fixed`], placed by arithmetic, and the position query happens in
+//! [`Presenter::open`] before the capture is installed. The only later query is the one a
+//! terminal resize needs (#3014): terminals disagree on what a grow does to the screen, so the
+//! block's new top is MEASURED, by asking the real terminal where its cursor is
+//! ([`PtyCapture::query_cursor`] writes the query to the saved terminal handle, not fd 1) and
+//! subtracting where the caret sits in the block. No answer means the old guess
+//! ([`resize_new_top`]) and no second question. (A grow pins the block to the new bottom either
+//! way; the measurement then tells the resize where the OLD block was, so it can erase it.) Two consequences follow and are enforced
+//! here rather than remembered:
 //! [`ScrollbackSink`] is implemented by hand (ratatui's `insert_before` is a
 //! silent no-op on `Fixed`), and autowrap is OFF while the cockpit owns the
 //! terminal with every row pre-wrapped to `cols` — so a row is a row, and the
@@ -62,8 +68,10 @@ use crossterm::style::{
 };
 use crossterm::terminal::{Clear, ClearType, EnableLineWrap};
 use crossterm::{execute, queue};
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, ClearType as BackendClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::Cell;
 use ratatui::layout::Rect;
+use ratatui::layout::{Position, Size};
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -215,13 +223,90 @@ impl std::os::fd::AsRawFd for WrapFence {
     }
 }
 
+/// The caret ratatui last placed, as `y << 16 | x`, or [`NO_CARET`].
+type CaretCell = Arc<std::sync::atomic::AtomicU32>;
+const NO_CARET: u32 = u32::MAX;
+
+/// A backend that remembers where ratatui last put the caret (#3014). A resize needs the
+/// caret's row to turn the terminal's cursor reply back into the block's top, and ratatui
+/// keeps that position private; this is the one place every draw reports it.
+struct CaretBackend<W: Write = File> {
+    inner: CrosstermBackend<WrapFence<W>>,
+    caret: CaretCell,
+}
+
+impl<W: Write> Backend for CaretBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.draw(content)
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.caret.store(NO_CARET, Ordering::Relaxed);
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let position = position.into();
+        self.caret.store(
+            (u32::from(position.y) << 16) | u32::from(position.x),
+            Ordering::Relaxed,
+        );
+        self.inner.set_cursor_position(position)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: BackendClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+}
+
+/// Where the caret was the last time the block was fully drawn, and the geometry that draw
+/// had. It answers a resize only while that geometry still holds (#3014).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaretFrame {
+    top: u16,
+    block_h: u16,
+    cols: u16,
+    rows: u16,
+    /// The caret's absolute row at that draw.
+    y: u16,
+    /// The caret's column: a narrower terminal may wrap the caret's own row before it.
+    x: u16,
+}
+
 /// The screen: the real terminal, and where the block is on it.
 ///
 /// Split from [`Presenter`] so the editor can be handed `&mut Screen` as its
 /// [`ScrollbackSink`] while the presenter still borrows the editor.
 struct Screen<W: Write = File> {
     tty: WrapFence<W>,
-    term: Terminal<CrosstermBackend<WrapFence<W>>>,
+    term: Terminal<CaretBackend<W>>,
+    caret: CaretCell,
+    /// The caret at the last complete draw; see [`CaretFrame`].
+    caret_frame: Option<CaretFrame>,
+    /// Cleared the first time the terminal fails to answer a cursor query, so a terminal
+    /// without DSR support pays for one wait, not one per resize.
+    can_query_cursor: bool,
     cols: u16,
     rows: u16,
     /// First row of the block (0-based).
@@ -348,8 +433,20 @@ impl Screen {
         )
     }
 
+    /// Output other than a draw has moved, or is about to move, the cursor off the caret: the
+    /// last draw's [`CaretFrame`] no longer says where it is, and unchanged geometry does not
+    /// either (a full screen scrolls under `insert_rows` with `top` and `block_h` intact).
+    /// Only a fresh draw makes the frame trustworthy again (#3014).
+    fn moved_cursor(&mut self) {
+        self.caret_frame = None;
+    }
+
     fn rebuild_term(&mut self) -> io::Result<()> {
-        let backend = CrosstermBackend::new(self.tty.fenced_clone()?);
+        self.moved_cursor();
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(self.tty.fenced_clone()?),
+            caret: Arc::clone(&self.caret),
+        };
         self.term = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -371,6 +468,7 @@ impl Screen {
         requested: u16,
         erase_from: u16,
     ) -> io::Result<ModalReservation> {
+        self.moved_cursor();
         let plan = plan_modal_reservation(self.top, self.rows, requested);
         self.tty.hold()?;
         let mut buf = Vec::new();
@@ -400,6 +498,7 @@ impl Screen {
         transcript_end: u16,
         requested: u16,
     ) -> io::Result<ModalReservation> {
+        self.moved_cursor();
         let plan = plan_modal_reservation(transcript_end, self.rows, requested);
         self.tty.hold()?;
         let buf = modal_reserve_bytes(occupied_top, transcript_end, self.rows, &plan)?;
@@ -410,6 +509,7 @@ impl Screen {
     }
 
     fn place_cursor(&mut self, row: u16) -> io::Result<()> {
+        self.moved_cursor();
         execute!(self.tty, MoveTo(0, row))?;
         self.tty.flush()
     }
@@ -418,6 +518,7 @@ impl Screen {
     /// transcript so the rows the panel scrolled the transcript out of are reclaimed rather
     /// than left blank in scrollback (#3012). The only way to release a reservation.
     fn release_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
+        self.moved_cursor();
         if reservation.chat_visible {
             return Ok(());
         }
@@ -451,6 +552,7 @@ impl Screen {
     /// re-seats the block viewport at its new top. All arithmetic, no queries —
     /// see the module docs.
     fn insert_rows(&mut self, rows: Vec<Row>) -> io::Result<()> {
+        self.moved_cursor();
         let cols = self.cols as usize;
         let phys: Vec<Row> = rows.iter().flat_map(|r| wrap_row(r, cols)).collect();
         if phys.is_empty() || phys.len() > u16::MAX as usize {
@@ -478,6 +580,7 @@ impl Screen {
     /// Change the block's height (the editor grew, the status row appeared…).
     /// Scrolls the transcript up if the taller block would not fit below it.
     fn relayout(&mut self, editor_rows: u16, status_rows: u16) -> io::Result<()> {
+        self.moved_cursor();
         let new_h = (editor_rows + status_rows).clamp(1, self.rows.max(1));
         if new_h == self.block_h && status_rows == self.status_rows {
             return Ok(());
@@ -503,31 +606,52 @@ impl Screen {
         self.rebuild_term()
     }
 
-    /// The terminal changed size: keep the block where the content actually
-    /// ends when it still fits there, and only fall back to the bottom
-    /// anchor when it doesn't. The transcript above is the terminal's to
-    /// reflow.
+    /// The terminal changed size: a grow pins the block to the new bottom
+    /// ([`resize_new_top`]); otherwise it stays where the content ends while it
+    /// still fits. The transcript above is the terminal's to reflow.
     fn resize(
         &mut self,
         cols: u16,
         rows: u16,
         editor_rows: u16,
         status_rows: u16,
+        measured_top: Option<u16>,
     ) -> io::Result<()> {
-        let old_top = self.top;
-        // Narrowing reflows any old block row wider than the new terminal onto
-        // extra rows, lifting the stale block above `old_top`.
-        let lifted = if cols.max(1) < self.cols {
-            reflow_growth(&self.painted_widths, cols.max(1))
-        } else {
-            0
+        // Narrowing reflows any old block row wider than the new terminal onto extra rows.
+        let growth = |widths: &[usize]| {
+            if cols.max(1) < self.cols {
+                reflow_growth(widths, cols.max(1))
+            } else {
+                0
+            }
         };
+        // Where the block WAS, once the terminal has had its say. Measured (#3014): the
+        // reply already includes where the reflow put the block, so only rows reflowed
+        // BEFORE the caret (the rows above it, and its own row's text left of it) are still
+        // unaccounted for; erasing a further `growth` rows up would eat transcript.
+        // Unmeasured: the old top is right only when nothing moved, and the whole reflow
+        // lifted the stale block above it.
+        let measured_top = measured_top.zip(self.caret_frame).and_then(|(top, frame)| {
+            let row = usize::from(frame.y.saturating_sub(frame.top)).min(self.painted_widths.len());
+            let own = caret_row_wrap(
+                frame.x,
+                self.painted_widths.get(row).copied().unwrap_or(0),
+                cols,
+            )?;
+            Some(top.saturating_sub(growth(&self.painted_widths[..row]).saturating_add(own)))
+        });
+        let (old_top, lifted) = match measured_top {
+            Some(top) => (top, 0),
+            None => (self.top, growth(&self.painted_widths)),
+        };
+        let old_rows = self.rows;
         self.cols = cols.max(1);
         self.rows = rows.max(1);
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
         self.block_h = new_h;
         self.status_rows = status_rows;
-        self.top = resize_new_top(old_top, self.rows, new_h);
+        self.top = resized_top(measured_top, self.top, old_rows, self.rows, new_h);
+        self.caret_frame = None;
         // FORCED: the TERMINAL resized; the block's new position is a
         // consequence, not a request.
         self.region.relocate(
@@ -635,8 +759,18 @@ impl<W: Write> Screen<W> {
             self.tty.write_all(&buf)?;
             self.tty.flush()?;
         }
+        self.caret.store(NO_CARET, Ordering::Relaxed);
         let frame = self.term.draw(|f| editor.draw(f, chrome, chat_inactive))?;
         let area = frame.area;
+        let placed = self.caret.load(Ordering::Relaxed);
+        self.caret_frame = (placed != NO_CARET).then_some(CaretFrame {
+            top: self.top,
+            block_h: self.block_h,
+            cols: self.cols,
+            rows: self.rows,
+            y: (placed >> 16) as u16,
+            x: (placed & 0xFFFF) as u16,
+        });
         widths.extend((area.top()..area.bottom()).map(|y| {
             (area.left()..area.right())
                 .rev()
@@ -735,26 +869,56 @@ fn restore_terminal_modes() {
     let _ = write_mode_restores(&mut io::stdout());
 }
 
-/// Where the block moves to on a resize event (#2441, #2632).
+/// Where the block moves to on a resize event (#2441, #2632, #3014).
 ///
-/// A terminal that GROWS does not pull the transcript down to meet a
-/// bottom-anchored block — most terminals add the new rows below existing
-/// content instead of scrolling it (confirmed against a real herdr pane
-/// grow, #2441 evidence) — so jumping straight to `new_rows - new_h` opens a
-/// blank canyon between the transcript, which stayed where it was, and the
-/// block, which jumped to the new bottom.
+/// **A terminal that GROWS pins the block to the new bottom** (maintainer decision on
+/// #3014 item 2). Terminals disagree on what a grow does to the transcript (some add rows
+/// below it, some pull it down), but the prompt stays where the operator's eyes and the
+/// keyboard are, the bottom row; the gap a bottom-adding terminal leaves above it is the
+/// accepted cost. This reverses the #2632 "stay under the content" rule for grows only.
 ///
-/// This holds for ANY resize event, not only a grow: a same-size
-/// notification (no content moved at all) and a height-only shrink that
-/// still leaves the block room both leave the transcript exactly where it
-/// was, so `old_top` is still correct ground truth there too. Move the block
-/// only when it no longer fits at `old_top` — the one case where the old
-/// position is not a valid answer — and fall back to the bottom anchor then.
-fn resize_new_top(old_top: u16, new_rows: u16, new_h: u16) -> u16 {
-    if old_top.saturating_add(new_h) <= new_rows {
+/// Every other resize (same size, or a shrink) leaves the transcript where it was, so
+/// `old_top` is still ground truth there. Move the block only when it no longer fits at
+/// `old_top`, and bottom-anchor it then.
+fn resize_new_top(old_top: u16, old_rows: u16, new_rows: u16, new_h: u16) -> u16 {
+    if new_rows <= old_rows && old_top.saturating_add(new_h) <= new_rows {
         old_top
     } else {
         new_rows.saturating_sub(new_h)
+    }
+}
+
+/// The block's top after a resize: a grow pins it to the bottom; otherwise the position the
+/// terminal reported when it was measured (#3014), else [`resize_new_top`]'s guess from the
+/// old top. Either way the block must fit the new screen.
+fn resized_top(
+    measured: Option<u16>,
+    current_top: u16,
+    old_rows: u16,
+    new_rows: u16,
+    new_h: u16,
+) -> u16 {
+    resize_new_top(measured.unwrap_or(current_top), old_rows, new_rows, new_h)
+}
+
+/// The block's top, from the row the terminal says its cursor is on and where the caret sits
+/// inside the block (`caret_offset` rows below the top). `None` when the reply is above the
+/// caret's own offset (a reply that cannot be this block's).
+fn block_top_from_reply(cursor_row: u16, caret_offset: u16) -> Option<u16> {
+    cursor_row.checked_sub(caret_offset)
+}
+
+/// How many rows further down a terminal `cols` wide reflows a caret at column `x` of a row
+/// whose text is `width` wide: the caret travels with the text left of it. `None` when the
+/// caret sits past the text and past the new width, where terminals disagree.
+fn caret_row_wrap(x: u16, width: usize, cols: u16) -> Option<u16> {
+    let cols = cols.max(1);
+    if x < cols {
+        Some(0)
+    } else if usize::from(x) < width {
+        Some(x / cols)
+    } else {
+        None
     }
 }
 
@@ -998,7 +1162,11 @@ impl Presenter {
         };
         let capture = PtyCapture::install(cols, rows)?;
         let tty = WrapFence::new(capture.tty().try_clone()?);
-        let backend = CrosstermBackend::new(tty.fenced_clone()?);
+        let caret: CaretCell = Arc::new(std::sync::atomic::AtomicU32::new(NO_CARET));
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(tty.fenced_clone()?),
+            caret: Arc::clone(&caret),
+        };
         let term = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -1018,6 +1186,9 @@ impl Presenter {
         let mut screen = Screen {
             tty,
             term,
+            caret,
+            caret_frame: None,
+            can_query_cursor: true,
             cols,
             rows,
             top,
@@ -1499,9 +1670,58 @@ impl Presenter {
                 drop(_stdin);
                 return self.on_event(evt);
             }
+            if let Event::Resize(cols, rows) = evt {
+                // The terminal's own resize arrives here, and only here: measure where it
+                // left the block rather than guess. Internal re-layouts keep the guess.
+                self.dirty = true;
+                let measured = self.measure_block_top();
+                self.resize_to(cols, rows, measured)?;
+                continue;
+            }
             self.on_event(evt)?;
         }
         Ok(())
+    }
+
+    /// Apply a new terminal size. `measured_top` is where the terminal says the block now
+    /// is (#3014); `None` keeps the arithmetic guess ([`resize_new_top`]).
+    fn resize_to(&mut self, cols: u16, rows: u16, measured_top: Option<u16>) -> io::Result<()> {
+        self.capture.resize(cols, rows);
+        let status_rows = self.status_rows();
+        let editor_rows = self.editor.wanted_rows(cols, rows, &self.surface.chrome());
+        self.screen
+            .resize(cols, rows, editor_rows, status_rows, measured_top)
+    }
+
+    /// Where the block's top is now, MEASURED: ask the terminal where its cursor is and
+    /// subtract where the caret sits in the block. Terminals disagree on what a resize does
+    /// to the screen (some pull scrollback down, some add rows below), so the old top is a
+    /// guess; the cursor is the one thing every terminal answers (#3014). `None` when the
+    /// answer cannot be trusted: a modal owns the cursor, the block moved since its last
+    /// draw, or the terminal does not reply (then the guess stands, and the question is not
+    /// asked again).
+    fn measure_block_top(&mut self) -> Option<u16> {
+        let screen = &self.screen;
+        let frame = screen.caret_frame?;
+        let current = CaretFrame {
+            top: screen.top,
+            block_h: screen.block_h,
+            cols: screen.cols,
+            rows: screen.rows,
+            y: frame.y,
+            x: frame.x,
+        };
+        if self.chat_inactive || !screen.can_query_cursor || frame != current {
+            return None;
+        }
+        let offset = frame.y.checked_sub(frame.top)?;
+        match self.capture.query_cursor() {
+            Ok((_, row)) => block_top_from_reply(row, offset),
+            Err(_) => {
+                self.screen.can_query_cursor = false;
+                None
+            }
+        }
     }
 
     fn on_event(&mut self, evt: Event) -> io::Result<()> {
@@ -1526,12 +1746,7 @@ impl Presenter {
                 }
                 Ok(())
             }
-            Event::Resize(cols, rows) => {
-                self.capture.resize(cols, rows);
-                let status_rows = self.status_rows();
-                let editor_rows = self.editor.wanted_rows(cols, rows, &self.surface.chrome());
-                self.screen.resize(cols, rows, editor_rows, status_rows)
-            }
+            Event::Resize(cols, rows) => self.resize_to(cols, rows, None),
             // #2005: the ladder decides, from `assets/esc_ladder.toml`. This
             // arm replaced a hand-written Ctrl-C predicate; it is the SAME
             // interrupt, widened to Esc, not a second mechanism beside it.
@@ -2027,6 +2242,180 @@ mod tests {
         );
     }
 
+    /// #3014 mocked tier: the cursor the terminal reports locates the block it left behind
+    /// (what the resize must erase), and a GROW pins the block to the new bottom whatever
+    /// the terminal did (maintainer decision on item 2). Without a grow, the block's top
+    /// follows the measured position.
+    #[test]
+    fn a_resize_follows_the_cursor_the_terminal_reports_not_a_guess() {
+        // A 24-row screen, a 4-row block at the bottom (top 20) with the caret on its
+        // second row (offset 1), grown to 34 rows.
+        let (old_top, offset, old_rows, new_rows, new_h) = (20u16, 1u16, 24u16, 34u16, 4u16);
+        let below = block_top_from_reply(old_top + offset, offset);
+        assert_eq!(below, Some(20));
+        let pulled = block_top_from_reply(old_top + offset + 10, offset);
+        assert_eq!(pulled, Some(30));
+        // A grow pins to the bottom (30) for a terminal that adds rows below, one that
+        // pulls scrollback down, and one that never answers.
+        for measured in [below, pulled, None] {
+            assert_eq!(
+                resized_top(measured, old_top, old_rows, new_rows, new_h),
+                30
+            );
+        }
+        // Not a grow: the measured position stands while it fits...
+        assert_eq!(resized_top(Some(12), 20, 34, 34, 4), 12);
+        // ...and a measured top that no longer fits the shrunk screen is clamped.
+        assert_eq!(resized_top(Some(30), 20, 34, 24, 4), 20);
+        // A reply above the caret's own offset cannot be this block's.
+        assert_eq!(block_top_from_reply(0, 3), None);
+    }
+
+    /// A screen over a scratch file with a painted block, for driving `resize` and
+    /// reading the bytes it wrote.
+    fn screen_with_block(
+        cols: u16,
+        rows: u16,
+        top: u16,
+        block_h: u16,
+        widths: &[usize],
+        (caret_x, caret_y): (u16, u16),
+    ) -> (Screen, std::fs::File) {
+        let file = tempfile::tempfile().unwrap();
+        let reader = file.try_clone().unwrap();
+        let tty = WrapFence::new(file);
+        let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(tty.fenced_clone().unwrap()),
+            caret: Arc::clone(&caret),
+        };
+        let term = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, top, cols, block_h)),
+            },
+        )
+        .unwrap();
+        let region = newt_core::tty::Terminal::lease_region(
+            block_region(top, block_h),
+            newt_core::tty::OnCollision::Refuse,
+        )
+        .expect("the test owns these rows");
+        let screen = Screen {
+            tty,
+            term,
+            caret,
+            caret_frame: Some(CaretFrame {
+                top,
+                block_h,
+                cols,
+                rows,
+                y: caret_y,
+                x: caret_x,
+            }),
+            can_query_cursor: true,
+            cols,
+            rows,
+            top,
+            block_h,
+            status_rows: 1,
+            status: Vec::new(),
+            queued: 0,
+            region,
+            painted_widths: widths.to_vec(),
+        };
+        (screen, reader)
+    }
+
+    /// The first row (zero-based) the resize erased downward from.
+    fn first_erase_row(mut written: std::fs::File) -> u16 {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut bytes = Vec::new();
+        written.seek(SeekFrom::Start(0)).unwrap();
+        written.read_to_end(&mut bytes).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let at = text.find("\x1b[J").expect("resize erases downward");
+        let (row, _) = text[..at]
+            .rsplit_once("\x1b[")
+            .and_then(|(_, m)| m.strip_suffix('H'))
+            .and_then(|m| m.split_once(';'))
+            .expect("a cursor move precedes the erase");
+        row.parse::<u16>().unwrap() - 1
+    }
+
+    /// #3021 review: a width shrink whose footer wraps BELOW the caret. The terminal's
+    /// reply already includes the scroll that reflow caused (block top 20), so erasing
+    /// from `20 - growth` deleted the last transcript row above the block.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_does_not_erase_transcript_above_the_block() {
+        // 80x24, three-row block at row 21, caret on row 22; shrink to 40 wraps the
+        // 70-column footer (+1 row), scrolling the block to row 20.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], (5, 22));
+        screen.resize(40, 24, 2, 1, Some(20)).unwrap();
+        assert_eq!(first_erase_row(log), 20, "row 19 is transcript");
+    }
+
+    /// The other side: a row ABOVE the caret wraps, pushing the caret down past the
+    /// block's own offset, so the measured top reads one row too low.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_with_a_wrapped_row_above_the_caret_erases_the_whole_block() {
+        // Header (70 cols) wraps to two rows: the block now starts at 20 with the
+        // caret on row 22, so `reply - offset` reads 21.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[70, 10, 10], (5, 22));
+        screen.resize(40, 24, 2, 1, Some(21)).unwrap();
+        assert_eq!(
+            first_erase_row(log),
+            20,
+            "the wrapped header row is erased too"
+        );
+    }
+
+    /// #3021 review, round 3: the caret's OWN row wraps before the caret. The input row
+    /// (70 cols, caret at column 60) splits at 40, carrying the caret one row further down,
+    /// so the reply reads one row lower than the header's wrap alone explains.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_with_the_caret_row_wrapped_before_the_caret_erases_the_whole_block()
+    {
+        // Block at 10: header 80 cols (+1 row), input 70 cols with the caret at (60, 11).
+        // At 40 cols the block stays at 10 and the caret lands on row 13.
+        let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (60, 11));
+        screen.resize(40, 24, 3, 1, Some(12)).unwrap();
+        assert_eq!(first_erase_row(log), 10, "the old header row is erased too");
+    }
+
+    /// The control: the caret sits in the first fragment of its row, so only the header's
+    /// wrap moved it.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_with_the_caret_before_its_rows_wrap_point_erases_the_block() {
+        let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (10, 11));
+        screen.resize(40, 24, 3, 1, Some(11)).unwrap();
+        assert_eq!(first_erase_row(log), 10);
+    }
+
+    /// The caret past its row's text, beyond the new width: terminals disagree on where
+    /// reflow puts it, so the reply is not trusted and the unmeasured guess stands.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_caret_past_its_rows_text_beyond_the_new_width_falls_back_to_the_guess() {
+        let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 50, 10], (60, 11));
+        screen.resize(40, 24, 3, 1, Some(12)).unwrap();
+        // Unmeasured: old top 10 lifted by the whole reflow (header +1, input +1).
+        assert_eq!(first_erase_row(log), 8);
+    }
+
+    /// Unmeasured, the guess still subtracts the whole reflow.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_unmeasured_width_shrink_still_lifts_by_the_whole_reflow() {
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], (5, 22));
+        screen.resize(40, 24, 2, 1, None).unwrap();
+        assert_eq!(first_erase_row(log), 20);
+    }
+
     /// The screen after a transcript of `lines` rows, a block of `block_h` rows under it, then a
     /// panel reserved for each of `requests` in turn (the operator sizing it), then released and
     /// one more transcript line inserted where the block now sits. Returns that screen.
@@ -2252,10 +2641,14 @@ mod tests {
     fn a_production_draw_reaches_the_writer_as_one_synchronized_write() {
         let log = Boundaries::default();
         let tty = WrapFence::new(log.clone());
-        let backend = CrosstermBackend::new(WrapFence {
-            file: log.clone(),
-            state: Arc::clone(&tty.state),
-        });
+        let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(WrapFence {
+                file: log.clone(),
+                state: Arc::clone(&tty.state),
+            }),
+            caret: Arc::clone(&caret),
+        };
         let (cols, top, block_h) = (40, 2, 4);
         let term = Terminal::with_options(
             backend,
@@ -2272,6 +2665,9 @@ mod tests {
         let mut screen = Screen {
             tty,
             term,
+            caret,
+            caret_frame: None,
+            can_query_cursor: true,
             cols,
             rows: 10,
             top,
@@ -2420,72 +2816,44 @@ mod tests {
         assert!(panel_erase_from(20, 8, 100, 118, 31, 8) > 0);
     }
 
-    /// #2441: a herdr pane grew from 30 to 63 rows with the block at top 27,
-    /// height 3. Before this fix the block jumped to `63 - 3 = 60`, opening a
-    /// 30-row blank canyon between the untouched transcript and the block —
-    /// exactly the "rows 27-60 blank" gap the evidence files captured. It
-    /// must stay put, directly under the existing content, instead.
+    /// #3014 item 2 (maintainer decision, reversing #2441/#2632 for grows): a herdr pane
+    /// grew from 30 to 63 rows with the block at top 27, height 3. The block is pinned to
+    /// the new bottom row, `63 - 3 = 60`, not left under the content.
     #[test]
-    fn growing_the_terminal_keeps_the_block_under_existing_content_2441() {
-        assert_eq!(resize_new_top(27, 63, 3), 27);
+    fn growing_the_terminal_pins_the_block_to_the_new_bottom_3014() {
+        assert_eq!(resize_new_top(27, 30, 63, 3), 60);
+        // Pinned already: a second grow moves it again, and a same-size notice does not.
+        assert_eq!(resize_new_top(60, 63, 90, 3), 87);
+        assert_eq!(resize_new_top(60, 63, 63, 3), 60);
     }
 
     #[test]
     fn a_shrinking_terminal_still_bottom_anchors_the_block() {
-        assert_eq!(resize_new_top(20, 10, 3), 7);
-    }
-
-    /// #2632 review finding 2: the old fallback test claimed to cover growth
-    /// but actually shrank (28 < 30 rows). Use a real grow that still doesn't
-    /// fit: old top 27 + height 5 would land on row 32, past the new 31-row
-    /// screen, so it must bottom-anchor instead of hanging off-screen.
-    #[test]
-    fn growth_too_small_for_the_block_to_fit_falls_back_to_the_bottom() {
-        assert_eq!(resize_new_top(27, 31, 5), 26);
+        assert_eq!(resize_new_top(20, 24, 10, 3), 7);
     }
 
     #[test]
-    fn equal_rows_keeps_the_existing_bottom_anchor_behavior() {
-        assert_eq!(resize_new_top(20, 24, 4), 20);
+    fn a_grow_by_one_row_pins_the_block_too_3014() {
+        assert_eq!(resize_new_top(27, 30, 31, 5), 26);
     }
 
-    /// #2632 review finding 1: a same-size notification (no rows added or
-    /// removed at all) used to fall through to the bottom-anchor branch and
-    /// silently move a block that was never bottom-anchored to begin with —
-    /// recreating the exact #2441 gap with no terminal movement. Repeated
-    /// same-size resizes, and repeated grows, must both keep the block at the
-    /// one position the content actually ends.
+    /// #2632 review finding 1, kept: a same-size notification (no rows added or removed)
+    /// must not move a block, so it cannot recreate a gap with no terminal movement.
     #[test]
-    fn repeated_same_size_resizes_do_not_recreate_the_gap_2632() {
-        // 30 -> 63 (grow, matches #2441) -> 63 (no-op notification).
-        let top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        let top = resize_new_top(top, 63, 3);
+    fn repeated_same_size_resizes_do_not_move_the_block_2632() {
+        assert_eq!(resize_new_top(20, 24, 24, 4), 20);
         assert_eq!(
-            top, 27,
-            "a same-size resize must not move a block that already fits"
+            resize_new_top(15, 24, 24, 4),
+            15,
+            "off the bottom, still fits"
         );
     }
 
-    #[test]
-    fn repeated_grows_keep_the_block_under_the_content_2632() {
-        let mut top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        top = resize_new_top(top, 90, 3);
-        assert_eq!(top, 27);
-    }
-
-    /// #2632 review finding 1: a height-only shrink that still leaves the
-    /// block room must not move it down to a new bottom anchor — the block
-    /// at its old, non-bottom position still fits, so it stays.
+    /// #2632 review finding 1, kept: a height-only shrink that still leaves the block room
+    /// must not re-anchor it.
     #[test]
     fn a_partial_shrink_that_still_fits_keeps_the_old_position_2632() {
-        // Grown to 63 with the block at 27 (matches #2441), then shrunk to
-        // 40: 27 + 3 = 30 <= 40, so the block still fits at 27.
-        let top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        let top = resize_new_top(top, 40, 3);
-        assert_eq!(top, 27, "old position still fits; must not re-anchor to 37");
+        assert_eq!(resize_new_top(27, 63, 40, 3), 27);
     }
 
     #[test]
@@ -2550,7 +2918,7 @@ pub(crate) use terminal_acceptance::cockpit_psyche_case;
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
     cockpit_clarification_input_case, cockpit_panel_gap_case, cockpit_panel_loop_case,
-    panel_live_resize_case, panel_resize_case,
+    cockpit_resize_anchor_case, panel_live_resize_case, panel_resize_case,
 };
 
 #[cfg(test)]

@@ -155,6 +155,11 @@ fn interaction_view_child() {
         "cockpit_panel_loop" => {
             crate::cockpit::presenter::cockpit_panel_loop_case();
         }
+        "cockpit_resize_anchor" | "cockpit_resize_anchor_dirty" => {
+            crate::cockpit::presenter::cockpit_resize_anchor_case(
+                mode == "cockpit_resize_anchor_dirty",
+            );
+        }
         "cockpit_panel_gap" => {
             crate::cockpit::presenter::cockpit_panel_gap_case();
         }
@@ -419,6 +424,8 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
             | "cockpit_buffered_input"
             | "cockpit_pager"
             | "cockpit_panel_loop"
+            | "cockpit_resize_anchor"
+            | "cockpit_resize_anchor_dirty"
             | "cockpit_panel_gap"
             | "cockpit_psyche"
     ) {
@@ -991,6 +998,117 @@ pub(crate) fn drive_cockpit_panel_close() {
         status.is_some_and(|status| status.success()),
         "{status:?}: {transcript:?}"
     );
+}
+
+/// `rows=N top=M` out of the last `marker` line on the screen.
+fn marker_numbers(screen: &str, marker: &str) -> Option<(u16, u16)> {
+    let line = screen.lines().rev().find(|l| l.contains(marker))?;
+    // The marker row is followed by a style reset: read the digits only.
+    let field = |name: &str| -> Option<u16> {
+        let tail = line.split(name).nth(1)?;
+        let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    Some((field("rows=")?, field("top=")?))
+}
+
+/// #3014: grow the terminal under a cockpit whose block sits at the bottom, once for a
+/// terminal that adds rows below (the block stays where it was) and once for one that pulls
+/// scrollback down by the new rows (the block follows its content). The cockpit asks where
+/// the cursor is and re-anchors from the answer; a guess from the old top gets the second
+/// wrong.
+pub(crate) fn drive_cockpit_resize_anchor() {
+    // `shift` is how far the terminal moves the content on the grow; `None` is a terminal
+    // that never answers a cursor query, so the old arithmetic guess must stand.
+    // `dirty`: output lands after the last draw and before the resize (#3014 review P2), so
+    // the cursor is not at the caret and must not be read as if it were.
+    for (name, shift, dirty) in [
+        ("adds rows below", Some(0i32), false),
+        ("pulls scrollback down", Some(10), false),
+        ("never answers a cursor query", None, false),
+        ("adds rows below after output landed", Some(0), true),
+    ] {
+        let state = std::sync::Arc::new(std::sync::Mutex::new((0i32, 24usize)));
+        let model_state = state.clone();
+        let pty = match shift {
+            Some(_) => Pty::open_with_cursor_model(move |stream| {
+                let (shift, rows) = *model_state.lock().unwrap();
+                let (_, (row, col)) = erasing_screen(stream, rows);
+                (u16::try_from(row as i32 + shift).unwrap_or(0), col as u16)
+            }),
+            None => Pty::open(),
+        };
+        pty.resize(24, 80);
+        let mut child = spawn_child(
+            &pty,
+            if dirty {
+                "cockpit_resize_anchor_dirty"
+            } else {
+                "cockpit_resize_anchor"
+            },
+        );
+        let mut transcript = String::new();
+        let result = (|| -> Result<(), String> {
+            if !pty.wait_for_screen("ANCHOR_READY", REACH_TIMEOUT) {
+                return Err("the cockpit never became ready".into());
+            }
+            transcript.push_str(&pty.screen());
+            let (rows, top) = marker_numbers(&transcript, "ANCHOR_READY").ok_or_else(|| {
+                let seen: Vec<_> = transcript
+                    .lines()
+                    .filter(|l| l.contains("ANCHOR"))
+                    .collect();
+                format!("no ANCHOR_READY numbers in {seen:?}")
+            })?;
+            if rows != 24 || top >= 24 {
+                return Err(format!("unexpected start geometry rows={rows} top={top}"));
+            }
+            // The terminal tells the truth about the move the harness is about to make.
+            state.lock().unwrap().0 = shift.unwrap_or(0);
+            pty.resize(34, 80);
+            signal_winch(child.id());
+            if !pty.wait_for_screen("ANCHOR_RESULT", REACH_TIMEOUT) {
+                return Err("the resize never reached the cockpit".into());
+            }
+            transcript.push_str(&pty.screen());
+            let (rows, new_top) =
+                marker_numbers(&transcript, "ANCHOR_RESULT").ok_or("no ANCHOR_RESULT numbers")?;
+            if rows != 34 {
+                return Err(format!("the cockpit saw {rows} rows, want 34"));
+            }
+            // Maintainer decision (#3014 item 2): a grow pins the block to the new bottom,
+            // whichever way this terminal moved its content.
+            let block_h: u16 = transcript
+                .rsplit("block_h=")
+                .next()
+                .and_then(|s| {
+                    s.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse()
+                        .ok()
+                })
+                .ok_or("no block_h in ANCHOR_RESULT")?;
+            let want = rows - block_h;
+            if new_top != want {
+                return Err(format!(
+                    "terminal that {name}: block top {new_top}, want {want} (was {top})"
+                ));
+            }
+            pty.type_in("\n");
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+        transcript.push_str(&pty.screen_to_eof());
+        assert!(result.is_ok(), "{name}: {result:?}: {transcript:?}");
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "{name}: {status:?}: {transcript:?}"
+        );
+    }
 }
 
 /// #3012: close an inline panel over a full transcript and read the screen the way the

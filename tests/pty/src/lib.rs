@@ -40,6 +40,18 @@ pub struct TermiosSnapshot {
     pub line_discipline: libc::cc_t,
 }
 
+/// A model of a terminal's cursor: everything the child has painted so far in, 0-based
+/// `(row, col)` out.
+type CursorModel = Box<dyn FnMut(&str) -> (u16, u16) + Send>;
+
+/// How a [`Pty`] answers the child's cursor-position queries.
+enum CursorReply {
+    /// The same reply every time.
+    Fixed(String),
+    /// Computed from everything the child has written so far.
+    Model(CursorModel),
+}
+
 /// A pty pair: we hold the master and read what the terminal was shown, while
 /// a child process runs against the slave believing it owns a real terminal.
 pub struct Pty {
@@ -92,10 +104,19 @@ impl Pty {
     /// Use [`Pty::open`] when deliberately testing the unanswered-query fallback.
     pub fn open_with_cursor_reply(row: u16, col: u16) -> Self {
         assert!(row > 0 && col > 0, "cursor replies are one-based");
-        Self::open_with_reply(Some(format!("\x1b[{row};{col}R")))
+        Self::open_with_reply(Some(CursorReply::Fixed(format!("\x1b[{row};{col}R"))))
     }
 
-    fn open_with_reply(cursor_reply: Option<String>) -> Self {
+    /// Answer every cursor-position query from a model of the terminal: `model` is handed
+    /// everything the child has written so far (the query itself included) and returns where
+    /// the cursor is, 0-based `(row, col)`. A test that needs the terminal to MOVE things on a
+    /// resize (pull scrollback down, or not) keeps that state in the closure.
+    pub fn open_with_cursor_model(model: impl FnMut(&str) -> (u16, u16) + Send + 'static) -> Self {
+        Self::open_with_reply(Some(CursorReply::Model(Box::new(model))))
+    }
+
+    fn open_with_reply(cursor_reply: Option<CursorReply>) -> Self {
+        let mut cursor_reply = cursor_reply;
         unsafe {
             let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
             assert!(
@@ -173,6 +194,7 @@ impl Pty {
                 let _done = done_tx;
                 let mut buf = [0u8; 8192];
                 let mut pending = Vec::new();
+                let mut history: Vec<u8> = Vec::new();
                 loop {
                     // This thread is the sole reader of `master`, which
                     // outlives it — the harness closes the master only in
@@ -185,16 +207,35 @@ impl Pty {
                         // before that close has already been delivered above.
                         return;
                     }
-                    if let Some(reply) = &cursor_reply {
+                    // Collected BEFORE the queries are answered, so a model sees the
+                    // stream up to and including the query it is answering.
+                    if matches!(cursor_reply, Some(CursorReply::Model(_))) {
+                        history.extend_from_slice(&buf[..n as usize]);
+                    }
+                    sink.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend_from_slice(&buf[..n as usize]);
+                    if let Some(reply) = cursor_reply.as_mut() {
                         // Same split-query scan as the cockpit's TestTty:
                         // process each request once, retaining only a possible
                         // prefix across kernel reads. screen() takes must not
                         // reset it or cause earlier queries to be answered again.
                         pending.extend_from_slice(&buf[..n as usize]);
                         while let Some(at) = pending.windows(4).position(|s| s == b"\x1b[6n") {
+                            let bytes = match reply {
+                                CursorReply::Fixed(fixed) => fixed.clone(),
+                                CursorReply::Model(model) => {
+                                    // The whole stream, not the sink: `screen()` takes the
+                                    // sink, and a terminal's cursor depends on everything
+                                    // ever painted.
+                                    let seen = String::from_utf8_lossy(&history).into_owned();
+                                    let (row, col) = model(&seen);
+                                    format!("\x1b[{};{}R", row + 1, col + 1)
+                                }
+                            };
                             assert_eq!(
-                                libc::write(master, reply.as_ptr().cast(), reply.len()),
-                                reply.len() as isize,
+                                libc::write(master, bytes.as_ptr().cast(), bytes.len()),
+                                bytes.len() as isize,
                                 "writing the cursor-position reply failed"
                             );
                             pending.drain(..at + 4);
@@ -202,9 +243,6 @@ impl Pty {
                         let discard = pending.len().saturating_sub(3);
                         pending.drain(..discard);
                     }
-                    sink.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .extend_from_slice(&buf[..n as usize]);
                 }
             });
 

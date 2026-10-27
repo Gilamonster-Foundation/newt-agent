@@ -50,6 +50,8 @@ pub(crate) mod sys;
 
 #[cfg(feature = "events")]
 pub use sys::position;
+#[cfg(all(feature = "events", unix))]
+pub use sys::position_to; // newt #3014
 
 /// A command that moves the terminal cursor to the given position (column, row).
 ///

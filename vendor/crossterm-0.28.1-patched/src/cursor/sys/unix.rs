@@ -29,11 +29,29 @@ fn read_position() -> io::Result<(u16, u16)> {
     pos
 }
 
+/// newt #3014: [`position`] with the `ESC [ 6 n` query written to `out` instead of the
+/// process's stdout. A caller whose fd 1 is a capture pty (the cockpit) hands in the real
+/// terminal, so the query never takes Rust's stdout lock, which a session thread blocked
+/// on that full pty can hold forever. The reply is still read from stdin as usual.
+pub fn position_to(out: &mut dyn Write) -> io::Result<(u16, u16)> {
+    if is_raw_mode_enabled() {
+        read_position_raw_to(out)
+    } else {
+        enable_raw_mode()?;
+        let pos = read_position_raw_to(out);
+        disable_raw_mode()?;
+        pos
+    }
+}
+
 fn read_position_raw() -> io::Result<(u16, u16)> {
+    read_position_raw_to(&mut io::stdout())
+}
+
+fn read_position_raw_to(out: &mut dyn Write) -> io::Result<(u16, u16)> {
     // Use `ESC [ 6 n` to and retrieve the cursor position.
-    let mut stdout = io::stdout();
-    stdout.write_all(b"\x1B[6n")?;
-    stdout.flush()?;
+    out.write_all(b"\x1B[6n")?;
+    out.flush()?;
 
     // newt #2644: upstream's `Err(_) => {}` arm below fell through to the top
     // of the loop instead of returning, so a pty that answers `poll`/`read`
