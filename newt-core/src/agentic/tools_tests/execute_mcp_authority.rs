@@ -479,3 +479,92 @@ async fn full_access_without_a_gate_is_still_denied() {
     assert!(recorded.is_empty());
     assert!(out.contains("no interactive permission gate"), "{out}");
 }
+
+// -----------------------------------------------------------------------
+// #3036: `mcp_status` is the model's read of the `/mcp` table.
+// -----------------------------------------------------------------------
+
+/// A bridge with one discovered server and no callable tools.
+struct StatusOnlyMcp;
+
+#[async_trait::async_trait]
+impl McpTools for StatusOnlyMcp {
+    fn handles(&self, _name: &str) -> bool {
+        false
+    }
+    fn tool_defs(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
+        unreachable!("mcp_status never reaches a connector")
+    }
+    fn server_status(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!([{
+            "name": "docs",
+            "state": "rejected",
+            "last_error": "MCP server returned HTTP 401 (Bearer abcdefghijklmnopqrstuvwxyz0123)",
+            "tool_count": 0,
+        }]))
+    }
+}
+
+fn advertises_mcp_status(mcp: &dyn McpTools) -> bool {
+    merged_tool_definitions(
+        mcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
+    )
+    .as_array()
+    .unwrap()
+    .iter()
+    .any(|def| def["function"]["name"] == "mcp_status")
+}
+
+/// #3036: a session that discovered MCP servers can read their state — even
+/// in Plan, with no permission gate, because it reads harness state and
+/// reaches no server — and credential-shaped error text is redacted. A
+/// session with no MCP servers is not shown the tool.
+#[tokio::test]
+async fn mcp_status_reports_server_state_read_only_and_redacted_3036() {
+    assert!(advertises_mcp_status(&StatusOnlyMcp));
+    assert!(!advertises_mcp_status(&NoMcp));
+
+    let mut mcp = StatusOnlyMcp;
+    let out = execute_tool_with_collaborators(
+        "mcp_status",
+        &serde_json::json!({}),
+        "/ws",
+        false,
+        20,
+        &Caveats::top(),
+        &mut mcp,
+        ToolCollaborators::default(),
+        false,
+        PromptDisposition::Plan,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        out.contains(r#""name":"docs""#) && out.contains(r#""state":"rejected""#),
+        "{out}"
+    );
+    assert!(out.contains("HTTP 401"), "the typed status survives: {out}");
+    assert!(
+        !out.contains("abcdefghijklmnopqrstuvwxyz0123"),
+        "no token reaches the model: {out}"
+    );
+}

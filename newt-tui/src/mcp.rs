@@ -797,6 +797,34 @@ impl Mcp {
         out
     }
 
+    /// The same statuses as [`Self::status_lines`], as data for the model's
+    /// read-only `mcp_status` tool (#3036): `{name, state, last_error,
+    /// tool_count}` per discovered server.
+    pub(crate) fn status_json(&self) -> Value {
+        Value::Array(
+            self.statuses
+                .iter()
+                .map(|(name, status)| {
+                    let (state, last_error, tool_count) = match status {
+                        McpStatus::Connected { tools, .. } if self.is_muted(name) => {
+                            ("muted", None, *tools)
+                        }
+                        McpStatus::Connected { tools, .. } => ("connected", None, *tools),
+                        McpStatus::Skipped(reason) => ("skipped", Some(reason), 0),
+                        McpStatus::Rejected(reason) => ("rejected", Some(reason), 0),
+                        McpStatus::Disabled => ("disabled", None, 0),
+                    };
+                    serde_json::json!({
+                        "name": name,
+                        "state": state,
+                        "last_error": last_error,
+                        "tool_count": tool_count,
+                    })
+                })
+                .collect(),
+        )
+    }
+
     pub(crate) fn is_muted(&self, name: &str) -> bool {
         self.session_muted.contains(name)
     }
@@ -1134,6 +1162,9 @@ impl newt_core::agentic::McpTools for Mcp {
         // The witness carries the leash-approved tool name + args; forward to the
         // inherent implementation.
         Self::call(self, leased.tool(), leased.args()).await
+    }
+    fn server_status(&self) -> Option<Value> {
+        (!self.statuses.is_empty()).then(|| self.status_json())
     }
 }
 
@@ -2119,6 +2150,72 @@ mod tests {
             lines[3]
         );
         assert!(lines[4].contains("disabled in config"), "{:?}", lines[4]);
+    }
+
+    /// #3036: the model's `mcp_status` reads the same statuses as `/mcp`,
+    /// one `{name, state, last_error, tool_count}` per discovered server,
+    /// including the typed-401 `Rejected` arm (#3032); no servers → `None`.
+    #[test]
+    fn server_status_reports_every_arm_to_the_model_3036() {
+        use newt_core::agentic::McpTools as _;
+        let mut mcp = Mcp::empty();
+        assert_eq!(mcp.server_status(), None);
+        mcp.statuses =
+            vec![
+                (
+                    "github".to_string(),
+                    McpStatus::Connected {
+                        tools: 12,
+                        confinement: Confinement::from_sandbox(None),
+                        net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
+                    },
+                ),
+                (
+                    "stale".to_string(),
+                    McpStatus::from_error(&anyhow::Error::new(
+                        newt_mcp_client::HttpStatusError::new(401, "Unauthorized", ""),
+                    )),
+                ),
+                (
+                    "slow".to_string(),
+                    McpStatus::Skipped("connect timeout".to_string()),
+                ),
+                ("off".to_string(), McpStatus::Disabled),
+            ];
+        assert!(mcp.mute("github"));
+        let status = mcp.server_status().expect("servers were discovered");
+        let rows: Vec<(String, String, Option<String>, u64)> = status
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["name"].as_str().unwrap().to_string(),
+                    row["state"].as_str().unwrap().to_string(),
+                    row["last_error"].as_str().map(str::to_string),
+                    row["tool_count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("github".into(), "muted".into(), None, 12),
+                (
+                    "stale".into(),
+                    "rejected".into(),
+                    Some("MCP server returned HTTP 401 Unauthorized".into()),
+                    0
+                ),
+                (
+                    "slow".into(),
+                    "skipped".into(),
+                    Some("connect timeout".into()),
+                    0
+                ),
+                ("off".into(), "disabled".into(), None, 0),
+            ]
+        );
     }
 
     #[test]

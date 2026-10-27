@@ -111,6 +111,7 @@ const EXPOSURE_CLASSES: &[(&str, ExposureClass)] = &[
     ("enter_plan_mode", ExposureClass::ByIntent),
     ("exit_plan_mode", ExposureClass::ByIntent),
     ("select_operating_mode", ExposureClass::ByIntent),
+    ("mcp_status", ExposureClass::ByIntent),
 ];
 
 /// The exposure class of a tool by name. Base tools are `Kernel`; a name found

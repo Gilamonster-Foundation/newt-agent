@@ -3060,6 +3060,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         | "update_plan"
         | "plan_get"
         | "get_context_remaining"
+        | "mcp_status"
         | "enter_plan_mode"
         | "exit_plan_mode" => String::new(),
         _ => args.to_string(),
@@ -4168,6 +4169,13 @@ async fn execute_authorized_tool(
             None => {
                 "unknown tool: code_search (semantic retrieval is off this session)".to_string()
             }
+        },
+
+        // #3036: per-server MCP health. Error text is server- and
+        // transport-authored, so it passes the credential redaction table.
+        "mcp_status" => match mcp.server_status() {
+            Some(status) => super::compress::redact_secrets(&status.to_string()),
+            None => "no MCP servers configured".to_string(),
         },
 
         // #1285: exact, typed-verdict symbol lookup — presence-gated on the
