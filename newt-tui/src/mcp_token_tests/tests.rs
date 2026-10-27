@@ -1185,3 +1185,38 @@ async fn a_fallback_bearer_carries_the_refused_grant_to_a_non_401_failure_3028()
     assert!(line.contains("invalid_grant"), "{line}");
     assert!(line.contains(crate::mcp::LOGIN_REMEDIATION), "{line}");
 }
+
+/// Maintainer's rule for #3028: only a refused grant (`invalid_grant`) or a
+/// missing refresh token makes a 401'd bearer a recorded rejection. A forced
+/// refresh that fails in transport — here the token endpoint's host does not
+/// resolve — writes no record, so a fresh reader still sees the login Valid.
+#[tokio::test]
+#[ignore = "real filesystem; weekly/release mcp-import-real lane"]
+async fn a_transport_failure_during_forced_refresh_writes_no_rejection_3028() {
+    let temp = tempfile::tempdir().unwrap();
+    let name = "Review.Source";
+    // Has a refresh token; its token endpoint (`auth.example.test`) cannot resolve.
+    let bundle = credential_test_bundle("current", false);
+    assert!(bundle.token.refresh_token.is_some());
+    let resource = bundle.meta.resource.clone();
+    publish(temp.path(), name, &bundle);
+
+    let outcome = refresh_bearer_token_from_dir(
+        name,
+        &resource,
+        "current",
+        temp.path(),
+        &test_oauth_policy(),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        Ok(None),
+        "a transport failure is not a refused grant"
+    );
+    assert!(
+        !rejection_path(temp.path(), name).exists(),
+        "no record written"
+    );
+    assert_eq!(state_of(temp.path(), name, &resource), AuthState::Valid);
+}
