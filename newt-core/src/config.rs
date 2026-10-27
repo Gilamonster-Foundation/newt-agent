@@ -27,9 +27,10 @@ pub use backend::{
     RequestMeter, RequestMode, Serving,
 };
 pub use context::{
-    compaction_trigger_is_session_pinned, input_percentage_ceiling, normalize_input_ceiling_pct,
-    session_compaction_trigger_policy, CompactionTriggerPolicy, ContextConfig, ContextFeature,
-    ContextFeatureSet, ContextFeatures, ContextManager,
+    compaction_trigger_is_session_pinned, context_index_enabled, input_percentage_ceiling,
+    normalize_input_ceiling_pct, session_compaction_trigger_policy, CompactionTriggerPolicy,
+    ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextIndex,
+    ContextManager, CONTEXT_INDEX_ENV,
 };
 pub use crew::{Crew, CrewBudgets, CrewPolicyConfig};
 pub use dropin::*;

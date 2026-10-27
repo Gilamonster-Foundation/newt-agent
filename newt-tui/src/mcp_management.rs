@@ -83,7 +83,7 @@ impl Mcp {
                 self.set_status(
                     &entry.name,
                     if entry.enabled {
-                        McpStatus::Skipped(format!("{error:#}"))
+                        McpStatus::from_error(&error)
                     } else {
                         McpStatus::Disabled
                     },
@@ -114,7 +114,7 @@ impl Mcp {
             }
             Err(error) => {
                 self.servers.retain(|server| server.live.name != name);
-                self.set_status(name, McpStatus::Skipped(format!("{error:#}")));
+                self.set_status(name, McpStatus::from_error(&error));
                 Err(error)
             }
         }
