@@ -419,7 +419,10 @@ mod tests {
         let second = cid(&archive, &tail);
         assert_ne!(first, second, "different results, different handles");
         assert_eq!(archive.find(&first.to_handle()).unwrap().dropped_lines(), 1);
-        assert_eq!(archive.find(&second.to_handle()).unwrap().dropped_lines(), 0);
+        assert_eq!(
+            archive.find(&second.to_handle()).unwrap().dropped_lines(),
+            0
+        );
     }
 
     /// #3022 review: without entropy the archive retains nothing rather than

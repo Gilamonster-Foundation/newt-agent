@@ -186,6 +186,7 @@ impl PaletteState {
     /// Offer the retained spills (`(id tail, label)`, newest first) as the
     /// completions of `/spill open `. Empty keeps the plain usage row.
     /// An open palette re-ranks, so its matches never index a stale list.
+    #[cfg(feature = "live-spill")]
     pub(crate) fn set_spill_choices(&mut self, choices: Vec<(String, String)>) {
         let entries: Vec<PaletteEntry> = choices
             .into_iter()
@@ -213,9 +214,11 @@ impl PaletteState {
     }
 
     /// The rows the filter ranks over: the retained spills once the operator
-    /// has typed `/spill open `, otherwise the command corpus.
+    /// is typing `/spill o…`, otherwise the command corpus. Switching at
+    /// `spill o`, not `spill open `, matters: no corpus row matches
+    /// `spill o`, so a palette still on the corpus closes there for good.
     fn list(&self) -> &[PaletteEntry] {
-        if !self.spill_entries.is_empty() && self.filter.to_lowercase().starts_with("spill open ") {
+        if !self.spill_entries.is_empty() && self.filter.to_lowercase().starts_with("spill o") {
             &self.spill_entries
         } else {
             &self.entries
@@ -554,6 +557,7 @@ mod tests {
     /// #3022: after `/spill open ` the palette lists the retained ids, newest
     /// first, each labelled; Tab completes the highlighted id. Mocked choices —
     /// the palette never sees the archive.
+    #[cfg(feature = "live-spill")]
     #[test]
     fn spill_open_completes_retained_ids_newest_first() {
         let mut s = PaletteState::new(vec![PaletteEntry {
@@ -591,6 +595,7 @@ mod tests {
     /// #3022: the cockpit refreshes choices on every key. A result retained
     /// while the palette is open re-ranks it, so Tab completes the newest id
     /// rather than whatever a stale index now points at.
+    #[cfg(feature = "live-spill")]
     #[test]
     fn new_spill_choices_rerank_an_open_palette() {
         let mut s = PaletteState::new(fixture());
@@ -610,6 +615,24 @@ mod tests {
             palette_step(&mut s, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
             PaletteStep::CompleteTo("/spill open newest22".to_string())
         );
+    }
+
+    /// #3022 review: typed one key at a time against the real corpus, the
+    /// palette closed at `/spill o` (no corpus row matches it) and Tab then
+    /// inserted spaces. It must stay open through to the retained ids.
+    #[cfg(feature = "live-spill")]
+    #[test]
+    fn typing_spill_open_key_by_key_reaches_the_retained_ids() {
+        let mut s = PaletteState::from_corpus();
+        s.set_spill_choices(vec![("abcdefgh".into(), "x".into())]);
+        let mut prev = String::new();
+        for c in "/spill open ".chars() {
+            let now = format!("{prev}{c}");
+            s.on_buffer_change(&prev, &now);
+            assert!(s.is_open(), "palette closed at {now:?}");
+            prev = now;
+        }
+        assert_eq!(matched_cmds(&s), ["/spill open abcdefgh"]);
     }
 
     /// With nothing retained the palette keeps today's `/spill open <ID>` row.
