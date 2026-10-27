@@ -290,14 +290,32 @@ pub fn load_project_packs_from_dir(dir: &Path) -> Vec<ProjectPack> {
 /// [`derive`]. `None` when no pack detects (PO-E) — the caller uses no model.
 #[must_use]
 pub fn scan_project(root: &Path, packs: &[ProjectPack]) -> Option<ProjectModel> {
+    let (pack, markers) = gather_markers(root, packs)?;
+    let unit_markers: Vec<(String, Value)> =
+        markers.into_iter().map(|m| (m.dir, m.value)).collect();
+    Some(derive(pack, &unit_markers))
+}
+
+/// One gathered unit marker: its dir, raw contents (the drift key) and parse.
+pub struct UnitMarker {
+    pub dir: String,
+    pub text: String,
+    pub value: Value,
+}
+
+/// The one gather both [`scan_project`] and [`scan_project_cached`] use, so
+/// they cannot disagree on which units exist or their order: detect the pack,
+/// then the root marker, plus workspace members (Cargo `workspace.members`,
+/// npm `workspaces`) in declared order. A missing/malformed member marker is
+/// skipped. Absent workspace list ⇒ the root is the unit.
+fn gather_markers<'a>(
+    root: &Path,
+    packs: &'a [ProjectPack],
+) -> Option<(&'a ProjectPack, Vec<UnitMarker>)> {
     let pack = detect_pack(packs, &|m| root.join(m).is_file())?;
     let marker_file = pack.markers.iter().find(|m| root.join(m).is_file())?;
     let root_text = std::fs::read_to_string(root.join(marker_file)).ok()?;
     let root_val = parse_marker(pack.format, &root_text)?;
-
-    // Workspace members (Cargo `workspace.members`, npm `workspaces`): each
-    // member dir carries its own marker of the same name. A missing/malformed
-    // member marker is skipped. Absent workspace list ⇒ the root is the unit.
     let members: Vec<String> = pack
         .workspace_members_at
         .as_deref()
@@ -310,21 +328,23 @@ pub fn scan_project(root: &Path, packs: &[ProjectPack]) -> Option<ProjectModel> 
                 .collect()
         })
         .unwrap_or_default();
-
-    let mut unit_markers: Vec<(String, Value)> = Vec::new();
     if members.is_empty() {
-        unit_markers.push((".".to_string(), root_val));
-    } else {
-        for dir in members {
-            let mpath = root.join(&dir).join(marker_file);
-            if let Ok(text) = std::fs::read_to_string(&mpath) {
-                if let Some(val) = parse_marker(pack.format, &text) {
-                    unit_markers.push((dir, val));
-                }
-            }
-        }
+        let unit = UnitMarker {
+            dir: ".".to_string(),
+            text: root_text,
+            value: root_val,
+        };
+        return Some((pack, vec![unit]));
     }
-    Some(derive(pack, &unit_markers))
+    let markers = members
+        .into_iter()
+        .filter_map(|dir| {
+            let text = std::fs::read_to_string(root.join(&dir).join(marker_file)).ok()?;
+            let value = parse_marker(pack.format, &text)?;
+            Some(UnitMarker { dir, text, value })
+        })
+        .collect();
+    Some((pack, markers))
 }
 
 /// Expand one workspace-member entry to concrete dirs: a literal dir, or a
@@ -358,7 +378,7 @@ use crate::drift_cache::{apply_drift, content_hash, DriftCache};
 /// Derive the model through the content-hash **drift-cache** (#1282): re-derive
 /// only the units whose marker content changed vs `prev`, reuse the cached
 /// [`ProjectUnit`] for the rest. Returns the model + the updated cache. **Pure**
-/// over the injected `(dir → marker contents)` map and `prev` cache — the fs
+/// over the gathered [`UnitMarker`]s (units keep their order) and `prev` — the fs
 /// gather + persistence live in [`scan_project_cached`].
 ///
 /// The units equal those of an uncached [`derive`] (the PO-C guarantee proved in
@@ -368,22 +388,24 @@ use crate::drift_cache::{apply_drift, content_hash, DriftCache};
 pub fn derive_cached(
     pack: &ProjectPack,
     prev: &DriftCache<ProjectUnit>,
-    markers: &std::collections::BTreeMap<String, String>,
+    markers: &[UnitMarker],
 ) -> (ProjectModel, DriftCache<ProjectUnit>) {
-    let hashes: std::collections::BTreeMap<String, String> = markers
+    let hashes: std::collections::BTreeMap<String, content_addressable::RawContentId> = markers
         .iter()
-        .map(|(dir, contents)| (dir.clone(), content_hash(contents.as_bytes())))
+        .map(|m| (m.dir.clone(), content_hash(m.text.as_bytes())))
         .collect();
+    let values: std::collections::BTreeMap<&str, &Value> =
+        markers.iter().map(|m| (m.dir.as_str(), &m.value)).collect();
     let next = apply_drift(prev, &hashes, |dir, _hash| {
-        let value = markers
-            .get(dir)
-            .and_then(|c| parse_marker(pack.format, c))
-            .unwrap_or(Value::Null);
-        derive_unit(pack, dir, &value)
+        derive_unit(pack, dir, values[dir])
     });
+    // Units in gathered (declared) order, as [`derive`] yields them.
     let model = ProjectModel {
         pack: pack.name.clone(),
-        units: next.entries.values().map(|e| e.value.clone()).collect(),
+        units: markers
+            .iter()
+            .map(|m| next.entries[&m.dir].value.clone())
+            .collect(),
     };
     (model, next)
 }
@@ -395,50 +417,33 @@ const PROJECT_MODEL_CACHE_VERSION: &str = "project-model.v1";
 /// Scan a project with the persistent drift-cache (#1282): an unchanged repo
 /// re-derives nothing; a touched unit re-derives only itself. The result equals
 /// [`scan_project`]'s units (PO-C). `config_dir` is where the cache lives
-/// (`<config_dir>/index/<repo-hash>/project-model.json`). Thin fs wrapper over
-/// [`derive_cached`].
+/// (`<config_dir>/index/<repo id>/project-model.<pack>.head` + its verified
+/// node). Thin fs wrapper over [`derive_cached`].
 #[must_use]
 pub fn scan_project_cached(
     root: &Path,
     packs: &[ProjectPack],
     config_dir: &Path,
 ) -> Option<ProjectModel> {
-    let pack = detect_pack(packs, &|m| root.join(m).is_file())?;
-    let marker_file = pack.markers.iter().find(|m| root.join(m).is_file())?;
-    let root_text = std::fs::read_to_string(root.join(marker_file)).ok()?;
-    let root_val = parse_marker(pack.format, &root_text)?;
-
-    // Gather each unit's marker CONTENTS (the drift key), root + members.
-    let members: Vec<String> = pack
-        .workspace_members_at
-        .as_deref()
-        .and_then(|p| dotted_get(&root_val, p))
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .flat_map(|g| expand_member_glob(root, g))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut markers = std::collections::BTreeMap::new();
-    if members.is_empty() {
-        markers.insert(".".to_string(), root_text);
-    } else {
-        for dir in members {
-            if let Ok(text) = std::fs::read_to_string(root.join(&dir).join(marker_file)) {
-                markers.insert(dir, text);
-            }
-        }
-    }
-
-    let cache_path =
-        crate::drift_cache::store_path(config_dir, root, &format!("project-model.{}", pack.name));
-    let prev = crate::drift_cache::load::<ProjectUnit>(&cache_path, PROJECT_MODEL_CACHE_VERSION)
+    let (pack, markers) = gather_markers(root, packs)?;
+    let dir = crate::drift_cache::store_dir(config_dir, root);
+    let name = format!("project-model.{}", pack.name);
+    let prev = crate::drift_cache::load::<ProjectUnit>(&dir, &name, PROJECT_MODEL_CACHE_VERSION)
         .unwrap_or_else(|| DriftCache::new(PROJECT_MODEL_CACHE_VERSION));
     let (model, next) = derive_cached(pack, &prev, &markers);
-    crate::drift_cache::save(&cache_path, &next);
+    if next != prev {
+        crate::drift_cache::save(&dir, &name, &next);
+    }
     Some(model)
+}
+
+/// [`scan_project_cached`] under the user config dir, else a plain
+/// [`scan_project`] when no config dir resolves.
+#[must_use]
+pub fn scan_project_persistent(root: &Path, packs: &[ProjectPack]) -> Option<ProjectModel> {
+    crate::Config::user_config_dir()
+        .and_then(|cfg| scan_project_cached(root, packs, &cfg))
+        .or_else(|| scan_project(root, packs))
 }
 
 #[cfg(test)]
@@ -459,16 +464,19 @@ mod tests {
         // from-scratch derive — on a cold cache, and after a marker edits.
         use crate::drift_cache::DriftCache;
         let p = rust();
-        let markers: std::collections::BTreeMap<String, String> = [
-            ("a".to_string(), "[package]\nname='a'\n".to_string()),
-            ("b".to_string(), "[package]\nname='b'\n".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        let uncached = |m: &std::collections::BTreeMap<String, String>| {
-            let ums: Vec<(String, Value)> = m
+        let marker = |dir: &str, text: &str| UnitMarker {
+            dir: dir.to_string(),
+            text: text.to_string(),
+            value: parse_marker(p.format, text).unwrap(),
+        };
+        let markers = vec![
+            marker("a", "[package]\nname='a'\n"),
+            marker("b", "[package]\nname='b'\n"),
+        ];
+        let uncached = |ms: &[UnitMarker]| {
+            let ums: Vec<(String, Value)> = ms
                 .iter()
-                .map(|(d, c)| (d.clone(), parse_marker(p.format, c).unwrap()))
+                .map(|m| (m.dir.clone(), m.value.clone()))
                 .collect();
             derive(&p, &ums)
         };
@@ -481,8 +489,10 @@ mod tests {
 
         // Edit b's marker; warm cache: still equals a fresh derive (PO-C), and
         // a's cached ProjectUnit is byte-identical (reused, not re-derived).
-        let mut edited = markers.clone();
-        edited.insert("b".to_string(), "[package]\nname='b2'\n".to_string());
+        let edited = vec![
+            marker("a", "[package]\nname='a'\n"),
+            marker("b", "[package]\nname='b2'\n"),
+        ];
         let (m2, cache2) = derive_cached(&p, &cache1, &edited);
         assert_eq!(m2.units, uncached(&edited).units);
         assert_eq!(

@@ -2901,7 +2901,13 @@ fn session_body(
     // Warm the model-free repository navigator in parallel with the remaining
     // session startup. The first consumer joins this handle; a failed task
     // leaves the existing synchronous ensure path as the honest fallback.
-    let mut nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
+    let mut nav_warmup = spawn_nav_warmup(
+        &rt,
+        workspace,
+        &cfg,
+        &index_status,
+        newt_core::config::context_index_enabled(&cfg),
+    );
     // Step 26.6a (#585): session-scoped experiential ledger. Unlike the others it
     // SURVIVES /new (cross-task reuse within the session) — see the /new handler.
     let experience_store = newt_core::SessionExperienceStore::default();
@@ -3925,7 +3931,10 @@ fn session_body(
                     }
                     #[cfg(feature = "rich-tui")]
                     macro_rules! manage_mcp {
-                        () => {{
+                        () => {
+                            manage_mcp!(crate::mcp_manager::run)
+                        };
+                        ($operation:path) => {{
                             reresolve(&mut cfg, color, verbose);
                             let cancel =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3970,7 +3979,7 @@ fn session_body(
                                         &newt_core::interaction_surface::SurfaceInteraction,
                                     ) -> PromptChoice,
                             };
-                            if let Err(error) = crate::mcp_manager::run(
+                            if let Err(error) = $operation(
                                 &mut mcp,
                                 surface.as_mut(),
                                 &mut gate,
@@ -4027,7 +4036,7 @@ fn session_body(
                                     }
                                     if !mcp.statuses.is_empty() {
                                         print_newt(
-                                            "usage: /mcp [on|off|enable|disable|auth] [name]",
+                                            "usage: /mcp [on|off|enable|disable|auth|login-all] [name]",
                                             color,
                                             verbose,
                                         );
@@ -4138,13 +4147,26 @@ fn session_body(
                                         Err(e) => print_newt(&format!("mcp {verb}: {e}"), color, verbose),
                                     }
                                 }
+                                // #3028: sign in to every server that needs it.
+                                ("login-all", "") => {
+                                    #[cfg(feature = "rich-tui")]
+                                    {
+                                        manage_mcp!(crate::mcp_manager::login_all);
+                                    }
+                                    #[cfg(not(feature = "rich-tui"))]
+                                    print_newt(
+                                        "run `newt auth --all` in a shell to sign in, then relaunch",
+                                        color,
+                                        verbose,
+                                    );
+                                }
                                 ("auth", n) if !n.is_empty() => print_newt(
                                     &format!("run `newt auth {n}` in a shell to (re)authenticate, then relaunch"),
                                     color,
                                     verbose,
                                 ),
                                 _ => print_newt(
-                                    "usage: /mcp [on|off|enable|disable|auth] [name]\n  on/off = this session (instant); enable/disable = config (durable)",
+                                    "usage: /mcp [on|off|enable|disable|auth|login-all] [name]\n  on/off = this session (instant); enable/disable = config (durable)",
                                     color,
                                     verbose,
                                 ),
@@ -5119,6 +5141,7 @@ fn session_body(
                                         &mut where_is_index,
                                         &mut nav_session,
                                         &index_status,
+                                        newt_core::config::context_index_enabled(&cfg),
                                     );
                                 }
                                 let msg = handle_nav_command(
@@ -6054,7 +6077,13 @@ fn session_body(
                         if let Some(warmup) = nav_warmup.take() {
                             warmup.abort();
                         }
-                        nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
+                        nav_warmup = spawn_nav_warmup(
+                            &rt,
+                            workspace,
+                            &cfg,
+                            &index_status,
+                            newt_core::config::context_index_enabled(&cfg),
+                        );
                         // Step 26.6a (#585): the experiential ledger is INTENTIONALLY
                         // NOT cleared here — it is cross-task by design (a later task
                         // reuses earlier lessons). It is dropped only at session end.
@@ -9412,6 +9441,7 @@ fn session_body(
                             &mut where_is_index,
                             &mut nav_session,
                             &index_status,
+                            newt_core::config::context_index_enabled(&cfg),
                         );
                     }
                     // The core sees this collaborator only in human-selected

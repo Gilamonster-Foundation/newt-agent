@@ -577,6 +577,15 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Surface::Native,
     ),
     cmd_on(
+        // #3026: `[context] index` — a `/settings` field row, not a verb.
+        "index",
+        &[],
+        Family::Session,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
         // Retired into `/resume` (#2009 PR6b). Its READS still read and
         // its MUTATORS redirect, so the row stays a permanent pointer
         // while the receipt debt it owes stays counted: the ops are
