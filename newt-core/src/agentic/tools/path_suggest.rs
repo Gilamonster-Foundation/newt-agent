@@ -1,5 +1,32 @@
-//! One bounded, authority-preserving hint for file-tool I/O failures (#2755).
+//! Model fs paths: the one resolution every file tool uses (#3039), and one
+//! bounded, authority-preserving hint for file-tool I/O failures (#2755).
 use std::path::{Component, Path, PathBuf};
+
+/// #3039: where a model-written fs `path` points. A leading `~` or `~/` is the
+/// home directory ([`crate::config::home_dir`], #1458) — a model's first
+/// instinct for home files — never a `<workspace>/~` literal. The result is an
+/// ordinary absolute path, so every fs gate judges it exactly as if the model
+/// had typed it out: expansion grants nothing. `~user` is refused, not looked
+/// up. Anything else joins the workspace, as before.
+pub(crate) fn resolve_tool_path(workspace: &Path, path: &str) -> Result<PathBuf, String> {
+    let Some(rest) = path.strip_prefix('~') else {
+        return Ok(workspace.join(path));
+    };
+    let rest = match rest.strip_prefix(std::path::is_separator) {
+        Some(rest) => rest,
+        None if rest.is_empty() => rest,
+        None => {
+            return Err(format!(
+                "error: `{path}`: only a leading `~` or `~/` expands (to your home \
+                 directory); `~user` forms are not expanded (#3039). Use the absolute path."
+            ))
+        }
+    };
+    let home = crate::config::home_dir().ok_or_else(|| {
+        format!("error: `{path}`: no home directory is set to expand `~`; use the absolute path")
+    })?;
+    Ok(home.join(rest))
+}
 
 use crate::caveats::Scope;
 
@@ -25,10 +52,12 @@ impl FileIoError {
         if self.kind != Some(std::io::ErrorKind::NotFound) {
             return self.text;
         }
+        // #3039: the text names the path as written; this names where it
+        // resolved (a relative operand is still workspace-joined).
         let text = format!(
-            "{}\nresolved against {}",
+            "{}\nresolved to {}",
             self.text,
-            crate::worktree_adoption::task_path_literal(Path::new(workspace))
+            crate::worktree_adoption::task_path_literal(&Path::new(workspace).join(&self.operand))
         );
         let Some(path) = self.operand.to_str() else {
             return text;

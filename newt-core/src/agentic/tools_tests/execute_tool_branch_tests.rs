@@ -358,3 +358,6 @@ mod memory;
 
 #[path = "path_suggest.rs"]
 mod path_suggest;
+
+#[path = "tilde_home.rs"]
+mod tilde_home;

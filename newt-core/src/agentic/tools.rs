@@ -60,6 +60,7 @@ pub use dispatch::{
     execute_tool_with_offload_and_prompt_and_artifacts,
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
+pub(crate) use path_suggest::resolve_tool_path;
 use path_suggest::FileIoError;
 pub(crate) mod exposure;
 mod grep_tool;
@@ -1720,7 +1721,7 @@ pub(super) fn authorized_read(
     caveats: &crate::caveats::Caveats,
     permission_gate: Option<&mut (dyn PermissionGate + '_)>,
 ) -> Result<String, String> {
-    let full = std::path::Path::new(workspace).join(path);
+    let full = resolve_tool_path(std::path::Path::new(workspace), path)?;
     let full_str = full.to_string_lossy();
     let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
     if !scope_permits {
@@ -5512,7 +5513,10 @@ async fn execute_authorized_tool(
                 }
                 None => content,
             };
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // Scope- vs #263-gate-authorised, same split as read_file (step-52.2):
             // decides whether the write below is object-bound.
@@ -5692,7 +5696,10 @@ async fn execute_authorized_tool(
             if path.trim().is_empty() {
                 return "error: path is required".to_string();
             }
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // step-52.6: same scope-vs-#263-gate split — decides whether the
             // removal below is object-bound (via unlinkat on the resolved parent).
@@ -5839,7 +5846,10 @@ async fn execute_authorized_tool(
                 return "error: old_string must not be empty — use write_file to create new files"
                     .to_string();
             }
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // step-52.5: same scope-vs-#263-gate split as write_file — decides
             // whether the read of `existing` and the write of `updated` below are
@@ -6024,7 +6034,10 @@ async fn execute_authorized_tool(
 
         "list_dir" => {
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // Scope- vs #263-gate-authorised, same split as read_file (step-52.2).
             let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
@@ -6078,7 +6091,10 @@ async fn execute_authorized_tool(
             },
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             const WORKSPACE_ONLY: &str = "capability denied: find is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
@@ -6164,7 +6180,10 @@ async fn execute_authorized_tool(
             // no subprocess, so a run_command refusal can't take the agent's
             // grep with it.
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             const WORKSPACE_ONLY: &str = "capability denied: grep is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {

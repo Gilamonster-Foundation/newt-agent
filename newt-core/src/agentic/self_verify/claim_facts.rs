@@ -195,10 +195,9 @@ impl VerificationLedger {
         }
         let command = observed_command(name, args);
         let directory = if let Some(path) = args["path"].as_str() {
-            Path::new(workspace)
-                .join(path)
-                .parent()
-                .map(Path::to_path_buf)
+            crate::agentic::tools::resolve_tool_path(Path::new(workspace), path)
+                .ok()
+                .and_then(|full| full.parent().map(Path::to_path_buf))
         } else if name == "build_exec"
             || super::super::dispatched_tool_name(name) == Some("run_command")
         {

@@ -4451,7 +4451,8 @@ async fn progress_workspace_state(
     let target = matches!(name, "write_file" | "edit_file" | "delete_file")
         .then(|| args.get("path").and_then(serde_json::Value::as_str))
         .flatten()
-        .map(|path| lexical_normalize(&root.join(path)));
+        .and_then(|path| tools::resolve_tool_path(&root, path).ok())
+        .map(|full| lexical_normalize(&full));
     let fs_read = fs_read.clone();
     tokio::task::spawn_blocking(move || {
         if let Some(target) = target {
