@@ -128,8 +128,11 @@ fn failure_message(error: &anyhow::Error) -> String {
     if let Some(required) = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>() {
         return format!("OCAP network approval needed for {}", required.host);
     }
-    // A dead refresh token surfaces as the token endpoint's `invalid_grant`.
-    if format!("{error:#}").contains("invalid_grant") {
+    // A dead refresh grant: the token endpoint answered `invalid_grant`.
+    if error
+        .downcast_ref::<crate::mcp_token::OAuthGrantRejected>()
+        .is_some()
+    {
         return format!(
             "Saved login was rejected (invalid_grant) · {}",
             crate::mcp::LOGIN_REMEDIATION
@@ -386,7 +389,7 @@ where
     let targets = crate::auth_command::login_all_targets(
         &entries,
         &|var| std::env::var(var).ok(),
-        &|entry| mcp.saved_login_usable(entry, &crate::mcp::saved_oauth_valid),
+        &crate::mcp::saved_oauth_valid,
     );
     let (color, verbose) = (gate.color, gate.verbose);
     context.cancel.store(false, Ordering::Relaxed);
@@ -489,8 +492,8 @@ mod tests {
             failure_message(&unauthorized),
             "HTTP 401 · login required or credential rejected · choose Login, or run /mcp login-all"
         );
-        let invalid_grant =
-            anyhow::anyhow!("OAuth error `invalid_grant`").context("token refresh failed");
+        let invalid_grant = anyhow::Error::new(crate::mcp_token::OAuthGrantRejected)
+            .context("token refresh failed");
         assert_eq!(
             failure_message(&invalid_grant),
             "Saved login was rejected (invalid_grant) · choose Login, or run /mcp login-all"
