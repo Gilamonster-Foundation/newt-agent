@@ -1531,6 +1531,76 @@ fn load_newt_mcp_toml(path: &Path) -> Vec<McpServerEntry> {
     parse_newt_mcp_toml(&text)
 }
 
+/// Whether `entry` configures an `Authorization` header (any value).
+pub fn has_configured_authorization_header(entry: &McpServerEntry) -> bool {
+    entry
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+}
+
+/// Any header whose value is a credential reference (`{ env | file | cmd }` or
+/// a whole `${VAR}`), whatever its name: such a server owns its own auth and is
+/// never sent to browser OAuth. A plain literal such as `Accept:
+/// application/json` is protocol, not a credential (#3028).
+pub fn has_credential_reference_header(entry: &McpServerEntry) -> bool {
+    entry.headers.values().any(authorization_is_reference)
+}
+
+/// Configured Authorization credentials must remain references at rest. A raw
+/// bearer string in TOML/borrowed JSON is easy to leak through audit, import,
+/// or repository history; the auto-loaded OAuth token is injected only after
+/// this check and is therefore unaffected.
+pub fn authorization_is_reference(value: &SecretValue) -> bool {
+    match value {
+        SecretValue::Ref(_) => true,
+        SecretValue::Literal(value) => {
+            let candidate = value
+                .trim()
+                .strip_prefix("Bearer ")
+                .unwrap_or_else(|| value.trim());
+            candidate.len() > 3
+                && candidate.starts_with("${")
+                && candidate.ends_with('}')
+                && !candidate[2..candidate.len() - 1].contains(['{', '}'])
+        }
+    }
+}
+
+/// The load-time auth completeness pass (#3038): one warning per admitted
+/// HTTP server with no `Authorization` header, no credential-reference header,
+/// no `oauth_client_id`, and no saved login the connect path can use.
+///
+/// `has_saved_login` is the caller's token store: the TUI passes its saved
+/// OAuth check; headless, which loads no saved login, passes `|_| false`. A
+/// missing `oauth_client_id` alone is not a gap: `newt auth` registers a client
+/// dynamically (RFC 7591) when the authorization server allows it, so a server
+/// with a usable saved login is not warned. Pure; callers emit the lines
+/// before their first connect.
+pub fn missing_auth_warnings(
+    entries: &[McpServerEntry],
+    has_saved_login: &dyn Fn(&McpServerEntry) -> bool,
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.transport == TransportKind::Http
+                && entry.url.is_some()
+                && admit(entry).is_ok()
+                && !has_configured_authorization_header(entry)
+                && !has_credential_reference_header(entry)
+                && entry.oauth_client_id.is_none()
+                && !has_saved_login(entry)
+        })
+        .map(|entry| {
+            let name = &entry.name;
+            format!(
+                "MCP server `{name}` (http) has no auth: no `headers.Authorization`, no `oauth_client_id`, no usable saved login; run `newt auth {name}`, or set one of those keys"
+            )
+        })
+        .collect()
+}
+
 /// The exact server prefix emitted into MCP tool names for this runtime mode.
 /// Every discovery, catalog, and routing surface uses this function so a
 /// sanitized collision cannot become a first-match dispatch ambiguity.
