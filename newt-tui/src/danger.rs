@@ -173,14 +173,19 @@ impl DangerTable {
     }
 
     /// Is `target` an interpreter/shell exec name? Compares the command's
-    /// file-name component, so `/usr/bin/python3` and `python3` both match.
+    /// file-name component, so `/usr/bin/python3` and `python3` both match. A
+    /// trailing `.N` version (`python3.12`) matches its base name (#3033).
     fn is_interpreter(&self, target: &str) -> bool {
         let trimmed = target.trim();
         let name = Path::new(trimmed)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(trimmed);
-        self.interpreters.contains(name)
+        let base = name
+            .rsplit_once('.')
+            .filter(|(_, v)| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .map_or(name, |(base, _)| base);
+        self.interpreters.contains(name) || self.interpreters.contains(base)
     }
 
     /// Is `target` a broad fs path — **at or above** any broad root? Granting an
@@ -230,8 +235,17 @@ mod tests {
             t.classify(DenialKind::Exec, "/usr/bin/python3"),
             DangerTier::High
         );
-        // A narrow command → Low.
-        for cmd in ["ls", "cargo", "git", "rg", "rm"] {
+        // #3033: a versioned interpreter (`python3.12`, the name a hermetic
+        // tree ships) is the same interpreter, not a narrow command.
+        for cmd in ["python3.12", "/opt/tree/bin/python3.13", "python2.7"] {
+            assert_eq!(
+                t.classify(DenialKind::Exec, cmd),
+                DangerTier::High,
+                "`{cmd}` is a versioned interpreter — high-danger"
+            );
+        }
+        // A narrow command → Low (a dotted name whose base is narrow stays Low).
+        for cmd in ["ls", "cargo", "git", "rg", "rm", "cargo.1", "python3.x"] {
             assert_eq!(
                 t.classify(DenialKind::Exec, cmd),
                 DangerTier::Low,

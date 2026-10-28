@@ -201,3 +201,36 @@ fn trusted_env_literal_without_token_resolves_verbatim() {
     let got = resolve_entry_secrets(&map, McpTrust::Trusted, "owned").unwrap();
     assert_eq!(got.get("K").map(String::as_str), Some("plain"));
 }
+
+/// #3033: the MCP spawn must declare its stdio as the audited NAMED variants.
+/// A raw `Stdio::piped()` converts to `ConfinedStdio::Other` (unaudited), and
+/// Seatbelt then refuses every `net:none` stdio MCP child on macOS. Grounded by
+/// the macOS real-resource test
+/// `env_isolation_tests::stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt`.
+#[test]
+fn mcp_spawn_declares_audited_piped_piped_null_stdio() {
+    use agent_bridle::ConfinedStdio;
+    let stdio = mcp_child_stdio();
+    assert!(
+        matches!(
+            stdio,
+            [
+                ConfinedStdio::Piped,
+                ConfinedStdio::Piped,
+                ConfinedStdio::Null
+            ]
+        ),
+        "MCP stdio must be ConfinedStdio::Piped/Piped/Null by name, got {stdio:?}"
+    );
+}
+
+/// #3033: a Seatbelt refusal names the non-root precondition; any other spawn
+/// failure keeps the plain context.
+#[test]
+fn spawn_failure_notice_names_non_root_only_for_a_seatbelt_refusal() {
+    let refused = spawn_failure_notice("gmail", "/opt/py/bin/python3.12", true);
+    assert!(refused.contains("spawning MCP server `gmail`"), "{refused}");
+    assert!(refused.contains("non-root user"), "{refused}");
+    let other = spawn_failure_notice("gmail", "/opt/py/bin/python3.12", false);
+    assert!(!other.contains("non-root"), "{other}");
+}
