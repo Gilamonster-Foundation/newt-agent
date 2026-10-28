@@ -163,9 +163,26 @@ fn builtin_tool_names_are_unique() {
 /// fails here.
 #[test]
 fn advertised_set_matches_all_tool_names_both_directions() {
+    /// A bridge that discovered a server, so the `Gate::Mcp` tools are on too.
+    struct DiscoveredMcp;
+    #[async_trait::async_trait]
+    impl McpTools for DiscoveredMcp {
+        fn handles(&self, _name: &str) -> bool {
+            false
+        }
+        fn tool_defs(&self) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+        async fn call(&mut self, _leased: &crate::agentic::mcp::LeasedMcpCall<'_>) -> String {
+            String::new()
+        }
+        fn server_status(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!([]))
+        }
+    }
     let git = Some(&crate::caveats::Scope::All);
     let all = merged_tool_definitions(
-        &NoMcp,
+        &DiscoveredMcp,
         true,
         true,
         true,

@@ -4910,6 +4910,7 @@ fn is_read_only_tool(name: &str) -> bool {
                 | "recall"
                 | "prompt_read"
                 | "artifact_read"
+                | "mcp_status"
         )
 }
 

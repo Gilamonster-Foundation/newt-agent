@@ -368,6 +368,7 @@ pub(crate) fn merged_tool_definitions(
     // compose_roster+crew #479, scratchpad #583, code_search #582, experiential
     // #585, scheduled #586/#715/#716). Adding a tool is one `ToolSpec`, which
     // updates this listing AND `ALL_TOOL_NAMES` together — no more drift.
+    let with_mcp = mcp.server_status().is_some();
     for spec in EXTENDED_TOOL_REGISTRY {
         if gate_satisfied(
             spec.gate,
@@ -383,6 +384,7 @@ pub(crate) fn merged_tool_definitions(
             with_operating_mode_control,
             with_plan_mode_control,
             with_plan_mode_active,
+            with_mcp,
         ) {
             defs.push(match (spec.gate, git_read_scope) {
                 (Gate::Git, Some(scope)) => {
@@ -509,6 +511,7 @@ fn common_read_only_tool_allowed(name: &str) -> bool {
                 // Read-only harness utilities / presentation.
                 | "tool_search"
                 | "get_context_remaining"
+                | "mcp_status"
                 | "render_report"
                 // Auto-mode selection changes only a future turn's working
                 // style. It cannot change the current disposition, caveats, or
@@ -780,6 +783,8 @@ pub(super) enum Gate {
     PlanMode,
     ScheduledPlanMode,
     OperatingMode,
+    /// At least one MCP server was discovered (#3036).
+    Mcp,
 }
 
 /// One built-in (non-base) tool, declared in exactly one place.
@@ -847,6 +852,12 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
         name: "render_report",
         definition: render_report_tool_definition,
         gate: Gate::Always,
+    },
+    // #3036: read-only per-server MCP health, the `/mcp` table for the model.
+    ToolSpec {
+        name: "mcp_status",
+        definition: super::super::mcp::mcp_status_tool_definition,
+        gate: Gate::Mcp,
     },
     // Presence-gated on an injected capability (one `with_*` flag each).
     ToolSpec {
@@ -1056,6 +1067,7 @@ fn gate_satisfied(
     with_operating_mode_control: bool,
     with_plan_mode_control: bool,
     with_plan_mode_active: bool,
+    with_mcp: bool,
 ) -> bool {
     match gate {
         Gate::Always => true,
@@ -1076,6 +1088,7 @@ fn gate_satisfied(
         Gate::PlanMode => (with_scheduled && with_plan_mode_control) || with_plan_mode_active,
         Gate::ScheduledPlanMode => with_scheduled && with_plan_mode_control,
         Gate::OperatingMode => with_operating_mode_control,
+        Gate::Mcp => with_mcp,
     }
 }
 

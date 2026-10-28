@@ -24,6 +24,24 @@ pub trait McpTools: Send {
     /// call-time leash ([`leash_mcp_call`]) does not type-check — the tool name
     /// and args travel *inside* the witness.
     async fn call(&mut self, leased: &LeasedMcpCall<'_>) -> String;
+    /// Per-server launch outcomes for the read-only `mcp_status` tool (#3036):
+    /// a JSON array of `{name, state, last_error, tool_count}`, or `None` when
+    /// no server was discovered (the tool is then not advertised).
+    fn server_status(&self) -> Option<serde_json::Value> {
+        None
+    }
+}
+
+/// The `mcp_status` tool definition (#3036): no arguments, read-only.
+pub fn mcp_status_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "mcp_status",
+            "description": "Report each configured MCP server's state (connected, skipped, rejected, disabled), its last connection error, and its tool count. Read-only.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    })
 }
 
 /// The no-servers bridge: handles nothing, advertises nothing. Used by
