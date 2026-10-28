@@ -61,7 +61,7 @@ pub use dispatch::{
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) use path_suggest::resolve_tool_path;
-use path_suggest::{workspace_locator, FileIoError};
+use path_suggest::{artifact_locator, FileIoError};
 pub(crate) mod exposure;
 mod grep_tool;
 mod live_output;
@@ -5467,7 +5467,8 @@ async fn execute_authorized_tool(
                         (moved.source.as_str(), super::artifact_hooks::ArtifactFileState::from_bytes(moved.before.as_bytes()), moved.parent.as_str()),
                         (path, super::artifact_hooks::ArtifactFileState::absent(), moved.child.as_str()),
                     ] {
-                        artifacts.push_str(&record_governed_file_change(artifact_sink, artifact_context, label, "write_file",
+                        // #3045 review: record the resolved files, not `~` spellings.
+                        artifacts.push_str(&record_governed_file_change(artifact_sink, artifact_context, &artifact_locator(workspace, label), "write_file",
                             Some(before), super::artifact_hooks::ArtifactFileState::from_bytes(after.as_bytes()), color, tool_output_lines));
                     }
                     return format!("Moved functions from {} into {}; confined cargo check --lib exited 0. Parent: {} lines; child: {} lines. Displaced entries retained as .newt-move-*.saved beside changed files; inspect before removing.{}",
@@ -5656,7 +5657,7 @@ async fn execute_authorized_tool(
                                 Ok(true) => record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
-                                    &workspace_locator(std::path::Path::new(workspace), &full),
+                                    &artifact_locator(workspace, path),
                                     "write_file",
                                     artifact_before,
                                     super::artifact_hooks::ArtifactFileState::from_bytes(
@@ -5791,7 +5792,7 @@ async fn execute_authorized_tool(
                                 record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
-                                    &workspace_locator(std::path::Path::new(workspace), &full),
+                                    &artifact_locator(workspace, path),
                                     "delete_file",
                                     artifact_before,
                                     super::artifact_hooks::ArtifactFileState::absent(),
@@ -5997,7 +5998,7 @@ async fn execute_authorized_tool(
                             Ok(true) => record_governed_file_change(
                                 artifact_sink,
                                 artifact_context,
-                                &workspace_locator(std::path::Path::new(workspace), &full),
+                                &artifact_locator(workspace, path),
                                 "edit_file",
                                 artifact_before,
                                 super::artifact_hooks::ArtifactFileState::from_bytes(

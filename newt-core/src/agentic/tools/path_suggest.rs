@@ -33,15 +33,22 @@ pub(crate) fn resolve_tool_path(workspace: &Path, path: &str) -> Result<PathBuf,
     Ok(home.join(rest))
 }
 
-/// #3045 review: the provenance locator of a resolved target — relative to
-/// the workspace when inside it, so `~/project/f` under a workspace at
-/// `~/project` records `f`. A target outside keeps its absolute spelling,
-/// which the artifact layer refuses as it refuses any absolute locator.
-pub(crate) fn workspace_locator(workspace: &Path, full: &Path) -> String {
-    full.strip_prefix(workspace)
-        .unwrap_or(full)
-        .to_string_lossy()
-        .into_owned()
+/// #3045 review: the provenance locator of a model-written path — resolved
+/// like the tool resolved it, then relative to the workspace when inside it,
+/// so `~/project/f` under a workspace at `~/project` records `f`. A target
+/// outside keeps its absolute spelling, which the artifact layer refuses as
+/// it refuses any absolute locator; an unresolvable label is kept as written.
+pub(crate) fn artifact_locator(workspace: &str, label: &str) -> String {
+    let workspace = Path::new(workspace);
+    resolve_tool_path(workspace, label).map_or_else(
+        |_| label.to_owned(),
+        |full| {
+            full.strip_prefix(workspace)
+                .unwrap_or(&full)
+                .to_string_lossy()
+                .into_owned()
+        },
+    )
 }
 
 use crate::caveats::Scope;

@@ -114,6 +114,9 @@ async fn missing_tilde_path_names_written_and_resolved() {
 /// stays under home. Stripping only one left `/<abs>`, which `join` let
 /// replace home: read_file and write_file then acted on a different file,
 /// granted but not the one written, and reported success.
+/// Unix-only: the "other" file is a root-relative absolute path, which has no
+/// drive-free spelling on Windows (see the Windows twin below).
+#[cfg(unix)]
 #[tokio::test]
 async fn repeated_separators_after_tilde_stay_under_home() {
     let _lock = env_lock().await;
@@ -157,4 +160,65 @@ async fn repeated_separators_after_tilde_stay_under_home() {
     .await;
     assert_eq!(std::fs::read_to_string(&home_file).unwrap(), "written");
     assert_eq!(std::fs::read_to_string(&other_file).unwrap(), "other copy");
+}
+
+/// #3045 review, portable: `~//x` is `~/x` on every platform.
+#[tokio::test]
+async fn doubled_separator_after_tilde_reads_the_home_file() {
+    let _lock = env_lock().await;
+    let ws = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("notes.txt"), "from home").unwrap();
+    let _home = EnvVar::set("HOME", &home.path().to_string_lossy());
+    let caveats = read_only(&[ws.path(), home.path()]);
+    let out = run_tool(
+        "read_file",
+        serde_json::json!({"path": "~//notes.txt"}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(out.contains("from home"), "{out}");
+}
+
+/// #3045 review, Windows twin: a drive after `~/` would make `join` replace
+/// home, so it is refused, never resolved to the other drive.
+#[cfg(windows)]
+#[tokio::test]
+async fn drive_prefix_after_tilde_is_refused() {
+    let _lock = env_lock().await;
+    let ws = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvVar::set("HOME", &home.path().to_string_lossy());
+    let caveats = read_only(&[ws.path(), home.path()]);
+    for path in ["~/C:/Windows/win.ini", "~\\C:\\Windows\\win.ini"] {
+        let out = run_tool(
+            "read_file",
+            serde_json::json!({"path": path}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.contains("must be relative"), "{path}: {out}");
+    }
+}
+
+/// #3045 review: the move_from arm records both operands through this
+/// locator. Under a workspace at `~/project`, `~/project/src/lib.rs` is the
+/// workspace's `src/lib.rs`; a plain relative label is unchanged.
+#[tokio::test]
+async fn tilde_labels_map_to_workspace_relative_locators() {
+    let _lock = env_lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let ws = home.path().join("project");
+    let _home = EnvVar::set("HOME", &home.path().to_string_lossy());
+    let ws = ws.to_string_lossy();
+    let locator = |label| crate::agentic::tools::path_suggest::artifact_locator(&ws, label);
+    assert_eq!(
+        std::path::PathBuf::from(locator("~/project/src/lib.rs")),
+        std::path::Path::new("src").join("lib.rs")
+    );
+    assert_eq!(locator("src/child.rs"), "src/child.rs");
 }
