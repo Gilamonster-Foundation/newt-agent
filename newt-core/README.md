@@ -128,6 +128,8 @@ can omit `TZ`; unrelated environment variables remain excluded. The operating
 system/runtime interprets the timezone, and a `TZ` file path grants no filesystem
 access. Stdio MCP children use the same timezone default with per-server
 environment overrides retaining precedence.
+Under `--ambient` (or `--yolo`), a `run_command` on the host shell gets the
+parent's full environment instead, minus newt's own secrets and switches.
 
 It also hosts the shared agentic tool executor used by the TUI and headless
 paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
