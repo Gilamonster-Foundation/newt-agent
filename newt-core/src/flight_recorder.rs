@@ -34,6 +34,9 @@ pub enum ShadowAxis {
     FsRead,
     FsWrite,
     Net,
+    /// A per-server MCP connect/auth outcome (#3037). An availability record,
+    /// not a policy capability: [`FlightCapture::gaps`] never proposes it.
+    Mcp,
 }
 
 impl ShadowAxis {
@@ -43,8 +46,31 @@ impl ShadowAxis {
             Self::Exec => "exec",
             Self::FsRead | Self::FsWrite => "fs",
             Self::Net => "net",
+            Self::Mcp => "mcp",
         }
     }
+}
+
+/// How one MCP server connect ended (#3037) — the `/mcp` status variant, so
+/// the class comes from typed evidence, never from error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpConnectOutcome {
+    Connected,
+    /// The server refused the credential (a typed HTTP 401 or rejected grant).
+    Rejected,
+    /// Any other failure (timeout, spawn error, network denial, other status).
+    Skipped,
+}
+
+/// The MCP half of an [`ShadowAxis::Mcp`] record: transport, outcome and the
+/// typed HTTP status the connection error carried, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConnectRecord {
+    pub transport: crate::mcp::TransportKind,
+    pub outcome: McpConnectOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
 }
 
 /// One observed authority: a capability + the concrete target a confined run
@@ -68,6 +94,9 @@ pub struct ShadowCaveat {
     /// excluded) — see the reader.
     #[serde(default)]
     pub session: Option<String>,
+    /// Set on [`ShadowAxis::Mcp`] records only (#3037).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConnectRecord>,
 }
 
 /// A session's accumulated capture, deduplicated by (axis, target). The map
@@ -96,6 +125,19 @@ impl FlightCapture {
         command: &str,
         session: Option<&str>,
     ) {
+        self.observe_record(axis, target, command, session, None);
+    }
+
+    /// [`Self::observe`] carrying an MCP connect record (kept from the first
+    /// observation, like `command`).
+    fn observe_record(
+        &mut self,
+        axis: ShadowAxis,
+        target: &str,
+        command: &str,
+        session: Option<&str>,
+        mcp: Option<McpConnectRecord>,
+    ) {
         let target = target.trim();
         if target.is_empty() {
             return;
@@ -110,6 +152,7 @@ impl FlightCapture {
                 command: command.to_string(),
                 count: 1,
                 session: session.map(str::to_string),
+                mcp,
             });
     }
 
@@ -134,7 +177,10 @@ impl FlightCapture {
     ) -> Vec<&'a ShadowCaveat> {
         self.caveats
             .values()
-            .filter(|c| !in_policy.contains(&(c.axis.class().to_string(), c.target.clone())))
+            .filter(|c| {
+                c.axis != ShadowAxis::Mcp
+                    && !in_policy.contains(&(c.axis.class().to_string(), c.target.clone()))
+            })
             .collect()
     }
 
@@ -216,6 +262,32 @@ pub fn log_observed(axis: ShadowAxis, target: &str, command: &str) {
     append_capture(&cap);
 }
 
+/// The capture for one MCP server connect (#3037): one [`ShadowAxis::Mcp`]
+/// record under `session`, or the active session when `session` is `None`.
+pub fn mcp_connect_capture(
+    server: &str,
+    record: McpConnectRecord,
+    session: Option<&str>,
+) -> FlightCapture {
+    let mut cap = FlightCapture::default();
+    let active = crate::lifecycle::active_session();
+    let command = format!("mcp {} connect", record.transport.as_str());
+    cap.observe_record(
+        ShadowAxis::Mcp,
+        server,
+        &command,
+        session.or(active.as_deref()),
+        Some(record),
+    );
+    cap
+}
+
+/// Hook for MCP server connects (#3037): append [`mcp_connect_capture`] the
+/// same append-only way as [`log_observed`]. A no-op when recording is off.
+pub fn log_mcp_connect(server: &str, record: McpConnectRecord, session: Option<&str>) {
+    append_capture(&mcp_connect_capture(server, record, session));
+}
+
 /// Append every caveat in `cap` to the armed capture file as JSONL (one
 /// [`ShadowCaveat`] per line). Append-only, so concurrent dispatches never race
 /// a read-modify-write; every error is swallowed — the recorder never perturbs
@@ -273,7 +345,7 @@ pub fn read_capture_jsonl_sessioned(text: &str, session: Option<&str>) -> Flight
             };
             if belongs {
                 for _ in 0..c.count.max(1) {
-                    cap.observe(c.axis, &c.target, &c.command, c.session.as_deref());
+                    cap.observe_record(c.axis, &c.target, &c.command, c.session.as_deref(), c.mcp);
                 }
             }
         }
@@ -413,6 +485,37 @@ mod tests {
         assert!(std::env::var_os(CAPTURE_PATH_ENV).is_none());
         log_observed(ShadowAxis::FsRead, "/ws/x", "read_file");
         log_observed(ShadowAxis::Net, "example.com", "https://example.com");
+    }
+
+    /// #3037: an MCP connect/auth outcome is recorded on its own axis with
+    /// server, transport, outcome and typed HTTP status; the JSONL line folds
+    /// back intact, and it is never offered as a policy gap.
+    #[test]
+    fn mcp_connect_outcomes_round_trip_and_are_never_policy_gaps_3037() {
+        let rejected = McpConnectRecord {
+            transport: crate::mcp::TransportKind::Http,
+            outcome: McpConnectOutcome::Rejected,
+            http_status: Some(401),
+        };
+        let mut cap = FlightCapture::default();
+        cap.observe_record(
+            ShadowAxis::Mcp,
+            "docs",
+            "mcp http connect",
+            Some("s1"),
+            Some(rejected),
+        );
+        let line = serde_json::to_string(&cap.caveats[&(ShadowAxis::Mcp, "docs".into())]).unwrap();
+        assert_eq!(
+            line,
+            r#"{"axis":"mcp","target":"docs","command":"mcp http connect","count":1,"session":"s1","mcp":{"transport":"http","outcome":"rejected","http_status":401}}"#
+        );
+        let back = read_capture_jsonl_sessioned(&line, Some("s1"));
+        assert_eq!(back, cap);
+        assert!(cap.gaps(&HashSet::new()).is_empty());
+        // Pre-#3037 lines (no `mcp` key) still parse.
+        let exec = r#"{"axis":"exec","target":"cargo","command":"cargo build","count":1}"#;
+        assert_eq!(read_capture_jsonl(exec).caveats.len(), 1);
     }
 
     #[test]

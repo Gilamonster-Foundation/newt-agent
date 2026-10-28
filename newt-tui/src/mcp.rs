@@ -156,6 +156,9 @@ pub(crate) struct McpLaunchAuthority<'a> {
     pub(crate) caveats: &'a newt_core::Caveats,
     pub(crate) protection:
         Option<std::sync::Arc<newt_core::workspace_protection::WorkspaceProtection>>,
+    /// The session these connects belong to (#3037). Startup connects before
+    /// the lifecycle session is installed, so it is passed explicitly.
+    pub(crate) session: Option<&'a str>,
 }
 
 pub(crate) struct Mcp {
@@ -399,16 +402,50 @@ async fn reconnect_http(
     state: &HttpReconnectState,
     bearer: Option<&str>,
 ) -> anyhow::Result<ClientConnectedServer> {
-    let admitted = newt_core::mcp::admit(&state.entry)
-        .map_err(|denied| anyhow::anyhow!("MCP reconnect was no longer admitted: {denied}"))?;
-    connect_http_with_runtime_bearer(
-        &admitted,
-        &state.caveats,
-        bearer,
-        state.insecure_authorization_allowed,
-        &state.explicit_net_hosts,
-    )
-    .await
+    let result = async {
+        let admitted = newt_core::mcp::admit(&state.entry)
+            .map_err(|denied| anyhow::anyhow!("MCP reconnect was no longer admitted: {denied}"))?;
+        connect_http_with_runtime_bearer(
+            &admitted,
+            &state.caveats,
+            bearer,
+            state.insecure_authorization_allowed,
+            &state.explicit_net_hosts,
+        )
+        .await
+    }
+    .await;
+    // Automatic recovery is a connect too (#3037).
+    newt_core::flight_recorder::log_mcp_connect(
+        &state.entry.name,
+        management::connect_record(TransportKind::Http, result.as_ref().err()),
+        None,
+    );
+    result
+}
+
+/// The refresh step of tool-call recovery (#3037). Recovery asks for a
+/// refresh only after a typed 401; when no bearer comes back (a refused grant
+/// or no refresh token) it returns that 401 without reconnecting, so no
+/// connect path records it. Record it here, once per recovery attempt. A
+/// refreshed bearer is recorded by the reconnect that uses it.
+fn refreshed_or_recorded(
+    server: &str,
+    refreshed: Result<Option<String>, crate::mcp_token::OAuthGrantRejected>,
+    record: impl FnOnce(&str, newt_core::flight_recorder::McpConnectRecord),
+) -> Option<String> {
+    if let Ok(Some(bearer)) = refreshed {
+        return Some(bearer);
+    }
+    record(
+        server,
+        newt_core::flight_recorder::McpConnectRecord {
+            transport: TransportKind::Http,
+            outcome: newt_core::flight_recorder::McpConnectOutcome::Rejected,
+            http_status: Some(401),
+        },
+    );
+    None
 }
 
 /// The permission gate returns fresh caveats, the named net approvals that
@@ -901,6 +938,7 @@ impl Mcp {
         let McpLaunchAuthority {
             caveats,
             protection,
+            session,
         } = authority;
         let (mut grant_net, startup_cancel) = match grant_net {
             Some((prompt, cancel)) => (Some(prompt), Some(cancel)),
@@ -934,6 +972,7 @@ impl Mcp {
                 allow_insecure_hosts,
                 &mut grant_net,
                 protection.as_deref(),
+                session,
             )
             .await;
             match result {
@@ -1072,20 +1111,32 @@ impl Mcp {
                     move |rejected| {
                         let refresh_state = refresh_state.clone();
                         async move {
-                            let url = refresh_state.entry.url.as_deref()?;
-                            let policy = crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(
-                                &refresh_state.caveats.net,
-                                &refresh_state.explicit_net_hosts,
-                            );
-                            crate::mcp_token::refresh_bearer_token(
+                            let refreshed = match refresh_state.entry.url.as_deref() {
+                                Some(url) => {
+                                    let policy =
+                                        crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(
+                                            &refresh_state.caveats.net,
+                                            &refresh_state.explicit_net_hosts,
+                                        );
+                                    crate::mcp_token::refresh_bearer_token(
+                                        &refresh_state.entry.name,
+                                        url,
+                                        &rejected,
+                                        &policy,
+                                    )
+                                    .await
+                                }
+                                None => Ok(None),
+                            };
+                            refreshed_or_recorded(
                                 &refresh_state.entry.name,
-                                url,
-                                &rejected,
-                                &policy,
+                                refreshed,
+                                |server, record| {
+                                    newt_core::flight_recorder::log_mcp_connect(
+                                        server, record, None,
+                                    );
+                                },
                             )
-                            .await
-                            .ok()
-                            .flatten()
                         }
                     },
                     move |bearer| {
@@ -1654,6 +1705,71 @@ mod tests {
         assert!(!is_http_unauthorized(&anyhow::anyhow!(
             "server text happened to contain 401 Unauthorized"
         )));
+    }
+
+    /// #3037 review: a tool call's 401 whose bearer refresh is refused ends
+    /// recovery with no reconnect, so the refresh step records it: once, as
+    /// `rejected` with the typed 401. A refreshed bearer records nothing here;
+    /// its reconnect does.
+    #[tokio::test]
+    async fn a_refused_refresh_during_tool_call_recovery_is_recorded_once_3037() {
+        use newt_core::flight_recorder::{McpConnectOutcome, McpConnectRecord};
+        use std::sync::{Arc, Mutex};
+
+        async fn recover(
+            refreshed: Result<Option<String>, crate::mcp_token::OAuthGrantRejected>,
+        ) -> (Vec<(String, McpConnectRecord)>, usize, bool) {
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let reconnects = Arc::new(Mutex::new(0));
+            let (sink, counter) = (Arc::clone(&records), Arc::clone(&reconnects));
+            let refreshed = Arc::new(Mutex::new(Some(refreshed)));
+            let result = newt_mcp_client::recover_http_call_after_error(
+                anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+                    401,
+                    "Unauthorized",
+                    "",
+                )),
+                true,
+                Some("rejected-token".to_string()),
+                false,
+                move |_rejected| {
+                    let sink = Arc::clone(&sink);
+                    let refreshed = refreshed.lock().unwrap().take().unwrap();
+                    async move {
+                        refreshed_or_recorded("docs", refreshed, |server, record| {
+                            sink.lock().unwrap().push((server.to_string(), record));
+                        })
+                    }
+                },
+                move |_bearer| {
+                    *counter.lock().unwrap() += 1;
+                    async { Err::<(), _>(anyhow::anyhow!("reconnect not under test")) }
+                },
+                |live| async move { (live, Ok::<(), anyhow::Error>(())) },
+            )
+            .await;
+            let records = records.lock().unwrap().clone();
+            let reconnects = *reconnects.lock().unwrap();
+            (records, reconnects, result.is_err())
+        }
+
+        let rejected = McpConnectRecord {
+            transport: TransportKind::Http,
+            outcome: McpConnectOutcome::Rejected,
+            http_status: Some(401),
+        };
+        for refused in [Err(crate::mcp_token::OAuthGrantRejected), Ok(None)] {
+            let (records, reconnects, failed) = recover(refused).await;
+            assert_eq!(records, [("docs".to_string(), rejected)]);
+            assert_eq!(reconnects, 0, "a refused refresh never reconnects");
+            assert!(failed, "the original 401 is returned");
+        }
+        let (records, reconnects, _) = recover(Ok(Some("fresh".into()))).await;
+        assert!(
+            records.is_empty(),
+            "the reconnect records a refreshed bearer"
+        );
+        assert_eq!(reconnects, 1);
     }
 
     #[tokio::test]

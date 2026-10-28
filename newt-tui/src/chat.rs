@@ -2537,6 +2537,11 @@ fn session_body(
         .tui
         .as_ref()
         .map(|tui| tui.permissions.mcp_net_prompt_default);
+    // #1662: THE identity of this running Newt, stable for its whole lifetime
+    // and distinct from any conversation id. Minted here, before MCP startup,
+    // so startup connect records carry it (#3037); it is installed as the
+    // active session further down, once memory has initialised.
+    let lifecycle_session = newt_core::lifecycle::new_session_id();
     let mut mcp = tokio::task::block_in_place(|| -> anyhow::Result<_> {
         let mut permission_gate = interactive.then(|| PromptPermissionGate {
             pending_command_retries: Default::default(),
@@ -2585,6 +2590,7 @@ fn session_body(
             crate::mcp::McpLaunchAuthority {
                 caveats: &connect_caveats,
                 protection: workspace_settings.protection.clone(),
+                session: Some(lifecycle_session.as_str()),
             },
             &explicit_net_hosts,
             Some((&mut grant_net, &startup_cancel)),
@@ -2914,12 +2920,10 @@ fn session_body(
     // Step 26.6b (#586): session-scoped plan ledger for the scheduled view.
     // Task-specific → CLEARED on /new (like the scratchpad).
     let step_ledger = newt_core::SessionStepLedger::default();
-    // #1662: THE identity of this running Newt, stable for its whole lifetime
-    // and distinct from any conversation id. The previous scheme was
+    // #1662: `lifecycle_session` (minted above) replaced
     // `SystemTime::now().as_secs()`, so two Newts launched in the same second —
-    // a script, a tab restore, a Herdr layout opening several panes — shared
-    // one lifecycle identity and each answered to the other's events.
-    let lifecycle_session = newt_core::lifecycle::new_session_id();
+    // a script, a tab restore, a Herdr layout opening several panes — no longer
+    // share one lifecycle identity and answer to each other's events.
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: lifecycle_session.to_string(),
