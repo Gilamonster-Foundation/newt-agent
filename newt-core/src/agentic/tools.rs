@@ -60,7 +60,8 @@ pub use dispatch::{
     execute_tool_with_offload_and_prompt_and_artifacts,
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
-use path_suggest::FileIoError;
+pub(crate) use path_suggest::resolve_tool_path;
+use path_suggest::{artifact_locator, FileIoError};
 pub(crate) mod exposure;
 mod grep_tool;
 mod live_output;
@@ -1731,7 +1732,7 @@ pub(super) fn authorized_read(
     caveats: &crate::caveats::Caveats,
     permission_gate: Option<&mut (dyn PermissionGate + '_)>,
 ) -> Result<String, String> {
-    let full = std::path::Path::new(workspace).join(path);
+    let full = resolve_tool_path(std::path::Path::new(workspace), path)?;
     let full_str = full.to_string_lossy();
     let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
     if !scope_permits {
@@ -5490,7 +5491,8 @@ async fn execute_authorized_tool(
                         (moved.source.as_str(), super::artifact_hooks::ArtifactFileState::from_bytes(moved.before.as_bytes()), moved.parent.as_str()),
                         (path, super::artifact_hooks::ArtifactFileState::absent(), moved.child.as_str()),
                     ] {
-                        artifacts.push_str(&record_governed_file_change(artifact_sink, artifact_context, label, "write_file",
+                        // #3045 review: record the resolved files, not `~` spellings.
+                        artifacts.push_str(&record_governed_file_change(artifact_sink, artifact_context, &artifact_locator(workspace, label), "write_file",
                             Some(before), super::artifact_hooks::ArtifactFileState::from_bytes(after.as_bytes()), color, tool_output_lines));
                     }
                     return format!("Moved functions from {} into {}; confined cargo check --lib exited 0. Parent: {} lines; child: {} lines. Displaced entries retained as .newt-move-*.saved beside changed files; inspect before removing.{}",
@@ -5536,7 +5538,10 @@ async fn execute_authorized_tool(
                 }
                 None => content,
             };
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // Scope- vs #263-gate-authorised, same split as read_file (step-52.2):
             // decides whether the write below is object-bound.
@@ -5676,7 +5681,7 @@ async fn execute_authorized_tool(
                                 Ok(true) => record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
-                                    path,
+                                    &artifact_locator(workspace, path),
                                     "write_file",
                                     artifact_before,
                                     super::artifact_hooks::ArtifactFileState::from_bytes(
@@ -5716,7 +5721,10 @@ async fn execute_authorized_tool(
             if path.trim().is_empty() {
                 return "error: path is required".to_string();
             }
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // step-52.6: same scope-vs-#263-gate split — decides whether the
             // removal below is object-bound (via unlinkat on the resolved parent).
@@ -5808,7 +5816,7 @@ async fn execute_authorized_tool(
                                 record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
-                                    path,
+                                    &artifact_locator(workspace, path),
                                     "delete_file",
                                     artifact_before,
                                     super::artifact_hooks::ArtifactFileState::absent(),
@@ -5863,7 +5871,10 @@ async fn execute_authorized_tool(
                 return "error: old_string must not be empty — use write_file to create new files"
                     .to_string();
             }
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // step-52.5: same scope-vs-#263-gate split as write_file — decides
             // whether the read of `existing` and the write of `updated` below are
@@ -6011,7 +6022,7 @@ async fn execute_authorized_tool(
                             Ok(true) => record_governed_file_change(
                                 artifact_sink,
                                 artifact_context,
-                                path,
+                                &artifact_locator(workspace, path),
                                 "edit_file",
                                 artifact_before,
                                 super::artifact_hooks::ArtifactFileState::from_bytes(
@@ -6048,7 +6059,10 @@ async fn execute_authorized_tool(
 
         "list_dir" => {
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // Scope- vs #263-gate-authorised, same split as read_file (step-52.2).
             let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
@@ -6102,7 +6116,10 @@ async fn execute_authorized_tool(
             },
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             const WORKSPACE_ONLY: &str = "capability denied: find is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
@@ -6188,7 +6205,10 @@ async fn execute_authorized_tool(
             // no subprocess, so a run_command refusal can't take the agent's
             // grep with it.
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             const WORKSPACE_ONLY: &str = "capability denied: grep is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
