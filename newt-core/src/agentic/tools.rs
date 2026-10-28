@@ -142,6 +142,17 @@ pub fn read_only_hidden_tool(name: &str) -> bool {
 /// `NEWT_VENV` (set from `--venv` or auto-detected from `$VIRTUAL_ENV` by the
 /// CLI) takes precedence; falls back to `$VIRTUAL_ENV` if the TUI was invoked
 /// directly without going through the CLI's `dispatch`.
+/// Redact every string value inside `value` in place (#3036), keeping the
+/// JSON structure intact.
+fn redact_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = super::compress::redact_secrets(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_strings),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(redact_json_strings),
+        _ => {}
+    }
+}
+
 /// Atomically validate a model-emitted tool call **before any side effect**
 /// (invariant #3: no malformed tool call reaches a tool). Both the name and the
 /// arguments are checked up front; the caller receives EITHER a ready-to-dispatch
@@ -4172,9 +4183,14 @@ async fn execute_authorized_tool(
         },
 
         // #3036: per-server MCP health. Error text is server- and
-        // transport-authored, so it passes the credential redaction table.
+        // transport-authored, so each string value passes the credential
+        // redaction table before serializing; redacting the serialized array
+        // could eat a closing quote or the rest of the document.
         "mcp_status" => match mcp.server_status() {
-            Some(status) => super::compress::redact_secrets(&status.to_string()),
+            Some(mut status) => {
+                redact_json_strings(&mut status);
+                status.to_string()
+            }
             None => "no MCP servers configured".to_string(),
         },
 
