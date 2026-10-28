@@ -262,21 +262,30 @@ pub fn log_observed(axis: ShadowAxis, target: &str, command: &str) {
     append_capture(&cap);
 }
 
-/// Hook for MCP server connects (#3037): record `server`'s connect/auth
-/// outcome as one [`ShadowAxis::Mcp`] line, the same append-only way as
-/// [`log_observed`]. A no-op when recording is off.
-pub fn log_mcp_connect(server: &str, record: McpConnectRecord) {
+/// The capture for one MCP server connect (#3037): one [`ShadowAxis::Mcp`]
+/// record under `session`, or the active session when `session` is `None`.
+pub fn mcp_connect_capture(
+    server: &str,
+    record: McpConnectRecord,
+    session: Option<&str>,
+) -> FlightCapture {
     let mut cap = FlightCapture::default();
-    let session = crate::lifecycle::active_session();
+    let active = crate::lifecycle::active_session();
     let command = format!("mcp {} connect", record.transport.as_str());
     cap.observe_record(
         ShadowAxis::Mcp,
         server,
         &command,
-        session.as_deref(),
+        session.or(active.as_deref()),
         Some(record),
     );
-    append_capture(&cap);
+    cap
+}
+
+/// Hook for MCP server connects (#3037): append [`mcp_connect_capture`] the
+/// same append-only way as [`log_observed`]. A no-op when recording is off.
+pub fn log_mcp_connect(server: &str, record: McpConnectRecord, session: Option<&str>) {
+    append_capture(&mcp_connect_capture(server, record, session));
 }
 
 /// Append every caveat in `cap` to the armed capture file as JSONL (one

@@ -152,6 +152,9 @@ pub(crate) struct McpLaunchAuthority<'a> {
     pub(crate) caveats: &'a newt_core::Caveats,
     pub(crate) protection:
         Option<std::sync::Arc<newt_core::workspace_protection::WorkspaceProtection>>,
+    /// The session these connects belong to (#3037). Startup connects before
+    /// the lifecycle session is installed, so it is passed explicitly.
+    pub(crate) session: Option<&'a str>,
 }
 
 pub(crate) struct Mcp {
@@ -418,16 +421,26 @@ async fn reconnect_http(
     state: &HttpReconnectState,
     bearer: Option<&str>,
 ) -> anyhow::Result<ClientConnectedServer> {
-    let admitted = newt_core::mcp::admit(&state.entry)
-        .map_err(|denied| anyhow::anyhow!("MCP reconnect was no longer admitted: {denied}"))?;
-    connect_http_with_runtime_bearer(
-        &admitted,
-        &state.caveats,
-        bearer,
-        state.insecure_authorization_allowed,
-        &state.explicit_net_hosts,
-    )
-    .await
+    let result = async {
+        let admitted = newt_core::mcp::admit(&state.entry)
+            .map_err(|denied| anyhow::anyhow!("MCP reconnect was no longer admitted: {denied}"))?;
+        connect_http_with_runtime_bearer(
+            &admitted,
+            &state.caveats,
+            bearer,
+            state.insecure_authorization_allowed,
+            &state.explicit_net_hosts,
+        )
+        .await
+    }
+    .await;
+    // Automatic recovery is a connect too (#3037).
+    newt_core::flight_recorder::log_mcp_connect(
+        &state.entry.name,
+        management::connect_record(TransportKind::Http, result.as_ref().err()),
+        None,
+    );
+    result
 }
 
 /// The permission gate returns fresh caveats, the named net approvals that
@@ -892,6 +905,7 @@ impl Mcp {
         let McpLaunchAuthority {
             caveats,
             protection,
+            session,
         } = authority;
         let (mut grant_net, startup_cancel) = match grant_net {
             Some((prompt, cancel)) => (Some(prompt), Some(cancel)),
@@ -922,6 +936,7 @@ impl Mcp {
                 allow_insecure_hosts,
                 &mut grant_net,
                 protection.as_deref(),
+                session,
             )
             .await;
             match result {

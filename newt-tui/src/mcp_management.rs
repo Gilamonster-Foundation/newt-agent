@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Connect one entry and record its outcome in the flight recorder (#3037).
+/// `session` is the owning session when the caller knows it before the
+/// lifecycle cell is installed (startup); `None` uses the active session.
 pub(super) async fn connect_entry(
     entry: &McpServerEntry,
     caveats: &newt_core::Caveats,
@@ -9,22 +12,50 @@ pub(super) async fn connect_entry(
     allow_insecure_hosts: &[String],
     grant_net: &mut Option<&mut McpNetGrantPrompt<'_>>,
     protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
+    session: Option<&str>,
 ) -> anyhow::Result<ReconnectableServer> {
-    anyhow::ensure!(entry.enabled, "server is disabled in configuration");
-    let admitted = newt_core::mcp::admit(entry).map_err(|denied| anyhow::anyhow!("{denied}"))?;
-    let result = match entry.transport {
-        TransportKind::Stdio => connect_stdio_with_protection(&admitted, caveats, protection)
-            .await
-            .map(|live| ReconnectableServer { live, http: None }),
-        TransportKind::Http => {
-            anyhow::ensure!(!has_plaintext_authorization_header(entry),
-                "plaintext Authorization credential in MCP config; replace it with an environment/file reference");
-            connect_http_with_net_prompt(&admitted, http_policy, allow_insecure_hosts, grant_net)
+    connect_entry_recorded(
+        entry,
+        caveats,
+        http_policy,
+        allow_insecure_hosts,
+        grant_net,
+        protection,
+        &mut |server, record| newt_core::flight_recorder::log_mcp_connect(server, record, session),
+    )
+    .await
+}
+
+/// [`connect_entry`] with the recorder injected. Every outcome, including an
+/// admission or configuration refusal before any dial, reaches `record` once.
+async fn connect_entry_recorded(
+    entry: &McpServerEntry,
+    caveats: &newt_core::Caveats,
+    http_policy: &mut (newt_core::Caveats, Vec<String>),
+    allow_insecure_hosts: &[String],
+    grant_net: &mut Option<&mut McpNetGrantPrompt<'_>>,
+    protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
+    record: &mut (dyn FnMut(&str, newt_core::flight_recorder::McpConnectRecord) + Send),
+) -> anyhow::Result<ReconnectableServer> {
+    let result = async {
+        anyhow::ensure!(entry.enabled, "server is disabled in configuration");
+        let admitted =
+            newt_core::mcp::admit(entry).map_err(|denied| anyhow::anyhow!("{denied}"))?;
+        match entry.transport {
+            TransportKind::Stdio => connect_stdio_with_protection(&admitted, caveats, protection)
                 .await
+                .map(|live| ReconnectableServer { live, http: None }),
+            TransportKind::Http => {
+                anyhow::ensure!(!has_plaintext_authorization_header(entry),
+                    "plaintext Authorization credential in MCP config; replace it with an environment/file reference");
+                connect_http_with_net_prompt(&admitted, http_policy, allow_insecure_hosts, grant_net)
+                    .await
+            }
+            TransportKind::Sse => anyhow::bail!("legacy SSE transport (use type = \"http\")"),
         }
-        TransportKind::Sse => anyhow::bail!("legacy SSE transport (use type = \"http\")"),
-    };
-    newt_core::flight_recorder::log_mcp_connect(
+    }
+    .await;
+    record(
         &entry.name,
         connect_record(entry.transport, result.as_ref().err()),
     );
@@ -92,6 +123,7 @@ impl Mcp {
             allow_insecure_hosts,
             &mut grant_net,
             self.protection.as_deref(),
+            None,
         )
         .await;
         synchronize_http_reconnect_policy(&mut self.servers, &policy);
@@ -177,48 +209,62 @@ impl Mcp {
             .ok_or_else(|| anyhow::anyhow!("missing server endpoint"))?;
         let mut reconnect_policy = policy.clone();
         let mut approved = std::collections::BTreeSet::new();
-        loop {
-            let hop_policy =
-                crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(&policy.0.net, &policy.1);
-            match crate::mcp_token::run_oauth_flow_cancellable(
-                &entry.name,
-                url,
-                &crate::mcp_token::ConfiguredOAuth::from_entry(entry),
-                &hop_policy,
-                Some(cancel.clone()),
-            )
-            .await
-            {
-                Ok(()) => break,
-                Err(error) => {
-                    let Some(required) =
-                        error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()
-                    else {
-                        return Err(error);
-                    };
-                    let host = required.host.clone();
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed)
-                        || approved.len() >= 8
-                        || approved.contains(&host)
-                    {
-                        return Err(error);
+        // An OAuth failure is an auth outcome the recorder sees (#3037); a
+        // successful login is recorded by the reconnect below.
+        let flow: anyhow::Result<()> = async {
+            loop {
+                let hop_policy =
+                    crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(&policy.0.net, &policy.1);
+                match crate::mcp_token::run_oauth_flow_cancellable(
+                    &entry.name,
+                    url,
+                    &crate::mcp_token::ConfiguredOAuth::from_entry(entry),
+                    &hop_policy,
+                    Some(cancel.clone()),
+                )
+                .await
+                {
+                    Ok(()) => break,
+                    Err(error) => {
+                        let Some(required) =
+                            error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()
+                        else {
+                            return Err(error);
+                        };
+                        let host = required.host.clone();
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed)
+                            || approved.len() >= 8
+                            || approved.contains(&host)
+                        {
+                            return Err(error);
+                        }
+                        let Some((granted, hosts, remembered)) =
+                            request_net_grant(&error, &entry.name, &mut grant_net, "mcp login",
+                                "Allow once covers this OAuth login only. The new server connection may ask separately; session/permanent can cover both.")
+                        else {
+                            return Err(error);
+                        };
+                        apply_login_net_grant(
+                            &mut policy,
+                            &mut reconnect_policy,
+                            &mut approved,
+                            host,
+                            (granted, hosts, remembered),
+                        );
                     }
-                    let Some((granted, hosts, remembered)) =
-                        request_net_grant(&error, &entry.name, &mut grant_net, "mcp login",
-                            "Allow once covers this OAuth login only. The new server connection may ask separately; session/permanent can cover both.")
-                    else {
-                        return Err(error);
-                    };
-                    apply_login_net_grant(
-                        &mut policy,
-                        &mut reconnect_policy,
-                        &mut approved,
-                        host,
-                        (granted, hosts, remembered),
-                    );
                 }
             }
+            Ok(())
         }
+        .await;
+        if let Err(error) = &flow {
+            newt_core::flight_recorder::log_mcp_connect(
+                &entry.name,
+                connect_record(entry.transport, Some(error)),
+                None,
+            );
+        }
+        flow?;
         anyhow::ensure!(
             !cancel.load(std::sync::atomic::Ordering::Relaxed),
             "MCP login cancelled"
@@ -300,6 +346,70 @@ fn apply_login_net_grant(
 mod tests {
     use super::*;
     use newt_core::caveats::Scope;
+
+    /// #3037 review: refusals that end a connect before any dial (admission,
+    /// a plaintext Authorization header, legacy SSE) still reach the recorder,
+    /// and an explicitly passed startup session survives the scoped reader.
+    #[tokio::test]
+    async fn refusals_before_any_dial_are_recorded_3037() {
+        use newt_core::flight_recorder::{
+            mcp_connect_capture, read_capture_jsonl_sessioned, McpConnectOutcome, ShadowAxis,
+        };
+        let entry = |name: &str, extra: &str| -> McpServerEntry {
+            let mut entry: McpServerEntry = toml::from_str(&format!(
+                "name = '{name}'\ntype = 'http'\nurl = 'https://{name}.example.test/mcp'\n{extra}"
+            ))
+            .unwrap();
+            entry.trust = newt_core::mcp::McpTrust::Trusted;
+            entry
+        };
+        let mut untrusted = entry("untrusted", "");
+        untrusted.trust = newt_core::mcp::McpTrust::Untrusted;
+        let plaintext = entry("plaintext", "headers = { Authorization = 'Bearer abc' }");
+        let mut sse = entry("sse", "");
+        sse.transport = TransportKind::Sse;
+
+        let mut recorded = Vec::new();
+        for entry in [&untrusted, &plaintext, &sse] {
+            let result = connect_entry_recorded(
+                entry,
+                &newt_core::Caveats::top(),
+                &mut (newt_core::Caveats::top(), Vec::new()),
+                &[],
+                &mut None,
+                None,
+                &mut |server, record| recorded.push((server.to_string(), record)),
+            )
+            .await;
+            assert!(result.is_err(), "{} must be refused", entry.name);
+        }
+        let names: Vec<&str> = recorded.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["untrusted", "plaintext", "sse"]);
+        assert!(recorded
+            .iter()
+            .all(|(_, record)| record.outcome == McpConnectOutcome::Skipped));
+
+        // Startup passes its session explicitly, before the lifecycle cell is
+        // installed; the scoped reader keeps every line.
+        let lines: String = recorded
+            .iter()
+            .flat_map(|(server, record)| {
+                mcp_connect_capture(server, *record, Some("startup-session"))
+                    .caveats
+                    .into_values()
+            })
+            .map(|caveat| serde_json::to_string(&caveat).unwrap() + "\n")
+            .collect();
+        let scoped = read_capture_jsonl_sessioned(&lines, Some("startup-session"));
+        assert_eq!(
+            scoped
+                .caveats
+                .keys()
+                .filter(|(axis, _)| *axis == ShadowAxis::Mcp)
+                .count(),
+            3
+        );
+    }
 
     /// #3037: the recorded connect outcome comes from typed evidence — a
     /// typed 401 is `rejected` with its status; error text that merely says
