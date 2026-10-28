@@ -109,3 +109,52 @@ async fn missing_tilde_path_names_written_and_resolved() {
     assert!(out.contains("~/absent.toml"), "{out}");
     assert!(out.contains(&format!("resolved to `{resolved}`")), "{out}");
 }
+
+/// #3045 review: `~//<abs>` strips every separator after `~`, so the rest
+/// stays under home. Stripping only one left `/<abs>`, which `join` let
+/// replace home: read_file and write_file then acted on a different file,
+/// granted but not the one written, and reported success.
+#[tokio::test]
+async fn repeated_separators_after_tilde_stay_under_home() {
+    let _lock = env_lock().await;
+    let ws = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let _home = EnvVar::set("HOME", &home.path().to_string_lossy());
+    let other_file = other.path().join("marker.txt");
+    let suffix = other_file.strip_prefix("/").unwrap();
+    let home_file = home.path().join(suffix);
+    std::fs::create_dir_all(home_file.parent().unwrap()).unwrap();
+    std::fs::write(&home_file, "home copy").unwrap();
+    std::fs::write(&other_file, "other copy").unwrap();
+    let roots = [ws.path(), home.path(), other.path()];
+    let scope = Scope::only(roots.iter().map(|r| r.to_string_lossy().into_owned()));
+    let caveats = Caveats {
+        fs_write: scope.clone(),
+        ..read_only(&roots)
+    };
+    let path = format!("~/{}", other_file.display());
+    assert!(path.starts_with("~//"), "{path}");
+    let out = run_tool(
+        "read_file",
+        serde_json::json!({"path": path}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(
+        out.contains("home copy") && !out.contains("other copy"),
+        "{out}"
+    );
+    run_tool(
+        "write_file",
+        serde_json::json!({"path": path, "content": "written"}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&home_file).unwrap(), "written");
+    assert_eq!(std::fs::read_to_string(&other_file).unwrap(), "other copy");
+}

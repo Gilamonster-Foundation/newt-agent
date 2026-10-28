@@ -12,20 +12,36 @@ pub(crate) fn resolve_tool_path(workspace: &Path, path: &str) -> Result<PathBuf,
     let Some(rest) = path.strip_prefix('~') else {
         return Ok(workspace.join(path));
     };
-    let rest = match rest.strip_prefix(std::path::is_separator) {
-        Some(rest) => rest,
-        None if rest.is_empty() => rest,
-        None => {
-            return Err(format!(
-                "error: `{path}`: only a leading `~` or `~/` expands (to your home \
-                 directory); `~user` forms are not expanded (#3039). Use the absolute path."
-            ))
-        }
-    };
+    if !rest.is_empty() && !rest.starts_with(std::path::is_separator) {
+        return Err(format!(
+            "error: `{path}`: only a leading `~` or `~/` expands (to your home \
+             directory); `~user` forms are not expanded (#3039). Use the absolute path."
+        ));
+    }
+    // Every separator after `~` goes (`~//x` is `~/x`). A rest that still
+    // carries a root or prefix (Windows `C:`) would make `join` REPLACE home
+    // and act on another file, so it is refused rather than joined.
+    let rest = Path::new(rest.trim_start_matches(std::path::is_separator));
+    if rest.has_root() || matches!(rest.components().next(), Some(Component::Prefix(_))) {
+        return Err(format!(
+            "error: `{path}`: the part after `~/` must be relative to your home directory"
+        ));
+    }
     let home = crate::config::home_dir().ok_or_else(|| {
         format!("error: `{path}`: no home directory is set to expand `~`; use the absolute path")
     })?;
     Ok(home.join(rest))
+}
+
+/// #3045 review: the provenance locator of a resolved target — relative to
+/// the workspace when inside it, so `~/project/f` under a workspace at
+/// `~/project` records `f`. A target outside keeps its absolute spelling,
+/// which the artifact layer refuses as it refuses any absolute locator.
+pub(crate) fn workspace_locator(workspace: &Path, full: &Path) -> String {
+    full.strip_prefix(workspace)
+        .unwrap_or(full)
+        .to_string_lossy()
+        .into_owned()
 }
 
 use crate::caveats::Scope;

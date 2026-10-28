@@ -61,7 +61,7 @@ pub use dispatch::{
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) use path_suggest::resolve_tool_path;
-use path_suggest::FileIoError;
+use path_suggest::{workspace_locator, FileIoError};
 pub(crate) mod exposure;
 mod grep_tool;
 mod live_output;
@@ -5656,7 +5656,7 @@ async fn execute_authorized_tool(
                                 Ok(true) => record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
-                                    path,
+                                    &workspace_locator(std::path::Path::new(workspace), &full),
                                     "write_file",
                                     artifact_before,
                                     super::artifact_hooks::ArtifactFileState::from_bytes(
@@ -5791,7 +5791,7 @@ async fn execute_authorized_tool(
                                 record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
-                                    path,
+                                    &workspace_locator(std::path::Path::new(workspace), &full),
                                     "delete_file",
                                     artifact_before,
                                     super::artifact_hooks::ArtifactFileState::absent(),
@@ -5997,7 +5997,7 @@ async fn execute_authorized_tool(
                             Ok(true) => record_governed_file_change(
                                 artifact_sink,
                                 artifact_context,
-                                path,
+                                &workspace_locator(std::path::Path::new(workspace), &full),
                                 "edit_file",
                                 artifact_before,
                                 super::artifact_hooks::ArtifactFileState::from_bytes(
