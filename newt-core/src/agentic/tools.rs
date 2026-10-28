@@ -5143,7 +5143,15 @@ async fn execute_authorized_tool(
             let joined = cmds.join(" && ");
             // #3040: a `pyo3` pick made only by coexisting manifests is said
             // in-band on every outcome, so the session sees the misdetection.
-            let note = crate::tooling::detection_note(effective_path, phase)
+            // #3050 review: manifests are read through the same scoped,
+            // object-bound, size-bounded, regular-file-only capture the file
+            // tools use; anything it cannot read is unknown, so no note.
+            let note = crate::tooling::detection_note(effective_path, phase, |manifest| {
+                match file_capture::capture(&caveats.fs_read, manifest) {
+                    file_capture::TextSnapshot::Present(text) => Some(text),
+                    _ => None,
+                }
+            })
                 .map(|note| format!("\n{note}"))
                 .unwrap_or_default();
             // Inspect exactly the retained source used by both execution lanes.

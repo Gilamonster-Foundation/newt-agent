@@ -754,13 +754,26 @@ async fn lifecycle_list_at(cargo: &str, pyproject: &str) -> String {
     let ws = tempfile::tempdir().unwrap();
     std::fs::write(ws.path().join("Cargo.toml"), cargo).unwrap();
     std::fs::write(ws.path().join("pyproject.toml"), pyproject).unwrap();
+    lifecycle_list(
+        ws.path(),
+        serde_json::json!({ "phase": "test", "action": "list" }),
+        &crate::caveats::Caveats::top(),
+    )
+    .await
+}
+
+async fn lifecycle_list(
+    ws: &std::path::Path,
+    args: serde_json::Value,
+    caveats: &crate::caveats::Caveats,
+) -> String {
     execute_tool(
         "lifecycle",
-        &serde_json::json!({ "phase": "test", "action": "list" }),
-        &ws.path().to_string_lossy(),
+        &args,
+        &ws.to_string_lossy(),
         false,
         20,
-        &crate::caveats::Caveats::top(),
+        caveats,
         &mut NoMcp,
         None,
         None,
@@ -811,8 +824,59 @@ async fn lifecycle_does_not_flag_a_real_pyo3_project() {
             "[package]\nname = \"ext\"\n",
             "[build-system]\nrequires = [\"maturin\"]\nbuild-backend = \"maturin\"\n",
         ),
+        // #3050 review: a renamed dependency, a target-specific table, and a
+        // setuptools-rust build are PyO3 evidence too.
+        (
+            "[package]\nname = \"ext\"\n[dependencies]\nffi = { package = \"pyo3\", version = \"0.28\" }\n",
+            "[project]\nname = \"ext\"\n",
+        ),
+        (
+            "[package]\nname = \"ext\"\n[target.'cfg(unix)'.dependencies]\npyo3 = \"0.28\"\n",
+            "[project]\nname = \"ext\"\n",
+        ),
+        (
+            "[package]\nname = \"ext\"\n",
+            "[build-system]\nrequires = [\"setuptools>=61\", \"setuptools-rust>=1.5\"]\nbuild-backend = \"setuptools.build_meta\"\n",
+        ),
     ] {
         let out = lifecycle_list_at(cargo, pyproject).await;
         assert_eq!(out, "lifecycle test → cargo test", "{cargo} / {pyproject}");
     }
+}
+
+/// #3050 review: the manifests are evidence only where the session may read.
+/// A `dir` outside a workspace-only read grant still resolves its pack, but
+/// its manifests are not read, so no note is claimed from their contents.
+#[tokio::test]
+async fn lifecycle_does_not_read_manifests_outside_the_read_grant() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside.path().join("Cargo.toml"),
+        "[package]\nname = \"plain\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        outside.path().join("pyproject.toml"),
+        "[project]\nname = \"tools\"\n",
+    )
+    .unwrap();
+    let workspace_only = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::only([ws.path().to_string_lossy().into_owned()]),
+        fs_write: crate::caveats::Scope::none(),
+        exec: crate::caveats::Scope::none(),
+        net: crate::caveats::Scope::none(),
+        ..crate::caveats::Caveats::top()
+    };
+    let args = serde_json::json!({
+        "phase": "test",
+        "action": "list",
+        "dir": outside.path().to_string_lossy(),
+    });
+    let out = lifecycle_list(ws.path(), args.clone(), &workspace_only).await;
+    assert!(out.contains("cargo test"), "{out}");
+    assert!(!out.contains("dual-manifest root"), "{out}");
+    // Control: the same directory under a read grant does get the note.
+    let out = lifecycle_list(ws.path(), args, &crate::caveats::Caveats::top()).await;
+    assert!(out.contains("dual-manifest root"), "{out}");
 }
