@@ -1226,7 +1226,7 @@ impl Presenter {
                     let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
                 } else if let Some(line) = self.queued.pop_front() {
                     self.screen.queued = self.queued.len();
-                    self.serving_command = line.starts_with('/');
+                    self.hand_over(&line);
                     let _ = reply.send(Ok(ReadOutcome::Line(line)));
                 } else {
                     self.pending_read = Some(reply);
@@ -1990,12 +1990,18 @@ impl Presenter {
         }
     }
 
+    /// The session is about to serve `line`. It runs it as a command when it reads it as one,
+    /// and then the windows it opens are the operator's (#3056).
+    fn hand_over(&mut self, line: &str) {
+        self.serving_command = crate::chat::operator_task(line).starts_with('/');
+    }
+
     /// A submitted line: the session's if it is waiting for one, otherwise
     /// queued for the next `ReadLine`. It was already echoed into scrollback
     /// by the editor, so a queued line reads back exactly like a sent one.
     fn submit(&mut self, body: String) {
         if let Some(reply) = self.pending_read.take() {
-            self.serving_command = body.starts_with('/');
+            self.hand_over(&body);
             let _ = reply.send(Ok(ReadOutcome::Line(body)));
         } else {
             self.queued.push_back(body);

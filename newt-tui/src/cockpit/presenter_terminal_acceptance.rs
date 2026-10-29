@@ -1368,10 +1368,16 @@ fn acceptance_case() {
         );
 
         // #3056: a form opened by a command the operator typed takes the
-        // alternate screen; once a turn has started, the same form is a
-        // decision the turn asked for and stays inline under it.
-        for (turn, alternate) in [(false, true), (true, false)] {
-            operator_typed(&mut cockpit, "/form");
+        // alternate screen, however the session reads the command (it trims
+        // the line). After model input, or once a turn has started, the same
+        // form is a decision the session asked for and stays inline.
+        for (line, turn, alternate) in [
+            ("/form", false, true),
+            ("  /form", false, true),
+            ("what does /form do?", false, false),
+            ("/form", true, false),
+        ] {
+            operator_typed(&mut cockpit, line);
             if turn {
                 cockpit
                     .handle_request(SurfaceRequest::TurnStarted {
@@ -1405,7 +1411,7 @@ fn acceptance_case() {
             assert_eq!(
                 form_delta.contains("\x1b[?1049h"),
                 alternate,
-                "during a turn: {turn}; painted: {form_delta:?}"
+                "after {line:?}, during a turn: {turn}; painted: {form_delta:?}"
             );
             if turn {
                 cockpit
