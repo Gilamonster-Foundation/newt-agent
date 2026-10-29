@@ -757,9 +757,10 @@ fn closing_a_panel_over_a_full_transcript_leaves_no_blank_rows_3012() {
 }
 
 /// #3056: over a full screen, the operator's command opens and closes a decision (what
-/// `/settings workspaces` opens), then a 12-row panel and a 6-row one. The screen after each
-/// close must be the screen before the first open, and the last panel must not open below a
-/// blank band.
+/// `/settings workspaces` opens), then a 12-row panel and, after an operation like `/mcp`'s
+/// Test, a 6-row one. Each window must take the alternate screen, the screen after each close
+/// must be the screen before the first open, and the last panel must not open below a blank
+/// band.
 ///
 /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
 /// subprocess and races libtest under load).
@@ -800,8 +801,9 @@ fn operator_typed(cockpit: &mut Presenter, line: &str) {
 }
 
 /// Present a decision first if `decide` (`interaction_view_pty_test`'s fixture), then one
-/// panel per entry of `heights` (the first lists `panel-row-NN`, the next `again-row-NN`),
-/// each closed by the operator, then print `PANEL_CLOSED`. With `operator`, a command the
+/// panel per entry of `heights` (the first lists `panel-row-NN`, the next `again-row-NN`,
+/// after an operation starts and ends), each closed by the operator, then print
+/// `PANEL_CLOSED`. With `operator`, a command the
 /// operator typed opens them.
 fn panel_loop(fill_rows: usize, operator: bool, decide: bool, heights: &'static [u16]) {
     // This disposable child owns the tty queried by Crossterm's geometry API.
@@ -836,6 +838,13 @@ fn panel_loop(fill_rows: usize, operator: bool, decide: bool, heights: &'static 
             crate::chat::InputSurface::present_interaction(&mut remote, &decision);
         }
         for (&height, name) in heights.iter().zip(["panel", "again"]) {
+            if name == "again" {
+                // An operation between the two openings, the way `/mcp` runs
+                // Test or Reconnect and then reopens its panel.
+                let cancel = Arc::new(AtomicBool::new(false));
+                crate::chat::InputSurface::turn_started(&mut remote, cancel);
+                crate::chat::InputSurface::turn_ended(&mut remote);
+            }
             let window =
                 crate::chat::InputSurface::open_panel(&mut remote, PanelMode::Inline(height));
             let rows = (0..30).map(|n| format!("{name}-row-{n:02}")).collect();

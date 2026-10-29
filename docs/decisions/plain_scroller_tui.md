@@ -373,10 +373,11 @@ when the operator opened it with a command: a panel such as `/settings` or
 over a full screen scrolled transcript rows into scrollback, where a terminal
 cannot scroll them back, so closing the window stranded the prompt mid-screen.
 Leaving the alternate screen restores the primary screen exactly. The presenter
-decides, in one place: a window opened while the session is serving a line the
-operator typed (before it starts a turn or asks for input again) is the
+decides, in one place: a window opened while the session is serving a command
+the operator typed (a line starting `/`, until the session asks for input
+again), and while no turn or operation that command runs is in progress, is the
 operator's. The 2026-08-11 conditions hold: such a window is operator-invoked
 and never opens during a turn, it is compile-gated to `rich-tui`, and an RAII
 guard leaves the alternate screen on every exit path. Anything else (a
-permission prompt during a turn, a clarification, a prompt at startup) stays an
-inline modal, so the transcript it asks about stays in view.
+permission prompt during a turn or an operation, a clarification, a prompt at
+startup) stays an inline modal, so the transcript it asks about stays in view.

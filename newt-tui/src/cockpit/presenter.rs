@@ -981,10 +981,11 @@ pub(crate) struct Presenter {
     arbiter: newt_core::tty::EphemeralRegistration,
     _arbiter_target: Arc<dyn newt_core::tty::Ephemeral>,
     was_suspended: bool,
-    /// The session is serving a line the operator typed: set when one is handed over, cleared
-    /// when the session starts a turn or asks for input again. A blocking window opened in
-    /// between is one the operator asked for, so it draws on the alternate screen (#3056).
-    serving_operator: bool,
+    /// The session is serving a command the operator typed (a line starting `/`): set when one
+    /// is handed over, cleared when the session asks for input again. A turn or operation the
+    /// command runs does not clear it, so a window the command reopens afterwards is still the
+    /// operator's (#3056); see [`Self::take_modal_rows`].
+    serving_command: bool,
     /// True only while a blocking window owns the keyboard. The editor draft
     /// stays mounted in memory and is hidden until the window closes.
     chat_inactive: bool,
@@ -1168,7 +1169,7 @@ impl Presenter {
             arbiter,
             _arbiter_target: ephemeral,
             was_suspended: false,
-            serving_operator: false,
+            serving_command: false,
             chat_inactive: false,
             dirty: true,
             meta: crate::prefix::Sequencer::new(crate::prefix::current()),
@@ -1217,7 +1218,7 @@ impl Presenter {
     pub(crate) fn handle_request(&mut self, req: SurfaceRequest) -> io::Result<()> {
         match req {
             SurfaceRequest::ReadLine { prompt: _, reply } => {
-                self.serving_operator = false;
+                self.serving_command = false;
                 // A confirmed `:wq` submitted its turn last time; now that the
                 // turn has run, end the conversation and exit before reading
                 // anything new — same order as the classic surface.
@@ -1225,7 +1226,7 @@ impl Presenter {
                     let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
                 } else if let Some(line) = self.queued.pop_front() {
                     self.screen.queued = self.queued.len();
-                    self.serving_operator = true;
+                    self.serving_command = line.starts_with('/');
                     let _ = reply.send(Ok(ReadOutcome::Line(line)));
                 } else {
                     self.pending_read = Some(reply);
@@ -1245,9 +1246,9 @@ impl Presenter {
                 verbose: _,
                 reply,
             } => {
-                // The session is asking, not serving a line: the question
+                // The session is asking, not serving a command: the question
                 // stays inline, under the turn that asked it.
-                self.serving_operator = false;
+                self.serving_command = false;
                 if self.surface.take_end_quit() {
                     let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
                     self.dirty = true;
@@ -1345,7 +1346,6 @@ impl Presenter {
                 self.dirty = true;
             }
             SurfaceRequest::TurnStarted { cancel } => {
-                self.serving_operator = false;
                 self.turn = Some(Turn { cancel });
                 // #2006: the mode hint may advertise `^C interrupt` exactly
                 // while that is true.
@@ -1765,12 +1765,13 @@ impl Presenter {
     }
 
     /// Rows for a blocking window `requested` high (#3056). One the operator opened with a
-    /// command draws at the bottom of the alternate screen, and leaving it gives the primary
-    /// screen back exactly: nothing is scrolled, reclaimed or repainted. Anything else (a
-    /// permission prompt during a turn, a clarification, a prompt at startup) reserves rows
-    /// under the transcript, which stays in view (`plain_scroller_tui.md`).
+    /// command, outside any turn or operation it runs, draws at the bottom of the alternate
+    /// screen, and leaving it gives the primary screen back exactly: nothing is scrolled,
+    /// reclaimed or repainted. Anything else (a permission prompt during a turn or an
+    /// operation, a clarification, a prompt at startup) reserves rows under the transcript,
+    /// which stays in view (`plain_scroller_tui.md`).
     fn take_modal_rows(&mut self, requested: u16) -> io::Result<ModalRows> {
-        let (reservation, alternate) = if self.serving_operator {
+        let (reservation, alternate) = if self.serving_command && self.turn.is_none() {
             let out = crate::inline_viewport::PanelOut::Tty(self.screen.tty.try_clone()?);
             let screen = crate::transcript_pager::AltScreenGuard::enter_on(out, None)?;
             (None, Some(screen))
@@ -1799,18 +1800,16 @@ impl Presenter {
         Rect::new(0, height - lent, cols, lent)
     }
 
-    /// #2571: the terminal resized under a live panel on the alternate screen, or the
-    /// operator sized it (Shift-↑/↓, zoom). The primary screen is out of sight, so the
-    /// presenter's own resize waits until it is back; here the capture learns the new size and
-    /// the alternate screen is cleared for the panel to redraw in its new region. Inline rows
-    /// are kept until the window closes.
+    /// #2571: the terminal resized under a live panel, or the operator sized it (Shift-↑/↓,
+    /// zoom). The capture learns the new size and what the panel repaints is cleared: the
+    /// alternate screen from its top, or an inline window's own rows, never the transcript
+    /// above them. The presenter's own resize waits until the window closes
+    /// ([`Self::finish_modal_rows`]).
     fn remeasure_panel(&mut self, rows: &ModalRows) -> io::Result<()> {
-        if rows.reservation.is_some() {
-            return Ok(());
-        }
         let (cols, height) = self.screen.terminal_size()?;
         self.capture.resize(cols, height);
-        self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
+        let from = rows.reservation.as_ref().map_or(0, |r| r.start);
+        self.screen.tty.write_all(&modal_cleanup_bytes(from)?)?;
         self.screen.tty.flush()
     }
 
@@ -1996,7 +1995,7 @@ impl Presenter {
     /// by the editor, so a queued line reads back exactly like a sent one.
     fn submit(&mut self, body: String) {
         if let Some(reply) = self.pending_read.take() {
-            self.serving_operator = true;
+            self.serving_command = body.starts_with('/');
             let _ = reply.send(Ok(ReadOutcome::Line(body)));
         } else {
             self.queued.push_back(body);

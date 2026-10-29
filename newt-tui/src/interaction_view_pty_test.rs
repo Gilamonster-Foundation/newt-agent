@@ -1185,8 +1185,8 @@ pub(crate) fn drive_cockpit_panel_gap() {
     );
 }
 
-/// #3056: over a full screen, answer a decision, then open and close a 12-row panel and a 6-row
-/// one. Read the stream at the cockpit's last frame before the decision and at its repaint after
+/// #3056: over a full screen, answer a decision, then open and close a 12-row panel and (after
+/// an operation) a 6-row one. Each must enter the alternate screen. Read the stream at the cockpit's last frame before the decision and at its repaint after
 /// each close: those screens must be the same, row for row. And while the last panel is up, any
 /// transcript still visible above it must end on the row above its border, with no blank band.
 pub(crate) fn drive_cockpit_panel_reopen() {
@@ -1268,6 +1268,13 @@ pub(crate) fn drive_cockpit_panel_reopen() {
                     border - text - 1
                 ));
             }
+        }
+        let entries = stream.matches("\x1b[?1049h").count();
+        if entries != WINDOWS.len() {
+            failures.push(format!(
+                "{entries} alternate-screen entries for {} windows the operator opened",
+                WINDOWS.len()
+            ));
         }
         if !failures.is_empty() {
             return Err(failures.join("\n"));
