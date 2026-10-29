@@ -212,6 +212,9 @@ async fn historical_notes_preserve_content_without_redefining_the_live_workspace
 pub(super) struct SkillRootSandbox {
     vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
     cwd: std::path::PathBuf,
+    // The process-env lock the settings and workspace tests take; released
+    // after `drop` restores the variables.
+    _env: newt_core::process_env::EnvGuard,
 }
 
 impl SkillRootSandbox {
@@ -221,11 +224,14 @@ impl SkillRootSandbox {
             newt_core::config::NEWT_CONFIG_DIR_ENV,
             "HOME",
         ];
+        let _env = newt_core::process_env::lock();
         let sandbox = Self {
             vars: keys.iter().map(|k| (*k, std::env::var_os(k))).collect(),
             cwd: std::env::current_dir().unwrap(),
+            _env,
         };
-        // SAFETY: the caller is in the `serial(real_fs)` lane.
+        // SAFETY: the process-env lock is held, and the caller is in the
+        // `serial(real_fs)` lane for the cwd.
         unsafe {
             std::env::remove_var("NEWT_CONFIG");
             std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, config_dir);
@@ -240,7 +246,7 @@ impl Drop for SkillRootSandbox {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.cwd);
         for (key, value) in &self.vars {
-            // SAFETY: still inside the `serial(real_fs)` lane.
+            // SAFETY: the process-env lock is still held.
             unsafe {
                 match value {
                     Some(v) => std::env::set_var(key, v),
@@ -249,6 +255,18 @@ impl Drop for SkillRootSandbox {
             }
         }
     }
+}
+
+/// The sandbox moves `NEWT_CONFIG_DIR` and `HOME`, which every `settings_guard`
+/// test re-reads; it must hold the process-env lock until it restores them.
+#[test]
+#[serial_test::serial(real_fs)]
+fn skill_root_sandbox_holds_the_process_env_lock() {
+    let here = std::env::current_dir().unwrap();
+    let sandbox = SkillRootSandbox::enter(&here, &here);
+    assert!(newt_core::process_env::held_by_current_thread());
+    drop(sandbox);
+    assert!(!newt_core::process_env::held_by_current_thread());
 }
 
 /// #2331 real-resource grounding for the mocked resolver and same-copy tests
