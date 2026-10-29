@@ -201,6 +201,11 @@ fn remove_legacy_json(index: &Path) {
     }
 }
 
+/// How many times, and how far apart, [`load`] reads a head that a concurrent
+/// [`save`] is replacing: at most ~0.1 s before a still-unreadable head is no cache.
+const HEAD_READ_ATTEMPTS: u32 = 20;
+const HEAD_READ_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
 fn head_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.head"))
 }
@@ -216,7 +221,7 @@ pub fn load<T: Serialize + DeserializeOwned>(
     name: &str,
     expected_version: &str,
 ) -> Option<DriftCache<T>> {
-    let head = std::fs::read_to_string(head_path(dir, name)).ok()?;
+    let head = read_head(|| std::fs::read_to_string(head_path(dir, name)))?;
     let id: ContentId = head.trim().parse().ok()?;
     let store = agent_harness::store::FrameStore::open(dir).ok()?;
     match store.get::<DriftCache<T>>(&id) {
@@ -226,6 +231,26 @@ pub fn load<T: Serialize + DeserializeOwned>(
             None
         }
     }
+}
+
+/// Read a head through `read`, riding out a concurrent [`save`] replacing it.
+/// On Windows that rename (`MoveFileExW`) can fail a reader for an instant with
+/// `ERROR_ACCESS_DENIED` (the old head is delete-pending, `PermissionDenied`) or
+/// `ERROR_SHARING_VIOLATION` (32); taken as "no cache", it cost a rebuild. Any
+/// other error is no cache at once, and a head that stays unreadable is too.
+fn read_head(mut read: impl FnMut() -> std::io::Result<String>) -> Option<String> {
+    for _ in 1..HEAD_READ_ATTEMPTS {
+        match read() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || (cfg!(windows) && e.raw_os_error() == Some(32)) =>
+            {
+                std::thread::sleep(HEAD_READ_RETRY);
+            }
+            result => return result.ok(),
+        }
+    }
+    read().ok()
 }
 
 /// Save the cache as a write-once node, then point `<name>.head` at it through
@@ -269,6 +294,39 @@ mod tests {
         kv.iter()
             .map(|(u, h)| (u.to_string(), content_hash(h.as_bytes())))
             .collect()
+    }
+
+    /// Windows CI: `concurrent_saves_never_tear_the_head` saw no cache when a
+    /// reader opened the head while a concurrent save replaced it. A head being
+    /// replaced is re-read, a bounded number of times; any other error is no
+    /// cache at once.
+    #[test]
+    fn head_read_rides_out_a_concurrent_replace_and_nothing_else() {
+        let calls = std::cell::Cell::new(0u32);
+        let read = |error: fn() -> std::io::Error, failures: u32| {
+            calls.set(0);
+            read_head(|| {
+                calls.set(calls.get() + 1);
+                if calls.get() <= failures {
+                    Err(error())
+                } else {
+                    Ok("head".to_string())
+                }
+            })
+        };
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(read(denied, 2).as_deref(), Some("head"));
+        assert_eq!(calls.get(), 3, "re-read until the replace is done");
+        assert_eq!(read(denied, u32::MAX), None);
+        assert_eq!(calls.get(), HEAD_READ_ATTEMPTS, "bounded");
+        assert_eq!(read(|| std::io::ErrorKind::NotFound.into(), u32::MAX), None);
+        assert_eq!(calls.get(), 1, "a missing head is not retried");
+        #[cfg(windows)]
+        {
+            let sharing = || std::io::Error::from_raw_os_error(32);
+            assert_eq!(read(sharing, 1).as_deref(), Some("head"));
+            assert_eq!(calls.get(), 2, "a sharing violation is a replace too");
+        }
     }
 
     #[test]
