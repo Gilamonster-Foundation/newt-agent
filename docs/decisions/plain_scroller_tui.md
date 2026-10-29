@@ -364,3 +364,19 @@ submits a prompt nor answers an authorization request. The presenter remains
 the sole terminal owner and restores the mounted draft on dismissal. Native
 scrollback stays native; its old rows are not screen-coordinate click targets.
 Pending interaction inspection remains inside the existing inline modal.
+
+## Amendment: windows the operator opens draw on the alternate screen (#3056)
+
+The rich cockpit draws a blocking window at the bottom of the alternate screen
+when the operator opened it with a command: a panel such as `/settings` or
+`/mcp`, or a form such as `/settings workspaces`. Reserving those rows inline
+over a full screen scrolled transcript rows into scrollback, where a terminal
+cannot scroll them back, so closing the window stranded the prompt mid-screen.
+Leaving the alternate screen restores the primary screen exactly. The presenter
+decides, in one place: a window opened while the session is serving a line the
+operator typed (before it starts a turn or asks for input again) is the
+operator's. The 2026-08-11 conditions hold: such a window is operator-invoked
+and never opens during a turn, it is compile-gated to `rich-tui`, and an RAII
+guard leaves the alternate screen on every exit path. Anything else (a
+permission prompt during a turn, a clarification, a prompt at startup) stays an
+inline modal, so the transcript it asks about stays in view.
