@@ -6,15 +6,18 @@
 //! by `content-addressable`; this module only refuses what the snapshot must
 //! not silently accept, and reports.
 //!
+//! A tree holding a symlink, a hard link, or a fifo, socket or device is
+//! refused. Where the hard-link check cannot run (std exposes no link count
+//! off unix), every tree is refused rather than digested unchecked.
+//!
 //! A file link is `{id, size}` with **no mode bits**, so a `chmod` does not
 //! change the id; whatever installs a tree derives modes on its own. The
 //! node bytes are non-frozen upstream, which is why the workspace pins
 //! `content-addressable` exactly.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::Subcommand;
 use content_addressable::structures::dir_tree::{self, DirNode, Link};
 use content_addressable::{ContentAddressable, MemoryStore, NodeStoreExt};
@@ -23,7 +26,8 @@ use serde::Serialize;
 #[derive(Subcommand, Debug)]
 pub enum CapsCmd {
     /// Print the content id (CIDv1) of a tool tree. Refuses a symlink, a hard
-    /// link, or a fifo, socket or device anywhere in it.
+    /// link, or a fifo, socket or device anywhere in it, and refuses every tree
+    /// on a platform where hard links cannot be detected.
     Digest {
         /// The tree to digest.
         dir: PathBuf,
@@ -85,36 +89,35 @@ fn tally(store: &MemoryStore, link: &Link) -> Result<(u64, u64)> {
 /// after approval. The snapshot already refuses symlinks, fifos, sockets and
 /// devices with a named error; this walk adds only the link count it does not
 /// check, and never follows a symlink.
+#[cfg(unix)]
 fn refuse_hard_links(path: &Path) -> Result<()> {
+    use anyhow::Context;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
     let meta = fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
     if meta.is_dir() {
         let entries = fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?;
         for entry in entries {
             refuse_hard_links(&entry?.path())?;
         }
-    } else if meta.is_file() && hard_linked(&meta) {
+    } else if meta.is_file() && meta.nlink() > 1 {
         bail!("hard link refused: {}", path.display());
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn hard_linked(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    meta.nlink() > 1
-}
-
-/// Windows: std has no stable link count (`number_of_links` is unstable), so
-/// hard links are NOT detected there and only the snapshot's own refusals apply.
+/// Off unix std has no stable link count (`number_of_links` is unstable), so
+/// the check cannot run, and a digest that skipped it could silently accept an
+/// NTFS hard link. Fail closed.
 #[cfg(not(unix))]
-fn hard_linked(_: &fs::Metadata) -> bool {
-    false
+fn refuse_hard_links(_: &Path) -> Result<()> {
+    bail!("hard-link check unavailable on this platform; refusing to digest")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use content_addressable::structures::dir_tree::DirTreeError;
+    use std::fs;
 
     /// `{README, bin/tool, lib/mod.py}` in a fresh tempdir.
     fn fixture() -> tempfile::TempDir {
@@ -131,6 +134,7 @@ mod tests {
     /// Pinned while dir_tree bytes are non-frozen upstream: a change here
     /// means a `content-addressable` bump changed every tree id, and the bump
     /// must say so.
+    #[cfg(unix)]
     #[test]
     fn a_fixed_tree_digests_to_a_pinned_cid() {
         let tmp = fixture();
@@ -141,6 +145,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn json_reports_cid_size_and_entry_count() {
         let tmp = fixture();
@@ -156,6 +161,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlink_is_refused() {
+        use content_addressable::structures::dir_tree::DirTreeError;
         let tmp = fixture();
         std::os::unix::fs::symlink("tool", tmp.path().join("bin/alias")).unwrap();
         let err = digest(tmp.path()).unwrap_err();
@@ -192,5 +198,18 @@ mod tests {
         assert_eq!(digest(tmp.path()).unwrap().cid, before);
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(digest(tmp.path()).unwrap().cid, before);
+    }
+
+    /// Off unix the hard-link check cannot run, so a clean tree is refused
+    /// rather than digested with the check skipped.
+    #[cfg(not(unix))]
+    #[test]
+    fn without_a_link_count_every_tree_is_refused() {
+        let tmp = fixture();
+        let err = digest(tmp.path()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "hard-link check unavailable on this platform; refusing to digest"
+        );
     }
 }
