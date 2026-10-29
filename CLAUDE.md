@@ -199,7 +199,7 @@ The rule above says "do not add a second implementation of something that
 already exists." Here is the binding, named, so it cannot be missed:
 
 **Every data structure that is persisted, transmitted, chained, or identified
-takes its identity from `content-addressable` (v0.1.1). Hand-rolling a hash,
+takes its identity from `content-addressable` (pinned `=0.1.3`). Hand-rolling a hash,
 digest, id, or canonical encoding is a defect.**
 
 | Use | Type |
@@ -208,6 +208,7 @@ digest, id, or canonical encoding is a defect.**
 | opaque **byte string** (file, payload, tool result, cache key) | `RawContentId` — CIDv1 / raw / BLAKE3 |
 | node with **causal parents** (chain or DAG link) | `MerkleNode<T>` — id over payload AND parents |
 | **storing** addressed nodes | `NodeStore` |
+| **directory tree** (tool tree) | `structures::dir_tree` — one root id over named files; `newt caps digest` |
 | carrying a **foreign** CID without minting one | `ClassifiedCid` |
 
 `ContentId` and `RawContentId` are different identities even with identical

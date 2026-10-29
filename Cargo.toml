@@ -214,7 +214,10 @@ age = { version = "0.11", features = ["armor"] }
 # what lets a deleted or reordered row be detected at all. CLAUDE.md names the
 # type for exactly this use, so this is uptake of the existing abstraction
 # rather than a hand-rolled chain beside it.
-content-addressable = { version = "0.1.2", features = ["unstable-merkle", "unstable-store"] }
+# `dir-tree` mints the DirNode root id `newt caps digest` prints (#3034). Its
+# bytes are NON-FROZEN upstream until conformance vectors land, so the version
+# is pinned exactly: a bump may change every tree id and must be deliberate.
+content-addressable = { version = "=0.1.3", features = ["unstable-merkle", "unstable-store", "dir-tree"] }
 # The key-precedence ladder (#2005, docs/decisions/key_ladder_crate.md §1): who
 # owns a trigger right now, as a pure predicate over a TOML table. Extracted to
 # its own repo rather than a newt module because a foreign TUI must be able to

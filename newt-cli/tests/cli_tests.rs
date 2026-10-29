@@ -630,3 +630,39 @@ fn dgx_models_uses_env_endpoint() {
         .assert()
         .failure();
 }
+
+/// #3034: `newt caps digest` prints the tree's root id, `--json` adds size and
+/// entry count, and a tree holding a symlink exits non-zero with a named error.
+#[cfg(unix)]
+#[test]
+fn caps_digest_prints_the_root_id_and_refuses_a_symlink() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("tool"), b"echo hi\n").unwrap();
+    let dir = tree.path().to_str().unwrap();
+
+    let out = common::newt()
+        .args(["caps", "digest", dir, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        (v["size"].as_u64(), v["entries"].as_u64()),
+        (Some(8), Some(1))
+    );
+    let cid = v["cid"].as_str().unwrap();
+    common::newt()
+        .args(["caps", "digest", dir])
+        .assert()
+        .success()
+        .stdout(format!("{cid}\n"));
+
+    std::os::unix::fs::symlink("tool", tree.path().join("alias")).unwrap();
+    common::newt()
+        .args(["caps", "digest", dir])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("symlink refused"));
+}

@@ -9,6 +9,7 @@
 //! kept out of the default workspace.
 
 mod auth_cmd;
+mod caps_cmd;
 mod compaction_cmd;
 mod config_cmd;
 pub mod crew;
@@ -871,6 +872,12 @@ pub enum Command {
     Ocap {
         #[command(subcommand)]
         cmd: ocap_cmd::OcapCmd,
+    },
+    /// Content identity for a vetted tool tree. `digest` prints the root id
+    /// that names the tree's exact bytes rather than its path.
+    Caps {
+        #[command(subcommand)]
+        cmd: caps_cmd::CapsCmd,
     },
     /// Manage approved docks for newt-web mesh docking (requirement 5). Approve
     /// a peer agent (SAS-confirmed, root-key-signed) so a hub cockpit will
@@ -1928,6 +1935,7 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Caps { cmd } => caps_cmd::run(&cmd),
         Command::Dock { cmd } => {
             let code = dock_cmd::run(cmd, cli.config.as_deref())?;
             if code != 0 {
