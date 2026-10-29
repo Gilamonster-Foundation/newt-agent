@@ -6,25 +6,32 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<OsString>,
+    // The process-env lock `settings_guard` takes too: `serial(real_fs)` alone
+    // does not exclude those tests. Released after `drop` restores the value.
+    _env: newt_core::process_env::EnvGuard,
 }
 
 impl EnvVarGuard {
     fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let _env = newt_core::process_env::lock();
         let guard = Self {
             key,
             previous: std::env::var_os(key),
+            _env,
         };
-        // SAFETY: every caller is in the `serial(real_fs)` lane.
+        // SAFETY: the process-env lock is held.
         unsafe { std::env::set_var(key, value) };
         guard
     }
 
     fn remove(key: &'static str) -> Self {
+        let _env = newt_core::process_env::lock();
         let guard = Self {
             key,
             previous: std::env::var_os(key),
+            _env,
         };
-        // SAFETY: every caller is in the `serial(real_fs)` lane.
+        // SAFETY: the process-env lock is held.
         unsafe { std::env::remove_var(key) };
         guard
     }
@@ -32,7 +39,7 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        // SAFETY: every caller is in the `serial(real_fs)` lane. Drop
+        // SAFETY: the process-env lock is still held. Drop
         // restores state even when an assertion panics or `?` returns.
         unsafe {
             match self.previous.as_ref() {
@@ -41,6 +48,19 @@ impl Drop for EnvVarGuard {
             }
         }
     }
+}
+
+/// The settings-form flake: this guard moved `NEWT_CONFIG_DIR` and `HOME` under
+/// `serial(real_fs)` only, which a `settings_guard` test does not take, so that
+/// test re-derived a different user config path mid-scenario. It must hold the
+/// process-env lock for as long as the variable is moved.
+#[test]
+#[serial_test::serial(real_fs)]
+fn env_var_guard_holds_the_process_env_lock() {
+    let guard = EnvVarGuard::remove("NEWT_TEST_PRESET_KEY");
+    assert!(newt_core::process_env::held_by_current_thread());
+    drop(guard);
+    assert!(!newt_core::process_env::held_by_current_thread());
 }
 
 /// Mirrors `newt_core::config::layering::expand_tilde` (crate-private to
