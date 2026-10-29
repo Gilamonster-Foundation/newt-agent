@@ -511,7 +511,7 @@ pub(crate) fn panel_resize_case() {
 }
 
 /// #2571: a panel follows the terminal while it is OPEN, not only on release.
-/// Shrink then grow a real tty under a live inline panel; each re-measure must
+/// Shrink then grow a real tty under a live operator's panel; each re-measure must
 /// hand back the panel's rows anchored at the new bottom, at the new width.
 ///
 /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
@@ -537,6 +537,7 @@ pub(crate) fn panel_live_resize_case() {
         )
         .unwrap();
     let draft = cockpit.editor.draft();
+    operator_typed(&mut cockpit, "/panel");
     let (reply, received) =
         std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
     let panel = std::thread::spawn(move || {
@@ -667,9 +668,9 @@ fn a_same_size_resize_does_not_move_the_block_away_from_its_content_2632() {
 
 /// #2573 review: the whole panel path on a real terminal — the cockpit lends
 /// rows, `panel::drive` runs a real panel through its own event loop, and the
-/// parent resizes and types. Grounds `panel::classify`, `PanelWindow`'s
-/// remeasure tests and `panel_erase_from`, none of which can observe a real
-/// terminal's resize, rendered cells or restored modes.
+/// parent resizes and types. Grounds `panel::classify` and `PanelWindow`'s
+/// remeasure tests, neither of which can observe a real terminal's resize,
+/// rendered cells or restored modes.
 ///
 /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
 /// subprocess and races libtest under load).
@@ -755,25 +756,62 @@ fn closing_a_panel_over_a_full_transcript_leaves_no_blank_rows_3012() {
     crate::interaction_view_pty_test::drive_cockpit_panel_gap();
 }
 
+/// #3056: over a full screen, the operator's command opens and closes a decision (what
+/// `/settings workspaces` opens), then a 12-row panel and a 6-row one. The screen after each
+/// close must be the screen before the first open, and the last panel must not open below a
+/// blank band.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn closing_a_panel_gives_back_the_screen_it_opened_over_3056() {
+    crate::interaction_view_pty_test::drive_cockpit_panel_reopen();
+}
+
 pub(crate) fn cockpit_panel_loop_case() {
-    panel_loop(0);
+    panel_loop(0, true, false, &[8]);
 }
 
 /// #3012: the same cockpit, with enough history that the block sits at the bottom of the
-/// screen, so the panel has to scroll transcript rows up to make room.
+/// screen, so an inline panel (one the operator did not open) has to scroll transcript rows
+/// up to make room.
 pub(crate) fn cockpit_panel_gap_case() {
-    panel_loop(40);
+    panel_loop(40, false, false, &[8]);
 }
 
-fn panel_loop(fill_rows: usize) {
+/// #3056: a full screen, then a decision, a 12-row panel and a 6-row one.
+pub(crate) fn cockpit_panel_reopen_case() {
+    panel_loop(40, true, true, &[12, 6]);
+}
+
+/// Hand the session a line the operator typed, the way a submit at the prompt does, so
+/// the windows it opens next are the operator's (#3056). The draft in the editor is left
+/// alone.
+fn operator_typed(cockpit: &mut Presenter, line: &str) {
+    let (reply, _session) = std::sync::mpsc::sync_channel(1);
+    cockpit
+        .handle_request(SurfaceRequest::ReadLine {
+            prompt: String::new(),
+            reply,
+        })
+        .unwrap();
+    cockpit.on_outcome(EditorOutcome::Line(line.into()));
+}
+
+/// Present a decision first if `decide` (`interaction_view_pty_test`'s fixture), then one
+/// panel per entry of `heights` (the first lists `panel-row-NN`, the next `again-row-NN`),
+/// each closed by the operator, then print `PANEL_CLOSED`. With `operator`, a command the
+/// operator typed opens them.
+fn panel_loop(fill_rows: usize, operator: bool, decide: bool, heights: &'static [u16]) {
     // This disposable child owns the tty queried by Crossterm's geometry API.
     assert!(unsafe { libc::setsid() } >= 0);
     assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
     let before = termios_of(0);
     let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
     let mut cockpit = Presenter::open(surface).expect("cockpit");
-    // A full transcript puts the block at the bottom: a panel then scrolls transcript rows
-    // into scrollback, which is what releasing it must give back (#3012).
+    // A full transcript puts the block at the bottom: an inline panel then scrolls transcript
+    // rows into scrollback, which releasing it must reclaim (#3012).
     let mut history: Vec<Vec<u8>> = (0..fill_rows)
         .map(|n| format!("FILL-{n:02}").into_bytes())
         .collect();
@@ -787,14 +825,24 @@ fn panel_loop(fill_rows: usize) {
         )
         .unwrap();
     cockpit.draw().unwrap();
+    if operator {
+        operator_typed(&mut cockpit, "/panel");
+    }
     let (to_ui, requests) = std::sync::mpsc::sync_channel(8);
     let worker = std::thread::spawn(move || {
         let mut remote = crate::session_worker::RemoteSurface::new(to_ui);
-        let window = crate::chat::InputSurface::open_panel(&mut remote, PanelMode::Inline(8));
-        let rows = (0..30).map(|n| format!("panel-row-{n:02}")).collect();
-        let mut panel = crate::lines_panel::LinesPanel::new("loop", rows);
-        crate::panel::drive(&mut panel, 8, window.as_ref()).unwrap();
-        drop(window);
+        if decide {
+            let decision = crate::interaction_view_pty_test::fixture_interaction();
+            crate::chat::InputSurface::present_interaction(&mut remote, &decision);
+        }
+        for (&height, name) in heights.iter().zip(["panel", "again"]) {
+            let window =
+                crate::chat::InputSurface::open_panel(&mut remote, PanelMode::Inline(height));
+            let rows = (0..30).map(|n| format!("{name}-row-{n:02}")).collect();
+            let mut panel = crate::lines_panel::LinesPanel::new("loop", rows);
+            crate::panel::drive(&mut panel, height, window.as_ref()).unwrap();
+            drop(window);
+        }
         println!("PANEL_CLOSED");
         match remote.read_line("after panel").unwrap() {
             ReadOutcome::Line(line) => assert_eq!(line, "draft-survives-the-panel"),
@@ -1310,6 +1358,53 @@ fn acceptance_case() {
             "backing out of a modal keeps the mounted chat draft"
         );
 
+        // #3056: a form opened by a command the operator typed takes the
+        // alternate screen; once a turn has started, the same form is a
+        // decision the turn asked for and stays inline under it.
+        for (turn, alternate) in [(false, true), (true, false)] {
+            operator_typed(&mut cockpit, "/form");
+            if turn {
+                cockpit
+                    .handle_request(SurfaceRequest::TurnStarted {
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    })
+                    .expect("start a turn");
+            }
+            let before_form = tty.painted().len();
+            let typer = tty.type_when_painted("screen?", b"\x1b");
+            let (form_reply, _form_answer) = std::sync::mpsc::sync_channel(1);
+            cockpit
+                .handle_request(SurfaceRequest::Interact {
+                    interaction: Box::new(
+                        newt_core::interaction_surface::SurfaceInteraction::blocking(
+                            crate::permissions::free_text_form("Whose screen?"),
+                        ),
+                    ),
+                    reply: form_reply,
+                })
+                .expect("present the form");
+            typer.join().expect("form watcher");
+            assert!(
+                tty.wait_for_painted_after(
+                    before_form,
+                    "screen?",
+                    std::time::Duration::from_secs(2)
+                ),
+                "the form was drawn in this round"
+            );
+            let form_delta = &tty.painted()[before_form..];
+            assert_eq!(
+                form_delta.contains("\x1b[?1049h"),
+                alternate,
+                "during a turn: {turn}; painted: {form_delta:?}"
+            );
+            if turn {
+                cockpit
+                    .handle_request(SurfaceRequest::TurnEnded)
+                    .expect("end the turn");
+            }
+        }
+
         // The modal's raw reader still composes with the cockpit's own
         // raw-mode guard. This checks termios directly, independently of
         // the visibility assertion above.
@@ -1450,7 +1545,16 @@ fn acceptance_case() {
         // vanishes between asking for rows and taking them. Either would
         // strand the presenter parked on rows nobody will release, which
         // presents as a frozen cockpit rather than as an error.
-        for mode in [PanelMode::Inline(6), PanelMode::AlternateScreen] {
+        // Last, the same two paths for a panel the operator opened, which
+        // takes the alternate screen and must leave it (#3056).
+        for (mode, operator) in [
+            (PanelMode::Inline(6), false),
+            (PanelMode::AlternateScreen, false),
+            (PanelMode::Inline(6), true),
+        ] {
+            if operator {
+                operator_typed(&mut cockpit, "/panel");
+            }
             let (early_reply, early_window) =
                 std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
             let early = std::thread::spawn(move || {

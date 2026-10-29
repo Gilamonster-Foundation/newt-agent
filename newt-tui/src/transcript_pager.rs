@@ -453,15 +453,14 @@ pub(crate) use terminal::run_output_pager;
 pub(crate) use terminal::run_pager;
 #[cfg(all(unix, feature = "rich-tui", feature = "live-spill"))]
 pub(crate) use terminal::run_spill_picker;
-/// Re-exported for the real-PTY acceptance test only (#1677): it drops the
-/// guard mid-unwind in a child process to prove the restoration claim against
-/// an actual terminal. Nothing in the shipping path constructs it directly —
-/// `run_pager` owns its lifetime.
-// unix as well as test: the sole consumer is `transcript_pager_pty_test`,
-// which is itself `cfg(all(test, unix, feature = "rich-tui"))` because a pty
-// pair is unix-only. Without the `unix` here the re-export is an unused
-// import on Windows, and this repo runs `-D warnings`.
-#[cfg(all(test, unix, feature = "rich-tui"))]
+/// Re-exported for the cockpit presenter, which holds one while an operator's
+/// panel draws on the alternate screen (#3056), and for the real-PTY
+/// acceptance test (#1677), which drops it mid-unwind in a child process to
+/// prove the restoration claim against an actual terminal.
+// unix: both consumers are unix-only (the presenter, and a pty pair). Without
+// it the re-export is an unused import on Windows, and this repo runs
+// `-D warnings`.
+#[cfg(all(unix, feature = "rich-tui"))]
 pub(crate) use terminal::AltScreenGuard;
 
 #[cfg(feature = "rich-tui")]
@@ -487,9 +486,10 @@ mod terminal {
     /// panic included. Leaking the alternate screen would strand the whole
     /// session invisible, a worse failure than any pager bug.
     ///
-    /// `pub(crate)` solely for `transcript_pager_pty_test` (#1677): the real-PTY
-    /// error-path test drops this guard mid-unwind in a child process to prove
-    /// the restoration claim above against an actual terminal.
+    /// `pub(crate)` for the cockpit presenter's operator panels (#3056), and for
+    /// `transcript_pager_pty_test` (#1677): the real-PTY error-path test drops
+    /// this guard mid-unwind in a child process to prove the restoration claim
+    /// above against an actual terminal.
     ///
     /// **Composed onto [`RawModeGuard`] (#1905).** The alternate screen is
     /// this type's own; raw mode is the shared, nesting-aware owner held as a
@@ -534,7 +534,7 @@ mod terminal {
             Self::enter_on(out, window)
         }
 
-        fn enter_on(out: PanelOut, window: Option<PanelWindow>) -> io::Result<Self> {
+        pub(crate) fn enter_on(out: PanelOut, window: Option<PanelWindow>) -> io::Result<Self> {
             let raw = RawModeGuard::enter()?;
             // `SuspendHolder`, and it is the honest policy rather than the
             // convenient one: the alternate screen genuinely DOES suspend

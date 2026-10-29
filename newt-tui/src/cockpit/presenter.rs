@@ -355,6 +355,16 @@ struct ModalReservation {
     transcript_end: u16,
 }
 
+/// The rows a blocking window holds until [`Presenter::finish_modal`] gives them back.
+struct ModalRows {
+    /// The height asked for; `u16::MAX` for a caller's own alternate screen, which takes it all.
+    requested: u16,
+    /// Rows reserved under the transcript; `None` on the alternate screen.
+    reservation: Option<ModalReservation>,
+    /// The alternate screen entered for the window. Dropping it leaves, on every exit path.
+    alternate: Option<crate::transcript_pager::AltScreenGuard>,
+}
+
 /// Plan a bottom-anchored reservation of `requested` rows. `transcript_end` is the first row
 /// below the transcript before the reservation (the block's top when a panel opens).
 fn plan_modal_reservation(
@@ -380,23 +390,18 @@ fn reclaimed_top(reservation: &ModalReservation, block_h: u16, screen_rows: u16)
         .min(screen_rows.saturating_sub(block_h))
 }
 
-/// The bytes that reserve `plan` for a panel: erase from the occupied rows down, scroll the
-/// transcript rows the plan covers (`transcript_end - plan.start`) into scrollback, and
-/// clear the panel's own rows.
-fn modal_reserve_bytes(
-    occupied_top: u16,
-    transcript_end: u16,
-    screen_rows: u16,
-    plan: &ModalReservation,
-) -> io::Result<Vec<u8>> {
+/// The bytes that reserve `plan` for a modal over a block at `top`: erase from the block
+/// down, scroll the transcript rows the plan covers (`top - plan.start`) into scrollback,
+/// and clear the modal's own rows.
+fn modal_reserve_bytes(top: u16, screen_rows: u16, plan: &ModalReservation) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     queue!(
         buf,
         crossterm::cursor::Hide,
-        MoveTo(0, occupied_top),
+        MoveTo(0, top),
         Clear(ClearType::FromCursorDown)
     )?;
-    let covered_transcript = transcript_end.saturating_sub(plan.start);
+    let covered_transcript = top.saturating_sub(plan.start);
     if covered_transcript > 0 {
         queue!(buf, MoveTo(0, screen_rows.saturating_sub(1)))?;
         buf.extend(std::iter::repeat_n(b'\n', covered_transcript as usize));
@@ -459,57 +464,21 @@ impl Screen {
     /// Give the blocking window the composer's rows. Erase the editor first,
     /// then preserve any covered transcript in scrollback. The draft stays in
     /// memory and is painted again only after this window releases input.
-    /// Re-reserve a live panel's rows after a resize (#2573). Unlike
-    /// [`Self::reserve_modal_rows`] this erases only from `erase_from` — what
-    /// the OLD panel could still occupy — and scrolls nothing: the transcript
-    /// above the panel is left where the terminal put it.
-    fn remeasure_modal_rows(
-        &mut self,
-        requested: u16,
-        erase_from: u16,
-    ) -> io::Result<ModalReservation> {
+    fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
         self.moved_cursor();
         let plan = plan_modal_reservation(self.top, self.rows, requested);
         self.tty.hold()?;
-        let mut buf = Vec::new();
-        queue!(
-            buf,
-            crossterm::cursor::Hide,
-            MoveTo(0, erase_from.min(plan.start)),
-            Clear(ClearType::FromCursorDown)
-        )?;
+        let buf = modal_reserve_bytes(self.top, self.rows, &plan)?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
         self.term.clear()?;
         Ok(plan)
     }
 
-    fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
-        self.reserve_modal_rows_from(self.top, self.top, requested)
-    }
-
-    /// Reserve `requested` rows for a modal whose rows today start at `occupied_top` — the
-    /// block's top when a modal opens, the panel's own top when the operator sizes it
-    /// (#2574) — over a transcript that ends at `transcript_end`. Only transcript rows the
-    /// new plan covers scroll into scrollback.
-    fn reserve_modal_rows_from(
-        &mut self,
-        occupied_top: u16,
-        transcript_end: u16,
-        requested: u16,
-    ) -> io::Result<ModalReservation> {
-        self.moved_cursor();
-        let plan = plan_modal_reservation(transcript_end, self.rows, requested);
-        self.tty.hold()?;
-        let buf = modal_reserve_bytes(occupied_top, transcript_end, self.rows, &plan)?;
-        self.tty.write_all(&buf)?;
-        self.tty.flush()?;
-        self.term.clear()?;
-        Ok(plan)
-    }
-
+    /// Park the cursor on a blocking window's top row. Not [`Self::moved_cursor`]: an inline
+    /// reservation has already said so, and the alternate screen keeps the primary cursor
+    /// where the last draw left it, which is what a resize measures after (#3056).
     fn place_cursor(&mut self, row: u16) -> io::Result<()> {
-        self.moved_cursor();
         execute!(self.tty, MoveTo(0, row))?;
         self.tty.flush()
     }
@@ -931,27 +900,6 @@ fn resize_erase_from(old_top: u16, new_top: u16, rows: u16) -> u16 {
     old_top.min(new_top).min(rows.saturating_sub(1))
 }
 
-/// The row a live panel's resize erases from (#2573): the higher of its old
-/// and new tops — both bottom-anchored, the same rule the block uses — raised
-/// by the rows a narrower terminal reflowed its old full-width rows onto.
-/// Nothing above that is the panel's, so the transcript survives.
-fn panel_erase_from(
-    old_start: u16,
-    old_rows: u16,
-    old_cols: u16,
-    cols: u16,
-    rows: u16,
-    requested: u16,
-) -> u16 {
-    let new_start = plan_modal_reservation(0, rows, requested).start;
-    let lifted = if cols < old_cols {
-        reflow_growth(&vec![usize::from(old_cols); usize::from(old_rows)], cols)
-    } else {
-        0
-    };
-    resize_erase_from(old_start, new_start, rows).saturating_sub(lifted)
-}
-
 /// How many rows the old block grows by when a terminal reflows it at `cols`:
 /// each row `w` wide now takes `ceil(w / cols)` rows instead of one.
 fn reflow_growth(widths: &[usize], cols: u16) -> u16 {
@@ -1033,6 +981,10 @@ pub(crate) struct Presenter {
     arbiter: newt_core::tty::EphemeralRegistration,
     _arbiter_target: Arc<dyn newt_core::tty::Ephemeral>,
     was_suspended: bool,
+    /// The session is serving a line the operator typed: set when one is handed over, cleared
+    /// when the session starts a turn or asks for input again. A blocking window opened in
+    /// between is one the operator asked for, so it draws on the alternate screen (#3056).
+    serving_operator: bool,
     /// True only while a blocking window owns the keyboard. The editor draft
     /// stays mounted in memory and is hidden until the window closes.
     chat_inactive: bool,
@@ -1216,6 +1168,7 @@ impl Presenter {
             arbiter,
             _arbiter_target: ephemeral,
             was_suspended: false,
+            serving_operator: false,
             chat_inactive: false,
             dirty: true,
             meta: crate::prefix::Sequencer::new(crate::prefix::current()),
@@ -1264,6 +1217,7 @@ impl Presenter {
     pub(crate) fn handle_request(&mut self, req: SurfaceRequest) -> io::Result<()> {
         match req {
             SurfaceRequest::ReadLine { prompt: _, reply } => {
+                self.serving_operator = false;
                 // A confirmed `:wq` submitted its turn last time; now that the
                 // turn has run, end the conversation and exit before reading
                 // anything new — same order as the classic surface.
@@ -1271,6 +1225,7 @@ impl Presenter {
                     let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
                 } else if let Some(line) = self.queued.pop_front() {
                     self.screen.queued = self.queued.len();
+                    self.serving_operator = true;
                     let _ = reply.send(Ok(ReadOutcome::Line(line)));
                 } else {
                     self.pending_read = Some(reply);
@@ -1290,6 +1245,9 @@ impl Presenter {
                 verbose: _,
                 reply,
             } => {
+                // The session is asking, not serving a line: the question
+                // stays inline, under the turn that asked it.
+                self.serving_operator = false;
                 if self.surface.take_end_quit() {
                     let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
                     self.dirty = true;
@@ -1301,17 +1259,17 @@ impl Presenter {
                 }
                 let requested_rows =
                     crate::clarification_modal::requested_rows(&batch, self.screen.cols);
-                let reservation = self.screen.reserve_modal_rows(requested_rows)?;
+                let rows = self.take_modal_rows(requested_rows)?;
+                let area = self.lent_area(&rows);
                 self.chat_inactive = true;
-                if reservation.chat_visible {
+                if rows.reservation.as_ref().is_some_and(|r| r.chat_visible) {
                     if let Err(error) = self.draw() {
                         self.chat_inactive = false;
                         return Err(error);
                     }
                 }
-                if let Err(error) = self.screen.place_cursor(reservation.start) {
-                    self.chat_inactive = false;
-                    let _ = self.finish_modal(Some(&reservation));
+                if let Err(error) = self.screen.place_cursor(area.y) {
+                    let _ = self.finish_modal(Some(rows));
                     let _ = self.draw();
                     return Err(error);
                 }
@@ -1320,18 +1278,12 @@ impl Presenter {
                     .screen
                     .tty
                     .try_clone()
-                    .and_then(|out| {
-                        crate::inline_viewport::cockpit_panel_terminal(
-                            out,
-                            Rect::new(0, reservation.start, self.screen.cols, reservation.rows),
-                        )
-                    })
+                    .and_then(|out| crate::inline_viewport::cockpit_panel_terminal(out, area))
                     .and_then(|mut terminal| {
                         crate::clarification_modal::present_in(&mut terminal, &batch, &hint)
                     });
                 drop(window);
-                let modal_cleanup = self.finish_modal(Some(&reservation));
-                self.chat_inactive = false;
+                let modal_cleanup = self.finish_modal(Some(rows));
                 let repaint = (|| -> io::Result<()> {
                     self.screen.term.clear()?;
                     self.draw()
@@ -1393,6 +1345,7 @@ impl Presenter {
                 self.dirty = true;
             }
             SurfaceRequest::TurnStarted { cancel } => {
+                self.serving_operator = false;
                 self.turn = Some(Turn { cancel });
                 // #2006: the mode hint may advertise `^C interrupt` exactly
                 // while that is true.
@@ -1429,18 +1382,18 @@ impl Presenter {
                 }
                 let requested_rows =
                     crate::interaction_view::requested_rows(&interaction, self.screen.cols);
-                let reservation = self.screen.reserve_modal_rows(requested_rows)?;
+                let rows = self.take_modal_rows(requested_rows)?;
+                let area = self.lent_area(&rows);
                 // The modal is the only visible input surface until it exits.
                 self.chat_inactive = true;
-                if reservation.chat_visible {
+                if rows.reservation.as_ref().is_some_and(|r| r.chat_visible) {
                     if let Err(error) = self.draw() {
                         self.chat_inactive = false;
                         return Err(error);
                     }
                 }
-                if let Err(error) = self.screen.place_cursor(reservation.start) {
-                    self.chat_inactive = false;
-                    let _ = self.finish_modal(Some(&reservation));
+                if let Err(error) = self.screen.place_cursor(area.y) {
+                    let _ = self.finish_modal(Some(rows));
                     let _ = self.draw();
                     return Err(error);
                 }
@@ -1451,10 +1404,7 @@ impl Presenter {
                 // answered.
                 let window = Self::suspend_terminal(prompt_output);
                 let rich = self.screen.tty.try_clone().and_then(|out| {
-                    let terminal = crate::inline_viewport::cockpit_panel_terminal(
-                        out,
-                        Rect::new(0, reservation.start, self.screen.cols, reservation.rows),
-                    )?;
+                    let terminal = crate::inline_viewport::cockpit_panel_terminal(out, area)?;
                     crate::interaction_view::present_in(terminal, &interaction)
                 });
                 let (outcome, prompt_notice) = match rich {
@@ -1466,8 +1416,7 @@ impl Presenter {
                     ),
                 };
                 drop(window);
-                let modal_cleanup = self.finish_modal(Some(&reservation));
-                self.chat_inactive = false;
+                let modal_cleanup = self.finish_modal(Some(rows));
                 // The modal wrote outside ratatui's diff. Repaint the inline
                 // region from a clean buffer so focus returns to chat without
                 // leaving modal bytes or a dim chevron behind. Send the answer
@@ -1488,9 +1437,10 @@ impl Presenter {
                 repaint?;
             }
             // The panel sibling of `Interact`: lend the real terminal and
-            // park while the session draws. Inline panels reserve rows;
-            // alternate-screen panels preserve the primary buffer themselves.
-            // Both use the same focus transfer and release channel.
+            // park while the session draws. Inline panels take rows like any
+            // blocking window; alternate-screen panels preserve the primary
+            // buffer themselves. Both use the same focus transfer and release
+            // channel.
             SurfaceRequest::Panel { mode, reply } => {
                 let panel_output = match self.screen.tty.try_clone() {
                     Ok(tty) => tty,
@@ -1507,14 +1457,19 @@ impl Presenter {
                 if self.dirty {
                     self.draw()?;
                 }
-                let reservation = match mode {
-                    PanelMode::Inline(rows) => Some(self.screen.reserve_modal_rows(rows)?),
+                let mut rows = match mode {
+                    PanelMode::Inline(requested) => self.take_modal_rows(requested)?,
                     // The caller's alternate buffer occludes the composer and
                     // saves the primary screen. Do not erase or scroll it first.
-                    PanelMode::AlternateScreen => None,
+                    PanelMode::AlternateScreen => ModalRows {
+                        requested: u16::MAX,
+                        reservation: None,
+                        alternate: None,
+                    },
                 };
                 self.chat_inactive = true;
-                if reservation
+                if rows
+                    .reservation
                     .as_ref()
                     .is_some_and(|window| window.chat_visible)
                 {
@@ -1530,14 +1485,13 @@ impl Presenter {
                 let (release, released) = std::sync::mpsc::sync_channel(1);
                 let window = crate::session_worker::PanelWindow::new(
                     panel_output,
-                    self.lent_area(reservation.as_ref()),
+                    self.lent_area(&rows),
                     Some(release),
                 );
                 if reply.send(Some(window)).is_err() {
                     // The session vanished between asking and receiving. Undo
                     // the reservation rather than parking forever.
-                    self.chat_inactive = false;
-                    let cleanup = self.finish_modal(reservation.as_ref());
+                    let cleanup = self.finish_modal(Some(rows));
                     let _ = self.screen.term.clear();
                     let _ = self.draw();
                     return cleanup;
@@ -1548,23 +1502,21 @@ impl Presenter {
                 // #2571: while parked, answer re-measure requests — the panel
                 // hears the resize (it owns the keyboard), this thread owns
                 // the layout. A `RecvError` is the drop: the panel is done.
-                let mut reservation = reservation;
-                let mut mode = mode;
-                while let Ok(crate::session_worker::PanelSignal::Remeasure { rows, reply }) =
+                while let Ok(crate::session_worker::PanelSignal::Remeasure { rows: asked, reply }) =
                     released.recv()
                 {
-                    // The operator sized the panel (Shift-↑/↓, zoom): an inline
-                    // loan takes the new request; the screen clamps it.
-                    if let (Some(rows), PanelMode::Inline(_)) = (rows, mode) {
-                        mode = PanelMode::Inline(rows);
+                    // The operator sized the panel (Shift-↑/↓, zoom): one on
+                    // the alternate screen takes the new request, which
+                    // `lent_area` clamps.
+                    if let (Some(asked), Some(_)) = (asked, &rows.alternate) {
+                        rows.requested = asked;
                     }
-                    // A failed re-plan keeps the old region rather than
+                    // A failed re-measure keeps the old region rather than
                     // stranding the panel: the reply still goes out.
-                    let _ = self.remeasure_panel(mode, &mut reservation);
-                    let _ = reply.send(self.lent_area(reservation.as_ref()));
+                    let _ = self.remeasure_panel(&rows);
+                    let _ = reply.send(self.lent_area(&rows));
                 }
-                let modal_cleanup = self.finish_modal(reservation.as_ref());
-                self.chat_inactive = false;
+                let modal_cleanup = self.finish_modal(Some(rows));
                 // The panel wrote outside ratatui's diff, so the mounted block
                 // is repainted from a clean buffer — the same restore the
                 // modal path performs, and the reason the header comes back.
@@ -1812,81 +1764,88 @@ impl Presenter {
         Ok(true)
     }
 
-    /// The region lent to a panel: its reservation, or the whole screen for an
-    /// alternate-screen loan.
-    fn lent_area(&self, reservation: Option<&ModalReservation>) -> Rect {
-        let (top, rows) = reservation.map_or((0, self.screen.rows), |r| (r.start, r.rows));
-        Rect::new(0, top, self.screen.cols, rows)
-    }
-
-    /// #2571: the terminal resized under a live panel, or the operator asked
-    /// for a different height (Shift-↑/↓, zoom). The same re-layout
-    /// `finish_modal_rows` applies to a resize that lands after a dialog
-    /// closes — clear what a narrower panel may have rewrapped above its old
-    /// top, then the presenter's own resize — and the panel's rows reserved
-    /// again against the new screen.
-    fn remeasure_panel(
-        &mut self,
-        mode: PanelMode,
-        reservation: &mut Option<ModalReservation>,
-    ) -> io::Result<()> {
-        let (cols, rows) = self.screen.terminal_size()?;
-        let resized = (cols, rows) != (self.screen.cols, self.screen.rows);
-        // Measured before the presenter's own resize moves its geometry.
-        let old = reservation
-            .as_ref()
-            .map(|r| (r.start, r.rows, r.transcript_end));
-        let old_cols = self.screen.cols;
-        if resized {
-            self.on_event(Event::Resize(cols, rows))?;
-        }
-        // An alternate-screen loan owns the whole screen and redraws it: the
-        // presenter's own resize above is its whole resize contract (#2573).
-        let (PanelMode::Inline(requested), Some((old_start, old_rows, old_end))) = (mode, old)
-        else {
-            return Ok(());
+    /// Rows for a blocking window `requested` high (#3056). One the operator opened with a
+    /// command draws at the bottom of the alternate screen, and leaving it gives the primary
+    /// screen back exactly: nothing is scrolled, reclaimed or repainted. Anything else (a
+    /// permission prompt during a turn, a clarification, a prompt at startup) reserves rows
+    /// under the transcript, which stays in view (`plain_scroller_tui.md`).
+    fn take_modal_rows(&mut self, requested: u16) -> io::Result<ModalRows> {
+        let (reservation, alternate) = if self.serving_operator {
+            let out = crate::inline_viewport::PanelOut::Tty(self.screen.tty.try_clone()?);
+            let screen = crate::transcript_pager::AltScreenGuard::enter_on(out, None)?;
+            (None, Some(screen))
+        } else {
+            (Some(self.screen.reserve_modal_rows(requested)?), None)
         };
-        if resized {
-            let erase_from = panel_erase_from(old_start, old_rows, old_cols, cols, rows, requested);
-            *reservation = Some(self.screen.remeasure_modal_rows(requested, erase_from)?);
-        } else if old_rows != requested.min(self.screen.rows) {
-            // The operator sized the panel (#2574): reserved from the panel's
-            // own top, so a grow scrolls only the rows it newly covers into
-            // scrollback and a shrink erases only the rows it gives back.
-            *reservation = Some(
-                self.screen
-                    .reserve_modal_rows_from(old_start, old_end, requested)?,
-            );
-        }
-        Ok(())
+        Ok(ModalRows {
+            requested,
+            reservation,
+            alternate,
+        })
     }
 
-    /// A blocking dialog may have consumed every resize event while this
-    /// presenter was parked. Read the real tty before restoring its draft.
-    fn finish_modal(&mut self, reservation: Option<&ModalReservation>) -> io::Result<()> {
-        let cleanup = self.finish_modal_rows(reservation);
+    /// Where a blocking window draws: its inline reservation, else the bottom rows it asked
+    /// for on the alternate screen, measured afresh. Afresh, because the presenter's geometry
+    /// describes the primary screen and waits for it ([`Self::finish_modal_rows`]).
+    fn lent_area(&self, rows: &ModalRows) -> Rect {
+        if let Some(r) = &rows.reservation {
+            return Rect::new(0, r.start, self.screen.cols, r.rows);
+        }
+        let (cols, height) = self
+            .screen
+            .terminal_size()
+            .unwrap_or((self.screen.cols, self.screen.rows));
+        let lent = rows.requested.min(height);
+        Rect::new(0, height - lent, cols, lent)
+    }
+
+    /// #2571: the terminal resized under a live panel on the alternate screen, or the
+    /// operator sized it (Shift-↑/↓, zoom). The primary screen is out of sight, so the
+    /// presenter's own resize waits until it is back; here the capture learns the new size and
+    /// the alternate screen is cleared for the panel to redraw in its new region. Inline rows
+    /// are kept until the window closes.
+    fn remeasure_panel(&mut self, rows: &ModalRows) -> io::Result<()> {
+        if rows.reservation.is_some() {
+            return Ok(());
+        }
+        let (cols, height) = self.screen.terminal_size()?;
+        self.capture.resize(cols, height);
+        self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
+        self.screen.tty.flush()
+    }
+
+    /// Give a blocking window's rows back and the keyboard to chat. The alternate screen, if
+    /// the window had one, is left first, so what follows measures the primary screen. A
+    /// dialog may have consumed every resize event while this presenter was parked, so the
+    /// real tty is read before the draft is restored.
+    fn finish_modal(&mut self, rows: Option<ModalRows>) -> io::Result<()> {
+        self.chat_inactive = false;
+        // Taking the reservation drops the rest, the alternate-screen guard included.
+        let reservation = rows.and_then(|rows| rows.reservation);
+        let cleanup = self.finish_modal_rows(reservation.as_ref());
         let released = self.screen.tty.release();
         cleanup.and(released)
     }
 
     fn finish_modal_rows(&mut self, reservation: Option<&ModalReservation>) -> io::Result<()> {
         let (cols, rows) = self.screen.terminal_size()?;
-        if (cols, rows) != (self.screen.cols, self.screen.rows) {
-            // A narrower inline dialog may have expanded above its old top.
-            // Alternate-screen loans never painted the primary buffer; only
-            // inline dialogs need their old pixels cleared before resizing.
-            if let Some(reservation) = reservation {
-                self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
-                self.screen.tty.flush()?;
-                // Reclaim before the resize re-anchors the block (it rebuilds the viewport).
-                self.screen.reclaim_modal_rows(reservation);
-            }
-            self.on_event(Event::Resize(cols, rows))
-        } else if let Some(reservation) = reservation {
-            self.screen.release_modal(reservation)
-        } else {
-            Ok(())
+        if (cols, rows) == (self.screen.cols, self.screen.rows) {
+            return reservation
+                .map_or(Ok(()), |reservation| self.screen.release_modal(reservation));
         }
+        let Some(reservation) = reservation else {
+            // The terminal resized while the primary screen sat behind the alternate one:
+            // ask where it left the block, as a resize at the prompt does (#3014).
+            self.dirty = true;
+            let measured = self.measure_block_top();
+            return self.resize_to(cols, rows, measured);
+        };
+        // A narrower inline dialog may have expanded above its old top.
+        self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
+        self.screen.tty.flush()?;
+        // Reclaim before the resize re-anchors the block (it rebuilds the viewport).
+        self.screen.reclaim_modal_rows(reservation);
+        self.on_event(Event::Resize(cols, rows))
     }
 
     fn suspend_terminal(output: File) -> newt_core::tty::PromptWindow {
@@ -2037,6 +1996,7 @@ impl Presenter {
     /// by the editor, so a queued line reads back exactly like a sent one.
     fn submit(&mut self, body: String) {
         if let Some(reply) = self.pending_read.take() {
+            self.serving_operator = true;
             let _ = reply.send(Ok(ReadOutcome::Line(body)));
         } else {
             self.queued.push_back(body);
@@ -2470,11 +2430,11 @@ mod tests {
         assert_eq!(first_erase_row(log), 20);
     }
 
-    /// The screen after a transcript of `lines` rows, a block of `block_h` rows under it, then a
-    /// panel reserved for each of `requests` in turn (the operator sizing it), then released and
-    /// one more transcript line inserted where the block now sits. Returns that screen.
+    /// The screen after a transcript of `lines` rows, a block of `block_h` rows under it, then an
+    /// inline modal of `requested` rows reserved, released, and one more transcript line
+    /// inserted where the block now sits. Returns that screen.
     #[cfg(feature = "rich-tui")]
-    fn panel_round_trip(rows: u16, lines: u16, block_h: u16, requests: &[u16]) -> Vec<String> {
+    fn panel_round_trip(rows: u16, lines: u16, block_h: u16, requested: u16) -> Vec<String> {
         let mut stream = String::new();
         for n in 0..lines {
             stream.push_str(&format!("\x1b[{};1HT{n:02}", n + 1));
@@ -2483,20 +2443,12 @@ mod tests {
         for b in 0..block_h {
             stream.push_str(&format!("\x1b[{};1HBLOCK", top + b + 1));
         }
-        let mut occupied_top = top;
-        let mut reservation = None::<ModalReservation>;
-        for &requested in requests {
-            let end = reservation.as_ref().map_or(top, |r| r.transcript_end);
-            let plan = plan_modal_reservation(end, rows, requested);
-            let bytes = modal_reserve_bytes(occupied_top, end, rows, &plan).unwrap();
-            stream.push_str(&String::from_utf8(bytes).unwrap());
-            for r in plan.start..rows {
-                stream.push_str(&format!("\x1b[{};1HPANEL", r + 1));
-            }
-            occupied_top = plan.start;
-            reservation = Some(plan);
+        let reservation = plan_modal_reservation(top, rows, requested);
+        let bytes = modal_reserve_bytes(top, rows, &reservation).unwrap();
+        stream.push_str(&String::from_utf8(bytes).unwrap());
+        for r in reservation.start..rows {
+            stream.push_str(&format!("\x1b[{};1HPANEL", r + 1));
         }
-        let reservation = reservation.expect("at least one request");
         stream
             .push_str(&String::from_utf8(modal_cleanup_bytes(reservation.start).unwrap()).unwrap());
         let new_top = reclaimed_top(&reservation, block_h, rows);
@@ -2520,25 +2472,13 @@ mod tests {
     #[test]
     fn closing_a_panel_over_a_full_transcript_leaves_no_blank_rows() {
         // A 24-row screen, transcript T00..T20 above a 3-row block, a 10-row panel.
-        let grid = panel_round_trip(24, 21, 3, &[10]);
+        let grid = panel_round_trip(24, 21, 3, 10);
         let (last, next) = (row_of(&grid, "T20"), row_of(&grid, "NEXT"));
         assert_eq!(next, last + 1, "NEXT must follow T20 directly: {grid:?}");
         assert!(
             !grid.iter().any(|row| row.contains("PANEL")),
             "panel text left behind: {grid:?}"
         );
-    }
-
-    /// The same, when the operator sizes the panel taller and then shorter before closing: the
-    /// transcript ended where the LARGEST reservation scrolled it to.
-    #[cfg(feature = "rich-tui")]
-    #[test]
-    fn sizing_a_panel_then_closing_it_reclaims_exactly_what_it_scrolled() {
-        for requests in [&[6, 14][..], &[14, 6][..], &[6, 14, 8][..]] {
-            let grid = panel_round_trip(24, 21, 3, requests);
-            let (last, next) = (row_of(&grid, "T20"), row_of(&grid, "NEXT"));
-            assert_eq!(next, last + 1, "{requests:?}: {grid:?}");
-        }
     }
 
     /// A panel shorter than the block covers no transcript: nothing scrolled, and the block
@@ -2549,7 +2489,7 @@ mod tests {
         let plan = plan_modal_reservation(10, 24, 4);
         assert_eq!(plan.transcript_end, 10);
         assert_eq!(reclaimed_top(&plan, 3, 24), 10);
-        let grid = panel_round_trip(24, 10, 3, &[4]);
+        let grid = panel_round_trip(24, 10, 3, 4);
         assert_eq!(row_of(&grid, "NEXT"), row_of(&grid, "T09") + 1, "{grid:?}");
     }
 
@@ -2852,24 +2792,6 @@ mod tests {
         assert_eq!(reflow_growth(&[47], 47), 0, "an exact fit does not wrap");
     }
 
-    /// #2573 review: a live panel's resize erases only rows the panel could
-    /// still occupy. The regression: clearing from row 0 wiped the transcript.
-    #[test]
-    fn a_panel_resize_erases_only_what_the_old_panel_could_occupy() {
-        // Same height, wider: only the panel's own rows (13..).
-        assert_eq!(panel_erase_from(13, 18, 100, 118, 31, 18), 13);
-        // Taller terminal: the old panel at 13.. is stale; nothing above it.
-        assert_eq!(panel_erase_from(13, 18, 100, 100, 45, 18), 13);
-        // Shorter: the new panel starts higher, so erase from its top.
-        assert_eq!(panel_erase_from(13, 18, 100, 100, 25, 18), 7);
-        // Narrower: each full-width old row reflows onto two, lifting the
-        // stale panel by its height — never past the top of the screen.
-        assert_eq!(panel_erase_from(20, 8, 100, 60, 31, 8), 12);
-        assert_eq!(panel_erase_from(13, 18, 100, 60, 31, 18), 0);
-        // Never row 0 unless the reflow truly reaches it.
-        assert!(panel_erase_from(20, 8, 100, 118, 31, 8) > 0);
-    }
-
     /// #3014 item 2 (maintainer decision, reversing #2441/#2632 for grows): a herdr pane
     /// grew from 30 to 63 rows with the block at top 27, height 3. The block is pinned to
     /// the new bottom row, `63 - 3 = 60`, not left under the content.
@@ -2972,7 +2894,8 @@ pub(crate) use terminal_acceptance::cockpit_psyche_case;
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
     cockpit_clarification_input_case, cockpit_panel_gap_case, cockpit_panel_loop_case,
-    cockpit_resize_anchor_case, panel_live_resize_case, panel_resize_case,
+    cockpit_panel_reopen_case, cockpit_resize_anchor_case, panel_live_resize_case,
+    panel_resize_case,
 };
 
 #[cfg(test)]

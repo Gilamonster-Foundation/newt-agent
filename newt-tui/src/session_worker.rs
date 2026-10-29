@@ -66,6 +66,9 @@ use crate::chat::{BackgroundJob, ReadOutcome};
 #[cfg(feature = "rich-tui")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PanelMode {
+    /// This many rows at the bottom of the screen, placed by the presenter: on the
+    /// alternate screen for a panel the operator opened, inline under the transcript
+    /// otherwise (#3056).
     Inline(u16),
     /// The caller's alternate-screen guard preserves the primary screen.
     AlternateScreen,
@@ -153,9 +156,9 @@ pub(crate) enum SurfaceRequest {
     /// config and its filesystem writers — `!Send`, and not expressible as a
     /// `SurfaceInteraction` — so the loop cannot be moved to the UI thread the
     /// way a semantic interaction is. What CAN move is the terminal: the
-    /// presenter reserves inline rows (or leaves the primary buffer intact
-    /// for an alternate-screen caller), hands back a [`PanelWindow`] onto the
-    /// real tty, and parks until the window is dropped.
+    /// presenter lends rows (or leaves the primary buffer intact for an
+    /// alternate-screen caller — see [`PanelMode`]), hands back a
+    /// [`PanelWindow`] onto the real tty, and parks until the window is dropped.
     ///
     /// `None` means "no cockpit here" — a lean or piped surface has no rows to
     /// lend, and the caller keeps its existing stdout path.
