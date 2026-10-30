@@ -65,7 +65,7 @@ fn fenced_private_dns_answer_requests_a_typed_hostname_grant() {
         FencedHttpClient::for_url_with_resolver(&url, Duration::from_secs(1), allow, &answer(ip))
     };
 
-    let error = build(false, "10.0.0.7")
+    let error = build(false, "10.0.0.1")
         .err()
         .expect("unapproved private answer");
     let required = error.downcast_ref::<HttpNetGrantRequired>();
@@ -77,8 +77,8 @@ fn fenced_private_dns_answer_requests_a_typed_hostname_grant() {
         }),
         "{error:#}"
     );
-    assert!(!format!("{error:#}").contains("10.0.0.7"), "{error:#}");
-    assert!(build(true, "10.0.0.7").is_ok());
+    assert!(!format!("{error:#}").contains("10.0.0.1"), "{error:#}");
+    assert!(build(true, "10.0.0.1").is_ok());
 
     let metadata = build(true, "169.254.169.254")
         .err()
