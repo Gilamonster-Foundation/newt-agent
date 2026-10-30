@@ -164,14 +164,14 @@ draft. The table keeps these weights apart.
 | Concept | AAT -02 | BA -03 | DP -00 / DPS-AB 0.3.0 | Newt / Bridle today |
 |---|---|---|---|---|
 | Root authority | trust anchor (issuer URI + key), root token (§2, §6.1) | organizational identity root (§3, §11.7) | verifier's own trust policy (DP §3, §10) | per-user `UserKey` → session-root `CertChain` ([`newt-identity`](../../../newt-identity/src/lib.rs)) |
-| Grant value | `authorization_details` (RAR profile, §3.3) | none | approved specification (DPS-AB item 2) | `Caveats` (mesh); `GitCaveats`; `SshCaveats` |
+| Grant value | `authorization_details` (RAR profile, §3.3) | none | approved specification (DPS-AB item 2) | `Caveats` (mesh); `GitCaveats`; `SshCaveats` (no production caller) |
 | Attenuated child | derived token (§6.2) | none | none | `AgentKey::delegate` cert; `Subtask.caveats = parent.meet(policy)` ([`plan.rs`](../../../newt-core/src/plan.rs)) |
 | Derivation check | I1–I6, §8 step 4 | none | none | `CertChain::verify` (`child ⊑ parent` per link); mesh `check_derivation` (exists, unused by Newt, §4.1.8) |
 | Parent binding | `par_hash` = SHA-256(parent JWS signing input) (I5) | none | none | `CertChain`: key only (measured, §4.1.8); mesh `Derivation::Attenuation{parent: GrantId}`: CID |
 | Holder / session key | `cnf.jwk`, PoP JWT (§7) | party key | approver / organisation key | mesh agent key; Bridle `SessionId` (step-up) |
 | Request | presentation = chain + PoP (`hta` = args) (§7.4) | request attestation (§3) | request stage | `CallRequest{tool,args,resource}`; `PermissionChallenge` |
 | Policy evaluated | leaf constraint map | constraint-set snapshot digest + per-constraint results (§5) | "applicable policy version" in spec; recheck stage | `AdmittedFence` (`resolved ⊆ delegated ∪ runtime_closure`); ocap store precedence |
-| Human decision | none; approval gates would need a profile (§9.1.2) | `hitl_dispatched`/`escalated` (capsule §5.5.1) | outcome `approved`/`rejected`/`escalated` + approver signature | step-up `Attestation`; `OperatorDecision` (`AllowOnce`/`AllowSession`/`Deny`/`ApproveDurable`) |
+| Human decision | none; approval gates would need a profile (§9.1.2) | `hitl_dispatched`/`escalated` (capsule §5.5.1) | outcome `approved`/`rejected`/`escalated` + approver signature | `OperatorDecision` (`AllowOnce`/`AllowSession`/`Deny`/`ApproveDurable`). Bridle step-up `Attestation` exists but Newt's passkey answer path is "designed but never wired" ([`permission_challenge.rs`](../../../newt-core/src/permission_challenge.rs)) |
 | Disposition | PERMIT/DENY (§8) | action attestation disposition (capsule `verdict_class`) | attempt + result `succeeded`/`failed`/`indeterminate` | `ExecutionTerminal::{Exited, Denied, Failed}` |
 | Effect evidence | none | via capsule effect record (`effect_mode`, `effect_attestation`) | observed result "with the basis of the observation" | `ExitEvidence{fence, dropped, proxy}` |
 | Fence identity | none | constraint-set digest | none | `AdmittedFenceId` (CIDv1, [`admitted.rs`](../../../vendor/agent-bridle-core/src/admitted.rs)) |
@@ -304,7 +304,7 @@ No unsound row was found. That soundness stops at the string; see §4.1.5.
 | One repository, not another | Yes, if the repo is a string argument: `repo: exact "…"`. Closed-world maps reject the rest (§3.3). | The tool must resolve the string to that repository (§9.1.1) | `GitCaveats.remote` is scoped by remote *name*, an alias ([`git_caveats.rs`](../../../agent-toolchain/src/git_caveats.rs)). The governed push approves the *literal* `remote.<name>.url` and the OID ([`git_staging.rs`](../../../newt-core/src/git_staging.rs) header) |
 | Selected paths / an authorized projection | Paths: enumeration only (`exact`, `one_of`). Prefix or tree needs an extension type (§3.4). A projection is not expressible at all: constraints restrict arguments, not results (§9.1.2) | A path extension with sound resolved-object semantics; a projection identity (§6, CE5) | `fs_cap` binds to the opened object on Linux (`openat2` RESOLVE_BENEATH) and macOS (held fds + `O_NOFOLLOW`) ([`fs_cap.rs`](../../../newt-core/src/fs_cap.rs)). Register residual: "pathname grants and signatures do not pin an inode" |
 | Read / propose-patch / commit / push / merge | Yes, as distinct tool identifiers. Omitting a tool attenuates (§3.6.2) | Ordering ("merge only after review") is not expressible (§9.1.2) | `GitCaveats{read, stage, commit_local, refs, remote, fetch, push, clone}`. No propose-patch or merge verb |
-| One named SSH key without `~/.ssh` | As a *designation*: `key: exact "deploy-a"`. The key material must stay with the enforcement point | Delegated execution. A path-valued key argument brings aliasing back | `SshCaveats` (hosts + keys). The harness-private marker refuses `.ssh` in `RuntimeClosure` ([`admitted.rs`](../../../vendor/agent-bridle-core/src/admitted.rs)) |
+| One named SSH key without `~/.ssh` | As a *designation*: `key: exact "deploy-a"`. The key material must stay with the enforcement point | Delegated execution. A path-valued key argument brings aliasing back | `SshCaveats` (hosts + keys) is inert: the inert-code ratchet lists it as debt X02, "no production caller" ([`inert_code_ratchet.rs`](../../../newt-core/tests/inert_code_ratchet.rs)). The harness-private marker refuses `.ssh` in `RuntimeClosure` ([`admitted.rs`](../../../vendor/agent-bridle-core/src/admitted.rs)) |
 | Network destination, protocol, method, bounded payload | Host, scheme and method: `exact`/`one_of`. **Payload size: no.** `range` takes numbers only, and there is no length constraint (Table 2) | An extension, or a numeric size argument computed by the enforcement point | Bridle `NetPolicy` host allow-list + egress proxy; `web_fetch` SSRF screen |
 | A tool with structural argument restrictions | Top-level arguments only. Nested values only by whole-value `one_of` | A structured extension type | Name-level leashes (`RemoteTool`) |
 | Content-addressed inputs | Yes: `exact` on a digest string. This is the strongest designation, because a CID has no filesystem alias | Exact-string comparison treats multibase variants of one CID as different values. That fails closed for allow-lists and open for `not_one_of` | `content-addressable` CIDs; git OIDs in the governed push |
@@ -492,6 +492,14 @@ The pass is specific to a parent cert of the *same* key. The cause is in
   about narrowness when the parent is ⊤. The ceiling has to come from somewhere
   other than the signature: the preset meet, the operator.
 
+**Fact.** On the TUI path the signature is not load-bearing at all.
+`session_capability.rs` mints with `mint_operating_key(p, &policy).ok()` and
+falls back to the unsigned `policy` when minting or `enforced_caveats` fails
+([`session_capability.rs`](../../../newt-tui/src/session_capability.rs)).
+**Inference.** The enforced caveats equal the policy either way, so this is not
+a widening. It does mean a signed grant is evidence of the grant only when one
+was minted, and nothing records which case occurred.
+
 ### 4.2 Bilateral Attestation (-03)
 
 #### 4.2.1 Objects, signers and commitments
@@ -616,7 +624,9 @@ Newt has two layers of the "platform" kind:
 
 - `EnforcementReport`/`FenceEvidence`, which are *self-reported* by the harness
   process;
-- `AdmittedFenceId`, re-derived at apply time. It closes in-process admit/apply
+- `AdmittedFenceId`, re-derived at apply time. Newt's own crates never read it
+  (`git grep fence_id -- 'newt-core/src/*.rs' 'newt-tui/src/*.rs'` prints
+  nothing). It closes in-process admit/apply
   drift (L2), not third-party trust.
 
 **Rec.** Keep the four proofs separate (P0-2).
@@ -763,8 +773,8 @@ flowchart TB
 |---|---|---|---|---|---|---|
 | 1 | operator → root grant | operator → harness | AAT root signed by the trust anchor (§6.1.3). Newt session-root `CertChain` signed by `UserKey`. Bridle `HumanPrincipal`/`PrincipalBinding` for OIDC humans | AAT `jti`, allocated. Newt key `Fingerprint`. A mesh `GrantId` exists but is not minted by Newt (§4.1.8) | AAT: issuer policy, out of scope (§6.1.3 step 6). Newt: posture/preset. The mint re-roots at ⊤ (§4.1.8) | AS key / `UserKey` / IdP |
 | 2 | root → attenuated session capability | harness → session key | AAT derived token + `par_hash`. Newt `delegate` cert | AAT `par_hash`. Newt: none binds the parent instance (measured) | I4 / `Caveats::leq` per link | root |
-| 3 | session → agent plan | model proposes; harness records | none in any draft. Newt `Plan` is unsigned | none: `plan.rs` has no `ContentId` (`git grep -c -E "ContentId\|content_id" -- newt-core/src/plan.rs` → no match, exit 1) | `CaveatPolicy` default-deny; subtask = `parent.meet(policy)` | none. Model output is data |
-| 4 | plan → approved decision | approver → harness | DPS-AB outcome + approver signature + organisation seal. Bridle step-up `Attestation` over `Challenge(session, action, generation, nonce)`. `OperatorDecision` pins `PermissionChallenge::digest` | DPS-AB SHA-256 of spec bytes. Bridle `step_up::ContentId` = BLAKE3 over sorted-key JSON, *not* `content-addressable` | DPS charter reference (issuer claim). Bridle `StepUpPolicy`; ocap store deny > passkey > ask > approve | verifier trust policy; operator-signed credential registry ([`credential_registry.rs`](../../../newt-core/src/credential_registry.rs)) |
+| 3 | session → agent plan | model proposes; harness records | none in any draft. Newt `Plan` is unsigned. Plan mode's `PresentedPlan` carries a `RawContentId` over the draft Markdown, held in memory, consumed once on approval, not persisted or signed ([`plan_mode.rs`](../../../newt-core/src/agentic/plan_mode.rs)) | the crew plan has none: `plan.rs` has no `ContentId` (`git grep -c -E "ContentId\|content_id" -- newt-core/src/plan.rs` → no match, exit 1) | `CaveatPolicy` default-deny; subtask = `parent.meet(policy)` | none. Model output is data |
+| 4 | plan → approved decision | approver → harness | DPS-AB outcome + approver signature + organisation seal. Bridle step-up `Attestation` over `Challenge(session, action, generation, nonce)`, not yet wired into Newt. `OperatorDecision` pins `PermissionChallenge::digest` | DPS-AB SHA-256 of spec bytes. Bridle `step_up::ContentId` = BLAKE3 over sorted-key JSON, *not* `content-addressable` | DPS charter reference (issuer claim). Bridle `StepUpPolicy`; ocap store deny > passkey > ask > approve | verifier trust policy; operator-signed credential registry ([`credential_registry.rs`](../../../newt-core/src/credential_registry.rs)) |
 | 5 | decision → cross-boundary request | harness → boundary | AAT PoP + chain. BA request attestation | `aat_hash`; JCS(`hta`); BA request digest (encoding TBD); DPS-AB request digest | leaf constraint map, closed-world | AAT trust anchor; BA organizational root |
 | 6 | request → Bridle evaluation | inside the boundary | BA: none yet. Bridle `AdmittedFence::admit`, unsigned | `AdmittedFenceId` (CIDv1 over mechanism caveats + mechanism). BA constraint-set digest | `resolved ⊆ delegated ∪ runtime_closure`, floor, `Unknown` → refuse | the harness process. No platform attestation |
 | 7 | evaluation → disposition | boundary → harness / requester | BA action attestation. Capsule `verdict_class` + `effect_mode`. Bridle `ExecutionTerminal`, unsigned | `FenceEvidence.fence_id`. `ExecutionId` is a `u64` counter, allocated | same | performer key. None locally |
