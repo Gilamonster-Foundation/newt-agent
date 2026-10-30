@@ -8,13 +8,16 @@ fn import_dedup_errors_on_clash_unless_force_or_merge() {
     let claude = sb.cwd.join("c.json");
     std::fs::write(
         &claude,
-        r#"{ "mcpServers": { "fs": { "command": "v2-cmd" } } }"#,
+        r#"{ "mcpServers": {
+              "fs": { "type": "http", "url": "https://new.example/mcp" },
+              "shell": { "command": "shell-mcp" }
+        } }"#,
     )
     .unwrap();
     // Pre-seed an mcp.toml with a clashing `fs`.
     std::fs::write(
         sb.config_dir.join("mcp.toml"),
-        "[[mcp_servers]]\nname = \"fs\"\ncommand = \"v1-cmd\"\n",
+        "# local settings\n[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nenabled = false\nlogin_argv = [\"client\", \"login\"]\nrequest_timeout_secs = 90\n",
     )
     .unwrap();
 
@@ -27,11 +30,11 @@ fn import_dedup_errors_on_clash_unless_force_or_merge() {
     let servers = newt_core::mcp::parse_newt_mcp_toml(
         &std::fs::read_to_string(sb.config_dir.join("mcp.toml")).unwrap(),
     );
-    assert_eq!(
-        servers[0].command.as_deref(),
-        Some("v1-cmd"),
-        "unchanged on error"
-    );
+    let fs = servers.iter().find(|entry| entry.name == "fs").unwrap();
+    assert_eq!(fs.url.as_deref(), Some("https://old.example/mcp"));
+    assert!(!fs.enabled, "unchanged on error");
+    assert_eq!(fs.login_argv, vec!["client", "login"]);
+    assert_eq!(fs.request_timeout_secs, Some(90));
 
     // --merge: keep the existing entry, skip the import.
     newt(&sb)
@@ -44,15 +47,14 @@ fn import_dedup_errors_on_clash_unless_force_or_merge() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Skipped"));
+        .stdout(predicate::str::contains("Skipped"))
+        .stdout(predicate::str::contains(
+            "Results: 1 added, 0 replaced, 0 unchanged, 1 skipped.",
+        ));
     let servers = newt_core::mcp::parse_newt_mcp_toml(
         &std::fs::read_to_string(sb.config_dir.join("mcp.toml")).unwrap(),
     );
-    assert_eq!(
-        servers[0].command.as_deref(),
-        Some("v1-cmd"),
-        "merge kept existing"
-    );
+    assert_eq!(servers[0].command.as_deref(), None, "merge kept existing");
 
     // --force: overwrite the existing entry.
     newt(&sb)
@@ -65,24 +67,43 @@ fn import_dedup_errors_on_clash_unless_force_or_merge() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Overwrote"));
+        .stdout(predicate::str::contains("Overwrote 1"))
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 1 replaced, 1 unchanged, 0 skipped.",
+        ));
     let servers = newt_core::mcp::parse_newt_mcp_toml(
         &std::fs::read_to_string(sb.config_dir.join("mcp.toml")).unwrap(),
     );
-    assert_eq!(
-        servers[0].command.as_deref(),
-        Some("v2-cmd"),
-        "force overwrote"
-    );
+    let fs = servers.iter().find(|entry| entry.name == "fs").unwrap();
+    assert_eq!(fs.url.as_deref(), Some("https://new.example/mcp"));
+    assert!(!fs.enabled);
+    assert_eq!(fs.login_argv, vec!["client", "login"]);
+    assert_eq!(fs.request_timeout_secs, Some(90));
+    assert!(std::fs::read_to_string(sb.config_dir.join("mcp.toml"))
+        .unwrap()
+        .contains("# local settings"));
+
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            claude.to_str().unwrap(),
+            "--all",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 0 replaced, 2 unchanged, 0 skipped.",
+        ));
 }
 
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
-fn import_refuses_a_name_already_in_config_toml_that_outranks_mcp_toml() {
-    // FIX 3 (#1301): config.toml outranks ~/.newt/mcp.toml, so importing a name
-    // already in config.toml would write a silently-shadowed entry. It must be a
-    // loud error (not a misleading "Imported"), and even --force must not write.
+fn import_force_updates_the_effective_config_owner() {
+    // config.toml outranks ~/.newt/mcp.toml. --force must update that owner,
+    // while non-mutating modes continue to refuse a shadowed default target.
     let sb = sandbox();
     std::fs::write(
         sb.config_dir.join("config.toml"),
@@ -96,7 +117,7 @@ fn import_refuses_a_name_already_in_config_toml_that_outranks_mcp_toml() {
     )
     .unwrap();
 
-    for extra in [&[][..], &["--force"][..], &["--merge"][..]] {
+    for extra in [&[][..], &["--merge"][..]] {
         let mut args = vec!["mcp", "import", claude.to_str().unwrap(), "--all"];
         args.extend_from_slice(extra);
         newt(&sb)
@@ -106,11 +127,65 @@ fn import_refuses_a_name_already_in_config_toml_that_outranks_mcp_toml() {
             .stderr(predicate::str::contains("outranks"))
             .stderr(predicate::str::contains("scrybe"));
     }
-    // Nothing was written to mcp.toml (the ineffective entry never lands).
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            claude.to_str().unwrap(),
+            "--all",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Results: 0 added, 1 replaced"));
+
+    let updated = std::fs::read_to_string(sb.config_dir.join("config.toml")).unwrap();
+    assert!(updated.contains("command = \"claude-scrybe\""));
+    // No shadowed entry is written to the lower-precedence breakout file.
     assert!(
         !sb.config_dir.join("mcp.toml").exists(),
-        "no shadowed entry should be written"
+        "force should replace the existing owner, not create a duplicate"
     );
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn force_import_refuses_a_batch_with_multiple_owners_without_writing() {
+    let sb = sandbox();
+    let config_path = sb.config_dir.join("config.toml");
+    let mcp_path = sb.config_dir.join("mcp.toml");
+    let config_original = "[[mcp_servers]]\nname = \"config-owned\"\ncommand = \"old-config\"\n";
+    let mcp_original = "[[mcp_servers]]\nname = \"mcp-owned\"\ncommand = \"old-mcp\"\n";
+    std::fs::write(&config_path, config_original).unwrap();
+    std::fs::write(&mcp_path, mcp_original).unwrap();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "config-owned": { "command": "new-config" },
+              "mcp-owned": { "command": "new-mcp" }
+        } }"#,
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--all",
+            "--force",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("different owning files"));
+
+    assert_eq!(
+        std::fs::read_to_string(config_path).unwrap(),
+        config_original
+    );
+    assert_eq!(std::fs::read_to_string(mcp_path).unwrap(), mcp_original);
 }
 
 #[test]

@@ -105,3 +105,14 @@ RUST_LOG = "debug"
         Some(SecretValue::Ref(SecretRef { cmd: Some(_), .. }))
     ));
 }
+
+#[test]
+fn checked_newt_mcp_parser_reports_malformed_toml_without_source_text() {
+    let error = parse_newt_mcp_toml_checked(
+        "[[mcp_servers]]\nname = \"private-token-marker\"\ncommand = =\n",
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "invalid MCP TOML syntax");
+    assert!(!error.to_string().contains("private-token-marker"));
+    assert!(parse_newt_mcp_toml_checked("other = 1").unwrap().is_empty());
+}
