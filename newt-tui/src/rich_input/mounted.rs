@@ -72,6 +72,16 @@ pub(crate) struct MountedEditor {
 }
 
 impl MountedEditor {
+    /// #3022: the retained spills `/spill open ` completes to.
+    #[cfg(feature = "live-spill")]
+    pub(crate) fn set_spill_choices(&mut self, choices: Vec<(String, String)>) {
+        self.palette.set_spill_choices(choices);
+    }
+
+    /// Nothing is typed.
+    pub(crate) fn is_blank(&self) -> bool {
+        self.textarea.lines().iter().all(|l| l.is_empty())
+    }
     pub(crate) fn new(
         edit: Edit,
         gutter: Option<u16>,
@@ -271,6 +281,7 @@ impl MountedEditor {
                 headline: chrome.headline,
                 modal: chrome.modal,
                 background_jobs: chrome.background_jobs,
+                tools: chrome.tools,
                 palette: Some(&self.palette),
                 chat_inactive,
                 turn_running: self.turn_running,
@@ -457,6 +468,8 @@ impl MountedEditor {
         self.pending_ex_echo = None;
         self.hist_pos = self.history.len();
         self.stash.clear();
+        let spills = self.palette.take_spill_entries();
         self.palette = PaletteState::from_corpus();
+        self.palette.restore_spill_entries(spills);
     }
 }

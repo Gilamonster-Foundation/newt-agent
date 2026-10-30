@@ -1,36 +1,32 @@
 #!/usr/bin/env bash
-# commit-msg hook — block Claude session URLs / trailers from entering history.
+# commit-msg hook — keep two kinds of junk out of history:
 #
-# WHY: a `Claude-Session: https://claude.ai/code/session_…` trailer (or any
-# claude.ai/code/session link) is agent-session plumbing, not repository
-# provenance. Once committed to a public repo it is cloned, forked, and cached
-# forever — it clutters `git log`/`git blame` and leaks an internal session
-# handle. It slipped into public history once (commit dc6a167); this hook makes
-# that mechanically impossible going forward.
+# 1. Claude session URLs / trailers. A `Claude-Session: https://claude.ai/code/
+#    session_…` trailer is agent-session plumbing, not repository provenance.
+#    Once committed to a public repo it is cloned, forked, and cached forever.
+#    It slipped into public history once (commit dc6a167). `Co-Authored-By:`
+#    attribution is fine — only the session link is banned. See CLAUDE.md
+#    "expunge Claude sessions". Check: scripts/check_session_url.sh.
 #
-# Policy: agents MUST NOT put Claude session URLs in commit messages (or PR
-# bodies). `Co-Authored-By:` attribution is fine — only the session link is
-# banned. See WORKSPACE_RULES.md / CLAUDE.md "expunge Claude sessions".
+# 2. Placeholder identities. An author or committer email with no dot in its
+#    domain (`x@y`, `a@localhost`) is a placeholder; GitHub may link it to an
+#    unrelated real account, which then appears as a contributor. Check:
+#    scripts/check_commit_identity.sh.
 #
-# PIPELINE PARITY: message hygiene only — not a CI-mirror step. The pre-push
-# hook (.githooks/pre-push) is the lint/test/coverage gate; this is orthogonal.
+# PIPELINE PARITY: This hook mirrors the `commit-messages` job in
+# .github/workflows/ci.yml, which runs the same two scripts over a PR's
+# commits — the copy `--no-verify` cannot skip. When editing this hook, update
+# that job to match. It is orthogonal to .githooks/pre-push (lint/test gate).
 set -euo pipefail
 
 msg_file="$1"
+scripts="$(git rev-parse --show-toplevel)/scripts"
 
-# Match the session URL in any form, and the trailer key, case-insensitively.
-if grep -qiE 'claude\.ai/code/session|^[[:space:]]*Claude-Session[[:space:]]*:' "$msg_file"; then
-    cat >&2 <<'EOF'
-✗ commit blocked: Claude session URL / trailer found in the commit message.
+ident_email() { git var "$1" | sed -n 's/.*<\(.*\)>.*/\1/p'; }
 
-  A `Claude-Session:` trailer or a claude.ai/code/session link is agent-session
-  plumbing — it does not belong in repository history (it leaks into public
-  clones/forks forever). Remove it and commit again.
-
-  Keep `Co-Authored-By:` attribution if you like — only the session link is
-  banned. Policy: CLAUDE.md → "expunge Claude sessions".
-EOF
-    exit 1
-fi
-
-exit 0
+rc=0
+"$scripts/check_session_url.sh" "$msg_file" || rc=1
+"$scripts/check_commit_identity.sh" \
+    "$(ident_email GIT_AUTHOR_IDENT)" "$(ident_email GIT_COMMITTER_IDENT)" || rc=1
+[ "$rc" -eq 0 ] || echo "✗ commit blocked (see above)." >&2
+exit "$rc"

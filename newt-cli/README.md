@@ -12,6 +12,10 @@ without importing again. The option requires an explicit interactive resume,
 does not authorize other tabs, and leaves backend selection and permission
 gates unchanged.
 
+`newt mcp import` names each rejected server, respects the config locks it
+already holds, and reports each adopted server's readiness the same way as
+`newt doctor`, `newt auth` and `/mcp`.
+
 `newt mcp import --merge --grant-net` skips existing servers without creating
 an empty authoritative config or granting their imported hosts. Adopted
 servers and exact host grants share the existing atomic config transaction.

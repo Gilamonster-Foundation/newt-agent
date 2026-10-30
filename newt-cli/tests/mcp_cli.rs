@@ -537,6 +537,7 @@ mod composed_private_mcp_uat {
                 plan_mode_control: None,
                 plan_draft_sink: None,
                 steering: None,
+                report_sink: None,
             },
             &mut mcp,
         )

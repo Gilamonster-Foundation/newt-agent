@@ -748,11 +748,15 @@ async fn discover_oauth_meta_within_budget(
         None,
         false,
         &OAuthHopPolicy::new(&newt_core::Scope::All),
+        None,
         budget,
     )
     .await
 }
 
+/// Unpinned discovery for a saved client; the flow itself goes through
+/// `select_oauth_client`, which supplies any pinned scopes.
+#[cfg(test)]
 async fn discover_oauth_meta_for_client_with_policy(
     server_url: &str,
     allow_test_loopback_http: bool,
@@ -766,6 +770,7 @@ async fn discover_oauth_meta_for_client_with_policy(
         client,
         allow_re_registration,
         policy,
+        None,
         &DiscoveryBudget::new(OAUTH_DISCOVERY_BUDGET),
     )
     .await
@@ -777,6 +782,7 @@ async fn discover_oauth_meta_within_budget_for_client(
     client: Option<&ClientFile>,
     allow_re_registration: bool,
     policy: &OAuthHopPolicy,
+    pinned_scope: Option<&str>,
     budget: &DiscoveryBudget,
 ) -> anyhow::Result<DiscoveredOAuthMeta> {
     let resource = validate_resource_url(server_url, allow_test_loopback_http)?;
@@ -795,8 +801,12 @@ async fn discover_oauth_meta_within_budget_for_client(
         client,
         allow_re_registration,
     )?;
-    let requested_scope = challenge_scope.clone().or_else(|| {
-        (!protected.scopes_supported.is_empty()).then(|| protected.scopes_supported.join(" "))
+    // Pinned scopes (Claude's `oauth.scopes`) are the request, so they — not
+    // the resource's advertisement — decide whether a saved client is reusable.
+    let requested_scope = pinned_scope.map(str::to_string).or_else(|| {
+        challenge_scope.clone().or_else(|| {
+            (!protected.scopes_supported.is_empty()).then(|| protected.scopes_supported.join(" "))
+        })
     });
     let mut errors = Vec::new();
     let mut selected = None;
@@ -1059,7 +1069,8 @@ fn callback_target(client: &ClientFile) -> anyhow::Result<CallbackTarget> {
             ));
             continue;
         }
-        if host.eq_ignore_ascii_case("localhost") {
+        let localhost = host.eq_ignore_ascii_case("localhost");
+        if localhost && !client_is_static(client) {
             failures.push(format!(
                 "redirect `{candidate}` is ambiguous between IPv4 and IPv6; register 127.0.0.1 or ::1 explicitly"
             ));
@@ -1071,11 +1082,17 @@ fn callback_target(client: &ClientFile) -> anyhow::Result<CallbackTarget> {
             ));
             continue;
         };
-        let ip = host
-            .parse::<std::net::IpAddr>()
-            .ok()
-            .filter(std::net::IpAddr::is_loopback)
-            .ok_or_else(|| anyhow::anyhow!("redirect host is not loopback"))?;
+        // ponytail: a static client's registered `localhost` callback binds
+        // IPv4 loopback only; browsers fall back from ::1. Bind both if an
+        // IPv6-only resolver ever bites.
+        let ip = if localhost {
+            std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            host.parse::<std::net::IpAddr>()
+                .ok()
+                .filter(std::net::IpAddr::is_loopback)
+                .ok_or_else(|| anyhow::anyhow!("redirect host is not loopback"))?
+        };
         return Ok(CallbackTarget {
             redirect_uri: candidate,
             bind_addr: std::net::SocketAddr::new(ip, port),
@@ -1361,6 +1378,85 @@ fn issuer_redirect_uris(issuer: &str) -> Vec<String> {
     )]
 }
 
+/// Build a public PKCE [`ClientFile`] from an operator-supplied static client
+/// ID (Claude's `oauth.clientId`). No dynamic registration round-trip: the
+/// authorization server already knows this pre-registered public client.
+///
+/// The redirect URI is the one such a client is registered with —
+/// `http://localhost:PORT/callback`, Claude Code's documented form, with the
+/// configured port or an ephemeral one (RFC 8252 §7.3) — never newt's
+/// issuer-specific path, which the authorization server has not registered.
+/// A shared path gives no issuer separation, so the RFC 9207 `iss` response
+/// parameter is required as the mix-up defense.
+fn static_public_client(
+    client_id: &str,
+    callback_port: Option<u16>,
+    discovered: &DiscoveredOAuthMeta,
+) -> anyhow::Result<ClientFile> {
+    if !discovered.authorization_response_iss_parameter_supported {
+        anyhow::bail!(
+            "authorization server `{}` does not advertise the RFC 9207 `iss` response parameter; a static OAuth client on the shared `/callback` path needs it to defend against authorization-server mix-up",
+            discovered.issuer
+        );
+    }
+    let mut extra = BTreeMap::new();
+    extra.insert(
+        "token_endpoint_auth_method".into(),
+        serde_json::Value::String("none".into()),
+    );
+    extra.insert(
+        "registration_method".into(),
+        serde_json::Value::String("static".into()),
+    );
+    let client = ClientFile {
+        client_id: client_id.to_string(),
+        redirect_uris: vec![format!(
+            "http://localhost:{}/callback",
+            callback_port.unwrap_or(0)
+        )],
+        issuer: Some(discovered.issuer.clone()),
+        extra,
+    };
+    if !client_auth_is_usable(&client) {
+        anyhow::bail!("static OAuth client ID is not usable as a public PKCE client");
+    }
+    Ok(client)
+}
+
+fn client_is_static(client: &ClientFile) -> bool {
+    client
+        .extra
+        .get("registration_method")
+        .and_then(serde_json::Value::as_str)
+        == Some("static")
+}
+
+/// Refuse operator OAuth settings the flow cannot honour, before any I/O.
+fn validate_configured_oauth(configured: &ConfiguredOAuth) -> anyhow::Result<()> {
+    if configured
+        .client_id
+        .as_deref()
+        .is_some_and(|id| !newt_core::mcp::valid_oauth_client_id(id))
+    {
+        anyhow::bail!("configured OAuth client ID is malformed");
+    }
+    if configured
+        .scopes
+        .as_deref()
+        .is_some_and(|scopes| !newt_core::mcp::valid_oauth_scopes(scopes))
+    {
+        anyhow::bail!("configured OAuth scopes are not an RFC 6749 scope string");
+    }
+    if configured.callback_port == Some(0)
+        || (configured.callback_port.is_some() && configured.client_id.is_none())
+    {
+        anyhow::bail!(
+            "configured OAuth callback port applies only to a static client ID with a nonzero port"
+        );
+    }
+    Ok(())
+}
+
 fn client_has_issuer_distinct_redirect(client: &ClientFile, issuer: &str) -> bool {
     let expected_path = issuer_callback_path(issuer);
     client.redirect_uris.iter().any(|redirect| {
@@ -1506,15 +1602,110 @@ fn build_authorization_url(
 pub async fn run_oauth_flow(
     server_name: &str,
     server_url: &str,
+    configured: &ConfiguredOAuth,
     policy: &OAuthHopPolicy,
 ) -> anyhow::Result<()> {
-    run_oauth_flow_cancellable(server_name, server_url, policy, None).await
+    run_oauth_flow_cancellable(server_name, server_url, configured, policy, None).await
+}
+
+/// Operator-pinned OAuth settings for one server (Claude's `oauth` object,
+/// newt's `oauth_*` TOML fields).
+#[derive(Debug, Clone, Default)]
+pub struct ConfiguredOAuth {
+    /// Pre-registered public PKCE client; skips dynamic registration.
+    pub client_id: Option<String>,
+    /// Pinned requested scopes, replacing the discovered set.
+    pub scopes: Option<String>,
+    /// Fixed port of the static client's registered loopback callback.
+    pub callback_port: Option<u16>,
+}
+
+impl ConfiguredOAuth {
+    pub fn from_entry(entry: &newt_core::mcp::McpServerEntry) -> Self {
+        Self {
+            client_id: entry.oauth_client_id.clone(),
+            scopes: entry.oauth_scopes.clone(),
+            callback_port: entry.oauth_callback_port,
+        }
+    }
+}
+
+/// Steps 1–2 of the flow: OAuth discovery and client selection — everything
+/// that decides the authorization URL before a listener binds or a browser
+/// opens. Returns the discovered metadata, the client and the scope to request.
+async fn select_oauth_client(
+    server_url: &str,
+    allow_test_loopback_http: bool,
+    stored_client: Option<ClientFile>,
+    prior_token: Option<&TokenFile>,
+    prior_meta: Option<&MetaFile>,
+    configured: &ConfiguredOAuth,
+    policy: &OAuthHopPolicy,
+) -> anyhow::Result<(DiscoveredOAuthMeta, ClientFile, Option<String>)> {
+    validate_configured_oauth(configured)?;
+    // A static client never registers, so discovery must not demand a dynamic
+    // registration endpoint or match a saved client; issuer, PKCE and network
+    // checks still apply.
+    let is_static = configured.client_id.is_some();
+    let discovery_client = stored_client
+        .as_ref()
+        .filter(|client| client.issuer.is_some() || client_is_portable_cimd(client))
+        .filter(|_| !is_static);
+
+    // ── 1. OAuth server metadata ──────────────────────────────────────────
+    // Explicit authentication always rediscovers: RFC 9728 allows the resource
+    // to change AS metadata, and stale cached issuer state must not silently win.
+    let discovered = discover_oauth_meta_within_budget_for_client(
+        server_url,
+        allow_test_loopback_http,
+        discovery_client,
+        !is_static,
+        policy,
+        configured.scopes.as_deref(),
+        &DiscoveryBudget::new(OAUTH_DISCOVERY_BUDGET),
+    )
+    .await?;
+    // Pinned scopes (Claude's `oauth.scopes`) are the requested set, not a
+    // hint: they replace the discovered and previously granted scopes.
+    let requested_scope = match &configured.scopes {
+        Some(pinned) => Some(pinned.clone()),
+        None => {
+            let prior_scope = prior_scope_for_binding(
+                prior_token,
+                prior_meta,
+                &discovered.resource,
+                &discovered.issuer,
+            );
+            merge_scopes(discovered.scope.as_deref(), prior_scope.as_deref())
+        }
+    };
+    // ── 2. Client registration ────────────────────────────────────────────
+    // A static public client ID supplied by the operator (e.g. Claude's
+    // `oauth.clientId`) short-circuits dynamic client registration: the
+    // authorization server already knows this pre-registered public PKCE
+    // client, so newt builds the client file directly and skips DCR.
+    let client = match configured.client_id.as_deref() {
+        Some(client_id) => static_public_client(client_id, configured.callback_port, &discovered)?,
+        None => {
+            resolve_client_registration(
+                stored_client,
+                &discovered,
+                requested_scope.as_deref(),
+                allow_test_loopback_http,
+                policy,
+            )
+            .await?
+            .0
+        }
+    };
+    Ok((discovered, client, requested_scope))
 }
 
 /// Interactive variant using the terminal owner's existing cancellation flag.
 pub(crate) async fn run_oauth_flow_cancellable(
     server_name: &str,
     server_url: &str,
+    configured: &ConfiguredOAuth,
     policy: &OAuthHopPolicy,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<()> {
@@ -1582,28 +1773,16 @@ pub(crate) async fn run_oauth_flow_cancellable(
             records.meta,
         )
     };
-    let discovery_client = stored_client
-        .as_ref()
-        .filter(|client| client.issuer.is_some() || client_is_portable_cimd(client));
-
-    // ── 1. OAuth server metadata ──────────────────────────────────────────
-    // Explicit authentication always rediscovers: RFC 9728 allows the resource
-    // to change AS metadata, and stale cached issuer state must not silently win.
-    let discovered = discover_oauth_meta_for_client_with_policy(
+    let (discovered, client, requested_scope) = select_oauth_client(
         server_url,
         false,
-        discovery_client,
-        true,
+        stored_client,
+        prior_token.as_ref(),
+        prior_meta.as_ref(),
+        configured,
         policy,
     )
     .await?;
-    let prior_scope = prior_scope_for_binding(
-        prior_token.as_ref(),
-        prior_meta.as_ref(),
-        &discovered.resource,
-        &discovered.issuer,
-    );
-    let requested_scope = merge_scopes(discovered.scope.as_deref(), prior_scope.as_deref());
     let auth_endpoint = discovered.authorization_endpoint.clone();
     let token_endpoint = discovered.token_endpoint.clone();
     let issuer = discovered.issuer.clone();
@@ -1617,15 +1796,6 @@ pub(crate) async fn run_oauth_flow_cancellable(
             .authorization_response_iss_parameter_supported,
         extra: discovered.extra.clone(),
     };
-    // ── 2. Client registration ────────────────────────────────────────────
-    let (client, _migrated) = resolve_client_registration(
-        stored_client,
-        &discovered,
-        requested_scope.as_deref(),
-        false,
-        policy,
-    )
-    .await?;
     let callback = callback_target(&client)?;
 
     // Bind the callback listener NOW (before opening the browser) so the port

@@ -13,6 +13,12 @@ struct HookHandshake {
 
 impl CommitPolicy for HookHandshake {
     fn finalize_message(&self, message: &str) -> Result<String, String> {
+        // Commit review (#2906) probes the policy with an empty message on the
+        // dispatch thread before Git runs; blocking there deadlocked this
+        // current-thread test. Only Git's own hook call carries a message.
+        if message.is_empty() {
+            return Ok(String::new());
+        }
         if let Some(entered) = self.entered.lock().unwrap().take() {
             entered.send(()).unwrap();
             // The real Git hook is waiting for this host broker callback.

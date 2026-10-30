@@ -326,6 +326,16 @@ pub trait PermissionGate {
     /// request was allowed; any single deny keeps the whole denial.
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision;
 
+    /// #2995: `--full-access` is the operator's launch-time grant, so the
+    /// caller wants the PROMPT skipped, not the gate. A gate that can honour
+    /// that runs its own non-interactive vetoes (inherited delegation ceiling,
+    /// stored denials), and only then records an "allow for this session"
+    /// naming full access as the reason, never persisted. The caller must
+    /// honour the returned decision. Default: no pre-approval path, so ask.
+    fn ask_full_access(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+        self.ask(requests)
+    }
+
     /// #2636: a caller that just spent an `Allow(kind, target)` on an
     /// immediate, one-shot action — rather than leaving it for the model's
     /// own later retry — tells the gate so any proactive once-grant it
@@ -732,6 +742,22 @@ mod tests {
         assert!(Verdict::try_from(PermissionAction::AllowPermanent).is_err());
     }
 
+    /// macOS spells /etc, /tmp and /var as symlinks into /private; a grant
+    /// for the alias must be stored (and so matched) under the real spelling.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn widen_stores_macos_fs_grants_under_their_private_spelling() {
+        let widened = widen_caveats(
+            &base(),
+            &[
+                (DenialKind::FsRead, "/etc/hosts".to_string()),
+                (DenialKind::FsWrite, "/tmp/out".to_string()),
+            ],
+        );
+        assert!(widened.permits_fs_read("/private/etc/hosts"));
+        assert!(widened.permits_fs_write("/private/tmp/out"));
+    }
+
     #[test]
     fn widen_adds_each_grant_to_its_axis_only() {
         let widened = widen_caveats(
@@ -746,8 +772,14 @@ mod tests {
         assert!(widened.permits_exec("npm"));
         assert!(widened.permits_exec("cargo"), "existing grants kept");
         assert!(widened.permits_net("docs.rs"));
-        assert!(widened.permits_fs_read("/etc/hosts"));
-        assert!(widened.permits_fs_write("/tmp/out"));
+        // macOS stores fs grants under their canonical alias (/private/...);
+        // `rewrite` is the identity elsewhere, and absent off Unix.
+        #[cfg(unix)]
+        let alias = |p: &'static str| crate::fs_aliases::rewrite(p).into_owned();
+        #[cfg(not(unix))]
+        let alias = |p: &'static str| p.to_owned();
+        assert!(widened.permits_fs_read(&alias("/etc/hosts")));
+        assert!(widened.permits_fs_write(&alias("/tmp/out")));
         // Untouched axes / non-granted targets stay denied.
         assert!(!widened.permits_exec("rm"));
         assert!(!widened.permits_net("evil.example.com"));

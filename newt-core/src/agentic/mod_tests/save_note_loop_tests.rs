@@ -105,6 +105,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         plan_mode_control: None,
         plan_draft_sink: None,
         steering: None,
+        report_sink: None,
         completed_spill_renderer: None,
         reader_source: None,
     }
@@ -400,6 +401,49 @@ async fn nudge_appended_to_user_message_when_due() {
     );
 }
 
+/// #2950 review 2 (P2): the reminder is harness-owned guidance that names
+/// `save_note`. When the operator's allow list hides that tool, the reminder
+/// stays silent on the due turn and the tool is not advertised — sink or no
+/// sink, so prompt and catalog cannot contradict each other.
+#[tokio::test]
+async fn operator_hidden_save_note_silences_the_nudge() {
+    let server = MockServer::start().await;
+    let advertised = Arc::new(AtomicBool::new(false));
+    let nudge_seen = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(NoSinkObserver {
+            save_note_advertised: advertised.clone(),
+            nudge_seen: nudge_seen.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut sink = MockSink::default();
+    let mut nudge = NoteNudge::new(1);
+    let _ = nudge.begin_turn();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.note_sink = Some(&mut sink);
+    c.note_nudge = Some(&mut nudge);
+    c.exposure.allow_list = Some(vec!["read_file".to_string(), "run_command".to_string()]);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("chat_complete should succeed");
+
+    assert_eq!(crate::agentic::model_explanation(&reply), "plain answer");
+    assert!(
+        !advertised.load(Ordering::SeqCst),
+        "save_note advertised although the operator hid it"
+    );
+    assert!(
+        !nudge_seen.load(Ordering::SeqCst),
+        "the reminder named a tool the operator hid"
+    );
+}
+
 #[tokio::test]
 async fn organic_save_resets_the_nudge_counter() {
     let server = MockServer::start().await;
@@ -589,4 +633,63 @@ async fn over_budget_error_round_trips_to_the_model() {
         nudge.begin_turn().is_none(),
         "a failed organic save attempt must still reset the nudge"
     );
+}
+
+/// A router answers with a different model than the one requested (the
+/// session asks for `test-model`; the reply says `routed/model-x`, as
+/// `openrouter/auto` does). Commit credit must name the model that did the
+/// work. RED before: the ledger recorded the requested `test-model`.
+#[tokio::test]
+async fn attribution_credits_the_served_model_not_the_requested_one() {
+    struct Routed;
+    impl Respond for Routed {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            // `get_context_remaining` is answered in the loop (no filesystem)
+            // and is not a read-only tool, so it is credited like other work.
+            let message = if messages_contain(&body, "\"role\":\"tool\"")
+                || body["messages"]
+                    .as_array()
+                    .is_some_and(|m| m.iter().any(|m| m["role"] == "tool"))
+            {
+                serde_json::json!({ "content": "done" })
+            } else {
+                serde_json::json!({ "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": { "name": "get_context_remaining", "arguments": "{}" }
+                }]})
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "routed/model-x",
+                "choices": [{ "message": message }]
+            }))
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Routed)
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::cell::RefCell::new(crate::attribution::AttributionLedger::new(
+        crate::agent_identity::DEFAULT_AGENT_EMAIL,
+    ));
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.attribution = Some(&ledger);
+    chat_complete(c, &mut NoMcp)
+        .await
+        .expect("openai loop should succeed");
+
+    let credited: Vec<String> = ledger
+        .borrow()
+        .contributors()
+        .iter()
+        .map(|a| a.model.clone())
+        .collect();
+    assert_eq!(credited, ["routed/model-x"]);
 }

@@ -52,9 +52,9 @@ impl RecordingRenderer {
 }
 
 impl crate::agentic::CompletedSpillRenderer for RecordingRenderer {
-    fn retain_completed(&self, output: &str) -> Option<u64> {
+    fn retain_completed(&self, output: &str) -> Option<crate::agentic::SpillCid> {
         self.retained.lock().unwrap().push(output.to_string());
-        Some(7)
+        Some(crate::agentic::session_output_cid([7; 16], "fold").unwrap())
     }
 
     fn render_completed(&self, output: &str, _width: usize, _max_height: usize) -> usize {
@@ -131,7 +131,12 @@ fn summary_mode_commits_the_marker_but_the_viewport_gets_full_output() {
         "the committed record is the collapsed marker: {committed}"
     );
     assert!(
-        committed.contains("/spill open 7"),
+        committed.contains(&format!(
+            "/spill open {}",
+            crate::agentic::session_output_cid([7; 16], "fold")
+                .unwrap()
+                .tail()
+        )),
         "the marker names the retained result it can actually reopen: {committed}"
     );
     assert!(

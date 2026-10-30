@@ -1,0 +1,36 @@
+[package]
+name = "newt-flock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Newt's side of an agent-mesh flock: a verified follower, with tasks, asks and signed replies."
+
+[dependencies]
+# Read side only: no `serve` / `emit`, so no server, no signing key.
+agent-mesh-flock = "0.8.0"
+agent-mesh-flock-server = { version = "0.8.0", default-features = false }
+agent-mesh-flock-session = { version = "0.8.0", default-features = false }
+# The Prover's types (a stream challenge and its proof); newt signs nothing.
+agent-mesh-protocol = "0.8.0"
+# A connect that returns instead of waiting when the peer's accept queue is full.
+socket2 = "0.6"
+content-addressable.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+# The member session with its signer, so replies are signed by the real thing.
+agent-mesh-flock-session = { version = "0.8.0", features = ["emit"] }
+# Writer features are for the in-process fixture only.
+agent-mesh-flock-server = { version = "0.8.0", features = ["serve"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+tempfile.workspace = true
+
+[lints]
+workspace = true

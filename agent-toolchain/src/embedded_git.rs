@@ -88,6 +88,17 @@ pub trait GitTool: Send + Sync {
         None
     }
 
+    /// The model that served the current round, as the backend reported it.
+    /// A router (for example `openrouter/auto`) serves a different model than
+    /// the session requested, and a commit made this round must credit the
+    /// one that did the work. Default: ignored.
+    fn note_served_model(&self, _model: &str) {}
+
+    /// A served model did material work this turn (a successful, non-read-only
+    /// tool call). A commit later in the same turn credits it alongside the
+    /// active model. Default: ignored.
+    fn note_contribution(&self, _model: &str) {}
+
     fn dispatch(
         &self,
         op: &str,

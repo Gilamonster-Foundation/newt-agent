@@ -11,6 +11,9 @@ fn admit_denies_untrusted_and_disabled_admits_trusted() {
     // A discovered (untrusted) STDIO overlay is refused — it may not spawn
     // without approval outside the repo; headless has no interactive path.
     let untrusted = McpServerEntry {
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: McpTrust::Untrusted,
         ..stdio("evil", "/bin/sh")
     };
@@ -21,6 +24,9 @@ fn admit_denies_untrusted_and_disabled_admits_trusted() {
 
     // Transport-agnostic: an untrusted HTTP overlay is refused too.
     let untrusted_http = McpServerEntry {
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: McpTrust::Untrusted,
         transport: TransportKind::Http,
         command: None,
@@ -45,6 +51,9 @@ fn admit_denies_untrusted_and_disabled_admits_trusted() {
 /// came from, rendered by the ONE `Display` (no per-caller string building).
 fn untrusted_from(name: &str, origin: Option<McpOrigin>) -> String {
     let entry = McpServerEntry {
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: McpTrust::Untrusted,
         origin,
         ..stdio(name, "/bin/sh")
@@ -97,4 +106,62 @@ fn an_untracked_origin_names_the_server_without_inventing_a_command() {
     let msg = untrusted_from("orphan", None);
     assert!(msg.contains("\"orphan\""), "{msg}");
     assert!(!msg.contains("--name"), "{msg}");
+}
+
+/// #3038: an admitted HTTP server with no auth path is warned at load, naming
+/// the missing keys and the fix. An Authorization header, a
+/// credential-reference header of any name, `oauth_client_id`, or a usable
+/// saved (dynamically registered) login is an auth path; stdio and
+/// unadmitted servers are not checked.
+#[test]
+fn missing_auth_warnings_name_only_servers_with_no_auth_path_3038() {
+    let http = |name: &str| McpServerEntry {
+        transport: TransportKind::Http,
+        command: None,
+        url: Some(format!("https://{name}.example.test/mcp")),
+        ..stdio(name, "")
+    };
+    let with_header = |name: &str, header: &str, value: SecretValue| {
+        let mut entry = http(name);
+        entry.headers.insert(header.into(), value);
+        entry
+    };
+    let mut client_id = http("client-id");
+    client_id.oauth_client_id = Some("newt-public".into());
+    let mut untrusted = http("untrusted");
+    untrusted.trust = McpTrust::Untrusted;
+    let entries = vec![
+        http("bare"),
+        with_header(
+            "plaintext",
+            "Authorization",
+            SecretValue::literal("Bearer abc"),
+        ),
+        with_header(
+            "api-key",
+            "X-API-Key",
+            SecretValue::Ref(SecretRef {
+                env: None,
+                file: Some("key.txt".into()),
+                cmd: None,
+            }),
+        ),
+        with_header(
+            "protocol",
+            "Accept",
+            SecretValue::literal("application/json"),
+        ),
+        client_id,
+        http("saved-login"),
+        untrusted,
+        stdio("local", "/bin/echo"),
+    ];
+    let warnings = missing_auth_warnings(&entries, &|entry| entry.name == "saved-login");
+    assert_eq!(
+        warnings,
+        [
+            "MCP server `bare` (http) has no auth: no `headers.Authorization`, no `oauth_client_id`, no usable saved login; run `newt auth bare`, or set one of those keys",
+            "MCP server `protocol` (http) has no auth: no `headers.Authorization`, no `oauth_client_id`, no usable saved login; run `newt auth protocol`, or set one of those keys",
+        ]
+    );
 }

@@ -90,6 +90,92 @@ async fn compaction_store_captures_redacted_span_and_names_the_handle() {
     );
 }
 
+/// Infinite context depends on this: the second compaction's middle starts with the
+/// first summary card (harness-owned, so it never anchors the tail), and that card
+/// is spilled verbatim. The span under the new handle therefore names the old handle,
+/// so `memory_fetch` can walk the chain back one hop at a time.
+#[tokio::test]
+async fn second_compaction_span_names_the_first_handle() {
+    use crate::agentic::content_spill::{SessionSpillStore, SpillCid, SpillStore};
+
+    async fn pass(
+        store: &SessionSpillStore,
+        msgs: &[Value],
+        state: &mut CompressState,
+    ) -> CompressOutcome {
+        compress(
+            CompressRequest {
+                rewrites_history: true,
+                messages: msgs,
+                budget: 300,
+                max_messages: None,
+                replay_protected_tail_len: 0,
+                task: "task",
+                hard_budget: true,
+                authoritative: true,
+                focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
+                compaction_store: Some(store),
+                compaction_stage: None,
+            },
+            None,
+            state,
+        )
+        .await
+    }
+
+    fn handles(msgs: &[Value]) -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| m["content"].as_str())
+            .flat_map(|c| {
+                c.split("compaction:")
+                    .skip(1)
+                    .map(|s| s.split('"').next().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    let store = SessionSpillStore::new([7u8; 16]);
+    let mut msgs = vec![sys("sys"), user("task")];
+    for i in 0..24 {
+        msgs.push(user(&format!("first middle note {i} {}", "m".repeat(200))));
+    }
+    msgs.push(user("recent tail"));
+    let mut state = CompressState::new();
+    let first = pass(&store, &msgs, &mut state).await;
+    let h1 = handles(&first.messages);
+    assert_eq!(h1.len(), 1, "first pass names one handle");
+
+    let mut grown = first.messages.clone();
+    for i in 0..24 {
+        grown.push(user(&format!("second middle note {i} {}", "n".repeat(200))));
+    }
+    grown.push(user("recent tail 2"));
+    let second = pass(&store, &grown, &mut state).await;
+    let h2 = handles(&second.messages);
+    assert_eq!(h2.len(), 1, "the window names only the newest handle");
+    assert_ne!(h2[0], h1[0], "the second pass mints a new handle");
+
+    let span2 = store
+        .fetch(&SpillCid::parse(&h2[0]).unwrap())
+        .unwrap()
+        .redacted_text;
+    assert!(
+        span2.contains(&format!("compaction:{}", h1[0])),
+        "the second span must carry the first handle (the chain)"
+    );
+    let span1 = store
+        .fetch(&SpillCid::parse(&h1[0]).unwrap())
+        .unwrap()
+        .redacted_text;
+    assert!(
+        span1.contains("first middle note 0"),
+        "the first span still resolves"
+    );
+}
+
 // -- redaction ----------------------------------------------------------------
 
 #[test]

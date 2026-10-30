@@ -147,8 +147,8 @@ async fn find_error_uses_the_same_spill_boundary() {
     assert_eq!(
         out,
         format!(
-            "error: no such path 'missing'\nresolved against `{}`",
-            dunce::simplified(ws.path()).display()
+            "error: no such path 'missing'\nresolved to `{}`",
+            dunce::simplified(&ws.path().join("missing")).display()
         )
     );
     assert!(
@@ -156,7 +156,7 @@ async fn find_error_uses_the_same_spill_boundary() {
             .starts_with("⚙  find: missing (name=*.rs, type=f)\n▒ error: no such path 'missing'\n"),
         "{rendered}"
     );
-    assert!(rendered.contains("resolved against"), "{rendered}");
+    assert!(rendered.contains("resolved to"), "{rendered}");
     assert!(rendered.ends_with("…\n"), "{rendered}");
     assert_eq!(rendered.matches("⚙  find:").count(), 1);
 }

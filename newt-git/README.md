@@ -1,61 +1,21 @@
 # newt-git
 
-`newt-git` is Newt-Agent's embedded local Git engine. It wraps the pure-Rust
-[`grit-lib`](https://crates.io/crates/grit-lib) implementation behind
-Newt-Agent's `GitCaveats` capability surface.
+An embedded, pure-Rust Git engine for Newt. It wraps
+[`grit-lib`](https://crates.io/crates/grit-lib) behind the `GitCaveats`
+capability surface from [`agent-toolchain`](../agent-toolchain/README.md).
+Every read or write takes the caller's caveats and fails closed without them.
 
-The crate exposes structured operations for repository status, history,
-diffs, staging, commits, branches, checkout, rebasing, and stashes. Every
-repository read or write receives the caller's already-composed caveats and
-fails closed when the required capability is absent.
+**Where it sits.** A backend for the harness's `GitTool`, used by `newt-cli`,
+`newt-tui` and `newt-mcp-server`. In the TUI and headless loops the model is
+not shown a `git` tool: commits go through ordinary `git` in `run_command`,
+and the native commit broker stamps attribution. `newt-mcp-server` still
+exposes Git operations to MCP clients. It is a separate crate to keep
+`grit-lib` and its heavy dependencies out of `newt-core`; `newt-cli` still
+links it.
 
-The injected tool also requires the session's filesystem read grants for its
-repository and Git administrative directories. `branch-list` reports separate
-counts and full ref names for local branches and cached remote-tracking
-branches (`scope=local|remote|all`, default `all`), excluding symbolic remote
-aliases. It does not contact remotes or count open pull requests. This is the
-only Git operation exposed in Explain, Research, and Plan dispositions; other
-operations require Act disposition and unrestricted filesystem reads.
+**Direction.** `agent-toolchain` with real, digest-pinned Git is intended to
+replace this engine. New Git behaviour belongs on that path, not here.
 
-For any session with bounded filesystem read grants (`Scope::Only`),
-`branch-list` is the only supported Git operation, including in Act turns.
-Normal ReadOnly and WorkspaceEdit interactive launches are workspace-fenced,
-so this restriction applies to those ordinary defaults too: embedded `status`,
-`log`, and `commit` are unavailable. Restoring those workflows requires a
-capability-safe Git executor; the harness does not widen the read grant.
-The legacy engine constructor requires the same read scope before repository
-discovery. Optional snapshots and automatic Git metadata become unavailable
-under bounded read grants; they do not fabricate clean state or commit evidence.
-Legacy operations require unrestricted filesystem reads (`Scope::All`): their
-object databases, alternate stores, index overrides, and config cascades do not
-yet enforce bounded grants. Git write permission cannot override this limit,
-and the tool will not request a write grant to bypass it.
-
-The structured tool accepts an optional `cwd` relative to the session workspace,
-for example `{"op":"branch-list","cwd":".worktrees/task","scope":"local"}`.
-It selects an existing repository/worktree root for that call only; other tools
-and later calls retain their own targets. Absolute paths, parent traversal,
-escaping symlinks and directories that would discover a parent repository are
-refused. Selected worktrees and shared Git metadata retain their read/write
-grant checks. Admitted commits use the same attribution finalizer and success
-accounting as the session root. This does not enable commits under bounded
-reads; that remaining boundary is tracked in
-[#2288](https://github.com/Gilamonster-Foundation/newt-agent/issues/2288).
-
-Branch listing reads the files-backed ref store without opening an object
-database or loading the global Git configuration cascade. Linked worktrees
-need explicit read grants for their external Git metadata. Reftables, nested
-common directories, ambient `GIT_NAMESPACE`, and symbolic targets outside
-`refs/` are currently unsupported and fail with an error rather than an
-incomplete count. Canonical path preflight is not a replacement for the
-workspace's object-bound filesystem confinement work: concurrent path
-replacement remains outside this check.
-
-Operations are local to an existing repository. Network operations such as
-clone, fetch, and push are outside this crate's current surface.
+Behaviour, limits and grant rules: [docs/design/newt-git.md](../docs/design/newt-git.md).
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent).
-
-## License
-
-Apache-2.0

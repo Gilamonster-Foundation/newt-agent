@@ -56,6 +56,7 @@ fn git_head_snapshot_requires_effective_workspace_read_authority() {
         commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         signer: None,
+        served_model: Default::default(),
     };
     let mut denied = newt_core::Caveats::top();
     denied.fs_read = newt_core::Scope::none();
@@ -604,6 +605,16 @@ fn durable_pending_clarification_rehydrates_its_lineage_after_resume() {
             .is_none(),
         "a fully explicit answer must clear the recovered pending state"
     );
+}
+
+/// #3056: the session trims a line before it looks for a `/command`, so the
+/// cockpit, which reads the same function, must see ` /mcp` as the command it
+/// runs, and model input as model input.
+#[test]
+fn a_command_is_read_from_the_trimmed_line() {
+    assert_eq!(operator_task("  /mcp\t"), "/mcp");
+    assert_eq!(operator_task("one \\\ntwo"), "one \ntwo");
+    assert!(!operator_task("what does /mcp do?").starts_with('/'));
 }
 
 /// #2515: `/discuss` (the clarification batch's own advertised escape

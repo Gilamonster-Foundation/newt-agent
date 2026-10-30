@@ -31,9 +31,13 @@ async fn rust_edit_does_not_require_unselected_python_or_just_checks() {
         .await
         .unwrap();
     assert_eq!(relevant, cargo_checks(), "discovery is not a requirement");
-    assert_eq!(verify_gate_nudge(&relevant, &requested), None);
+    assert_eq!(
+        verify_gate_nudge(&relevant, &requested, &Default::default()),
+        None
+    );
     assert_eq!(
         conclude(&Conclusion {
+            exposure: &Default::default(),
             checks: &relevant,
             requested: &requested,
             ledger: &ledger,
@@ -50,9 +54,10 @@ async fn rust_edit_does_not_require_unselected_python_or_just_checks() {
         .applicable_checks(workspace, python_task, &requested)
         .await
         .unwrap();
-    let pending = verify_gate_nudge(&explicit, &requested).unwrap();
+    let pending = verify_gate_nudge(&explicit, &requested, &Default::default()).unwrap();
     assert!(pending.contains("python3 -m pytest"), "{pending}");
     let (_, pending_report) = conclude(&Conclusion {
+        exposure: &Default::default(),
         checks: &explicit,
         requested: &requested,
         ledger: &ledger,
@@ -70,6 +75,7 @@ async fn rust_edit_does_not_require_unselected_python_or_just_checks() {
         .await
         .unwrap();
     let (decision, report) = conclude(&Conclusion {
+        exposure: &Default::default(),
         checks: &attempted,
         requested: &requested,
         ledger: &ledger,
@@ -165,6 +171,7 @@ fn decide(
 ) -> (Decision, VerificationReport) {
     let requested: Vec<String> = requested.iter().map(|c| c.to_string()).collect();
     conclude(&Conclusion {
+        exposure: &Default::default(),
         checks: &checks(),
         requested: &requested,
         ledger,
@@ -183,7 +190,7 @@ fn nudge(decision: &Decision) -> &str {
 
 #[test]
 fn every_verification_nudge_honors_operator_steering_exactly_once() {
-    let attempted = verify_gate_nudge(&checks(), &[]).unwrap();
+    let attempted = verify_gate_nudge(&checks(), &[], &Default::default()).unwrap();
     let pending = decide(&VerificationLedger::default(), &[], None, 0, true).0;
     let mut ledger = VerificationLedger::default();
     ledger.record_exec(CHECK, Failed, None);
@@ -202,6 +209,7 @@ fn every_verification_nudge_honors_operator_steering_exactly_once() {
 fn a9_no_detected_checks_accepts_silently() {
     let ledger = VerificationLedger::default();
     let decision = conclude(&Conclusion {
+        exposure: &Default::default(),
         checks: &[],
         requested: &[],
         ledger: &ledger,
@@ -465,6 +473,7 @@ fn decide_with(
     tree_now: Option<ContentId>,
 ) -> Decision {
     conclude(&Conclusion {
+        exposure: &Default::default(),
         checks,
         requested: &[],
         ledger,
@@ -674,6 +683,7 @@ fn standing(
         ledger.record_exec(command, *outcome, tree);
     }
     let (_, report) = conclude(&Conclusion {
+        exposure: &Default::default(),
         checks,
         requested: &[],
         ledger: &ledger,

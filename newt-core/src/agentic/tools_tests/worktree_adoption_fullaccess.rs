@@ -400,6 +400,7 @@ fn assert_task_handoff(
             action,
             None,
             PromptReadContext::new(None, "Refactor in a new worktree", None),
+            &Default::default(),
             true,
             |_| true,
         );
@@ -420,6 +421,7 @@ fn assert_task_handoff(
         CompressAction::Summarized,
         None,
         PromptReadContext::new(None, "Refactor in a new worktree", None),
+        &Default::default(),
         true,
         |candidate| {
             assert!(candidate.last().unwrap()["content"]
@@ -585,8 +587,8 @@ async fn relative_task_root(bypass: bool) {
     let out = call("read_file", serde_json::json!({"path":"missing.txt"})).await;
     assert!(
         out.contains(&format!(
-            "resolved against `{}`",
-            dunce::simplified(&task).display()
+            "resolved to `{}`",
+            dunce::simplified(&task.join("missing.txt")).display()
         )),
         "{out}"
     );
@@ -625,7 +627,7 @@ fn relative_task_root_missing_error_names_base() {
     .render(root, &crate::Scope::All);
     let display_root = dunce::simplified(temp.path()).display();
     assert!(
-        out.contains(&format!("resolved against `{display_root}`")),
+        out.contains(&format!("resolved to `{display_root}")),
         "{out}"
     );
 }
@@ -724,6 +726,7 @@ fn handoff_2783_task_path_survives_model_and_operator_rendering() {
                 action,
                 None,
                 PromptReadContext::new(None, "Continue the task", None),
+                &Default::default(),
                 true,
                 |_| true,
             );

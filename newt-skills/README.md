@@ -105,6 +105,7 @@ Every fallible call returns the typed `SkillError`, separated by concern:
 | --- | --- |
 | Authoring (`SKILL.md` is wrong) | `Frontmatter`, `Yaml` |
 | Identity (name rejected / absent) | `InvalidName` (with a matchable `NameRejection`), `UnknownSkill` |
+| Operator (switched off by `[skills] off`) | `Off` |
 | Environment (the filesystem said no) | `Io` (path-tagged), `DestinationExists`, `Unsupported` |
 
 `SkillError` implements `std::error::Error`, so `?` still lifts it into

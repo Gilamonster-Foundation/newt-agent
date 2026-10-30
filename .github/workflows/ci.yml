@@ -62,6 +62,32 @@ jobs:
       # header list.
       - run: npm --prefix npm test
 
+  commit-messages:
+    # HOOK PARITY: mirrors .githooks/commit-msg — the same two scripts, over
+    # the PR's own commits (base..head), so `--no-verify` cannot skip them.
+    # When editing this job, update the hook to match. Commits already on the
+    # base branch are never checked.
+    name: Commit messages and identities
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: check PR commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          rc=0
+          for c in $(git rev-list "$BASE..$HEAD"); do
+            git log -1 --format=%B "$c" | scripts/check_session_url.sh - || { echo "  in $c"; rc=1; }
+            scripts/check_commit_identity.sh "$(git log -1 --format=%ae "$c")" \
+              "$(git log -1 --format=%ce "$c")" || { echo "  in $c"; rc=1; }
+          done
+          exit "$rc"
+
   lint:
     name: Rust lint (fmt + clippy)
     runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
@@ -105,9 +131,18 @@ jobs:
       # HOOK PARITY: CI-only workflow contract; named in .githooks/pre-push.
       - name: Carried artifact cache contract (#2817)
         run: python3 scripts/test_carried_cache.py
+      # HOOK PARITY: CI-only workflow contract; named in .githooks/pre-push.
+      - name: Real-PTY tier live-spill contract (#3023)
+        run: python3 scripts/test_pty_tier_live_spill.py
+      - name: Real-PTY tier wiring contract (#3025)
+        run: python3 scripts/test_pty_tier_wiring.py
       - name: push-hook reverse-dependent expansion regression
         if: always()
         run: python3 scripts/test_reverse_deps.py
+      # HOOK PARITY: self-test for the scripts .githooks/commit-msg runs.
+      - name: commit-msg identity and session-URL regression
+        if: always()
+        run: python3 scripts/test_commit_identity.py
       - name: clippy
         # `if: always()` so a fmt failure can't mask a clippy failure: the two
         # steps fail independently, surfacing both in one run instead of forcing
@@ -121,6 +156,22 @@ jobs:
         # feature the tests enable makes a feature-gated lint regression
         # invisible until someone builds it locally.
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+      # HOOK PARITY: CI-only; named in .githooks/pre-push. The read-only
+      # newt-flock library on its own, without dev-dependencies: its test
+      # fixture enables the agent-mesh writer features, so tests and
+      # `--all-targets` clippy cannot see a production-only build break (#2973).
+      - name: newt-flock production library builds
+        run: cargo check -p newt-flock --lib --locked
+      # HOOK PARITY: CI-only; named in .githooks/pre-push. Compiles every test
+      # target under the feature combinations the real-resource tiers run
+      # (newt-tui-pty.yml, ci.yml test job), which the default-feature clippy
+      # and test steps never build. Running them stays in their tiers (#2971).
+      - name: feature-gated test targets compile (#2971)
+        run: |
+          cargo check -p newt-tui --tests --features native-permission-test
+          cargo check -p newt-tui --tests --features rich-tui
+          cargo check -p newt-tui --tests --features rich-tui,live-spill
+          cargo check -p newt-core --tests --features ast
       # OCAP security gates (pure-Python, no cargo deps). Mirrored by the
       # `ocap-check` + `spawn-inventory` recipes in the justfile.
       - name: OCAP register honesty (ocap-check)
@@ -473,7 +524,7 @@ jobs:
       # `--all-targets` is load-bearing (#2161). Without it this builds lib and
       # bin only: a dev-dependency is resolved but never becomes a build unit,
       # so its rust-version is never enforced. The floor drifted a SECOND time
-      # that way — cargo-platform 0.3.3 (rust 1.91) reached only through a
+      # that way — cargo-platform 0.3.3 (above the floor of the day) reached only through a
       # dev-dep — and stayed green here for months. The stable jobs that do
       # pass --all-targets never run on 1.88; each gate saw one half and the
       # intersection was unwatched. docs/ROADMAP.md names `cargo test

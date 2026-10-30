@@ -32,7 +32,11 @@ async fn recovery_uses_accounted_calls_instead_of_model_blocker_claims() {
     harness.start_turn().unwrap();
     let answer = "The plan says Build was denied. I will retry the checks.";
     observe(&harness, answer);
-    let Control::Continue(nudge) = harness.classify(answer, 1, true, None).await.unwrap() else {
+    let Control::Continue(nudge) = harness
+        .classify(answer, 1, true, None, &Default::default())
+        .await
+        .unwrap()
+    else {
         panic!("narration must get a bounded recovery nudge");
     };
     assert!(nudge.contains("\"admitted_calls\":0"), "{nudge}");
@@ -53,7 +57,7 @@ async fn missing_turn_boundary_reports_unknown_instead_of_zero() {
     let (harness, _) = harness();
     observe(&harness, "I will run the checks.");
     let Control::Continue(nudge) = harness
-        .classify("I will run the checks.", 1, true, None)
+        .classify("I will run the checks.", 1, true, None, &Default::default())
         .await
         .unwrap()
     else {

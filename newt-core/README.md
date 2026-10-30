@@ -5,7 +5,10 @@ Newt-Agent core types, errors, and the NeMoCode-style tier router.
 The router is the NeMoCode inheritance: it classifies an incoming turn into a
 `Tier` (FAST / STANDARD / COMPLEX / REVIEW) and asks the configured backends
 which can serve that tier. The crate also carries the shared configuration
-model (`~/.newt/config.toml`), session and memory types, MCP server
+model (`~/.newt/config.toml`; a project `.newt/config.toml` cannot set
+inference endpoints, credentials or other control-plane keys; the MCP servers
+it declares are kept but marked untrusted, which does not let them connect),
+session and memory types, MCP server
 resolution, metrics, and capability caveat extensions used across the
 workspace.
 
@@ -125,6 +128,8 @@ can omit `TZ`; unrelated environment variables remain excluded. The operating
 system/runtime interprets the timezone, and a `TZ` file path grants no filesystem
 access. Stdio MCP children use the same timezone default with per-server
 environment overrides retaining precedence.
+Under `--ambient` (or `--yolo`), a `run_command` on the host shell gets the
+parent's full environment instead, minus newt's own secrets and switches.
 
 It also hosts the shared agentic tool executor used by the TUI and headless
 paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
@@ -222,8 +227,8 @@ are independent of time-budget selection.
 ## Worktree adoption with ambient execution
 
 Verified task-worktree creation protects the original checkout in confined
-sessions. With OCAP explicitly disabled (`--yolo`, including
-`--full-access --yolo`), adoption does not arm that protection: the operator
+sessions. With OCAP explicitly disabled (`--disable-ocap`, and so `--yolo`,
+which includes it), adoption does not arm that protection: the operator
 receives a notice and existing permissions still apply. Full filesystem grants
 alone do not disable protection when execution remains confined.
 

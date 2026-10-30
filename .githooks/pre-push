@@ -43,10 +43,15 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - GitHub Pages deploy and site entry-point check, .github/workflows/pages.yml
+#     (deployment/validation only; site-only pushes skip tests here).
 #   - hosted-model live eval, .github/workflows/eval-hosted.yml (weekly +
 #     release/**; needs EVAL_BASE_URL/EVAL_API_KEY, skips when unconfigured).
 #   - MCP import real-resource tier, .github/workflows/mcp-import-real.yml
-#     (weekly + release): --ignored subprocess/filesystem acceptance on all OSes.
+#     (weekly + release): --ignored subprocess/filesystem acceptance on all OSes,
+#     including the macOS-only stdio MCP net:none Seatbelt admission grounding
+#     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
+#     needs the macOS kernel and a non-root caller).
 #   - linked-worktree build metadata reads and hostile-env fixture (#2835),
 #     .github/workflows/macos-confined-contract.yml: linked_worktree_build_git
 #     runs natively under Seatbelt; Linux covers the same binary in scope.
@@ -63,10 +68,16 @@
 #   - pinned carried artifact caches + bounded retry downloads (#2817),
 #     .github/workflows/ci.yml Windows job (actions/cache requires CI), and
 #     scripts/test_carried_cache.py in its lint job (workflow contract).
+#   - live-spill PTY tests (#3023): scripts/test_pty_tier_live_spill.py in ci.yml's lint job
+#     checks newt-tui-pty.yml enables the feature (workflow contract).
 #     Cache hits still pass through Install-CarriedTools.ps1 SHA256 verification.
 #   - interpreter grant/retry turn lifetime (#2823), newt-tui-pty.yml Linux/macOS:
 #     exec_grant_retry_loop runs explicitly with native-permission-test and
 #     --ignored. Real Brush worker plus scripted ChatCtx; net:none, no kernel skip.
+#   - host-shell session isolation (#3025), newt-tui-pty.yml Linux job:
+#     host_timeout_tree_tests runs with --include-ignored under a real pty;
+#     the mocked supervisor tests of that module stay in the scoped Rust tests;
+#     scripts/test_pty_tier_wiring.py checks the wiring in ci.yml's lint job.
 #   - macOS executable basename pins (PR #2816), newt-tui-pty.yml macOS job:
 #     installs gh when absent, stages a root-owned copy outside Homebrew,
 #     runs macos_exec_basenames explicitly with --ignored,
@@ -106,6 +117,13 @@
 #   - `just cov-ci` (coverage floor, cargo-llvm-cov instrumented whole-workspace)
 #   - the `--no-default-features` lean build/test config (issue #416, #1409, #1828)
 #   - `just msrv` (MSRV toolchain check)
+#   - `cargo check -p newt-flock --lib --locked` (ci.yml lint job): the read-only
+#     library without dev-dependencies; its fixture's writer features hide a
+#     production-only build break from every test/clippy run (#2973)
+#   - feature-gated test targets compile (ci.yml lint job, #2971): `cargo check
+#     --tests` for newt-tui under native-permission-test / rich-tui /
+#     rich-tui,live-spill and newt-core under ast, the combinations the
+#     real-resource tiers run; per-PR clippy and tests build default features only
 #   - `just audit` (cargo-audit against .cargo/audit.toml)
 #   - `just eval-selftest` (bench/harbor and refactor-grader offline fixture suites;
 #     .github/workflows/ci.yml lint job runs scripts/eval/tests)
@@ -120,7 +138,7 @@
 #     behind a fixed wall-clock bound, and under this hook's parallel nextest
 #     run on a loaded dev box they cross it and reject the push (measured:
 #     three rejections on 2026-09-30, all in this shape, every one green in
-#     CI on the same SHA). CI's `test` job runs all six on every PR via
+#     CI on the same SHA). CI's `test` job runs all nine on every PR via
 #     `cargo test --workspace` (the `windows` job runs the three that are
 #     not `#![cfg(unix)]`); terminal_exit_pty also runs in newt-tui-pty.yml.
 #       newt-agent::lean_surface_purity  lean-surface byte contract; six
@@ -130,8 +148,21 @@
 #       newt-agent::personality_turn     real chat loop, 60 s
 #       newt-agent::migration_notices    real CLI startup, 20-30 s
 #       newt-agent::terminal_exit_pty    real PTY + CLI startup, 30 s budget
+#       newt-agent::prompt_override_pty  real PTY chat loop + mocked provider
+#                                         (#2938), 30 s budget per wait
+#       newt-agent::headless_prompt_override  real headless CLI against a
+#                                         capturing provider (#2938)
+#       newt-agent::context_request_preview  real chat loop x5, 90 s cap
+#       newt-agent::prompt_config_refusal  real CLI x4 against a recording
+#                                         provider (#2933), 60 s deadline each
+#       newt-agent::prompt_component_fence  real chat loop x5 + a recording
+#                                         provider (#2933), 60 s deadline each
+#       newt-agent::prompt_component_refresh  real CLI + real PTY against a
+#                                         recording provider (#2933), 60 s budget
+#       newt-agent::ambient_session       real chat loop x2 + a recording provider
+#                                         running one run_command (#978), 60 s budget
 #   - two more real-resource lanes, same tier as the six above (#2663 named
-#     the six real-`newt`-session binaries but missed these -- measured in
+#     the six original real-`newt`-session binaries but missed these -- measured in
 #     the push rejections of 2026-10-01/02):
 #       newt-eval::mock_e2e                        builds the real `newt`
 #                                                    worker binary once
@@ -360,7 +391,8 @@ fi
 
 # ── Changed-scope classification (#1098) ───────────────────────────────────────
 # scripts/changed-scope.sh reads the same ref list and prints:
-#   (nothing) -- deletion, tag push, or docs-only: skip the cargo gates
+#   (nothing) -- deletion, tag push, or docs-only (incl. site/ and the Pages
+#                workflow): skip the cargo gates
 #   ALL       -- a workspace-wide file changed: gate everything
 #   <crates>  -- only these crates (and their reverse dependents) changed
 SCOPE="$(printf '%s\n' "$REFS" | bash scripts/changed-scope.sh)"
@@ -434,20 +466,26 @@ cargo fmt --all -- --check
 # -- `cargo test -p newt-git --test native_git_commit -- --ignored` and
 # `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
 # real-resource CI lane of their own (tracked separately; out of scope here).
+# newt-core::macos_exec_basenames (#2816) runs its whole native-Seatbelt proof on
+# any argv containing --ignored, so nextest's discovery pass fails it on a dev Mac
+# whose ambient Homebrew gh is not a trusted exec fixture. It is CI-only (see the
+# header entry above; newt-tui-pty.yml stages a root-owned gh copy).
 # newt-core::native_git_broker_pipeline gates the SAME way but is NOT a
 # disclosed gap (#2693): `.github/workflows/native-git-broker-real.yml` runs
 # `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
-# weekly and on release tags, with NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL=1
+# weekly, on release tags and on PRs touching newt-core or agent-toolchain
+# (#2947), with NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL=1
 # so missing Landlock/git fails instead of silently skipping. This remains
 # a CI-only real-resource proof, excluded from the local pre-flight.
 #
-# The six newt-agent binaries are the real-`newt`-session / real-PTY tier;
+# The nine newt-agent binaries are the real-`newt`-session / real-PTY tier;
 # newt-eval::mock_e2e (whole binary) and the two named newt-tui tests are the
 # same tier, added later: see the CI-ONLY list in the header for each one's
 # reason and where CI runs it. scripts/test_pre_push.py pins this list;
 # change both together.
 NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-core::native_git_broker_pipeline)
+    and not binary_id(newt-core::macos_exec_basenames)
     and not binary_id(newt-harness::writer_inheritance)
     and not binary_id(newt-git::native_git_commit)
     and not binary_id(newt-agent::lean_surface_purity)
@@ -456,9 +494,17 @@ NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(newt-agent::personality_turn)
     and not binary_id(newt-agent::migration_notices)
     and not binary_id(newt-agent::terminal_exit_pty)
+    and not binary_id(newt-agent::prompt_override_pty)
+    and not binary_id(newt-agent::headless_prompt_override)
+    and not binary_id(newt-agent::context_request_preview)
+    and not binary_id(newt-agent::prompt_config_refusal)
+    and not binary_id(newt-agent::prompt_component_fence)
+    and not binary_id(newt-agent::prompt_component_refresh)
+    and not binary_id(newt-agent::ambient_session)
     and not binary_id(newt-eval::mock_e2e)
     and not (binary_id(newt-tui) and test(=prompt_visibility_test::mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal))
-    and not (binary_id(newt-tui) and test(=prompt_visibility_test::a_permission_prompt_is_visible_and_survives_a_live_spinner))'
+    and not (binary_id(newt-tui) and test(=prompt_visibility_test::a_permission_prompt_is_visible_and_survives_a_live_spinner))
+    and not (binary_id(newt-tui) and test(=system_prompt_edit::tests::real_fs_pre_existing_sibling_survives_and_a_failed_rename_leaves_nothing))'
 
 # nextest presence is probed the way cargo resolves subcommands (PATH plus
 # $CARGO_HOME/bin) rather than with `command -v cargo-nextest`, so the hook's
@@ -508,8 +554,22 @@ else
     cargo clippy "${_pkg_args[@]}" --all-targets -- -D warnings
 
     if [ "$_have_nextest" = 1 ]; then
-        echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
-        cargo nextest run --retries 2 -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
+        # A changed scope can hold no tests at all (a lockfile or README in a
+        # crate with no test targets). List the run's own selection with the
+        # profile default-filter ignored: empty means there is nothing to run,
+        # so skip. A selection the default-filter empties still fails, as
+        # nextest's default does. The listing must carry $NEXTEST_EXCLUDE: the
+        # binaries it names run their real body when merely listed. A
+        # listing that fails (a test binary that panics when listed) is not
+        # "no tests": fall through to the run, which reports the failure.
+        if _scope_list=$(cargo nextest list --ignore-default-filter -T oneline \
+                -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)" 2>/dev/null) \
+                && [ -z "$_scope_list" ]; then
+            echo "[pre-push] changed scope has no tests; skipping nextest"
+        else
+            echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
+            cargo nextest run --retries 2 -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
+        fi
     else
         echo "[pre-push] cargo-nextest not found; falling back to cargo test -p <crate> per crate"
         cargo test "${_pkg_args[@]}"

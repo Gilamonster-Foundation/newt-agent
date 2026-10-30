@@ -90,6 +90,7 @@ const ENV_KEYS: &[&str] = &[
     "NEWT_NUDGE",
     "NEWT_MARKDOWN",
     "NEWT_COMPACTION_TRIGGER",
+    crate::config::CONTEXT_INDEX_ENV,
     "NEWT_SPILL_LINES",
     crate::settings_receipt::RECEIPT_PATH_ENV,
     // #2085 PR-E2: the same hazard, one journal later. Six mutators now append

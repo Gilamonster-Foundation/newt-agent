@@ -1,6 +1,6 @@
 # Temporary Newt trusted-control integration patch
 
-Base: the exact crates.io `agent-bridle-core` 0.8.0-rc.5 package. Original
+Base: the exact crates.io `agent-bridle-core` 0.8.0-rc.6 package. Original
 `Cargo.toml.orig`, Cargo package metadata, and license notices are retained.
 
 The privacy-policy citation in `src/net_proxy.rs` belongs to the upstream
@@ -166,117 +166,36 @@ that one alias is admitted. Closes newt-agent#2630 (`git worktree add` under a
 `git`-only exec grant failed with `cannot exec 'branch'`). Remove this section
 when the vendored base moves to a release that contains the commit.
 
-## agent-mesh-protocol 0.7
-
-The published 0.8.0-rc.5 manifest requires `agent-mesh-protocol` 0.6.4. This
-copy requires 0.7.0, the version the rest of the Newt workspace pins. Without
-this change, Cargo resolves the two ranges to two separate crates, and every
-`Caveats` crossing between Newt and agent-bridle becomes a type mismatch. Only
-the version requirement changed: protocol 0.7 adds `AgentKey::issue_derived`
-and removes nothing this crate uses. Upstream agent-bridle needs the same bump
-before this vendored copy can be retired.
-
-## Backport of agent-bridle#406 + the #405 promotion/audit, pending both upstream merge and rc.6
-
-Two upstream pieces, backported together because the second depends on the
-first:
-
-1. **agent-bridle#406** (`adac41a`, merged 2026-09-29): the zero Mach-lookup
-   floor plus named `mach:<service>` grants. Replaces the old ambient
-   `MACH_LOOKUP_ALLOWLIST` ("ADR 0015 E4") with a default-deny floor: nothing
-   is ambient, and a service is reachable only via an explicit `mach:` grant
-   in the `net` scope, projected as the named class
-   `seatbelt-mach-service:<name>` (never `∅` while a grant exists). Ships
-   `MACH_DEPUTY_AUDIT = Incomplete`, so every restricted Seatbelt `net` shape
-   still resolves `Unknown` and is refused — this alone changes nothing about
-   what admits.
-2. **The #405 promotion** (agent-bridle branch `fix/405-macos-net-none-audit`,
-   head `97f031f` at backport time — **NOT YET MERGED to agent-bridle main,
-   no PR opened yet**): the completed native channel audit (ADR 0015
-   amendment E6 — unix-domain sockets, `open(1)`/LaunchServices, Darwin
-   notifications, pasteboard, `iokit-open`, `sysctl-write`, a write-class
-   `file-ioctl`, `process-info`/`signal`, XPC beyond `mach-lookup`, and
-   AppleEvents, each shown closed or correctly placed out of the net-egress
-   threat model) and the resulting flip: `MACH_DEPUTY_AUDIT = Complete`. This
-   is what actually changes behavior: a `net: none` (or `unix:`-only,
-   `mach:`-only, or a mixture of only those) Seatbelt scope now resolves
-   `Bounded(∅)` at the L3 scope bound (`resolved_authority`) AND reports
-   `Kernel` at the L4 strength floor (`report.rs`'s `enforcement_report`,
-   gated on the SAME audit-complete predicate) — together, not one without
-   the other. A named `mach:` grant resolves to its own class (never `∅`,
-   never `Unknown`); a loopback scope or a general remote-host allowlist are
-   unaffected and stay `Unknown`/`Advisory`.
-
-**Why newt needs this**: newt-agent#2673. On macOS, `ConstrainedExecutor`
-narrows every `run_command`/MCP-spawn's net scope to `net: none` before
-spawning (`NetGrant::DenyAll` → `deny_all_net`, `confined_exec.rs`) —
-independent of whatever the operator's config actually named. Before this
-backport, the vendored `SeatbeltSandbox::resolved_authority` mapped EVERY
-restricted `net` shape (`net: none` included) to `Unknown`, so
-`AdmittedFence::admit`'s L3 scope-bound check refused every confined macOS
-spawn with "not decidable against the delegated grant ∪ declared runtime
-closure (L3 BOUND)" — `run_command`, MCP servers, and git all failed. Linux
-was unaffected (a separate, independent `newt-net-guard` seccomp floor
-supplies its own Kernel witness there, outside this mechanism entirely).
-
-**What was backported, mechanically**: `src/sandbox.rs` and `src/report.rs`
-replaced with the upstream branch's content for these two files (verified:
-newt's one local addition in `sandbox.rs`, `net_unix_only` — a `unix:`-only
-predicate without `mach:` support — is strictly superseded by upstream's more
-general `net_direct_denied`, used at the exact same two call sites in the
-new code; nothing is lost). `src/spawn.rs` is a 3-way merge
-(`git merge-file`) against upstream's pre-#406 base
-(`9df604c08102175b3a2e03524b1b46b9f186ea4a`): clean, no conflicts, newt's
-trusted-worker-broker patch is untouched. `tests/unix_socket_grants.rs` is
-the straight upstream diff applied (bases were byte-identical). `src/lib.rs`
-gains the matching public re-exports (`mach_service_grants`,
-`seatbelt_mach_service_class`, `MachServiceDisclosure`,
-`mach_service_disclosure`, `MACH_GRANT_PREFIX`, `MACH_SERVICE_CANDIDATES`) —
-without them the standalone crate check flags all six as dead code, since
-the Seatbelt-only call sites that would otherwise use them are platform-gated
-out on Linux. No version bump: `content-addressable` and
-`agent-mesh-protocol` pins are unchanged.
-
-**Status**: both the agent-bridle PR for `fix/405-macos-net-none-audit` and
-this newt backport are unopened, per operator instruction, pending review.
-Remove this section (and fold the Mach-floor logic back into a plain `rc.6`
-bump) once agent-bridle's own release contains both #406 and the #405
-promotion.
-
-## Descriptor-bound read roots
+## Descriptor-bound read roots (vendor-only; rc.6 has no `HeldReadRoot`)
 
 `HeldReadRoot`, `Sandbox::apply_with_held_roots` and
 `ConfinedCommand::held_read_roots`: a caller that already holds a read root as
-a directory descriptor (and has verified its identity) hands a duplicate to the
-spawn. The Landlock ruleset adds `PathBeneath` on that descriptor and drops the
+a descriptor (and has verified its identity) hands a duplicate to the spawn.
+The Landlock ruleset adds `PathBeneath` on that descriptor and drops the
 path-opened rule for the same root, so a swap at the pathname after the
-caller's check cannot re-point the fence. Admission is unchanged — the root is
-still spelled in `fs_read` — only how the rule is built changes. A wrapper
+caller's check cannot re-point the fence. Admission is unchanged: the root is
+still spelled in `fs_read`; only how the rule is built changes. A wrapper
 backend (Seatbelt) refuses a non-empty set rather than fall back to the path.
-Newt's governed push uses this for the confined object copy. Filed upstream as
-a patch; retire this section when it lands.
+Newt's governed push uses this for the confined object copy.
 
-Hardened (#2674 P1): the two claims above — "admission unchanged" and "a
-caller that has verified its identity" — are now enforced, not merely
-documented preconditions. `HeldReadRoot::bind` (the only constructor; fields
-are private, no public struct literal) refuses unless `fd`'s `(dev, ino)`
-equals what `provenance` names right now, so a falsely labelled
-`HeldReadRoot(A, fd(B))` cannot be constructed. `ConfinedCommand::spawn`
-separately refuses any held root whose `provenance` is not a member of the
-admitted `fs_read` scope, before the spawn thread starts, so a genuinely
-bound but un-admitted `HeldReadRoot(B, fd(B))` cannot reach the sandbox
-either.
+Invariants (#2674 P1), enforced, not documented preconditions:
+- `HeldReadRoot::bind` is the only constructor (private fields, no public
+  literal). It refuses unless `fd`'s `(dev, ino)` equals what `provenance`
+  names right now (`fstat(fd)` vs `stat(path)`; the path is never reopened), so
+  a falsely labelled `HeldReadRoot(A, fd(B))` cannot be built.
+- `ConfinedCommand::spawn` refuses any held root whose `provenance` is not a
+  member of the admitted `fs_read` scope, before the spawn thread starts, so a
+  genuinely bound but un-admitted `HeldReadRoot(B, fd(B))` cannot reach the
+  sandbox.
+- Landlock chooses ReadFile for non-directory objects and ReadFile|ReadDir for
+  directories from `fstat` of the held fd. A regular-file root never grants
+  its parent directory. A real Landlock regression holds a regular file across
+  replacement and checks that the original inode stays readable while the
+  replacement and a sibling remain denied.
 
-Newt #2835 extends the same descriptor mechanism through
-`SandboxedWorker::held_read_roots`. The worker delegates the handles to its
-existing `ConfinedCommand`; admission and wrapper-backend refusal remain there.
-No handles or new fields are serialized into the worker protocol.
-
-## Held file read roots (system gitconfig release regression)
-
-Landlock's descriptor-bound read rules now choose ReadFile for non-directory
-objects and ReadFile|ReadDir for directories, based on fstat of the held fd.
-The inode/provenance binding and admitted-root checks are unchanged; a file
-root never grants its parent directory. A real Landlock regression holds a
-regular file across replacement and verifies the original inode remains
-readable while the replacement and a sibling remain denied.
+Newt #2835 extends the mechanism through `SandboxedWorker::held_read_roots`.
+The worker delegates the handles to its existing `ConfinedCommand`; admission
+and wrapper-backend refusal stay there. No handles or new fields are
+serialized into the worker protocol. Composing held roots with #419's worker
+binding keeps both original objects after their pathnames are replaced
+(#2692). Retire this section if the mechanism is upstreamed.

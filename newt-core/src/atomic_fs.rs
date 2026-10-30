@@ -144,6 +144,14 @@ pub struct LockGuard {
     owner: LockOwner,
 }
 
+impl LockGuard {
+    /// Path of the advisory lock this guard owns.
+    #[must_use]
+    pub fn lock_path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl Drop for LockGuard {
     fn drop(&mut self) {
         let ours = std::fs::read_to_string(&self.path)
@@ -155,6 +163,55 @@ impl Drop for LockGuard {
             let _ = sync_parent(&self.path);
         }
     }
+}
+
+thread_local! {
+    /// Counts how many times the current `acquire_lock` loop has tried to
+    /// publish the lock, so tests can assert retry behavior without timing it.
+    static LOCK_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Overrides [`LOCK_RETRY_DELAY`] for the current thread. Reset by dropping
+    /// the guard returned by [`set_lock_retry_delay_for_test`].
+    static LOCK_RETRY_DELAY_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: the lock attempt counter. Gated behind `cfg(test)` or the
+/// `test-util` feature so downstream crates' tests can observe it without
+/// shipping it in production builds.
+#[cfg(any(test, feature = "test-util"))]
+pub fn reset_lock_attempts_for_test() {
+    LOCK_ATTEMPTS.with(|count| count.set(0));
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn lock_attempts_for_test() -> usize {
+    LOCK_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+/// Pin the lock retry delay for the current thread. Real delays resume on
+/// drop, so a panic cannot leak the override into a later test.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn set_lock_retry_delay_for_test(delay: Duration) -> impl Drop {
+    struct Unpin;
+    impl Drop for Unpin {
+        fn drop(&mut self) {
+            LOCK_RETRY_DELAY_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+    LOCK_RETRY_DELAY_OVERRIDE.with(|cell| cell.set(Some(delay)));
+    Unpin
+}
+
+/// Returns the active lock retry delay. In tests this respects the thread-local
+/// override so retry-heavy cases do not wait on the real wall clock.
+fn lock_retry_delay() -> Duration {
+    #[cfg(test)]
+    if let Some(delay) = LOCK_RETRY_DELAY_OVERRIDE.with(|cell| cell.get()) {
+        return delay;
+    }
+    LOCK_RETRY_DELAY
 }
 
 /// Acquire the advisory lock at `lock_path`.
@@ -173,6 +230,8 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
     let encoded = owner.encode();
     let mut denied = false;
     for _ in 0..LOCK_RETRIES {
+        #[cfg(any(test, feature = "test-util"))]
+        LOCK_ATTEMPTS.with(|count| count.set(count.get() + 1));
         match publish_lock(lock_path, &encoded) {
             Ok(()) => {
                 return Ok(LockGuard {
@@ -192,7 +251,7 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
                 if reclaim_lock_once(lock_path)? {
                     continue;
                 }
-                std::thread::sleep(LOCK_RETRY_DELAY);
+                std::thread::sleep(lock_retry_delay());
             }
             Err(error) => return Err(error.into()),
         }
@@ -603,6 +662,22 @@ impl ResolvedPath {
     pub fn resolve(path: &Path) -> anyhow::Result<Self> {
         Ok(Self {
             path: resolve_stable_path(path)?,
+        })
+    }
+
+    /// Resolve `path`'s parent but not its last component, so a replace
+    /// swaps the directory entry itself, even a symlink, and never writes
+    /// through it.
+    pub fn resolve_entry(path: &Path) -> anyhow::Result<Self> {
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(Self {
+            path: std::fs::canonicalize(parent)?.join(name),
         })
     }
 

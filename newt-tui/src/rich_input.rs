@@ -634,6 +634,7 @@ fn footer_line(
     model: &str,
     endpoint: &str,
     gauge: Option<(u32, Option<u32>)>,
+    tools: &str,
     active: bool,
 ) -> Line<'static> {
     // ONE accent, shared with the chevron: two constants for one signal is how
@@ -646,6 +647,9 @@ fn footer_line(
         format!(" {}", editor.header_mode()),
         if active { accent } else { dim },
     ));
+    if let Some(hint) = editor.vi.hint {
+        spans.push(Span::styled(format!(" — {hint}"), accent));
+    }
     if !model.is_empty() {
         let loc = if endpoint.is_empty() {
             model.to_string()
@@ -656,6 +660,14 @@ fn footer_line(
     }
     if let Some(opts) = status_options(model) {
         spans.push(Span::styled(format!(" [{opts}]"), dim));
+    }
+    // #2932: the active tool profile, only when the operator narrowed it.
+    if !tools.is_empty() {
+        spans.push(Span::styled(format!(" [tools: {tools}]"), dim));
+    }
+    // #2938: an operator-owned system prompt is on the wire.
+    if let Some(badge) = crate::system_prompt_edit::status_badge() {
+        spans.push(Span::styled(format!(" {badge}"), accent));
     }
     // Step 24.6 (#559): the context-budget gauge — `used/budget` (e.g.
     // `899k/1024k`) colored by fill, so the operator sees context pressure
@@ -799,6 +811,9 @@ struct RichStatus<'a> {
     /// prose. Empty renders nothing rather than an empty bracket.
     headline: &'a str,
     background_jobs: &'a [BackgroundJob],
+    /// #2932: the tool-profile label the footer shows as `[tools: …]`; empty
+    /// → no bracket, so the open default is byte-identical to before.
+    tools: &'a str,
     /// The slash-command palette (#1674), rendered above the input row while
     /// open. `None`/closed → the layout is byte-identical to the pre-palette
     /// surface.
@@ -912,6 +927,7 @@ fn draw(
             status.model,
             status.endpoint,
             status.gauge,
+            status.tools,
             !empty && input_focused,
         )),
         footer_area,
@@ -1231,6 +1247,9 @@ pub(crate) struct RichSurface {
     /// the turn runs to completion before the session ends. A `Cell` because
     /// the event loop runs behind `&self`.
     pending_end_quit: Cell<bool>,
+    /// The flock intake's doorbell: rung while the prompt is empty, it ends
+    /// the read with [`ReadOutcome::Wake`] so the session can take the task.
+    waker: crate::flock_intake::Wake,
     /// The active model + endpoint shown in the status header (#527), refreshed
     /// each turn via [`InputSurface::set_runtime_context`] so a `/model` switch
     /// is reflected. Empty until the first turn sets them.
@@ -1240,6 +1259,9 @@ pub(crate) struct RichSurface {
     gauge: Option<(u32, Option<u32>)>,
     /// Harness tasks rendered by this surface while their shared state is live.
     background_jobs: Vec<BackgroundJob>,
+    /// #2932: the tool-profile label for the footer; empty under the open
+    /// default so the bracket is omitted entirely.
+    tools: String,
     /// #1669 PR-B: the open tabs, refreshed each loop head. Fewer than two →
     /// the bar renders no row.
     tabs: Vec<crate::tab_bar::TabCell>,
@@ -1255,6 +1277,9 @@ pub(crate) struct RichSurface {
     /// loop runs behind `&self`. `Cell::take` needs only `Option`'s `Default`,
     /// so `Vi` stays non-`Clone`.
     vi: Cell<Option<Vi>>,
+    /// #3022: the retained-output archive, for `/spill open ` completion.
+    #[cfg(feature = "live-spill")]
+    spills: Option<std::sync::Arc<crate::completed_spill::CompletedSpillArchive>>,
 }
 
 /// RAII owner of the rich surface's terminal modes: raw mode **and** bracketed
@@ -1338,13 +1363,17 @@ impl RichSurface {
             unsaved: Vec::new(),
             gutter: crate::resolve_gutter_setting(),
             pending_end_quit: Cell::new(false),
+            waker: crate::flock_intake::Wake::default(),
             model: String::new(),
             endpoint: String::new(),
             gauge: None,
             background_jobs: Vec::new(),
+            tools: String::new(),
             tabs: Vec::new(),
             session: String::new(),
             vi: Cell::new(None),
+            #[cfg(feature = "live-spill")]
+            spills: None,
         })
     }
 
@@ -1375,6 +1404,7 @@ impl RichSurface {
             // change would put a layout and a modal rewrite in one diff.
             modal: None,
             background_jobs: &self.background_jobs,
+            tools: &self.tools,
             tabs: &self.tabs,
         }
     }
@@ -1445,6 +1475,10 @@ impl RichSurface {
         if let Some(vi) = self.vi.take() {
             me.adopt_vi(vi);
         }
+        #[cfg(feature = "live-spill")]
+        if let Some(spills) = &self.spills {
+            me.set_spill_choices(spills.choices());
+        }
         let outcome = loop {
             let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
             let want = me.wanted_rows(term_w, term_h, &self.chrome());
@@ -1465,6 +1499,11 @@ impl RichSurface {
 
             // 250ms timeout drives the live clock when idle.
             if !event::poll(Duration::from_millis(250))? {
+                // Ring only wakes an EMPTY prompt: never discard what the
+                // operator is typing. A ring that finds text stays rung.
+                if me.is_blank() && self.waker.take() {
+                    break ReadOutcome::Wake;
+                }
                 continue;
             }
             let evt = event::read()?;
@@ -1505,6 +1544,8 @@ pub(crate) struct Chrome<'a> {
     pub(crate) modal: Option<&'a [Line<'static>]>,
     pub(crate) background_jobs: &'a [BackgroundJob],
     pub(crate) tabs: &'a [crate::tab_bar::TabCell],
+    /// #2932: the tool-profile label, or empty for the open default.
+    pub(crate) tools: &'a str,
 }
 
 /// Where the editor's committed lines go — the scrollback above the input.
@@ -1528,6 +1569,10 @@ impl ScrollbackSink for Term {
 }
 
 impl InputSurface for RichSurface {
+    fn set_waker(&mut self, wake: crate::flock_intake::Wake) {
+        self.waker = wake;
+    }
+
     /// **The terminal adapter** (C1, #1862), rendering natively (C2, #1876).
     ///
     /// This surface owns the terminal, so it — and not the session —
@@ -1651,8 +1696,20 @@ impl InputSurface for RichSurface {
         self.background_jobs = jobs;
     }
 
+    fn set_tool_policy(&mut self, label: Option<String>) {
+        self.tools = label.unwrap_or_default();
+    }
+
     fn set_tabs(&mut self, tabs: Vec<crate::tab_bar::TabCell>) {
         self.tabs = tabs;
+    }
+
+    #[cfg(feature = "live-spill")]
+    fn set_spill_archive(
+        &mut self,
+        archive: std::sync::Arc<crate::completed_spill::CompletedSpillArchive>,
+    ) {
+        self.spills = Some(archive);
     }
 }
 

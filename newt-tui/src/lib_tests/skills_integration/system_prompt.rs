@@ -1,6 +1,6 @@
 use super::*;
 
-fn write_skill(root: &std::path::Path, name: &str, desc: &str) {
+pub(super) fn write_skill(root: &std::path::Path, name: &str, desc: &str) {
     let dir = root.join(name);
     fs::create_dir_all(&dir).unwrap();
     fs::write(
@@ -16,7 +16,8 @@ fn system_prompt_index_includes_discovered_skill_name_and_description() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_skill(tmp.path(), "commit-style", "How this repo writes commits");
 
-    let block = skills_index_for_prompt(&[tmp.path().to_path_buf()]).expect("an index block");
+    let block =
+        skills_index_for_prompt(&[tmp.path().to_path_buf()], &|_| false).expect("an index block");
     assert!(block.contains("Available skills (call `use_skill` to load one):"));
     assert!(block.contains("commit-style: How this repo writes commits"));
     // Progressive disclosure: the body must NOT appear in the index.
@@ -32,8 +33,8 @@ fn system_prompt_index_includes_discovered_skill_name_and_description() {
 #[test]
 fn system_prompt_index_carries_the_install_hint_when_no_skills() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let block =
-        skills_index_for_prompt(&[tmp.path().to_path_buf()]).expect("install hint survives");
+    let block = skills_index_for_prompt(&[tmp.path().to_path_buf()], &|_| false)
+        .expect("install hint survives");
     assert!(block.contains("newt skills install"));
     assert!(!block.contains("Available skills"));
 }
@@ -48,8 +49,10 @@ fn system_prompt_index_unions_search_path_first_dir_wins() {
     write_skill(b.path(), "commit-style", "claude copy");
     write_skill(b.path(), "judge", "scoring");
 
-    let block = skills_index_for_prompt(&[a.path().to_path_buf(), b.path().to_path_buf()])
-        .expect("an index block");
+    let block = skills_index_for_prompt(&[a.path().to_path_buf(), b.path().to_path_buf()], &|_| {
+        false
+    })
+    .expect("an index block");
     // First dir's description wins; second dir's same-named skill is shadowed.
     assert!(block.contains("commit-style: newt copy"));
     assert!(!block.contains("claude copy"));
@@ -57,18 +60,21 @@ fn system_prompt_index_unions_search_path_first_dir_wins() {
     assert!(block.contains("judge: scoring"));
 }
 
+/// #2933 PR7: the soul is built from components, so a memory manager with NO
+/// providers still yields a prompt with its identity and no `soul.md` machinery.
 #[serial_test::serial(real_fs)]
 #[test]
-fn system_prompt_fallback_uses_canonical_default_soul() {
-    // Regression: the no-soul fallback used to be a private copy of the
-    // identity string that drifted from newt-core's DEFAULT_SOUL. It must
-    // now embed the canonical constant verbatim so the two can't diverge.
+fn the_soul_comes_from_components_not_a_provider() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
-    let prompt = build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None, "test-plan.md");
+    let memory = newt_core::MemoryManager::new();
+    let prompt = rebuild_system_prompt(tmp.path().to_str().unwrap(), &memory, None, "s", None);
     assert!(
-        prompt.contains(newt_core::DEFAULT_SOUL),
-        "fallback must embed newt_core::DEFAULT_SOUL verbatim"
+        prompt.starts_with("You are newt, a free, friendly, local agentic coder."),
+        "{prompt:.200}"
     );
+    assert!(prompt.contains("## How to work"), "{prompt:.200}");
+    assert!(prompt.contains("Workspace: "), "{prompt:.200}");
 }
 
 #[serial_test::serial(real_fs)]
@@ -80,7 +86,7 @@ fn system_prompt_names_the_per_session_plan_path() {
     let ws = tmp.path().to_str().unwrap();
     let path_a = newt_core::session_plan_path("sess-aaaa");
     let path_a = path_a.to_string_lossy();
-    let prompt_a = build_system_prompt_with_soul(ws, None, &path_a);
+    let prompt_a = build_system_prompt_with_persona(ws, None, None, &path_a, None);
     assert!(
         prompt_a.contains(path_a.as_ref()),
         "prompt must name the session plan path"
@@ -92,7 +98,8 @@ fn system_prompt_names_the_per_session_plan_path() {
 
     // Two different sessions get two different plan paths — the collision fix.
     let path_b = newt_core::session_plan_path("sess-bbbb");
-    let prompt_b = build_system_prompt_with_soul(ws, None, &path_b.to_string_lossy());
+    let prompt_b =
+        build_system_prompt_with_persona(ws, None, None, &path_b.to_string_lossy(), None);
     assert!(prompt_b.contains(&*path_b.to_string_lossy()));
     assert!(
         !prompt_b.contains(path_a.as_ref()),
@@ -103,18 +110,20 @@ fn system_prompt_names_the_per_session_plan_path() {
 #[serial_test::serial(real_fs)]
 #[test]
 fn default_soul_no_longer_hardcodes_a_plan_path() {
-    // The plan path moved out of the const so it can be per-session and so
-    // custom souls also get the guidance (issue #220).
+    // The plan path moved out of the soul so it can be per-session (issue #220), and
+    // the soul has no custom-text arm any more (#2933): the injected block is the
+    // only place the path appears.
     assert!(!newt_core::DEFAULT_SOUL.contains("plan.md"));
-    // A custom soul (no plan text of its own) still gets the injected block.
     let tmp = tempfile::TempDir::new().unwrap();
-    let prompt = build_system_prompt_with_soul(
+    let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some("You are a custom agent."),
+        None,
+        None,
         ".scratch/sessions/xyz/plan.md",
+        None,
     );
-    assert!(prompt.contains("You are a custom agent."));
     assert!(prompt.contains(".scratch/sessions/xyz/plan.md"));
+    assert_eq!(prompt.matches(".scratch/sessions/xyz/plan.md").count(), 1);
 }
 
 #[serial_test::serial(real_fs)]
@@ -142,6 +151,7 @@ async fn registered_agents_provider_block_reaches_prompt() {
         &memory,
         None,
         "test-conversation",
+        None,
     );
     assert!(prompt.contains("# Project instructions"));
     assert!(prompt.contains("Run just check before PRs."));
@@ -171,7 +181,7 @@ async fn historical_notes_preserve_content_without_redefining_the_live_workspace
         session_id: "current-session".into(),
     };
     memory.initialize_all(&ctx).await;
-    let prompt = rebuild_system_prompt(&ctx.workspace, &memory, None, &ctx.session_id);
+    let prompt = rebuild_system_prompt(&ctx.workspace, &memory, None, &ctx.session_id, None);
 
     assert_eq!(fs::read_to_string(&notes_path).unwrap(), original_notes);
     assert_eq!(prompt.matches(&note).count(), 1, "retain the note verbatim");
@@ -199,23 +209,29 @@ async fn historical_notes_preserve_content_without_redefining_the_live_workspace
 /// Pins the process-wide inputs skill resolution reads — `NEWT_CONFIG`,
 /// `NEWT_CONFIG_DIR`, `HOME` and the cwd — restoring them on drop, so a
 /// failing assertion cannot leak a redirected root into the next test.
-struct SkillRootSandbox {
+pub(super) struct SkillRootSandbox {
     vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
     cwd: std::path::PathBuf,
+    // The process-env lock the settings and workspace tests take; released
+    // after `drop` restores the variables.
+    _env: newt_core::process_env::EnvGuard,
 }
 
 impl SkillRootSandbox {
-    fn enter(config_dir: &std::path::Path, cwd: &std::path::Path) -> Self {
+    pub(super) fn enter(config_dir: &std::path::Path, cwd: &std::path::Path) -> Self {
         let keys = [
             "NEWT_CONFIG",
             newt_core::config::NEWT_CONFIG_DIR_ENV,
             "HOME",
         ];
+        let _env = newt_core::process_env::lock();
         let sandbox = Self {
             vars: keys.iter().map(|k| (*k, std::env::var_os(k))).collect(),
             cwd: std::env::current_dir().unwrap(),
+            _env,
         };
-        // SAFETY: the caller is in the `serial(real_fs)` lane.
+        // SAFETY: the process-env lock is held, and the caller is in the
+        // `serial(real_fs)` lane for the cwd.
         unsafe {
             std::env::remove_var("NEWT_CONFIG");
             std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, config_dir);
@@ -230,7 +246,7 @@ impl Drop for SkillRootSandbox {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.cwd);
         for (key, value) in &self.vars {
-            // SAFETY: still inside the `serial(real_fs)` lane.
+            // SAFETY: the process-env lock is still held.
             unsafe {
                 match value {
                     Some(v) => std::env::set_var(key, v),
@@ -239,6 +255,18 @@ impl Drop for SkillRootSandbox {
             }
         }
     }
+}
+
+/// The sandbox moves `NEWT_CONFIG_DIR` and `HOME`, which every `settings_guard`
+/// test re-reads; it must hold the process-env lock until it restores them.
+#[test]
+#[serial_test::serial(real_fs)]
+fn skill_root_sandbox_holds_the_process_env_lock() {
+    let here = std::env::current_dir().unwrap();
+    let sandbox = SkillRootSandbox::enter(&here, &here);
+    assert!(newt_core::process_env::held_by_current_thread());
+    drop(sandbox);
+    assert!(!newt_core::process_env::held_by_current_thread());
 }
 
 /// #2331 real-resource grounding for the mocked resolver and same-copy tests
@@ -267,7 +295,7 @@ async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
     let _sandbox = SkillRootSandbox::enter(&config_dir, &nested);
     let ws = nested.to_str().unwrap();
 
-    let prompt = build_system_prompt_with_soul(ws, None, "plan.md");
+    let prompt = build_system_prompt_with_persona(ws, None, None, "plan.md", None);
     assert!(
         prompt.contains("grounding-skill: Only in the bundled dir"),
         "the prompt index must list the bundled-only skill"
@@ -299,5 +327,252 @@ async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
     assert!(
         body.contains("Full body of grounding-skill."),
         "use_skill must load the copy the index listed, got: {body}"
+    );
+}
+
+// #2937: workspace-header annotation must not swallow project-context provider
+// annotations. Doer: soul + agents + notes providers all get individual labels;
+// workspace-header covers only the workspace line, not provider content.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn provider_annotations_labeled_independently_doer_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Use four spaces for indentation.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "user: prefers vi\n§\n").unwrap();
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        None,
+        "sess-doer",
+        Some(&sink),
+    );
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+
+    // #2933: the doer soul is reported as its components, by id.
+    assert!(
+        labels.contains(&"identity") && labels.contains(&"habit-one-change"),
+        "doer soul must be labelled by component id; got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"soul"),
+        "no whole-soul label; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"project-instructions"),
+        "'project-instructions' (agents) provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"notes"),
+        "'notes' (note_store) provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"workspace-header"),
+        "workspace-header must be labeled; got {labels:?}"
+    );
+
+    // workspace-header must be a separate, short component — not one that swallows
+    // provider blocks. The workspace header text is ~200 chars; provider content
+    // adds thousands. A swallowing annotation would have chars >> 500.
+    let ws_chars = report.system[0]
+        .components
+        .iter()
+        .find(|c| c.label == "workspace-header")
+        .expect("workspace-header component must exist")
+        .chars;
+    assert!(
+        ws_chars < 500,
+        "workspace-header chars ({ws_chars}) must be small — not absorbing provider blocks"
+    );
+}
+
+// #2937: coach altitude — workspace-header must not swallow context providers.
+// Coach replaces soul with COACH_SOUL, but agents and notes remain labeled.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn provider_annotations_labeled_independently_coach_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Always ask before acting.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "project: uses just check\n§\n").unwrap();
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let mut coach_persona = test_persona(
+        "coach",
+        "Give advice.",
+        std::path::PathBuf::from("/personas/coach.md"),
+    );
+    coach_persona.profile.altitude = Some(newt_core::Altitude::Coach);
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        Some(&coach_persona),
+        "sess-coach",
+        Some(&sink),
+    );
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+
+    assert!(
+        labels.contains(&"coach-identity") && labels.contains(&"coach-advise"),
+        "coach must have its component labels; got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"coach-soul"),
+        "no whole-soul label; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"project-instructions"),
+        "'project-instructions' (agents) provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"notes"),
+        "'notes' (note_store) provider must be labeled; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"workspace-header"),
+        "workspace-header must be labeled; got {labels:?}"
+    );
+
+    let ws_chars = report.system[0]
+        .components
+        .iter()
+        .find(|c| c.label == "workspace-header")
+        .expect("workspace-header component must exist")
+        .chars;
+    assert!(
+        ws_chars < 500,
+        "workspace-header chars ({ws_chars}) must not absorb provider blocks"
+    );
+
+    // Prompt must contain AGENTS.md and notes content despite coach altitude.
+    assert!(
+        prompt.contains("Always ask before acting"),
+        "agents content must reach prompt"
+    );
+    assert!(
+        prompt.contains("uses just check"),
+        "notes content must reach prompt"
+    );
+}
+
+// #2937: when no soul provider is present, context providers (agents, notes)
+// still receive individual annotations. No DEFAULT_SOUL must be invented.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn context_providers_are_annotated_with_no_soul_provider_2937() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let ws = dir.path();
+    fs::write(ws.join("AGENTS.md"), "Commit with clear messages.").unwrap();
+    let notes_path = ws.join("NOTES.md");
+    fs::write(&notes_path, "user: uses rg not grep\n§\n").unwrap();
+
+    // No soul provider exists any more: only the context providers.
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::AgentsProvider::new(true, None));
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: ws.to_string_lossy().into_owned(),
+        session_id: "s".into(),
+    };
+    memory.initialize_all(&ctx).await;
+
+    let sink = newt_core::agentic::request_report::ReportSink::new();
+    let prompt = rebuild_system_prompt(
+        ws.to_str().unwrap(),
+        &memory,
+        None,
+        "sess-nosoul",
+        Some(&sink),
+    );
+
+    sink.arm_capture_next();
+    let _ = sink.observe_request(&[&prompt], None);
+    let report = sink.last_report().expect("report captured");
+    let labels: Vec<&str> = report.system[0]
+        .components
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+
+    assert!(
+        labels.contains(&"project-instructions"),
+        "'project-instructions' must be labeled even with no soul; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"notes"),
+        "'note_store' must be labeled even with no soul; got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"soul"),
+        "no soul provider means no 'soul' label; got {labels:?}"
+    );
+}
+
+/// #2938: with a system prompt file set, the session's prompt is that file's
+/// bytes and nothing of the assembled prompt; unset, it is assembled again.
+/// Grounds the mocked override tests in a real file read.
+#[serial_test::serial(real_fs)]
+#[test]
+fn a_system_prompt_file_replaces_the_assembled_prompt_2938() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_str().unwrap();
+    let file = tmp.path().join("pruned.md");
+    let pruned = "Be brief.\n\n  Keep this spacing.\n";
+    std::fs::write(&file, pruned).unwrap();
+    let memory = newt_core::MemoryManager::new();
+
+    newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, file.to_str().unwrap());
+    let overridden = rebuild_system_prompt(workspace, &memory, None, "s", None);
+    newt_core::process_env::set_var(newt_core::SYSTEM_PROMPT_FILE_ENV, "");
+    let assembled = rebuild_system_prompt(workspace, &memory, None, "s", None);
+    newt_core::process_env::remove_var(newt_core::SYSTEM_PROMPT_FILE_ENV);
+
+    assert_eq!(overridden, pruned);
+    assert!(
+        assembled.contains("Workspace: "),
+        "unset, newt assembles its own: {assembled:.200}"
     );
 }

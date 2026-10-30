@@ -39,6 +39,9 @@ pub struct ActivePosture {
     pub clamp: crate::Caveats,
     /// One-line human summary of the clamp (for `/permissions`).
     pub clamp_summary: String,
+    /// The skill this posture was activated with (`[modes.<name>] skill` AT activation),
+    /// so `[skills] off` follows the binding even if the config is edited afterwards.
+    pub skill: Option<String>,
     /// The validated skill guidance composed into each live turn.
     pub skill_body: Option<String>,
     /// Operator-defined framing composed into each live turn.
@@ -112,6 +115,7 @@ pub fn build_posture(
         preset_name,
         clamp,
         clamp_summary,
+        skill: mode_cfg.skill.clone(),
         skill_body,
         framing: mode_cfg.framing.clone(),
     })
@@ -158,6 +162,7 @@ mod tests {
             preset_name: "strict".to_string(),
             clamp: crate::Caveats::default(),
             clamp_summary: "deny writes".to_string(),
+            skill: None,
             skill_body: None,
             framing: None,
         }));
@@ -179,6 +184,7 @@ mod tests {
             preset_name: String::new(),
             clamp: crate::Caveats::default(),
             clamp_summary: String::new(),
+            skill: None,
             skill_body: Some("be careful".to_string()),
             framing: None,
         };

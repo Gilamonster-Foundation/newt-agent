@@ -577,6 +577,15 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Surface::Native,
     ),
     cmd_on(
+        // #3026: `[context] index` — a `/settings` field row, not a verb.
+        "index",
+        &[],
+        Family::Session,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
         // Retired into `/resume` (#2009 PR6b). Its READS still read and
         // its MUTATORS redirect, so the row stays a permanent pointer
         // while the receipt debt it owes stays counted: the ops are
@@ -796,6 +805,35 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Keep,
         Receipt::Journal,
     ),
+    // #2932: the tool surface the model sees and the read-only toggle. Two
+    // VALUES, so two `/settings` fields rather than a `/harness tools` verb
+    // (the issue's working name predates the slash consolidation). On a rich
+    // TTY `/settings tools` opens the checklist; typed, it is one write.
+    cmd_on(
+        "tools",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    // #2933: which skills the model is offered. Typed: `/settings skills on|off <name>`.
+    cmd_on(
+        "skills",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
+        "read-only",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
     cmd(
         // Absorbed as `/settings detail` (#2009 PR7b) and still a
         // typed verb: `/detail` toggles, the field sets a count.
@@ -868,6 +906,17 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Family::Tuning,
         Disposition::Absorb,
         Receipt::Journal,
+    ),
+    cmd_on(
+        // #2938: the operator's system prompt file, a `/settings` field that
+        // was never a verb. Journal, because the write goes through
+        // `apply_and_record`; `edit` opens it in $EDITOR.
+        "system-prompt",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
     ),
     cmd_on(
         // The meta prefix (ctrl+space by default): a `/settings` field that

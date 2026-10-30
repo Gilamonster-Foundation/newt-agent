@@ -673,14 +673,29 @@ fn assemble_env_grants(
     shell_env: &BTreeMap<String, String>,
     entry_env: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
+    assemble_env_grants_with(passthrough, shell_env, entry_env, cfg!(windows))
+}
+
+/// [`assemble_env_grants`] with the name identity chosen: Windows names are
+/// case-insensitive, so an inherited `Path` and an explicit server `PATH` are ONE variable
+/// and the later layer (the server entry) replaces the earlier one, spelling included.
+fn assemble_env_grants_with(
+    passthrough: &[(String, String)],
+    shell_env: &BTreeMap<String, String>,
+    entry_env: &BTreeMap<String, String>,
+    case_insensitive: bool,
+) -> Vec<(String, String)> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
-    for (k, v) in passthrough {
-        map.insert(k.clone(), v.clone());
-    }
-    for (k, v) in shell_env {
-        map.insert(k.clone(), v.clone());
-    }
-    for (k, v) in entry_env {
+    let layers = passthrough
+        .iter()
+        .map(|(k, v)| (k, v))
+        .chain(shell_env.iter())
+        .chain(entry_env.iter());
+    for (k, v) in layers {
+        // A lower layer's same-named variable (under the host's identity) is replaced.
+        map.retain(|existing, _| {
+            !newt_core::ambient_shell::same_env_key(existing, k, case_insensitive)
+        });
         map.insert(k.clone(), v.clone());
     }
     map.into_iter().collect()
@@ -713,18 +728,53 @@ fn resolve_entry_secrets(
         .collect()
 }
 
+/// What the parent environment contributes to a stdio server's env: the closed allow-list,
+/// or, under `--ambient` (#978), the full environment minus newt's own control plane, so
+/// `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` reach a
+/// browser launch. Pure over `vars`.
+fn parent_passthrough(
+    ambient: bool,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    parent_passthrough_with(ambient, vars, cfg!(windows))
+}
+
+/// [`parent_passthrough`] with the name comparison chosen (Windows names are
+/// case-insensitive), so both behaviours are testable on any host.
+fn parent_passthrough_with(
+    ambient: bool,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    case_insensitive: bool,
+) -> Vec<(String, String)> {
+    if ambient {
+        return newt_core::ambient_shell::child_env_with(
+            vars,
+            newt_core::agentic::CHILD_STRIPPED_AUTHORITY_ENV,
+            case_insensitive,
+        );
+    }
+    let allowed = newt_core::mcp_stdio_env_passthrough();
+    vars.into_iter()
+        .filter_map(|(k, v)| {
+            let k = k.into_string().ok()?;
+            allowed
+                .iter()
+                .any(|a| newt_core::ambient_shell::same_env_key(a, &k, case_insensitive))
+                .then(|| (k, v.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
 /// Resolve the three env-grant sources from the live environment (parent env +
 /// the shell-env dir + the entry's own — now secret-resolved — env) and fold
 /// them via [`assemble_env_grants`]. The impure edge — kept tiny so the assembly
 /// logic itself stays pure/tested. Fails loudly if a configured secret reference
 /// cannot be resolved.
 fn resolve_env_grants(entry: &McpServerEntry) -> Result<Vec<(String, String)>> {
-    let passthrough: Vec<(String, String)> = newt_core::mcp_stdio_env_passthrough()
-        .iter()
-        .filter_map(|k| {
-            std::env::var_os(k).map(|v| (k.to_string(), v.to_string_lossy().into_owned()))
-        })
-        .collect();
+    let passthrough = parent_passthrough(
+        newt_core::launch_authority::current().ambient(),
+        std::env::vars_os(),
+    );
     let shell_env = newt_core::Config::user_config_path()
         .map(|p| newt_core::shell_env::from_config_dir(&p))
         .unwrap_or_default();
@@ -810,6 +860,36 @@ fn prepare_stdio_caveats(
             .context("workspace-protected MCP authority refused")?;
     }
     Ok(prepared)
+}
+
+/// The stdio a stdio MCP child is spawned with, declared BY NAME (#3033): a
+/// raw `std::process::Stdio` converts in as `ConfinedStdio::Other`, which is
+/// unaudited, so Seatbelt resolves `net:none` to `Unknown` and admission
+/// refuses every such spawn on macOS. Piped stdin/stdout carry JSON-RPC; stderr
+/// is discarded so server logging cannot corrupt the stream.
+#[cfg(unix)]
+fn mcp_child_stdio() -> [agent_bridle::ConfinedStdio; 3] {
+    [
+        agent_bridle::ConfinedStdio::Piped,
+        agent_bridle::ConfinedStdio::Piped,
+        agent_bridle::ConfinedStdio::Null,
+    ]
+}
+
+/// The context on a failed confined MCP spawn. A Seatbelt refusal names the
+/// precondition an operator can act on (#3033): bridle admits a `net:none`
+/// child only for an unprivileged caller, so newt running as root is refused
+/// even with audited stdio.
+#[cfg(unix)]
+fn spawn_failure_notice(name: &str, command: &str, seatbelt_refusal: bool) -> String {
+    let mut notice = format!("spawning MCP server `{name}` ({command}) confined");
+    if seatbelt_refusal {
+        notice.push_str(
+            "; on macOS a `net:none` stdio server is admitted only when newt runs as a \
+             non-root user",
+        );
+    }
+    notice
 }
 
 /// Log the confinement actually achieved — honest, never over-claimed.
@@ -959,13 +1039,17 @@ impl StdioTransport {
         for (k, v) in &grants {
             cmd = cmd.env(k, v);
         }
+        let [stdin, stdout, stderr] = mcp_child_stdio();
         let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
             .spawn_tokio(&cx)
-            .with_context(|| {
-                format!("spawning MCP server `{}` ({command}) confined", entry.name)
+            .map_err(|e| {
+                let seatbelt_refusal = cfg!(target_os = "macos")
+                    && matches!(e, agent_bridle::ToolError::Denied { .. });
+                let notice = spawn_failure_notice(&entry.name, command, seatbelt_refusal);
+                anyhow::Error::new(e).context(notice)
             })?;
         let sandbox_kind = child.sandbox_kind;
         log_confinement(&entry.name, sandbox_kind);
@@ -2339,9 +2423,32 @@ impl McpToolset {
             std::path::Path::new(workspace),
             sanitize_server_names,
         );
+        Self::connect_discovered(
+            &entries,
+            sanitize_server_names,
+            caveats,
+            explicit_net_hosts,
+            &mut |warning| tracing::warn!("{warning}"),
+        )
+        .await
+    }
+
+    /// Connect already-discovered `entries`. `warn` receives the #3038 auth
+    /// completeness lines first, before any server is dialed. Headless loads no
+    /// saved OAuth login, so none counts as an auth path here.
+    async fn connect_discovered(
+        entries: &[McpServerEntry],
+        sanitize_server_names: bool,
+        caveats: &Caveats,
+        explicit_net_hosts: &[String],
+        warn: &mut (dyn FnMut(&str) + Send),
+    ) -> Self {
+        for warning in newt_core::mcp::missing_auth_warnings(entries, &|_| false) {
+            warn(&warning);
+        }
         let mut servers = Vec::new();
         let mut connected_prefixes = std::collections::BTreeSet::new();
-        for entry in &entries {
+        for entry in entries {
             // step-1.1: admission gate FIRST. Headless has no interactive
             // approval path, so an untrusted (repo-shipped `.mcp.json` /
             // `~/.claude.json` / project overlay) or disabled server is refused

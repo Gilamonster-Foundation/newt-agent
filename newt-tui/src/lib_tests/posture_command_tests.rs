@@ -19,6 +19,7 @@ fn triage_config(skills_dir: &std::path::Path) -> newt_core::Config {
         skills: Some(newt_core::SkillsConfig {
             search: vec![skills_dir.to_string_lossy().into_owned()],
             bundled_dir: String::new(),
+            ..Default::default()
         }),
         ..newt_core::Config::default()
     };
@@ -68,6 +69,7 @@ fn posture_status_lists_active_and_available_names() {
         preset_name: "readonly-triage".to_string(),
         clamp: newt_core::Caveats::top(),
         clamp_summary: "read-only".to_string(),
+        skill: None,
         skill_body: None,
         framing: None,
     };
@@ -223,6 +225,7 @@ fn effective_caveats_intersect_base_with_the_posture_clamp() {
         preset_name: "readonly-triage".to_string(),
         clamp_summary: "readonly".to_string(),
         clamp,
+        skill: None,
         skill_body: None,
         framing: None,
     };
@@ -232,6 +235,47 @@ fn effective_caveats_intersect_base_with_the_posture_clamp() {
     assert!(!eff.permits_fs_write("/x"), "readonly clamp applied");
     // No posture ⇒ base unchanged (bit-for-bit).
     assert_eq!(effective_caveats(&base, None), base);
+}
+
+/// #2932 / #2950 review 1: `[tool_exposure] read_only` is one toggle that
+/// hides the write tools AND meets the session's authority — so a session
+/// already authorized to write loses `fs_write` through every tool, including
+/// the shell, and nothing else widens.
+#[test]
+fn read_only_tool_policy_attenuates_session_authority_through_the_mode_seam() {
+    use newt_core::operating_mode::OperatingMode;
+    let base = newt_core::Caveats::top();
+    let narrowed = operating_mode_caveats(true, OperatingMode::Dev, false, base.clone());
+    assert!(!narrowed.permits_fs_write("/x"), "write authority is gone");
+    assert!(narrowed.permits_fs_read("/x"), "reads survive");
+    assert!(
+        narrowed.permits_exec("cargo"),
+        "exec survives: read-only still builds"
+    );
+    assert!(narrowed.leq(&base), "only narrows");
+    assert_eq!(
+        operating_mode_caveats(false, OperatingMode::Dev, false, base.clone()),
+        base,
+        "toggle off ⇒ bit-for-bit base"
+    );
+    // Composes with a mode clamp: Plan stays fully offline underneath it.
+    let planned = operating_mode_caveats(true, OperatingMode::Plan, false, base.clone());
+    assert!(!planned.permits_fs_write("/x") && !planned.permits_exec("cargo"));
+}
+
+/// The permission gate's ceiling carries the read-only clamp too, so a
+/// recalled or newly admitted grant cannot re-open writes above it.
+#[test]
+fn read_only_tool_policy_is_a_permission_gate_ceiling() {
+    use newt_core::operating_mode::OperatingMode;
+    let ceiling = operating_mode_permission_clamp(true, OperatingMode::Dev, false, None)
+        .expect("read_only alone yields a ceiling");
+    assert!(!ceiling.permits_fs_write("/x"));
+    assert_eq!(
+        operating_mode_permission_clamp(false, OperatingMode::Dev, false, None),
+        None,
+        "no toggle, no mode, no posture ⇒ no ceiling (unchanged)"
+    );
 }
 
 #[test]
@@ -280,6 +324,7 @@ fn posture_command_off_releases_a_settings_installed_binding() {
         preset_name: "strict".into(),
         clamp: newt_core::Caveats::default(),
         clamp_summary: "deny writes".into(),
+        skill: None,
         skill_body: None,
         framing: None,
     }));
@@ -305,6 +350,7 @@ fn posture_settings_guard_restores_the_permission_binding() {
         }
         .clamp(),
         clamp_summary: "deny writes".into(),
+        skill: None,
         skill_body: Some("Keep the existing skill body.".into()),
         framing: Some("Keep the existing framing.".into()),
     };
@@ -317,6 +363,7 @@ fn posture_settings_guard_restores_the_permission_binding() {
                 preset_name: String::new(),
                 clamp: newt_core::Caveats::top(),
                 clamp_summary: "unconstrained".into(),
+                skill: None,
                 skill_body: None,
                 framing: None,
             }));

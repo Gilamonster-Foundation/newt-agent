@@ -82,6 +82,14 @@ pub struct Disclosure {
     /// select-available only; #149/I10). Names the backend actually applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_forced: Option<String>,
+    /// The Mach-service posture of a network-denied macOS run
+    /// (agent-bridle#405): which services the operator granted by name
+    /// (`mach:<service>`) and which known candidates the zero floor withheld.
+    /// The structured "service X denied" result a host uses to offer a grant —
+    /// derived from the installed policy, since the kernel denies a Mach lookup
+    /// silently. `None` when no Mach floor is installed for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mach_services: Option<crate::MachServiceDisclosure>,
     /// Which shell **engine** ran this operation (ADR 0019 D4 / #194) — e.g.
     /// `"safe-subset"` or `"sandbox-host"`. Lets an embedder log which engine a
     /// dispatch used when more than one is registered. `None` when unset.
@@ -104,6 +112,7 @@ impl Disclosure {
             && self.normalizations_disabled.is_empty()
             && !self.net_over_delivery
             && self.backend_forced.is_none()
+            && self.mach_services.is_none()
             && self.engine.is_none()
     }
 }

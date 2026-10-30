@@ -39,9 +39,13 @@ pub(crate) fn cockpit_pager_case() {
         let body = (0..50)
             .map(|i| format!("spill-row-{i:02}\n"))
             .collect::<String>();
-        let id = archive.retain(&body);
-        crate::transcript_pager::run_output_pager(&archive.get(id).unwrap(), &mut remote, true)
-            .unwrap();
+        let id = archive.retain(&body).unwrap();
+        crate::transcript_pager::run_output_pager(
+            &archive.find(&id.to_handle()).unwrap(),
+            &mut remote,
+            true,
+        )
+        .unwrap();
         println!("PAGER_RETURNED");
         match remote.read_line("after pager").unwrap() {
             ReadOutcome::Line(line) => assert_eq!(line, "after-view", "modal keys leaked"),
@@ -197,7 +201,7 @@ fn buffered_input_case() {
         let archive = Arc::new(crate::completed_spill::CompletedSpillArchive::default());
         archive.retain("operator inspection payload");
         cockpit
-            .handle_request(SurfaceRequest::SetSpillArchive(archive))
+            .handle_request(SurfaceRequest::SetSpillArchive(Arc::clone(&archive)))
             .unwrap();
         let (reply, inspected) = std::sync::mpsc::sync_channel(1);
         cockpit
@@ -206,6 +210,22 @@ fn buffered_input_case() {
                 reply,
             })
             .unwrap();
+        use crossterm::event::{KeyCode, KeyEvent};
+        // #3022 review: `/spill open ` + Tab completes a result retained AFTER
+        // the cockpit mounted its editor (it once inserted spaces instead).
+        let newest = archive.retain("retained after mount").unwrap();
+        for c in "/spill open ".chars() {
+            cockpit
+                .on_event(Event::Key(KeyEvent::from(KeyCode::Char(c))))
+                .unwrap();
+        }
+        cockpit
+            .on_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
+            .unwrap();
+        assert_eq!(
+            cockpit.editor.draft(),
+            format!("/spill open {}", newest.tail())
+        );
         cockpit
             .on_event(Event::Paste("unsent draft".into()))
             .unwrap();
@@ -491,7 +511,7 @@ pub(crate) fn panel_resize_case() {
 }
 
 /// #2571: a panel follows the terminal while it is OPEN, not only on release.
-/// Shrink then grow a real tty under a live inline panel; each re-measure must
+/// Shrink then grow a real tty under a live operator's panel; each re-measure must
 /// hand back the panel's rows anchored at the new bottom, at the new width.
 ///
 /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
@@ -517,6 +537,7 @@ pub(crate) fn panel_live_resize_case() {
         )
         .unwrap();
     let draft = cockpit.editor.draft();
+    operator_typed(&mut cockpit, "/panel");
     let (reply, received) =
         std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
     let panel = std::thread::spawn(move || {
@@ -647,9 +668,9 @@ fn a_same_size_resize_does_not_move_the_block_away_from_its_content_2632() {
 
 /// #2573 review: the whole panel path on a real terminal — the cockpit lends
 /// rows, `panel::drive` runs a real panel through its own event loop, and the
-/// parent resizes and types. Grounds `panel::classify`, `PanelWindow`'s
-/// remeasure tests and `panel_erase_from`, none of which can observe a real
-/// terminal's resize, rendered cells or restored modes.
+/// parent resizes and types. Grounds `panel::classify` and `PanelWindow`'s
+/// remeasure tests, neither of which can observe a real terminal's resize,
+/// rendered cells or restored modes.
 ///
 /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
 /// subprocess and races libtest under load).
@@ -670,17 +691,134 @@ fn closing_a_panel_leaves_the_transcript_above_it_and_none_of_the_panel() {
     crate::interaction_view_pty_test::drive_cockpit_panel_close();
 }
 
+/// #3014: the terminal tells the cockpit where the block is after a resize, and the cockpit
+/// believes it, whichever way the terminal moves things.
+///
+/// The harness plays two terminals by answering the cursor query from a model: one adds rows
+/// below on a grow (the cursor row does not change), one pulls scrollback down (the cursor
+/// row moves with the content). Neither is decided by a wall clock: the model is told what
+/// shift to apply before the resize is delivered.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_resize_re_anchors_the_block_where_the_terminal_put_it_3014() {
+    crate::interaction_view_pty_test::drive_cockpit_resize_anchor();
+}
+
+pub(crate) fn cockpit_resize_anchor_case(dirty: bool) {
+    assert!(unsafe { libc::setsid() } >= 0);
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    // Enough history that the block sits on the bottom rows.
+    let history: Vec<Vec<u8>> = (0..40)
+        .map(|n| format!("HISTORY-{n:02}").into_bytes())
+        .collect();
+    cockpit.screen.insert_rows(history).unwrap();
+    cockpit.draw().unwrap();
+    let rows = cockpit.screen.rows;
+    println!("ANCHOR_READY rows={} top={}", rows, cockpit.screen.top);
+    cockpit.drain_pty().unwrap();
+    cockpit.draw().unwrap();
+    if dirty {
+        // Output after the last draw: on a full screen it scrolls the transcript, leaves the
+        // block's geometry unchanged and parks the cursor on the clearing walk, not the caret.
+        cockpit
+            .screen
+            .insert_rows(vec![b"OUTPUT_BEFORE_RESIZE".to_vec()])
+            .unwrap();
+    }
+    // Deliver the resize through the real event loop; bounded by count, not by time.
+    for _ in 0..1500 {
+        cockpit.poll_keys().unwrap();
+        if cockpit.screen.rows != rows {
+            break;
+        }
+    }
+    println!(
+        "ANCHOR_RESULT rows={} top={} block_h={}",
+        cockpit.screen.rows, cockpit.screen.top, cockpit.screen.block_h
+    );
+    cockpit.drain_pty().unwrap();
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+}
+
+/// #3012: closing an inline panel over a full transcript leaves no blank rows: the line
+/// printed after the close sits directly under the last history row.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn closing_a_panel_over_a_full_transcript_leaves_no_blank_rows_3012() {
+    crate::interaction_view_pty_test::drive_cockpit_panel_gap();
+}
+
+/// #3056: over a full screen, the operator's command opens and closes a decision (what
+/// `/settings workspaces` opens), then a 12-row panel and, after an operation like `/mcp`'s
+/// Test, a 6-row one. Each window must take the alternate screen, the screen after each close
+/// must be the screen before the first open, and the last panel must not open below a blank
+/// band.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn closing_a_panel_gives_back_the_screen_it_opened_over_3056() {
+    crate::interaction_view_pty_test::drive_cockpit_panel_reopen();
+}
+
 pub(crate) fn cockpit_panel_loop_case() {
+    panel_loop(0, true, false, &[8]);
+}
+
+/// #3012: the same cockpit, with enough history that the block sits at the bottom of the
+/// screen, so an inline panel (one the operator did not open) has to scroll transcript rows
+/// up to make room.
+pub(crate) fn cockpit_panel_gap_case() {
+    panel_loop(40, false, false, &[8]);
+}
+
+/// #3056: a full screen, then a decision, a 12-row panel and a 6-row one.
+pub(crate) fn cockpit_panel_reopen_case() {
+    panel_loop(40, true, true, &[12, 6]);
+}
+
+/// Hand the session a line the operator typed, the way a submit at the prompt does, so
+/// the windows it opens next are the operator's (#3056). The draft in the editor is left
+/// alone.
+fn operator_typed(cockpit: &mut Presenter, line: &str) {
+    let (reply, _session) = std::sync::mpsc::sync_channel(1);
+    cockpit
+        .handle_request(SurfaceRequest::ReadLine {
+            prompt: String::new(),
+            reply,
+        })
+        .unwrap();
+    cockpit.on_outcome(EditorOutcome::Line(line.into()));
+}
+
+/// Present a decision first if `decide` (`interaction_view_pty_test`'s fixture), then one
+/// panel per entry of `heights` (the first lists `panel-row-NN`, the next `again-row-NN`,
+/// after an operation starts and ends), each closed by the operator, then print
+/// `PANEL_CLOSED`. With `operator`, a command the
+/// operator typed opens them.
+fn panel_loop(fill_rows: usize, operator: bool, decide: bool, heights: &'static [u16]) {
     // This disposable child owns the tty queried by Crossterm's geometry API.
     assert!(unsafe { libc::setsid() } >= 0);
     assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
     let before = termios_of(0);
     let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
     let mut cockpit = Presenter::open(surface).expect("cockpit");
-    cockpit
-        .screen
-        .insert_rows(vec![b"HISTORY_ABOVE_PANEL".to_vec()])
-        .unwrap();
+    // A full transcript puts the block at the bottom: an inline panel then scrolls transcript
+    // rows into scrollback, which releasing it must reclaim (#3012).
+    let mut history: Vec<Vec<u8>> = (0..fill_rows)
+        .map(|n| format!("FILL-{n:02}").into_bytes())
+        .collect();
+    history.push(b"HISTORY_ABOVE_PANEL".to_vec());
+    cockpit.screen.insert_rows(history).unwrap();
     cockpit
         .editor
         .on_event(
@@ -689,14 +827,31 @@ pub(crate) fn cockpit_panel_loop_case() {
         )
         .unwrap();
     cockpit.draw().unwrap();
+    if operator {
+        operator_typed(&mut cockpit, "/panel");
+    }
     let (to_ui, requests) = std::sync::mpsc::sync_channel(8);
     let worker = std::thread::spawn(move || {
         let mut remote = crate::session_worker::RemoteSurface::new(to_ui);
-        let window = crate::chat::InputSurface::open_panel(&mut remote, PanelMode::Inline(8));
-        let rows = (0..30).map(|n| format!("panel-row-{n:02}")).collect();
-        let mut panel = crate::lines_panel::LinesPanel::new("loop", rows);
-        crate::panel::drive(&mut panel, 8, window.as_ref()).unwrap();
-        drop(window);
+        if decide {
+            let decision = crate::interaction_view_pty_test::fixture_interaction();
+            crate::chat::InputSurface::present_interaction(&mut remote, &decision);
+        }
+        for (&height, name) in heights.iter().zip(["panel", "again"]) {
+            if name == "again" {
+                // An operation between the two openings, the way `/mcp` runs
+                // Test or Reconnect and then reopens its panel.
+                let cancel = Arc::new(AtomicBool::new(false));
+                crate::chat::InputSurface::turn_started(&mut remote, cancel);
+                crate::chat::InputSurface::turn_ended(&mut remote);
+            }
+            let window =
+                crate::chat::InputSurface::open_panel(&mut remote, PanelMode::Inline(height));
+            let rows = (0..30).map(|n| format!("{name}-row-{n:02}")).collect();
+            let mut panel = crate::lines_panel::LinesPanel::new("loop", rows);
+            crate::panel::drive(&mut panel, height, window.as_ref()).unwrap();
+            drop(window);
+        }
         println!("PANEL_CLOSED");
         match remote.read_line("after panel").unwrap() {
             ReadOutcome::Line(line) => assert_eq!(line, "draft-survives-the-panel"),
@@ -1068,9 +1223,21 @@ fn acceptance_case() {
         );
         assert_eq!(cockpit.editor.draft(), draft, "the chat draft survives");
         assert!(!cockpit.chat_inactive, "keyboard focus returns to chat");
+        // The reservation was planned from the pending layout's top (`expected_top`); releasing
+        // it moves the block back to where the transcript ended (#3012), not to the old top.
         assert_eq!(
-            cockpit.screen.top, expected_top,
+            expected_reservation.transcript_end,
+            expected_top.min(expected_reservation.start),
             "the pending layout is applied before modal reservation"
+        );
+        assert_eq!(
+            cockpit.screen.top,
+            reclaimed_top(
+                &expected_reservation,
+                cockpit.screen.block_h,
+                cockpit.screen.rows
+            ),
+            "closing the modal reclaims the rows it scrolled the transcript out of"
         );
         let provisional = tty.painted();
         let prompt_at = provisional
@@ -1199,6 +1366,59 @@ fn acceptance_case() {
             draft,
             "backing out of a modal keeps the mounted chat draft"
         );
+
+        // #3056: a form opened by a command the operator typed takes the
+        // alternate screen, however the session reads the command (it trims
+        // the line). After model input, or once a turn has started, the same
+        // form is a decision the session asked for and stays inline.
+        for (line, turn, alternate) in [
+            ("/form", false, true),
+            ("  /form", false, true),
+            ("what does /form do?", false, false),
+            ("/form", true, false),
+        ] {
+            operator_typed(&mut cockpit, line);
+            if turn {
+                cockpit
+                    .handle_request(SurfaceRequest::TurnStarted {
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    })
+                    .expect("start a turn");
+            }
+            let before_form = tty.painted().len();
+            let typer = tty.type_when_painted("screen?", b"\x1b");
+            let (form_reply, _form_answer) = std::sync::mpsc::sync_channel(1);
+            cockpit
+                .handle_request(SurfaceRequest::Interact {
+                    interaction: Box::new(
+                        newt_core::interaction_surface::SurfaceInteraction::blocking(
+                            crate::permissions::free_text_form("Whose screen?"),
+                        ),
+                    ),
+                    reply: form_reply,
+                })
+                .expect("present the form");
+            typer.join().expect("form watcher");
+            assert!(
+                tty.wait_for_painted_after(
+                    before_form,
+                    "screen?",
+                    std::time::Duration::from_secs(2)
+                ),
+                "the form was drawn in this round"
+            );
+            let form_delta = &tty.painted()[before_form..];
+            assert_eq!(
+                form_delta.contains("\x1b[?1049h"),
+                alternate,
+                "after {line:?}, during a turn: {turn}; painted: {form_delta:?}"
+            );
+            if turn {
+                cockpit
+                    .handle_request(SurfaceRequest::TurnEnded)
+                    .expect("end the turn");
+            }
+        }
 
         // The modal's raw reader still composes with the cockpit's own
         // raw-mode guard. This checks termios directly, independently of
@@ -1340,7 +1560,16 @@ fn acceptance_case() {
         // vanishes between asking for rows and taking them. Either would
         // strand the presenter parked on rows nobody will release, which
         // presents as a frozen cockpit rather than as an error.
-        for mode in [PanelMode::Inline(6), PanelMode::AlternateScreen] {
+        // Last, the same two paths for a panel the operator opened, which
+        // takes the alternate screen and must leave it (#3056).
+        for (mode, operator) in [
+            (PanelMode::Inline(6), false),
+            (PanelMode::AlternateScreen, false),
+            (PanelMode::Inline(6), true),
+        ] {
+            if operator {
+                operator_typed(&mut cockpit, "/panel");
+            }
             let (early_reply, early_window) =
                 std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
             let early = std::thread::spawn(move || {

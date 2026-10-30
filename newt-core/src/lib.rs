@@ -58,6 +58,8 @@ pub mod git_hardening;
 pub mod git_staging;
 pub mod grant_tree;
 pub mod grounding;
+/// Pinned inference (#2927): the sovereign-only policy and its discovery.
+pub mod inference_pin;
 /// The initiative dial: how much the agent looks before acting (split from
 /// [`tenacity`]), with the per-model-family defaults.
 pub mod initiative;
@@ -79,6 +81,7 @@ pub mod interaction_surface;
 // and `--no-default-features` therefore did not COMPILE (#1890): an unresolved
 // `crate::markup::spans`, not merely a lint. The wyvern tier falls back to
 // `markup::plain`, which stays unconditional for exactly this reason.
+pub mod ambient_shell;
 #[cfg(feature = "markdown")]
 pub mod interaction_view;
 pub mod kit;
@@ -120,6 +123,7 @@ pub mod progress;
 pub mod project_map;
 pub mod project_model;
 pub mod prompt;
+pub mod prompt_components;
 /// Hosted-provider presets (the wizard's roster; Hermes-compatible drop-ins) —
 /// distinct from `[[providers]]` subprocess plugins.
 pub mod provider_preset;
@@ -153,6 +157,7 @@ pub mod ssh_caveats;
 pub mod stack;
 pub mod store;
 pub mod symbols;
+pub mod system_prompt;
 pub mod templates;
 pub mod tenacity;
 /// A shared RAII guard for tests that touch the process-global operator settings
@@ -203,27 +208,28 @@ pub use agentic::preserve_mcp_resource_url_affinity;
 pub use agentic::wrap_untrusted;
 pub use agentic::{
     append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
-    compress_user_initiated_for_task, execute_tool, experience_block, format_index_status,
-    format_search_hits, format_search_model, format_search_preview, format_search_rejects,
-    fresh_multi_step_plan, gather_code_files, gather_with_manifest, index_files, load_denials,
-    memory_fetch_tool_definition, openai_chat_complete, openai_chat_complete_with_prompt,
-    openai_responses_complete, openai_responses_complete_with_prompt, parse_context_window_error,
-    plan_block, plan_verdict, recover_context_window_400, render_code_evidence, retrieve_evidence,
-    retrieve_evidence_steered, retrieve_ranked, set_spill_lines, set_spill_summary,
-    set_time_marker_secs, transcript_lines, transcript_lines_styled, trim_for_summary,
-    widen_caveats, BehaviorSignal, ChatCtx, CodeSearch, CompressCounters, CompressState,
-    DenialKind, Embedder, EmbeddingsClient, ErrorClass, EvidenceKind, ExperienceStore,
-    ExposureSettings, GatherCaps, GatherManifest, HeadlessCodeSearch, HumanQuestionOutcome,
-    IndexStatus, LiveToolOutput, ManualCompressOutcome, ManualCompressPolicy, McpTools, MemAddr,
-    MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, ParseSignal, PermissionAction,
-    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PlanDraft,
-    PlanDraftSink, PlanEntry, PlanModeControl, PlanSnapshot, PlanVerdict, RankedHit, RecallSource,
-    RejectReason, RetrievalResult, RetrievalSteer, RoundObservation, ScratchpadStore,
-    SemanticIndex, SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex,
-    SessionSpillStore, SessionStepLedger, ShellObservation, SolveObservation, SpillStore, Step,
-    StepLedger, StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture,
-    Summarizer, ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle,
-    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, BOUND_REASON_PREFIX,
+    compress_user_initiated_for_task, execute_tool, execute_tool_quiet, experience_block,
+    format_index_status, format_search_hits, format_search_model, format_search_preview,
+    format_search_rejects, fresh_multi_step_plan, gather_code_files, gather_with_manifest,
+    index_files, load_denials, memory_fetch_tool_definition, openai_chat_complete,
+    openai_chat_complete_with_prompt, openai_responses_complete,
+    openai_responses_complete_with_prompt, parse_context_window_error, plan_block, plan_verdict,
+    recover_context_window_400, render_code_evidence, retrieve_evidence, retrieve_evidence_steered,
+    retrieve_ranked, set_spill_lines, set_spill_summary, set_time_marker_secs, transcript_lines,
+    transcript_lines_styled, trim_for_summary, widen_caveats, BehaviorSignal, ChatCtx, CodeSearch,
+    CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ErrorClass,
+    EvidenceKind, ExperienceStore, ExposureSettings, GatherCaps, GatherManifest,
+    HeadlessCodeSearch, HumanQuestionOutcome, IndexStatus, LiveToolOutput, ManualCompressOutcome,
+    ManualCompressPolicy, McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink,
+    ParseSignal, PermissionAction, PermissionDecision, PermissionGate, PermissionRecord,
+    PermissionRequest, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanSnapshot,
+    PlanVerdict, RankedHit, RecallSource, RejectReason, RetrievalResult, RetrievalSteer,
+    RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
+    SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, SessionStepLedger,
+    ShellObservation, SolveObservation, SpillStore, Step, StepLedger, StepStatus,
+    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
+    ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
+    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, BOUND_REASON_PREFIX,
     EXPERIENCE_TOP_K, MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use agents::AgentsProvider;
@@ -250,10 +256,11 @@ pub use config::{
     DropinOwnership, EditMode, ExposureProfile, FooterMode, IntakeConfig, Loadout, LoadoutSettings,
     LogConfig, ManagedMode, MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind,
     MeterConfig, OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia, PlanConfig, PlanPruneConfig,
-    ProbeObservation, ProbeWriteback, ProbedServing, ProfilePick, ProviderConfig, RequestMeter,
-    RequestMode, ResolvedBackend, ResolvedConfig, RunCommandBudget, ScratchConfig, SemanticConfig,
-    Serving, ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode,
-    ToolExposureConfig, ToolPermissions, TuiConfig,
+    ProbeObservation, ProbeWriteback, ProbedServing, ProfilePick, PromptConfig, ProviderConfig,
+    RequestMeter, RequestMode, ResolvedBackend, ResolvedConfig, RunCommandBudget, ScratchConfig,
+    SemanticConfig, Serving, ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig,
+    SystemPromptOverride, ThinkingMode, ToolExposureConfig, ToolPermissions, TuiConfig,
+    PI_PRESET_TOOLS, SYSTEM_PROMPT_FILE_ENV,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
@@ -274,6 +281,9 @@ pub use runtime::{
     BackendAxisAction, BackendState, OperatorPreferencePin, PreferenceActions, PreferenceApplyPlan,
     PreferenceAxes, RouteModel, RuntimeSettingsSnapshot,
 };
+pub use system_prompt::{
+    assemble_system_prompt, AssembledPrompt, PersonaPart, PromptParts, ReadmePart,
+};
 pub use tenacity::Tenacity;
 pub use where_is::{
     build_where_is_index, build_where_is_index_from_workspace, execute_where_is,
@@ -290,8 +300,8 @@ pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{
     persist_compaction_summary, MemMessage, MemoryIndex, MemoryManager, MemoryProvider, NoteStore,
-    NotesUnsupported, Role, RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing,
-    TokenBudget, COACH_SOUL, DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
+    NotesUnsupported, Role, RollingWindow, SessionContext, Summarizing, TokenBudget, COACH_SOUL,
+    DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
 };
 pub use metrics::{TokenUsage, TurnEndReason, TurnMetrics};
 pub use model_id::ModelId;
@@ -332,8 +342,9 @@ pub use newt_interaction::ControlKind;
 /// vocabulary" the note above is about.
 pub use newt_interaction::InteractionDefinition;
 pub use store::{
-    sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, InjectOutcome,
-    InjectedPrompt, LivenessFn, Roadmap, RoadmapSummary, SearchHit, StoredOwner, Verdict,
+    sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, FlockTask, InjectOutcome,
+    InjectedPrompt, LivenessFn, NewFlockTask, Roadmap, RoadmapSummary, SearchHit, StoredOwner,
+    Verdict,
 };
 pub use tokens::TokenEstimation;
 pub use tty::{Action, Question};

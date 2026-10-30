@@ -17,6 +17,9 @@ fn http_test_entry(url: String) -> McpServerEntry {
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     }
@@ -391,4 +394,47 @@ fn call_reports_non_namespaced_name_without_wrapping() {
             toolset.call("not_namespaced", &json!({})).await
         });
     assert_eq!(out, "error: `not_namespaced` is not a namespaced MCP tool");
+}
+
+/// Records each dial into the shared event log, then refuses it.
+struct RecordDial(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Respond for RecordDial {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.0.lock().unwrap().push("dial".into());
+        ResponseTemplate::new(401)
+    }
+}
+
+/// #3038 review: the headless planner delivers the missing-auth warning for an
+/// HTTP server with no auth path before it dials that server.
+#[tokio::test]
+async fn headless_warns_about_missing_auth_before_the_first_dial_3038() {
+    let server = MockServer::start().await;
+    let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    Mock::given(method("POST"))
+        .respond_with(RecordDial(Arc::clone(&events)))
+        .mount(&server)
+        .await;
+    let entry = http_test_entry(format!("{}/mcp", server.uri()));
+    let sink = Arc::clone(&events);
+    let toolset = McpToolset::connect_discovered(
+        std::slice::from_ref(&entry),
+        true,
+        &Caveats::top(),
+        &[],
+        &mut move |warning| sink.lock().unwrap().push(warning.to_string()),
+    )
+    .await;
+    assert!(toolset.is_empty());
+    let events = events.lock().unwrap();
+    assert!(events.len() >= 2, "a warning and a dial: {events:?}");
+    assert!(
+        events[0].starts_with("MCP server `headless-http` (http) has no auth"),
+        "{events:?}"
+    );
+    assert!(
+        events[1..].iter().all(|event| event == "dial"),
+        "{events:?}"
+    );
 }

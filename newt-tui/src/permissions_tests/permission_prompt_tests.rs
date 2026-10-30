@@ -2934,7 +2934,8 @@ fn explicit_operating_mode_ceiling_survives_permission_grants() {
             (DenialKind::Exec, "git".into()),
             (DenialKind::FsWrite, "/outside/recalled".into()),
         ]);
-        let base = crate::operating_mode_caveats(configured, model_plan_phase, base_caveats("/ws"));
+        let base =
+            crate::operating_mode_caveats(false, configured, model_plan_phase, base_caveats("/ws"));
         let prompts = Rc::new(Cell::new(0));
         let mut gate = scripted_gate(
             &mut state,
@@ -2945,7 +2946,7 @@ fn explicit_operating_mode_ceiling_survives_permission_grants() {
             prompts.clone(),
         );
         gate.preset_clamp =
-            crate::operating_mode_permission_clamp(configured, model_plan_phase, None);
+            crate::operating_mode_permission_clamp(false, configured, model_plan_phase, None);
         let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
             panic!("refresh returns the attenuated authority");
         };
@@ -2988,7 +2989,7 @@ fn explicit_operating_mode_ceiling_survives_permission_grants() {
     }
 
     assert!(
-        crate::operating_mode_permission_clamp(OperatingMode::Auto, false, None).is_none(),
+        crate::operating_mode_permission_clamp(false, OperatingMode::Auto, false, None).is_none(),
         "an inferred working style must not introduce a grant ceiling"
     );
 }
@@ -4117,6 +4118,7 @@ fn permissions_command_reflects_the_active_posture() {
         preset_name: "readonly-triage".to_string(),
         clamp: preset.clamp(),
         clamp_summary: preset.summary(),
+        skill: None,
         skill_body: None,
         framing: None,
     };

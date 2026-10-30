@@ -11,9 +11,10 @@ fn system_prompt_includes_active_persona_overlay() {
     );
     let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some(newt_core::DEFAULT_SOUL),
+        None,
         Some(&persona),
         "test-plan.md",
+        None,
     );
     assert!(prompt.contains("Active persona: reviewer"));
     assert!(prompt.contains("Review from a persona file."));
@@ -38,9 +39,10 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
     };
     let prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some(newt_core::DEFAULT_SOUL),
+        None,
         Some(&coach),
         "test-plan.md",
+        None,
     );
     assert!(
         prompt.contains("COACH mode"),
@@ -59,9 +61,10 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
     let doer = test_persona("worker", "Do the work.", tmp.path().join("worker.md"));
     let doer_prompt = build_system_prompt_with_persona(
         tmp.path().to_str().unwrap(),
-        Some(newt_core::DEFAULT_SOUL),
+        None,
         Some(&doer),
         "test-plan.md",
+        None,
     );
     assert!(doer_prompt.contains("On an `act` turn, never describe a code change"));
     assert!(!doer_prompt.contains("COACH mode"));
@@ -143,7 +146,9 @@ fn persona_store_writes_coder_default_only_when_loaded() {
 
     assert_eq!(persona.name, "coder");
     assert_eq!(persona.path, dir.join("coder.md"));
-    assert!(persona.prompt.contains(newt_core::DEFAULT_SOUL));
+    // #2935: coder body is no longer DEFAULT_SOUL (that caused the soul to
+    // appear twice when --persona coder was active).
+    assert!(!persona.prompt.is_empty(), "coder has a non-empty body");
     assert!(
         dir.join("coder.md").is_file(),
         "first persona load should materialize the default coder file"
@@ -247,7 +252,7 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
             "old task",
         )
         .await;
-    let mut system = rebuild_system_prompt(workspace, &memory, None, "test-session");
+    let mut system = rebuild_system_prompt(workspace, &memory, None, "test-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = String::from("test-session");
     let mode_states = ConversationModeStates::default();
@@ -258,10 +263,12 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
 
     let message = {
         let mut ctx = ConversationResetContext {
+            cfg: &crate::test_session_config(),
             memory: &mut memory,
             system: &mut system,
             conversation_id: &mut active_conversation_id,
             mode_states: &mode_states,
+            sink: None,
         };
         handle_persona_command(
             "/persona reviewer",
@@ -320,8 +327,13 @@ async fn new_conversation_preserves_active_persona() {
         "Keep replies short.",
         tmp.path().join("personas").join("terse.md"),
     ));
-    let mut system =
-        rebuild_system_prompt(workspace, &memory, active_persona.as_ref(), "test-session");
+    let mut system = rebuild_system_prompt(
+        workspace,
+        &memory,
+        active_persona.as_ref(),
+        "test-session",
+        None,
+    );
     let mut active_conversation_id = String::from("test-session");
 
     // A latched anti-thrash switch must be re-armed by /new (F4): the
@@ -336,10 +348,12 @@ async fn new_conversation_preserves_active_persona() {
         .unwrap();
     newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
     let mut ctx = ConversationResetContext {
+        cfg: &crate::test_session_config(),
         memory: &mut memory,
         system: &mut system,
         conversation_id: &mut active_conversation_id,
         mode_states: &mode_states,
+        sink: None,
     };
     let scratchpad = newt_core::SessionScratchpadStore::default();
     let ledger = newt_core::SessionStepLedger::default();

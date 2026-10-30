@@ -795,11 +795,16 @@ pub async fn retrieve_evidence_steered(
 /// gather pins nothing**, so the caps are *declared* and reported in the
 /// [`GatherManifest`], not hidden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GatherCaps {
     /// Max files kept (in lexicographic order). Default 400.
     pub max_files: usize,
     /// Max bytes per file; larger files are cut, not silently skipped. Default 200_000.
     pub max_bytes: u64,
+    /// Max walk entries visited (files and directories) before the walk stops
+    /// and records a [`CutClass::WalkBudget`] cut (#3026). Default 50_000 —
+    /// bounds the warm-up on a huge folder of many repos.
+    pub max_walk_entries: usize,
 }
 
 impl Default for GatherCaps {
@@ -807,6 +812,7 @@ impl Default for GatherCaps {
         Self {
             max_files: 400,
             max_bytes: 200_000,
+            max_walk_entries: 50_000,
         }
     }
 }
@@ -819,6 +825,9 @@ pub enum CutClass {
     TooLarge,
     /// Beyond [`GatherCaps::max_files`] in lexicographic order.
     OverFileCap,
+    /// The walk stopped at [`GatherCaps::max_walk_entries`]; the rest of the
+    /// tree was never visited (#3026). Recorded once, with path `.`.
+    WalkBudget,
 }
 
 /// One candidate the caps dropped — the honest record (path + why).
@@ -951,7 +960,16 @@ pub fn gather_with_manifest(
         }
     };
     let mut candidates: Vec<(String, u64)> = Vec::new();
-    for entry in ignore::WalkBuilder::new(workspace).build().flatten() {
+    let mut walk_cut = false;
+    for (visited, entry) in ignore::WalkBuilder::new(workspace)
+        .build()
+        .flatten()
+        .enumerate()
+    {
+        if visited >= caps.max_walk_entries {
+            walk_cut = true;
+            break;
+        }
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
         if !ext.is_some_and(|e| extensions.iter().any(|x| x == e)) {
@@ -965,7 +983,17 @@ pub fn gather_with_manifest(
         };
         candidates.push((relative.to_string_lossy().into_owned(), metadata.len()));
     }
-    let (kept, manifest) = plan_gather(&candidates, caps);
+    let (kept, mut manifest) = plan_gather(&candidates, caps);
+    if walk_cut {
+        // "." sorts before any relative path, keeping the cut list ordered.
+        manifest.cuts.insert(
+            0,
+            Cut {
+                path: ".".into(),
+                class: CutClass::WalkBudget,
+            },
+        );
+    }
     let mut files = Vec::with_capacity(kept.len());
     for rel in &kept {
         if let Ok(src) = open(std::path::Path::new(rel)).and_then(|mut file| {

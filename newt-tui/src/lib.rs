@@ -14,6 +14,9 @@ mod codex_env;
 mod color;
 mod context_window;
 mod crew_form;
+mod flock_intake;
+#[cfg(feature = "flock")]
+mod flock_ui;
 mod help;
 #[cfg(feature = "rich-tui")]
 mod inference_panel;
@@ -32,10 +35,14 @@ pub(crate) use session_capability::SessionCapability;
 // `newt auth`'s driver. Re-exported, not moved out of the public API:
 // newt-cli calls `newt_tui::run_auth`, so the path must not change.
 pub use auth_command::run_auth;
+// #2913: one admission/auth readiness classification shared by import,
+// doctor, `newt auth` and the /mcp panel.
+pub use mcp::{classify_readiness, readiness_label, saved_oauth_valid, McpReadiness};
 // Only `lib.rs` itself calls these (`resolve_backend_choice`); nothing else in
 // the crate does, so this is a private import rather than a re-export.
 use codex_env::{codex_env_allowed, codex_env_backend};
 mod turn_input;
+mod turn_system;
 // `with_live_spill_watch` (both cfg arms) and `with_interrupt_watch` are the
 // only two the rest of the crate calls from non-test code: chat.rs,
 // commands/model.rs and interrupt_ack_pty_test.rs. Both exist in EVERY config,
@@ -74,6 +81,8 @@ pub mod dgx_probe;
 /// #2085 PR-E2: where a non-setting state mutator's journal event is named,
 /// and the registry gate that decides whether it may be written at all.
 mod event_receipt;
+#[cfg(all(feature = "live-spill", feature = "rich-tui"))]
+mod fold_list;
 pub mod herdr;
 /// #1950: the ONE inline-viewport constructor, and the one answer to "where is
 /// the cursor?" when the terminal will not say.
@@ -119,6 +128,7 @@ mod prompt_visibility_test;
 // assertion is structural ("on screen while still running"), not a stopwatch.
 #[cfg(all(test, unix))]
 mod interrupt_ack_pty_test;
+mod prompt_components_form;
 #[cfg(any(feature = "rich-tui", feature = "live-spill"))]
 mod scrollbar;
 /// #1981: the ONE list of top-level slash commands. Three lists knew this
@@ -133,10 +143,12 @@ mod settings_form;
 mod settings_form_pty_test;
 #[cfg(feature = "rich-tui")]
 mod shell;
+mod skills_form;
 mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
 mod status_topics;
+mod system_prompt_edit;
 /// #1669 PR-A — the staged tab switch and the one tab-action handler, against
 /// live session state. Separate from the pure model so the staging discipline
 /// (Stage-0 read, deactivate, hydrate, reset⊕overlay, owner handoff) reads in
@@ -228,8 +240,14 @@ mod prefix;
 mod permissions_panel;
 #[cfg(feature = "rich-tui")]
 mod settings_panel;
+// #2932: the `/settings tools` checklist — edits the `[tool_exposure]` policy
+// through the settings form's one mutation path.
+#[cfg(feature = "rich-tui")]
+mod components_panel;
 #[cfg(feature = "rich-tui")]
 mod theme_panel;
+#[cfg(feature = "rich-tui")]
+mod tools_panel;
 // The backend chooser/editor panel (#1667) — same grammar, same gating; its
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]
@@ -679,9 +697,12 @@ pub fn run_code(
     // (issue #527). Config is folded in here, where a session reads it; the
     // `color_supported_with` shim (used pre-config, e.g. the wizard) stays Auto.
     let mut migration_notices = crate::migration_notices::Pending::default();
+    // An invalid config refuses the session here, before any splash, wizard or
+    // inference: a default config would drop `[tool_exposure]` and the rest of what
+    // the operator restricted (#2933 review of #2990).
     let cfg_color = newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
-        .ok()
-        .and_then(|c| c.tui)
+        .map_err(|e| anyhow::anyhow!("config resolution failed: {e:#}; nothing was started"))?
+        .tui
         .map(|t| t.color)
         .unwrap_or_default();
     let color = color_enabled_for(
@@ -713,7 +734,7 @@ pub fn run_code(
         let unconfigured =
             newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
                 .map(|c| c.is_unconfigured())
-                .unwrap_or(true);
+                .map_err(|e| anyhow::anyhow!("config resolution failed: {e:#}"))?;
         let context = if unconfigured || setup.is_some() {
             "initial setup"
         } else {
@@ -1141,6 +1162,7 @@ fn filesystem_authority_note() -> &'static str {
 /// prompt itself is frozen at conversation start). Without it the model has no
 /// way to know its identity and confabulates one (e.g. inventing a name for
 /// commit attribution). Kept short — it rides in every request.
+#[cfg(test)]
 fn runtime_context_block(
     model: &str,
     endpoint: &str,
@@ -1148,6 +1170,49 @@ fn runtime_context_block(
     identity: &newt_core::AgentIdentity,
     disposition: newt_core::agentic::PromptDisposition,
 ) -> String {
+    runtime_context_parts(model, endpoint, kind, identity, disposition)
+        .render(&newt_core::prompt_components::ComponentSet::default())
+}
+
+/// The runtime context as the four pieces `[prompt] components` can switch off
+/// (#2933). Each ends where the next begins, so with all four on they concatenate to
+/// exactly the block this used to be.
+pub(crate) struct RuntimeContextParts {
+    pub environment: String,
+    pub runtime_authority: String,
+    pub git_identity: String,
+    pub fs_confinement: String,
+}
+
+impl RuntimeContextParts {
+    /// `(component id, text)` in the order the block carries them.
+    pub(crate) fn pieces(&self) -> [(&'static str, &str); 4] {
+        [
+            ("environment", &self.environment),
+            ("runtime-authority", &self.runtime_authority),
+            ("git-identity", &self.git_identity),
+            ("fs-confinement", &self.fs_confinement),
+        ]
+    }
+
+    /// The pieces whose components are on, concatenated.
+    #[cfg(test)]
+    pub(crate) fn render(&self, set: &newt_core::prompt_components::ComponentSet) -> String {
+        self.pieces()
+            .into_iter()
+            .filter(|(id, _)| set.is_on_id(id))
+            .map(|(_, text)| text)
+            .collect()
+    }
+}
+
+fn runtime_context_parts(
+    model: &str,
+    endpoint: &str,
+    kind: newt_core::BackendKind,
+    identity: &newt_core::AgentIdentity,
+    disposition: newt_core::agentic::PromptDisposition,
+) -> RuntimeContextParts {
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
@@ -1161,26 +1226,29 @@ fn runtime_context_block(
     let runtime_authority = runtime_authority_note(disposition)
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
-    let filesystem_authority = filesystem_authority_note();
-    format!(
-        "# Environment (refreshed every turn)\n\
-         Harness: newt-agent v{VERSION}\n\
-         Model: {model}\n\
-         Backend: {backend} @ {endpoint}\n\
-         Current date/time: {now}\n\
-         You are the model named above, running under the newt-agent harness. \
-         When asked who or what you are — and when attributing work (commit \
-         trailers, git notes, PR text) — use this real model name and harness; \
-         never invent or guess an identity.\n\
-         {runtime_authority}\
-         # Git commit identity\n\
-         Configured Git identity: `{author_name} <{author_email}>`. \
-         Use ordinary Git commands for repository work. Harness-managed commits \
-         record every contributing model/harness pair from the attribution ledger. \
-         Never invent an author identity or claim a commit or signature without \
-         a successful tool result.\n\
-         {filesystem_authority}"
-    )
+    RuntimeContextParts {
+        environment: format!(
+            "# Environment (refreshed every turn)\n\
+             Harness: newt-agent v{VERSION}\n\
+             Model: {model}\n\
+             Backend: {backend} @ {endpoint}\n\
+             Current date/time: {now}\n\
+             You are the model named above, running under the newt-agent harness. \
+             When asked who or what you are — and when attributing work (commit \
+             trailers, git notes, PR text) — use this real model name and harness; \
+             never invent or guess an identity.\n"
+        ),
+        runtime_authority,
+        git_identity: format!(
+            "# Git commit identity\n\
+             Configured Git identity: `{author_name} <{author_email}>`. \
+             Use ordinary Git commands for repository work. Harness-managed commits \
+             record every contributing model/harness pair from the attribution ledger. \
+             Never invent an author identity or claim a commit or signature without \
+             a successful tool result.\n"
+        ),
+        fs_confinement: filesystem_authority_note().to_string(),
+    }
 }
 
 /// Read-only enforcement caveats (read anything; no write/exec/net) — the safe
@@ -1322,7 +1390,7 @@ impl AutoModeState {
         }
     }
 
-    #[cfg(test)]
+    /// Read the pending selection without consuming it (`/context request`).
     fn pending_for(&self, conversation_id: &str) -> Option<OperatingMode> {
         self.selected
             .lock()
@@ -1792,11 +1860,21 @@ fn apply_operating_mode_to_intake(
 /// Only an operator-selected mode or an active model Plan phase may clamp
 /// authority. Inferred working styles guide the response; they cannot remove
 /// existing grants. Every clamp is a meet, so it cannot add authority either.
+///
+/// `tool_read_only` is `[tool_exposure] read_only` (#2932): the one toggle
+/// that hides the write tools ALSO meets [`newt_core::agentic::read_only_clamp`]
+/// here, so what the model cannot see it also cannot do — through any tool.
 fn operating_mode_caveats(
+    tool_read_only: bool,
     configured: OperatingMode,
     model_plan_phase: bool,
     caveats: newt_core::Caveats,
 ) -> newt_core::Caveats {
+    let caveats = if tool_read_only {
+        caveats.meet(&newt_core::agentic::read_only_clamp())
+    } else {
+        caveats
+    };
     let mode = if model_plan_phase {
         OperatingMode::Plan
     } else {
@@ -1811,12 +1889,14 @@ fn operating_mode_caveats(
 
 /// The ceiling re-applied by the permission gate after recalled or new grants.
 fn operating_mode_permission_clamp(
+    tool_read_only: bool,
     configured: OperatingMode,
     model_plan_phase: bool,
     posture_clamp: Option<newt_core::Caveats>,
 ) -> Option<newt_core::Caveats> {
     let has_posture_clamp = posture_clamp.is_some();
     let ceiling = operating_mode_caveats(
+        tool_read_only,
         configured,
         model_plan_phase,
         posture_clamp.unwrap_or_else(newt_core::Caveats::top),
@@ -2486,6 +2566,36 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
     )
 }
 
+/// The session-start banner for the `--ambient` axis and for `--yolo`, which is all three
+/// (#978). It lists exactly what is off, from the effective decision rather than the flags:
+/// the shell is claimed only where `run_command` runs on the host shell (`--disable-ocap`
+/// with `--full-access`), and `shell` is how `$SHELL` really resolved (a POSIX login shell, or
+/// the `/bin/sh` that runs instead, with the reason).
+fn ambient_banner(
+    authority: newt_core::launch_authority::LaunchAuthority,
+    shell: &newt_core::ambient_shell::AmbientShell,
+) -> String {
+    let children = "child processes and stdio MCP servers get your FULL environment \
+         (DISPLAY, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, tokens and all); newt's own \
+         secrets and switches are still withheld";
+    // From the route dispatch selects, so each platform names what really runs.
+    let runs = newt_core::agentic::ambient_interpreter_description(shell);
+    if authority.ocap_disabled() && authority.full_access() {
+        format!(
+            "⚠ YOLO (--yolo): approvals OFF (--disable-ocap), confinement OFF (--full-access), \
+             environment OFF (--ambient): run_command runs {runs}, and {children}. Drop the \
+             flag to restore confinement."
+        )
+    } else {
+        format!(
+            "⚠ AMBIENT (--ambient): environment OFF: {children}. run_command keeps its current \
+             shell: the login shell applies only where it runs on the host shell, which needs \
+             --disable-ocap and an exec floor that permits the command (--yolo is all three). \
+             This flag alone leaves approvals and confinement as they are."
+        )
+    }
+}
+
 /// The unmissable session-start banner shown when the `--full-access` preset
 /// override is asserted (`NEWT_FULL_ACCESS=1`). The override itself lives in
 /// `policy_for`; this is the loud surfacing half of the contract, mirroring
@@ -2503,6 +2613,110 @@ fn full_access_banner() -> String {
      flag to restore Object-Capability authority restrictions. Private HTTP destinations \
      still require exact MCP net grants in [tui.permissions] net."
         .to_string()
+}
+
+#[cfg(all(test, unix))]
+mod ambient_banner_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+
+    // Unix absolute paths (`/usr/bin/zsh`) are not absolute on Windows: the module is unix-only.
+    #[test]
+    fn the_banner_lists_exactly_what_is_off_from_the_effective_decision() {
+        use newt_core::launch_authority::LaunchAuthority;
+        // The interpreter is named from the route dispatch selects, which needs the host
+        // bypass on: the session this banner describes.
+        let _env = newt_core::process_env::lock();
+        let saved = std::env::var("NEWT_DISABLE_OCAP").ok();
+        newt_core::process_env::set_var("NEWT_DISABLE_OCAP", "1");
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => newt_core::process_env::set_var("NEWT_DISABLE_OCAP", v),
+                    None => newt_core::process_env::remove_var("NEWT_DISABLE_OCAP"),
+                }
+            }
+        }
+        let _restore = Restore(saved);
+        let shell = AmbientShell::resolve(Some("/usr/bin/zsh".as_ref()));
+        let yolo = LaunchAuthority::from_parts_for_test(true, true, true);
+        let all = ambient_banner(yolo, &shell);
+        for needle in [
+            "YOLO (--yolo)",
+            "approvals OFF (--disable-ocap)",
+            "confinement OFF (--full-access)",
+            "environment OFF (--ambient)",
+            "login shell /usr/bin/zsh -l -i -c",
+            "FULL environment",
+        ] {
+            assert!(all.contains(needle), "missing `{needle}`: {all}");
+        }
+        // `--ambient` alone: run_command stays where it is, so no shell is claimed.
+        for authority in [
+            LaunchAuthority::AMBIENT,
+            LaunchAuthority::from_parts_for_test(true, false, true),
+        ] {
+            let alone = ambient_banner(authority, &shell);
+            assert!(
+                alone.contains("AMBIENT (--ambient): environment OFF"),
+                "{alone}"
+            );
+            assert!(
+                !alone.contains("login shell /usr/bin/zsh")
+                    && !alone.contains("run_command runs your"),
+                "must not claim a shell that does not run: {alone}"
+            );
+            assert!(
+                !alone.contains("approvals OFF") && !alone.contains("confinement OFF"),
+                "the ambient axis alone must not claim the others: {alone}"
+            );
+        }
+        // A login shell that cannot run is reported as the /bin/sh that does.
+        let missing = AmbientShell::resolve_checked(Some("/no/such/zsh".as_ref()), |_| false);
+        let fallback = ambient_banner(yolo, &missing);
+        assert!(
+            fallback.contains(
+                "$SHELL does not exist; ambient commands run /bin/sh -c with your full environment"
+            ),
+            "{fallback}"
+        );
+        assert!(!fallback.contains("/no/such/zsh"), "{fallback}");
+        // A non-POSIX $SHELL runs /bin/sh, and the banner says so plainly.
+        let fish = ambient_banner(yolo, &AmbientShell::resolve(Some("/usr/bin/fish".as_ref())));
+        assert!(
+            fish.contains("$SHELL is fish, not a POSIX shell; ambient commands run /bin/sh -c with your full environment"),
+            "{fish}"
+        );
+        assert!(!fish.contains("login shell /usr/bin/fish"), "{fish}");
+    }
+}
+
+/// On Windows the banner names the Brush/cmd shell that runs, not a unix `/bin/sh`.
+#[cfg(all(test, windows))]
+mod ambient_banner_windows_tests {
+    use super::*;
+    use newt_core::ambient_shell::AmbientShell;
+    use newt_core::launch_authority::LaunchAuthority;
+
+    #[test]
+    fn the_banner_names_the_shell_that_runs_on_windows() {
+        let _env = newt_core::process_env::lock();
+        let saved = std::env::var("NEWT_DISABLE_OCAP").ok();
+        newt_core::process_env::set_var("NEWT_DISABLE_OCAP", "1");
+        let banner = ambient_banner(
+            LaunchAuthority::from_parts_for_test(true, true, true),
+            &AmbientShell::resolve(None),
+        );
+        match saved {
+            Some(v) => newt_core::process_env::set_var("NEWT_DISABLE_OCAP", &v),
+            None => newt_core::process_env::remove_var("NEWT_DISABLE_OCAP"),
+        }
+        assert!(
+            banner.contains("unix-only") && !banner.contains("/bin/sh"),
+            "{banner}"
+        );
+    }
 }
 
 /// The ONE `full-access` line written to the #263 permission log at session
@@ -5162,13 +5376,6 @@ pub(crate) fn persist_preference_actions(
 #[path = "lib_tests/resumed_preference_tests.rs"]
 mod resumed_preference_tests;
 
-/// Build a system prompt with workspace context so the model knows the project.
-// build_system_prompt_with_soul is used directly now; this wrapper kept for tests.
-#[allow(dead_code)]
-fn build_system_prompt(workspace: &str, plan_path: &str) -> String {
-    build_system_prompt_with_soul(workspace, None, plan_path)
-}
-
 /// Seat `persona`'s declared dials (cognition and initiative) as the persona
 /// resolution layers, or clear them for `None`. Every persona activation site
 /// calls this one function: startup, `/persona set|clear`, a conversation
@@ -5389,7 +5596,9 @@ impl PersonaStore {
     /// Shipped default personas, seeded per-file-idempotently (FR-16, #1000):
     /// each MISSING one is written on any store access, so an upgrade that
     /// predates a new default still receives it (the old empty-dir gate would
-    /// strand it forever). `coder` is the doer identity (DEFAULT_SOUL); `coach`
+    /// strand it forever). `coder` is a short editable placeholder (#2935 — it
+    /// used to seed DEFAULT_SOUL, which doubled the soul in the system prompt);
+    /// `coach`
     /// prefers advising first; its `altitude = "coach"` selects COACH_SOUL.
     /// `personal-assistant` specializes in routine automation. Its `skills:`
     /// binding preloads `gila-personal-assistant`, and its `tools:` preferences
@@ -5399,7 +5608,7 @@ impl PersonaStore {
     /// not capability or action-policy settings. A user who deletes a default
     /// gets it back next launch; empty the file to suppress it.
     const DEFAULT_PERSONAS: &'static [(&'static str, &'static str)] = &[
-        (Self::DEFAULT_NAME, newt_core::DEFAULT_SOUL),
+        (Self::DEFAULT_NAME, CODER_PERSONA),
         ("coach", COACH_PERSONA),
         ("personal-assistant", PERSONAL_ASSISTANT_PERSONA),
         ("steady", include_str!("../../personas/steady.md")),
@@ -5411,13 +5620,37 @@ impl PersonaStore {
         std::fs::create_dir_all(&self.dir)?;
         for &(name, body) in Self::DEFAULT_PERSONAS {
             let path = self.dir.join(format!("{name}.md"));
-            if !path.exists() {
+            if !path.exists() || Self::is_legacy_coder_seed(name, &path) {
                 std::fs::write(&path, body)?;
             }
         }
         Ok(())
     }
+
+    /// #2935: through v0.8.2 `coder` was seeded with DEFAULT_SOUL verbatim,
+    /// which doubled the soul in every `--persona coder` prompt. An existing
+    /// file whose body is still exactly that seed is the untouched old seed,
+    /// not an operator edit, so it is replaced like a missing default. Any
+    /// other content is operator data and is left alone.
+    ///
+    /// The comparison text is a frozen snapshot of the v0.8.2 soul, not the live
+    /// soul: the soul is components now (#2933) and may change without stranding
+    /// older installs.
+    fn is_legacy_coder_seed(name: &str, path: &std::path::Path) -> bool {
+        name == Self::DEFAULT_NAME
+            && std::fs::read_to_string(path)
+                .is_ok_and(|body| body.trim() == LEGACY_CODER_SEED_V082.trim())
+    }
 }
+
+/// What v0.8.2 seeded into `coder.md`: the whole default soul, verbatim (#2935).
+/// Frozen; see [`PersonaStore::is_legacy_coder_seed`].
+const LEGACY_CODER_SEED_V082: &str = include_str!("legacy_coder_seed_v0.8.2.txt");
+
+/// The default coder persona (#2935): a short placeholder the user can edit.
+/// Using DEFAULT_SOUL here would send the soul twice when `--persona coder` is
+/// active (once from the identity block, once from the persona overlay).
+const CODER_PERSONA: &str = include_str!("../../personas/coder.md");
 
 /// The read-only coach persona shipped as a repo template (FR-16, #1000), so
 /// `shipped_role_templates_parse` type-checks its front-matter beside the others.
@@ -5453,7 +5686,7 @@ fn missing_bound_skills(skills: &[String], search_dirs: &[std::path::PathBuf]) -
 /// skill that doesn't resolve under `search_dirs`.
 fn warn_on_missing_bound_skills(
     persona: Option<&Persona>,
-    search_dirs: &[std::path::PathBuf],
+    cfg: &newt_core::Config,
     color: bool,
     verbose: bool,
 ) {
@@ -5461,7 +5694,23 @@ fn warn_on_missing_bound_skills(
     let Some(skills) = &persona.profile.skills else {
         return;
     };
-    let missing = missing_bound_skills(skills, search_dirs);
+    let off: Vec<&str> = skills
+        .iter()
+        .map(String::as_str)
+        .filter(|s| cfg.skill_is_off(s))
+        .collect();
+    if !off.is_empty() {
+        print_newt(
+            &format!(
+                "warning: persona `{}` binds skill(s) you switched off: {} (`/settings skills on <name>`)",
+                persona.name,
+                off.join(", ")
+            ),
+            color,
+            verbose,
+        );
+    }
+    let missing = missing_bound_skills(skills, &cfg.skill_search_dirs());
     if !missing.is_empty() {
         print_newt(
             &format!(
@@ -5818,14 +6067,15 @@ fn parse_conversation_rest<'a>(
 /// from the skills found across `skills_dirs` (names + descriptions only, never
 /// bodies), or `None` when no skills are installed. Uses the same ordered,
 /// first-directory-wins union as discovery. Split out from
-/// [`build_system_prompt_with_soul`] so the injection can be unit-tested against
+/// [`build_system_prompt_with_persona`] so the injection can be unit-tested against
 /// controlled directories without mutating the process-wide `$HOME`.
-fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String> {
-    newt_skills::index_block(&newt_skills::discover_paths(skills_dirs))
-}
-
-fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>, plan_path: &str) -> String {
-    build_system_prompt_with_persona(workspace, soul, None, plan_path)
+fn skills_index_for_prompt(
+    skills_dirs: &[std::path::PathBuf],
+    off: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let mut skills = newt_skills::discover_paths(skills_dirs);
+    skills.retain(|s| !off(&s.name));
+    newt_skills::index_block(&skills)
 }
 
 /// FR-5 (#999): the minimal persona that carries ONLY an altitude, used when
@@ -5859,146 +6109,341 @@ pub(crate) fn narration_intent_line(enabled: bool) -> Option<&'static str> {
     enabled.then_some(NARRATION_INTENT_LINE)
 }
 
+/// `context` carries the non-soul provider blocks (AGENTS.md/CLAUDE.md,
+/// notes, memory index, project map).  It follows the identity whatever the
+/// altitude, so coach altitude, which replaces the soul/identity with
+/// `COACH_SOUL`, never silently drops project-specific instructions (#2934).
+/// The unit tier resolves the config from disk, as the builder used to.
+#[cfg(test)]
 fn build_system_prompt_with_persona(
     workspace: &str,
-    soul: Option<&str>,
+    context: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
-    // FR-5 (#999): the active persona's ALTITUDE selects the base identity. A
-    // `Coach` altitude REPLACES the identity with COACH_SOUL (and overrides a
-    // doer-flavored soul.md), so a coaching persona's overlay no longer sits on
-    // top of a contradictory doer soul. Doer (the default, and every persona
-    // that doesn't declare an altitude) keeps today's behavior: the resolved
-    // soul.md, else DEFAULT_SOUL. The `--altitude` flag rides here too — it
-    // seeds/overrides `active_persona`'s altitude at startup (see `run_code`),
-    // so it needs no separate plumbing through the session-management helpers.
-    let effective_altitude = persona.and_then(|p| p.profile.altitude).unwrap_or_default();
-    let identity = match effective_altitude {
-        newt_core::Altitude::Coach => newt_core::COACH_SOUL,
-        newt_core::Altitude::Doer => soul.unwrap_or(newt_core::DEFAULT_SOUL),
-    };
-    let mut ctx = format!(
-        "{identity}\n\nWorkspace: {workspace}\n\
-         This is the current runtime root. Relative tool paths resolve here; \
-         run_command starts here unless its cwd or command selects another directory. \
-         Other requested paths remain governed by the session's permissions. \
-         Historical notes do not redefine this root.\n"
+    let cfg = test_session_config();
+    build_system_prompt_for(workspace, context, persona, plan_path, &cfg, sink)
+}
+
+/// The config of a test session: what the sandbox's files resolve to.
+#[cfg(test)]
+pub(crate) fn test_session_config() -> Box<newt_core::Config> {
+    Box::new(newt_core::Config::clone(&resolve_runtime_or_default()))
+}
+
+/// Render the system prompt from the SESSION's accepted config (`cfg`), never from
+/// a fresh read of the file: a refresh that failed keeps the session's last accepted
+/// config, and the prompt must follow it, not the file on disk.
+fn build_system_prompt_for(
+    workspace: &str,
+    context: Option<&str>,
+    persona: Option<&Persona>,
+    plan_path: &str,
+    cfg: &newt_core::Config,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    // FR-5 (#999): the active persona's ALTITUDE selects the soul's component SET:
+    // the doer's, or the coach's ADVISE-first one, so a coaching persona's overlay
+    // never sits on top of a contradictory doer soul. Doer is the default, and every
+    // persona that doesn't declare an altitude. The soul is built from components
+    // (#2933): there is no soul.md and no fallback text. The `--altitude` flag rides
+    // here too: it seeds/overrides `active_persona`'s altitude at startup (see
+    // `run_code`), so it needs no separate plumbing through the session helpers.
+    let coach = matches!(
+        persona.and_then(|p| p.profile.altitude).unwrap_or_default(),
+        newt_core::Altitude::Coach
     );
-    if let Some(persona) = persona {
-        ctx.push_str(&format!(
-            "\nActive persona: {}\n{}\n",
-            persona.name, persona.prompt
-        ));
-        ctx.push_str(
-            "\nPersona guidance does not override the operator's explicit task. \
-             Treat advice-only wording and preferred tools as defaults; use the tools \
-             needed for the requested work. OCAP permissions, explicit postures, and \
-             delegation limits still govern every action.\n",
-        );
-    }
-
-    // Resolved once and shared with the skills index below; the ratchet in
-    // newt-core/tests/resolve_publishes_ratchet.rs pins the publishing resolve
-    // count per file.
-    let cfg = crate::migration_notices::read(|report| newt_core::Config::resolve(report));
-
-    // Per-session plan instruction (issue #220). Injected here, with the
-    // resolved per-session path, rather than baked into DEFAULT_SOUL — so the
-    // path is dynamic AND custom soul.md users still get the guidance. The path
-    // is unique to this conversation, so concurrent newt instances in the same
-    // repo never clobber each other's plan.
-    ctx.push_str(&format!(
-        "\n**Plan before coding.** For any task requiring more than one file \
-         change, write a plan to `{plan_path}` first (create it if it does not \
-         exist). List the concrete steps and check them off as you complete \
-         each one. This plan file is unique to this session — read it when \
-         resuming so you can pick up exactly where you left off without \
-         re-reading the whole codebase.\n"
-    ));
-
-    ctx.push_str(newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE);
-    ctx.push('\n');
-
-    // `[tui] narration_intent_line` (opt-in): appended here like the plan
-    // sentence, so every identity gets it and no soul text carries it.
-    let intent = cfg
-        .as_ref()
-        .ok()
-        .and_then(|c| c.tui.as_ref())
-        .is_some_and(|t| t.narration_intent_line);
-    if let Some(line) = narration_intent_line(intent) {
-        ctx.push_str(&format!("\n{line}\n"));
-    }
-
+    // #2932: the soul names only the tools the operator lets the model see: the same
+    // `[tool_exposure]` policy that selects the catalog, so the prompt cannot steer
+    // the model at a tool the wire never carries.
+    let exposure = newt_core::ExposureSettings::from(cfg.tool_exposure());
+    // The accepted config was validated when it was resolved, so this holds.
+    let components = cfg.prompt_components().unwrap_or_else(|e| {
+        debug_assert!(false, "accepted config has invalid components: {e}");
+        Default::default()
+    });
+    let identity = exposure.render_soul(&components, coach);
+    // The soul is built from components; the report names each by id.
+    let soul_pieces = newt_core::prompt_components::soul_parts(
+        &|c| components.is_on(c),
+        &|t| exposure.operator_visible(t),
+        components.preset(),
+        coach,
+    );
+    // `[tui] narration_intent_line` (opt-in): every identity gets it and no
+    // soul text carries it.
+    let intent = cfg.tui.as_ref().is_some_and(|t| t.narration_intent_line);
     // Progressive disclosure: inject ONLY the skills index (one
     // `name: description (when to use: …)` line per installed skill) — never
     // the bodies. Bodies load on demand when the model calls the `use_skill`
     // tool. Skills come from the one resolver `use_skill` also reads (#2331):
     // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
     // missing dir contributes nothing.
-    let skills_dirs = cfg.map(|c| c.skill_search_dirs()).unwrap_or_default();
-    if let Some(index) = skills_index_for_prompt(&skills_dirs) {
-        ctx.push('\n');
-        ctx.push_str(&index);
-    }
-
-    // Directory listing (top-level, no hidden files)
-    if let Ok(mut entries) = std::fs::read_dir(workspace) {
-        let mut names: Vec<String> = entries
-            .by_ref()
+    let skills_dirs = cfg.skill_search_dirs();
+    // A skill the operator switched off (`[skills] off`) is not offered to the model.
+    let skills_index = skills_index_for_prompt(&skills_dirs, &|name| cfg.skill_is_off(name));
+    // Top-level names only; the assembler drops hidden ones and caps the list.
+    let file_names: Option<Vec<String>> = std::fs::read_dir(workspace).ok().map(|entries| {
+        entries
             .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    None
-                } else {
-                    Some(name)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    });
+    let readme_text = ["README.md", "readme.md", "README.txt"]
+        .into_iter()
+        .find_map(|name| {
+            std::fs::read_to_string(std::path::Path::new(workspace).join(name))
+                .ok()
+                .map(|text| (name, text))
+        });
+    let assembled = newt_core::assemble_system_prompt(&newt_core::PromptParts {
+        identity: &identity,
+        coach_identity: coach,
+        context,
+        workspace,
+        persona: persona.map(|p| newt_core::PersonaPart {
+            name: &p.name,
+            prompt: &p.prompt,
+        }),
+        plan_path,
+        publish_guidance: newt_core::agentic::REFACTOR_PUBLISH_GUIDANCE,
+        narration_line: narration_intent_line(intent),
+        skills_index: skills_index.as_deref(),
+        file_names: file_names.as_deref(),
+        readme: readme_text
+            .as_ref()
+            .map(|(file_name, text)| newt_core::ReadmePart { file_name, text }),
+        components: &components,
+    });
+    if let Some(s) = sink {
+        for n in &assembled.notes {
+            if matches!(n.label.as_str(), "soul" | "coach-soul") {
+                // #2933: the soul is reported as its components, by id. The soul
+                // provider labelled the whole block earlier; that note would
+                // swallow the pieces (and go stale once one is switched off).
+                s.forget("soul");
+                for (id, text) in &soul_pieces {
+                    s.annotate(id, "prompt_components::SOUL", text);
                 }
-            })
-            .collect();
-        names.sort();
-        ctx.push_str("\nFiles:\n");
-        for name in names.iter().take(40) {
-            ctx.push_str(&format!("  {name}\n"));
-        }
-    }
-
-    // README (truncated)
-    for readme in ["README.md", "readme.md", "README.txt"] {
-        let path = std::path::Path::new(workspace).join(readme);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let excerpt: String = text.chars().take(3000).collect();
-            ctx.push_str(&format!("\n{readme}:\n{excerpt}\n"));
-            if text.len() > 3000 {
-                ctx.push_str("...[truncated]\n");
+            } else {
+                s.annotate(&n.label, &n.source, &n.text);
             }
-            break;
         }
     }
-
-    ctx
+    assembled.text
 }
 
 // ---------------------------------------------------------------------------
 // Tool-use loop — the real agentic core
 // ---------------------------------------------------------------------------
 
+/// The operator's system prompt file (`[prompt] file`, or the session's
+/// `/settings system-prompt`), if one is set. A file that is set but cannot
+/// be used is said out loud and the assembled prompt is sent instead: the
+/// session is already running, and a dead override must not stop it.
+pub(crate) fn system_prompt_override() -> Option<newt_core::SystemPromptOverride> {
+    match try_system_prompt_override() {
+        Ok(found) => found,
+        Err(error) => {
+            print_newt(
+                &format!("{error}; sending newt's own system prompt"),
+                false,
+                false,
+            );
+            None
+        }
+    }
+}
+
+/// [`system_prompt_override`] without the warning, for per-turn checks.
+pub(crate) fn try_system_prompt_override() -> Result<Option<newt_core::SystemPromptOverride>, String>
+{
+    migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
+        .map_err(|e| e.to_string())?
+        .system_prompt_override()
+}
+
+/// [`rebuild_system_prompt_for`] over the sandbox's config, for the unit tier.
+#[cfg(test)]
 fn rebuild_system_prompt(
     workspace: &str,
     memory: &newt_core::MemoryManager,
     persona: Option<&Persona>,
     conversation_id: &str,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
 ) -> String {
-    let soul_additions = memory.build_system_prompt_additions();
-    let soul_text = if soul_additions.is_empty() {
+    let cfg = test_session_config();
+    rebuild_system_prompt_for(workspace, memory, persona, conversation_id, &cfg, sink)
+}
+
+/// The footer badge for the components in force: `pi` for the untouched preset,
+/// `custom` for any change from a preset, none for the untouched default.
+fn components_badge(set: &newt_core::prompt_components::ComponentSet) -> Option<&'static str> {
+    use newt_core::prompt_components::Preset;
+    match (set.preset(), set.is_default()) {
+        (_, true) => None,
+        (Preset::Pi, false) if set.deltas() == (Vec::new(), Vec::new()) => Some("pi"),
+        _ => Some("custom"),
+    }
+}
+
+fn rebuild_system_prompt_for(
+    workspace: &str,
+    memory: &newt_core::MemoryManager,
+    persona: Option<&Persona>,
+    conversation_id: &str,
+    cfg: &newt_core::Config,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    // #2938: the operator's file REPLACES the assembled prompt entirely.
+    let found = system_prompt_override();
+    system_prompt_edit::set_active(found.as_ref().map(|f| f.path.clone()));
+    let components = cfg.prompt_components().unwrap_or_default();
+    system_prompt_edit::set_components_badge(if found.is_some() {
         None
     } else {
-        Some(soul_additions.as_str())
+        components_badge(&components)
+    });
+    if let Some(found) = found {
+        if let Some(s) = sink {
+            s.annotate(
+                "prompt override",
+                &found.path.display().to_string(),
+                &found.text,
+            );
+        }
+        return found.text;
+    }
+    assemble_session_prompt(workspace, memory, persona, conversation_id, cfg, sink)
+}
+
+/// The assembled prompt (no `[prompt] file` override) from the session's providers
+/// and accepted config. The TUI and `newt headless` both build it here, so the same
+/// config yields the same system text.
+fn assemble_session_prompt(
+    workspace: &str,
+    memory: &newt_core::MemoryManager,
+    persona: Option<&Persona>,
+    conversation_id: &str,
+    cfg: &newt_core::Config,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    let components = cfg.prompt_components().unwrap_or_default();
+    // #2934: separate the soul/identity from the project-context additions so
+    // that coach altitude can replace the soul with COACH_SOUL without
+    // silently dropping AGENTS.md, notes, and the project map.
+    // A provider's block is a component (`project-instructions`, `notes`, ...); one
+    // that is off is neither sent nor reported.
+    let keep_provider = |name: &str| {
+        newt_core::prompt_components::provider_component(name)
+            .is_none_or(|id| components.is_on_id(id))
     };
+    let context = memory.context_additions_where(&keep_provider);
+    let context_ref = if context.is_empty() {
+        None
+    } else {
+        Some(context.as_str())
+    };
+    // #2937 P2-2: annotate each provider's block separately BEFORE building the
+    // combined prompt, so per-provider spans survive (see build_system_prompt_with_persona).
+    // Call unconditionally when a sink exists — the method skips empty blocks itself,
+    // and context providers (AGENTS.md, notes) need annotation even when soul is absent.
+    if let Some(s) = sink {
+        memory.annotate_system_prompt_additions_where(s, &keep_provider);
+    }
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
-    build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy())
+    build_system_prompt_for(
+        workspace,
+        context_ref,
+        persona,
+        &plan_path.to_string_lossy(),
+        cfg,
+        sink,
+    )
+}
+
+/// `AGENTS.md` / `CLAUDE.md` as the session reads it: `NEWT_NO_AGENTS_FILE` forces it
+/// off, `NEWT_AGENTS_FILE` forces it on (and names the file), else `[agents]`.
+pub(crate) fn project_instructions_provider(cfg: &newt_core::Config) -> newt_core::AgentsProvider {
+    let enabled = std::env::var("NEWT_NO_AGENTS_FILE").is_err()
+        && (cfg.agents.enabled || std::env::var("NEWT_AGENTS_FILE").is_ok());
+    let path = std::env::var("NEWT_AGENTS_FILE")
+        .ok()
+        .or_else(|| cfg.agents.path.clone());
+    newt_core::AgentsProvider::new(enabled, path)
+}
+
+/// The route a headless run talks to: what the TUI's startup budget is derived from.
+pub struct HeadlessRoute<'a> {
+    pub kind: newt_core::BackendKind,
+    pub backend_name: &'a str,
+    pub serving: Option<newt_core::Serving>,
+    pub model: &'a str,
+    /// `--context-window`: the served window, when given.
+    pub served_window: Option<u32>,
+}
+
+/// The system prompt `newt headless` sends: the TUI's assembled prompt for the same
+/// config, from the same providers (project instructions, notes, the active profile's
+/// API surface, the memory index). Headless has no persona. `cfg`'s `[prompt]` is
+/// whatever the caller resolved, so a `--prompt-preset` is a `cfg` the caller already
+/// changed. `knowledge_base` is whether the active profile enables it; `route`
+/// the route's context window (the API surface scales with it) is resolved by the TUI's own function.
+pub async fn headless_system_prompt(
+    workspace: &str,
+    cfg: &newt_core::Config,
+    knowledge_base: bool,
+    route: &HeadlessRoute<'_>,
+    sink: Option<&newt_core::agentic::request_report::ReportSink>,
+) -> String {
+    let mut memory = newt_core::MemoryManager::new();
+    let budget = chat::headless_memory_budget(
+        cfg,
+        route.kind,
+        route.backend_name,
+        route.serving,
+        route.model,
+        route.served_window,
+    );
+    chat::add_prompt_providers(&mut memory, cfg, workspace, knowledge_base, budget);
+    let session = newt_core::lifecycle::new_session_id().to_string();
+    memory
+        .initialize_all(&newt_core::SessionContext {
+            workspace: workspace.to_string(),
+            session_id: session.clone(),
+        })
+        .await;
+    assemble_session_prompt(workspace, &memory, None, &session, cfg, sink)
+}
+
+/// Keep the active posture's preloaded skill in step with `[skills] off`: a posture binds
+/// its skill by the `skill` of its `[modes.<name>]` entry, and loaded the body once at
+/// `/posture`. Switching that skill off drops the body from the next turn; switching it on
+/// again reloads it. Returns whether the posture changed.
+pub(crate) fn reconcile_posture_skill(cfg: &newt_core::Config) -> bool {
+    let Some(mut posture) = newt_core::posture::active_posture() else {
+        return false;
+    };
+    // The skill bound AT ACTIVATION, not whatever the config maps the name to now.
+    let Some(skill) = posture.skill.clone() else {
+        return false;
+    };
+    if cfg.skill_is_off(&skill) {
+        if posture.skill_body.take().is_none() {
+            return false;
+        }
+    } else if posture.skill_body.is_none() {
+        match cfg.load_skill_body(&skill) {
+            Ok(body) => posture.skill_body = Some(body),
+            Err(_) => return false,
+        }
+    } else {
+        return false;
+    }
+    newt_core::posture::set_active_posture(Some(posture));
+    true
 }
 
 fn handle_operating_mode_command(
@@ -6110,10 +6555,7 @@ fn handle_posture_command(arg: &str, cfg: &newt_core::Config, color: bool, verbo
     // Resolve + validate WITHOUT mutating. The skill loader reuses the SAME
     // `use_skill` path (`load_body_from` over the configured search dirs) —
     // skill dirs are config-rooted, exactly as the `use_skill` tool resolves.
-    let skills_dirs = cfg.skill_search_dirs();
-    let posture = build_posture(arg, cfg, |skill_name| {
-        newt_skills::load_body_from(&skills_dirs, skill_name)
-    });
+    let posture = build_posture(arg, cfg, |skill_name| cfg.load_skill_body(skill_name));
     let posture = match posture {
         Ok(posture) => posture,
         Err(e) => {
@@ -6216,10 +6658,13 @@ fn persona_list(store: &PersonaStore) -> anyhow::Result<String> {
 }
 
 struct ConversationResetContext<'a> {
+    /// The session's accepted config, which the rebuilt prompt renders from.
+    cfg: &'a newt_core::Config,
     memory: &'a mut newt_core::MemoryManager,
     system: &'a mut String,
     conversation_id: &'a mut String,
     mode_states: &'a ConversationModeStates,
+    sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 fn reset_conversation(
@@ -6233,7 +6678,14 @@ fn reset_conversation(
     // survive any of those paths.
     ctx.mode_states.clear();
     ctx.memory.reset_all();
-    *ctx.system = rebuild_system_prompt(workspace, ctx.memory, active_persona, ctx.conversation_id);
+    *ctx.system = rebuild_system_prompt_for(
+        workspace,
+        ctx.memory,
+        active_persona,
+        ctx.conversation_id,
+        ctx.cfg,
+        ctx.sink,
+    );
 }
 
 fn new_conversation_message(active_persona: Option<&Persona>) -> String {
@@ -6824,6 +7276,8 @@ fn conversation_show_message(record: &newt_core::ConversationRecord) -> String {
 }
 
 struct ConversationCommandContext<'a> {
+    /// The session's accepted config, which the rebuilt prompt renders from.
+    cfg: &'a newt_core::Config,
     store: &'a newt_core::ConversationStore,
     persona_store: &'a PersonaStore,
     workspace: &'a str,
@@ -6850,6 +7304,7 @@ struct ConversationCommandContext<'a> {
     /// successful restore is a hard boundary and clears it before adopting
     /// the restored conversation, including A→B→A switches.
     mode_states: &'a ConversationModeStates,
+    sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 fn handle_conversation_command(
@@ -7033,6 +7488,7 @@ pub(crate) fn prepare_conversation_restore(
 /// Every field here is one `ConversationCommandContext` already owns; this is a
 /// narrowing reborrow, not a second source of truth.
 pub(crate) struct CommitContext<'a> {
+    pub cfg: &'a newt_core::Config,
     pub workspace: &'a str,
     pub memory: &'a mut newt_core::MemoryManager,
     pub system: &'a mut String,
@@ -7043,12 +7499,14 @@ pub(crate) struct CommitContext<'a> {
     pub step_ledger: &'a dyn newt_core::StepLedger,
     pub active_prompt_context: &'a mut Option<newt_core::TurnPromptContext>,
     pub mode_states: &'a ConversationModeStates,
+    pub sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 impl<'a> ConversationCommandContext<'a> {
     /// Narrow to what commit may touch — dropping the two stores.
     pub(crate) fn commit_context(&mut self) -> CommitContext<'_> {
         CommitContext {
+            cfg: self.cfg,
             workspace: self.workspace,
             memory: self.memory,
             system: self.system,
@@ -7059,6 +7517,7 @@ impl<'a> ConversationCommandContext<'a> {
             step_ledger: self.step_ledger,
             active_prompt_context: self.active_prompt_context,
             mode_states: self.mode_states,
+            sink: self.sink,
         }
     }
 }
@@ -7143,11 +7602,13 @@ fn commit_prepared(
     seat_persona_dials(ctx.active_persona.as_ref());
     ctx.compress_state.reset();
     *ctx.active_conversation_id = record.id.clone();
-    *ctx.system = rebuild_system_prompt(
+    *ctx.system = rebuild_system_prompt_for(
         ctx.workspace,
         ctx.memory,
         ctx.active_persona.as_ref(),
         ctx.active_conversation_id,
+        ctx.cfg,
+        ctx.sink,
     );
     (record, warning)
 }
@@ -7773,11 +8234,13 @@ fn handle_persona_command(
                 // Persistent-actor swap: rebuild the system prompt for the new
                 // role WITHOUT discarding the conversation history — same
                 // conversation, same plan file.
-                *ctx.system = rebuild_system_prompt(
+                *ctx.system = rebuild_system_prompt_for(
                     workspace,
                     ctx.memory,
                     active_persona.as_ref(),
                     ctx.conversation_id,
+                    ctx.cfg,
+                    ctx.sink,
                 );
                 Ok(persona_swap_kept_context_message(active_persona.as_ref()))
             } else {
@@ -7830,7 +8293,7 @@ fn time_marker_secs(cfg: &newt_core::Config) -> u64 {
     cfg.tui.as_ref().map(|t| t.time_marker_secs).unwrap_or(300)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SpillCommand {
     Status,
     Set(usize),
@@ -7841,8 +8304,8 @@ enum SpillCommand {
     Excerpt,
     /// Open the newest retained completed result.
     Last,
-    /// Open one stable, session-local retained result.
-    Open(u64),
+    /// Open one retained result by its content id or a unique tail of it.
+    Open(String),
 }
 
 /// Apply a parsed `/spill` command to the two session overrides. Pure and
@@ -7884,15 +8347,28 @@ fn parse_spill_command(input: &str) -> anyhow::Result<SpillCommand> {
 
     let arg = rest.trim();
     let normalized = arg.to_ascii_lowercase();
+    // #3022: a bare `open` gestures at the newest retained spill.
+    if normalized == "open" {
+        return Ok(SpillCommand::Last);
+    }
     if let Some(value) = normalized.strip_prefix("open ") {
-        let id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("/spill open needs a positive result id"))?;
-        if id == 0 || value.split_whitespace().count() != 1 {
-            anyhow::bail!("/spill open needs one positive result id");
+        let tail = value.trim();
+        if tail.is_empty() {
+            return Ok(SpillCommand::Last);
         }
-        return Ok(SpillCommand::Open(id));
+        if tail.split_whitespace().count() != 1 {
+            anyhow::bail!("/spill open needs one result id");
+        }
+        if tail.len() < newt_core::agentic::MIN_SPILL_TAIL_CHARS {
+            anyhow::bail!(
+                "/spill open needs at least {} characters of the result id",
+                newt_core::agentic::MIN_SPILL_TAIL_CHARS
+            );
+        }
+        if !tail.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')) {
+            anyhow::bail!("/spill open takes the base32 result id shown on the marker");
+        }
+        return Ok(SpillCommand::Open(tail.to_string()));
     }
     match normalized.as_str() {
         "" | "show" | "status" => Ok(SpillCommand::Status),
@@ -8137,7 +8613,7 @@ impl SpillEligibility {
             Self::TermDumb => "live interaction unavailable: TERM=dumb disclaims cursor control",
             Self::TerminalOwnedByCockpit => {
                 "live interaction unavailable: the cockpit owns the terminal \
-                 (committed results stay full; /spill open <id> reopens one)"
+                 (committed results stay full; /spill open reopens the newest)"
             }
         }
     }

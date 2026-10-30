@@ -318,7 +318,7 @@ adds something the model must remember.
 ## Content-addressable data structures — the base rule
 
 **Every data structure that is persisted, transmitted, chained, or identified
-derives its identity from the `content-addressable` crate (v0.1.1). Hand-rolling
+derives its identity from the `content-addressable` crate (pinned `=0.1.3`). Hand-rolling
 a hash, digest, id, or canonical encoding is a defect, not a style choice.**
 
 This sits at the same tier as TDD discipline below. It is not advice.
@@ -331,6 +331,7 @@ This sits at the same tier as TDD discipline below. It is not advice.
 | an opaque **byte string** (a file, a payload, a tool result, a cache key) | `RawContentId` — CIDv1, raw, BLAKE3 |
 | a node with **causal parents** (a chain or DAG link) | `MerkleNode<T>` — id derived over payload AND parents |
 | **storing** addressed nodes | `NodeStore` (`StoreError::Backend` anticipates a disk backend) |
+| a **directory tree** (a tool tree) | `structures::dir_tree` — one root id over named files; `newt caps digest` |
 | carrying a **foreign** CID without minting it | `ClassifiedCid` |
 
 `ContentId` and `RawContentId` are **different identities even with identical

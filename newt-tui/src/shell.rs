@@ -776,6 +776,29 @@ mod tests {
         }
     }
 
+    /// #3056: a summary longer than its column ran straight into the
+    /// accelerator — `server launch[i]` in the live `/settings`.
+    #[test]
+    fn a_long_summary_keeps_a_gap_before_its_accelerator() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut inference = link("Inference", 'i');
+        inference.summary = "window · ceiling · thinking · sampling · server launch".into();
+        let shell = Shell::new(vec![link("Session", 's'), inference]);
+        let mut term = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        term.draw(|frame| shell.draw(frame)).unwrap();
+        let buffer = term.backend().buffer();
+        let row = (0..8)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("Inference"))
+            .expect("the section is listed");
+        assert!(row.contains("server launch [i]"), "{row}");
+    }
+
     /// The index renders one row per section, with its accelerator, and the
     /// section draws instead once it is open.
     #[test]

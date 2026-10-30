@@ -27,15 +27,18 @@ pub use backend::{
     RequestMeter, RequestMode, Serving,
 };
 pub use context::{
-    compaction_trigger_is_session_pinned, input_percentage_ceiling, normalize_input_ceiling_pct,
-    session_compaction_trigger_policy, CompactionTriggerPolicy, ContextConfig, ContextFeature,
-    ContextFeatureSet, ContextFeatures, ContextManager,
+    compaction_trigger_is_session_pinned, context_index_enabled, input_percentage_ceiling,
+    normalize_input_ceiling_pct, session_compaction_trigger_policy, CompactionTriggerPolicy,
+    ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextIndex,
+    ContextManager, CONTEXT_INDEX_ENV,
 };
 pub use crew::{Crew, CrewBudgets, CrewPolicyConfig};
 pub use dropin::*;
+#[cfg(test)]
+pub(crate) use layering::CONTROL_PLANE_KEYS;
 pub(crate) use layering::{
     expand_tilde, find_ancestor_dir, find_project_config_from, find_project_file_from, home_dir,
-    merge_project_overlay, merge_toml, strip_control_plane,
+    merge_project_overlay, merge_toml, project_dirs_from, resolve_or_self, strip_control_plane,
 };
 pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use loadout::{Loadout, LoadoutSettings};
@@ -50,12 +53,13 @@ pub use profile::{
     BundleConfig, PickVia, ProfileConfig, ProfilePick, RetryKnobs, VerifyGateKnobs,
     KNOWN_TECHNIQUES,
 };
+pub use prompt::{ComponentDeltas, PromptConfig, SystemPromptOverride, SYSTEM_PROMPT_FILE_ENV};
 pub use semantic::{OnEmbedFailure, SemanticConfig};
 pub use skills::SkillsConfig;
 pub(crate) use smart_harness::{normalize_path, resolve_uncreated_path, validate_stable_anchor};
 pub use smart_harness::{HarnessLaunch, SmartHarnessConfig};
 pub use summarizer::SummarizerConfig;
-pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
+pub use tool_exposure::{ExposureProfile, ToolExposureConfig, PI_PRESET_TOOLS};
 pub use tools::ToolsConfig;
 mod command_budget;
 pub use command_budget::RunCommandBudget;
@@ -71,7 +75,9 @@ mod memory;
 mod permissions;
 mod presentation;
 mod profile;
+mod prompt;
 mod redact;
+mod self_edit;
 mod semantic;
 mod shell;
 mod skills;
@@ -87,6 +93,7 @@ use context::default_input_ceiling_pct;
 use layering::{array_merge_strategy, base_is_ambient_newt_toml, mark_project_mcp_untrusted};
 use presentation::{default_spill_lines, default_time_marker_secs, default_tool_output_lines};
 use redact::{redact_arg_secrets, redact_url_secrets};
+pub use self_edit::{backup_path, ConfigEdit};
 pub use shell::{
     confined_default_engine, full_access_default_engine, mcp_stdio_env_passthrough,
     ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
@@ -238,6 +245,11 @@ pub struct Config {
     /// authorized catalog). See [`ToolExposureConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_exposure: Option<ToolExposureConfig>,
+
+    /// `[prompt]` — `file` replaces the assembled system prompt entirely
+    /// (#2938). `None` → newt assembles its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<PromptConfig>,
 
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1379,6 +1391,7 @@ impl Default for Config {
             tools: None,
             initiative: None,
             tool_exposure: None,
+            prompt: None,
             pricing: None,
             memory: None,
             agents: AgentsConfig::default(),
@@ -1407,23 +1420,39 @@ impl Default for Config {
 impl Config {
     /// Load configuration from an explicit file path.
     pub fn load(path: &Path, report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Result<Self> {
-        let text = Self::read_text(path, report)?;
+        Self::load_with_held_locks(path, &[], report)
+    }
+
+    /// Load configuration while respecting locks the caller already holds.
+    ///
+    /// This is the path for multi-file transactions (for example, MCP import)
+    /// that have already locked the consulted configs and must re-read them
+    /// without self-contention.
+    pub fn load_with_held_locks(
+        path: &Path,
+        held_locks: &[&crate::atomic_fs::LockGuard],
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<Self> {
+        let text = Self::read_text_with_held_locks(path, held_locks, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
     /// Read a config file's text for decoding: the ONE file-read chokepoint
-    /// ([`Self::load`] and every layered path through `load_value`). It runs
-    /// the psyche importer first, so a pre-split `[tenacity]` table reaches
+    /// ([`Self::load`] and every layered path through `load_value_with_held_locks`).
+    /// It runs the psyche importer first, so a pre-split `[tenacity]` table reaches
     /// the typed decode as `[initiative]`. Only the operator's own config
     /// (under [`Self::user_config_dir`]) is rewritten on disk; a project,
     /// ambient, `/etc` or explicitly named file is shared or untrusted, so it
     /// is translated in memory with a warning.
-    fn read_text(
+    fn read_text_with_held_locks(
         path: &Path,
+        held_locks: &[&crate::atomic_fs::LockGuard],
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<String> {
         let own = Self::user_config_dir().is_some_and(|dir| path.starts_with(dir));
-        Ok(crate::psyche_import::read_config_file(path, own, report)?)
+        Ok(crate::psyche_import::read_config_file(
+            path, own, held_locks, report,
+        )?)
     }
 
     /// Resolve configuration by searching well-known locations, then layering a
@@ -1504,6 +1533,19 @@ impl Config {
     pub fn resolve_runtime_unpublished(
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<ResolvedConfig> {
+        Self::resolve_runtime_unpublished_with_held_locks(report, &[])
+    }
+
+    /// [`Self::resolve_runtime_unpublished`] while respecting locks the caller
+    /// already holds, so re-reading a held base or project config does not
+    /// self-contend. Used by multi-file transactions such as MCP import.
+    ///
+    /// # Errors
+    /// Any config-load error `resolve` itself would surface.
+    pub fn resolve_runtime_unpublished_with_held_locks(
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+        held_locks: &[&crate::atomic_fs::LockGuard],
+    ) -> Result<ResolvedConfig> {
         let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
@@ -1530,13 +1572,13 @@ impl Config {
                     // the base vector the convergence audit surfaced. A
                     // `$NEWT_CONFIG`-pinned / user-home / `/etc` base is
                     // operator-explicit (Trusted) and loaded verbatim.
-                    let mut base_val = Self::load_value(p, report)?;
+                    let mut base_val = Self::load_value_with_held_locks(p, held_locks, report)?;
                     strip_control_plane(&mut base_val);
                     base_val
                         .try_into()
                         .map_err(|e| NewtError::Config(e.to_string()))?
                 } else {
-                    Self::load(p, report)?
+                    Self::load_with_held_locks(p, held_locks, report)?
                 }
             }
             (None, None) => Self::default(),
@@ -1544,7 +1586,7 @@ impl Config {
             // config when there is no base file).
             (base, Some(proj)) => {
                 let mut merged = match base {
-                    Some(p) => Self::load_value(p, report)?,
+                    Some(p) => Self::load_value_with_held_locks(p, held_locks, report)?,
                     None => toml::Value::try_from(Self::default())
                         .map_err(|e| NewtError::Config(e.to_string()))?,
                 };
@@ -1554,7 +1596,7 @@ impl Config {
                 if base_ambient {
                     strip_control_plane(&mut merged);
                 }
-                let project_val = Self::load_value(proj, report)?;
+                let project_val = Self::load_value_with_held_locks(proj, held_locks, report)?;
                 // The merge strategy is itself config: the project declares how
                 // it wants to be merged (`[merge] arrays = ...`), else the global
                 // config's setting, else the built-in default (Replace).
@@ -1613,26 +1655,23 @@ impl Config {
         // hand-deconflict. Runs first so disk loadouts/crews can name a disk
         // backend's provider.
         // The backend assembly: identity validation FIRST (name-keyed
-        // machinery is unsound on duplicate/empty names), then per-file
-        // drop-ins from the `backends/` dirs next to the config —
-        // `~/.newt/backends/*.toml` first, then the project
-        // `.newt/backends/` (so project overrides home overrides inline
-        // `[[backends]]`).
+        // machinery is unsound on duplicate/empty names), then the operator's
+        // per-file drop-ins in `~/.newt/backends/` (home overrides inline
+        // `[[backends]]`). A project's `.newt/backends/` is NOT merged: an
+        // endpoint is control plane (`CONTROL_PLANE_KEYS` strips `backends`
+        // from a project config for the same reason), and a drop-in there
+        // could replace an operator backend by name and receive every prompt.
         let mut assembly =
             BackendAssembly::new(std::mem::take(&mut cfg.backends)).map_err(NewtError::Config)?;
         validate_provider_names(&cfg.providers).map_err(NewtError::Config)?;
+        cfg.prompt_components().map_err(NewtError::Config)?;
         if let Some(dir) = Self::user_config_dir() {
             assembly
                 .merge_dir(&dir.join("backends"))
                 .map_err(NewtError::Config)?;
         }
-        if let Some(proj) = Self::project_config_path() {
-            if let Some(parent) = proj.parent() {
-                assembly
-                    .merge_dir(&parent.join("backends"))
-                    .map_err(NewtError::Config)?;
-            }
-        }
+        report_ignored_project_endpoint_dropins(report);
+        report_retired_soul(&cfg, report);
         // A successfully merged operator drop-in is operator-supplied
         // configuration — the resolved backend list is no longer the bare
         // compiled-in fallback (see `is_unconfigured`).
@@ -1722,6 +1761,7 @@ impl Config {
         let mut assembly =
             BackendAssembly::new(std::mem::take(&mut self.backends)).map_err(NewtError::Config)?;
         validate_provider_names(&self.providers).map_err(NewtError::Config)?;
+        self.prompt_components().map_err(NewtError::Config)?;
         let default_backend = self.default_backend.clone();
         let over = cli_backend_override();
         let requested_slot = assembly
@@ -1796,7 +1836,7 @@ impl Config {
     /// The resolved `[tool_exposure]` policy, or the identity (`Full`) default
     /// when the section is absent. See [`ToolExposureConfig`].
     pub fn tool_exposure(&self) -> ToolExposureConfig {
-        self.tool_exposure.unwrap_or_default()
+        self.tool_exposure.clone().unwrap_or_default()
     }
 
     /// The configured head allocation for oversized `run_command` output
@@ -1830,19 +1870,14 @@ impl Config {
         validate_backend_names(self.backends.iter())
     }
 
-    /// Merge per-file DGX nodes from the `dgx/` dirs next to the config:
-    /// `~/.newt/dgx/*.toml` first, then the project `.newt/dgx/` (so project
-    /// overrides home overrides inline `[[dgx.nodes]]`). Filename stem = node
-    /// name. A malformed drop-in is skipped with a warning; it must not break
-    /// startup.
+    /// Merge the operator's per-file DGX nodes from `~/.newt/dgx/*.toml` (home
+    /// overrides inline `[[dgx.nodes]]`). A project's `.newt/dgx/` is not
+    /// merged: a node is an endpoint plus ssh, which `CONTROL_PLANE_KEYS`
+    /// keeps out of a project config. Filename stem = node name. A malformed
+    /// drop-in is skipped with a warning; it must not break startup.
     fn merge_disk_dgx_nodes(&mut self) {
         if let Some(dir) = Self::user_config_dir() {
             self.merge_dgx_nodes_from_dir(&dir.join("dgx"));
-        }
-        if let Some(proj) = Self::project_config_path() {
-            if let Some(parent) = proj.parent() {
-                self.merge_dgx_nodes_from_dir(&parent.join("dgx"));
-            }
         }
     }
 
@@ -1885,12 +1920,14 @@ impl Config {
         }
     }
 
-    /// Load a config file as a raw `toml::Value` (for layered merging).
-    fn load_value(
+    /// Load a config file as a raw `toml::Value`, respecting locks the caller
+    /// already holds so re-reading a held config does not self-contend.
+    fn load_value_with_held_locks(
         path: &Path,
+        held_locks: &[&crate::atomic_fs::LockGuard],
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<toml::Value> {
-        let text = Self::read_text(path, report)?;
+        let text = Self::read_text_with_held_locks(path, held_locks, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
@@ -2178,6 +2215,151 @@ impl Config {
         Ok(doc.to_string())
     }
 
+    /// Set `[tool_exposure] allow_list` (#2932) — `None` removes the key, so
+    /// the model sees the whole catalog again — preserving the rest of the
+    /// document exactly as [`with_tui_key`](Self::with_tui_key) does. PURE:
+    /// the caller owns the filesystem write.
+    pub fn with_tool_exposure_allow_list(
+        text: &str,
+        allow_list: Option<&[&str]>,
+    ) -> Result<String> {
+        Self::with_tool_exposure_item(
+            text,
+            "allow_list",
+            allow_list.map(|names| {
+                let mut array = toml_edit::Array::new();
+                for name in names {
+                    array.push(*name);
+                }
+                toml_edit::value(array)
+            }),
+        )
+    }
+
+    /// Set `[tool_exposure] read_only` (#2932), preserving the rest of the
+    /// document. PURE: the caller owns the filesystem write.
+    pub fn with_tool_exposure_read_only(text: &str, read_only: bool) -> Result<String> {
+        Self::with_tool_exposure_item(text, "read_only", Some(toml_edit::value(read_only)))
+    }
+
+    fn with_tool_exposure_item(
+        text: &str,
+        key: &str,
+        item: Option<toml_edit::Item>,
+    ) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("tool_exposure")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`tool_exposure` is not a table".to_string()))?;
+        match item {
+            Some(mut item) => {
+                // Keep the old value's trailing comment and spacing, as
+                // `with_default_backend` does.
+                if let (Some(new), Some(old)) = (
+                    item.as_value_mut(),
+                    table.get(key).and_then(toml_edit::Item::as_value),
+                ) {
+                    *new.decor_mut() = old.decor().clone();
+                }
+                table.insert(key, item);
+            }
+            None => {
+                table.remove(key);
+            }
+        }
+        Ok(doc.to_string())
+    }
+
+    /// Set `[prompt] preset` and `components` (#2933) to the given preset and deltas,
+    /// dropping `preset` for `default` and `components` when both are empty, preserving the rest of the document. PURE: the caller owns
+    /// the filesystem write.
+    pub fn with_prompt_components(
+        text: &str,
+        preset: &str,
+        on: &[&str],
+        off: &[&str],
+    ) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("prompt")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`prompt` is not a table".to_string()))?;
+        if on.is_empty() && off.is_empty() {
+            table.remove("components");
+        } else {
+            let list = |names: &[&str]| {
+                let mut array = toml_edit::Array::new();
+                for name in names {
+                    array.push(*name);
+                }
+                toml_edit::Value::Array(array)
+            };
+            let mut inline = toml_edit::InlineTable::new();
+            if !on.is_empty() {
+                inline.insert("on", list(on));
+            }
+            if !off.is_empty() {
+                inline.insert("off", list(off));
+            }
+            replace_in_place(table, "components", toml_edit::value(inline));
+        }
+        if preset == "default" {
+            // An existing `preset = "default"` is not ours to delete: a component edit
+            // leaves it, comments and all. Any other value is normalised away.
+            if table.get("preset").and_then(toml_edit::Item::as_str) != Some("default") {
+                table.remove("preset");
+            }
+        } else {
+            replace_in_place(table, "preset", toml_edit::value(preset));
+        }
+        Ok(doc.to_string())
+    }
+
+    /// Set `[skills] off` (`/settings skills on|off`), removing the key when `off` is
+    /// empty and preserving the rest of the document. PURE: the caller owns the write.
+    pub fn with_skills_off(text: &str, off: &[&str]) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("skills")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`skills` is not a table".to_string()))?;
+        if off.is_empty() {
+            table.remove("off");
+        } else {
+            let mut array = toml_edit::Array::new();
+            for name in off {
+                array.push(*name);
+            }
+            replace_in_place(table, "off", toml_edit::value(array));
+        }
+        Ok(doc.to_string())
+    }
+
     /// Set `enabled` on the named `[[mcp_servers]]` entry, preserving comments
     /// and formatting (`/mcp enable|disable`, #1149). PURE (no I/O) like
     /// [`with_net_host`](Self::with_net_host); the caller does the read/write.
@@ -2314,3 +2496,170 @@ mod tests;
 mod select_backend_tests;
 
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 21:30 EDT | Date: 2026-08-12
+
+/// Endpoint drop-in dirs a project may ship but newt never merges: each one
+/// names an inference endpoint or a DGX host, which is control plane.
+const PROJECT_ENDPOINT_DROPIN_DIRS: &[&str] = &["backends", "dgx"];
+
+/// Warn when the project's `.newt/` carries endpoint drop-ins, so a repo that
+/// relied on them learns they are ignored instead of silently losing them.
+/// Each dir is found on its own walk, so a repo cannot dodge the warning by
+/// omitting `.newt/config.toml`; the path is neutralised before display, since
+/// a repo controls the directory names in it.
+fn report_ignored_project_endpoint_dropins(report: &mut dyn FnMut(crate::tty::Notice<'static>)) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let home = home_dir();
+    for kind in PROJECT_ENDPOINT_DROPIN_DIRS {
+        // The first ancestor dir that actually holds a drop-in, so an empty
+        // nested `.newt/<kind>/` cannot hide an ancestor's.
+        let Some(dir) =
+            layering::find_project_entry_from(&cwd, home.as_deref(), kind, dir_has_toml)
+        else {
+            continue;
+        };
+        let shown = dir.display().to_string();
+        report(crate::tty::Notice::new(
+            crate::tty::Level::Warn,
+            "",
+            format!(
+                "newt: warning: ignoring {}: a project cannot supply inference endpoints; \
+                 move a file you trust to ~/.newt/{kind}/",
+                crate::notes_scan::neutralize_for_display(&shown)
+            ),
+        ));
+    }
+}
+
+/// One-release notice (#2933): the soul is components now. A `soul.md` in the project
+/// or the user config directory, or `[memory] soul_file`, is no longer read; say so
+/// once per source, and point at `[prompt] file`, which replaces the whole prompt.
+fn report_retired_soul(cfg: &Config, report: &mut dyn FnMut(crate::tty::Notice<'static>)) {
+    let cwd = std::env::current_dir().ok();
+    let user_dir = Config::user_config_dir();
+    for source in retired_soul_sources(
+        cfg,
+        cwd.as_deref(),
+        home_dir().as_deref(),
+        user_dir.as_deref(),
+    ) {
+        if !first_report_of(&source) {
+            continue;
+        }
+        report(crate::tty::Notice::new(
+            crate::tty::Level::Warn,
+            "",
+            format!(
+                "newt: warning: ignoring {}: the soul is built from components now. Tune it \
+                 with `[prompt] components` or `/settings system-prompt`; to keep a prompt of \
+                 your own, put it in a file and set `[prompt] file = \"<path>\"`. This notice \
+                 goes away next release.",
+                crate::notes_scan::neutralize_for_display(&source)
+            ),
+        ));
+    }
+}
+
+/// True the first time `source` is reported in this session. Config is re-resolved at
+/// startup and after every refresh, and a notice per read would repeat all session.
+/// (Thread-local under test, so parallel tests do not share the set.)
+fn first_report_of(source: &str) -> bool {
+    #[cfg(not(test))]
+    {
+        static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        SEEN.lock()
+            .map_or(true, |mut seen| seen.insert(source.to_string()))
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static SEEN: std::cell::RefCell<std::collections::BTreeSet<String>> =
+                const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+        }
+        SEEN.with(|seen| seen.borrow_mut().insert(source.to_string()))
+    }
+}
+
+/// What the retired soul mechanism left behind: `[memory] soul_file`, a project
+/// `.newt/soul.md`, and the user config directory's `soul.md`.
+fn retired_soul_sources(
+    cfg: &Config,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    user_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut sources: Vec<String> = Vec::new();
+    if let Some(path) = cfg.memory.as_ref().and_then(|m| m.soul_file.as_ref()) {
+        sources.push(format!("[memory] soul_file = {path:?}"));
+    }
+    if let Some(found) =
+        cwd.and_then(|cwd| layering::find_project_entry_from(cwd, home, "soul.md", Path::is_file))
+    {
+        sources.push(found.display().to_string());
+    }
+    if let Some(user) = user_dir.map(|d| d.join("soul.md")).filter(|p| p.is_file()) {
+        sources.push(user.display().to_string());
+    }
+    sources
+}
+
+fn dir_has_toml(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "toml"))
+    })
+}
+
+/// Set `key` to `item`, keeping the key and the old value's decoration (comments,
+/// spacing) when the key already exists: the key's own comment lives with the key,
+/// so replace the item in place rather than inserting a fresh key.
+fn replace_in_place(table: &mut toml_edit::Table, key: &str, mut item: toml_edit::Item) {
+    match table.get_mut(key) {
+        Some(existing) => {
+            if let (Some(new), Some(old)) = (item.as_value_mut(), existing.as_value()) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *existing = item;
+        }
+        None => {
+            table.insert(key, item);
+        }
+    }
+}
+
+#[cfg(test)]
+mod retired_soul_tests {
+    use super::*;
+
+    /// #2933 PR7: each leftover of the retired soul mechanism is named once.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn each_retired_soul_source_is_named() {
+        let root = tempfile::TempDir::new().unwrap();
+        let project = root.path().join("proj");
+        let user = root.path().join("user");
+        std::fs::create_dir_all(project.join(".newt")).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let cfg: Config = toml::from_str("[memory]\nsoul_file = \"/x/soul.md\"\n").unwrap();
+        let none: Config = toml::from_str("").unwrap();
+
+        assert!(retired_soul_sources(&none, Some(&project), None, Some(&user)).is_empty());
+        assert_eq!(
+            retired_soul_sources(&cfg, Some(&project), None, Some(&user)),
+            ["[memory] soul_file = \"/x/soul.md\""]
+        );
+        std::fs::write(project.join(".newt/soul.md"), "mine").unwrap();
+        std::fs::write(user.join("soul.md"), "mine too").unwrap();
+        let found = retired_soul_sources(&cfg, Some(&project), None, Some(&user));
+        assert_eq!(found.len(), 3, "{found:?}");
+        // Compared as paths: a Windows rendering separates with `\`.
+        assert!(
+            Path::new(&found[1]).ends_with(Path::new("proj").join(".newt").join("soul.md"))
+                && Path::new(&found[2]).ends_with(Path::new("user").join("soul.md")),
+            "{found:?}"
+        );
+    }
+}

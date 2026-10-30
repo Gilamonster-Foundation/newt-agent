@@ -100,6 +100,8 @@ fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
             // #728: advertised ALWAYS (a model must always be able to ask the
             // human; degrades honestly headless), pushed last.
             "request_user_input",
+            // #144: advertised ALWAYS; refuses without an operator gate.
+            "propose_config_edit",
             // #891: advertised ALWAYS (the model-facing lifecycle surface;
             // degrades honestly with "no command configured"), pushed after
             // request_user_input.
@@ -161,9 +163,26 @@ fn builtin_tool_names_are_unique() {
 /// fails here.
 #[test]
 fn advertised_set_matches_all_tool_names_both_directions() {
+    /// A bridge that discovered a server, so the `Gate::Mcp` tools are on too.
+    struct DiscoveredMcp;
+    #[async_trait::async_trait]
+    impl McpTools for DiscoveredMcp {
+        fn handles(&self, _name: &str) -> bool {
+            false
+        }
+        fn tool_defs(&self) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+        async fn call(&mut self, _leased: &crate::agentic::mcp::LeasedMcpCall<'_>) -> String {
+            String::new()
+        }
+        fn server_status(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!([]))
+        }
+    }
     let git = Some(&crate::caveats::Scope::All);
     let all = merged_tool_definitions(
-        &NoMcp,
+        &DiscoveredMcp,
         true,
         true,
         true,
@@ -891,4 +910,17 @@ fn publish_2796_catalog_guidance() {
         let description = defs[0]["function"]["description"].as_str().unwrap();
         assert!(description.contains("To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials."), "{description}");
     }
+}
+
+/// #2949: the base catalog (the eleven always-on tools) serialized as sent to
+/// the model, as a ceiling that only ratchets DOWN. The number is what the
+/// diet left; a description that grows past it needs a reason in its PR.
+#[test]
+fn base_catalog_2949_chars_ratchet() {
+    const CEILING: usize = 7966;
+    let chars = serde_json::to_string(&tool_definitions()).unwrap().len();
+    assert!(
+        chars <= CEILING,
+        "base catalog is {chars} chars as sent; ceiling {CEILING}"
+    );
 }

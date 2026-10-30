@@ -316,9 +316,10 @@ fn post_compaction_continuation_reanchors_on_ground_truth() {
         None,
         None,
         prompt_read::PromptReadContext::new(None, "", None),
+        &Default::default(),
     );
     assert!(d.contains("re-anchor on ground truth"), "{d}");
-    assert!(d.contains("git branch"), "{d}");
+    assert!(d.contains("current branch"), "{d}");
     assert!(
         d.contains("clean working tree does NOT mean no work happened"),
         "{d}"
@@ -343,6 +344,7 @@ fn post_compaction_continuation_preserves_work_but_defers_to_operator_correction
         None,
         Some(&ledger),
         prompt_read::PromptReadContext::new(None, "", None),
+        &Default::default(),
     );
     // The full plan is present — including the not-yet-reached step.
     assert!(
@@ -363,6 +365,7 @@ fn post_compaction_continuation_preserves_work_but_defers_to_operator_correction
         None,
         None,
         prompt_read::PromptReadContext::new(None, "", None),
+        &Default::default(),
     );
     assert!(!empty.contains("saved plan is below"), "{empty}");
 }
@@ -381,6 +384,7 @@ fn post_compaction_continuation_points_to_the_immutable_prompt_without_quoting_i
         None,
         None,
         prompt_read::PromptReadContext::new(Some(&turn), task, None),
+        &Default::default(),
     );
     assert!(d.contains(&turn.active().id().to_string()), "{d}");
     assert!(d.contains(turn.active().model_digest()), "{d}");
@@ -416,6 +420,7 @@ fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt(
         CompressAction::Summarized,
         None,
         prompt_context,
+        &Default::default(),
         true,
         |_| true,
     );
@@ -470,6 +475,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         CompressAction::Pruned,
         None,
         prompt_context,
+        &Default::default(),
         true,
         |_| true,
     );
@@ -486,6 +492,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         CompressAction::Summarized,
         None,
         prompt_context,
+        &Default::default(),
         false,
         |_| true,
     );
@@ -502,6 +509,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         CompressAction::Summarized,
         None,
         prompt_context,
+        &Default::default(),
         true,
         |_| true,
     );
@@ -559,6 +567,7 @@ fn post_compaction_optional_hint_obeys_each_provider_budget() {
             CompressAction::StaticFallback,
             None,
             prompt,
+            &Default::default(),
             true,
             |_| true,
         );
@@ -591,6 +600,7 @@ fn post_compaction_optional_hint_obeys_each_provider_budget() {
                 CompressAction::StaticFallback,
                 None,
                 prompt,
+                &Default::default(),
                 true,
                 admits,
             );
@@ -607,4 +617,37 @@ fn post_compaction_optional_hint_obeys_each_provider_budget() {
             );
         }
     }
+}
+
+/// #2932 round 3: the continuation keeps pointing at the protected prompt but
+/// recommends `prompt_read` / `artifact_read` only when the operator left
+/// them visible.
+#[test]
+fn post_compaction_continuation_omits_recovery_recipes_for_operator_hidden_tools() {
+    let task = "make a plan, make a branch, write me a commit for each suggestion";
+    let turn = crate::TurnPromptContext::ephemeral_operator("conv", task, task);
+    let four_tools = crate::agentic::tools::ExposureSettings {
+        allow_list: Some(
+            ["read_file", "run_command", "edit_file", "write_file"]
+                .map(String::from)
+                .to_vec(),
+        ),
+        ..Default::default()
+    };
+    for prompt in [
+        prompt_read::PromptReadContext::new(Some(&turn), task, None),
+        prompt_read::PromptReadContext::new(None, "", None),
+    ] {
+        let d = post_compaction_continuation(None, None, prompt, &four_tools);
+        assert!(d.contains("[NEWT ACTIVE PROMPT v1]"), "{d}");
+        assert!(!d.contains("prompt_read"), "{d}");
+        assert!(!d.contains("artifact_read"), "{d}");
+    }
+    let d = post_compaction_continuation(
+        None,
+        None,
+        prompt_read::PromptReadContext::new(Some(&turn), task, None),
+        &four_tools,
+    );
+    assert!(d.contains(&turn.active().id().to_string()), "{d}");
 }

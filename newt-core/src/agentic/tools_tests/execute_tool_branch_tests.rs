@@ -62,6 +62,8 @@ struct MockGate {
     allow: bool,
     base: Caveats,
     asks: Vec<(String, String)>,
+    /// `kind:target` of each request recorded as a full-access pre-approval.
+    full_access: Vec<String>,
 }
 
 impl MockGate {
@@ -70,11 +72,27 @@ impl MockGate {
             allow,
             base: base.clone(),
             asks: Vec::new(),
+            full_access: Vec::new(),
         }
     }
 }
 
 impl super::PermissionGate for MockGate {
+    fn ask_full_access(
+        &mut self,
+        requests: &[super::PermissionRequest],
+    ) -> super::PermissionDecision {
+        self.full_access.extend(
+            requests
+                .iter()
+                .map(|r| format!("{}:{}", r.kind.as_str(), r.target)),
+        );
+        let grants: Vec<_> = requests
+            .iter()
+            .map(|r| (r.kind, r.target.clone()))
+            .collect();
+        super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+    }
     fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
         for r in requests {
             self.asks
@@ -340,3 +358,6 @@ mod memory;
 
 #[path = "path_suggest.rs"]
 mod path_suggest;
+
+#[path = "tilde_home.rs"]
+mod tilde_home;

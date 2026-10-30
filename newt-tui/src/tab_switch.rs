@@ -73,6 +73,7 @@ pub(crate) struct TabSwitchCtx<'a> {
     pub input_stash: &'a mut String,
     pub color: bool,
     pub verbose: bool,
+    pub report_sink: Option<&'a newt_core::agentic::request_report::ReportSink>,
 }
 
 /// What a completed switch tells the caller.
@@ -284,10 +285,12 @@ impl TabSwitchCtx<'_> {
     fn reset_to_clean_conversation(&mut self) {
         self.compress_state.reset();
         let mut reset = crate::ConversationResetContext {
+            cfg: self.cfg,
             memory: self.memory,
             system: self.system,
             conversation_id: self.active_conversation_id,
             mode_states: self.mode_states,
+            sink: self.report_sink,
         };
         crate::reset_conversation(self.workspace, self.active_persona.as_ref(), &mut reset);
         crate::ConversationScopedState {
@@ -315,6 +318,7 @@ impl TabSwitchCtx<'_> {
                 // Built WITHOUT the stores: commit cannot perform a fallible
                 // read because it has nothing to read from.
                 let mut commit = crate::CommitContext {
+                    cfg: self.cfg,
                     workspace: self.workspace,
                     memory: self.memory,
                     system: self.system,
@@ -325,6 +329,7 @@ impl TabSwitchCtx<'_> {
                     step_ledger: self.step_ledger,
                     active_prompt_context: self.active_prompt_context,
                     mode_states: self.mode_states,
+                    sink: self.report_sink,
                 };
                 let (_, warning) = crate::commit_conversation_restore(&mut commit, *prepared);
                 if let Some(w) = warning {
@@ -345,11 +350,13 @@ impl TabSwitchCtx<'_> {
                     .and_then(|s| s.persona.clone());
                 *self.active_persona = seeded;
                 crate::seat_persona_dials(self.active_persona.as_ref());
-                *self.system = crate::rebuild_system_prompt(
+                *self.system = crate::rebuild_system_prompt_for(
                     self.workspace,
                     self.memory,
                     self.active_persona.as_ref(),
                     self.active_conversation_id,
+                    self.cfg,
+                    self.report_sink,
                 );
             }
         }

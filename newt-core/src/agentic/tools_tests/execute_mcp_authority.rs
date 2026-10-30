@@ -418,3 +418,207 @@ async fn remote_tool_outside_allow_list_is_prompted_not_hard_vetoed() {
     );
     assert!(out.contains("permission"), "headless denial: {out}");
 }
+
+// -----------------------------------------------------------------------
+// #2995: `--full-access` is the operator's launch-time grant, so an MCP call
+// is not asked about again — but the decision is recorded, `--yolo` alone
+// grants nothing, and a headless run (no gate) is unchanged.
+// -----------------------------------------------------------------------
+
+async fn remote_call_under(
+    full_access: bool,
+    yolo: bool,
+    with_gate: bool,
+) -> (bool, usize, Vec<String>, String) {
+    let _authority = crate::launch_authority::ScopedAuthority::new(full_access, yolo);
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+    let mut mcp = OneRemoteTool::new("mail__search");
+    let mut gate = MockGate::new(true, &caveats);
+    let out = run_remote_gated(
+        "mail__search",
+        ws.path(),
+        &caveats,
+        None,
+        &mut mcp,
+        with_gate.then_some(&mut gate),
+    )
+    .await;
+    (mcp.called, gate.asks.len(), gate.full_access, out)
+}
+
+#[tokio::test]
+async fn full_access_runs_an_mcp_call_without_asking_and_records_it() {
+    let (called, asks, recorded, out) = remote_call_under(true, false, true).await;
+    assert!(called, "{out}");
+    assert_eq!(asks, 0, "the operator already answered at launch");
+    assert_eq!(recorded, ["remote_tool:mail__search"]);
+}
+
+#[tokio::test]
+async fn without_full_access_an_mcp_call_still_asks() {
+    let (called, asks, recorded, _) = remote_call_under(false, false, true).await;
+    assert!(called);
+    assert_eq!(asks, 1);
+    assert!(recorded.is_empty());
+}
+
+#[tokio::test]
+async fn yolo_alone_does_not_preapprove_an_mcp_call() {
+    let (called, asks, recorded, _) = remote_call_under(false, true, true).await;
+    assert!(called);
+    assert_eq!(asks, 1, "--yolo only changes the exec mechanism");
+    assert!(recorded.is_empty());
+}
+
+#[tokio::test]
+async fn full_access_without_a_gate_is_still_denied() {
+    let (called, asks, recorded, out) = remote_call_under(true, false, false).await;
+    assert!(!called, "headless stays fail-closed: {out}");
+    assert_eq!(asks, 0);
+    assert!(recorded.is_empty());
+    assert!(out.contains("no interactive permission gate"), "{out}");
+}
+
+// -----------------------------------------------------------------------
+// #3036: `mcp_status` is the model's read of the `/mcp` table.
+// -----------------------------------------------------------------------
+
+/// A bridge with one discovered server and no callable tools.
+struct StatusOnlyMcp;
+
+#[async_trait::async_trait]
+impl McpTools for StatusOnlyMcp {
+    fn handles(&self, _name: &str) -> bool {
+        false
+    }
+    fn tool_defs(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
+        unreachable!("mcp_status never reaches a connector")
+    }
+    fn server_status(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!([{
+            "name": "docs",
+            "state": "rejected",
+            "last_error": "MCP server returned HTTP 401 (Bearer abcdefghijklmnopqrstuvwxyz0123)",
+            "tool_count": 0,
+        }]))
+    }
+}
+
+fn advertises_mcp_status(mcp: &dyn McpTools) -> bool {
+    merged_tool_definitions(
+        mcp,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Default::default(),
+        crate::agentic::shell_dialect_sentence(false, false),
+    )
+    .as_array()
+    .unwrap()
+    .iter()
+    .any(|def| def["function"]["name"] == "mcp_status")
+}
+
+/// #3036: a session that discovered MCP servers can read their state — even
+/// in Plan, with no permission gate, because it reads harness state and
+/// reaches no server — and credential-shaped error text is redacted. A
+/// session with no MCP servers is not shown the tool.
+#[tokio::test]
+async fn mcp_status_reports_server_state_read_only_and_redacted_3036() {
+    assert!(advertises_mcp_status(&StatusOnlyMcp));
+    assert!(!advertises_mcp_status(&NoMcp));
+
+    let mut mcp = StatusOnlyMcp;
+    let out = execute_tool_with_collaborators(
+        "mcp_status",
+        &serde_json::json!({}),
+        "/ws",
+        false,
+        20,
+        &Caveats::top(),
+        &mut mcp,
+        ToolCollaborators::default(),
+        false,
+        PromptDisposition::Plan,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        out.contains(r#""name":"docs""#) && out.contains(r#""state":"rejected""#),
+        "{out}"
+    );
+    assert!(out.contains("HTTP 401"), "the typed status survives: {out}");
+    assert!(
+        !out.contains("abcdefghijklmnopqrstuvwxyz0123"),
+        "no token reaches the model: {out}"
+    );
+}
+
+/// Status rows whose error text needs redaction.
+struct SecretErrorMcp;
+
+#[async_trait::async_trait]
+impl McpTools for SecretErrorMcp {
+    fn handles(&self, _name: &str) -> bool {
+        false
+    }
+    fn tool_defs(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
+        unreachable!("mcp_status never reaches a connector")
+    }
+    fn server_status(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!([
+            {"name": "assign", "state": "rejected", "last_error": "authentication failed: password=abcdefgh", "tool_count": 0},
+            {"name": "pem", "state": "skipped", "last_error": "invalid key: -----BEGIN PRIVATE KEY----- abcdefgh", "tool_count": 0},
+            {"name": "healthy", "state": "connected", "last_error": null, "tool_count": 3},
+        ]))
+    }
+}
+
+/// #3036 review: redaction runs per string value, so a credential
+/// assignment or an unterminated private key in one server's error cannot
+/// break the JSON or hide the servers after it.
+#[tokio::test]
+async fn mcp_status_redaction_keeps_the_json_and_every_server_3036() {
+    let mut mcp = SecretErrorMcp;
+    let out = execute_tool_with_collaborators(
+        "mcp_status",
+        &serde_json::json!({}),
+        "/ws",
+        false,
+        20,
+        &Caveats::top(),
+        &mut mcp,
+        ToolCollaborators::default(),
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    let rows = rows.as_array().unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["assign", "pem", "healthy"]);
+    assert_eq!(rows[2]["state"], "connected");
+    assert_eq!(rows[2]["tool_count"], 3);
+    assert!(!out.contains("abcdefgh"), "{out}");
+}

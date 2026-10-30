@@ -43,6 +43,7 @@ pub async fn run(
             disclosure: None,
             compaction_store: None,
             scratchpad: false,
+            report_sink: None,
             scratchpad_store: None,
             code_search: None,
             where_is: None,

@@ -116,14 +116,27 @@ fn failure_message(error: &anyhow::Error) -> String {
         return format!(
             "HTTP {status}{}",
             if status == 401 {
-                " · login required or credential rejected"
+                format!(
+                    " · login required or credential rejected · {}",
+                    crate::mcp::LOGIN_REMEDIATION
+                )
             } else {
-                " · connection failed"
+                " · connection failed".into()
             }
         );
     }
     if let Some(required) = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>() {
         return format!("OCAP network approval needed for {}", required.host);
+    }
+    // A dead refresh grant: the token endpoint answered `invalid_grant`.
+    if error
+        .downcast_ref::<crate::mcp_token::OAuthGrantRejected>()
+        .is_some()
+    {
+        return format!(
+            "Saved login was rejected (invalid_grant) · {}",
+            crate::mcp::LOGIN_REMEDIATION
+        );
     }
     let reason = error.to_string();
     if reason.contains("cancelled") {
@@ -160,6 +173,15 @@ fn confirm_login(
     surface.present_interaction(&SurfaceInteraction::blocking(definition))
 }
 
+/// The single exit for an operation outcome (#3013): the panel footer shows it
+/// until the next page change, and `emit` commits it to scrollback so a
+/// finished operation is distinguishable from a hung one once the panel closes.
+/// Every outcome goes through here; nothing sets `panel.message` directly.
+fn outcome(panel: &mut McpPanel, message: String, emit: &mut dyn FnMut(&str)) {
+    emit(&message);
+    panel.message = message;
+}
+
 pub(crate) fn run<F>(
     mcp: &mut Mcp,
     surface: &mut dyn InputSurface,
@@ -177,6 +199,8 @@ where
             .as_ref()
             .is_none_or(|tui| tui.sanitize_mcp_server_names),
     );
+    let (color, verbose) = (gate.color, gate.verbose);
+    let mut commit = |text: &str| crate::print_newt(text, color, verbose);
     loop {
         let window = surface.open_panel(crate::session_worker::PanelMode::Inline(24));
         crate::panel::drive(&mut panel, 24, window.as_ref())?;
@@ -190,14 +214,22 @@ where
             .iter()
             .find(|server| server.entry.name == action.server)
         else {
-            panel.message = "Server configuration changed; reopen MCP settings.".into();
+            outcome(
+                &mut panel,
+                "Server configuration changed; reopen MCP settings.".into(),
+                &mut commit,
+            );
             continue;
         };
         let entry = &server.entry;
         context.cancel.store(false, Ordering::Relaxed);
         if action.kind == ActionKind::Login && entry.transport == TransportKind::Stdio {
             let Some(argv) = entry.operator_login_argv() else {
-                panel.message = "No trusted login_argv configured. Log in using the server's CLI, then Reconnect.".into();
+                outcome(
+                    &mut panel,
+                    "No trusted login_argv configured. Log in using the server's CLI, then Reconnect.".into(),
+                    &mut commit,
+                );
                 continue;
             };
             match confirm_login(surface, entry) {
@@ -210,90 +242,36 @@ where
                     return Ok(());
                 }
                 _ => {
-                    panel.message = "Login cancelled".into();
+                    outcome(&mut panel, "Login cancelled".into(), &mut commit);
                     continue;
                 }
             }
             match surface.run_login_argv(argv, gate.color, gate.verbose) {
                 Ok(true) => {}
                 Ok(false) => {
-                    panel.message = "Login failed or was interrupted; connection unchanged.".into();
+                    outcome(
+                        &mut panel,
+                        "Login failed or was interrupted; connection unchanged.".into(),
+                        &mut commit,
+                    );
                     continue;
                 }
                 Err(_) => {
-                    panel.message =
-                        "Could not run the configured login; connection unchanged.".into();
+                    outcome(
+                        &mut panel,
+                        "Could not run the configured login; connection unchanged.".into(),
+                        &mut commit,
+                    );
                     continue;
                 }
             }
         }
-        let caveats = gate.current_caveats()?;
-        let mut hosts = context
-            .cfg
-            .tui
-            .as_ref()
-            .map_or_else(Vec::new, |tui| tui.permissions.net.clone());
-        hosts.extend(gate.retained_net_hosts());
-        hosts.sort();
-        hosts.dedup();
-        let insecure = context
-            .cfg
-            .tui
-            .as_ref()
-            .map_or(&[][..], |tui| tui.mcp_allow_insecure_hosts.as_slice());
-        surface.turn_started(context.cancel.clone());
-        crate::print_newt(
-            "MCP operation running · Ctrl-C cancels",
-            gate.color,
-            gate.verbose,
-        );
-        let mut grant_net =
-            |request: &newt_core::PermissionRequest| gate.ask_mcp_net_grant(request);
-        let result =
-            crate::with_interrupt_watch(!context.terminal_owns_turn, &context.cancel, || {
-                tokio::task::block_in_place(|| {
-                    context.runtime.block_on(async {
-                        if action.kind == ActionKind::Login
-                            && entry.transport == TransportKind::Http
-                        {
-                            mcp.login_http(
-                                entry,
-                                (caveats, hosts),
-                                insecure,
-                                Some(&mut grant_net),
-                                context.cancel.clone(),
-                            )
-                            .await
-                        } else {
-                            let result = until_cancelled(&context.cancel, async {
-                                if action.kind == ActionKind::Test {
-                                    mcp.test_connection(&entry.name).await
-                                } else {
-                                    mcp.reconnect(
-                                        entry,
-                                        &caveats,
-                                        &hosts,
-                                        insecure,
-                                        Some(&mut grant_net),
-                                    )
-                                    .await
-                                }
-                            })
-                            .await;
-                            if context.cancel.load(Ordering::Relaxed) {
-                                mcp.cancel_connection(&entry.name);
-                                return Err(anyhow::anyhow!("MCP operation cancelled"));
-                            }
-                            result
-                        }
-                    })
-                })
-            });
-        surface.turn_ended();
-        panel.message = match result {
+        let result = perform(mcp, surface, gate, &context, entry, action.kind)?;
+        let message = match result {
             Ok(count) => format!("Success · {count} tools available"),
             Err(error) => failure_message(&error),
         };
+        outcome(&mut panel, message, &mut commit);
         panel.refresh(views(mcp, &discovery(&context)));
         if gate.exit.is_some_and(|exit| exit.load(Ordering::Relaxed)) {
             return Ok(());
@@ -318,6 +296,116 @@ pub(crate) async fn until_cancelled<T>(
     };
     anyhow::ensure!(!cancel.load(Ordering::Relaxed), "MCP operation cancelled");
     result
+}
+
+/// One Login / Reconnect / Test against `entry`, under the same caveats, net
+/// grants and Ctrl-C watch whichever surface asked (the panel, or
+/// `/mcp login-all`). The outer error is the gate's; the inner is the
+/// operation's.
+fn perform<F>(
+    mcp: &mut Mcp,
+    surface: &mut dyn InputSurface,
+    gate: &mut PromptPermissionGate<'_, F>,
+    context: &Context<'_>,
+    entry: &McpServerEntry,
+    kind: ActionKind,
+) -> anyhow::Result<anyhow::Result<usize>>
+where
+    F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice,
+{
+    let caveats = gate.current_caveats()?;
+    let mut hosts = context
+        .cfg
+        .tui
+        .as_ref()
+        .map_or_else(Vec::new, |tui| tui.permissions.net.clone());
+    hosts.extend(gate.retained_net_hosts());
+    hosts.sort();
+    hosts.dedup();
+    let insecure = context
+        .cfg
+        .tui
+        .as_ref()
+        .map_or(&[][..], |tui| tui.mcp_allow_insecure_hosts.as_slice());
+    surface.turn_started(context.cancel.clone());
+    crate::print_newt(
+        "MCP operation running · Ctrl-C cancels",
+        gate.color,
+        gate.verbose,
+    );
+    let mut grant_net = |request: &newt_core::PermissionRequest| gate.ask_mcp_net_grant(request);
+    let result = crate::with_interrupt_watch(!context.terminal_owns_turn, &context.cancel, || {
+        tokio::task::block_in_place(|| {
+            context.runtime.block_on(async {
+                if kind == ActionKind::Login && entry.transport == TransportKind::Http {
+                    mcp.login_http(
+                        entry,
+                        (caveats, hosts),
+                        insecure,
+                        Some(&mut grant_net),
+                        context.cancel.clone(),
+                    )
+                    .await
+                } else {
+                    let result = until_cancelled(&context.cancel, async {
+                        if kind == ActionKind::Test {
+                            mcp.test_connection(&entry.name).await
+                        } else {
+                            mcp.reconnect(entry, &caveats, &hosts, insecure, Some(&mut grant_net))
+                                .await
+                        }
+                    })
+                    .await;
+                    if context.cancel.load(Ordering::Relaxed) {
+                        mcp.cancel_connection(&entry.name);
+                        return Err(anyhow::anyhow!("MCP operation cancelled"));
+                    }
+                    result
+                }
+            })
+        })
+    });
+    surface.turn_ended();
+    Ok(result)
+}
+
+/// `/mcp login-all` (#3028): sign in to every admitted HTTP server that needs
+/// it, one after another, through the panel's own Login path. Ctrl-C stops the
+/// run; logins that already finished stay saved.
+pub(crate) fn login_all<F>(
+    mcp: &mut Mcp,
+    surface: &mut dyn InputSurface,
+    gate: &mut PromptPermissionGate<'_, F>,
+    context: Context<'_>,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice,
+{
+    let entries: Vec<McpServerEntry> = discovery(&context)
+        .servers
+        .into_iter()
+        .map(|server| server.entry)
+        .collect();
+    let targets = crate::auth_command::login_all_targets(
+        &entries,
+        &|var| std::env::var(var).ok(),
+        &crate::mcp::saved_oauth_valid,
+    );
+    let (color, verbose) = (gate.color, gate.verbose);
+    context.cancel.store(false, Ordering::Relaxed);
+    let cancel = context.cancel.clone();
+    // The summary is already printed; a failed run is not a panel error.
+    let _ = crate::auth_command::login_all(
+        &targets,
+        |entry| match perform(mcp, surface, gate, &context, entry, ActionKind::Login) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(failure_message(&error)),
+            Err(error) => Err(error.to_string()),
+        },
+        &|| cancel.load(Ordering::Relaxed),
+        &mut |line| crate::print_newt(line, color, verbose),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -366,5 +454,49 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "MCP operation cancelled");
         assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn an_outcome_is_committed_to_scrollback_as_well_as_the_panel() {
+        let mut panel = McpPanel::new(Vec::new(), true);
+        let mut committed = Vec::new();
+        outcome(
+            &mut panel,
+            "Success · 3 tools available".into(),
+            &mut |text| committed.push(text.to_string()),
+        );
+        assert_eq!(panel.message, "Success · 3 tools available");
+        assert_eq!(committed, ["Success · 3 tools available"]);
+    }
+
+    /// #3013: an outcome that only sets `panel.message` is invisible once the
+    /// panel closes. The helper above is the one place allowed to do it.
+    #[test]
+    fn no_outcome_bypasses_the_commit_helper() {
+        let src = include_str!("mcp_manager.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        let direct = production.matches("panel.message =").count();
+        assert_eq!(direct, 1, "only `outcome` may assign panel.message");
+    }
+
+    /// #3028: a 401 on connect/Reconnect, or an OAuth `invalid_grant` (a dead
+    /// refresh token), tells the operator how to sign in again.
+    #[test]
+    fn a_rejected_credential_points_at_login_and_login_all_3028() {
+        let unauthorized = anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+            401,
+            "Unauthorized",
+            "",
+        ));
+        assert_eq!(
+            failure_message(&unauthorized),
+            "HTTP 401 · login required or credential rejected · choose Login, or run /mcp login-all"
+        );
+        let invalid_grant = anyhow::Error::new(crate::mcp_token::OAuthGrantRejected)
+            .context("token refresh failed");
+        assert_eq!(
+            failure_message(&invalid_grant),
+            "Saved login was rejected (invalid_grant) · choose Login, or run /mcp login-all"
+        );
     }
 }

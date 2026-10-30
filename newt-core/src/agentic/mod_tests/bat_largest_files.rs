@@ -266,6 +266,7 @@ pub(super) async fn run_scenario_for(
         plan_mode_control: None,
         plan_draft_sink: None,
         steering: None,
+        report_sink: None,
         completed_spill_renderer: None,
         reader_source: None,
     };

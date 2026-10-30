@@ -439,7 +439,11 @@ pub fn unrun<'a>(checks: &'a [VerifyCheck], commands: &[String]) -> Vec<&'a Veri
 /// The nudge to hand the model when it is concluding with unrun verifications —
 /// or `None` when there is nothing to verify (no checks detected) or everything
 /// was already run. The loop injects the `Some` text and grants one more round.
-pub fn verify_gate_nudge(checks: &[VerifyCheck], commands: &[String]) -> Option<String> {
+pub fn verify_gate_nudge(
+    checks: &[VerifyCheck],
+    commands: &[String],
+    exposure: &super::tools::ExposureSettings,
+) -> Option<String> {
     let pending = unrun(checks, commands);
     if pending.is_empty() {
         return None;
@@ -449,12 +453,26 @@ pub fn verify_gate_nudge(checks: &[VerifyCheck], commands: &[String]) -> Option<
         .map(|c| c.label.as_str())
         .collect::<Vec<_>>()
         .join("; ");
-    Some(super::workflow_guidance(format!(
-        "Before you finish: you have NOT run the verification this task ships — {named}. \
-         Do not declare the task done on an unverified solution. Run it now with run_command, \
-         read the output, and if it fails, FIX the code and run it again until it passes. \
-         Only conclude once you have seen it pass (or have proven there is nothing to run)."
-    )))
+    Some(super::workflow_guidance(
+        format!(
+            "Before you finish: you have NOT run the verification this task ships — {named}. \
+             Do not declare the task done on an unverified solution. Run it now{}, \
+             read the output, and if it fails, FIX the code and run it again until it passes. \
+             Only conclude once you have seen it pass (or have proven there is nothing to run).",
+            run_with(exposure)
+        ),
+        exposure,
+    ))
+}
+
+/// The `run_command` recipe a verification nudge may carry: only when the
+/// operator left that tool visible (#2932).
+fn run_with(exposure: &super::tools::ExposureSettings) -> &'static str {
+    if exposure.operator_visible("run_command") {
+        " with run_command"
+    } else {
+        ""
+    }
 }
 
 /// The `run_command` command strings the model issued this turn, read straight
@@ -891,6 +909,7 @@ impl VerificationLedger {
         gate_on: bool,
         round: usize,
         solve_obs: Option<&mut super::observability::SolveObservation>,
+        exposure: &super::tools::ExposureSettings,
     ) -> crate::TurnEndReason {
         if !(self.result_aware && gate_on) {
             return crate::TurnEndReason::RoundCap;
@@ -903,6 +922,7 @@ impl VerificationLedger {
             tree_now: self.tree_now(workspace).await,
             repairs_used: VERIFY_REPAIR_ALLOWANCE,
             rounds_left: false,
+            exposure,
         });
         let exhausted = decision == Decision::Stop(crate::TurnEndReason::RepairExhausted);
         if let Some(obs) = solve_obs.filter(|_| exhausted || scanned.is_none()) {
@@ -980,6 +1000,8 @@ pub(crate) struct Concluding<'a> {
     pub round: usize,
     pub ledger: &'a VerificationLedger,
     pub solve_obs: Option<&'a mut super::observability::SolveObservation>,
+    /// The operator's tool policy: a nudge names `run_command` only when it is visible (#2932).
+    pub exposure: &'a super::tools::ExposureSettings,
 }
 
 /// The one result-aware decision every caller uses (the two ordinary gates and
@@ -1002,6 +1024,7 @@ pub(crate) async fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> 
         tree_now: turn.ledger.tree_now(turn.workspace).await,
         repairs_used,
         rounds_left: turn.rounds_left,
+        exposure: turn.exposure,
     });
     if let Some(obs) = turn.solve_obs {
         obs.behavior_signals
@@ -1037,6 +1060,7 @@ pub struct Conclusion<'a> {
     pub repairs_used: usize,
     /// Whether a round remains after this one.
     pub rounds_left: bool,
+    pub exposure: &'a super::tools::ExposureSettings,
 }
 
 /// What the gate does with a concluding answer.
@@ -1317,11 +1341,14 @@ fn decide(c: &Conclusion<'_>, reports: &[CheckReport]) -> Decision {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        return Decision::Nudge(super::workflow_guidance(format!(
-            "Before you finish (verification repair {n}/{VERIFY_REPAIR_ALLOWANCE}): {items}. \
+        return Decision::Nudge(super::workflow_guidance(
+            format!(
+                "Before you finish (verification repair {n}/{VERIFY_REPAIR_ALLOWANCE}): {items}. \
              Read its output above, fix the cause, and run it again. Conclude only after you \
              have seen it pass."
-        )));
+            ),
+            c.exposure,
+        ));
     }
     if can_nudge && !unverified.is_empty() {
         let items = unverified
@@ -1339,10 +1366,14 @@ fn decide(c: &Conclusion<'_>, reports: &[CheckReport]) -> Decision {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        return Decision::Nudge(super::workflow_guidance(format!(
-            "Before you finish (verification {n}/{VERIFY_REPAIR_ALLOWANCE}): {items}. Run it with \
-             run_command and read the output before you conclude."
-        )));
+        return Decision::Nudge(super::workflow_guidance(
+            format!(
+                "Before you finish (verification {n}/{VERIFY_REPAIR_ALLOWANCE}): {items}. Run it{} \
+                 and read the output before you conclude.",
+                run_with(c.exposure)
+            ),
+            c.exposure,
+        ));
     }
     Decision::Stop(if broken.is_empty() {
         crate::TurnEndReason::VerificationIncomplete
@@ -1547,7 +1578,7 @@ mod tests {
             "cargo clippy --workspace -- -D warnings",
         ] {
             assert!(
-                verify_gate_nudge(&checks, &[only.into()]).is_some(),
+                verify_gate_nudge(&checks, &[only.into()], &Default::default()).is_some(),
                 "`{only}` runs no test, so the gate must still fire"
             );
         }
@@ -1573,7 +1604,7 @@ mod tests {
             "cargo nextest run -p newt-core",
         ] {
             assert_eq!(
-                verify_gate_nudge(&checks, &[ran.into()]),
+                verify_gate_nudge(&checks, &[ran.into()], &Default::default()),
                 None,
                 "`{ran}` ran the tests, so the gate must be silent"
             );
@@ -1602,7 +1633,7 @@ mod tests {
         let checks = detect_checks(&entries(&["test_outputs.py"]), "");
         // The model only edited + catted, never ran the tests.
         let commands = vec!["cat solution.py".into(), "ls -la".into()];
-        let nudge = verify_gate_nudge(&checks, &commands);
+        let nudge = verify_gate_nudge(&checks, &commands, &Default::default());
         assert!(nudge.is_some());
         assert!(nudge.unwrap().contains("Python tests"));
     }
@@ -1612,22 +1643,34 @@ mod tests {
         let checks = detect_checks(&entries(&["test_outputs.py"]), "");
         // A pytest invocation satisfies the check → no nudge.
         let commands = vec!["python -m pytest test_outputs.py -q".into()];
-        assert_eq!(verify_gate_nudge(&checks, &commands), None);
+        assert_eq!(
+            verify_gate_nudge(&checks, &commands, &Default::default()),
+            None
+        );
     }
 
     #[test]
     fn nudge_silent_when_the_instruction_command_was_run() {
         let checks = detect_checks(&entries(&["m.py"]), "Run `python check.py` to verify.");
-        assert!(verify_gate_nudge(&checks, &["python check.py".into()]).is_none());
+        assert!(
+            verify_gate_nudge(&checks, &["python check.py".into()], &Default::default()).is_none()
+        );
         // But if it ran something else, the nudge still fires.
-        assert!(verify_gate_nudge(&checks, &["python m.py".into()]).is_some());
+        assert!(verify_gate_nudge(&checks, &["python m.py".into()], &Default::default()).is_some());
     }
 
     #[test]
     fn nudge_silent_when_no_checks_detected() {
-        assert_eq!(verify_gate_nudge(&[], &["anything".into()]), None);
         assert_eq!(
-            verify_gate_nudge(&detect_checks(&entries(&["a.txt"]), ""), &[]),
+            verify_gate_nudge(&[], &["anything".into()], &Default::default()),
+            None
+        );
+        assert_eq!(
+            verify_gate_nudge(
+                &detect_checks(&entries(&["a.txt"]), ""),
+                &[],
+                &Default::default()
+            ),
             None
         );
     }
@@ -1635,7 +1678,10 @@ mod tests {
     #[test]
     fn run_marker_match_is_case_insensitive() {
         let checks = detect_checks(&entries(&["Makefile"]), "");
-        assert_eq!(verify_gate_nudge(&checks, &["MAKE TEST".into()]), None);
+        assert_eq!(
+            verify_gate_nudge(&checks, &["MAKE TEST".into()], &Default::default()),
+            None
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1899,7 +1945,7 @@ mod tests {
         ];
         let cmds = commands_from_messages(&messages);
         assert_eq!(
-            verify_gate_nudge(&checks, &cmds),
+            verify_gate_nudge(&checks, &cmds, &Default::default()),
             None,
             "an attempted check satisfies the gate — otherwise a workspace \
              where the check CANNOT run pays a nudge every round"
@@ -1959,6 +2005,6 @@ mod tests {
             "tool_calls": [{ "function": { "name": "run_command", "arguments": "{\"command\": \"python -m pytest\"}" }}]
         })];
         let cmds = commands_from_messages(&messages);
-        assert_eq!(verify_gate_nudge(&checks, &cmds), None);
+        assert_eq!(verify_gate_nudge(&checks, &cmds, &Default::default()), None);
     }
 }

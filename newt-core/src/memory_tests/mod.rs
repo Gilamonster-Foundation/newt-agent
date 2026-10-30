@@ -56,7 +56,7 @@ fn capturing_summarizer(
 
 // --- Summarizing tests ---
 
-// --- SoulProvider tests ---
+// --- The soul oracles ---
 
 // --- Continuity: restore + delegation (Step 18.5, #247) ---
 
@@ -94,6 +94,9 @@ mod memory_index;
 #[cfg(test)]
 #[path = "note_routing.rs"]
 mod note_routing;
+#[cfg(test)]
+#[path = "report_labels.rs"]
+mod report_labels;
 #[cfg(test)]
 #[path = "rolling_window.rs"]
 mod rolling_window;

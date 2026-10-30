@@ -106,11 +106,13 @@ pub fn in_policy_pairs(set: &PolicySet) -> HashSet<(String, String)> {
 
 /// The policy capability class a shadow axis maps to (the same mapping
 /// [`crate::ocap_store::class_for`] uses for the denial axes).
-fn axis_class(axis: ShadowAxis) -> CapabilityClass {
+fn axis_class(axis: ShadowAxis) -> Option<CapabilityClass> {
     match axis {
-        ShadowAxis::Exec => CapabilityClass::Exec,
-        ShadowAxis::FsRead | ShadowAxis::FsWrite => CapabilityClass::Fs,
-        ShadowAxis::Net => CapabilityClass::Net,
+        ShadowAxis::Exec => Some(CapabilityClass::Exec),
+        ShadowAxis::FsRead | ShadowAxis::FsWrite => Some(CapabilityClass::Fs),
+        ShadowAxis::Net => Some(CapabilityClass::Net),
+        // An availability record (#3037), not a capability to propose.
+        ShadowAxis::Mcp => None,
     }
 }
 
@@ -146,7 +148,9 @@ pub fn propose_from_capture(
 ) -> Proposal {
     let mut proposal = Proposal::default();
     for c in capture.gaps(in_policy) {
-        let class = axis_class(c.axis);
+        let Some(class) = axis_class(c.axis) else {
+            continue;
+        };
         if is_high_danger(class, &c.target) {
             proposal.deferred.push(DeferredCaveat {
                 class: c.axis.class(),
@@ -191,6 +195,7 @@ pub fn propose_from_capture(
                 by,
                 sig: None,
             }),
+            ShadowAxis::Mcp => {}
         }
     }
     proposal
