@@ -51,28 +51,49 @@ async fn host_denied_oauth_hop_surfaces_as_typed_grant_cause() {
     assert!(!required.map(|r| r.private).unwrap_or(false));
 }
 
-/// A missing login stays a distinct typed cause from a host denial.
+/// After a resource 401, a refresh that finds no usable login leaves the plain
+/// credential failure, while a refresh blocked because the token endpoint's
+/// host is outside the grant carries the typed `HttpNetGrantRequired`: the
+/// connect path's grant prompt downcasts it instead of reporting a missing
+/// login. The real refresh functions are grounded by the real-filesystem
+/// `token_host_outside_the_grant_asks_for_approval_not_login_2914`.
 #[tokio::test]
 async fn missing_login_stays_distinct_from_host_denial() {
-    // A host denial produces the typed grant cause ...
-    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
-    let error = validate_discovery_hop_with_policy(
-        "https://denied.example.test/token",
-        "token endpoint",
-        false,
-        &policy,
-    )
-    .unwrap_err();
-    assert!(error.downcast_ref::<HttpNetGrantRequired>().is_some());
+    async fn after_refresh(refreshed: Result<Option<String>, RefreshRefusal>) -> anyhow::Error {
+        crate::mcp::retry_http_unauthorized_once(
+            Err::<(), _>(anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+                401,
+                "Unauthorized",
+                "",
+            ))),
+            Some("stored".to_string()),
+            || async { refreshed },
+            |_| {},
+            |_| async { anyhow::Ok(()) },
+        )
+        .await
+        .err()
+        .expect("no refreshed bearer, so no reconnect")
+    }
 
-    // ... but an invalid-endpoint (missing-login-class) error stays a plain
-    // string — it must not be confused with the typed host-denial cause.
-    let error = validate_discovery_hop_with_policy("not-a-url", "token endpoint", false, &policy)
-        .unwrap_err();
+    let missing = after_refresh(Ok(None)).await;
     assert!(
-        error.downcast_ref::<HttpNetGrantRequired>().is_none(),
-        "a plain invalid-URL error must not be the host-denial typed cause: {error:#}"
+        missing.downcast_ref::<HttpNetGrantRequired>().is_none(),
+        "{missing:#}"
     );
+    assert_eq!(newt_mcp_client::http_error_status(&missing), Some(401));
+
+    let denial = HttpNetGrantRequired {
+        host: "auth.example.test".into(),
+        private: false,
+    };
+    let denied = after_refresh(Err(RefreshRefusal::NetGrantRequired(denial.clone()))).await;
+    assert_eq!(
+        denied.downcast_ref::<HttpNetGrantRequired>(),
+        Some(&denial),
+        "{denied:#}"
+    );
+    assert_eq!(newt_mcp_client::http_error_status(&denied), Some(401));
 }
 
 /// Grounds the UI cancellation flag against the real callback listener: cancelling

@@ -431,7 +431,7 @@ async fn reconnect_http(
 /// refreshed bearer is recorded by the reconnect that uses it.
 fn refreshed_or_recorded(
     server: &str,
-    refreshed: Result<Option<String>, crate::mcp_token::OAuthGrantRejected>,
+    refreshed: Result<Option<String>, crate::mcp_token::RefreshRefusal>,
     record: impl FnOnce(&str, newt_core::flight_recorder::McpConnectRecord),
 ) -> Option<String> {
     if let Ok(Some(bearer)) = refreshed {
@@ -502,7 +502,7 @@ async fn connect_http_entry(
         crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(&caveats.net, explicit_net_hosts);
     let crate::mcp_token::LoadedBearer {
         token,
-        grant_rejected,
+        refresh_refusal,
     } = match entry.url.as_deref() {
         Some(url) if !has_configured_authorization_header(entry) => {
             crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy).await
@@ -549,7 +549,7 @@ async fn connect_http_entry(
         },
     )
     .await
-    .map_err(|error| attach_grant_rejection(error, grant_rejected))
+    .map_err(|error| attach_refresh_refusal(error, refresh_refusal))
     .map(|outcome| ReconnectableServer {
         live: outcome.value,
         http: Some(HttpReconnectState {
@@ -656,14 +656,14 @@ pub(crate) struct HttpConnectOutcome<T> {
     bearer: Option<String>,
 }
 
-/// A refused refresh grant explains whatever connection failure follows it —
-/// an anonymous connect, or a fallback bearer's 401 or non-401 failure.
-pub(crate) fn attach_grant_rejection(
+/// A refused refresh explains whatever connection failure follows it — an
+/// anonymous connect, or a fallback bearer's 401 or non-401 failure.
+pub(crate) fn attach_refresh_refusal(
     error: anyhow::Error,
-    grant_rejected: Option<crate::mcp_token::OAuthGrantRejected>,
+    refusal: Option<crate::mcp_token::RefreshRefusal>,
 ) -> anyhow::Error {
-    match grant_rejected {
-        Some(rejected) => error.context(rejected),
+    match refusal {
+        Some(refusal) => refusal.explain(error),
         None => error,
     }
 }
@@ -686,7 +686,7 @@ pub(crate) async fn retry_http_unauthorized_once<
 where
     Refresh: FnOnce() -> RefreshFuture,
     RefreshFuture:
-        std::future::Future<Output = Result<Option<String>, crate::mcp_token::OAuthGrantRejected>>,
+        std::future::Future<Output = Result<Option<String>, crate::mcp_token::RefreshRefusal>>,
     Reconnect: FnOnce(String) -> ReconnectFuture,
     ReconnectFuture: std::future::Future<Output = anyhow::Result<T>>,
 {
@@ -704,7 +704,7 @@ where
                 });
             }
             Ok(None) => {}
-            Err(rejected) => return Err(initial.err().expect("checked above").context(rejected)),
+            Err(refusal) => return Err(refusal.explain(initial.err().expect("checked above"))),
         }
     }
     Ok(HttpConnectOutcome {
@@ -1717,7 +1717,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         async fn recover(
-            refreshed: Result<Option<String>, crate::mcp_token::OAuthGrantRejected>,
+            refreshed: Result<Option<String>, crate::mcp_token::RefreshRefusal>,
         ) -> (Vec<(String, McpConnectRecord)>, usize, bool) {
             let records = Arc::new(Mutex::new(Vec::new()));
             let reconnects = Arc::new(Mutex::new(0));
@@ -1758,7 +1758,12 @@ mod tests {
             outcome: McpConnectOutcome::Rejected,
             http_status: Some(401),
         };
-        for refused in [Err(crate::mcp_token::OAuthGrantRejected), Ok(None)] {
+        for refused in [
+            Err(crate::mcp_token::RefreshRefusal::GrantRejected(
+                crate::mcp_token::OAuthGrantRejected,
+            )),
+            Ok(None),
+        ] {
             let (records, reconnects, failed) = recover(refused).await;
             assert_eq!(records, [("docs".to_string(), rejected)]);
             assert_eq!(reconnects, 0, "a refused refresh never reconnects");
