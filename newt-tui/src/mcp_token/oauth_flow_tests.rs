@@ -1835,22 +1835,68 @@ async fn dcr_rejects_a_response_that_omits_redirect_uris() {
     assert!(error.contains("omitted redirect_uris"), "{error}");
 }
 
-/// A host-denied OAuth hop surfaced during *metadata aggregation* must keep its
-/// typed `HttpNetGrantRequired` cause instead of being flattened into a
-/// plain-string aggregate error, so the /mcp panel can still offer the
-/// exact-host prompt (`mcp_management.rs` downcasts on this type).
+/// A protected resource advertising a host-denied issuer first and a loopback
+/// (test-admitted) issuer second. Only the second serves metadata, and only
+/// when `serve_metadata` is set.
+async fn denied_then_permitted_issuers(serve_metadata: bool) -> (MockServer, MockServer, String) {
+    let resource_server = MockServer::start().await;
+    let permitted_server = MockServer::start().await;
+    let resource = format!("{}/mcp", resource_server.uri());
+    let permitted = permitted_server.uri();
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&resource_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-protected-resource/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resource": resource,
+            "authorization_servers": ["https://denied.example.test", permitted]
+        })))
+        .mount(&resource_server)
+        .await;
+    if serve_metadata {
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": permitted,
+                "authorization_endpoint": format!("{permitted}/authorize"),
+                "token_endpoint": format!("{permitted}/token"),
+                "code_challenge_methods_supported": ["S256"]
+            })))
+            .mount(&permitted_server)
+            .await;
+    }
+    (resource_server, permitted_server, resource)
+}
+
+/// Advertised issuers can sit on different hosts: a denied first candidate must
+/// not stop discovery from selecting a later one on a permitted host.
+#[tokio::test]
+async fn host_denied_issuer_does_not_stop_a_later_permitted_candidate() {
+    let (_resource_server, permitted_server, resource) = denied_then_permitted_issuers(true).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let discovered =
+        discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+            .await
+            .expect("the permitted candidate must still be discovered");
+    assert_eq!(discovered.issuer, permitted_server.uri());
+}
+
+/// When no candidate passes, the first host denial must survive the aggregate
+/// "no advertised authorization server" error as its typed
+/// `HttpNetGrantRequired` cause (the /mcp panel downcasts it to offer the
+/// exact-host prompt), with every candidate's failure still in the message.
 #[tokio::test]
 async fn host_denied_oauth_hop_survives_metadata_aggregation() {
-    // `fetch_authorization_server_meta` is the aggregation function called for
-    // each advertised issuer during discovery. It validates the issuer hop
-    // first (before any network call), so a host denial returns the typed
-    // cause without a mock server.
-    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
-    let error = fetch_authorization_server_meta("https://denied.example.test", false, &policy)
+    let (_resource_server, permitted_server, resource) = denied_then_permitted_issuers(false).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let error = discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
         .await
         .unwrap_err();
 
-    let required = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
     assert!(
         required.is_some(),
         "expected typed HttpNetGrantRequired to survive aggregation, got: {error:#}"
@@ -1860,6 +1906,20 @@ async fn host_denied_oauth_hop_survives_metadata_aggregation() {
         Some("denied.example.test")
     );
     assert!(!required.map(|r| r.private).unwrap_or(false));
+    let message = error.to_string();
+    assert!(
+        message.starts_with("no advertised authorization server passed discovery")
+            && message.contains(&permitted_server.uri()),
+        "the aggregate must name every candidate: {message}"
+    );
+    assert!(
+        !permitted_server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "the candidate after the denied one must still be tried"
+    );
 }
 
 /// A protected resource whose authorization server has NO dynamic client

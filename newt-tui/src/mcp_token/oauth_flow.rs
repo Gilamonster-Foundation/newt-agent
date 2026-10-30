@@ -98,7 +98,11 @@ pub(super) fn validate_discovery_hop_with_policy(
     let host = url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("OAuth {kind} URL has no host: {endpoint}"))?;
-    if !(policy.permits_host(host) || cfg!(test) && allow_test_loopback_http) {
+    // The test flag admits only the loopback mock servers, so a test can still
+    // exercise a host-scope denial beside them.
+    if !(policy.permits_host(host)
+        || cfg!(test) && allow_test_loopback_http && newt_mcp_client::host_is_loopback(host))
+    {
         return Err(newt_mcp_client::HttpNetGrantRequired {
             host: host.to_string(),
             private: false,
@@ -809,6 +813,7 @@ async fn discover_oauth_meta_within_budget_for_client(
         })
     });
     let mut errors = Vec::new();
+    let mut host_denial = None;
     let mut selected = None;
     for issuer in issuers {
         if budget.is_exhausted() {
@@ -864,26 +869,31 @@ async fn discover_oauth_meta_within_budget_for_client(
                 break;
             }
             Err(error) => {
-                // Host denial is terminal under this session's net policy — no
-                // other issuer candidate will pass it — so preserve the typed
-                // HttpNetGrantRequired cause all the way to the /mcp panel,
-                // which downcasts it to offer the exact-host prompt.
-                if error
-                    .downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()
-                    .is_some()
-                {
-                    return Err(error);
-                }
                 errors.push(format!("{issuer}: {error:#}"));
+                // Advertised issuers can sit on different hosts, so a denied
+                // host must not stop a later candidate on a permitted one.
+                // Keep the first denial typed: if nothing is selected, the
+                // /mcp panel downcasts it to offer the exact-host prompt.
+                if host_denial.is_none()
+                    && error
+                        .downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()
+                        .is_some()
+                {
+                    host_denial = Some(error);
+                }
             }
         }
     }
-    let (issuer, metadata) = selected.ok_or_else(|| {
-        anyhow::anyhow!(
+    let Some((issuer, metadata)) = selected else {
+        let aggregate = format!(
             "no advertised authorization server passed discovery: {}",
             errors.join("; ")
-        )
-    })?;
+        );
+        return Err(match host_denial {
+            Some(denial) => denial.context(aggregate),
+            None => anyhow::anyhow!(aggregate),
+        });
+    };
     Ok(DiscoveredOAuthMeta {
         resource: canonical_resource,
         issuer,
