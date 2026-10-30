@@ -24,6 +24,9 @@ For all three, the datatracker API reported group "Individual Submissions" and n
 stream on 2026-10-30. DP's header names "SCITT", but it is not a working-group
 document. **None of the three has IETF standing.** Each is work in progress, and
 any of them may change incompatibly. AAT -02 already breaks -01 (AAT App. F).
+The SCITT documents that BA and DP build on are published: the datatracker
+lists RFC 9943 (architecture) and RFC 9942 (COSE Receipts) as Proposed
+Standards, checked on 2026-10-30.
 The text read was `https://www.ietf.org/archive/id/<name>-<rev>.txt`, with these
 SHA-256 values:
 
@@ -83,6 +86,24 @@ its output are shown), **derived** or **believed**. Draft text that describes an
 implementation, such as AAT App. E's notes on Tenuo, Warden and ARCP, is the
 author's claim. Nothing here verifies it.
 
+### 0.4 Normative weight of what is cited
+
+A MUST in an individual draft binds only an implementation that claims that
+draft. The table keeps these weights apart.
+
+| Source | Weight |
+|---|---|
+| AAT -02 §3–§8 | Normative text of an individual Standards-Track draft |
+| AAT §4.1 lattice model, App. A–E | Non-normative by the draft's own labels. App. E is author claims |
+| BA -03 | Informational individual draft. Its obligations are prose, and its wire encodings are "TBD" (§4, §13) |
+| Capsule -05 | Individual Standards-Track draft that BA cites normatively for dispositions |
+| DP -00 | Informational individual draft that "adds no rule" of its own (§7) |
+| DPS action binding 0.3.0, signatures 0.2.0 | Repository proposals at commit `5b0534d`, "not part of the Standard", with reference tests. An implementation convention |
+| RFC 9396, RFC 9942, RFC 9943 | Proposed Standards |
+| RFC 9334, RFC 8785 | Informational RFCs |
+| in-toto, SLSA, Sigstore, Git object format | Community specifications and implementations |
+| Newt and Bridle code | Implementation fact at `origin/main` |
+
 ## 1. Executive conclusion
 
 1. **None of the three drafts replaces a Newt mechanism. Each sharpens one seam.**
@@ -91,7 +112,8 @@ author's claim. Nothing here verifies it.
 2. **AAT is the closest match, and its algebra is the same shape as Newt's.**
    - Its core constraints (`exact`, `one_of`, `subset`, `range`, `wildcard`,
      `all`/`any`) have decidable, sound and conservative subsumption (§4.5).
-     Newt's `Scope = All | Only(set)` lattice is exactly that shape.
+     Newt's `Scope = All | Only(set)` lattice is the `wildcard` + `one_of`
+     fragment of that algebra.
    - AAT's one property Newt's *identity* delegation lacks is parent-instance
      binding (`par_hash`, I5). This is **measured** in §4.1.8: a mesh `CertChain`
      child still verifies after being re-paired with a different parent cert
@@ -251,9 +273,9 @@ Not covered by any signature:
 
 #### 4.1.2 Which attenuation relations are checked
 
-**Fact (§4, §8 step 4).** All six invariants are checked algorithmically at
-every link, offline: I1 delegation authority (thumbprint), I2 depth, I3 TTL,
-I4 capability, I5 `par_hash` and I6 PoP.
+**Fact (§4, §8).** I1–I5 are checked algorithmically at every link, and I6
+once per presentation, all offline: I1 delegation authority (thumbprint), I2
+depth, I3 TTL, I4 capability, I5 `par_hash`, and I6 the leaf holder's PoP.
 
 I4 is structural subsumption over a closed table (§4.5, Table 4). It is
 conservative: an `exact` child under a parent `any` is rejected.
@@ -332,7 +354,7 @@ url prefix: forge.example/org/repo-a/../rep  textual_ok=True  resolved_inside=Fa
 url prefix: forge.example/org/repo-a%2F..%2  textual_ok=True  resolved_inside=False
 url prefix: forge.example@evil.example/org/  textual_ok=True  resolved_inside=False
 url prefix: forge.example.evil.example/org/  textual_ok=True  resolved_inside=False
-not_one_of: /srv/café/secret           textual_ok=True  resolved_inside=False
+not_one_of: /srv/cafe\u0301/secret           textual_ok=True  resolved_inside=False
 not_one_of: /var/agent/.SSH/id_ed25519       textual_ok=True  resolved_inside=False
 exact symlink: repo-a/README -> repo-b/secret textual_ok=True  resolved_inside=False
 ```
@@ -343,8 +365,12 @@ The rows test different things:
   and requires a sound one (§5.1).
 - **Rows 6–7** use the core `not_one_of`. The denylist is sound over strings,
   but on a normalization-insensitive or case-insensitive filesystem the excluded
-  file is reachable through an alias. Whether a given filesystem merges these
-  names is believed and was not measured here.
+  file is reachable through an alias.
+  **Measured** on a default APFS volume under macOS 15: after creating the
+  NFC-named `café/secret` and `.ssh/id_ed25519`, the NFD spelling and `.SSH`
+  both open them, and Rust's `std::fs::canonicalize` returns the on-disk
+  spellings `café/secret` and `.ssh/id_ed25519`. A case-sensitive Linux
+  filesystem would not merge the names (believed, not measured here).
 - **Row 8** uses the core `exact`. The string never changes, but the object
   behind it does.
 
@@ -417,7 +443,7 @@ object-bound primitive exists: `fs_cap`, OIDs.
 `CertChain`).** The probe below is a scratch crate outside this repository,
 depending only on `agent-mesh-protocol = "=0.7.1"`, built `--offline`. It is
 abridged: `meta` builds an `AgentMetadata`, and `role` reads the parent cert's
-`role`.
+`role`. The last three lines are a negative control.
 
 ```rust
 let user = UserKey::generate();
@@ -425,14 +451,24 @@ let parent_a = AgentKey::issue_derived(&user, "lbl", meta("reviewer-session-1", 
 let parent_b = AgentKey::issue_derived(&user, "lbl", meta("deployer-session-2", Caveats::top()));
 assert_eq!(parent_a.cert().agent_pubkey, parent_b.cert().agent_pubkey);
 let child = parent_a.delegate(meta("leaf", Caveats::top())).unwrap();
+println!("original parent role = {}  verify_ok = {}", role(child.cert()), child.cert().verify().is_ok());
 let mut swapped = child.cert().clone();
 if let Issuer::Agent { parent, .. } = &mut swapped.issuer { **parent = parent_b.cert().clone(); }
-println!("swapped parent role = {}  verify_ok = {}", role(&swapped), swapped.verify().is_ok());
+println!("swapped  parent role = {}  verify_ok = {}", role(&swapped), swapped.verify().is_ok());
+let parent_c = AgentKey::issue(&user, meta("other-key", Caveats::top()));
+let mut wrong = child.cert().clone();
+if let Issuer::Agent { parent, .. } = &mut wrong.issuer { **parent = parent_c.cert().clone(); }
+println!("different-key parent  verify_ok = {}", wrong.verify().is_ok());
 ```
 ```
-original parent role = reviewer-session-1
+original parent role = reviewer-session-1  verify_ok = true
 swapped  parent role = deployer-session-2  verify_ok = true
+different-key parent  verify_ok = false
 ```
+
+The pass is specific to a parent cert of the *same* key. The cause is in
+`sign_payload`: the signed bytes are `agent_pubkey ‖ serde_json(metadata)`, and
+`verify_inner` relates child to parent only by key equality and `leq`.
 
 **Inference.**
 
@@ -465,7 +501,7 @@ swapped  parent role = deployer-session-2  verify_ok = true
 | Request attestation | requester org | request content digest, nonce, timestamp, validity window, requester identity, named performer (§3) | the request terms. Not any authorization behind them (an optional delegation-receipt reference, §10) |
 | Action attestation | performer org | request-attestation digest; constraint-set snapshot digest; a result per constraint (`pass`/`fail`/`not-evaluated` + reason); input-commitment digest (SHOULD); disposition (capsule `verdict_class`) (§3, §5) | the request, *transitively*. The performer's chosen constraint set. Its own disposition claim |
 | Refusal | performer org | not a separate object: an action attestation with a decline disposition (§6) | same as above |
-| Escalation | performer org | not a separate object: capsule `escalated`/`hitl_dispatched` ("open item", capsule §5.5.1) | an open item. -03 defines no closure object for escalation |
+| Escalation | performer org | not a separate object: capsule `escalated`/`hitl_dispatched` ("open item", capsule §5.5.1) | an open item. -03 defines no closure object for escalation. Capsule §5.5.4 chains a later resolving Capsule |
 | Acknowledgment ×2 | each org | receipt of the counterparty's attestation, "does not assert agreement" (§3) | the counterparty's half. Whether the two acknowledgments commit to each other is unspecified |
 | Reduced-assurance indicator | the producing party | a marker in the record, MUST be recorded (§7, §11.3). Registry TBD (§13) | nothing. It is a label |
 | Asymmetry dispositions | the surviving party | `delivery_unconfirmed`, `counterparty_timeout`, `countersign_refused`. Orphans are a defined state (§8) | the correlation id + action digest |
@@ -503,7 +539,7 @@ It does not prove:
 | What was authorized | **No** | §10 composes an external delegation receipt by reference, optionally |
 | What policy was evaluated | Claimed | constraint-set digest + results (§5) |
 | What was attempted | **No** in -03 | delegated to the capsule's effect record |
-| What effect occurred | **No** in -03 | capsule `effect_mode` / `effect_attestation`. `gate_executed` ranks above `runtime_claimed` and `host_served_observed` (capsule §5.4) |
+| What effect occurred | **No** in -03 | capsule `effect_mode` / `effect_attestation`. `gate_executed` ranks above `runtime_claimed` and `host_served_observed` (capsule §5.3) |
 | What each party acknowledged | Yes | acknowledgments (§4) |
 
 #### 4.2.4 Failure analysis
@@ -683,7 +719,7 @@ program requires.
 | Macaroons (HMAC caveat chains) | Paper + implementations (informative) | offline attenuation; re-keying makes the parent unrecoverable | needs the root secret to verify; designation is by name | AAT gives up re-keying for public-key verification (§1.3, §9.4). Bridle's `Discharge` borrows the third-party-caveat vocabulary |
 | OAuth RAR (RFC 9396) | Standards Track RFC | structured `authorization_details` | attenuation semantics, which a type must define | AAT profiles it (§3.3) |
 | in-toto / SLSA | Community specifications (implementation conventions) | "how was this artifact built", by subject digest | who decided; authorization | DP cites them by digest (DP §4) |
-| SCITT signed statements + Receipts | RFC 9943 / RFC 9942, as the drafts cite them (believed; not independently verified) | that a statement was registered (inclusion) | time; log consistency; truth of contents (DP §7) | BA SHOULD-registers; DP registers checkpoints |
+| SCITT signed statements + Receipts | RFC 9943 / RFC 9942, Proposed Standards (datatracker, 2026-10-30) | that a statement was registered (inclusion) | time; log consistency; truth of contents (DP §7) | BA SHOULD-registers; DP registers checkpoints |
 | RATS (RFC 9334) | Informational RFC | the state of a platform or workload | what that platform did | orthogonal (BA §10, AAT §9.3) |
 | Git object ids | Implementation (background, believed) | blob, tree and commit identity by content; a tree id commits to every entry | refs are mutable names. A push is a ref update and is not content-addressed | the governed push pins the OID and literal URL at approval |
 | Sigstore / transparency logs | Implementation (background, believed) | inclusion and, with monitors, consistency; short-lived identity-bound signing | authority to sign; completeness of what was logged | the same limits DP §7 states |
@@ -811,7 +847,7 @@ entirely.
 | CE | Scenario | AAT -02 | BA -03 | DP -00 | Newt today (Fact) |
 |---|---|---|---|---|---|
 | 1 | A narrower-looking token expands authority through normalization | P for the token algebra; **M** for resolution; **M** for `not_one_of` aliases | R (if inputs committed) | R | `fs_cap` P for Linux/macOS file tools. Governed push P (literal URL + OID). Register: "pathname grants … do not pin an inode" |
-| 2 | Decision approves artifact A; B is published | M (no decision concept) | R | D *if* the spec pins the digest, the attempt is honestly recorded, and the verifier hashes what was published; else M | push: P ("nothing resolves a ref after approval") |
+| 2 | Decision approves artifact A; B is published | M (no decision concept) | R | D *if* the spec pins the digest, the attempt is honestly recorded, and the verifier hashes what was published; else M | push: P on the brokered path ("nothing resolves a ref after approval"). The register keeps OPEN a bypass by an opaque descendant with unrestricted network |
 | 3 | Signed request evaluated under a stale or substituted policy | M | R (pins the stale digest faithfully) | R (the issuer's recheck) | `durable_grants`: "Signatures and encryption do not prevent restoration of an older valid ciphertext" → M |
 | 4 | A valid bilateral record omits a material side effect | M | M | M | M: `ExitEvidence` has no downstream effects and no allowed destinations |
 | 5 | A projection leaks a hidden object's existence or identity | M; the denylist form *leaks* | M | M | partial: the push broker drops raw diagnostics |
@@ -842,6 +878,9 @@ entirely.
 - **Newt.** The governed push avoids this. Its approval object is the OID plus
   the literal URL, and it pushes `<approved-oid>:refs/heads/<branch>` from a
   staging repo ([`git_staging.rs`](../../../newt-core/src/git_staging.rs)).
+- **Residual (Fact, register "Known issues (governed push)").** "an opaque
+  descendant with unrestricted network can bypass the broker". The prevention
+  holds only on the brokered path.
 - **Not verified here.** Whether that approval is persisted as a
   content-addressed record.
 
@@ -884,8 +923,8 @@ entirely.
   - (b) A digest of low-entropy hidden content is a confirmation oracle. Fact:
     BA §11.6 states this property for predictable values.
   - (c) Proposing a patch that collides with a hidden path makes a conflict or
-    refusal reveal it. Fact: Newt's governed push captures raw diagnostics "and
-    drops them entirely" ([register](../../security/ocap-deviations.md),
+    refusal reveal it. Fact: the register says the governed push's raw git/gh diagnostics are
+    "captured and dropped entirely" ([register](../../security/ocap-deviations.md),
     "Known issues (governed push)").
   - (d) An AAT `not_one_of` that hides paths puts the hidden names *into the
     token*. Fact: AAT §10, "an AAT chain can reveal … argument constraints".
@@ -1036,9 +1075,16 @@ rejected for the stated reason. The CE1 path variant is recorded as a known pass
    Bridle attest: binary digest, `AdmittedFenceId`, kernel features? Who
    appraises it?
 9. **Bridle's harness-private marker check.** `entry_reaches_harness_private`
-   matches path-component strings (`.ssh`, `.newt`, …). Is it reached with a
-   case-folded or Unicode-variant alias on case-insensitive volumes? Its comment
-   relies on canonical forms from the backend. Untested here.
+   is a case-sensitive path-component match (`.ssh`, `.newt`, …) in
+   [`admitted.rs`](../../../vendor/agent-bridle-core/src/admitted.rs). Fact:
+   the runtime closure is declared only for trusted-worker spawns, never for
+   model-selected ones (`trusted_worker_closure` in
+   [`spawn.rs`](../../../vendor/agent-bridle-core/src/spawn.rs)). The Seatbelt
+   arm canonicalizes the program first, and on APFS that yields the on-disk
+   `.ssh` (measured, §4.1.5), so a `.SSH` alias is caught there. The public
+   `RuntimeClosure::with_exec` says "Canonicalized by the caller" and does not
+   enforce it. Should the type accept only a canonical path, so that an
+   uncanonicalized alias cannot be represented?
 
 ## 11. Decisions and experiments (prioritized)
 

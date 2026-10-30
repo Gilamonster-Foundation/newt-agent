@@ -49,7 +49,9 @@ for child, fold in [
         fold(child) not in {fold(e) for e in excluded})
 
 # 4. exact() is unchanged, but the object behind it moves between grant and use.
-with tempfile.TemporaryDirectory() as tmp:
+with tempfile.TemporaryDirectory() as raw_tmp:
+    # realpath: on macOS the temp dir sits behind the /var -> /private/var link.
+    tmp = os.path.realpath(raw_tmp)
     for d in ("repo-a", "repo-b"):
         os.mkdir(os.path.join(tmp, d))
     open(os.path.join(tmp, "repo-a", "README"), "w").close()
