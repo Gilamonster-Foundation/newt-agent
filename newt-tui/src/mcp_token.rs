@@ -175,6 +175,37 @@ impl std::fmt::Display for OAuthGrantRejected {
 
 impl std::error::Error for OAuthGrantRejected {}
 
+/// Why a refresh produced no bearer, when the reason is one a caller acts on:
+/// a refused grant needs a fresh login, and a token endpoint outside the active
+/// net grant needs an exact-host approval. Any other refresh failure is
+/// transient and changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshRefusal {
+    GrantRejected(OAuthGrantRejected),
+    NetGrantRequired(newt_mcp_client::HttpNetGrantRequired),
+}
+
+impl RefreshRefusal {
+    fn of(error: &anyhow::Error) -> Option<Self> {
+        if let Some(rejected) = error.downcast_ref::<OAuthGrantRejected>() {
+            return Some(Self::GrantRejected(*rejected));
+        }
+        error
+            .downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()
+            .cloned()
+            .map(Self::NetGrantRequired)
+    }
+
+    /// Attach the refusal to the connection failure it explains, as typed
+    /// context: status, Reconnect and the grant prompt find it by downcast.
+    pub fn explain(self, error: anyhow::Error) -> anyhow::Error {
+        match self {
+            Self::GrantRejected(rejected) => error.context(rejected),
+            Self::NetGrantRequired(required) => error.context(required),
+        }
+    }
+}
+
 /// A resource's durable refusal of one stored bearer (#3028 follow-up): a 401
 /// whose forced refresh was refused (`invalid_grant`) or impossible (no
 /// refresh token), or a 401 on the refreshed bearer itself. Bound to the server (by path), the
@@ -1547,11 +1578,11 @@ pub async fn load_bearer_token(
 
 /// What loading found: the bearer to try (possibly an unknown-lifetime
 /// fallback) AND whether a refresh on the way was refused. Both travel, so a
-/// fallback bearer's later failure can still name the refused grant.
+/// fallback bearer's later failure can still name the refusal.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LoadedBearer {
     pub token: Option<String>,
-    pub grant_rejected: Option<OAuthGrantRejected>,
+    pub refresh_refusal: Option<RefreshRefusal>,
 }
 
 async fn load_bearer_token_from_dir(
@@ -1560,12 +1591,12 @@ async fn load_bearer_token_from_dir(
     dir: &Path,
     policy: &OAuthHopPolicy,
 ) -> LoadedBearer {
-    let mut grant_rejected = false;
+    let mut refresh_refusal = None;
     let token =
-        load_bearer_token_inner(server_name, resource_url, dir, policy, &mut grant_rejected).await;
+        load_bearer_token_inner(server_name, resource_url, dir, policy, &mut refresh_refusal).await;
     LoadedBearer {
         token,
-        grant_rejected: grant_rejected.then_some(OAuthGrantRejected),
+        refresh_refusal,
     }
 }
 
@@ -1596,7 +1627,7 @@ async fn load_bearer_token_inner(
     resource_url: &str,
     dir: &Path,
     policy: &OAuthHopPolicy,
-    grant_rejected: &mut bool,
+    refresh_refusal: &mut Option<RefreshRefusal>,
 ) -> Option<String> {
     validate_https_resource(resource_url).ok()?;
     let transaction = acquire_credential_lock(dir, server_name)
@@ -1691,7 +1722,7 @@ async fn load_bearer_token_inner(
                     }
                 }
                 Err(error) => {
-                    *grant_rejected = error.downcast_ref::<OAuthGrantRejected>().is_some();
+                    *refresh_refusal = RefreshRefusal::of(&error);
                     tracing::warn!(
                         "MCP OAuth refresh for `{server_name}` failed safely: {error:#}"
                     );
@@ -1711,7 +1742,7 @@ async fn load_bearer_token_inner(
             let refreshed = try_refresh(server_name, resource_url, &bundle, policy)
                 .await
                 .map_err(|error| {
-                    *grant_rejected = error.downcast_ref::<OAuthGrantRejected>().is_some();
+                    *refresh_refusal = RefreshRefusal::of(&error);
                     tracing::warn!(
                         "MCP OAuth refresh for `{server_name}` failed safely: {error:#}"
                     );
@@ -1746,13 +1777,14 @@ async fn load_bearer_token_inner(
 /// the resource's refusal of the still-active bearer is recorded durably, so
 /// `auth_status` reports NeedsFlow until a new token replaces it. A transport
 /// or other transient refresh failure records nothing. `Err` when the token
-/// endpoint answered `invalid_grant`.
+/// endpoint answered `invalid_grant`, or when its host is outside the active
+/// net grant (recorded as nothing: an approval, not a new login, recovers it).
 pub async fn refresh_bearer_token(
     server_name: &str,
     resource_url: &str,
     rejected_bearer: &str,
     policy: &OAuthHopPolicy,
-) -> Result<Option<String>, OAuthGrantRejected> {
+) -> Result<Option<String>, RefreshRefusal> {
     let Some(dir) = hermes_token_dir() else {
         return Ok(None);
     };
@@ -1765,7 +1797,7 @@ async fn refresh_bearer_token_from_dir(
     rejected_bearer: &str,
     dir: &Path,
     policy: &OAuthHopPolicy,
-) -> Result<Option<String>, OAuthGrantRejected> {
+) -> Result<Option<String>, RefreshRefusal> {
     if validate_https_resource(resource_url).is_err() {
         return Ok(None);
     }
@@ -1812,13 +1844,15 @@ async fn refresh_bearer_token_from_dir(
     tracing::warn!("MCP OAuth forced refresh for `{server_name}` failed: {error:#}");
     // Only a refused grant is a rejection: a network or other transient
     // failure leaves the login as it was, to be retried later.
-    let Some(rejected) = error.downcast_ref::<OAuthGrantRejected>().copied() else {
+    let Some(refusal) = RefreshRefusal::of(&error) else {
         return Ok(None);
     };
-    // Record only if the refused bearer is still the active one: a concurrent
-    // login or refresh that replaced it must not be poisoned.
-    record_bearer_rejected_in(dir, server_name, resource_url, rejected_bearer);
-    Err(rejected)
+    if matches!(refusal, RefreshRefusal::GrantRejected(_)) {
+        // Record only if the refused bearer is still the active one: a
+        // concurrent login or refresh that replaced it must not be poisoned.
+        record_bearer_rejected_in(dir, server_name, resource_url, rejected_bearer);
+    }
+    Err(refusal)
 }
 
 #[derive(Debug, PartialEq, Eq)]

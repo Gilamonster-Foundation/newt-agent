@@ -1206,7 +1206,16 @@ impl FencedHttpClient {
         timeout: std::time::Duration,
         allow_private_host: bool,
     ) -> Result<Self> {
-        let origin = resolve_origin(url, &system_resolver)?;
+        Self::for_url_with_resolver(url, timeout, allow_private_host, &system_resolver)
+    }
+
+    fn for_url_with_resolver(
+        url: &reqwest::Url,
+        timeout: std::time::Duration,
+        allow_private_host: bool,
+        resolver: &impl Fn(&str, u16) -> std::io::Result<Vec<std::net::SocketAddr>>,
+    ) -> Result<Self> {
+        let origin = resolve_origin(url, resolver)?;
         let client = build_pinned_client(&origin, timeout, allow_private_host)?;
         Ok(Self {
             client,
@@ -1437,20 +1446,42 @@ fn resolve_origin(
     })
 }
 
+/// The one rule for a resolved answer: an address no exact grant may approve is
+/// a hard refusal, and an approvable private answer without approval is a typed
+/// [`HttpNetGrantRequired`] the interactive caller can turn into a hostname-only
+/// prompt. Neither message carries the resolved address.
+fn screen_resolved_addresses(
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+    allow_private_host: bool,
+) -> Result<()> {
+    let non_global = || {
+        addresses
+            .iter()
+            .map(std::net::SocketAddr::ip)
+            .filter(|ip| ip_is_non_global(*ip))
+    };
+    if non_global().any(|ip| !ip_is_approvable_private(ip)) {
+        return Err(anyhow!(
+            "HTTP host `{host}` resolved to a forbidden non-global address; an exact net grant cannot approve it"
+        ));
+    }
+    if !allow_private_host && non_global().next().is_some() {
+        return Err(HttpNetGrantRequired {
+            host: host.to_string(),
+            private: true,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn build_pinned_client(
     origin: &ResolvedOrigin,
     timeout: std::time::Duration,
     allow_private_host: bool,
 ) -> Result<reqwest::Client> {
-    for address in &origin.addresses {
-        if !fenced_ip_is_allowed(address.ip(), allow_private_host) {
-            return Err(anyhow!(
-                "fenced HTTP host `{}` resolved to forbidden non-global address {}",
-                origin.host,
-                address.ip()
-            ));
-        }
-    }
+    screen_resolved_addresses(&origin.host, &origin.addresses, allow_private_host)?;
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
@@ -1606,10 +1637,6 @@ fn ip_is_non_global(ip: std::net::IpAddr) -> bool {
                 || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
         }
     }
-}
-
-fn fenced_ip_is_allowed(ip: std::net::IpAddr, allow_private_host: bool) -> bool {
-    !ip_is_non_global(ip) || (allow_private_host && ip_is_approvable_private(ip))
 }
 
 fn ip_is_approvable_private(ip: std::net::IpAddr) -> bool {
@@ -1788,25 +1815,15 @@ impl HttpTransport {
                 canonical.host
             ));
         }
+        screen_resolved_addresses(
+            &canonical.host,
+            &origin.addresses,
+            exact_private_approval || loopback_origin,
+        )?;
         let has_non_global = origin
             .addresses
             .iter()
             .any(|address| ip_is_non_global(address.ip()));
-        if origin.addresses.iter().any(|address| {
-            ip_is_non_global(address.ip()) && !ip_is_approvable_private(address.ip())
-        }) {
-            return Err(anyhow!(
-                "HTTP host `{}` resolved to a forbidden non-global address; an exact net grant cannot approve it",
-                canonical.host
-            ));
-        }
-        if has_non_global && !exact_private_approval && !loopback_origin {
-            return Err(HttpNetGrantRequired {
-                host: canonical.host,
-                private: true,
-            }
-            .into());
-        }
 
         let (client, proxy, private_origin_pinned) = if has_non_global {
             (

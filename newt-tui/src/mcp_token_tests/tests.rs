@@ -1128,7 +1128,7 @@ async fn token_endpoint_invalid_grant_reaches_the_status_message_3028() {
         loaded,
         LoadedBearer {
             token: None,
-            grant_rejected: Some(OAuthGrantRejected),
+            refresh_refusal: Some(RefreshRefusal::GrantRejected(OAuthGrantRejected)),
         }
     );
 
@@ -1240,13 +1240,13 @@ async fn a_fallback_bearer_carries_the_refused_grant_to_a_non_401_failure_3028()
         loaded,
         LoadedBearer {
             token: Some("current".to_string()),
-            grant_rejected: Some(OAuthGrantRejected),
+            refresh_refusal: Some(RefreshRefusal::GrantRejected(OAuthGrantRejected)),
         }
     );
 
-    let failure = crate::mcp::attach_grant_rejection(
+    let failure = crate::mcp::attach_refresh_refusal(
         anyhow::anyhow!("MCP initialize failed: connection reset"),
-        loaded.grant_rejected,
+        loaded.refresh_refusal,
     );
     let mut mcp = crate::mcp::Mcp::empty();
     mcp.statuses = vec![(name.into(), crate::mcp::McpStatus::from_error(&failure))];
@@ -1286,6 +1286,73 @@ async fn a_transport_failure_during_forced_refresh_writes_no_rejection_3028() {
     assert!(
         !rejection_path(temp.path(), name).exists(),
         "no record written"
+    );
+    assert_eq!(state_of(temp.path(), name, &resource), AuthState::Valid);
+}
+
+/// #2914 part (a): a stored login whose token endpoint is outside the active
+/// net grant is an approval to ask for, not a missing login. Both refresh
+/// paths carry the typed `HttpNetGrantRequired` — the proactive refresh of an
+/// expired token on load, and the forced refresh after a resource 401 — so the
+/// connect path's grant prompt (which downcasts it) is offered. Nothing is
+/// recorded as a rejection: an approval, not a new login, recovers it.
+#[tokio::test]
+#[ignore = "real filesystem; weekly/release mcp-import-real lane"]
+async fn token_host_outside_the_grant_asks_for_approval_not_login_2914() {
+    let temp = tempfile::tempdir().unwrap();
+    let name = "Review.Source";
+    // The resource host is granted; the token endpoint (`auth.example.test`) is not.
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::only(["mcp.example.test".to_string()]));
+    let denial = newt_mcp_client::HttpNetGrantRequired {
+        host: "auth.example.test".into(),
+        private: false,
+    };
+    let unauthorized = || {
+        anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+            401,
+            "Unauthorized",
+            "",
+        ))
+    };
+
+    let mut expired = credential_test_bundle("expired", false);
+    expired.token.expires_at = Some(1.0);
+    let resource = expired.meta.resource.clone();
+    publish(temp.path(), name, &expired);
+    let loaded = load_bearer_token_from_dir(name, &resource, temp.path(), &policy).await;
+    assert_eq!(
+        loaded,
+        LoadedBearer {
+            token: None,
+            refresh_refusal: Some(RefreshRefusal::NetGrantRequired(denial.clone())),
+        }
+    );
+    let anonymous = crate::mcp::attach_refresh_refusal(unauthorized(), loaded.refresh_refusal);
+    assert_eq!(
+        anonymous.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>(),
+        Some(&denial)
+    );
+
+    publish(temp.path(), name, &credential_test_bundle("current", false));
+    let dir = temp.path().to_path_buf();
+    let failed = crate::mcp::retry_http_unauthorized_once(
+        Err::<(), _>(unauthorized()),
+        Some("current".to_string()),
+        || async { refresh_bearer_token_from_dir(name, &resource, "current", &dir, &policy).await },
+        |_| {},
+        |_| async { anyhow::Ok(()) },
+    )
+    .await
+    .err()
+    .expect("a blocked refresh cannot reconnect");
+    assert_eq!(
+        failed.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>(),
+        Some(&denial),
+        "{failed:#}"
+    );
+    assert!(
+        !rejection_path(temp.path(), name).exists(),
+        "a host denial is not a refused login"
     );
     assert_eq!(state_of(temp.path(), name, &resource), AuthState::Valid);
 }

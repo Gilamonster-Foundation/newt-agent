@@ -98,16 +98,26 @@ pub(super) fn validate_discovery_hop_with_policy(
     let host = url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("OAuth {kind} URL has no host: {endpoint}"))?;
-    if !(policy.permits_host(host) || cfg!(test) && allow_test_loopback_http) {
-        anyhow::bail!("OAuth {kind} host `{host}` is outside the session network capability");
+    // The test flag admits only the loopback mock servers, so a test can still
+    // exercise a host-scope denial beside them.
+    if !(policy.permits_host(host)
+        || cfg!(test) && allow_test_loopback_http && newt_mcp_client::host_is_loopback(host))
+    {
+        return Err(newt_mcp_client::HttpNetGrantRequired {
+            host: host.to_string(),
+            private: false,
+        }
+        .into());
     }
     if !allow_test_loopback_http
         && !exact_host_is_approved(&url, policy)
         && (newt_mcp_client::host_is_loopback(host) || is_internal_literal_host(host))
     {
-        anyhow::bail!(
-            "OAuth {kind} resolves to a forbidden loopback/private literal host: {endpoint}"
-        );
+        return Err(newt_mcp_client::HttpNetGrantRequired {
+            host: host.to_string(),
+            private: true,
+        }
+        .into());
     }
     Ok(url)
 }
@@ -624,7 +634,7 @@ async fn fetch_authorization_server_meta(
         issuer,
         allow_test_loopback_http,
     )?);
-    let mut failures = Vec::new();
+    let mut failures = DiscoveryFailures::default();
     for url in urls {
         let attempt = async {
             let parsed = validate_discovery_hop_with_policy(
@@ -700,13 +710,42 @@ async fn fetch_authorization_server_meta(
         .await;
         match attempt {
             Ok(metadata) => return Ok(metadata),
-            Err(error) => failures.push(format!("{url}: {error:#}")),
+            Err(error) => failures.record(&url, &error),
         }
     }
-    anyhow::bail!(
-        "authorization server metadata discovery failed for `{issuer}`: {}",
-        failures.join("; ")
-    )
+    Err(failures.into_error(&format!(
+        "authorization server metadata discovery failed for `{issuer}`"
+    )))
+}
+
+/// Failures across alternative discovery attempts. Every one is kept as text
+/// for the aggregate; the first host denial is also kept typed, so when no
+/// alternative succeeds the /mcp panel can still downcast it and offer the
+/// exact-host prompt. A denial never ends the search early: alternatives can
+/// sit on other, permitted hosts.
+#[derive(Default)]
+struct DiscoveryFailures {
+    notes: Vec<String>,
+    host_denial: Option<newt_mcp_client::HttpNetGrantRequired>,
+}
+
+impl DiscoveryFailures {
+    fn record(&mut self, attempt: &str, error: &anyhow::Error) {
+        self.notes.push(format!("{attempt}: {error:#}"));
+        self.host_denial = self.host_denial.take().or_else(|| {
+            error
+                .downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()
+                .cloned()
+        });
+    }
+
+    fn into_error(self, summary: &str) -> anyhow::Error {
+        let aggregate = format!("{summary}: {}", self.notes.join("; "));
+        match self.host_denial {
+            Some(denial) => anyhow::Error::new(denial).context(aggregate),
+            None => anyhow::anyhow!(aggregate),
+        }
+    }
 }
 
 /// Discover RFC 9728 protected-resource metadata, then independently discover
@@ -802,11 +841,11 @@ async fn discover_oauth_meta_within_budget_for_client(
             (!protected.scopes_supported.is_empty()).then(|| protected.scopes_supported.join(" "))
         })
     });
-    let mut errors = Vec::new();
+    let mut failures = DiscoveryFailures::default();
     let mut selected = None;
     for issuer in issuers {
         if budget.is_exhausted() {
-            errors.push(format!(
+            failures.notes.push(format!(
                 "{issuer}: OAuth discovery budget of {}s exhausted before this candidate",
                 OAUTH_DISCOVERY_BUDGET.as_secs()
             ));
@@ -824,7 +863,7 @@ async fn discover_oauth_meta_within_budget_for_client(
                     && !metadata_supports_cimd(&metadata.extra)
                     && !(allow_re_registration && metadata.registration_endpoint.is_some()) =>
             {
-                errors.push(format!(
+                failures.notes.push(format!(
                     "{issuer}: authorization server does not advertise client_id_metadata_document_supported"
                 ));
             }
@@ -849,7 +888,7 @@ async fn discover_oauth_meta_within_budget_for_client(
                     && !stored_reusable
                     && metadata.registration_endpoint.is_none()
                 {
-                    errors.push(format!(
+                    failures.notes.push(format!(
                         "{issuer}: saved client is not reusable and the authorization server has no dynamic client registration endpoint"
                     ));
                     continue;
@@ -857,15 +896,12 @@ async fn discover_oauth_meta_within_budget_for_client(
                 selected = Some((issuer, metadata));
                 break;
             }
-            Err(error) => errors.push(format!("{issuer}: {error:#}")),
+            Err(error) => failures.record(&issuer, &error),
         }
     }
-    let (issuer, metadata) = selected.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no advertised authorization server passed discovery: {}",
-            errors.join("; ")
-        )
-    })?;
+    let Some((issuer, metadata)) = selected else {
+        return Err(failures.into_error("no advertised authorization server passed discovery"));
+    };
     Ok(DiscoveredOAuthMeta {
         resource: canonical_resource,
         issuer,

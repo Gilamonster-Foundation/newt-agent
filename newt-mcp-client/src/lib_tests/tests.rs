@@ -51,6 +51,45 @@ fn private_resolution_requires_an_exact_host_policy_decision() {
     assert!(FencedHttpClient::for_url(&url, Duration::from_secs(1), true).is_ok());
 }
 
+/// A permitted hostname whose DNS answer is an approvable private address asks
+/// for the exact-host grant as a typed, hostname-only `HttpNetGrantRequired`
+/// (the OAuth hops build their clients here), never an untyped error carrying
+/// the resolved address. An address no grant may approve stays a hard refusal.
+#[test]
+fn fenced_private_dns_answer_requests_a_typed_hostname_grant() {
+    let url = reqwest::Url::parse("https://auth.internal.example/token").unwrap();
+    let answer = |ip: &'static str| {
+        move |_host: &str, port: u16| Ok(vec![std::net::SocketAddr::new(ip.parse().unwrap(), port)])
+    };
+    let build = |allow: bool, ip: &'static str| {
+        FencedHttpClient::for_url_with_resolver(&url, Duration::from_secs(1), allow, &answer(ip))
+    };
+
+    let error = build(false, "10.0.0.1")
+        .err()
+        .expect("unapproved private answer");
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
+    assert_eq!(
+        required,
+        Some(&HttpNetGrantRequired {
+            host: "auth.internal.example".into(),
+            private: true,
+        }),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("10.0.0.1"), "{error:#}");
+    assert!(build(true, "10.0.0.1").is_ok());
+
+    let metadata = build(true, "169.254.169.254")
+        .err()
+        .expect("never approvable");
+    assert!(
+        metadata.downcast_ref::<HttpNetGrantRequired>().is_none(),
+        "{metadata:#}"
+    );
+    assert!(!format!("{metadata:#}").contains("169.254"), "{metadata:#}");
+}
+
 #[test]
 fn system_dns_resolution_has_an_explicit_deadline() {
     let error = resolve_with_timeout(
@@ -242,7 +281,12 @@ fn private_host_approval_never_overrides_special_address_fences() {
     let six_to_four: std::net::IpAddr = "2002:7f00:1::".parse().unwrap();
     assert!(ip_is_non_global(six_to_four));
     assert!(!ip_is_approvable_private(six_to_four));
-    assert!(!fenced_ip_is_allowed(six_to_four, true));
+    assert!(screen_resolved_addresses(
+        "relay.example",
+        &[std::net::SocketAddr::new(six_to_four, 443)],
+        true
+    )
+    .is_err());
     let link_local_metadata = std::net::Ipv4Addr::new(169, 254, 169, 254).to_string();
     let shared_address_space = std::net::Ipv4Addr::new(100, 64, 0, 1).to_string();
     for forbidden in [
@@ -255,7 +299,15 @@ fn private_host_approval_never_overrides_special_address_fences() {
         let address = forbidden.parse().unwrap();
         assert!(ip_is_non_global(address), "{address}");
         assert!(!ip_is_approvable_private(address), "{address}");
-        assert!(!fenced_ip_is_allowed(address, true), "{address}");
+        let screened = screen_resolved_addresses(
+            "special.example",
+            &[std::net::SocketAddr::new(address, 443)],
+            true,
+        );
+        assert!(
+            screened.is_err_and(|error| error.downcast_ref::<HttpNetGrantRequired>().is_none()),
+            "{address}"
+        );
     }
 }
 

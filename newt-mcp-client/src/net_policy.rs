@@ -58,7 +58,7 @@ impl HttpNetworkPolicy {
 }
 
 /// A host approval the interactive caller can request before retrying a connection.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpNetGrantRequired {
     pub host: String,
     pub private: bool,
