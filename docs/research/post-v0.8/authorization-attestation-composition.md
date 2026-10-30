@@ -863,6 +863,17 @@ Each line below is **Inference**, built on the facts cited.
    Lines 229 and 394 hash `serde_json` bytes. The source says "Full RFC 8785
    number/string normalization is a follow-up".
 
+8. **The enforcing implementation is not shown to preserve the caveat's
+   semantics.** Matching implementation digests show that two parties run the
+   same bytes. Verified provenance shows that the bytes came through a
+   recorded process. A compromised build pipeline passes both, which is the
+   SolarWinds case. Only a claim about the code itself addresses it: that the
+   mediator's behaviour stays inside the region the caveat allows. That claim
+   is tractable for safety properties. A leak through an allowed channel keeps
+   every single trace inside the region, so confidentiality needs reasoning
+   over pairs of traces. Proof-carrying code is the closest established model
+   (G12, P2-15).
+
 ## 6. Adversarial counterexamples
 
 Verdicts: **P** prevents, **D** detects, **R** merely records, **M** misses
@@ -990,6 +1001,7 @@ entirely.
 | G9 | Equivocation, omission, or joint rollback of a journal and its head | acknowledgment / log | BA R; DP R | one journal, one head, both in one store | inference | an independent freshness anchor for heads (P1-7, P2-14) |
 | G10 | Enforcement-point integrity | evaluation | all assume honest | self-reported `EnforcementReport` | inference | platform attestation (P2-15) |
 | G11 | Holder key reachable by the model | session | AAT voids its guarantees (§9.1.1) | the credential stays out of the box (`b1-os-isolation` GATED; `local-deputy-egress` OPEN) | fact (register) | keep harness-held keys (P0-3) |
+| G12 | Semantic conformance of the enforcing code across updates: matching digests and verified provenance both survive a compromised build pipeline | implementation / update | all M | Lean caveat-lattice proofs cover a hand model; tying them to the Rust is roadmap step 3, not done ([`formal/README.md`](../../../formal/README.md)). Bridle plans an Aeneas refinement of its kernel | fact (formal README) | proof-carrying enforcement receipt (P2-15) |
 
 ## 8. Adopt / Adapt / Reject / Watch
 
@@ -1199,8 +1211,14 @@ variant are recorded as known passes.
     boundary whose counterparty can countersign.
 14. **P2-14.** Register journal chain *heads* (not records) in a transparency
     log with consistency proofs, for third-party omission detection (G9).
-15. **P2-15.** Explore platform attestation of the enforcement point (G10).
-    Tie it to the hardware-provenance research track.
+15. **P2-15.** Proof-carrying enforcement, as a separate research thread (G10,
+    G12). Define a receipt assertion "binary X refines specification Y, by
+    proof Z, checked by W", each named by CID, before any proof exists. Fill it
+    first with graded evidence, such as adversarial vectors run per update and
+    labelled "tested", and later with Bridle's planned kernel refinement.
+    Start with safety properties. Confidentiality needs hyperproperties and
+    comes later. Platform attestation stays the "which bytes" evidence
+    underneath and never stands in for the semantic claim.
 
 ---
 
