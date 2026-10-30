@@ -1089,9 +1089,15 @@ pub(crate) fn render_panel_with_styles(
         let (name_style, val_style) = row_styles(row.selected, row.editable);
         let (value_override, annotation_override) = styles(row);
         let val_style = val_style.patch(value_override);
+        // A value that fills its column still keeps a gap before the annotation (#3056).
+        let gap = if val.chars().count() >= val_w {
+            " "
+        } else {
+            ""
+        };
         let mut spans = vec![
             Span::styled(name, name_style),
-            Span::styled(format!("{val:<val_w$}"), val_style),
+            Span::styled(format!("{val:<val_w$}{gap}"), val_style),
         ];
         if !row.provenance.is_empty() {
             spans.push(Span::styled(

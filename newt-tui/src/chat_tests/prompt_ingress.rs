@@ -607,6 +607,16 @@ fn durable_pending_clarification_rehydrates_its_lineage_after_resume() {
     );
 }
 
+/// #3056: the session trims a line before it looks for a `/command`, so the
+/// cockpit, which reads the same function, must see ` /mcp` as the command it
+/// runs, and model input as model input.
+#[test]
+fn a_command_is_read_from_the_trimmed_line() {
+    assert_eq!(operator_task("  /mcp\t"), "/mcp");
+    assert_eq!(operator_task("one \\\ntwo"), "one \ntwo");
+    assert!(!operator_task("what does /mcp do?").starts_with('/'));
+}
+
 /// #2515: `/discuss` (the clarification batch's own advertised escape
 /// hatch) must reach the pending clarification, not the slash registry —
 /// and only while something is actually pending. This is the input-routing

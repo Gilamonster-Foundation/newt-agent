@@ -163,6 +163,9 @@ fn interaction_view_child() {
         "cockpit_panel_gap" => {
             crate::cockpit::presenter::cockpit_panel_gap_case();
         }
+        "cockpit_panel_reopen" => {
+            crate::cockpit::presenter::cockpit_panel_reopen_case();
+        }
         "cockpit_acceptance" => {
             crate::cockpit::presenter::cockpit_acceptance_case();
         }
@@ -268,7 +271,7 @@ fn committed_frame_case(lines: u16, held: bool, window: bool, partial: bool) {
 
 /// A permission-shaped interaction with labels long enough that a narrow
 /// terminal must wrap them.
-fn fixture_interaction() -> newt_core::interaction_surface::SurfaceInteraction {
+pub(crate) fn fixture_interaction() -> newt_core::interaction_surface::SurfaceInteraction {
     use newt_interaction::{
         ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition, InteractionKind,
         OptionId, Requirement, SemanticRole,
@@ -427,6 +430,7 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
             | "cockpit_resize_anchor"
             | "cockpit_resize_anchor_dirty"
             | "cockpit_panel_gap"
+            | "cockpit_panel_reopen"
             | "cockpit_psyche"
     ) {
         child.env("NEWT_EDIT_MODE", "emacs");
@@ -657,7 +661,9 @@ fn drive_cockpit_pager_sizes(sizes: &[(u16, u16)]) {
 }
 
 /// The screen after `stream`, honouring what `screen_grid` ignores: erases
-/// (`ED`/`EL`) and scrolling at the bottom row. Approximation: cursor motion
+/// (`ED`/`EL`), scrolling at the bottom row, and the alternate screen (`?1049`:
+/// a blank screen of its own; leaving it restores the primary one and its
+/// cursor). Approximation: cursor motion
 /// is absolute and there is no reflow, so a resize is not modelled: `rows` is
 /// the height to scroll at, and rows are not lost when the terminal shrinks.
 pub(crate) fn erasing_grid(stream: &str, rows: usize) -> Vec<String> {
@@ -669,6 +675,7 @@ pub(crate) fn erasing_grid(stream: &str, rows: usize) -> Vec<String> {
 pub(crate) fn erasing_screen(stream: &str, rows: usize) -> (Vec<String>, (usize, usize)) {
     let mut grid: Vec<Vec<char>> = vec![Vec::new(); rows];
     let (mut row, mut col) = (0usize, 0usize);
+    let mut primary = None;
     let mut chars = stream.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -701,6 +708,17 @@ pub(crate) fn erasing_screen(stream: &str, rows: usize) -> (Vec<String>, (usize,
                         .unwrap_or(d)
                 };
                 match fin {
+                    'h' if params == "?1049" && primary.is_none() => {
+                        primary = Some((
+                            std::mem::replace(&mut grid, vec![Vec::new(); rows]),
+                            (row, col),
+                        ));
+                    }
+                    'l' if params == "?1049" => {
+                        if let Some((saved, cursor)) = primary.take() {
+                            (grid, (row, col)) = (saved, cursor);
+                        }
+                    }
                     'H' => (row, col) = ((n(0, 1) - 1).min(rows - 1), n(1, 1) - 1),
                     'J' | 'K' => {
                         let mode = n(0, 0);
@@ -814,9 +832,10 @@ fn panel_repaint_discards_erased_zoom_frame_in_one_drain() {
 }
 
 /// #2573 review: drive a real panel through resizes and keys, then close it.
-/// The selection must survive, no resize may erase from row 0 (the transcript
-/// above the panel stays), the border must sit at each new width, and the
-/// draft and terminal modes must come back.
+/// The selection must survive, no resize may erase from row 0 of the primary
+/// screen (the transcript stays; the panel is on the alternate one, #3056), the
+/// border must sit at each new width, and the draft and terminal modes must
+/// come back.
 pub(crate) fn drive_cockpit_panel_loop() {
     let pty = Pty::open_with_cursor_reply(1, 1);
     pty.resize(24, 80);
@@ -842,8 +861,12 @@ pub(crate) fn drive_cockpit_panel_loop() {
                     && rows.iter().any(|row| row.contains("❯ panel-row-03"))
             })?;
             transcript.push_str(&repaint);
-            if repaint.contains("\x1b[1;1H\x1b[J") || repaint.contains("\x1b[2J") {
-                return Err(format!("resize to {width}x{height} erased from row 0"));
+            let on_alternate = transcript.rfind("\x1b[?1049h") > transcript.rfind("\x1b[?1049l");
+            if !on_alternate && (repaint.contains("\x1b[1;1H\x1b[J") || repaint.contains("\x1b[2J"))
+            {
+                return Err(format!(
+                    "resize to {width}x{height} erased the primary screen from row 0"
+                ));
             }
             if !rows
                 .iter()
@@ -943,10 +966,8 @@ pub(crate) fn drive_cockpit_panel_loop() {
 }
 
 /// #2573 hardening: closing a panel leaves the transcript above it and none
-/// of the panel. No zoom and no resize, on purpose: a zoomed panel covers the
-/// transcript and the presenter scrolls it into scrollback (by design), and
-/// `erasing_grid` does not model a resize, so this is the case where "still on
-/// screen" is a claim it can make exactly.
+/// of the panel. No resize, on purpose: `erasing_grid` does not model one, so
+/// this is the case where "still on screen" is a claim it can make exactly.
 pub(crate) fn drive_cockpit_panel_close() {
     let pty = Pty::open_with_cursor_reply(1, 1);
     pty.resize(24, 80);
@@ -1162,6 +1183,129 @@ pub(crate) fn drive_cockpit_panel_gap() {
         status.is_some_and(|status| status.success()),
         "{status:?}: {transcript:?}"
     );
+}
+
+/// #3056: over a full screen, answer a decision, then open and close a 12-row panel and (after
+/// an operation) a 6-row one. Each must enter the alternate screen. Read the stream at the cockpit's last frame before the decision and at its repaint after
+/// each close: those screens must be the same, row for row. And while the last panel is up, any
+/// transcript still visible above it must end on the row above its border, with no blank band.
+pub(crate) fn drive_cockpit_panel_reopen() {
+    const ROWS: usize = 24;
+    const FRAME_END: &str = "\x1b[?2026l";
+    // What each window shows, and the key that closes it.
+    const WINDOWS: [(&str, &str, &str); 3] = [
+        ("the decision", "allowlist", "\x1b"),
+        ("the first panel", "panel-row-", "\x1b"),
+        ("the second panel", "again-row-", "\x1b"),
+    ];
+    let pty = Pty::open_with_cursor_reply(1, 1);
+    pty.resize(24, 80);
+    let mut child = spawn_child(&pty, "cockpit_panel_reopen");
+    let mut stream = String::new();
+    let result = (|| -> Result<(), String> {
+        for (name, marker, close) in WINDOWS {
+            if !pty.wait_for_screen_after(marker, "╯", REACH_TIMEOUT) {
+                return Err(format!("{name} never painted"));
+            }
+            stream.push_str(&pty.screen());
+            pty.type_in(close);
+        }
+        if !pty.wait_for_screen("PANEL_CLOSED", REACH_TIMEOUT) {
+            return Err("Esc did not close the second panel".into());
+        }
+        stream.push_str(&pty.screen());
+        let mut opens = Vec::new();
+        for (name, marker, _) in WINDOWS {
+            opens.push(
+                stream
+                    .find(marker)
+                    .ok_or_else(|| format!("{name} is not in the stream"))?,
+            );
+        }
+        let before_end = stream[..opens[0]]
+            .rfind(FRAME_END)
+            .ok_or("no cockpit frame before the decision")?;
+        let before = without_clock(erasing_grid(&stream[..before_end + FRAME_END.len()], ROWS));
+        if !before.iter().any(|row| row.contains("HISTORY_ABOVE_PANEL"))
+            || before.last().is_none_or(String::is_empty)
+        {
+            return Err(format!(
+                "control: no full screen before the decision: {before:?}"
+            ));
+        }
+        let mut failures = Vec::new();
+        for (i, (name, marker, _)) in WINDOWS.into_iter().enumerate() {
+            // The window's last bytes, then the cockpit's first repaint after them.
+            let until = opens.get(i + 1).copied().unwrap_or(stream.len());
+            let closed = stream[..until].rfind(marker).unwrap_or(opens[i]);
+            let repaint = stream[closed..]
+                .find(FRAME_END)
+                .ok_or_else(|| format!("no cockpit repaint after {name} closed"))?;
+            let after = without_clock(erasing_grid(
+                &stream[..closed + repaint + FRAME_END.len()],
+                ROWS,
+            ));
+            if after != before {
+                failures.push(format!(
+                    "the screen after {name} closed is not the screen before:\n\
+                     before {before:?}\nafter  {after:?}"
+                ));
+            }
+        }
+        let last = opens[2];
+        let frame = stream[last..]
+            .find("\x1b[?25l")
+            .ok_or("the second panel never finished a frame")?;
+        let open = erasing_grid(&stream[..last + frame], ROWS);
+        let border = open
+            .iter()
+            .rposition(|row| row.contains('╭'))
+            .ok_or_else(|| format!("no top border on the second panel: {open:?}"))?;
+        if let Some(text) = open[..border].iter().rposition(|row| !row.is_empty()) {
+            if border - text > 1 {
+                failures.push(format!(
+                    "{} blank rows between the transcript and the second panel: {open:?}",
+                    border - text - 1
+                ));
+            }
+        }
+        let entries = stream.matches("\x1b[?1049h").count();
+        if entries != WINDOWS.len() {
+            failures.push(format!(
+                "{entries} alternate-screen entries for {} windows the operator opened",
+                WINDOWS.len()
+            ));
+        }
+        if !failures.is_empty() {
+            return Err(failures.join("\n"));
+        }
+        pty.type_in("\r");
+        if !pty.wait_for_screen("PANEL_LOOP_RESTORED", REACH_TIMEOUT) {
+            return Err("the draft was not handed back intact".into());
+        }
+        pty.type_in("\n");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    if let Err(error) = &result {
+        panic!("{error}");
+    }
+    assert!(status.is_some_and(|status| status.success()), "{status:?}");
+}
+
+/// The block's live clock (`[YYYY-MM-DD HH:MM:SS]`) may tick between two reads of one screen.
+fn without_clock(rows: Vec<String>) -> Vec<String> {
+    rows.into_iter()
+        .map(
+            |row| match row.strip_prefix('[').and_then(|r| r.split_once(']')) {
+                Some((stamp, rest)) if stamp.len() == 19 => format!("[clock]{rest}"),
+                _ => row,
+            },
+        )
+        .collect()
 }
 
 pub(crate) fn drive_cockpit_bang() {

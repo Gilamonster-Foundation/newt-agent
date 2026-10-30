@@ -748,6 +748,14 @@ fn line_answers_pending_clarification(task: &str, has_pending: bool) -> bool {
     has_pending && newt_core::agentic::discussion_request(task).is_some()
 }
 
+/// A submitted line as the session reads it: `\`-continued lines rejoined into
+/// real newlines (a no-op for single-line input) and surrounding whitespace
+/// trimmed. The cockpit reads a line it hands over through this too, so it sees
+/// the same `/command` the session will run (#3056).
+pub(crate) fn operator_task(line: &str) -> String {
+    line.replace("\\\n", "\n").trim().to_string()
+}
+
 /// Comprehend an accepted prompt. A direct answer to a pending clarification
 /// is resolved against that manifest, not reclassified in isolation.
 ///
@@ -3781,9 +3789,7 @@ fn session_body(
                 continue;
             }
             ReadOutcome::Line(line) => {
-                // Rejoin `\`-continued lines (multi-line entry) into real
-                // newlines; a no-op for single-line input.
-                let task = line.replace("\\\n", "\n").trim().to_string();
+                let task = operator_task(&line);
                 if task.is_empty() {
                     continue;
                 }
