@@ -112,6 +112,11 @@ fn views(mcp: &Mcp, report: &newt_core::mcp::McpDiscoveryReport) -> Vec<ServerVi
 fn failure_message(error: &anyhow::Error) -> String {
     // No arbitrary transport body, credential-bearing URL, or child stderr is
     // copied into the panel. Typed protocol/network errors remain actionable.
+    // A host-grant cause wins over the 401 it explains: an approval, not a
+    // login, recovers a refresh blocked by the net grant.
+    if let Some(required) = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>() {
+        return format!("OCAP network approval needed for {}", required.host);
+    }
     if let Some(status) = newt_mcp_client::http_error_status(error) {
         return format!(
             "HTTP {status}{}",
@@ -124,9 +129,6 @@ fn failure_message(error: &anyhow::Error) -> String {
                 " · connection failed".into()
             }
         );
-    }
-    if let Some(required) = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>() {
-        return format!("OCAP network approval needed for {}", required.host);
     }
     // A dead refresh grant: the token endpoint answered `invalid_grant`.
     if error
@@ -497,6 +499,36 @@ mod tests {
         assert_eq!(
             failure_message(&invalid_grant),
             "Saved login was rejected (invalid_grant) · choose Login, or run /mcp login-all"
+        );
+    }
+
+    /// #2914 part (a): a 401 whose refresh was blocked because the token host
+    /// is outside the net grant is fixed by an approval, not a login. The
+    /// typed host-grant cause wins over the 401 it explains, in the panel
+    /// message and in the status that decides "login required".
+    #[test]
+    fn a_host_grant_cause_wins_over_the_401_it_explains_2914() {
+        let blocked_refresh = crate::mcp_token::RefreshRefusal::NetGrantRequired(
+            newt_mcp_client::HttpNetGrantRequired {
+                host: "auth.example.test".into(),
+                private: false,
+            },
+        )
+        .explain(anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+            401,
+            "Unauthorized",
+            "",
+        )));
+        assert_eq!(
+            failure_message(&blocked_refresh),
+            "OCAP network approval needed for auth.example.test"
+        );
+        assert!(
+            !matches!(
+                crate::mcp::McpStatus::from_error(&blocked_refresh),
+                crate::mcp::McpStatus::Rejected(_)
+            ),
+            "a login does not recover a host denial"
         );
     }
 }

@@ -52,13 +52,18 @@ pub(crate) enum McpStatus {
 impl McpStatus {
     /// The status a failed connection records. `Rejected` only on typed
     /// evidence (the HTTP status carried in the error chain), never because
-    /// the error text happens to mention "auth" or "401".
+    /// the error text happens to mention "auth" or "401". A typed host-grant
+    /// cause is not `Rejected`: an approval, not a login, recovers it.
     pub(crate) fn from_error(error: &anyhow::Error) -> Self {
         let reason = format!("{error:#}");
-        if newt_mcp_client::http_error_status(error) == Some(401)
+        let needs_login = newt_mcp_client::http_error_status(error) == Some(401)
             || error
                 .downcast_ref::<crate::mcp_token::OAuthGrantRejected>()
-                .is_some()
+                .is_some();
+        if needs_login
+            && error
+                .downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()
+                .is_none()
         {
             Self::Rejected(reason)
         } else {
