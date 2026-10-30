@@ -122,9 +122,12 @@ draft. The table keeps these weights apart.
      (`AUTH-05`, and the content-addressable rule).
 3. **AAT authorizes strings, not objects.**
    - Fact: AAT §3.3.1, §3.4 and §9.1.1 leave resolution to the tool.
-   - Measured (§6, CE1): in 8 of 8 alias cases, a textual check accepts the
-     value while the resolved object leaves the intended scope. Three of those
-     rows use AAT *core* types (`not_one_of` twice, `exact` once).
+   - Measured (§6, CE1): the script constructs 8 alias cases, and in each a
+     textual check accepts the value while the resolved object leaves the
+     intended scope. That is a demonstration count, not a failure rate. Five
+     rows attack a *hypothetical* prefix matcher, two simulate filesystem
+     folding in Python, and one swaps a real symlink. Three rows use AAT
+     *core* types (`not_one_of` twice, `exact` once).
    - Newt already relies on stronger mechanisms. Keep them as the authority
      designation:
      - object-bound opens (`fs_cap`);
@@ -363,7 +366,8 @@ The rows test different things:
 
 - **Rows 1–5** test a *hypothetical* lexical-prefix extension. AAT defines none
   and requires a sound one (§5.1).
-- **Rows 6–7** use the core `not_one_of`. The denylist is sound over strings,
+- **Rows 6–7** use the core `not_one_of`. The script *simulates* the fold
+  with `unicodedata.normalize` and `str.lower`. The denylist is sound over strings,
   but on a normalization-insensitive or case-insensitive filesystem the excluded
   file is reachable through an alias.
   **Measured** on a default APFS volume under macOS 15: after creating the
@@ -629,7 +633,7 @@ Newt has two layers of the "platform" kind:
   nothing). It closes in-process admit/apply
   drift (L2), not third-party trust.
 
-**Rec.** Keep the four proofs separate (P0-2).
+**Rec.** Keep these proofs separate (P0-2).
 
 ### 4.3 Decision Provenance for SCITT (-00)
 
@@ -831,6 +835,16 @@ Each line below is **Inference**, built on the facts cited.
    Each is internally sound. Joining them takes a declared transform. Without
    one, a verifier either cannot join them or trusts an unstated mapping.
 
+   **A common encoding does not give a common meaning.** Minting every record
+   through `content-addressable` makes all parties agree on the CID of a
+   value. It does not make the value unambiguous. Two parties can agree
+   exactly on the CID of `{tool: "repo.read_object", object: "README"}` while
+   meaning different tools and different objects. The action schema has to
+   bind what the name stands for: the tool's identity *and version* (or a
+   digest of its contract), the target as an object identity, the full
+   arguments, the input versions, and the execution context the decision
+   relied on, such as the policy CID and the fence mechanism (P0-4).
+
    **Fact:** BA §11.9 makes the same argument about canonicalization *within*
    one protocol. The ratchet cannot see Bridle's construction, because it counts
    only one literal:
@@ -906,7 +920,14 @@ entirely.
 - **Newt** concedes the rollback case in source
   ([`durable_grants.rs`](../../../newt-core/src/durable_grants.rs)).
 - **Rec.** Pin the policy set by CID in a chain with a separate head (`AUTH-08`,
-  P1-7).
+  P1-7). That is necessary, not sufficient. A policy CID identifies *a*
+  policy. It does not show that the policy was the latest applicable one.
+  An attacker who can restore an older journal *and* its head ref leaves both
+  mutually consistent, so the chain check passes. Freshness needs evidence the
+  attacker cannot roll back with the store: a monotonic counter or generation
+  held elsewhere, an operator-signed head that names its generation, or a head
+  registered in an external log. Without one, the verifier reports the policy
+  as *consistent with the cited head*, never as *current*.
 
 **CE4: an internally valid record that omits a side effect.**
 
@@ -941,8 +962,14 @@ entirely.
   - (e) Registering a decision record publishes digests of hidden artifacts
     (BA §12 recommends commitments instead).
 - **Verdict.** All three drafts miss it.
-- **Rec.** Give a projection its own identity, distinct from the source, and
-  express hidden parts only as salted commitments (P1-11).
+- **Rec.** Give a projection its own identity, distinct from the source.
+  Salted commitments to hidden parts slow down guessing of hidden *content*,
+  but they do not make a projection private. A changing commitment, an entry
+  count, the *kind* of error, and timing all still reveal hidden *activity*.
+  The projection design must first state what an authorized observer may
+  learn, for example "the projection's own tree and nothing else, including
+  whether hidden content exists or changed". Each channel above is then a
+  test against that statement (P1-11).
 
 **CE6: equivocation.** See §4.2.4 and the disagreement with BA §11.5.
 
@@ -960,7 +987,7 @@ entirely.
 | G6 | Shown ≠ approved ≠ executed | decision → request | DPS-AB D (if honest) | push binds OID+URL; other approvals bind `CallRequest`, whose `resource` is unenforced canonicalization | fact | approval stage chain (P1-10) |
 | G7 | Projection leakage | read / propose | all M | partial (diagnostics dropped) | inference | projection identity (P1-11) |
 | G8 | Refusal ≠ confinement; best-effort refusal records | disposition | BA overclaims (§6) | denial journal best-effort | fact | never cite a refusal as containment evidence (P0-2) |
-| G9 | Equivocation or omission outside the exchange | acknowledgment / log | BA R; DP R | one journal, one head | inference | chain heads to a transparency log (P2-14) |
+| G9 | Equivocation, omission, or joint rollback of a journal and its head | acknowledgment / log | BA R; DP R | one journal, one head, both in one store | inference | an independent freshness anchor for heads (P1-7, P2-14) |
 | G10 | Enforcement-point integrity | evaluation | all assume honest | self-reported `EnforcementReport` | inference | platform attestation (P2-15) |
 | G11 | Holder key reachable by the model | session | AAT voids its guarantees (§9.1.1) | the credential stays out of the box (`b1-os-isolation` GATED; `local-deputy-egress` OPEN) | fact (register) | keep harness-held keys (P0-3) |
 
@@ -1000,8 +1027,12 @@ test vectors.
 - The keepable output is the vectors and a verdict table, not the code.
 
 **Why reading a named object.** The object is designated by its git blob OID, so
-the outcome *verifies itself*: the returned bytes must hash to the requested OID.
-This is the one case where "the claimed effect occurred" can be checked offline.
+the *integrity* of the outcome can be checked offline: the returned bytes must
+hash to the requested OID. That is all the hash shows. A matching OID does not
+show that the object belongs to the authorized repository or projection, that
+the grant permitted disclosing it, or that the read ran confined. The verifier
+checks the first two separately (step 8), and the experiment does not claim the
+third.
 The "propose a patch" variant does the same with `{base tree, patch CID,
 resulting tree}`, re-applied offline. It must not push.
 
@@ -1009,12 +1040,15 @@ resulting tree}`, re-applied offline. It must not push.
 
 1. **Root grant R.** A mesh `Grant{Root}` over `Authority{caveats}`, plus a
    session-root `CertChain` signed by a test operator key. The `GrantId` is the
-   identity proof; the cert signature is the assertion proof.
+   content-identity proof and the cert signature is the assertion proof. The
+   operator key's entry in the verifier's trust policy is the principal
+   identity.
 2. **Child grant G.** `Derivation::Attenuation{parent: GrantId(R)}`, with
    `fs_read` narrowed to the repository root. `check_derivation` must return
    `Valid`.
-3. **Action A.** `{tool: "repo.read_object", repo: <repo identity>, object:
-   <blob OID>, grant: GrantId(G)}`, as a `ContentId`.
+3. **Action A.** `{tool: "repo.read_object", tool_contract: <CID of the tool's
+   contract and version>, projection: <projected tree CID>, object: <blob OID>,
+   grant: GrantId(G), policy: ContentId(P)}`, as a `ContentId`.
 4. **Decision D.** A step-up `Attestation` over
    `Challenge(session, ContentId(A), generation, nonce)`, signed by a test
    passkey key.
@@ -1030,8 +1064,17 @@ resulting tree}`, re-applied offline. It must not push.
    object store. No network. It recomputes every CID, verifies the cert chain and
    `check_derivation`, verifies D over the recomputed challenge, and checks P
    against the cited policy head. It checks O against A's OID, or the denial's
-   axis, and checks the chain against the head. Every dimension is reported
-   separately, never merged (the DP §6 step 5 discipline).
+   axis, and checks the chain against the head. It checks *membership*
+   separately: the OID must be reachable from A's projected tree CID, and
+   that tree must be the one G authorizes. It checks the tool contract CID
+   against a verifier-held allow-list. Every dimension is reported separately,
+   never merged (the DP §6 step 5 discipline).
+
+   **The verifier's output names each assertion and its evidence.** "Verified"
+   is never one word. Each row says which assertion passed and what supports
+   it, for example "content identity of O: recomputed hash", "operator
+   approval of A: signature by a key in the verifier's trust policy", "policy
+   current: not established, no independent freshness anchor".
 
 **Negative vectors** (each must be rejected for the stated reason):
 
@@ -1042,17 +1085,23 @@ resulting tree}`, re-applied offline. It must not push.
 | D signed over A′ ≠ A | challenge mismatch |
 | outcome bytes for another OID (CE2) | outcome ≠ A.object |
 | P′ not at the cited policy head (CE3) | stale policy |
+| policy journal *and* its head rolled back together (CE3) | **verifier passes**. Documents that a co-located head is no freshness evidence; reported "consistent, currency not established" |
+| same tool name, different `tool_contract` CID | contract not allow-listed |
+| valid blob OID that is not reachable from the authorized projection | object outside projection |
 | tampered O | CID mismatch |
 | tail-truncated journal | `ChainBreak::Truncated` |
 | path-designated variant of A with a symlink swap (CE1) | **verifier passes**. This vector *documents* the gap: designation by OID closes it, designation by path does not |
 
 **Success.** Every positive vector verifies offline. Every negative vector is
-rejected for the stated reason. The CE1 path variant is recorded as a known pass.
+rejected for the stated reason. The CE1 path variant and the joint-rollback
+variant are recorded as known passes.
 
 **What it will not show:**
 
 - that the operator is the human;
-- that Bridle enforced anything (there is no platform witness);
+- that Bridle enforced anything, including that the read was confined (there
+  is no platform witness);
+- that the policy was current, unless an independent freshness anchor is added;
 - any external effect (a local read has none);
 - performance.
 
@@ -1104,16 +1153,19 @@ rejected for the stated reason. The CE1 path variant is recorded as a known pass
    literal URL + OID for the push. Never accept string-prefix, glob or denylist
    matchers as authority. Any path/URL constraint is checked against the
    *resolved* object, with `Unknown` → refuse.
-2. **P0-2.** Keep the four proofs separate: identity (CID), assertion
-   (signature), authorization (algebra), enforcement (witness). Intent never
-   grants. A signed decision, a refusal receipt and a platform witness never
+2. **P0-2.** Keep the proofs separate: content identity (CID), principal
+   identity (a key bound to a trust anchor and its policy), assertion
+   (signature), authorization (algebra), enforcement (witness). A CID names
+   bytes and never a principal. Intent never grants. A signed decision, a refusal receipt and a platform witness never
    stand in for one another.
 3. **P0-3.** Keep holder keys and credentials harness-held and out of the
    model's reach. Delegated execution stays the pattern, because AAT §9.1.1
    shows the guarantees vanish otherwise.
 4. **P0-4.** Add no new canonical encoding at the joins. Future receipt,
    decision and policy identities are minted via `content-addressable`. Foreign
-   digests are carried, never re-minted.
+   digests are carried, never re-minted. An action record binds meaning, not
+   only bytes: tool contract and version, object target, arguments, input
+   versions and policy CID.
 
 **P1: first post-v0.8.0 research and prototypes.**
 
@@ -1121,7 +1173,8 @@ rejected for the stated reason. The CE1 path variant is recorded as a known pass
 6. **P1-6.** Take CE7 upstream to `agent-mesh-protocol`: add the probe as a
    regression test, then decide question 2.
 7. **P1-7.** Policy-set CID + per-rule completeness in Bridle admission records,
-   chained with a separate head (CE3).
+   chained with a separate head, plus a freshness anchor that cannot be rolled
+   back with the store (CE3, G9).
 8. **P1-8.** Effect grading in execution receipts (gate-observed vs
    runtime-claimed). Record *allowed* egress destinations in
    `ProxyFinalEvidence`, which today records only refused ones (CE4).
@@ -1132,9 +1185,10 @@ rejected for the stated reason. The CE1 path variant is recorded as a known pass
     rechecked → attempted → result) over `PermissionChallenge`,
     `OperatorDecision` and step-up. Verify that every approval binds the digest
     the operator was *shown* (G6).
-11. **P1-11.** Projection identity: a projected tree gets its own CID, and hidden
-    content appears only as salted commitments. Seed the CE5 cases into the
-    adversarial corpus.
+11. **P1-11.** Projection identity: a projected tree gets its own CID, and a
+    written statement of what an authorized observer may learn. Hidden content
+    appears only as salted commitments, and every CE5 channel (commitment
+    churn, counts, error kinds, timing) is a test against that statement.
 
 **P2: standards monitoring and longer-term exploration.**
 
