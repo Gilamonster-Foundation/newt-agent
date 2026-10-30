@@ -1835,14 +1835,10 @@ async fn dcr_rejects_a_response_that_omits_redirect_uris() {
     assert!(error.contains("omitted redirect_uris"), "{error}");
 }
 
-/// A protected resource advertising a host-denied issuer first and a loopback
-/// (test-admitted) issuer second. Only the second serves metadata, and only
-/// when `serve_metadata` is set.
-async fn denied_then_permitted_issuers(serve_metadata: bool) -> (MockServer, MockServer, String) {
+/// A protected resource on a loopback mock that advertises `issuers`.
+async fn resource_advertising(issuers: &[String]) -> (MockServer, String) {
     let resource_server = MockServer::start().await;
-    let permitted_server = MockServer::start().await;
     let resource = format!("{}/mcp", resource_server.uri());
-    let permitted = permitted_server.uri();
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .respond_with(ResponseTemplate::new(401))
@@ -1852,50 +1848,32 @@ async fn denied_then_permitted_issuers(serve_metadata: bool) -> (MockServer, Moc
         .and(path("/.well-known/oauth-protected-resource/mcp"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "resource": resource,
-            "authorization_servers": ["https://denied.example.test", permitted]
+            "authorization_servers": issuers
         })))
         .mount(&resource_server)
         .await;
-    if serve_metadata {
-        Mock::given(method("GET"))
-            .and(path("/.well-known/oauth-authorization-server"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "issuer": permitted,
-                "authorization_endpoint": format!("{permitted}/authorize"),
-                "token_endpoint": format!("{permitted}/token"),
-                "code_challenge_methods_supported": ["S256"]
-            })))
-            .mount(&permitted_server)
-            .await;
-    }
-    (resource_server, permitted_server, resource)
+    (resource_server, resource)
 }
 
-/// Advertised issuers can sit on different hosts: a denied first candidate must
-/// not stop discovery from selecting a later one on a permitted host.
-#[tokio::test]
-async fn host_denied_issuer_does_not_stop_a_later_permitted_candidate() {
-    let (_resource_server, permitted_server, resource) = denied_then_permitted_issuers(true).await;
-    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
-    let discovered =
-        discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
-            .await
-            .expect("the permitted candidate must still be discovered");
-    assert_eq!(discovered.issuer, permitted_server.uri());
+/// Serve usable metadata for the issuer at `server`, at `well_known`, with
+/// the token endpoint at `token_endpoint`.
+async fn serve_issuer_metadata(server: &MockServer, well_known: &str, token_endpoint: &str) {
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path(well_known))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": token_endpoint,
+            "code_challenge_methods_supported": ["S256"]
+        })))
+        .mount(server)
+        .await;
 }
 
-/// When no candidate passes, the first host denial must survive the aggregate
-/// "no advertised authorization server" error as its typed
-/// `HttpNetGrantRequired` cause (the /mcp panel downcasts it to offer the
-/// exact-host prompt), with every candidate's failure still in the message.
-#[tokio::test]
-async fn host_denied_oauth_hop_survives_metadata_aggregation() {
-    let (_resource_server, permitted_server, resource) = denied_then_permitted_issuers(false).await;
-    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
-    let error = discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
-        .await
-        .unwrap_err();
-
+/// Asserts `error` carries the typed public-host denial for `denied.example.test`
+/// under the aggregate discovery summary.
+fn assert_typed_denial_under_aggregate(error: &anyhow::Error) {
     let required = error.downcast_ref::<HttpNetGrantRequired>();
     assert!(
         required.is_some(),
@@ -1906,20 +1884,93 @@ async fn host_denied_oauth_hop_survives_metadata_aggregation() {
         Some("denied.example.test")
     );
     assert!(!required.map(|r| r.private).unwrap_or(false));
-    let message = error.to_string();
     assert!(
-        message.starts_with("no advertised authorization server passed discovery")
-            && message.contains(&permitted_server.uri()),
-        "the aggregate must name every candidate: {message}"
+        error
+            .to_string()
+            .starts_with("no advertised authorization server passed discovery"),
+        "{error:#}"
+    );
+}
+
+const RFC8414: &str = "/.well-known/oauth-authorization-server";
+const OIDC: &str = "/.well-known/openid-configuration";
+
+/// Advertised issuers can sit on different hosts: a denied first candidate must
+/// not stop discovery from selecting a later one on a permitted host.
+#[tokio::test]
+async fn host_denied_issuer_does_not_stop_a_later_permitted_candidate() {
+    let permitted = MockServer::start().await;
+    serve_issuer_metadata(&permitted, RFC8414, &format!("{}/token", permitted.uri())).await;
+    let (_resource_server, resource) =
+        resource_advertising(&["https://denied.example.test".into(), permitted.uri()]).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let discovered =
+        discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+            .await
+            .expect("the permitted candidate must still be discovered");
+    assert_eq!(discovered.issuer, permitted.uri());
+}
+
+/// When no candidate passes, the first host denial must survive the aggregate
+/// "no advertised authorization server" error as its typed
+/// `HttpNetGrantRequired` cause (the /mcp panel downcasts it to offer the
+/// exact-host prompt), with every candidate's failure still in the message.
+#[tokio::test]
+async fn host_denied_oauth_hop_survives_metadata_aggregation() {
+    let unusable = MockServer::start().await;
+    let (_resource_server, resource) =
+        resource_advertising(&["https://denied.example.test".into(), unusable.uri()]).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let error = discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+        .await
+        .unwrap_err();
+
+    assert_typed_denial_under_aggregate(&error);
+    assert!(
+        error.to_string().contains(&unusable.uri()),
+        "the aggregate must name every candidate: {error:#}"
     );
     assert!(
-        !permitted_server
+        !unusable
             .received_requests()
             .await
             .expect("recorded requests")
             .is_empty(),
         "the candidate after the denied one must still be tried"
     );
+}
+
+/// An allowed issuer whose metadata puts its token endpoint on a denied host:
+/// with no usable metadata alternative, the typed denial survives both the
+/// per-issuer metadata aggregate and the issuer aggregate.
+#[tokio::test]
+async fn host_denied_token_endpoint_survives_metadata_aggregation() {
+    let issuer = MockServer::start().await;
+    serve_issuer_metadata(&issuer, RFC8414, "https://denied.example.test/token").await;
+    let (_resource_server, resource) = resource_advertising(&[issuer.uri()]).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let error = discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+        .await
+        .unwrap_err();
+
+    assert_typed_denial_under_aggregate(&error);
+}
+
+/// A denied endpoint in one metadata document must not stop the search: a later
+/// metadata location for the same issuer that is usable still wins.
+#[tokio::test]
+async fn host_denied_token_endpoint_falls_back_to_a_usable_metadata_alternative() {
+    let issuer = MockServer::start().await;
+    serve_issuer_metadata(&issuer, RFC8414, "https://denied.example.test/token").await;
+    let usable_token = format!("{}/token", issuer.uri());
+    serve_issuer_metadata(&issuer, OIDC, &usable_token).await;
+    let (_resource_server, resource) = resource_advertising(&[issuer.uri()]).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let discovered =
+        discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+            .await
+            .expect("the usable metadata alternative must be selected");
+    assert_eq!(discovered.token_endpoint, usable_token);
 }
 
 /// A protected resource whose authorization server has NO dynamic client
