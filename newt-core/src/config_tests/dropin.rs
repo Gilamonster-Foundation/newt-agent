@@ -678,3 +678,25 @@ fn probe_observation_record_is_typed_only_instance_carries_model() {
         assert!(!body.contains(banned), "`{banned}` leaked into: {body}");
     }
 }
+
+/// #3062 review (F7, G1): a malformed drop-in is skipped with a warning on
+/// every config load. Its error names the position only: a TOML error quotes
+/// the offending line, and a serde message can quote the value itself.
+#[test]
+fn parse_dropin_reports_the_position_never_the_contents() {
+    let marker = "SYNTHETIC_SECRET_MARKER";
+    let syntax = format!("model = \"x\"\nendpoint = \"https://user:{marker}@example.invalid/v1\n");
+    let error = parse_dropin::<BackendConfig>(&syntax).unwrap_err();
+    assert!(!error.contains(marker), "{error}");
+    assert!(error.contains("line 2, column"), "{error}");
+
+    // Valid TOML of the wrong shape: serde's message would name the value.
+    let shape = format!("model = \"x\"\ntiers = \"{marker}\"\n");
+    assert!(toml::from_str::<BackendConfig>(&shape)
+        .unwrap_err()
+        .to_string()
+        .contains(marker));
+    let error = parse_dropin::<BackendConfig>(&shape).unwrap_err();
+    assert!(!error.contains(marker), "{error}");
+    assert!(error.contains("line 2, column"), "{error}");
+}

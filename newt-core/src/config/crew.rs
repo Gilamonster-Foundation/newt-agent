@@ -168,7 +168,7 @@ impl Config {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            match std::fs::read_to_string(&path).map(|t| toml::from_str::<Crew>(&t)) {
+            match std::fs::read_to_string(&path).map(|t| super::dropin::parse_dropin::<Crew>(&t)) {
                 Ok(Ok(crew)) => {
                     self.crews.insert(stem.to_string(), crew);
                 }

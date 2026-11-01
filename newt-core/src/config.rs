@@ -1904,7 +1904,8 @@ impl Config {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            match std::fs::read_to_string(&path).map(|t| toml::from_str::<crate::dgx::DgxNode>(&t))
+            match std::fs::read_to_string(&path)
+                .map(|t| dropin::parse_dropin::<crate::dgx::DgxNode>(&t))
             {
                 Ok(Ok(mut node)) => {
                     // The filename is authoritative for the name (collision-free).

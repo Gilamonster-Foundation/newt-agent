@@ -559,3 +559,47 @@ fn uat_import_reports_a_malformed_config_without_quoting_its_line() {
     assert_eq!(std::fs::read_to_string(&user_config).unwrap(), malformed);
     assert!(!sb.config_dir.join("mcp.toml").exists());
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn uat_default_route_never_logs_a_malformed_dropin_line() {
+    // #3062 review (F7, G1): the default-route import resolves the runtime
+    // config, which loads the drop-in directories and logs each malformed
+    // file it skips. A TOML error quotes the offending line, here a
+    // credential: the log names the file and position, never the line.
+    let sb = sandbox();
+    let marker = "SYNTHETIC_SECRET_MARKER";
+    let kinds = ["backends", "bundles", "crews", "dgx", "loadouts"];
+    for kind in kinds {
+        let dir = sb.config_dir.join(kind);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{kind}-leaky.toml")),
+            format!("endpoint = \"https://user:{marker}@example.invalid/v1\nmodel = \"x\"\n"),
+        )
+        .unwrap();
+    }
+    let source = sb.cwd.join("borrowed.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "other": { "command": "/bin/true" } } }"#,
+    )
+    .unwrap();
+
+    for args in [
+        &["mcp", "import", source.to_str().unwrap(), "--all"][..],
+        &["mcp", "list"][..],
+    ] {
+        let assert = newt(&sb)
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(marker).not())
+            .stderr(predicate::str::contains(marker).not());
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+        for kind in kinds {
+            assert!(stderr.contains(&format!("{kind}-leaky.toml")), "{stderr}");
+        }
+    }
+}
