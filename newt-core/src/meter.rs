@@ -93,27 +93,40 @@ pub async fn poll_openrouter_key(
     read_key_response(client.get(&url).bearer_auth(api_key).send(), deadline).await
 }
 
-/// Read a `/v1/key` response from `send` within `deadline`. `send` is the
-/// transport seam: production passes reqwest's `send()`, tests a controlled
-/// future, so the deadline tests run on paused time with no socket.
+/// Cap on a `/v1/key` body. The documented record is under 2 KiB; a body past
+/// this is not one, so reading stops there.
+const MAX_KEY_BODY: usize = 64 * 1024;
+
+/// Read a `/v1/key` response from `send`, headers and body both within one
+/// `deadline`. `send` is the transport seam: production passes reqwest's
+/// `send()`, tests a controlled future, so the deadline tests run on paused
+/// time with no socket.
 async fn read_key_response(
     send: impl Future<Output = reqwest::Result<reqwest::Response>>,
     deadline: Duration,
 ) -> SpendStatus {
-    let response = match tokio::time::timeout(deadline, send).await {
-        Ok(Ok(response)) => response,
-        // Timeout, connect failure, DNS, TLS — all mean unknown.
-        Ok(Err(_)) | Err(_) => return SpendStatus::Unknown,
-    };
-    if !response.status().is_success() {
+    let body = async {
         // 401, 4xx, 5xx — unknown, never an error that reaches a turn.
-        return SpendStatus::Unknown;
-    }
-    let body = match response.text().await {
-        Ok(body) => body,
-        Err(_) => return SpendStatus::Unknown,
+        let response = send.await.ok().filter(|r| r.status().is_success())?;
+        let mut body = Vec::new();
+        let mut read = 0;
+        let ended = crate::retry::read_response_bytes_into_checked(response, &mut body, |chunk| {
+            read += chunk.len();
+            anyhow::ensure!(read <= MAX_KEY_BODY, "key body over {MAX_KEY_BODY} bytes");
+            Ok(())
+        })
+        .await;
+        matches!(ended, Ok(None)).then_some(body)
     };
-    let parsed: OpenRouterKeyResponse = match serde_json::from_str(&body) {
+    match tokio::time::timeout(deadline, body).await {
+        Ok(Some(body)) => parse_key_body(&body),
+        // Timeout, connect or read failure, HTTP error, oversized body.
+        _ => SpendStatus::Unknown,
+    }
+}
+
+fn parse_key_body(body: &[u8]) -> SpendStatus {
+    let parsed: OpenRouterKeyResponse = match serde_json::from_slice(body) {
         Ok(parsed) => parsed,
         Err(_) => return SpendStatus::Unknown,
     };
