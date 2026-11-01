@@ -402,6 +402,31 @@ fn force_import_names_the_auth_consequence_of_a_resource_change() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_keeps_a_bare_origin_url_as_written() {
+    // #3062 review (F6): the import canonicalises `https://h` to `https://h/`,
+    // the same request target, but a saved login is bound to the spelling the
+    // operator configured. An identical source leaves that spelling alone.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let original =
+        "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://api.example.test\"\n";
+    std::fs::write(&mcp, original).unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://api.example.test" } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "Results: 0 added, 0 replaced, 1 unchanged, 0 skipped.",
+    ))
+    .stdout(predicate::str::contains("Endpoint changed").not());
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), original);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_refuses_to_carry_env_to_a_different_program() {
     // #2915: the stdio twin of the header transfer. A changed command, or the
     // same launcher running different args, must not inherit local `env`.

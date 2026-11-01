@@ -268,6 +268,34 @@ fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
 }
 
 #[test]
+fn with_mcp_server_merged_keeps_the_operators_spelling_of_one_endpoint() {
+    // #3062 review (F6): `https://h` and `https://h/` are one request target,
+    // but a saved login is bound to the exact spelling. An import that only
+    // canonicalises the URL leaves the operator's spelling, and the login.
+    let text =
+        "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://api.example.test\"\n";
+    let at = |url: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!(
+            "name = \"fs\"\ntype = \"http\"\nurl = \"{url}\"\n"
+        ))
+        .unwrap()
+    };
+    let provided = ["type", "url"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(text, &at("https://api.example.test/"), &provided).unwrap(),
+        text
+    );
+    // A real resource change is still written.
+    let moved =
+        Config::with_mcp_server_merged(text, &at("https://api.example.test/mcp"), &provided)
+            .unwrap();
+    assert!(
+        moved.contains("url = \"https://api.example.test/mcp\""),
+        "{moved}"
+    );
+}
+
+#[test]
 fn with_mcp_server_merged_refuses_to_carry_env_to_a_different_program() {
     // #2915: the stdio twin of the header transfer. The program is the argv,
     // so a launcher running other args counts as a different program too.

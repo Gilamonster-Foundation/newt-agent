@@ -2791,8 +2791,16 @@ fn local_mcp_spelling(
 
 /// Whether two spellings of one `[[mcp_servers]]` key configure the same
 /// thing, whatever their quoting, spacing or comments; an absent key equals a
-/// written default.
+/// written default. Two URLs of one endpoint (`https://h`, `https://h/`) are
+/// the same, so the operator's spelling, which a saved login is bound to,
+/// stays.
 fn same_mcp_field(key: &str, a: Option<&toml_edit::Item>, b: Option<&toml_edit::Item>) -> bool {
+    if key == "url" {
+        return !crate::mcp::mcp_endpoint_changed(
+            a.and_then(toml_edit::Item::as_str),
+            b.and_then(toml_edit::Item::as_str),
+        );
+    }
     let typed = |item: Option<&toml_edit::Item>| {
         let mut doc = toml_edit::DocumentMut::new();
         if let Some(item) = item {
