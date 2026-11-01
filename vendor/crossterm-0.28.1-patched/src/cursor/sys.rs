@@ -2,7 +2,7 @@
 
 #[cfg(unix)]
 #[cfg(feature = "events")]
-pub use self::unix::position;
+pub use self::unix::{position, position_to};
 #[cfg(windows)]
 #[cfg(feature = "events")]
 pub use self::windows::position;

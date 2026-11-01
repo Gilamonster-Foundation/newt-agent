@@ -18,11 +18,19 @@
   "result": {
     "tools": [
       {
-        "description": "Read a file's contents",
+        "description": "Read a file: up to `limit` lines (default 2000) starting at 1-based `offset` (default 1). A truncated result ends with a footer naming the next window.",
         "inputSchema": {
           "properties": {
+            "limit": {
+              "description": "Maximum number of lines to return (default 2000)",
+              "type": "integer"
+            },
+            "offset": {
+              "description": "1-based line number to start at (default 1)",
+              "type": "integer"
+            },
             "path": {
-              "description": "File path to read",
+              "description": "Absolute or workspace-relative file path. Preserve an operator-supplied absolute path.",
               "type": "string"
             }
           },
@@ -31,49 +39,209 @@
           ],
           "type": "object"
         },
-        "name": "code_read"
+        "name": "read_file"
       },
       {
-        "description": "Apply a unified diff patch to a file",
+        "description": "Create a file, or replace one entirely (parent directories are created). To change part of an existing file use edit_file. copy_from appends an exact line range from another file; move_from extracts named Rust free functions from another file into this new .rs file and wires the module (content must be empty and copy_from absent).",
         "inputSchema": {
           "properties": {
-            "patch": {
-              "description": "Unified diff to apply",
+            "content": {
+              "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty); with move_from, must be empty",
               "type": "string"
             },
+            "copy_from": {
+              "description": "Append lines start_line..end_line of another file, copied exactly",
+              "properties": {
+                "end_line": {
+                  "type": "integer"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "start_line": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "move_from": {
+              "properties": {
+                "items": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "items"
+              ],
+              "type": "object"
+            },
             "path": {
-              "description": "File path to edit",
+              "description": "Absolute or workspace-relative file path. Preserve an operator-supplied absolute path.",
               "type": "string"
             }
           },
           "required": [
             "path",
-            "patch"
+            "content"
           ],
           "type": "object"
         },
-        "name": "code_edit"
+        "name": "write_file"
       },
       {
-        "description": "Search files for a regex pattern",
+        "description": "Replace one exact string in an existing file. Fails if old_string is missing or matches more than once (add context). An empty new_string deletes the match.",
         "inputSchema": {
           "properties": {
-            "path": {
-              "description": "Root directory to search",
+            "new_string": {
+              "description": "Replacement (\"\" deletes the match)",
               "type": "string"
             },
-            "query": {
-              "description": "Regex pattern",
+            "old_string": {
+              "description": "Exact string to replace (must match exactly once)",
+              "type": "string"
+            },
+            "path": {
+              "description": "Absolute or workspace-relative file path. Preserve an operator-supplied absolute path.",
               "type": "string"
             }
           },
           "required": [
-            "query",
+            "path",
+            "old_string",
+            "new_string"
+          ],
+          "type": "object"
+        },
+        "name": "edit_file"
+      },
+      {
+        "description": "List files in a directory",
+        "inputSchema": {
+          "properties": {
+            "path": {
+              "description": "Directory path relative to workspace root (use '.' for root)",
+              "type": "string"
+            }
+          },
+          "required": [
             "path"
           ],
           "type": "object"
         },
-        "name": "code_search"
+        "name": "list_dir"
+      },
+      {
+        "description": "Find files and directories under the workspace by basename glob, without a shell. Returns relative paths, one per line, sorted; respects .gitignore.",
+        "inputSchema": {
+          "properties": {
+            "case_sensitive": {
+              "description": "Case-sensitive basename match. Default true.",
+              "type": "boolean"
+            },
+            "category": {
+              "description": "'source' keeps only files the language-pack registry recognizes as code; 'any' (default) keeps everything.",
+              "enum": [
+                "any",
+                "source"
+              ],
+              "type": "string"
+            },
+            "language": {
+              "description": "Source language name or alias, e.g. Rust, Python, ts. Implies category='source'.",
+              "type": "string"
+            },
+            "max_depth": {
+              "description": "Maximum depth below `path` (1 = immediate children).",
+              "type": "integer"
+            },
+            "max_results": {
+              "description": "Cap on matches returned. Default 1000.",
+              "type": "integer"
+            },
+            "name": {
+              "description": "Basename glob, e.g. '*.py'. Omit to match everything.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Directory to search under, relative to the workspace root. Default '.'.",
+              "type": "string"
+            },
+            "respect_gitignore": {
+              "description": "Skip .gitignored, hidden, and build directories. Default true.",
+              "type": "boolean"
+            },
+            "show_lines": {
+              "description": "Prefix each path with its line count. Default false.",
+              "type": "boolean"
+            },
+            "sort": {
+              "description": "'name' (default, ascending), 'size' (bytes, descending) or 'lines' (line count, descending).",
+              "enum": [
+                "name",
+                "size",
+                "lines"
+              ],
+              "type": "string"
+            },
+            "type": {
+              "description": "Files ('f'), directories ('d'), or both ('any', the default).",
+              "enum": [
+                "f",
+                "d",
+                "any"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "find"
+      },
+      {
+        "description": "Search file contents for a regex, without a shell. Returns one line per hit as `relative/path:LINE:text`; context lines are marked `:-:`. Respects .gitignore and skips binary files.",
+        "inputSchema": {
+          "properties": {
+            "context": {
+              "description": "Lines to show before and after each hit. Default 0.",
+              "type": "integer"
+            },
+            "glob": {
+              "description": "Path glob to restrict the search, e.g. '*.rs' or 'src/**'",
+              "type": "string"
+            },
+            "ignore_case": {
+              "description": "Case-insensitive match. Default false.",
+              "type": "boolean"
+            },
+            "max_results": {
+              "description": "Cap on hits returned. Default 100.",
+              "type": "integer"
+            },
+            "path": {
+              "description": "Directory to search under, relative to the workspace root. Default '.'.",
+              "type": "string"
+            },
+            "pattern": {
+              "description": "Regular expression, e.g. 'error|panic'",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "type": "object"
+        },
+        "name": "grep"
       },
       {
         "description": "Run a git operation via the embedded engine (grit-lib), gated by GitCaveats derived from the granted Caveats leash. Requires unrestricted fs_read because legacy repository reads are not path-confined. ops: status | log | diff | add | commit | branch. Local-only; network ops (clone/fetch/push) are fail-closed. A write op (add/commit/branch) under a read-only grant is DENIED (isError). Returns structured JSON.",
@@ -150,22 +318,6 @@
           "type": "object"
         },
         "name": "goal_run"
-      },
-      {
-        "description": "List directory contents (dirs first, then files, alphabetical). Returns name, kind, and size_bytes for each entry.",
-        "inputSchema": {
-          "properties": {
-            "path": {
-              "description": "Directory path to list",
-              "type": "string"
-            }
-          },
-          "required": [
-            "path"
-          ],
-          "type": "object"
-        },
-        "name": "fs_list"
       },
       {
         "description": "Run a shell command and capture stdout/stderr. Returns exit_code, stdout, stderr, timed_out. Max timeout 300s. CAVEATS-CONFINED: the command runs inside agent-bridle's brush shell under the granted Caveats leash (from ~/.newt/config.toml [caveats]); a command outside the granted exec/fs scope is DENIED (isError) rather than executed.",

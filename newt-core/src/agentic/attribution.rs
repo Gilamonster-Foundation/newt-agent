@@ -117,12 +117,16 @@ pub(super) fn ledger_note_write(
     if name != "write_file" && name != "edit_file" {
         return;
     }
-    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+    let path = args.get("path").and_then(|v| v.as_str());
+    // #3039: the same target the write tool resolves (`~/x` is home).
+    if let Some(full) =
+        path.and_then(|p| super::tools::resolve_tool_path(std::path::Path::new(workspace), p).ok())
+    {
         // Key on the lexically-normalized path so a raw model path like
         // `examples/../foo.py` matches the gate's filesystem-normalized `foo.py`
         // and the revert lookup actually hits — otherwise a non-normalized path
         // would silently evade revert (the fabrication persists, the gate is gamed).
-        let abs = lexical_normalize(&std::path::Path::new(workspace).join(p));
+        let abs = lexical_normalize(&full);
         led.borrow_mut().note_before_write(abs);
     }
 }

@@ -148,6 +148,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: workspace_str,

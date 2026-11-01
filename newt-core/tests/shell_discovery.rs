@@ -23,9 +23,12 @@ async fn run() {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let mut passed = true;
-    for tool in [
-        Box::new(agent_bridle::BrushShellTool::new()) as Box<dyn Tool>,
-        Box::new(agent_bridle::HostShellTool::new()),
+    for (tool_is_host, tool) in [
+        (
+            false,
+            Box::new(agent_bridle::BrushShellTool::new()) as Box<dyn Tool>,
+        ),
+        (true, Box::new(agent_bridle::HostShellTool::new())),
     ] {
         let cx = Gate::new(0)
             .authorize(tool.as_ref(), &Caveats::top())
@@ -44,7 +47,13 @@ async fn run() {
             ),
             (
                 "PATH='bin with spaces'; which gh",
-                "bin with spaces/gh\n".into(),
+                // BSD `which` (the macOS host shell) prints a relative PATH
+                // entry joined to the cwd; the Brush builtin and GNU print it as given.
+                if cfg!(target_os = "macos") && tool_is_host {
+                    format!("{}/gh\n", bin.display())
+                } else {
+                    "bin with spaces/gh\n".into()
+                },
                 0,
             ),
         ] {

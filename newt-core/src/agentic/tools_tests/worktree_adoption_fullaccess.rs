@@ -587,8 +587,8 @@ async fn relative_task_root(bypass: bool) {
     let out = call("read_file", serde_json::json!({"path":"missing.txt"})).await;
     assert!(
         out.contains(&format!(
-            "resolved against `{}`",
-            dunce::simplified(&task).display()
+            "resolved to `{}`",
+            dunce::simplified(&task.join("missing.txt")).display()
         )),
         "{out}"
     );
@@ -627,7 +627,7 @@ fn relative_task_root_missing_error_names_base() {
     .render(root, &crate::Scope::All);
     let display_root = dunce::simplified(temp.path()).display();
     assert!(
-        out.contains(&format!("resolved against `{display_root}`")),
+        out.contains(&format!("resolved to `{display_root}")),
         "{out}"
     );
 }

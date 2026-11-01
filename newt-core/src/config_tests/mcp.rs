@@ -66,6 +66,9 @@ fn with_mcp_server_merged_updates_imported_fields_and_keeps_local_fields() {
         headers: std::collections::BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: crate::mcp::McpTrust::Untrusted,
         origin: None,
     };
@@ -191,6 +194,9 @@ command = \"modulex-mcp\"
         headers: std::collections::BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: Some(120),
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: crate::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -234,6 +240,9 @@ fn with_mcp_server_added_creates_section_in_empty_text() {
         headers: std::collections::BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: crate::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -257,6 +266,9 @@ fn with_mcp_server_added_writes_sse_transport_and_url() {
         headers: std::collections::BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: crate::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -283,6 +295,9 @@ fn with_mcp_server_added_rejects_duplicates_and_invalid_entries() {
         headers: std::collections::BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: crate::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -365,6 +380,9 @@ fn mcp_writer_error_branches_are_loud() {
         headers: std::collections::BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: crate::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -380,6 +398,9 @@ fn mcp_writer_error_branches_are_loud() {
     let oversized = crate::mcp::McpServerEntry {
         login_argv: Vec::new(),
         request_timeout_secs: Some(u64::MAX),
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         ..entry
     };
     let err = Config::with_mcp_server_added("", &oversized).unwrap_err();

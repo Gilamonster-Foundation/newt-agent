@@ -7,7 +7,7 @@ timeout) the DSR cursor-position query never returns — not even past its own
 advertised 2s timeout. Confirmed still present in crossterm 0.29.0 and
 current `master` as of 2026-09-29 (an upgrade does not fix this). The one
 changed function is in `src/cursor/sys/unix.rs`, marked with a `newt #2644`
-comment; nothing else in this copy is touched.
+comment; nothing else in this copy is touched, except `cursor::position_to` (newt #3014): the same query written to a caller-supplied writer instead of stdout.
 
 ## This only helps builds FROM the newt workspace
 

@@ -4,6 +4,7 @@
 //! and its `mcp_token` ancestors' too — no re-export is needed for either.
 
 use super::*;
+use newt_mcp_client::HttpNetGrantRequired;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -11,11 +12,88 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn management_cancelled_oauth_stops_before_configuration_or_network() {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::caveats::Scope::All, &[]);
-    let error =
-        run_oauth_flow_cancellable("unregistered-test", "invalid-url", &policy, Some(cancel))
-            .await
-            .unwrap_err();
+    let error = run_oauth_flow_cancellable(
+        "unregistered-test",
+        "invalid-url",
+        &ConfiguredOAuth::default(),
+        &policy,
+        Some(cancel),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.to_string(), "MCP login cancelled");
+}
+
+/// A host-denied OAuth hop must surface as the *typed* grant cause
+/// (`HttpNetGrantRequired`), not a flattened string, so the /mcp panel can
+/// offer the exact-host prompt. `login_http` downcasts on this error; a
+/// plain-string bail in `validate_discovery_hop_with_policy` would let it
+/// pass through untyped.
+#[tokio::test]
+async fn host_denied_oauth_hop_surfaces_as_typed_grant_cause() {
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::none(), &[]);
+    let error = validate_discovery_hop_with_policy(
+        "https://denied.example.test/token",
+        "token endpoint",
+        false,
+        &policy,
+    )
+    .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
+    assert!(
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
+    );
+    assert_eq!(
+        required.map(|r| r.host.as_str()),
+        Some("denied.example.test")
+    );
+    assert!(!required.map(|r| r.private).unwrap_or(false));
+}
+
+/// After a resource 401, a refresh that finds no usable login leaves the plain
+/// credential failure, while a refresh blocked because the token endpoint's
+/// host is outside the grant carries the typed `HttpNetGrantRequired`: the
+/// connect path's grant prompt downcasts it instead of reporting a missing
+/// login. The real refresh functions are grounded by the real-filesystem
+/// `token_host_outside_the_grant_asks_for_approval_not_login_2914`.
+#[tokio::test]
+async fn missing_login_stays_distinct_from_host_denial() {
+    async fn after_refresh(refreshed: Result<Option<String>, RefreshRefusal>) -> anyhow::Error {
+        crate::mcp::retry_http_unauthorized_once(
+            Err::<(), _>(anyhow::Error::new(newt_mcp_client::HttpStatusError::new(
+                401,
+                "Unauthorized",
+                "",
+            ))),
+            Some("stored".to_string()),
+            || async { refreshed },
+            |_| {},
+            |_| async { anyhow::Ok(()) },
+        )
+        .await
+        .err()
+        .expect("no refreshed bearer, so no reconnect")
+    }
+
+    let missing = after_refresh(Ok(None)).await;
+    assert!(
+        missing.downcast_ref::<HttpNetGrantRequired>().is_none(),
+        "{missing:#}"
+    );
+    assert_eq!(newt_mcp_client::http_error_status(&missing), Some(401));
+
+    let denial = HttpNetGrantRequired {
+        host: "auth.example.test".into(),
+        private: false,
+    };
+    let denied = after_refresh(Err(RefreshRefusal::NetGrantRequired(denial.clone()))).await;
+    assert_eq!(
+        denied.downcast_ref::<HttpNetGrantRequired>(),
+        Some(&denial),
+        "{denied:#}"
+    );
+    assert_eq!(newt_mcp_client::http_error_status(&denied), Some(401));
 }
 
 /// Grounds the UI cancellation flag against the real callback listener: cancelling
@@ -73,12 +151,14 @@ fn oauth_hops_consume_the_complete_network_scope() {
         false,
         &denied,
     )
-    .unwrap_err()
-    .to_string();
+    .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
     assert!(
-        error.contains("outside the session network capability"),
-        "{error}"
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
     );
+    assert_eq!(required.map(|r| r.host.as_str()), Some("auth.example.test"));
+    assert!(!required.map(|r| r.private).unwrap_or(false));
 
     let allowed = OAuthHopPolicy::new(&newt_core::Scope::only(["auth.example.test".to_string()]));
     assert!(validate_discovery_hop_with_policy(
@@ -132,12 +212,14 @@ fn oauth_hops_do_not_restore_durable_hosts_removed_from_the_active_scope() {
     assert!(!exact_host_is_approved(&issuer, &policy));
     let error =
         validate_discovery_hop_with_policy(issuer.as_str(), "token endpoint", false, &policy)
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
     assert!(
-        error.contains("outside the session network capability"),
-        "{error}"
+        required.is_some(),
+        "expected typed HttpNetGrantRequired, got: {error:#}"
     );
+    assert_eq!(required.map(|r| r.host.as_str()), Some("auth.example.test"));
+    assert!(!required.map(|r| r.private).unwrap_or(false));
 }
 
 #[test]
@@ -1772,4 +1854,370 @@ async fn dcr_rejects_a_response_that_omits_redirect_uris() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("omitted redirect_uris"), "{error}");
+}
+
+/// A protected resource on a loopback mock that advertises `issuers`.
+async fn resource_advertising(issuers: &[String]) -> (MockServer, String) {
+    let resource_server = MockServer::start().await;
+    let resource = format!("{}/mcp", resource_server.uri());
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&resource_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-protected-resource/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resource": resource,
+            "authorization_servers": issuers
+        })))
+        .mount(&resource_server)
+        .await;
+    (resource_server, resource)
+}
+
+/// Serve usable metadata for the issuer at `server`, at `well_known`, with
+/// the token endpoint at `token_endpoint`.
+async fn serve_issuer_metadata(server: &MockServer, well_known: &str, token_endpoint: &str) {
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path(well_known))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": token_endpoint,
+            "code_challenge_methods_supported": ["S256"]
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Asserts `error` carries the typed public-host denial for `denied.example.test`
+/// under the aggregate discovery summary.
+fn assert_typed_denial_under_aggregate(error: &anyhow::Error) {
+    let required = error.downcast_ref::<HttpNetGrantRequired>();
+    assert!(
+        required.is_some(),
+        "expected typed HttpNetGrantRequired to survive aggregation, got: {error:#}"
+    );
+    assert_eq!(
+        required.map(|r| r.host.as_str()),
+        Some("denied.example.test")
+    );
+    assert!(!required.map(|r| r.private).unwrap_or(false));
+    assert!(
+        error
+            .to_string()
+            .starts_with("no advertised authorization server passed discovery"),
+        "{error:#}"
+    );
+}
+
+const RFC8414: &str = "/.well-known/oauth-authorization-server";
+const OIDC: &str = "/.well-known/openid-configuration";
+
+/// Advertised issuers can sit on different hosts: a denied first candidate must
+/// not stop discovery from selecting a later one on a permitted host.
+#[tokio::test]
+async fn host_denied_issuer_does_not_stop_a_later_permitted_candidate() {
+    let permitted = MockServer::start().await;
+    serve_issuer_metadata(&permitted, RFC8414, &format!("{}/token", permitted.uri())).await;
+    let (_resource_server, resource) =
+        resource_advertising(&["https://denied.example.test".into(), permitted.uri()]).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let discovered =
+        discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+            .await
+            .expect("the permitted candidate must still be discovered");
+    assert_eq!(discovered.issuer, permitted.uri());
+}
+
+/// When no candidate passes, the first host denial must survive the aggregate
+/// "no advertised authorization server" error as its typed
+/// `HttpNetGrantRequired` cause (the /mcp panel downcasts it to offer the
+/// exact-host prompt), with every candidate's failure still in the message.
+#[tokio::test]
+async fn host_denied_oauth_hop_survives_metadata_aggregation() {
+    let unusable = MockServer::start().await;
+    let (_resource_server, resource) =
+        resource_advertising(&["https://denied.example.test".into(), unusable.uri()]).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let error = discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+        .await
+        .unwrap_err();
+
+    assert_typed_denial_under_aggregate(&error);
+    assert!(
+        error.to_string().contains(&unusable.uri()),
+        "the aggregate must name every candidate: {error:#}"
+    );
+    assert!(
+        !unusable
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "the candidate after the denied one must still be tried"
+    );
+}
+
+/// An allowed issuer whose metadata puts its token endpoint on a denied host:
+/// with no usable metadata alternative, the typed denial survives both the
+/// per-issuer metadata aggregate and the issuer aggregate.
+#[tokio::test]
+async fn host_denied_token_endpoint_survives_metadata_aggregation() {
+    let issuer = MockServer::start().await;
+    serve_issuer_metadata(&issuer, RFC8414, "https://denied.example.test/token").await;
+    let (_resource_server, resource) = resource_advertising(&[issuer.uri()]).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let error = discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+        .await
+        .unwrap_err();
+
+    assert_typed_denial_under_aggregate(&error);
+}
+
+/// A denied endpoint in one metadata document must not stop the search: a later
+/// metadata location for the same issuer that is usable still wins.
+#[tokio::test]
+async fn host_denied_token_endpoint_falls_back_to_a_usable_metadata_alternative() {
+    let issuer = MockServer::start().await;
+    serve_issuer_metadata(&issuer, RFC8414, "https://denied.example.test/token").await;
+    let usable_token = format!("{}/token", issuer.uri());
+    serve_issuer_metadata(&issuer, OIDC, &usable_token).await;
+    let (_resource_server, resource) = resource_advertising(&[issuer.uri()]).await;
+    let policy = OAuthHopPolicy::new(&newt_core::Scope::none());
+    let discovered =
+        discover_oauth_meta_for_client_with_policy(&resource, true, None, false, &policy)
+            .await
+            .expect("the usable metadata alternative must be selected");
+    assert_eq!(discovered.token_endpoint, usable_token);
+}
+
+/// A protected resource whose authorization server has NO dynamic client
+/// registration endpoint and advertises `files:read files:write`.
+async fn static_client_fixture(iss_supported: bool) -> (MockServer, MockServer, String) {
+    let resource_server = MockServer::start().await;
+    let authorization_server = MockServer::start().await;
+    let resource = format!("{}/mcp", resource_server.uri());
+    let issuer = authorization_server.uri();
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&resource_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-protected-resource/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resource": resource,
+            "authorization_servers": [issuer],
+            "scopes_supported": ["files:read", "files:write"]
+        })))
+        .mount(&resource_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{}/authorize", authorization_server.uri()),
+            "token_endpoint": format!("{}/token", authorization_server.uri()),
+            "code_challenge_methods_supported": ["S256"],
+            "authorization_response_iss_parameter_supported": iss_supported
+        })))
+        .mount(&authorization_server)
+        .await;
+    (resource_server, authorization_server, resource)
+}
+
+fn static_config(scopes: Option<&str>, callback_port: Option<u16>) -> ConfiguredOAuth {
+    ConfiguredOAuth {
+        client_id: Some("public-client-abc123".into()),
+        scopes: scopes.map(str::to_string),
+        callback_port,
+    }
+}
+
+fn query_pairs(url: &str) -> BTreeMap<String, String> {
+    reqwest::Url::parse(url)
+        .unwrap()
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
+}
+
+/// PR #3000 review (P1): with fresh state, discovery rejected an issuer
+/// without a DCR endpoint before the static-client branch could run, so a
+/// configured static client ID never reached the authorization URL.
+#[tokio::test]
+async fn fresh_static_client_without_dcr_reaches_authorization_url() {
+    let (_resource_server, _authorization_server, resource) = static_client_fixture(true).await;
+    let (discovered, client, scope) = select_oauth_client(
+        &resource,
+        true,
+        None,
+        None,
+        None,
+        &static_config(None, None),
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap();
+    assert!(discovered.registration_endpoint.is_none());
+    assert!(discovered.authorization_endpoint.ends_with("/authorize"));
+    let callback = callback_target(&client).unwrap();
+    // The loopback fixture is plain HTTP; the URL builder (rightly) demands
+    // HTTPS, so build against an HTTPS endpoint of the same shape.
+    let url = build_authorization_url(
+        "https://auth.example.com/authorize",
+        &client.client_id,
+        &callback.redirect_uri,
+        "challenge",
+        &discovered.resource,
+        "state",
+        scope.as_deref(),
+    )
+    .unwrap();
+    let query = query_pairs(&url);
+    assert_eq!(query["client_id"], "public-client-abc123");
+    assert_eq!(query["code_challenge_method"], "S256");
+}
+
+/// PR #3000 review (P1): pinned `oauth.scopes` restrict the request; the
+/// discovered `files:write` must not be requested.
+#[tokio::test]
+async fn pinned_scopes_replace_discovered_scopes() {
+    let (_resource_server, _authorization_server, resource) = static_client_fixture(true).await;
+    let (_, _, scope) = select_oauth_client(
+        &resource,
+        true,
+        None,
+        None,
+        None,
+        &static_config(Some("files:read"), None),
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(scope.as_deref(), Some("files:read"));
+}
+
+/// PR #3000 review (P2): a static client uses its registered callback
+/// (`http://localhost:PORT/callback`, Claude's documented form), not an
+/// invented `/callback/newt-<hash>` path.
+#[tokio::test]
+async fn static_client_uses_registered_localhost_callback() {
+    let (_resource_server, _authorization_server, resource) = static_client_fixture(true).await;
+    let (_, client, _) = select_oauth_client(
+        &resource,
+        true,
+        None,
+        None,
+        None,
+        &static_config(None, Some(8080)),
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap();
+    let callback = callback_target(&client).unwrap();
+    assert_eq!(callback.redirect_uri, "http://localhost:8080/callback");
+    assert_eq!(callback.path, "/callback");
+    assert_eq!(
+        callback.bind_addr,
+        std::net::SocketAddr::from(([127, 0, 0, 1], 8080))
+    );
+}
+
+/// The shared `/callback` path is not issuer-distinct, so the RFC 9207 `iss`
+/// response parameter is the remaining mix-up defense: refuse without it.
+#[tokio::test]
+async fn static_client_requires_issuer_response_parameter() {
+    let (_resource_server, _authorization_server, resource) = static_client_fixture(false).await;
+    let error = select_oauth_client(
+        &resource,
+        true,
+        None,
+        None,
+        None,
+        &static_config(None, None),
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("RFC 9207"), "{error:#}");
+}
+
+/// Configuration the flow cannot honour is refused before any network I/O.
+#[tokio::test]
+async fn unusable_oauth_configuration_is_refused() {
+    for configured in [
+        ConfiguredOAuth {
+            callback_port: Some(8080),
+            ..ConfiguredOAuth::default()
+        },
+        ConfiguredOAuth {
+            client_id: Some("has space".into()),
+            ..ConfiguredOAuth::default()
+        },
+        static_config(Some("a  b"), None),
+    ] {
+        let error = select_oauth_client(
+            "https://mcp.example.com/mcp",
+            false,
+            None,
+            None,
+            None,
+            &configured,
+            &test_oauth_policy(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").starts_with("configured OAuth"),
+            "{error:#}"
+        );
+    }
+}
+
+/// PR #3000 review round 2 (P2): discovery judged a saved DCR client against
+/// the resource's advertised `files:read files:write` instead of the pinned
+/// `files:read`, so a saved read-only registration was refused as "not
+/// reusable" once the issuer stopped offering dynamic registration.
+#[tokio::test]
+async fn pinned_scopes_decide_saved_dcr_client_reuse() {
+    let (_resource_server, authorization_server, resource) = static_client_fixture(true).await;
+    let saved = ClientFile {
+        client_id: "saved-read-only-client".into(),
+        redirect_uris: vec!["http://127.0.0.1:0/callback".into()],
+        issuer: Some(authorization_server.uri()),
+        extra: BTreeMap::from([
+            ("registration_method".into(), serde_json::json!("dcr")),
+            (
+                "token_endpoint_auth_method".into(),
+                serde_json::json!("none"),
+            ),
+            (
+                "grant_types".into(),
+                serde_json::json!(["authorization_code", "refresh_token"]),
+            ),
+            ("response_types".into(), serde_json::json!(["code"])),
+            ("scope".into(), serde_json::json!("files:read")),
+        ]),
+    };
+    let (discovered, client, scope) = select_oauth_client(
+        &resource,
+        true,
+        Some(saved),
+        None,
+        None,
+        &ConfiguredOAuth {
+            scopes: Some("files:read".into()),
+            ..ConfiguredOAuth::default()
+        },
+        &test_oauth_policy(),
+    )
+    .await
+    .unwrap();
+    assert!(discovered.registration_endpoint.is_none());
+    assert_eq!(client.client_id, "saved-read-only-client");
+    assert_eq!(scope.as_deref(), Some("files:read"));
 }

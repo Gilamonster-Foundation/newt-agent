@@ -57,7 +57,7 @@ construction.
 | Feature | Default | Pulls | Enables |
 |---|---|---|---|
 | `linux-landlock` | off | `landlock` (Linux only) | filesystem confinement, direct-exec narrowing, and deny-all TCP on ABI-v4 kernels |
-| `macos-seatbelt` | off | no Rust dependency | `sandbox-exec` filesystem/exec confinement; expressible restricted-net profiles (deny-all, loopback, and exact `unix:` socket endpoints) add direct-network rules and `net:none`/`unix:`-only also add a Mach floor, but all remain `Unknown` and are refused |
+| `macos-seatbelt` | off | no Rust dependency | `sandbox-exec` filesystem/exec confinement; expressible restricted-net profiles (deny-all, loopback, exact `unix:` socket endpoints, and named `mach:` service grants) add direct-network rules and the network-denied shapes also install a zero Mach-lookup floor. Only the zero-grant `net:none` shape (unprivileged caller, audited stdio) reaches kernel strength; `unix:`/`mach:` grants project exactly but report `Advisory` (they fail only a `Kernel` net floor); loopback and remote-host scopes, and any root or unaudited-stdio launch, resolve `Unknown` and are refused at admission (see below) |
 | `windows-appcontainer` | off | companion `agent-bridle-aclaunch.exe` | AppContainer filesystem DACLs, deny-all or loopback-only network policy, and exec deny-all |
 | `os-sandbox` | off | target-specific backend deps | convenience feature for every native OS sandbox backend |
 | `verifier-ed25519` | off | `ed25519-dalek` | production `Ed25519Verifier` for step-up discharges |
@@ -71,12 +71,50 @@ network allowlists are not directly expressible by the native kernels. Their
 support is backend-specific, and the macOS proxy path is currently held. A
 restricted filesystem scope fails closed when no native backend can enforce it.
 
-On macOS, the E4 `net:none` Mach floor closes the demonstrated NSURLSession /
-`nsurlsessiond` deputy as defense in depth. It does not establish deputy-complete
-no-egress: allow-listed and other ambient IPC services have not been
-comprehensively certified. Consequently every restricted Seatbelt `net` scope,
-including `net:none`, loopback, and the former loopback-proxy shape, resolves
-`Unknown` and is refused by admission.
+On macOS, a network-denied profile (`net:none`, or `unix:`/`mach:` entries
+only) installs a **zero** Mach-lookup floor (agent-bridle#405): every named Mach
+service is kernel-denied unless the operator grants it by name with a
+`mach:<global-name>` scope entry, for example
+`mach:com.apple.system.opendirectoryd.libinfo`. Nothing is ambient; the former
+compatibility allow-list is now the documented candidate set
+(`MACH_SERVICE_CANDIDATES`) a host may offer for a grant. The result envelope's
+`disclosure.mach_services` names what was granted and which candidates were
+withheld — the structured "service X denied" signal, derived from the installed
+policy because the kernel denies a Mach lookup silently. With no grant the
+floor closes every named Mach lookup (the demonstrated NSURLSession /
+`nsurlsessiond` path included); a grant re-opens the named service, deputy or
+not. The deputy audit for the deny-all shape is **complete** (`MACH_DEPUTY_AUDIT`,
+`sandbox.rs:2862`; evidence in ADR 0015 amendment E6), narrowed to what was
+measured, so it is a bounded claim and not a proof that every ambient IPC route
+is closed. Consequently, on macOS:
+
+- **Prerequisites for every bounded projection.** The caller must not be root
+  and the spawn's stdio must be audited: a pipe or `/dev/null` for each of
+  stdin/stdout/stderr, plus the trusted-worker's one-shot authenticated control
+  channel (#417), which the worker retires before any governed action. A
+  root-owned caller or unaudited stdio (an inherited or redirected descriptor)
+  makes the net scope `Unknown` (`resolved_authority`, `sandbox.rs:3091-3096`),
+  so it is refused at scope admission **regardless of the requested strength
+  floor**, for `net:none`, `unix:` and `mach:` shapes alike.
+- **`net:none` (zero grants) is promoted.** With the prerequisites met, the
+  projection resolves it to the empty scope (`sandbox.rs:2873`) and the report
+  grants the net axis `Kernel` strength (`report.rs:435`), so it also satisfies
+  a `Kernel` net floor.
+- **`unix:`-only, `mach:`-only and mixed shapes**, with the prerequisites met,
+  resolve to exactly what the profile permits (the `unix:` endpoints as concrete
+  entries; each `mach:` grant as the named class `seatbelt-mach-service:<name>`,
+  never `∅`), so the scope bound compares them honestly and they can be
+  admitted at an `Advisory`-compatible floor such as the default. Their
+  enforcement report stays `Advisory` (the audit proved only the zero-grant
+  shape), so only a `Kernel` net floor rejects them.
+- **Loopback and remote-host allow-lists** (and the former loopback-proxy
+  shape) resolve `Unknown` under either state and are refused at scope
+  admission regardless of the floor: their Mach lookup is ambient (no floor),
+  so nothing bounds a deputy. Direct loopback rules are real, but they are not
+  an audited bound.
+
+A `mach:` grant mixed with a remote-host allow-list has no
+egress-proxy semantics and the proxy planner refuses it.
 
 An explicit `net` scope entry `unix:/absolute/canonical/service.sock` names a
 single existing Unix-domain socket; the path must already be canonical and
@@ -85,10 +123,9 @@ closed. The profile emits an exact outbound exception for that path and
 nothing wider; filesystem authority stays independent, and a mixed
 remote-host/socket scope requires the managed async egress proxy (Unix
 entries never enter its DNS host list). Every other backend refuses a `unix:`
-grant outright, including at the advisory strength floor. Like every other
-restricted Seatbelt `net` shape above, admission currently resolves this one
-`Unknown` too and refuses it — the profile machinery is real, but the same
-hold applies until the outstanding confinement proof is accepted.
+grant outright, including at the advisory strength floor. With the prerequisites above met, its scope resolves to the concrete socket
+entries and it can be admitted at an `Advisory`-compatible floor; its
+enforcement report stays `Advisory`, so a `Kernel` net floor refuses it.
 
 On Windows, AppContainer is attached at process creation by the wired
 `agent-bridle-aclaunch.exe` wrapper rather than by `Sandbox::apply` on the

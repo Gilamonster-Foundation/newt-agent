@@ -1075,12 +1075,12 @@ fn cap_exit_handoff_keeps_one_plan_step_per_rendered_line() {
 
 /// Stage 1: even a cap fallback must include harness facts, not only model claims.
 #[test]
-fn observed_report_is_present_at_cap_finalization() {
+fn observed_report_is_omitted_when_the_turn_observed_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let claims = claim_check::TurnClaims::capture(root, &crate::Scope::All, None);
     let out = finalize_final_text(
-        cap_exit_fallback(1, None, 0, None).test_text(),
+        "Hello again!".to_string(),
         root,
         &crate::Scope::All,
         &capability_check::Evidence::default(),
@@ -1088,8 +1088,55 @@ fn observed_report_is_present_at_cap_finalization() {
         &claims,
         &self_verify::VerificationLedger::default(),
     );
-    assert!(out.starts_with("## Observed"), "{out}");
-    assert!(out.contains("unavailable"), "{out}");
+    assert_eq!(out, "Hello again!");
+}
+
+/// #3009: the honest reason replaces "incomplete or unauthorized" off-repo.
+#[test]
+fn observed_report_names_a_root_that_is_not_a_work_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let claims = claim_check::TurnClaims::capture(root, &crate::Scope::All, None);
+    let out = claims.observed_report(root, &crate::Scope::All, "");
+    assert!(out.contains("root is not a Git work tree"), "{out}");
+    assert!(observed_report::split_report(&out).is_some(), "{out}");
+}
+
+/// #3009: "not a Git work tree" is claimed only on a positive negative. A
+/// repository subdirectory, a refused metadata probe and a repository root
+/// whose snapshot is merely unavailable all say "unavailable" instead.
+#[test]
+fn observed_report_claims_not_a_work_tree_only_on_a_positive_negative() {
+    let home = tempfile::tempdir().unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(hermetic_git(dir, home.path())
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    };
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    let sub = repo.path().join("crate");
+    std::fs::create_dir(&sub).unwrap();
+    let report = |dir: &std::path::Path, scope: &crate::Scope<String>| {
+        let root = dir.to_str().unwrap();
+        claim_check::TurnClaims::capture(root, &crate::Scope::All, None)
+            .observed_report(root, scope, "")
+    };
+    let denied = report(repo.path(), &crate::Scope::none());
+    assert!(
+        !denied.contains("not a Git work tree") && denied.contains("incomplete or unauthorized"),
+        "a refused probe is unknown, not absence: {denied}"
+    );
+    let inside = report(&sub, &crate::Scope::All);
+    assert!(
+        !inside.contains("not a Git work tree"),
+        "a subdirectory of a repository is not outside one: {inside}"
+    );
+    let outside = tempfile::tempdir().unwrap();
+    assert!(report(outside.path(), &crate::Scope::All).contains("not a Git work tree"));
 }
 
 /// Live report regression: copied report envelopes in model prose must not
@@ -1109,8 +1156,9 @@ fn observed_report_finalization_removes_model_report_copies() {
         &claims,
         &self_verify::VerificationLedger::default(),
     );
-    assert_eq!(out.matches("## Observed").count(), 1, "{out}");
-    assert_eq!(out.matches("## Model explanation").count(), 1, "{out}");
+    // Copies are stripped, and a factless turn adds no frame of its own.
+    assert_eq!(out.matches("## Observed").count(), 0, "{out}");
+    assert_eq!(out.matches("## Model explanation").count(), 0, "{out}");
     assert!(out.contains("First explanation."));
     assert!(out.contains("Second explanation."));
 }

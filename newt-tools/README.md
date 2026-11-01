@@ -1,14 +1,14 @@
 # newt-tools
 
-A file and code tool set: `read`, `list_dir`, `search`, `edit`, and
-`apply_patch` with pluggable appliers (fuzzy by default, `diffy` behind a
-feature).
+`apply_patch` and `apply_whole_files`: the landing pads for a model's
+unified-diff or whole-file emission, with pluggable appliers (fuzzy by
+default, `diffy` behind a feature).
 
-**Where it sits.** Used by `newt-mcp-server`, `newt-acp-worker`, `newt-coder`
-and the Python module. The tools the model gets in the TUI and headless are a
-separate implementation in `newt-core/src/agentic/tools/`. Folding the two into
-one is tracked in
-[#2956](https://github.com/Gilamonster-Foundation/newt-agent/issues/2956).
+**Where it sits.** Used by `newt-coder`, `newt-acp-worker` and the Python
+module. The file tools a model calls by name (`read_file`, `edit_file`,
+`list_dir`, `grep`, …) are newt-core's, in `newt-core/src/agentic/tools/`,
+and the MCP server serves those same ones
+([#2956](https://github.com/Gilamonster-Foundation/newt-agent/issues/2956)).
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent).
 

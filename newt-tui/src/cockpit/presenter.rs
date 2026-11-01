@@ -11,11 +11,17 @@
 //! when they push past the bottom the terminal scrolls them into history
 //! exactly as a plain `println!` would have.
 //!
-//! **No cursor queries after start.** Once fd 1 is on the pty, `ESC[6n` would
-//! go to the pty and its answer would never come — so the viewport is
-//! [`Viewport::Fixed`], placed by arithmetic, and the one position query
-//! happens in [`Presenter::open`] before the capture is installed. Two
-//! consequences follow and are enforced here rather than remembered:
+//! **One cursor query at start, one per resize.** Once fd 1 is on the pty, a plain
+//! `ESC[6n` would go to the pty and its answer would never come — so the viewport is
+//! [`Viewport::Fixed`], placed by arithmetic, and the position query happens in
+//! [`Presenter::open`] before the capture is installed. The only later query is the one a
+//! terminal resize needs (#3014): terminals disagree on what a grow does to the screen, so the
+//! block's new top is MEASURED, by asking the real terminal where its cursor is
+//! ([`PtyCapture::query_cursor`] writes the query to the saved terminal handle, not fd 1) and
+//! subtracting where the caret sits in the block. No answer means the old guess
+//! ([`resize_new_top`]) and no second question. (A grow pins the block to the new bottom either
+//! way; the measurement then tells the resize where the OLD block was, so it can erase it.) Two consequences follow and are enforced
+//! here rather than remembered:
 //! [`ScrollbackSink`] is implemented by hand (ratatui's `insert_before` is a
 //! silent no-op on `Fixed`), and autowrap is OFF while the cockpit owns the
 //! terminal with every row pre-wrapped to `cols` — so a row is a row, and the
@@ -62,8 +68,10 @@ use crossterm::style::{
 };
 use crossterm::terminal::{Clear, ClearType, EnableLineWrap};
 use crossterm::{execute, queue};
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, ClearType as BackendClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::Cell;
 use ratatui::layout::Rect;
+use ratatui::layout::{Position, Size};
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -103,10 +111,16 @@ struct FenceState {
     wrap_off: AtomicBool,
     /// A lent-out modal or panel is writing; keep autowrap off until released.
     held: AtomicBool,
+    /// An open frame (#3011): every clone's bytes collect here and reach the
+    /// terminal as ONE synchronized write, so no compositor can paint the
+    /// half-drawn state between `Hide` and ratatui's `Show`.
+    frame: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 const WRAP_OFF: &[u8] = b"\x1b[?7l";
 const WRAP_ON: &[u8] = b"\x1b[?7h";
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 impl<W: Write> WrapFence<W> {
     fn new(file: W) -> Self {
@@ -118,9 +132,39 @@ impl<W: Write> WrapFence<W> {
 
     fn turn_off(&mut self) -> io::Result<()> {
         if !self.state.wrap_off.swap(true, Ordering::Relaxed) {
-            self.file.write_all(WRAP_OFF)?;
+            self.emit(WRAP_OFF)?;
         }
         Ok(())
+    }
+
+    fn frame(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.state.frame.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn emit(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Disjoint fields: the lock borrows `state`, the write borrows `file`.
+        let mut frame = self.state.frame.lock().unwrap_or_else(|p| p.into_inner());
+        match frame.as_mut() {
+            Some(frame) => {
+                frame.extend_from_slice(bytes);
+                Ok(())
+            }
+            None => self.file.write_all(bytes),
+        }
+    }
+
+    fn begin_frame(&self) {
+        *self.frame() = Some(SYNC_BEGIN.to_vec());
+    }
+
+    /// Send the open frame in one write, then flush as any batch would.
+    fn end_frame(&mut self) -> io::Result<()> {
+        let Some(mut frame) = self.frame().take() else {
+            return Ok(());
+        };
+        frame.extend_from_slice(SYNC_END);
+        self.file.write_all(&frame)?;
+        self.flush()
     }
 
     fn hold(&mut self) -> io::Result<()> {
@@ -152,10 +196,18 @@ impl WrapFence {
 impl<W: Write> Write for WrapFence<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.turn_off()?;
+        if self.frame().is_some() {
+            self.emit(buf)?;
+            return Ok(buf.len());
+        }
         self.file.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if self.frame().is_some() {
+            // Deferred to `end_frame`, which flushes once for the whole frame.
+            return Ok(());
+        }
         if !self.state.held.load(Ordering::Relaxed)
             && self.state.wrap_off.swap(false, Ordering::Relaxed)
         {
@@ -171,13 +223,90 @@ impl std::os::fd::AsRawFd for WrapFence {
     }
 }
 
+/// The caret ratatui last placed, as `y << 16 | x`, or [`NO_CARET`].
+type CaretCell = Arc<std::sync::atomic::AtomicU32>;
+const NO_CARET: u32 = u32::MAX;
+
+/// A backend that remembers where ratatui last put the caret (#3014). A resize needs the
+/// caret's row to turn the terminal's cursor reply back into the block's top, and ratatui
+/// keeps that position private; this is the one place every draw reports it.
+struct CaretBackend<W: Write = File> {
+    inner: CrosstermBackend<WrapFence<W>>,
+    caret: CaretCell,
+}
+
+impl<W: Write> Backend for CaretBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.draw(content)
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.caret.store(NO_CARET, Ordering::Relaxed);
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let position = position.into();
+        self.caret.store(
+            (u32::from(position.y) << 16) | u32::from(position.x),
+            Ordering::Relaxed,
+        );
+        self.inner.set_cursor_position(position)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: BackendClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+}
+
+/// Where the caret was the last time the block was fully drawn, and the geometry that draw
+/// had. It answers a resize only while that geometry still holds (#3014).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaretFrame {
+    top: u16,
+    block_h: u16,
+    cols: u16,
+    rows: u16,
+    /// The caret's absolute row at that draw.
+    y: u16,
+    /// The caret's column: a narrower terminal may wrap the caret's own row before it.
+    x: u16,
+}
+
 /// The screen: the real terminal, and where the block is on it.
 ///
 /// Split from [`Presenter`] so the editor can be handed `&mut Screen` as its
 /// [`ScrollbackSink`] while the presenter still borrows the editor.
-struct Screen {
-    tty: WrapFence,
-    term: Terminal<CrosstermBackend<WrapFence>>,
+struct Screen<W: Write = File> {
+    tty: WrapFence<W>,
+    term: Terminal<CaretBackend<W>>,
+    caret: CaretCell,
+    /// The caret at the last complete draw; see [`CaretFrame`].
+    caret_frame: Option<CaretFrame>,
+    /// Cleared the first time the terminal fails to answer a cursor query, so a terminal
+    /// without DSR support pays for one wait, not one per resize.
+    can_query_cursor: bool,
     cols: u16,
     rows: u16,
     /// First row of the block (0-based).
@@ -210,20 +339,75 @@ fn block_region(top: u16, block_h: u16) -> newt_core::tty::Region {
     }
 }
 
+/// The rows a blocking window holds, bottom-anchored. It is a value the screen hands back
+/// only through [`Screen::release_modal`], which clears the panel's rows and reclaims the
+/// ones the panel scrolled the transcript out of in one step (#3012).
 #[derive(Debug, PartialEq, Eq)]
+#[must_use = "release a reservation with Screen::release_modal"]
 struct ModalReservation {
     start: u16,
     rows: u16,
     chat_visible: bool,
+    /// The first row below the transcript while the panel is up: the block's top when the
+    /// panel opened, or `start` if the panel scrolled the transcript up to make room.
+    /// Releasing moves the block back here, so the next transcript insert fills the rows
+    /// the panel covered instead of leaving them blank in scrollback.
+    transcript_end: u16,
 }
 
-fn plan_modal_reservation(_block_top: u16, screen_rows: u16, requested: u16) -> ModalReservation {
+/// The rows a blocking window holds until [`Presenter::finish_modal`] gives them back.
+struct ModalRows {
+    /// The height asked for; `u16::MAX` for a caller's own alternate screen, which takes it all.
+    requested: u16,
+    /// Rows reserved under the transcript; `None` on the alternate screen.
+    reservation: Option<ModalReservation>,
+    /// The alternate screen entered for the window. Dropping it leaves, on every exit path.
+    alternate: Option<crate::transcript_pager::AltScreenGuard>,
+}
+
+/// Plan a bottom-anchored reservation of `requested` rows. `transcript_end` is the first row
+/// below the transcript before the reservation (the block's top when a panel opens).
+fn plan_modal_reservation(
+    transcript_end: u16,
+    screen_rows: u16,
+    requested: u16,
+) -> ModalReservation {
     let rows = requested.min(screen_rows);
+    let start = screen_rows.saturating_sub(rows);
     ModalReservation {
-        start: screen_rows.saturating_sub(rows),
+        start,
         rows,
         chat_visible: false,
+        transcript_end: transcript_end.min(start),
     }
+}
+
+/// Where the block's top returns to when a reservation is released: the end of the
+/// transcript, clamped so the block still fits.
+fn reclaimed_top(reservation: &ModalReservation, block_h: u16, screen_rows: u16) -> u16 {
+    reservation
+        .transcript_end
+        .min(screen_rows.saturating_sub(block_h))
+}
+
+/// The bytes that reserve `plan` for a modal over a block at `top`: erase from the block
+/// down, scroll the transcript rows the plan covers (`top - plan.start`) into scrollback,
+/// and clear the modal's own rows.
+fn modal_reserve_bytes(top: u16, screen_rows: u16, plan: &ModalReservation) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    queue!(
+        buf,
+        crossterm::cursor::Hide,
+        MoveTo(0, top),
+        Clear(ClearType::FromCursorDown)
+    )?;
+    let covered_transcript = top.saturating_sub(plan.start);
+    if covered_transcript > 0 {
+        queue!(buf, MoveTo(0, screen_rows.saturating_sub(1)))?;
+        buf.extend(std::iter::repeat_n(b'\n', covered_transcript as usize));
+    }
+    queue!(buf, MoveTo(0, plan.start), Clear(ClearType::FromCursorDown))?;
+    Ok(buf)
 }
 
 /// Clear the window's whole reservation, including rows above the editor's
@@ -254,8 +438,20 @@ impl Screen {
         )
     }
 
+    /// Output other than a draw has moved, or is about to move, the cursor off the caret: the
+    /// last draw's [`CaretFrame`] no longer says where it is, and unchanged geometry does not
+    /// either (a full screen scrolls under `insert_rows` with `top` and `block_h` intact).
+    /// Only a fresh draw makes the frame trustworthy again (#3014).
+    fn moved_cursor(&mut self) {
+        self.caret_frame = None;
+    }
+
     fn rebuild_term(&mut self) -> io::Result<()> {
-        let backend = CrosstermBackend::new(self.tty.fenced_clone()?);
+        self.moved_cursor();
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(self.tty.fenced_clone()?),
+            caret: Arc::clone(&self.caret),
+        };
         self.term = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -268,76 +464,55 @@ impl Screen {
     /// Give the blocking window the composer's rows. Erase the editor first,
     /// then preserve any covered transcript in scrollback. The draft stays in
     /// memory and is painted again only after this window releases input.
-    /// Re-reserve a live panel's rows after a resize (#2573). Unlike
-    /// [`Self::reserve_modal_rows`] this erases only from `erase_from` — what
-    /// the OLD panel could still occupy — and scrolls nothing: the transcript
-    /// above the panel is left where the terminal put it.
-    fn remeasure_modal_rows(
-        &mut self,
-        requested: u16,
-        erase_from: u16,
-    ) -> io::Result<ModalReservation> {
-        let plan = plan_modal_reservation(self.top, self.rows, requested);
-        self.tty.hold()?;
-        let mut buf = Vec::new();
-        queue!(
-            buf,
-            crossterm::cursor::Hide,
-            MoveTo(0, erase_from.min(plan.start)),
-            Clear(ClearType::FromCursorDown)
-        )?;
-        self.tty.write_all(&buf)?;
-        self.tty.flush()?;
-        self.term.clear()?;
-        Ok(plan)
-    }
-
     fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
-        self.reserve_modal_rows_from(self.top, requested)
-    }
-
-    /// Reserve `requested` rows for a modal whose rows today start at
-    /// `occupied_top` — the block's top when a modal opens, the panel's own top
-    /// when the operator sizes it (#2574). Only transcript rows the new plan
-    /// covers above `occupied_top` scroll into scrollback.
-    fn reserve_modal_rows_from(
-        &mut self,
-        occupied_top: u16,
-        requested: u16,
-    ) -> io::Result<ModalReservation> {
+        self.moved_cursor();
         let plan = plan_modal_reservation(self.top, self.rows, requested);
         self.tty.hold()?;
-        let mut buf = Vec::new();
-        queue!(
-            buf,
-            crossterm::cursor::Hide,
-            MoveTo(0, occupied_top),
-            Clear(ClearType::FromCursorDown)
-        )?;
-        let covered_transcript = occupied_top.saturating_sub(plan.start);
-        if covered_transcript > 0 {
-            queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
-            buf.extend(std::iter::repeat_n(b'\n', covered_transcript as usize));
-        }
-        queue!(buf, MoveTo(0, plan.start), Clear(ClearType::FromCursorDown))?;
+        let buf = modal_reserve_bytes(self.top, self.rows, &plan)?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
         self.term.clear()?;
         Ok(plan)
     }
 
+    /// Park the cursor on a blocking window's top row. Not [`Self::moved_cursor`]: an inline
+    /// reservation has already said so, and the alternate screen keeps the primary cursor
+    /// where the last draw left it, which is what a resize measures after (#3056).
     fn place_cursor(&mut self, row: u16) -> io::Result<()> {
         execute!(self.tty, MoveTo(0, row))?;
         self.tty.flush()
     }
 
-    fn cleanup_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
+    /// Release a panel's rows: clear them, and move the block back to the end of the
+    /// transcript so the rows the panel scrolled the transcript out of are reclaimed rather
+    /// than left blank in scrollback (#3012). The only way to release a reservation.
+    fn release_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
+        self.moved_cursor();
         if reservation.chat_visible {
             return Ok(());
         }
         self.tty
             .write_all(&modal_cleanup_bytes(reservation.start)?)?;
-        self.tty.flush()
+        self.tty.flush()?;
+        if self.reclaim_modal_rows(reservation) {
+            self.rebuild_term()?;
+        }
+        Ok(())
+    }
+
+    /// Move the block's top back to where the transcript ended. `true` when it moved.
+    fn reclaim_modal_rows(&mut self, reservation: &ModalReservation) -> bool {
+        let top = reclaimed_top(reservation, self.block_h, self.rows);
+        if top == self.top {
+            return false;
+        }
+        self.top = top;
+        // FORCED: the rows were already given back on the terminal.
+        self.region.relocate(
+            block_region(self.top, self.block_h),
+            newt_core::tty::OnCollision::SuspendHolder,
+        );
+        true
     }
 
     /// Insert finished rows into the transcript above the block.
@@ -346,6 +521,7 @@ impl Screen {
     /// re-seats the block viewport at its new top. All arithmetic, no queries —
     /// see the module docs.
     fn insert_rows(&mut self, rows: Vec<Row>) -> io::Result<()> {
+        self.moved_cursor();
         let cols = self.cols as usize;
         let phys: Vec<Row> = rows.iter().flat_map(|r| wrap_row(r, cols)).collect();
         if phys.is_empty() || phys.len() > u16::MAX as usize {
@@ -373,6 +549,7 @@ impl Screen {
     /// Change the block's height (the editor grew, the status row appeared…).
     /// Scrolls the transcript up if the taller block would not fit below it.
     fn relayout(&mut self, editor_rows: u16, status_rows: u16) -> io::Result<()> {
+        self.moved_cursor();
         let new_h = (editor_rows + status_rows).clamp(1, self.rows.max(1));
         if new_h == self.block_h && status_rows == self.status_rows {
             return Ok(());
@@ -398,31 +575,52 @@ impl Screen {
         self.rebuild_term()
     }
 
-    /// The terminal changed size: keep the block where the content actually
-    /// ends when it still fits there, and only fall back to the bottom
-    /// anchor when it doesn't. The transcript above is the terminal's to
-    /// reflow.
+    /// The terminal changed size: a grow pins the block to the new bottom
+    /// ([`resize_new_top`]); otherwise it stays where the content ends while it
+    /// still fits. The transcript above is the terminal's to reflow.
     fn resize(
         &mut self,
         cols: u16,
         rows: u16,
         editor_rows: u16,
         status_rows: u16,
+        measured_top: Option<u16>,
     ) -> io::Result<()> {
-        let old_top = self.top;
-        // Narrowing reflows any old block row wider than the new terminal onto
-        // extra rows, lifting the stale block above `old_top`.
-        let lifted = if cols.max(1) < self.cols {
-            reflow_growth(&self.painted_widths, cols.max(1))
-        } else {
-            0
+        // Narrowing reflows any old block row wider than the new terminal onto extra rows.
+        let growth = |widths: &[usize]| {
+            if cols.max(1) < self.cols {
+                reflow_growth(widths, cols.max(1))
+            } else {
+                0
+            }
         };
+        // Where the block WAS, once the terminal has had its say. Measured (#3014): the
+        // reply already includes where the reflow put the block, so only rows reflowed
+        // BEFORE the caret (the rows above it, and its own row's text left of it) are still
+        // unaccounted for; erasing a further `growth` rows up would eat transcript.
+        // Unmeasured: the old top is right only when nothing moved, and the whole reflow
+        // lifted the stale block above it.
+        let measured_top = measured_top.zip(self.caret_frame).and_then(|(top, frame)| {
+            let row = usize::from(frame.y.saturating_sub(frame.top)).min(self.painted_widths.len());
+            let own = caret_row_wrap(
+                frame.x,
+                self.painted_widths.get(row).copied().unwrap_or(0),
+                cols,
+            )?;
+            Some(top.saturating_sub(growth(&self.painted_widths[..row]).saturating_add(own)))
+        });
+        let (old_top, lifted) = match measured_top {
+            Some(top) => (top, 0),
+            None => (self.top, growth(&self.painted_widths)),
+        };
+        let old_rows = self.rows;
         self.cols = cols.max(1);
         self.rows = rows.max(1);
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
         self.block_h = new_h;
         self.status_rows = status_rows;
-        self.top = resize_new_top(old_top, self.rows, new_h);
+        self.top = resized_top(measured_top, self.top, old_rows, self.rows, new_h);
+        self.caret_frame = None;
         // FORCED: the TERMINAL resized; the block's new position is a
         // consequence, not a request.
         self.region.relocate(
@@ -442,9 +640,49 @@ impl Screen {
         self.rebuild_term()
     }
 
-    /// Paint the block: the status row (raw, clipped, with the queued chip at
-    /// the right edge), then the ratatui viewport.
+    /// Leave the terminal as a plain shell expects it: block erased, cursor
+    /// at the block's top-left, wrap and cooked mode restored.
+    fn shutdown(&mut self, trailing: &[u8]) -> io::Result<()> {
+        let mut buf = Vec::new();
+        queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
+        if !trailing.is_empty() {
+            buf.extend_from_slice(trailing);
+            buf.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        queue!(
+            buf,
+            EnableLineWrap,
+            crossterm::event::DisableBracketedPaste,
+            crossterm::cursor::Show
+        )?;
+        self.tty.write_all(&buf)?;
+        self.tty.flush()?;
+        // Raw mode is NOT released here. The session guard's doc already says
+        // "the MODES are this guard's job"; disabling here as well restored
+        // crossterm's global early, while the capture was still installed, and
+        // then the guard restored again. One owner, one restore (#1925).
+        Ok(())
+    }
+}
+
+impl<W: Write> Screen<W> {
+    /// Paint the block as one frame (#3011): status row and viewport reach the
+    /// terminal in a single synchronized write, sent even if drawing failed.
     fn draw(
+        &mut self,
+        editor: &MountedEditor,
+        chrome: Chrome<'_>,
+        chat_inactive: bool,
+    ) -> io::Result<()> {
+        self.tty.begin_frame();
+        let drawn = self.draw_frame(editor, chrome, chat_inactive);
+        let sent = self.tty.end_frame();
+        drawn.and(sent)
+    }
+
+    /// The status row (raw, clipped, with the queued chip at the right edge),
+    /// then the ratatui viewport.
+    fn draw_frame(
         &mut self,
         editor: &MountedEditor,
         chrome: Chrome<'_>,
@@ -490,8 +728,18 @@ impl Screen {
             self.tty.write_all(&buf)?;
             self.tty.flush()?;
         }
+        self.caret.store(NO_CARET, Ordering::Relaxed);
         let frame = self.term.draw(|f| editor.draw(f, chrome, chat_inactive))?;
         let area = frame.area;
+        let placed = self.caret.load(Ordering::Relaxed);
+        self.caret_frame = (placed != NO_CARET).then_some(CaretFrame {
+            top: self.top,
+            block_h: self.block_h,
+            cols: self.cols,
+            rows: self.rows,
+            y: (placed >> 16) as u16,
+            x: (placed & 0xFFFF) as u16,
+        });
         widths.extend((area.top()..area.bottom()).map(|y| {
             (area.left()..area.right())
                 .rev()
@@ -499,30 +747,6 @@ impl Screen {
                 .map_or(0, |x| usize::from(x - area.left()) + 1)
         }));
         self.painted_widths = widths;
-        Ok(())
-    }
-
-    /// Leave the terminal as a plain shell expects it: block erased, cursor
-    /// at the block's top-left, wrap and cooked mode restored.
-    fn shutdown(&mut self, trailing: &[u8]) -> io::Result<()> {
-        let mut buf = Vec::new();
-        queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
-        if !trailing.is_empty() {
-            buf.extend_from_slice(trailing);
-            buf.extend_from_slice(b"\x1b[0m\r\n");
-        }
-        queue!(
-            buf,
-            EnableLineWrap,
-            crossterm::event::DisableBracketedPaste,
-            crossterm::cursor::Show
-        )?;
-        self.tty.write_all(&buf)?;
-        self.tty.flush()?;
-        // Raw mode is NOT released here. The session guard's doc already says
-        // "the MODES are this guard's job"; disabling here as well restored
-        // crossterm's global early, while the capture was still installed, and
-        // then the guard restored again. One owner, one restore (#1925).
         Ok(())
     }
 }
@@ -614,26 +838,56 @@ fn restore_terminal_modes() {
     let _ = write_mode_restores(&mut io::stdout());
 }
 
-/// Where the block moves to on a resize event (#2441, #2632).
+/// Where the block moves to on a resize event (#2441, #2632, #3014).
 ///
-/// A terminal that GROWS does not pull the transcript down to meet a
-/// bottom-anchored block — most terminals add the new rows below existing
-/// content instead of scrolling it (confirmed against a real herdr pane
-/// grow, #2441 evidence) — so jumping straight to `new_rows - new_h` opens a
-/// blank canyon between the transcript, which stayed where it was, and the
-/// block, which jumped to the new bottom.
+/// **A terminal that GROWS pins the block to the new bottom** (maintainer decision on
+/// #3014 item 2). Terminals disagree on what a grow does to the transcript (some add rows
+/// below it, some pull it down), but the prompt stays where the operator's eyes and the
+/// keyboard are, the bottom row; the gap a bottom-adding terminal leaves above it is the
+/// accepted cost. This reverses the #2632 "stay under the content" rule for grows only.
 ///
-/// This holds for ANY resize event, not only a grow: a same-size
-/// notification (no content moved at all) and a height-only shrink that
-/// still leaves the block room both leave the transcript exactly where it
-/// was, so `old_top` is still correct ground truth there too. Move the block
-/// only when it no longer fits at `old_top` — the one case where the old
-/// position is not a valid answer — and fall back to the bottom anchor then.
-fn resize_new_top(old_top: u16, new_rows: u16, new_h: u16) -> u16 {
-    if old_top.saturating_add(new_h) <= new_rows {
+/// Every other resize (same size, or a shrink) leaves the transcript where it was, so
+/// `old_top` is still ground truth there. Move the block only when it no longer fits at
+/// `old_top`, and bottom-anchor it then.
+fn resize_new_top(old_top: u16, old_rows: u16, new_rows: u16, new_h: u16) -> u16 {
+    if new_rows <= old_rows && old_top.saturating_add(new_h) <= new_rows {
         old_top
     } else {
         new_rows.saturating_sub(new_h)
+    }
+}
+
+/// The block's top after a resize: a grow pins it to the bottom; otherwise the position the
+/// terminal reported when it was measured (#3014), else [`resize_new_top`]'s guess from the
+/// old top. Either way the block must fit the new screen.
+fn resized_top(
+    measured: Option<u16>,
+    current_top: u16,
+    old_rows: u16,
+    new_rows: u16,
+    new_h: u16,
+) -> u16 {
+    resize_new_top(measured.unwrap_or(current_top), old_rows, new_rows, new_h)
+}
+
+/// The block's top, from the row the terminal says its cursor is on and where the caret sits
+/// inside the block (`caret_offset` rows below the top). `None` when the reply is above the
+/// caret's own offset (a reply that cannot be this block's).
+fn block_top_from_reply(cursor_row: u16, caret_offset: u16) -> Option<u16> {
+    cursor_row.checked_sub(caret_offset)
+}
+
+/// How many rows further down a terminal `cols` wide reflows a caret at column `x` of a row
+/// whose text is `width` wide: the caret travels with the text left of it. `None` when the
+/// caret sits past the text and past the new width, where terminals disagree.
+fn caret_row_wrap(x: u16, width: usize, cols: u16) -> Option<u16> {
+    let cols = cols.max(1);
+    if x < cols {
+        Some(0)
+    } else if usize::from(x) < width {
+        Some(x / cols)
+    } else {
+        None
     }
 }
 
@@ -644,27 +898,6 @@ fn resize_new_top(old_top: u16, new_rows: u16, new_h: u16) -> u16 {
 /// (possibly smaller) new screen.
 fn resize_erase_from(old_top: u16, new_top: u16, rows: u16) -> u16 {
     old_top.min(new_top).min(rows.saturating_sub(1))
-}
-
-/// The row a live panel's resize erases from (#2573): the higher of its old
-/// and new tops — both bottom-anchored, the same rule the block uses — raised
-/// by the rows a narrower terminal reflowed its old full-width rows onto.
-/// Nothing above that is the panel's, so the transcript survives.
-fn panel_erase_from(
-    old_start: u16,
-    old_rows: u16,
-    old_cols: u16,
-    cols: u16,
-    rows: u16,
-    requested: u16,
-) -> u16 {
-    let new_start = plan_modal_reservation(0, rows, requested).start;
-    let lifted = if cols < old_cols {
-        reflow_growth(&vec![usize::from(old_cols); usize::from(old_rows)], cols)
-    } else {
-        0
-    };
-    resize_erase_from(old_start, new_start, rows).saturating_sub(lifted)
 }
 
 /// How many rows the old block grows by when a terminal reflows it at `cols`:
@@ -748,6 +981,11 @@ pub(crate) struct Presenter {
     arbiter: newt_core::tty::EphemeralRegistration,
     _arbiter_target: Arc<dyn newt_core::tty::Ephemeral>,
     was_suspended: bool,
+    /// The session is serving a command the operator typed (a line starting `/`): set when one
+    /// is handed over, cleared when the session asks for input again. A turn or operation the
+    /// command runs does not clear it, so a window the command reopens afterwards is still the
+    /// operator's (#3056); see [`Self::take_modal_rows`].
+    serving_command: bool,
     /// True only while a blocking window owns the keyboard. The editor draft
     /// stays mounted in memory and is hidden until the window closes.
     chat_inactive: bool,
@@ -877,7 +1115,11 @@ impl Presenter {
         };
         let capture = PtyCapture::install(cols, rows)?;
         let tty = WrapFence::new(capture.tty().try_clone()?);
-        let backend = CrosstermBackend::new(tty.fenced_clone()?);
+        let caret: CaretCell = Arc::new(std::sync::atomic::AtomicU32::new(NO_CARET));
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(tty.fenced_clone()?),
+            caret: Arc::clone(&caret),
+        };
         let term = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -897,6 +1139,9 @@ impl Presenter {
         let mut screen = Screen {
             tty,
             term,
+            caret,
+            caret_frame: None,
+            can_query_cursor: true,
             cols,
             rows,
             top,
@@ -924,6 +1169,7 @@ impl Presenter {
             arbiter,
             _arbiter_target: ephemeral,
             was_suspended: false,
+            serving_command: false,
             chat_inactive: false,
             dirty: true,
             meta: crate::prefix::Sequencer::new(crate::prefix::current()),
@@ -972,6 +1218,7 @@ impl Presenter {
     pub(crate) fn handle_request(&mut self, req: SurfaceRequest) -> io::Result<()> {
         match req {
             SurfaceRequest::ReadLine { prompt: _, reply } => {
+                self.serving_command = false;
                 // A confirmed `:wq` submitted its turn last time; now that the
                 // turn has run, end the conversation and exit before reading
                 // anything new — same order as the classic surface.
@@ -979,6 +1226,7 @@ impl Presenter {
                     let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
                 } else if let Some(line) = self.queued.pop_front() {
                     self.screen.queued = self.queued.len();
+                    self.hand_over(&line);
                     let _ = reply.send(Ok(ReadOutcome::Line(line)));
                 } else {
                     self.pending_read = Some(reply);
@@ -998,6 +1246,9 @@ impl Presenter {
                 verbose: _,
                 reply,
             } => {
+                // The session is asking, not serving a command: the question
+                // stays inline, under the turn that asked it.
+                self.serving_command = false;
                 if self.surface.take_end_quit() {
                     let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
                     self.dirty = true;
@@ -1009,17 +1260,17 @@ impl Presenter {
                 }
                 let requested_rows =
                     crate::clarification_modal::requested_rows(&batch, self.screen.cols);
-                let reservation = self.screen.reserve_modal_rows(requested_rows)?;
+                let rows = self.take_modal_rows(requested_rows)?;
+                let area = self.lent_area(&rows);
                 self.chat_inactive = true;
-                if reservation.chat_visible {
+                if rows.reservation.as_ref().is_some_and(|r| r.chat_visible) {
                     if let Err(error) = self.draw() {
                         self.chat_inactive = false;
                         return Err(error);
                     }
                 }
-                if let Err(error) = self.screen.place_cursor(reservation.start) {
-                    self.chat_inactive = false;
-                    let _ = self.finish_modal(Some(&reservation));
+                if let Err(error) = self.screen.place_cursor(area.y) {
+                    let _ = self.finish_modal(Some(rows));
                     let _ = self.draw();
                     return Err(error);
                 }
@@ -1028,18 +1279,12 @@ impl Presenter {
                     .screen
                     .tty
                     .try_clone()
-                    .and_then(|out| {
-                        crate::inline_viewport::cockpit_panel_terminal(
-                            out,
-                            Rect::new(0, reservation.start, self.screen.cols, reservation.rows),
-                        )
-                    })
+                    .and_then(|out| crate::inline_viewport::cockpit_panel_terminal(out, area))
                     .and_then(|mut terminal| {
                         crate::clarification_modal::present_in(&mut terminal, &batch, &hint)
                     });
                 drop(window);
-                let modal_cleanup = self.finish_modal(Some(&reservation));
-                self.chat_inactive = false;
+                let modal_cleanup = self.finish_modal(Some(rows));
                 let repaint = (|| -> io::Result<()> {
                     self.screen.term.clear()?;
                     self.draw()
@@ -1085,13 +1330,16 @@ impl Presenter {
                 self.surface.set_background_jobs(jobs);
                 self.dirty = true;
             }
+            SurfaceRequest::SetToolPolicy(label) => {
+                self.surface.set_tool_policy(label);
+                self.dirty = true;
+            }
             #[cfg(feature = "live-spill")]
             SurfaceRequest::SetSpillArchive(archive) => {
                 archive.enable_inspection();
                 self.spills = Some(archive);
-                self.screen.insert_rows(vec![
-                    b"F4 inspect retained output (including /spill open IDs)".to_vec(),
-                ])?;
+                self.screen
+                    .insert_rows(vec![b"F4 inspect retained output (or /spill open)".to_vec()])?;
             }
             SurfaceRequest::SetTabs(tabs) => {
                 self.surface.set_tabs(tabs);
@@ -1134,18 +1382,18 @@ impl Presenter {
                 }
                 let requested_rows =
                     crate::interaction_view::requested_rows(&interaction, self.screen.cols);
-                let reservation = self.screen.reserve_modal_rows(requested_rows)?;
+                let rows = self.take_modal_rows(requested_rows)?;
+                let area = self.lent_area(&rows);
                 // The modal is the only visible input surface until it exits.
                 self.chat_inactive = true;
-                if reservation.chat_visible {
+                if rows.reservation.as_ref().is_some_and(|r| r.chat_visible) {
                     if let Err(error) = self.draw() {
                         self.chat_inactive = false;
                         return Err(error);
                     }
                 }
-                if let Err(error) = self.screen.place_cursor(reservation.start) {
-                    self.chat_inactive = false;
-                    let _ = self.finish_modal(Some(&reservation));
+                if let Err(error) = self.screen.place_cursor(area.y) {
+                    let _ = self.finish_modal(Some(rows));
                     let _ = self.draw();
                     return Err(error);
                 }
@@ -1156,10 +1404,7 @@ impl Presenter {
                 // answered.
                 let window = Self::suspend_terminal(prompt_output);
                 let rich = self.screen.tty.try_clone().and_then(|out| {
-                    let terminal = crate::inline_viewport::cockpit_panel_terminal(
-                        out,
-                        Rect::new(0, reservation.start, self.screen.cols, reservation.rows),
-                    )?;
+                    let terminal = crate::inline_viewport::cockpit_panel_terminal(out, area)?;
                     crate::interaction_view::present_in(terminal, &interaction)
                 });
                 let (outcome, prompt_notice) = match rich {
@@ -1171,8 +1416,7 @@ impl Presenter {
                     ),
                 };
                 drop(window);
-                let modal_cleanup = self.finish_modal(Some(&reservation));
-                self.chat_inactive = false;
+                let modal_cleanup = self.finish_modal(Some(rows));
                 // The modal wrote outside ratatui's diff. Repaint the inline
                 // region from a clean buffer so focus returns to chat without
                 // leaving modal bytes or a dim chevron behind. Send the answer
@@ -1193,9 +1437,10 @@ impl Presenter {
                 repaint?;
             }
             // The panel sibling of `Interact`: lend the real terminal and
-            // park while the session draws. Inline panels reserve rows;
-            // alternate-screen panels preserve the primary buffer themselves.
-            // Both use the same focus transfer and release channel.
+            // park while the session draws. Inline panels take rows like any
+            // blocking window; alternate-screen panels preserve the primary
+            // buffer themselves. Both use the same focus transfer and release
+            // channel.
             SurfaceRequest::Panel { mode, reply } => {
                 let panel_output = match self.screen.tty.try_clone() {
                     Ok(tty) => tty,
@@ -1212,14 +1457,19 @@ impl Presenter {
                 if self.dirty {
                     self.draw()?;
                 }
-                let reservation = match mode {
-                    PanelMode::Inline(rows) => Some(self.screen.reserve_modal_rows(rows)?),
+                let mut rows = match mode {
+                    PanelMode::Inline(requested) => self.take_modal_rows(requested)?,
                     // The caller's alternate buffer occludes the composer and
                     // saves the primary screen. Do not erase or scroll it first.
-                    PanelMode::AlternateScreen => None,
+                    PanelMode::AlternateScreen => ModalRows {
+                        requested: u16::MAX,
+                        reservation: None,
+                        alternate: None,
+                    },
                 };
                 self.chat_inactive = true;
-                if reservation
+                if rows
+                    .reservation
                     .as_ref()
                     .is_some_and(|window| window.chat_visible)
                 {
@@ -1235,14 +1485,13 @@ impl Presenter {
                 let (release, released) = std::sync::mpsc::sync_channel(1);
                 let window = crate::session_worker::PanelWindow::new(
                     panel_output,
-                    self.lent_area(reservation.as_ref()),
+                    self.lent_area(&rows),
                     Some(release),
                 );
                 if reply.send(Some(window)).is_err() {
                     // The session vanished between asking and receiving. Undo
                     // the reservation rather than parking forever.
-                    self.chat_inactive = false;
-                    let cleanup = self.finish_modal(reservation.as_ref());
+                    let cleanup = self.finish_modal(Some(rows));
                     let _ = self.screen.term.clear();
                     let _ = self.draw();
                     return cleanup;
@@ -1253,23 +1502,21 @@ impl Presenter {
                 // #2571: while parked, answer re-measure requests — the panel
                 // hears the resize (it owns the keyboard), this thread owns
                 // the layout. A `RecvError` is the drop: the panel is done.
-                let mut reservation = reservation;
-                let mut mode = mode;
-                while let Ok(crate::session_worker::PanelSignal::Remeasure { rows, reply }) =
+                while let Ok(crate::session_worker::PanelSignal::Remeasure { rows: asked, reply }) =
                     released.recv()
                 {
-                    // The operator sized the panel (Shift-↑/↓, zoom): an inline
-                    // loan takes the new request; the screen clamps it.
-                    if let (Some(rows), PanelMode::Inline(_)) = (rows, mode) {
-                        mode = PanelMode::Inline(rows);
+                    // The operator sized the panel (Shift-↑/↓, zoom): one on
+                    // the alternate screen takes the new request, which
+                    // `lent_area` clamps.
+                    if let (Some(asked), Some(_)) = (asked, &rows.alternate) {
+                        rows.requested = asked;
                     }
-                    // A failed re-plan keeps the old region rather than
+                    // A failed re-measure keeps the old region rather than
                     // stranding the panel: the reply still goes out.
-                    let _ = self.remeasure_panel(mode, &mut reservation);
-                    let _ = reply.send(self.lent_area(reservation.as_ref()));
+                    let _ = self.remeasure_panel(&rows);
+                    let _ = reply.send(self.lent_area(&rows));
                 }
-                let modal_cleanup = self.finish_modal(reservation.as_ref());
-                self.chat_inactive = false;
+                let modal_cleanup = self.finish_modal(Some(rows));
                 // The panel wrote outside ratatui's diff, so the mounted block
                 // is repainted from a clean buffer — the same restore the
                 // modal path performs, and the reason the header comes back.
@@ -1374,9 +1621,58 @@ impl Presenter {
                 drop(_stdin);
                 return self.on_event(evt);
             }
+            if let Event::Resize(cols, rows) = evt {
+                // The terminal's own resize arrives here, and only here: measure where it
+                // left the block rather than guess. Internal re-layouts keep the guess.
+                self.dirty = true;
+                let measured = self.measure_block_top();
+                self.resize_to(cols, rows, measured)?;
+                continue;
+            }
             self.on_event(evt)?;
         }
         Ok(())
+    }
+
+    /// Apply a new terminal size. `measured_top` is where the terminal says the block now
+    /// is (#3014); `None` keeps the arithmetic guess ([`resize_new_top`]).
+    fn resize_to(&mut self, cols: u16, rows: u16, measured_top: Option<u16>) -> io::Result<()> {
+        self.capture.resize(cols, rows);
+        let status_rows = self.status_rows();
+        let editor_rows = self.editor.wanted_rows(cols, rows, &self.surface.chrome());
+        self.screen
+            .resize(cols, rows, editor_rows, status_rows, measured_top)
+    }
+
+    /// Where the block's top is now, MEASURED: ask the terminal where its cursor is and
+    /// subtract where the caret sits in the block. Terminals disagree on what a resize does
+    /// to the screen (some pull scrollback down, some add rows below), so the old top is a
+    /// guess; the cursor is the one thing every terminal answers (#3014). `None` when the
+    /// answer cannot be trusted: a modal owns the cursor, the block moved since its last
+    /// draw, or the terminal does not reply (then the guess stands, and the question is not
+    /// asked again).
+    fn measure_block_top(&mut self) -> Option<u16> {
+        let screen = &self.screen;
+        let frame = screen.caret_frame?;
+        let current = CaretFrame {
+            top: screen.top,
+            block_h: screen.block_h,
+            cols: screen.cols,
+            rows: screen.rows,
+            y: frame.y,
+            x: frame.x,
+        };
+        if self.chat_inactive || !screen.can_query_cursor || frame != current {
+            return None;
+        }
+        let offset = frame.y.checked_sub(frame.top)?;
+        match self.capture.query_cursor() {
+            Ok((_, row)) => block_top_from_reply(row, offset),
+            Err(_) => {
+                self.screen.can_query_cursor = false;
+                None
+            }
+        }
     }
 
     fn on_event(&mut self, evt: Event) -> io::Result<()> {
@@ -1401,12 +1697,7 @@ impl Presenter {
                 }
                 Ok(())
             }
-            Event::Resize(cols, rows) => {
-                self.capture.resize(cols, rows);
-                let status_rows = self.status_rows();
-                let editor_rows = self.editor.wanted_rows(cols, rows, &self.surface.chrome());
-                self.screen.resize(cols, rows, editor_rows, status_rows)
-            }
+            Event::Resize(cols, rows) => self.resize_to(cols, rows, None),
             // #2005: the ladder decides, from `assets/esc_ladder.toml`. This
             // arm replaced a hand-written Ctrl-C predicate; it is the SAME
             // interrupt, widened to Esc, not a second mechanism beside it.
@@ -1420,6 +1711,12 @@ impl Presenter {
             }
             Event::Key(key) if key.kind == KeyEventKind::Press && self.meta_key(&key)? => Ok(()),
             other => {
+                // #3022: `/spill open ` completes the ids retained so far. The
+                // archive grows after the editor mounts, so refresh per key.
+                #[cfg(feature = "live-spill")]
+                if let Some(spills) = &self.spills {
+                    self.editor.set_spill_choices(spills.choices());
+                }
                 let outcome = self.editor.on_event(other, &mut self.screen)?;
                 if let Some(outcome) = outcome {
                     self.on_outcome(outcome);
@@ -1467,73 +1764,87 @@ impl Presenter {
         Ok(true)
     }
 
-    /// The region lent to a panel: its reservation, or the whole screen for an
-    /// alternate-screen loan.
-    fn lent_area(&self, reservation: Option<&ModalReservation>) -> Rect {
-        let (top, rows) = reservation.map_or((0, self.screen.rows), |r| (r.start, r.rows));
-        Rect::new(0, top, self.screen.cols, rows)
-    }
-
-    /// #2571: the terminal resized under a live panel, or the operator asked
-    /// for a different height (Shift-↑/↓, zoom). The same re-layout
-    /// `finish_modal_rows` applies to a resize that lands after a dialog
-    /// closes — clear what a narrower panel may have rewrapped above its old
-    /// top, then the presenter's own resize — and the panel's rows reserved
-    /// again against the new screen.
-    fn remeasure_panel(
-        &mut self,
-        mode: PanelMode,
-        reservation: &mut Option<ModalReservation>,
-    ) -> io::Result<()> {
-        let (cols, rows) = self.screen.terminal_size()?;
-        let resized = (cols, rows) != (self.screen.cols, self.screen.rows);
-        // Measured before the presenter's own resize moves its geometry.
-        let old = reservation.as_ref().map(|r| (r.start, r.rows));
-        let old_cols = self.screen.cols;
-        if resized {
-            self.on_event(Event::Resize(cols, rows))?;
-        }
-        // An alternate-screen loan owns the whole screen and redraws it: the
-        // presenter's own resize above is its whole resize contract (#2573).
-        let (PanelMode::Inline(requested), Some((old_start, old_rows))) = (mode, old) else {
-            return Ok(());
+    /// Rows for a blocking window `requested` high (#3056). One the operator opened with a
+    /// command, outside any turn or operation it runs, draws at the bottom of the alternate
+    /// screen, and leaving it gives the primary screen back exactly: nothing is scrolled,
+    /// reclaimed or repainted. Anything else (a permission prompt during a turn or an
+    /// operation, a clarification, a prompt at startup) reserves rows under the transcript,
+    /// which stays in view (`plain_scroller_tui.md`).
+    fn take_modal_rows(&mut self, requested: u16) -> io::Result<ModalRows> {
+        let (reservation, alternate) = if self.serving_command && self.turn.is_none() {
+            let out = crate::inline_viewport::PanelOut::Tty(self.screen.tty.try_clone()?);
+            let screen = crate::transcript_pager::AltScreenGuard::enter_on(out, None)?;
+            (None, Some(screen))
+        } else {
+            (Some(self.screen.reserve_modal_rows(requested)?), None)
         };
-        if resized {
-            let erase_from = panel_erase_from(old_start, old_rows, old_cols, cols, rows, requested);
-            *reservation = Some(self.screen.remeasure_modal_rows(requested, erase_from)?);
-        } else if old_rows != requested.min(self.screen.rows) {
-            // The operator sized the panel (#2574): reserved from the panel's
-            // own top, so a grow scrolls only the rows it newly covers into
-            // scrollback and a shrink erases only the rows it gives back.
-            *reservation = Some(self.screen.reserve_modal_rows_from(old_start, requested)?);
-        }
-        Ok(())
+        Ok(ModalRows {
+            requested,
+            reservation,
+            alternate,
+        })
     }
 
-    /// A blocking dialog may have consumed every resize event while this
-    /// presenter was parked. Read the real tty before restoring its draft.
-    fn finish_modal(&mut self, reservation: Option<&ModalReservation>) -> io::Result<()> {
-        let cleanup = self.finish_modal_rows(reservation);
+    /// Where a blocking window draws: its inline reservation, else the bottom rows it asked
+    /// for on the alternate screen, measured afresh. Afresh, because the presenter's geometry
+    /// describes the primary screen and waits for it ([`Self::finish_modal_rows`]).
+    fn lent_area(&self, rows: &ModalRows) -> Rect {
+        if let Some(r) = &rows.reservation {
+            return Rect::new(0, r.start, self.screen.cols, r.rows);
+        }
+        let (cols, height) = self
+            .screen
+            .terminal_size()
+            .unwrap_or((self.screen.cols, self.screen.rows));
+        let lent = rows.requested.min(height);
+        Rect::new(0, height - lent, cols, lent)
+    }
+
+    /// #2571: the terminal resized under a live panel, or the operator sized it (Shift-↑/↓,
+    /// zoom). The capture learns the new size and what the panel repaints is cleared: the
+    /// alternate screen from its top, or an inline window's own rows, never the transcript
+    /// above them. The presenter's own resize waits until the window closes
+    /// ([`Self::finish_modal_rows`]).
+    fn remeasure_panel(&mut self, rows: &ModalRows) -> io::Result<()> {
+        let (cols, height) = self.screen.terminal_size()?;
+        self.capture.resize(cols, height);
+        let from = rows.reservation.as_ref().map_or(0, |r| r.start);
+        self.screen.tty.write_all(&modal_cleanup_bytes(from)?)?;
+        self.screen.tty.flush()
+    }
+
+    /// Give a blocking window's rows back and the keyboard to chat. The alternate screen, if
+    /// the window had one, is left first, so what follows measures the primary screen. A
+    /// dialog may have consumed every resize event while this presenter was parked, so the
+    /// real tty is read before the draft is restored.
+    fn finish_modal(&mut self, rows: Option<ModalRows>) -> io::Result<()> {
+        self.chat_inactive = false;
+        // Taking the reservation drops the rest, the alternate-screen guard included.
+        let reservation = rows.and_then(|rows| rows.reservation);
+        let cleanup = self.finish_modal_rows(reservation.as_ref());
         let released = self.screen.tty.release();
         cleanup.and(released)
     }
 
     fn finish_modal_rows(&mut self, reservation: Option<&ModalReservation>) -> io::Result<()> {
         let (cols, rows) = self.screen.terminal_size()?;
-        if (cols, rows) != (self.screen.cols, self.screen.rows) {
-            // A narrower inline dialog may have expanded above its old top.
-            // Alternate-screen loans never painted the primary buffer; only
-            // inline dialogs need their old pixels cleared before resizing.
-            if reservation.is_some() {
-                self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
-                self.screen.tty.flush()?;
-            }
-            self.on_event(Event::Resize(cols, rows))
-        } else if let Some(reservation) = reservation {
-            self.screen.cleanup_modal(reservation)
-        } else {
-            Ok(())
+        if (cols, rows) == (self.screen.cols, self.screen.rows) {
+            return reservation
+                .map_or(Ok(()), |reservation| self.screen.release_modal(reservation));
         }
+        let Some(reservation) = reservation else {
+            // The terminal resized while the primary screen sat behind the alternate one:
+            // ask where it left the block, as a resize at the prompt does (#3014).
+            self.dirty = true;
+            let measured = self.measure_block_top();
+            return self.resize_to(cols, rows, measured);
+        };
+        // A narrower inline dialog may have expanded above its old top.
+        self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
+        self.screen.tty.flush()?;
+        // Reclaim before the resize re-anchors the block (it rebuilds the viewport).
+        self.screen.reclaim_modal_rows(reservation);
+        self.on_event(Event::Resize(cols, rows))
     }
 
     fn suspend_terminal(output: File) -> newt_core::tty::PromptWindow {
@@ -1679,11 +1990,18 @@ impl Presenter {
         }
     }
 
+    /// The session is about to serve `line`. It runs it as a command when it reads it as one,
+    /// and then the windows it opens are the operator's (#3056).
+    fn hand_over(&mut self, line: &str) {
+        self.serving_command = crate::chat::operator_task(line).starts_with('/');
+    }
+
     /// A submitted line: the session's if it is waiting for one, otherwise
     /// queued for the next `ReadLine`. It was already echoed into scrollback
     /// by the editor, so a queued line reads back exactly like a sent one.
     fn submit(&mut self, body: String) {
         if let Some(reply) = self.pending_read.take() {
+            self.hand_over(&body);
             let _ = reply.send(Ok(ReadOutcome::Line(body)));
         } else {
             self.queued.push_back(body);
@@ -1870,6 +2188,7 @@ mod tests {
                 start: 19,
                 rows: 5,
                 chat_visible: false,
+                transcript_end: 19,
             }
         );
         assert_eq!(
@@ -1878,6 +2197,7 @@ mod tests {
                 start: 0,
                 rows: 7,
                 chat_visible: false,
+                transcript_end: 0,
             },
             "a short terminal gives the blocking modal the whole screen"
         );
@@ -1887,7 +2207,310 @@ mod tests {
                 start: 2,
                 rows: 2,
                 chat_visible: false,
+                transcript_end: 0,
             }
+        );
+    }
+
+    /// #3014 mocked tier: the cursor the terminal reports locates the block it left behind
+    /// (what the resize must erase), and a GROW pins the block to the new bottom whatever
+    /// the terminal did (maintainer decision on item 2). Without a grow, the block's top
+    /// follows the measured position.
+    #[test]
+    fn a_resize_follows_the_cursor_the_terminal_reports_not_a_guess() {
+        // A 24-row screen, a 4-row block at the bottom (top 20) with the caret on its
+        // second row (offset 1), grown to 34 rows.
+        let (old_top, offset, old_rows, new_rows, new_h) = (20u16, 1u16, 24u16, 34u16, 4u16);
+        let below = block_top_from_reply(old_top + offset, offset);
+        assert_eq!(below, Some(20));
+        let pulled = block_top_from_reply(old_top + offset + 10, offset);
+        assert_eq!(pulled, Some(30));
+        // A grow pins to the bottom (30) for a terminal that adds rows below, one that
+        // pulls scrollback down, and one that never answers.
+        for measured in [below, pulled, None] {
+            assert_eq!(
+                resized_top(measured, old_top, old_rows, new_rows, new_h),
+                30
+            );
+        }
+        // Not a grow: the measured position stands while it fits...
+        assert_eq!(resized_top(Some(12), 20, 34, 34, 4), 12);
+        // ...and a measured top that no longer fits the shrunk screen is clamped.
+        assert_eq!(resized_top(Some(30), 20, 34, 24, 4), 20);
+        // A reply above the caret's own offset cannot be this block's.
+        assert_eq!(block_top_from_reply(0, 3), None);
+    }
+
+    /// A screen over a scratch file with a painted block, for driving `resize` and
+    /// reading the bytes it wrote.
+    fn screen_with_block(
+        cols: u16,
+        rows: u16,
+        top: u16,
+        block_h: u16,
+        widths: &[usize],
+        (caret_x, caret_y): (u16, u16),
+    ) -> (Screen, std::fs::File) {
+        let file = tempfile::tempfile().unwrap();
+        let reader = file.try_clone().unwrap();
+        let tty = WrapFence::new(file);
+        let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(tty.fenced_clone().unwrap()),
+            caret: Arc::clone(&caret),
+        };
+        let term = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, top, cols, block_h)),
+            },
+        )
+        .unwrap();
+        let region = newt_core::tty::Terminal::lease_region(
+            block_region(top, block_h),
+            newt_core::tty::OnCollision::Refuse,
+        )
+        .expect("the test owns these rows");
+        let screen = Screen {
+            tty,
+            term,
+            caret,
+            caret_frame: Some(CaretFrame {
+                top,
+                block_h,
+                cols,
+                rows,
+                y: caret_y,
+                x: caret_x,
+            }),
+            can_query_cursor: true,
+            cols,
+            rows,
+            top,
+            block_h,
+            status_rows: 1,
+            status: Vec::new(),
+            queued: 0,
+            region,
+            painted_widths: widths.to_vec(),
+        };
+        (screen, reader)
+    }
+
+    /// The first row (zero-based) the resize erased downward from.
+    fn first_erase_row(mut written: std::fs::File) -> u16 {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut bytes = Vec::new();
+        written.seek(SeekFrom::Start(0)).unwrap();
+        written.read_to_end(&mut bytes).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let at = text.find("\x1b[J").expect("resize erases downward");
+        let (row, _) = text[..at]
+            .rsplit_once("\x1b[")
+            .and_then(|(_, m)| m.strip_suffix('H'))
+            .and_then(|m| m.split_once(';'))
+            .expect("a cursor move precedes the erase");
+        row.parse::<u16>().unwrap() - 1
+    }
+
+    /// Every row (zero-based) the screen erased downward from, in order.
+    fn erase_rows(mut written: std::fs::File) -> Vec<u16> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut bytes = Vec::new();
+        written.seek(SeekFrom::Start(0)).unwrap();
+        written.read_to_end(&mut bytes).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        // The last cursor move before each erase; the wrap fence's own escapes interleave.
+        text.match_indices("\x1b[J")
+            .map(|(at, _)| {
+                let (row, _) = text[..at]
+                    .rsplit("\x1b[")
+                    .find_map(|m| m.strip_suffix('H')?.split_once(';'))
+                    .expect("a cursor move precedes the erase");
+                row.parse::<u16>().unwrap() - 1
+            })
+            .collect()
+    }
+
+    /// #3041: split (narrow), draw, close the split (widen), draw. A screen part-filled
+    /// with transcript keeps the block where it is through both reflows, so no erase may
+    /// start above row 10: rows 0..10 are transcript.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_narrow_then_widen_resize_never_erases_above_the_block() {
+        let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (60, 11));
+        // Narrow to 40: header and input each wrap once; the caret lands on row 13.
+        screen.resize(40, 24, 2, 1, Some(13 - 1)).unwrap();
+        assert_eq!(screen.top, 10, "the block did not move");
+        // The redraw at 40 columns.
+        screen.painted_widths = vec![40, 40, 10];
+        screen.caret_frame = Some(CaretFrame {
+            top: 10,
+            block_h: 3,
+            cols: 40,
+            rows: 24,
+            y: 11,
+            x: 20,
+        });
+        // Widen back to 80: nothing in the block wraps, the caret is still on row 11.
+        screen.resize(80, 24, 2, 1, Some(11 - 1)).unwrap();
+        assert_eq!(screen.top, 10, "the block did not move");
+        let erased = erase_rows(log);
+        assert!(
+            erased.iter().all(|&r| r >= 10),
+            "transcript erased: erase rows {erased:?}"
+        );
+    }
+
+    /// #3021 review: a width shrink whose footer wraps BELOW the caret. The terminal's
+    /// reply already includes the scroll that reflow caused (block top 20), so erasing
+    /// from `20 - growth` deleted the last transcript row above the block.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_does_not_erase_transcript_above_the_block() {
+        // 80x24, three-row block at row 21, caret on row 22; shrink to 40 wraps the
+        // 70-column footer (+1 row), scrolling the block to row 20.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], (5, 22));
+        screen.resize(40, 24, 2, 1, Some(20)).unwrap();
+        assert_eq!(first_erase_row(log), 20, "row 19 is transcript");
+    }
+
+    /// The other side: a row ABOVE the caret wraps, pushing the caret down past the
+    /// block's own offset, so the measured top reads one row too low.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_with_a_wrapped_row_above_the_caret_erases_the_whole_block() {
+        // Header (70 cols) wraps to two rows: the block now starts at 20 with the
+        // caret on row 22, so `reply - offset` reads 21.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[70, 10, 10], (5, 22));
+        screen.resize(40, 24, 2, 1, Some(21)).unwrap();
+        assert_eq!(
+            first_erase_row(log),
+            20,
+            "the wrapped header row is erased too"
+        );
+    }
+
+    /// #3021 review, round 3: the caret's OWN row wraps before the caret. The input row
+    /// (70 cols, caret at column 60) splits at 40, carrying the caret one row further down,
+    /// so the reply reads one row lower than the header's wrap alone explains.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_with_the_caret_row_wrapped_before_the_caret_erases_the_whole_block()
+    {
+        // Block at 10: header 80 cols (+1 row), input 70 cols with the caret at (60, 11).
+        // At 40 cols the block stays at 10 and the caret lands on row 13.
+        let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (60, 11));
+        screen.resize(40, 24, 3, 1, Some(12)).unwrap();
+        assert_eq!(first_erase_row(log), 10, "the old header row is erased too");
+    }
+
+    /// The control: the caret sits in the first fragment of its row, so only the header's
+    /// wrap moved it.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_measured_width_shrink_with_the_caret_before_its_rows_wrap_point_erases_the_block() {
+        let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (10, 11));
+        screen.resize(40, 24, 3, 1, Some(11)).unwrap();
+        assert_eq!(first_erase_row(log), 10);
+    }
+
+    /// The caret past its row's text, beyond the new width: terminals disagree on where
+    /// reflow puts it, so the reply is not trusted and the unmeasured guess stands.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_caret_past_its_rows_text_beyond_the_new_width_falls_back_to_the_guess() {
+        let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 50, 10], (60, 11));
+        screen.resize(40, 24, 3, 1, Some(12)).unwrap();
+        // Unmeasured: old top 10 lifted by the whole reflow (header +1, input +1).
+        assert_eq!(first_erase_row(log), 8);
+    }
+
+    /// Unmeasured, the guess still subtracts the whole reflow.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_unmeasured_width_shrink_still_lifts_by_the_whole_reflow() {
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], (5, 22));
+        screen.resize(40, 24, 2, 1, None).unwrap();
+        assert_eq!(first_erase_row(log), 20);
+    }
+
+    /// The screen after a transcript of `lines` rows, a block of `block_h` rows under it, then an
+    /// inline modal of `requested` rows reserved, released, and one more transcript line
+    /// inserted where the block now sits. Returns that screen.
+    #[cfg(feature = "rich-tui")]
+    fn panel_round_trip(rows: u16, lines: u16, block_h: u16, requested: u16) -> Vec<String> {
+        let mut stream = String::new();
+        for n in 0..lines {
+            stream.push_str(&format!("\x1b[{};1HT{n:02}", n + 1));
+        }
+        let top = lines;
+        for b in 0..block_h {
+            stream.push_str(&format!("\x1b[{};1HBLOCK", top + b + 1));
+        }
+        let reservation = plan_modal_reservation(top, rows, requested);
+        let bytes = modal_reserve_bytes(top, rows, &reservation).unwrap();
+        stream.push_str(&String::from_utf8(bytes).unwrap());
+        for r in reservation.start..rows {
+            stream.push_str(&format!("\x1b[{};1HPANEL", r + 1));
+        }
+        stream
+            .push_str(&String::from_utf8(modal_cleanup_bytes(reservation.start).unwrap()).unwrap());
+        let new_top = reclaimed_top(&reservation, block_h, rows);
+        let (insert, _) = render_insert(new_top, block_h, rows, &[b"NEXT".to_vec()]).unwrap();
+        stream.push_str(&String::from_utf8(insert).unwrap());
+        crate::interaction_view_pty_test::erasing_grid(&stream, usize::from(rows))
+    }
+
+    /// The row index of the first line starting `prefix`.
+    #[cfg(feature = "rich-tui")]
+    fn row_of(grid: &[String], prefix: &str) -> usize {
+        grid.iter()
+            .position(|row| row.starts_with(prefix))
+            .unwrap_or_else(|| panic!("{prefix} is not on the screen: {grid:?}"))
+    }
+
+    /// #3012: a panel that covered transcript rows scrolled them into scrollback; releasing it
+    /// moves the block back, so the next transcript line lands directly under the last one
+    /// instead of below a permanent band of blank rows.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn closing_a_panel_over_a_full_transcript_leaves_no_blank_rows() {
+        // A 24-row screen, transcript T00..T20 above a 3-row block, a 10-row panel.
+        let grid = panel_round_trip(24, 21, 3, 10);
+        let (last, next) = (row_of(&grid, "T20"), row_of(&grid, "NEXT"));
+        assert_eq!(next, last + 1, "NEXT must follow T20 directly: {grid:?}");
+        assert!(
+            !grid.iter().any(|row| row.contains("PANEL")),
+            "panel text left behind: {grid:?}"
+        );
+    }
+
+    /// A panel shorter than the block covers no transcript: nothing scrolled, and the block
+    /// does not move.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn closing_a_panel_that_covered_no_transcript_does_not_move_the_block() {
+        let plan = plan_modal_reservation(10, 24, 4);
+        assert_eq!(plan.transcript_end, 10);
+        assert_eq!(reclaimed_top(&plan, 3, 24), 10);
+        let grid = panel_round_trip(24, 10, 3, 4);
+        assert_eq!(row_of(&grid, "NEXT"), row_of(&grid, "T09") + 1, "{grid:?}");
+    }
+
+    /// Control: this is what the release did before #3012: redraw the block at its old top.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn the_old_release_left_the_gap_this_test_fails_to_hide() {
+        let rows = 24u16;
+        let plan = plan_modal_reservation(21, rows, 10);
+        // Old behaviour: the block's top was never moved back.
+        assert!(plan.start < 21, "the panel covered transcript rows");
+        assert_eq!(reclaimed_top(&plan, 3, rows), plan.start);
+        assert_ne!(
+            reclaimed_top(&plan, 3, rows),
+            21,
+            "21 would leave blank rows"
         );
     }
 
@@ -1956,6 +2579,166 @@ mod tests {
         assert_eq!(fence.file, b"\x1b[?7lab\x1b[?7h");
     }
 
+    /// #3011: a frame's writes and flushes, from any clone, reach the terminal
+    /// as one synchronized write, so a compositor never paints a half frame
+    /// (cursor hidden, caret not yet placed).
+    #[test]
+    fn a_frame_reaches_the_terminal_as_one_synchronized_write() {
+        let mut screen = WrapFence::new(Vec::new());
+        let mut backend = WrapFence {
+            file: Vec::new(),
+            state: Arc::clone(&screen.state),
+        };
+        screen.begin_frame();
+        screen.write_all(b"\x1b[?25lstatus").unwrap();
+        screen.flush().unwrap();
+        backend.write_all(b"cells").unwrap();
+        backend.flush().unwrap();
+        backend.write_all(b"\x1b[?25h").unwrap();
+        backend.flush().unwrap();
+        assert!(
+            screen.file.is_empty() && backend.file.is_empty(),
+            "nothing sent mid-frame"
+        );
+        screen.end_frame().unwrap();
+        assert_eq!(
+            screen.file,
+            b"\x1b[?2026h\x1b[?7l\x1b[?25lstatuscells\x1b[?25h\x1b[?2026l\x1b[?7h"
+        );
+        backend.write_all(b"after").unwrap();
+        assert_eq!(
+            backend.file, b"\x1b[?7lafter",
+            "outside a frame, writes go straight through"
+        );
+    }
+
+    /// Records each `write` as its own entry, so a test sees WRITE BOUNDARIES
+    /// (a `Vec<u8>` keeps only the concatenation and cannot tell one write
+    /// from a thousand), and each `flush` as a marker.
+    #[derive(Clone, Default)]
+    struct Boundaries(Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>);
+
+    impl Write for Boundaries {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push(Some(buf.to_vec()));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push(None);
+            Ok(())
+        }
+    }
+
+    /// #3011: drives the PRODUCTION `Screen::draw` (status row, ratatui
+    /// viewport, caret) and asserts the whole synchronized frame (`?2026h`
+    /// through the caret's `Show`, to `?2026l`) crosses the writer as ONE
+    /// write, with nothing flushed or written before it. Removing the
+    /// `begin_frame`/`end_frame` wrapper, or splitting the payload into several
+    /// writes, fails here; the fence unit test above cannot see either.
+    #[test]
+    fn a_production_draw_reaches_the_writer_as_one_synchronized_write() {
+        let log = Boundaries::default();
+        let tty = WrapFence::new(log.clone());
+        let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
+        let backend = CaretBackend {
+            inner: CrosstermBackend::new(WrapFence {
+                file: log.clone(),
+                state: Arc::clone(&tty.state),
+            }),
+            caret: Arc::clone(&caret),
+        };
+        let (cols, top, block_h) = (40, 2, 4);
+        let term = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, top, cols, block_h)),
+            },
+        )
+        .unwrap();
+        let region = newt_core::tty::Terminal::lease_region(
+            block_region(top, block_h),
+            newt_core::tty::OnCollision::Refuse,
+        )
+        .expect("the test owns these rows");
+        let mut screen = Screen {
+            tty,
+            term,
+            caret,
+            caret_frame: None,
+            can_query_cursor: true,
+            cols,
+            rows: 10,
+            top,
+            block_h,
+            status_rows: 1,
+            status: b"working".to_vec(),
+            queued: 0,
+            region,
+            painted_widths: Vec::new(),
+        };
+        let editor = MountedEditor::new(crate::rich_input::Edit::Emacs, None, Vec::new(), "hi");
+        let chrome = crate::rich_input::Chrome {
+            model: "m",
+            endpoint: "e",
+            gauge: None,
+            session: "s",
+            headline: "",
+            modal: None,
+            background_jobs: &[],
+            tabs: &[],
+            tools: "",
+        };
+        screen.draw(&editor, chrome, false).unwrap();
+
+        let log = log.0.lock().unwrap();
+        let writes: Vec<&Vec<u8>> = log.iter().flatten().collect();
+        let frames: Vec<&&Vec<u8>> = writes
+            .iter()
+            .filter(|w| w.starts_with(SYNC_BEGIN))
+            .collect();
+        assert_eq!(frames.len(), 1, "exactly one synchronized frame: {log:?}");
+        let frame = frames[0];
+        assert!(
+            frame.ends_with(SYNC_END),
+            "the frame closes itself: {frame:?}"
+        );
+        let body = &frame[..frame.len() - SYNC_END.len()];
+        let text = String::from_utf8_lossy(body);
+        assert!(
+            text.contains("working"),
+            "status row in the frame: {text:?}"
+        );
+        assert!(text.contains("hi"), "viewport cells in the frame: {text:?}");
+        assert!(
+            text.contains("\x1b[?25l"),
+            "status hides the cursor inside the frame: {text:?}"
+        );
+        // The caret sits after "❯ hi" on the viewport's first row (1-based
+        // row 4, column 5): shown, then placed, last before SYNC_END.
+        assert!(
+            body.ends_with(b"\x1b[?25h\x1b[4;5H"),
+            "show cursor and caret position close the frame: {text:?}"
+        );
+        let first = log.iter().position(|e| e.is_some()).unwrap();
+        assert!(
+            log[first].as_ref().unwrap().starts_with(SYNC_BEGIN),
+            "nothing reaches the terminal before the frame: {log:?}"
+        );
+        // Everything after the frame is the single autowrap restore + flush.
+        let end = log
+            .iter()
+            .position(|e| e.as_ref().is_some_and(|w| w.ends_with(SYNC_END)))
+            .unwrap();
+        assert!(
+            log[end + 1..]
+                .iter()
+                .flatten()
+                .all(|w| w.as_slice() == WRAP_ON),
+            "only the autowrap restore follows the frame: {log:?}"
+        );
+    }
+
     #[test]
     fn a_held_fence_keeps_wrap_off_across_flushes_until_released() {
         let mut fence = WrapFence::new(Vec::new());
@@ -2014,90 +2797,44 @@ mod tests {
         assert_eq!(reflow_growth(&[47], 47), 0, "an exact fit does not wrap");
     }
 
-    /// #2573 review: a live panel's resize erases only rows the panel could
-    /// still occupy. The regression: clearing from row 0 wiped the transcript.
+    /// #3014 item 2 (maintainer decision, reversing #2441/#2632 for grows): a herdr pane
+    /// grew from 30 to 63 rows with the block at top 27, height 3. The block is pinned to
+    /// the new bottom row, `63 - 3 = 60`, not left under the content.
     #[test]
-    fn a_panel_resize_erases_only_what_the_old_panel_could_occupy() {
-        // Same height, wider: only the panel's own rows (13..).
-        assert_eq!(panel_erase_from(13, 18, 100, 118, 31, 18), 13);
-        // Taller terminal: the old panel at 13.. is stale; nothing above it.
-        assert_eq!(panel_erase_from(13, 18, 100, 100, 45, 18), 13);
-        // Shorter: the new panel starts higher, so erase from its top.
-        assert_eq!(panel_erase_from(13, 18, 100, 100, 25, 18), 7);
-        // Narrower: each full-width old row reflows onto two, lifting the
-        // stale panel by its height — never past the top of the screen.
-        assert_eq!(panel_erase_from(20, 8, 100, 60, 31, 8), 12);
-        assert_eq!(panel_erase_from(13, 18, 100, 60, 31, 18), 0);
-        // Never row 0 unless the reflow truly reaches it.
-        assert!(panel_erase_from(20, 8, 100, 118, 31, 8) > 0);
-    }
-
-    /// #2441: a herdr pane grew from 30 to 63 rows with the block at top 27,
-    /// height 3. Before this fix the block jumped to `63 - 3 = 60`, opening a
-    /// 30-row blank canyon between the untouched transcript and the block —
-    /// exactly the "rows 27-60 blank" gap the evidence files captured. It
-    /// must stay put, directly under the existing content, instead.
-    #[test]
-    fn growing_the_terminal_keeps_the_block_under_existing_content_2441() {
-        assert_eq!(resize_new_top(27, 63, 3), 27);
+    fn growing_the_terminal_pins_the_block_to_the_new_bottom_3014() {
+        assert_eq!(resize_new_top(27, 30, 63, 3), 60);
+        // Pinned already: a second grow moves it again, and a same-size notice does not.
+        assert_eq!(resize_new_top(60, 63, 90, 3), 87);
+        assert_eq!(resize_new_top(60, 63, 63, 3), 60);
     }
 
     #[test]
     fn a_shrinking_terminal_still_bottom_anchors_the_block() {
-        assert_eq!(resize_new_top(20, 10, 3), 7);
-    }
-
-    /// #2632 review finding 2: the old fallback test claimed to cover growth
-    /// but actually shrank (28 < 30 rows). Use a real grow that still doesn't
-    /// fit: old top 27 + height 5 would land on row 32, past the new 31-row
-    /// screen, so it must bottom-anchor instead of hanging off-screen.
-    #[test]
-    fn growth_too_small_for_the_block_to_fit_falls_back_to_the_bottom() {
-        assert_eq!(resize_new_top(27, 31, 5), 26);
+        assert_eq!(resize_new_top(20, 24, 10, 3), 7);
     }
 
     #[test]
-    fn equal_rows_keeps_the_existing_bottom_anchor_behavior() {
-        assert_eq!(resize_new_top(20, 24, 4), 20);
+    fn a_grow_by_one_row_pins_the_block_too_3014() {
+        assert_eq!(resize_new_top(27, 30, 31, 5), 26);
     }
 
-    /// #2632 review finding 1: a same-size notification (no rows added or
-    /// removed at all) used to fall through to the bottom-anchor branch and
-    /// silently move a block that was never bottom-anchored to begin with —
-    /// recreating the exact #2441 gap with no terminal movement. Repeated
-    /// same-size resizes, and repeated grows, must both keep the block at the
-    /// one position the content actually ends.
+    /// #2632 review finding 1, kept: a same-size notification (no rows added or removed)
+    /// must not move a block, so it cannot recreate a gap with no terminal movement.
     #[test]
-    fn repeated_same_size_resizes_do_not_recreate_the_gap_2632() {
-        // 30 -> 63 (grow, matches #2441) -> 63 (no-op notification).
-        let top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        let top = resize_new_top(top, 63, 3);
+    fn repeated_same_size_resizes_do_not_move_the_block_2632() {
+        assert_eq!(resize_new_top(20, 24, 24, 4), 20);
         assert_eq!(
-            top, 27,
-            "a same-size resize must not move a block that already fits"
+            resize_new_top(15, 24, 24, 4),
+            15,
+            "off the bottom, still fits"
         );
     }
 
-    #[test]
-    fn repeated_grows_keep_the_block_under_the_content_2632() {
-        let mut top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        top = resize_new_top(top, 90, 3);
-        assert_eq!(top, 27);
-    }
-
-    /// #2632 review finding 1: a height-only shrink that still leaves the
-    /// block room must not move it down to a new bottom anchor — the block
-    /// at its old, non-bottom position still fits, so it stays.
+    /// #2632 review finding 1, kept: a height-only shrink that still leaves the block room
+    /// must not re-anchor it.
     #[test]
     fn a_partial_shrink_that_still_fits_keeps_the_old_position_2632() {
-        // Grown to 63 with the block at 27 (matches #2441), then shrunk to
-        // 40: 27 + 3 = 30 <= 40, so the block still fits at 27.
-        let top = resize_new_top(27, 63, 3);
-        assert_eq!(top, 27);
-        let top = resize_new_top(top, 40, 3);
-        assert_eq!(top, 27, "old position still fits; must not re-anchor to 37");
+        assert_eq!(resize_new_top(27, 63, 40, 3), 27);
     }
 
     #[test]
@@ -2161,7 +2898,8 @@ pub(crate) use terminal_acceptance::cockpit_psyche_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
-    cockpit_clarification_input_case, cockpit_panel_loop_case, panel_live_resize_case,
+    cockpit_clarification_input_case, cockpit_panel_gap_case, cockpit_panel_loop_case,
+    cockpit_panel_reopen_case, cockpit_resize_anchor_case, panel_live_resize_case,
     panel_resize_case,
 };
 

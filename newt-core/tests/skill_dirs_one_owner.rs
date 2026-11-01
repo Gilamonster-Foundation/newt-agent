@@ -48,30 +48,24 @@ const CONSUMERS: &[(&str, usize, usize, &str)] = &[
         "`newt skills` list, install and share; the install default",
     ),
     (
-        "newt-core/src/agentic/tools.rs",
-        1,
-        1,
-        "the `use_skill` loader",
-    ),
-    (
         "newt-core/src/config/skills.rs",
-        0,
-        1,
-        "the owner (search path falls back to the install dir)",
-    ),
-    (
-        "newt-tui/src/chat.rs",
-        0,
         2,
-        "persona skill-binding warnings at start and on /persona",
+        3,
+        "the owner: the search path, and the on-skills list and `load_skill_body` that \
+         `use_skill`, postures and persona bindings all read (`[skills] off`)",
     ),
     (
         "newt-tui/src/lib.rs",
+        2,
         3,
-        3,
-        "prompt index, persona binding check, /posture skills, default-skill seeding",
+        "prompt index (minus off skills), persona binding check, default-skill seeding",
     ),
-    ("newt-tui/src/settings_form.rs", 1, 1, "/settings posture"),
+    (
+        "newt-tui/src/skills_form.rs",
+        2,
+        2,
+        "`/settings skills` listing and the unknown-skill check",
+    ),
 ];
 
 fn count(code: &str, needles: &[&str]) -> usize {

@@ -6,7 +6,8 @@
 //! request and cannot drift from it. Assemblers may [`ReportSink::annotate`]
 //! the pieces they join into a system message (label + source); the report
 //! locates each piece in the sent text and reports every remaining byte as an
-//! explicit `(unattributed)` component, so the component sizes always sum to
+//! explicit component (`(separator)` for a bare join, `(unattributed)` for
+//! text nobody labelled), so the component sizes always sum to
 //! the exact message length.
 //!
 //! Sizes are characters. Token counts are not shown: the backend reports
@@ -57,9 +58,14 @@ pub struct RequestReport {
     /// True when the provider sent no tools field at all (distinct from an
     /// empty `[]` array).
     pub tools_omitted: bool,
+    /// `Some(what is missing)` marks a #2959 preview: not a request that was
+    /// sent, so the renderer never says "as sent" and totals read partial.
+    pub partial: Option<String>,
 }
 
 const UNATTRIBUTED: &str = "(unattributed)";
+/// Whitespace between two labelled pieces: the join, not unlabelled text.
+const SEPARATOR: &str = "(separator)";
 
 fn chars(s: &str) -> usize {
     s.chars().count()
@@ -82,26 +88,27 @@ fn components_of(text: &str, notes: &[Annotation]) -> Vec<Component> {
             chars: chars(piece),
         });
     };
+    // A gap of only whitespace is the join between two pieces; anything else
+    // is text nobody labelled.
+    let gap = |push: &mut dyn FnMut(&str, &str, &str), piece: &str| {
+        if !piece.is_empty() && piece.trim().is_empty() {
+            push(SEPARATOR, "joins between components", piece);
+        } else {
+            push(UNATTRIBUTED, "unlabelled text", piece);
+        }
+    };
     for (at, len, note) in found {
         if at < cursor {
             continue; // overlaps a piece already placed
         }
         if at > cursor {
-            push(
-                UNATTRIBUTED,
-                "separators and unlabelled text",
-                &text[cursor..at],
-            );
+            gap(&mut push, &text[cursor..at]);
         }
         push(&note.label, &note.source, &text[at..at + len]);
         cursor = at + len;
     }
     if cursor < text.len() || text.is_empty() {
-        push(
-            UNATTRIBUTED,
-            "separators and unlabelled text",
-            &text[cursor..],
-        );
+        gap(&mut push, &text[cursor..]);
     }
     out
 }
@@ -119,7 +126,7 @@ impl RequestReport {
         notes: &[Annotation],
     ) -> Self {
         let card = Annotation {
-            label: "active-prompt card".into(),
+            label: "card".into(),
             source: "agentic::prompt_read::active_prompt_card".into(),
             text: String::new(),
         };
@@ -161,6 +168,7 @@ impl RequestReport {
             tools: tool_sizes,
             tools_array_chars,
             tools_omitted,
+            partial: None,
         }
     }
 
@@ -179,7 +187,15 @@ impl RequestReport {
     }
 
     pub fn to_markdown(&self) -> String {
-        let mut out = String::from("# Request prompt report\n\nSizes are characters (the backend reports tokens only after a request).\n");
+        let mut out = match &self.partial {
+            Some(omitted) => format!("# Request prompt report (preview, partial)\n\nNo request is dispatched. Sizes are characters. Not included: {omitted}\n"),
+            None => String::from("# Request prompt report\n\nSizes are characters (the backend reports tokens only after a request).\n"),
+        };
+        let sent = if self.partial.is_some() {
+            "previewed"
+        } else {
+            "as sent"
+        };
         for (i, m) in self.system.iter().enumerate() {
             out.push_str(&format!(
                 "\n## System message {} ({} chars)\n\n| component | source | chars |\n|---|---|---:|\n",
@@ -194,7 +210,7 @@ impl RequestReport {
             out.push_str("\n## Tools (omitted by provider — no tools field sent)\n\n");
         } else {
             out.push_str(&format!(
-                "\n## Tools ({} tools, {} chars as sent)\n\n| tool | chars |\n|---|---:|\n",
+                "\n## Tools ({} tools, {} chars {sent})\n\n| tool | chars |\n|---|---:|\n",
                 self.tools.len(),
                 self.tools_array_chars
             ));
@@ -205,7 +221,12 @@ impl RequestReport {
             }
         }
         out.push_str(&format!(
-            "\nTotal: system {} + tools {} = {} chars\n",
+            "\nTotal{}: system {} + tools {} = {} chars\n",
+            if self.partial.is_some() {
+                " (partial)"
+            } else {
+                ""
+            },
             self.system_chars(),
             self.tools_array_chars,
             self.system_chars() + self.tools_array_chars
@@ -219,7 +240,7 @@ impl RequestReport {
         }
         // Full schemas as dispatched — the central inspection requirement.
         if !self.tools.is_empty() {
-            out.push_str("\n## Tool schemas (as sent)\n");
+            out.push_str(&format!("\n## Tool schemas ({sent})\n"));
             for t in &self.tools {
                 out.push_str(&format!(
                     "\n### {}\n\n```json\n{}\n```\n",
@@ -314,6 +335,26 @@ impl ReportSink {
             source: source.into(),
             text: text.into(),
         });
+    }
+
+    /// Like [`annotate`](Self::annotate), but one label may carry several spans:
+    /// an earlier note is replaced only when BOTH its label and its source match.
+    /// For pieces that share a component id yet come from different sources (the two
+    /// API providers, #2933), so none of them is attributed away.
+    pub fn annotate_span(&self, label: &str, source: &str, text: &str) {
+        let mut s = self.s();
+        s.notes.retain(|n| n.label != label || n.source != source);
+        s.notes.push(Annotation {
+            label: label.into(),
+            source: source.into(),
+            text: text.into(),
+        });
+    }
+
+    /// Drop the annotation labelled `label`, for a caller that reports the same
+    /// text under finer labels (the soul's components, #2933).
+    pub fn forget(&self, label: &str) {
+        self.s().notes.retain(|n| n.label != label);
     }
 
     /// Arm: print the report just before the next request is sent.
@@ -431,17 +472,48 @@ mod tests {
             .iter()
             .map(|c| c.label.as_str())
             .collect();
-        assert_eq!(
-            labels,
-            ["identity", UNATTRIBUTED, "workspace", UNATTRIBUTED]
-        );
-        assert_eq!(r.system[1].components[0].label, "active-prompt card");
+        assert_eq!(labels, ["identity", SEPARATOR, "workspace", UNATTRIBUTED]);
+        assert_eq!(r.system[1].components[0].label, "card");
         let tool_sum: usize = r.tools.iter().map(|t| t.chars).sum();
         assert_eq!(r.tools_array_chars, tool_sum + r.tools.len() + 1);
         assert_eq!(r.tools[1].name, "bb");
         assert!(r.to_markdown().contains("| bb |"));
         // #2937: full schema must appear in the markdown output
         assert!(r.to_markdown().contains("\"name\": \"bb\""));
+    }
+
+    /// #2933: a bare `\n\n` between two labelled pieces is the join, named as
+    /// such; only text nobody labelled is `(unattributed)`.
+    #[test]
+    fn forgetting_a_label_removes_only_that_note() {
+        let sink = ReportSink::new();
+        sink.annotate("a", "s", "one");
+        sink.annotate("b", "s", "two");
+        sink.forget("a");
+        sink.forget("missing");
+        let labels: Vec<String> = sink.snapshot_notes().into_iter().map(|n| n.label).collect();
+        assert_eq!(labels, ["b"]);
+    }
+
+    #[test]
+    fn a_bare_join_is_a_separator_and_stray_text_is_not() {
+        let text = "one\n\ntwo\n\nstray\n\nthree";
+        let notes = [
+            note("one", "one"),
+            note("two", "two"),
+            note("three", "three"),
+        ];
+        let m = RequestReport::build_from_parts(&[text], None, &notes)
+            .system
+            .remove(0);
+        let labels: Vec<&str> = m.components.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["one", SEPARATOR, "two", UNATTRIBUTED, "three"],
+            "{:?}",
+            m.components
+        );
+        assert_eq!(m.components[3].chars, "\n\nstray\n\n".len());
     }
 
     #[test]

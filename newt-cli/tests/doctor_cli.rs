@@ -365,7 +365,7 @@ url = "http://127.0.0.1:1/mcp"
         .assert()
         .success()
         .stdout(predicate::str::contains("self [stdio] — OK"))
-        .stdout(predicate::str::contains("code_read"))
+        .stdout(predicate::str::contains("read_file"))
         .stdout(predicate::str::contains("dead [stdio] — ERROR:"))
         .stdout(predicate::str::contains(
             "remote [http] — http://127.0.0.1:1/mcp (configured (no credential) — \

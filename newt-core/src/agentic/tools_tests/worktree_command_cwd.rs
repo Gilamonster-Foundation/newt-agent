@@ -364,19 +364,22 @@ async fn bound_task_error_rendering(tool: &str) {
     let missing = policy.worktree.join("missing");
     let task_text = dunce::simplified(&policy.worktree).display().to_string();
     let missing_text = dunce::simplified(&missing).display().to_string();
+    let missing_file = dunce::simplified(&policy.worktree.join("missing.txt"))
+        .display()
+        .to_string();
     for (name, args, phrases) in [
         (
             "run_command",
             serde_json::json!({"command":"echo should-not-run", "cwd":missing}),
             vec![
                 ("working directory", missing_text),
-                ("default working directory remains", task_text.clone()),
+                ("default working directory remains", task_text),
             ],
         ),
         (
             "read_file",
             serde_json::json!({"path":"missing.txt"}),
-            vec![("resolved against", task_text)],
+            vec![("resolved to", missing_file)],
         ),
     ] {
         if name != tool {

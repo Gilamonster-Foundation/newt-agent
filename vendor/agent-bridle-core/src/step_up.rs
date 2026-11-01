@@ -1819,11 +1819,7 @@ mod tests {
         let sig: Signature = key.sign(&signed);
         Discharge {
             presence,
-            credential_id: key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec(),
+            credential_id: key.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
             challenge: *challenge.as_bytes(),
             signature: sig.to_der().as_bytes().to_vec(),
             authenticator_data: Some(auth_data),
@@ -1904,12 +1900,46 @@ mod tests {
         let other = p256::ecdsa::SigningKey::from_slice(&[0x43u8; 32]).unwrap();
         d.credential_id = other
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         assert!(WebAuthnEs256Verifier
             .verify(
                 &d,
+                &AttestRequirement::presence(Presence::Passkey),
+                &challenge
+            )
+            .is_err());
+    }
+
+    /// Known-answer pin (RUSTSEC-2026-0387 p256 0.13 -> 0.14 port): a fixed key's
+    /// SEC1 public point and RFC6979 DER signature are checked against constants,
+    /// so a crypto-stack upgrade that changed either encoding or verification
+    /// fails here, not only in a sign-then-verify round trip.
+    #[cfg(feature = "verifier-webauthn-es256")]
+    #[test]
+    fn webauthn_es256_known_answer_vector() {
+        const PUBKEY: &str = "043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d";
+        const SIG_DER: &str = "304502206cf073286cdee90137216d64e92bd4af3d8f43e8faa7cb0989c01e5a0f4a78960221009318fa5db50c25105c08e5974127d186257a198663411bb02ed9ef883746ea06";
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let challenge = es256_challenge(9);
+        let d = webauthn_es256_discharge(&es256_key(), &challenge, Presence::Passkey, 0x05);
+        assert_eq!(hex(&d.credential_id), PUBKEY);
+        assert_eq!(hex(&d.signature), SIG_DER);
+        assert!(WebAuthnEs256Verifier
+            .verify(
+                &d,
+                &AttestRequirement::presence(Presence::Passkey),
+                &challenge
+            )
+            .is_ok());
+        // Flipping one signature bit must be rejected.
+        let mut bad = d.clone();
+        let n = bad.signature.len() - 1;
+        bad.signature[n] ^= 1;
+        assert!(WebAuthnEs256Verifier
+            .verify(
+                &bad,
                 &AttestRequirement::presence(Presence::Passkey),
                 &challenge
             )

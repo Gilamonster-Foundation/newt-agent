@@ -264,7 +264,7 @@ fn startup_run_code_paths(tty: &TestTty, dir: &std::path::Path) {
         let old = concat!(
             "[[providers]]\nname = \"fixture\"\n",
             "command = \"unused-provider-fixture\"\n",
-            "model = \"fixture\"\ntiers = [\"complex\"]\n",
+            "model = \"fixture\"\ntiers = [\"COMPLEX\"]\n",
             "[tenacity]\ndefault = \"standard\"\n",
         );
         std::fs::write(&path, old).unwrap();

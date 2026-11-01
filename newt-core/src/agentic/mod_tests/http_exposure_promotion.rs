@@ -986,3 +986,57 @@ async fn anthropic_read_only_nudges_never_name_write_tools() {
     let _env = crate::agentic::anthropic_loop_tests::test_env(false);
     read_only_nudges_never_name_write_tools(Wire::Anthropic).await;
 }
+
+/// #2959: the tools `/context request` previews are the tools the wire loop
+/// sends. Both come from `tool_set::derive_tool_set`, so a narrowed allow list
+/// (`/settings tools`, #2932) and `read_only` must shape them identically on
+/// every wire.
+async fn the_preview_tool_set_is_what_the_wire_loop_sends(wire: Wire) {
+    let narrowed = crate::agentic::tools::ExposureSettings {
+        allow_list: Some(vec!["read_file".into(), "run_command".into()]),
+        ..Default::default()
+    };
+    let read_only = crate::agentic::tools::ExposureSettings {
+        read_only: true,
+        ..Default::default()
+    };
+    for exposure in [narrowed, read_only] {
+        let (server, requests) = scripted(wire, vec![]).await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = ctx(&uri, &messages, &caveats);
+        context.action_nudges = false;
+        context.exposure = exposure.clone();
+        let preview =
+            crate::agentic::tool_set::exposed_tool_set(&crate::agentic::tool_set::ToolSetInputs {
+                mcp: &NoMcp,
+                advertise: Default::default(),
+                command_budget: context.command_budget,
+                shell_dialect: context.shell_dialect,
+                persona_tools: None,
+                smart_harness: None,
+                disposition: context.prompt_disposition,
+                exposure: &exposure,
+                exposure_budget_tokens: None,
+                estimation: context.estimation,
+                openai_compatible: matches!(wire, Wire::ChatCompletions | Wire::Responses),
+            });
+        let previewed: Vec<String> = preview
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(String::from))
+            .collect();
+        wire.run(context, &mut NoMcp).await;
+        let sent = wire.tool_names(&requests.lock().unwrap()[0]);
+        assert!(!sent.is_empty(), "{wire:?}: the request carried tools");
+        assert_eq!(previewed, sent, "{wire:?}: {exposure:?}");
+    }
+}
+
+per_wire!(the_preview_tool_set_is_what_the_wire_loop_sends:
+    the_preview_tool_set_matches_the_ollama_request,
+    the_preview_tool_set_matches_the_chat_completions_request,
+    the_preview_tool_set_matches_the_responses_request,
+    the_preview_tool_set_matches_the_anthropic_request);

@@ -53,6 +53,7 @@ on:
       - "newt-tui/src/rich_input_pty_test.rs"
       - "newt-cli/tests/terminal_exit_pty.rs"
       - "newt-tui/src/transcript_pager.rs"
+      - "newt-tui/src/fold_list.rs"
       - "newt-tui/src/transcript_pager_pty_test.rs"
       - "newt-tui/src/permissions.rs"
       - "newt-tui/src/native_permission_test.rs"
@@ -72,6 +73,10 @@ on:
       - "newt-tui/src/live_spill.rs"
       - "newt-tui/src/live_spill_tests.rs"
       - "newt-tui/src/live_spill_pty_tests.rs"
+      # lib.rs holds run_code, which refuses an invalid config before the
+      # cockpit draws; #2990 changed it and broke the cockpit PTY fixtures
+      # without firing this tier (fixed by #2998).
+      - "newt-tui/src/lib.rs"
       # chat.rs is also reached by these tests but is deliberately left out: it
       # would fire this tier on nearly every PR (see the scoped-gate note above).
       # PR #2816: this existing macOS job also proves confined basename exec.
@@ -81,6 +86,10 @@ on:
       - "newt-core/tests/macos_exec_basenames.rs"
       - "newt-tui/src/session_capability.rs"
       - "newt-core/src/tty/**"
+      # #3025: host-shell children start in their own session; the controlling-
+      # terminal regression below only runs here.
+      - "newt-core/src/agentic/tools/shell.rs"
+      - "newt-core/src/agentic/tools_tests/host_timeout_tree_tests.rs"
       - "newt-core/src/agentic/permissions.rs"
       - "tests/pty/**"
       - ".github/workflows/newt-tui-pty.yml"
@@ -133,7 +142,7 @@ jobs:
 
       - name: Run transcript pager real-PTY tests
         run: |
-          cargo test -p newt-tui --features rich-tui transcript_pager_pty_test \
+          cargo test -p newt-tui --features rich-tui,live-spill transcript_pager_pty_test \
             -- --ignored --test-threads=1
 
       # The panel driver on a real terminal with no cockpit (`panel::drive(..,
@@ -181,6 +190,18 @@ jobs:
       - name: Run cockpit terminal-ownership acceptance
         run: |
           cargo test -p newt-tui --features rich-tui,live-spill cockpit:: \
+            -- --include-ignored --test-threads=1
+
+      # #3005/#3024: the host-shell child must start in its own session or an
+      # interactive `--ambient` login shell is stopped by SIGTTIN under a
+      # controlling terminal. The parent test is `#[ignore]`d (real pty + login
+      # shell), so ci.yml's workspace run skips it; `--include-ignored` also runs
+      # the real process-group timeout proof (#2882) in the same module.
+      # HOOK PARITY: CI-only real-PTY proof; .githooks/pre-push runs the mocked
+      # supervisor tests of this module.
+      - name: Run host-shell session isolation real-PTY tests
+        run: |
+          cargo test -p newt-core --lib host_timeout_tree_tests \
             -- --include-ignored --test-threads=1
 
   # macOS leg. The terminal code here is POSIX, not Linux: termios restoration,
@@ -251,5 +272,5 @@ jobs:
 
       - name: Run transcript pager real-PTY tests
         run: |
-          cargo test -p newt-tui --features rich-tui transcript_pager_pty_test \
+          cargo test -p newt-tui --features rich-tui,live-spill transcript_pager_pty_test \
             -- --ignored --test-threads=1

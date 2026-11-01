@@ -174,7 +174,18 @@ impl SpillCid {
     pub fn as_content_id(&self) -> &ContentId {
         &self.0
     }
+    /// The last [`SPILL_TAIL_CHARS`] of the handle: short enough to type, and the
+    /// part that varies (the leading characters are the constant CID prefix).
+    pub fn tail(&self) -> String {
+        let handle = self.0.to_string();
+        handle[handle.len() - SPILL_TAIL_CHARS..].to_string()
+    }
 }
+
+/// Characters of a [`SpillCid`] shown to the operator by [`SpillCid::tail`].
+pub const SPILL_TAIL_CHARS: usize = 8;
+/// Shortest handle suffix an operator may type to name a spill.
+pub const MIN_SPILL_TAIL_CHARS: usize = 6;
 
 impl std::fmt::Display for SpillCid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -218,6 +229,18 @@ impl StagedSpill {
     pub fn redacted_chars(&self) -> usize {
         self.redacted_chars
     }
+}
+
+/// The handle for a completed tool result a host retains for its own viewer:
+/// minted through the one record/CID path, under the host's session nonce, so
+/// the same bytes in one session always name the same spill.
+pub fn session_output_cid(nonce: [u8; 16], text: &str) -> Result<SpillCid, ContentError> {
+    let record = SpillRecordV1::new(
+        SpillScope::Session(nonce),
+        SpillProvenance::ToolOutput { tool_name: None },
+        text.to_string(),
+    );
+    Ok(*StagedSpill::from_record(record)?.cid())
 }
 
 /// A committed spill: the CID now resolves in the store.

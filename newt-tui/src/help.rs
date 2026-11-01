@@ -121,6 +121,13 @@ The text form works everywhere; bare /settings uses it outside a rich terminal:
   /settings thinking fold
   /settings rounds 40
   /settings workspaces       interactive operator editor for next-launch access
+  /settings tools pi         show the model only read_file, write_file, edit_file, run_command
+  /settings tools a,b,c      an explicit allow list; `all` releases it (bare: checklist on a rich TTY)
+  /settings read-only on     hide the write tools and clamp fs_write with them; the footer shows [tools: …]
+  /settings skills           list skills with their context cost; `off <name>` / `on <name>` switch one (use_skill refuses an off skill)
+  /settings system-prompt components   list the soul's rules: id, on/off, size (bare: checklist on a rich TTY)
+  /settings system-prompt off habit-ground-truth   drop one rule from the prompt (on <id> restores; preset default resets)
+                             presentation only: it changes what the model is told, never what it may do
 
 /model, /backends, /permissions, and /workspace remain direct shortcuts."
         }
@@ -201,7 +208,7 @@ optional field. Same form as `newt crew --edit`.
   /settings thinking fold      (default) the first `/spill N` rows of
                                reasoning, then one line saying how long it
                                thought and what is behind the fold, reopenable
-                               with the `/spill open <id>` it names
+                               with the `/spill open` it names
   /settings thinking stream    every line, unbounded — the historical trickle
   /settings thinking off       just the answer
 
@@ -517,6 +524,8 @@ Use /help for the in-session command list."
   /mcp disable <name>          durable: write enabled=false to config + drop now
   /mcp enable <name>           durable: write enabled=true; choose Reconnect in MCP
   /mcp auth <name>             how to (re)authenticate (`newt auth <name>`)
+  /mcp login-all               sign in to every server that needs a login, in
+                               turn (`newt auth --all`); Ctrl-C stops the run
 
 The same manager is under /settings → MCP. Enter opens server → tools → details;
 Up/Down navigates, Esc returns one level. Login reconnects after successful
@@ -585,7 +594,7 @@ The model and noninteractive surfaces cannot approve changes in this editor."
         }
         "spill" => {
             "\
-/spill [status|N|reset|summary|excerpt|last|open ID] — tool-output controls
+/spill [status|N|reset|summary|excerpt|last|open [ID]] — tool-output controls
 
   /spill                 show the effective row count and live availability
   /spill <N>             set collapsed live and completed rows for later tools
@@ -593,8 +602,9 @@ The model and noninteractive surfaces cannot approve changes in this editor."
   /spill 0               disable live display; show completed output unbounded
   /spill summary         collapse spilled results to one line (rich default)
   /spill excerpt         restore the multi-row excerpt for spilled results
-  /spill last            open the newest retained result (rich, this session)
-  /spill open <ID>       open the retained result named by a collapse marker
+  /spill open            open the newest retained result (rich, this session)
+  /spill open <ID>       open another by its marker id (≥6 trailing chars; Tab lists them)
+  /spill last            same as a bare /spill open
   F4 (cockpit)           choose retained output without submitting a prompt
   F4 (decision prompt)   inspect the pending request; Esc returns without answering
 
@@ -822,6 +832,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
         "  /context compaction [headroom_aware|message_count|reset] - set this session's automatic-compaction trigger policy",
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
+        "  /context request         - preview the next request's system messages and tools; sends nothing",
         "  /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /discuss [text]          - talk through a pending clarification batch instead of answering it (alias: /chat); \
@@ -864,14 +875,16 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /ocap propose save       - also write them, unsigned, to approve.toml (existing entries kept)",
         "  /workspace               - review and save workspace access for the next process launch",
         "  /settings workspaces     - open the same operator workspace editor",
+        "  /settings tools [all|pi|none|a,b,c] - which tools the model sees; bare opens the checklist on a rich TTY",
+        "  /settings read-only [on|off] - hide write_file/edit_file/delete_file and clamp fs_write with them",
         "  /status                  - session and environment summary (the default view)",
         "  /status <topic>          - config · version · workspace · loadout · byline · memory · models · info",
         "  /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers",
         "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /psyche                  - effort dial panel: cognition, tenacity, initiative, persona (Esc exits; /psyche obsessive = max)",
-        "  /mcp [on|off|enable|disable|auth] [name] - MCP manager; session mute (on/off) or durable config (enable/disable)",
-        "  /spill [status|N|reset|summary|excerpt|last|open ID] - tool output",
+        "  /mcp [on|off|enable|disable|auth|login-all] [name] - MCP manager; session mute (on/off), durable config (enable/disable), or sign in to every server (login-all)",
+        "  /spill [status|N|reset|summary|excerpt|last|open [ID]] - tool output",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
         "  /vi  /emacs  /nano       - switch line-editor key bindings for this session",

@@ -27,9 +27,10 @@ pub use backend::{
     RequestMeter, RequestMode, Serving,
 };
 pub use context::{
-    compaction_trigger_is_session_pinned, input_percentage_ceiling, normalize_input_ceiling_pct,
-    session_compaction_trigger_policy, CompactionTriggerPolicy, ContextConfig, ContextFeature,
-    ContextFeatureSet, ContextFeatures, ContextManager,
+    compaction_trigger_is_session_pinned, context_index_enabled, input_percentage_ceiling,
+    normalize_input_ceiling_pct, session_compaction_trigger_policy, CompactionTriggerPolicy,
+    ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextIndex,
+    ContextManager, CONTEXT_INDEX_ENV,
 };
 pub use crew::{Crew, CrewBudgets, CrewPolicyConfig};
 pub use dropin::*;
@@ -52,12 +53,13 @@ pub use profile::{
     BundleConfig, PickVia, ProfileConfig, ProfilePick, RetryKnobs, VerifyGateKnobs,
     KNOWN_TECHNIQUES,
 };
+pub use prompt::{ComponentDeltas, PromptConfig, SystemPromptOverride, SYSTEM_PROMPT_FILE_ENV};
 pub use semantic::{OnEmbedFailure, SemanticConfig};
 pub use skills::SkillsConfig;
 pub(crate) use smart_harness::{normalize_path, resolve_uncreated_path, validate_stable_anchor};
 pub use smart_harness::{HarnessLaunch, SmartHarnessConfig};
 pub use summarizer::SummarizerConfig;
-pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
+pub use tool_exposure::{ExposureProfile, ToolExposureConfig, PI_PRESET_TOOLS};
 pub use tools::ToolsConfig;
 mod command_budget;
 pub use command_budget::RunCommandBudget;
@@ -73,7 +75,9 @@ mod memory;
 mod permissions;
 mod presentation;
 mod profile;
+mod prompt;
 mod redact;
+mod self_edit;
 mod semantic;
 mod shell;
 mod skills;
@@ -89,6 +93,7 @@ use context::default_input_ceiling_pct;
 use layering::{array_merge_strategy, base_is_ambient_newt_toml, mark_project_mcp_untrusted};
 use presentation::{default_spill_lines, default_time_marker_secs, default_tool_output_lines};
 use redact::{redact_arg_secrets, redact_url_secrets};
+pub use self_edit::{backup_path, ConfigEdit};
 pub use shell::{
     confined_default_engine, full_access_default_engine, mcp_stdio_env_passthrough,
     ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
@@ -240,6 +245,11 @@ pub struct Config {
     /// authorized catalog). See [`ToolExposureConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_exposure: Option<ToolExposureConfig>,
+
+    /// `[prompt]` — `file` replaces the assembled system prompt entirely
+    /// (#2938). `None` → newt assembles its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<PromptConfig>,
 
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1381,6 +1391,7 @@ impl Default for Config {
             tools: None,
             initiative: None,
             tool_exposure: None,
+            prompt: None,
             pricing: None,
             memory: None,
             agents: AgentsConfig::default(),
@@ -1653,12 +1664,14 @@ impl Config {
         let mut assembly =
             BackendAssembly::new(std::mem::take(&mut cfg.backends)).map_err(NewtError::Config)?;
         validate_provider_names(&cfg.providers).map_err(NewtError::Config)?;
+        cfg.prompt_components().map_err(NewtError::Config)?;
         if let Some(dir) = Self::user_config_dir() {
             assembly
                 .merge_dir(&dir.join("backends"))
                 .map_err(NewtError::Config)?;
         }
         report_ignored_project_endpoint_dropins(report);
+        report_retired_soul(&cfg, report);
         // A successfully merged operator drop-in is operator-supplied
         // configuration — the resolved backend list is no longer the bare
         // compiled-in fallback (see `is_unconfigured`).
@@ -1748,6 +1761,7 @@ impl Config {
         let mut assembly =
             BackendAssembly::new(std::mem::take(&mut self.backends)).map_err(NewtError::Config)?;
         validate_provider_names(&self.providers).map_err(NewtError::Config)?;
+        self.prompt_components().map_err(NewtError::Config)?;
         let default_backend = self.default_backend.clone();
         let over = cli_backend_override();
         let requested_slot = assembly
@@ -2201,6 +2215,151 @@ impl Config {
         Ok(doc.to_string())
     }
 
+    /// Set `[tool_exposure] allow_list` (#2932) — `None` removes the key, so
+    /// the model sees the whole catalog again — preserving the rest of the
+    /// document exactly as [`with_tui_key`](Self::with_tui_key) does. PURE:
+    /// the caller owns the filesystem write.
+    pub fn with_tool_exposure_allow_list(
+        text: &str,
+        allow_list: Option<&[&str]>,
+    ) -> Result<String> {
+        Self::with_tool_exposure_item(
+            text,
+            "allow_list",
+            allow_list.map(|names| {
+                let mut array = toml_edit::Array::new();
+                for name in names {
+                    array.push(*name);
+                }
+                toml_edit::value(array)
+            }),
+        )
+    }
+
+    /// Set `[tool_exposure] read_only` (#2932), preserving the rest of the
+    /// document. PURE: the caller owns the filesystem write.
+    pub fn with_tool_exposure_read_only(text: &str, read_only: bool) -> Result<String> {
+        Self::with_tool_exposure_item(text, "read_only", Some(toml_edit::value(read_only)))
+    }
+
+    fn with_tool_exposure_item(
+        text: &str,
+        key: &str,
+        item: Option<toml_edit::Item>,
+    ) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("tool_exposure")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`tool_exposure` is not a table".to_string()))?;
+        match item {
+            Some(mut item) => {
+                // Keep the old value's trailing comment and spacing, as
+                // `with_default_backend` does.
+                if let (Some(new), Some(old)) = (
+                    item.as_value_mut(),
+                    table.get(key).and_then(toml_edit::Item::as_value),
+                ) {
+                    *new.decor_mut() = old.decor().clone();
+                }
+                table.insert(key, item);
+            }
+            None => {
+                table.remove(key);
+            }
+        }
+        Ok(doc.to_string())
+    }
+
+    /// Set `[prompt] preset` and `components` (#2933) to the given preset and deltas,
+    /// dropping `preset` for `default` and `components` when both are empty, preserving the rest of the document. PURE: the caller owns
+    /// the filesystem write.
+    pub fn with_prompt_components(
+        text: &str,
+        preset: &str,
+        on: &[&str],
+        off: &[&str],
+    ) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("prompt")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`prompt` is not a table".to_string()))?;
+        if on.is_empty() && off.is_empty() {
+            table.remove("components");
+        } else {
+            let list = |names: &[&str]| {
+                let mut array = toml_edit::Array::new();
+                for name in names {
+                    array.push(*name);
+                }
+                toml_edit::Value::Array(array)
+            };
+            let mut inline = toml_edit::InlineTable::new();
+            if !on.is_empty() {
+                inline.insert("on", list(on));
+            }
+            if !off.is_empty() {
+                inline.insert("off", list(off));
+            }
+            replace_in_place(table, "components", toml_edit::value(inline));
+        }
+        if preset == "default" {
+            // An existing `preset = "default"` is not ours to delete: a component edit
+            // leaves it, comments and all. Any other value is normalised away.
+            if table.get("preset").and_then(toml_edit::Item::as_str) != Some("default") {
+                table.remove("preset");
+            }
+        } else {
+            replace_in_place(table, "preset", toml_edit::value(preset));
+        }
+        Ok(doc.to_string())
+    }
+
+    /// Set `[skills] off` (`/settings skills on|off`), removing the key when `off` is
+    /// empty and preserving the rest of the document. PURE: the caller owns the write.
+    pub fn with_skills_off(text: &str, off: &[&str]) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let table = doc
+            .as_table_mut()
+            .entry("skills")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`skills` is not a table".to_string()))?;
+        if off.is_empty() {
+            table.remove("off");
+        } else {
+            let mut array = toml_edit::Array::new();
+            for name in off {
+                array.push(*name);
+            }
+            replace_in_place(table, "off", toml_edit::value(array));
+        }
+        Ok(doc.to_string())
+    }
+
     /// Set `enabled` on the named `[[mcp_servers]]` entry, preserving comments
     /// and formatting (`/mcp enable|disable`, #1149). PURE (no I/O) like
     /// [`with_net_host`](Self::with_net_host); the caller does the read/write.
@@ -2536,10 +2695,134 @@ fn report_ignored_project_endpoint_dropins(report: &mut dyn FnMut(crate::tty::No
     }
 }
 
+/// One-release notice (#2933): the soul is components now. A `soul.md` in the project
+/// or the user config directory, or `[memory] soul_file`, is no longer read; say so
+/// once per source, and point at `[prompt] file`, which replaces the whole prompt.
+fn report_retired_soul(cfg: &Config, report: &mut dyn FnMut(crate::tty::Notice<'static>)) {
+    let cwd = std::env::current_dir().ok();
+    let user_dir = Config::user_config_dir();
+    for source in retired_soul_sources(
+        cfg,
+        cwd.as_deref(),
+        home_dir().as_deref(),
+        user_dir.as_deref(),
+    ) {
+        if !first_report_of(&source) {
+            continue;
+        }
+        report(crate::tty::Notice::new(
+            crate::tty::Level::Warn,
+            "",
+            format!(
+                "newt: warning: ignoring {}: the soul is built from components now. Tune it \
+                 with `[prompt] components` or `/settings system-prompt`; to keep a prompt of \
+                 your own, put it in a file and set `[prompt] file = \"<path>\"`. This notice \
+                 goes away next release.",
+                crate::notes_scan::neutralize_for_display(&source)
+            ),
+        ));
+    }
+}
+
+/// True the first time `source` is reported in this session. Config is re-resolved at
+/// startup and after every refresh, and a notice per read would repeat all session.
+/// (Thread-local under test, so parallel tests do not share the set.)
+fn first_report_of(source: &str) -> bool {
+    #[cfg(not(test))]
+    {
+        static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        SEEN.lock()
+            .map_or(true, |mut seen| seen.insert(source.to_string()))
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static SEEN: std::cell::RefCell<std::collections::BTreeSet<String>> =
+                const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+        }
+        SEEN.with(|seen| seen.borrow_mut().insert(source.to_string()))
+    }
+}
+
+/// What the retired soul mechanism left behind: `[memory] soul_file`, a project
+/// `.newt/soul.md`, and the user config directory's `soul.md`.
+fn retired_soul_sources(
+    cfg: &Config,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    user_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut sources: Vec<String> = Vec::new();
+    if let Some(path) = cfg.memory.as_ref().and_then(|m| m.soul_file.as_ref()) {
+        sources.push(format!("[memory] soul_file = {path:?}"));
+    }
+    if let Some(found) =
+        cwd.and_then(|cwd| layering::find_project_entry_from(cwd, home, "soul.md", Path::is_file))
+    {
+        sources.push(found.display().to_string());
+    }
+    if let Some(user) = user_dir.map(|d| d.join("soul.md")).filter(|p| p.is_file()) {
+        sources.push(user.display().to_string());
+    }
+    sources
+}
+
 fn dir_has_toml(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|entries| {
         entries
             .flatten()
             .any(|e| e.path().extension().is_some_and(|x| x == "toml"))
     })
+}
+
+/// Set `key` to `item`, keeping the key and the old value's decoration (comments,
+/// spacing) when the key already exists: the key's own comment lives with the key,
+/// so replace the item in place rather than inserting a fresh key.
+fn replace_in_place(table: &mut toml_edit::Table, key: &str, mut item: toml_edit::Item) {
+    match table.get_mut(key) {
+        Some(existing) => {
+            if let (Some(new), Some(old)) = (item.as_value_mut(), existing.as_value()) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *existing = item;
+        }
+        None => {
+            table.insert(key, item);
+        }
+    }
+}
+
+#[cfg(test)]
+mod retired_soul_tests {
+    use super::*;
+
+    /// #2933 PR7: each leftover of the retired soul mechanism is named once.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn each_retired_soul_source_is_named() {
+        let root = tempfile::TempDir::new().unwrap();
+        let project = root.path().join("proj");
+        let user = root.path().join("user");
+        std::fs::create_dir_all(project.join(".newt")).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let cfg: Config = toml::from_str("[memory]\nsoul_file = \"/x/soul.md\"\n").unwrap();
+        let none: Config = toml::from_str("").unwrap();
+
+        assert!(retired_soul_sources(&none, Some(&project), None, Some(&user)).is_empty());
+        assert_eq!(
+            retired_soul_sources(&cfg, Some(&project), None, Some(&user)),
+            ["[memory] soul_file = \"/x/soul.md\""]
+        );
+        std::fs::write(project.join(".newt/soul.md"), "mine").unwrap();
+        std::fs::write(user.join("soul.md"), "mine too").unwrap();
+        let found = retired_soul_sources(&cfg, Some(&project), None, Some(&user));
+        assert_eq!(found.len(), 3, "{found:?}");
+        // Compared as paths: a Windows rendering separates with `\`.
+        assert!(
+            Path::new(&found[1]).ends_with(Path::new("proj").join(".newt").join("soul.md"))
+                && Path::new(&found[2]).ends_with(Path::new("user").join("soul.md")),
+            "{found:?}"
+        );
+    }
 }

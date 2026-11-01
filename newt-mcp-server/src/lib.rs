@@ -1,9 +1,8 @@
 //! Newt-Agent MCP server — stdio JSON-RPC.
 //!
 //! v0 tool surface (vi-minimal):
-//! - `code_read` — read a file
-//! - `code_edit` — apply a unified diff patch
-//! - `code_search` — regex search across a directory tree
+//! - `read_file` / `write_file` / `edit_file` / `list_dir` / `find` / `grep` —
+//!   newt-core's file tools, under the granted leash (#2956)
 //! - `goal_run` — tier-routed inference (wired through Router +
 //!   BackendRegistry; tries to discover a local Ollama on startup)
 

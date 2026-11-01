@@ -65,7 +65,7 @@ async fn memory_index_lists_ids_and_titles_not_bodies() {
 }
 #[tokio::test]
 async fn memory_index_is_system_prompt_only() {
-    // Like NoteStore / SoulProvider — never competes for the
+    // Like NoteStore — never competes for the
     // first-non-empty build_messages slot.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("NOTES.md");

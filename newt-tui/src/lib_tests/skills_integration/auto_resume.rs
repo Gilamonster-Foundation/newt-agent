@@ -77,6 +77,7 @@ async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -126,6 +127,7 @@ fn auto_resume_empty_workspace_is_silent_fresh_start() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -170,6 +172,7 @@ async fn resume_exact_restores_that_conversation() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -225,6 +228,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
     // A stale key from a "prior conversation" the boundary must drop.
     scratchpad_store.set("stale", "from before".to_string());
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -299,6 +303,7 @@ async fn resume_rehydrates_plan_into_live_ledger() {
     // A stale plan from a "prior conversation" the boundary must drop.
     step_ledger.set_plan(&["stale step".to_string()]);
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -357,6 +362,7 @@ fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,

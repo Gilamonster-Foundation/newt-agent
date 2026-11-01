@@ -1,6 +1,6 @@
 # Temporary Newt integration patch
 
-Upstream: `agent-bridle-tool-shell` 0.8.0-rc.5 from crates.io. Original
+Upstream: `agent-bridle-tool-shell` 0.8.0-rc.6 from crates.io. Original
 package provenance (`Cargo.toml.orig`), tests, and license notices are retained;
 the live manifest and the integration sources carry the changes below.
 

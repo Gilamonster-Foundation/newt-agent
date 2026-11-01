@@ -699,7 +699,9 @@ async fn run_one_turn(
     // The working-memory head is ephemeral like the TUI's: it leads this turn's
     // message[0] and never enters the driver transcript.
     let messages: std::borrow::Cow<'_, [MemMessage]> =
-        match working_memory_head(runtime.scratchpad.as_deref(), false) {
+        match working_memory_head(runtime.scratchpad.as_deref(), false)
+            .filter(|_| !config.exposure.verbatim_system)
+        {
             None => messages.into(),
             Some(head) => {
                 let mut turn = messages.to_vec();

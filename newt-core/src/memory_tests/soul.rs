@@ -1,17 +1,5 @@
 use super::*;
 
-#[tokio::test]
-async fn soul_provider_uses_default_when_no_file() {
-    let mut sp = SoulProvider::new(None);
-    let ctx = SessionContext {
-        workspace: "/nonexistent".into(),
-        session_id: "s".into(),
-    };
-    sp.initialize(&ctx).await.unwrap();
-    assert_eq!(sp.source, SoulSource::Default);
-    let block = sp.system_prompt_block().unwrap();
-    assert!(block.contains("newt"), "default soul should mention newt");
-}
 #[test]
 fn default_soul_lists_all_current_tools() {
     // Regression: DEFAULT_SOUL went stale when use_skill (#135) and
@@ -64,64 +52,4 @@ fn coach_soul_forbids_mutation_and_mandates_advice() {
         !COACH_SOUL.contains("Never describe a code change — make it"),
         "COACH_SOUL must not inherit the doer imperative"
     );
-}
-#[tokio::test]
-async fn soul_provider_loads_workspace_soul() {
-    let dir = tempfile::tempdir().unwrap();
-    // Create .newt/soul.md inside the temp dir.
-    let newt_dir = dir.path().join(".newt");
-    std::fs::create_dir_all(&newt_dir).unwrap();
-    std::fs::write(newt_dir.join("soul.md"), "You are a Django expert.").unwrap();
-
-    let mut sp = SoulProvider::new(None);
-    let ctx = SessionContext {
-        workspace: dir.path().to_string_lossy().into(),
-        session_id: "s".into(),
-    };
-    sp.initialize(&ctx).await.unwrap();
-    assert_eq!(sp.source, SoulSource::Workspace);
-    let block = sp.system_prompt_block().unwrap();
-    assert!(block.contains("Django"), "should use workspace soul");
-}
-#[tokio::test]
-async fn soul_provider_explicit_path_wins() {
-    let dir = tempfile::tempdir().unwrap();
-    let soul_file = dir.path().join("custom_soul.md");
-    std::fs::write(&soul_file, "You are a security auditor.").unwrap();
-
-    // Also create a workspace soul — explicit should win.
-    let ws_dir = tempfile::tempdir().unwrap();
-    let newt_dir = ws_dir.path().join(".newt");
-    std::fs::create_dir_all(&newt_dir).unwrap();
-    std::fs::write(newt_dir.join("soul.md"), "You are a Django expert.").unwrap();
-
-    let mut sp = SoulProvider::new(Some(soul_file.clone()));
-    let ctx = SessionContext {
-        workspace: ws_dir.path().to_string_lossy().into(),
-        session_id: "s".into(),
-    };
-    sp.initialize(&ctx).await.unwrap();
-    assert_eq!(sp.source, SoulSource::Explicit(soul_file));
-    let block = sp.system_prompt_block().unwrap();
-    assert!(
-        block.contains("security auditor"),
-        "explicit path should win"
-    );
-}
-#[tokio::test]
-async fn soul_provider_empty_workspace_soul_falls_through() {
-    let dir = tempfile::tempdir().unwrap();
-    let newt_dir = dir.path().join(".newt");
-    std::fs::create_dir_all(&newt_dir).unwrap();
-    // Empty workspace soul → should fall through to default.
-    std::fs::write(newt_dir.join("soul.md"), "   ").unwrap();
-
-    let mut sp = SoulProvider::new(None);
-    let ctx = SessionContext {
-        workspace: dir.path().to_string_lossy().into(),
-        session_id: "s".into(),
-    };
-    sp.initialize(&ctx).await.unwrap();
-    // Empty file → falls through to default.
-    assert_eq!(sp.source, SoulSource::Default);
 }

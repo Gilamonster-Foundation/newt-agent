@@ -1,0 +1,49 @@
+name: pages
+
+# Publishes `site/` (static, no build step) to GitHub Pages. Requires the repo's
+# Pages source set to "GitHub Actions" (Settings -> Pages). Runs only when the
+# site changes; PRs get a no-deploy sanity check that the files exist.
+# HOOK PARITY: CI-only (deploy/validation); .githooks/pre-push skips site-only
+# pushes and does not mirror this workflow.
+on:
+  push:
+    branches: [main]
+    paths: ['site/**', '.github/workflows/pages.yml']
+  pull_request:
+    paths: ['site/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check entry points
+        run: test -s site/index.html && test -s site/logo.png
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

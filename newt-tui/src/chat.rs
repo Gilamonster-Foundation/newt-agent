@@ -12,6 +12,25 @@ use background_warmup::{
     resolved_source_extensions, spawn_nav_warmup, spawn_semantic_indexing, SemanticIndexWarmup,
 };
 
+/// Re-read the config after a command that may have changed it. A config that no
+/// longer resolves keeps the one the session already accepted, and says so: falling
+/// back to defaults would drop the operator's `[tool_exposure]` and the rest.
+pub(crate) fn reresolve(cfg: &mut newt_core::ResolvedConfig, color: bool, verbose: bool) {
+    match crate::migration_notices::read(|report| {
+        newt_core::Config::resolve_runtime_unpublished(report)
+    }) {
+        Ok(next) => *cfg = next,
+        Err(e) => print_newt(
+            &format!(
+                "config resolution failed: {e:#} — keeping the last accepted configuration; \
+                 fix the file"
+            ),
+            color,
+            verbose,
+        ),
+    }
+}
+
 fn memory_fetch_source<'a>(
     notes: Option<&'a newt_core::NoteStore>,
     store: Option<&'a newt_core::ConversationStore>,
@@ -256,6 +275,38 @@ fn decorate_round_cap_reply(
         format!("{reply}{separator}{footer}")
     }
 }
+
+/// #3009: whether the harness report folds on THIS surface. Tied to the
+/// surface that can reopen it (`/spill open` needs the Rich TUI's archive and
+/// pager), never to the global `spill_summary()` flag: that flag is also set by
+/// `/spill summary` on lean/piped sessions, where recovery is refused, and is
+/// false in the cockpit, which has no live viewport yet does have the pager.
+/// Rich folds by default; `/spill excerpt` shows it; lean/piped always shows it.
+#[cfg(feature = "live-spill")]
+fn observed_report_folds(surface_is_rich: bool, session_override: Option<bool>) -> bool {
+    surface_is_rich && effective_spill_summary(true, session_override)
+}
+
+/// #3009: on a surface that collapses committed results, the harness report
+/// folds to one `Fold` marker. `retain` archives the body and returns its
+/// recovery handle; `None` (nothing retained) leaves the reply unfolded.
+#[cfg(feature = "live-spill")]
+fn fold_observed_report(
+    reply: &str,
+    retain: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    let (report, rest) = newt_core::agentic::split_observed_report(reply)?;
+    let handle = retain(report)?;
+    let fold = newt_core::agentic::Fold::lines(
+        report.lines().count(),
+        newt_core::agentic::Recovery::Command(&handle),
+    );
+    Some(format!("▸ Observed · {fold}\n\n{rest}"))
+}
+
+#[cfg(all(test, feature = "live-spill"))]
+#[path = "chat_tests/observed_fold.rs"]
+mod observed_fold_tests;
 
 #[cfg(test)]
 #[path = "chat_tests/origin_upgrade.rs"]
@@ -695,6 +746,14 @@ fn record_turn_disposition(
 /// text promises.
 fn line_answers_pending_clarification(task: &str, has_pending: bool) -> bool {
     has_pending && newt_core::agentic::discussion_request(task).is_some()
+}
+
+/// A submitted line as the session reads it: `\`-continued lines rejoined into
+/// real newlines (a no-op for single-line input) and surrounding whitespace
+/// trimmed. The cockpit reads a line it hands over through this too, so it sees
+/// the same `/command` the session will run (#3056).
+pub(crate) fn operator_task(line: &str) -> String {
+    line.replace("\\\n", "\n").trim().to_string()
 }
 
 /// Comprehend an accepted prompt. A direct answer to a pending clarification
@@ -1455,6 +1514,12 @@ pub(crate) trait InputSurface {
     /// Replace the harness-owned jobs whose live state the input surface may
     /// render. Default no-op keeps lean/headless output free of ephemeral UI.
     fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {}
+    /// #2932: the operator's tool-profile label for the footer (`pi`,
+    /// `read-only`, `3 tools`), or `None` when the model sees every tool and
+    /// there is nothing to show. Sent at each loop head beside
+    /// `set_runtime_context`, and again right after `/settings tools` changes
+    /// it. Default no-op: the lean prompt carries it as `$TOOLS` instead.
+    fn set_tool_policy(&mut self, _label: Option<String>) {}
     /// #1669 PR-B: the open tabs, projected for the bottom bar. Sent once per
     /// loop head beside `set_runtime_context`, so a `/rename`, a `/tab close`
     /// or a newly degraded pin is reflected on the next prompt.
@@ -1541,6 +1606,122 @@ pub(crate) trait InputSurface {
     #[cfg(feature = "rich-tui")]
     fn open_panel(&mut self, _mode: PanelMode) -> Option<crate::session_worker::PanelWindow> {
         None
+    }
+}
+
+/// The context budget in tokens a session sizes its memory providers from (`[memory]
+/// context_tokens`, else the selected model's declared window, else the capability
+/// cache). The TUI at startup and `newt headless` both read it here (#2933), so the
+/// prompt providers see the same window in both.
+pub(crate) fn startup_memory_budget(
+    cfg: &newt_core::Config,
+    kind: newt_core::BackendKind,
+    model: &str,
+    served: Option<u32>,
+    entry: &probe::CapabilityEntry,
+    community: &newt_core::tuning::CommunityTunings,
+) -> u32 {
+    // The turn loop's own derivation (#2567), so the startup budget and the first turn
+    // cannot disagree about the window.
+    let declared_window = crate::context_window::resolve(crate::context_window::facts_for(
+        cfg, kind, model, served, entry, community, None, None,
+    ))
+    .full_window;
+    probe::resolve_memory_budget(
+        cfg.memory.as_ref().and_then(|m| m.context_tokens),
+        declared_window,
+        Some(entry),
+    )
+}
+
+/// The budget `newt headless` sizes the shared prompt providers with: the same
+/// derivation, over the cached capability evidence for the route, with the served
+/// window from `--context-window`.
+pub(crate) fn headless_memory_budget(
+    cfg: &newt_core::Config,
+    kind: newt_core::BackendKind,
+    backend_name: &str,
+    serving: Option<newt_core::Serving>,
+    model: &str,
+    served: Option<u32>,
+) -> u32 {
+    let cache = probe::load_cache();
+    let entry = cache
+        .get(&session_cap_id(serving, backend_name, model))
+        .cloned()
+        .unwrap_or_default();
+    startup_memory_budget(
+        cfg,
+        kind,
+        model,
+        served,
+        &entry,
+        &newt_core::tuning::load_community_tunings(),
+    )
+}
+
+/// The memory providers whose blocks land in the frozen system prompt: project
+/// instructions, the profile's API surface and project map, notes, and the memory
+/// index. The TUI registers them at startup and `newt headless` through
+/// `headless_system_prompt`, so the same config yields the same prompt (#2933).
+/// `mem_budget` is the context window in tokens the API surface scales with.
+pub(crate) fn add_prompt_providers(
+    mgr: &mut newt_core::MemoryManager,
+    cfg: &newt_core::Config,
+    workspace: &str,
+    knowledge_base: bool,
+    mem_budget: u32,
+) {
+    let mem_cfg = cfg.memory.clone().unwrap_or_default();
+    // `--no-agents-file` / `--agents-file` (via env) over `[agents] enabled`.
+    mgr.add_provider(crate::project_instructions_provider(cfg));
+    // Profile technique: knowledge_base (R1) — inject the authoritative PyO3
+    // import surface into the system prompt when the active profile lists it.
+    // Rides the provider seam (survives system-prompt rebuilds); a no-op on a
+    // non-PyO3 workspace. See docs/design/technique-library.md.
+    if knowledge_base {
+        // The PyO3/FFI import surface (#74) + the general workspace API
+        // surface (#669) — both stable bases in the protected system prompt.
+        mgr.add_provider(newt_core::FfiSurfaceProvider::new());
+        // Built-in language packs + any inline `[[context.api_surface.
+        // language_packs]]`. (Drop-in `~/.newt/language-packs/*.toml`
+        // auto-discovery uses the public load_packs_from_dir — wired next.)
+        let api_cfg = cfg
+            .context
+            .as_ref()
+            .map(|c| c.api_surface.clone())
+            .unwrap_or_default();
+        // #1283: the tier-2 surface budget scales with the discovered window
+        // (SC-L2), replacing the starved fixed 3000-char cap. `w` = the same
+        // resolved send budget the memory providers use (mem_budget); the
+        // ratio is the static `[context.estimation]` value, so `b` is a pure
+        // session-fixed function (never the live calibrated ratio).
+        let surface_cpt = cfg
+            .context
+            .as_ref()
+            .map(|c| c.estimation.chars_per_token)
+            .unwrap_or(4);
+        let surface_budget =
+            newt_core::resolve_surface_budget(mem_budget as usize, surface_cpt, &api_cfg);
+        let packs = resolved_language_packs(workspace, &api_cfg);
+        mgr.add_provider(
+            newt_core::ApiSurfaceProvider::new(packs, &api_cfg).with_budget(surface_budget),
+        );
+        // #1284: the untruncatable project map (crate/package units + curated
+        // purposes) — the navigation floor of the "IDE for LLMs" spine. A
+        // no-op on a non-project dir; drift-cached so a re-launch is cheap.
+        mgr.add_provider(newt_core::ProjectMapProvider::new());
+    }
+    // NoteStore is always active — manages system-prompt injection only.
+    mgr.add_provider(newt_core::NoteStore::default_path());
+    // Progressive-disclosure memory (Workstream A MVP, #319): under
+    // `[memory] disclosure = "index"` ONLY, add the budgeted MemoryIndex
+    // provider (note ids/titles in the prompt; bodies fetched on demand via
+    // `memory_fetch`). Default (`frozen`) registers nothing — bit-for-bit
+    // unchanged. System-prompt-only, so it never competes for the
+    // build_messages slot.
+    if mem_cfg.disclosure == newt_core::MemoryDisclosure::Index {
+        mgr.add_provider(newt_core::MemoryIndex::default_path());
     }
 }
 
@@ -1853,19 +2034,14 @@ fn session_body(
     // intentional refresh point — config.toml may have changed on disk.
     // UNPUBLISHED resolution: process-globals land only after the typed
     // backend choice below ACCEPTS — a refused startup publishes nothing.
-    // A resolution failure is visible, then the session runs on defaults.
+    // A resolution failure refuses the session.
     let mut cfg = match crate::migration_notices::read(|report| {
         newt_core::Config::resolve_runtime_unpublished(report)
     }) {
         Ok(cfg) => cfg,
-        Err(e) => {
-            print_newt(
-                &format!("config resolution failed: {e:#} — running on built-in defaults"),
-                color,
-                verbose,
-            );
-            newt_core::ResolvedConfig::unrequested(newt_core::Config::default())
-        }
+        // Fail closed: built-in defaults would drop `[tool_exposure]` and every
+        // other restriction the operator wrote, and the session would go on.
+        Err(e) => anyhow::bail!("config resolution failed: {e:#}; no session was started"),
     };
     // The active profile is resolved just below, AFTER the model is known — a
     // `--bundle`/inferred bundle picks its profile from the model id.
@@ -2331,6 +2507,13 @@ fn session_body(
         }
     }
 
+    // --ambient / --yolo (#978): say plainly what is off, after the per-axis banners above.
+    let authority = newt_core::launch_authority::current();
+    if authority.ambient() {
+        let shell = newt_core::ambient_shell::AmbientShell::resolve_host();
+        print_newt(&ambient_banner(authority, &shell), color, verbose);
+    }
+
     // Connect to discovered MCP servers ONCE for the session (newt config +
     // Claude Code config). Failures are logged + skipped; their tools are added
     // to the agent's tool set, namespaced `server__tool`. `newt doctor` shows
@@ -2362,6 +2545,11 @@ fn session_body(
         .tui
         .as_ref()
         .map(|tui| tui.permissions.mcp_net_prompt_default);
+    // #1662: THE identity of this running Newt, stable for its whole lifetime
+    // and distinct from any conversation id. Minted here, before MCP startup,
+    // so startup connect records carry it (#3037); it is installed as the
+    // active session further down, once memory has initialised.
+    let lifecycle_session = newt_core::lifecycle::new_session_id();
     let mut mcp = tokio::task::block_in_place(|| -> anyhow::Result<_> {
         let mut permission_gate = interactive.then(|| PromptPermissionGate {
             pending_command_retries: Default::default(),
@@ -2410,6 +2598,7 @@ fn session_body(
             crate::mcp::McpLaunchAuthority {
                 caveats: &connect_caveats,
                 protection: workspace_settings.protection.clone(),
+                session: Some(lifecycle_session.as_str()),
             },
             &explicit_net_hosts,
             Some((&mut grant_net, &startup_cancel)),
@@ -2459,6 +2648,8 @@ fn session_body(
     // Human `/cd` session working directory — SEPARATE from the
     // OCAP-load-bearing `workspace`. `/cd` moves it (confined below `workspace`),
     // the prompt shows it; it never mutates `workspace` or the process cwd.
+    // The last turn's usable context budget, for the preview's tool exposure.
+    let mut last_exposure_budget: Option<usize> = None;
     let mut session_cwd = workspace_settings
         .profile
         .as_ref()
@@ -2483,12 +2674,7 @@ fn session_body(
         Some(name) => Some(persona_store.load(name)?),
         None => None,
     };
-    warn_on_missing_bound_skills(
-        active_persona.as_ref(),
-        &cfg.skill_search_dirs(),
-        color,
-        verbose,
-    );
+    warn_on_missing_bound_skills(active_persona.as_ref(), &cfg, color, verbose);
     // FR-5 (#999): apply the `--altitude` flag. It rides on `active_persona`
     // (already threaded through every prompt rebuild), so an explicit flag either
     // overrides a loaded persona's altitude or — with no `--persona` — synthesizes
@@ -2586,84 +2772,33 @@ fn session_body(
                 inf_kind,
                 inf_key.as_deref(),
             );
-        // The turn loop's own derivation (#2567), so the startup budget and
-        // the first turn cannot disagree about the window.
-        let declared_window = crate::context_window::resolve(crate::context_window::facts_for(
+        let budget = startup_memory_budget(
             &cfg,
             inf_kind,
             &inf_model,
             inf_context_window,
             entry,
             &community_tunings,
-            None,
-            None,
-        ))
-        .full_window;
+        );
         if updated {
             probe::save_cache(&cap_cache);
         }
-        probe::resolve_memory_budget(
-            mem_cfg.context_tokens,
-            declared_window,
-            cap_cache.get(&cap_id),
-        )
+        budget
     };
     let mut smart_sessions = smart_sessions::Sessions::new(smart_startup_caveats);
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
-        // Soul provider first — sets the frozen identity block.
-        let soul_override = mem_cfg.soul_file.as_ref().map(std::path::PathBuf::from);
-        mgr.add_provider(newt_core::SoulProvider::new(soul_override));
-        // Project instructions (AGENTS.md / CLAUDE.md) — compose right after
-        // the soul so the block lands in the frozen system prompt. CLI-env
-        // overrides config: --no-agents-file forces off, --agents-file forces
-        // on (and sets the search target); otherwise follow `[agents] enabled`.
-        let agents_enabled = std::env::var("NEWT_NO_AGENTS_FILE").is_err()
-            && (cfg.agents.enabled || std::env::var("NEWT_AGENTS_FILE").is_ok());
-        let agents_path = std::env::var("NEWT_AGENTS_FILE")
-            .ok()
-            .or_else(|| cfg.agents.path.clone());
-        mgr.add_provider(newt_core::AgentsProvider::new(agents_enabled, agents_path));
-        // Profile technique: knowledge_base (R1) — inject the authoritative PyO3
-        // import surface into the system prompt when the active profile lists it.
-        // Rides the provider seam (survives system-prompt rebuilds); a no-op on a
-        // non-PyO3 workspace. See docs/design/technique-library.md.
-        if active_profile
-            .as_ref()
-            .is_some_and(|p| p.enables("knowledge_base"))
-        {
-            // The PyO3/FFI import surface (#74) + the general workspace API
-            // surface (#669) — both stable bases in the protected system prompt.
-            mgr.add_provider(newt_core::FfiSurfaceProvider::new());
-            // Built-in language packs + any inline `[[context.api_surface.
-            // language_packs]]`. (Drop-in `~/.newt/language-packs/*.toml`
-            // auto-discovery uses the public load_packs_from_dir — wired next.)
-            let api_cfg = cfg
-                .context
+        // Providers whose blocks land in the frozen system prompt are registered by the
+        // one function `newt headless` also calls (#2933).
+        add_prompt_providers(
+            &mut mgr,
+            &cfg,
+            workspace,
+            active_profile
                 .as_ref()
-                .map(|c| c.api_surface.clone())
-                .unwrap_or_default();
-            // #1283: the tier-2 surface budget scales with the discovered window
-            // (SC-L2), replacing the starved fixed 3000-char cap. `w` = the same
-            // resolved send budget the memory providers use (mem_budget); the
-            // ratio is the static `[context.estimation]` value, so `b` is a pure
-            // session-fixed function (never the live calibrated ratio).
-            let surface_cpt = cfg
-                .context
-                .as_ref()
-                .map(|c| c.estimation.chars_per_token)
-                .unwrap_or(4);
-            let surface_budget =
-                newt_core::resolve_surface_budget(mem_budget as usize, surface_cpt, &api_cfg);
-            let packs = resolved_language_packs(workspace, &api_cfg);
-            mgr.add_provider(
-                newt_core::ApiSurfaceProvider::new(packs, &api_cfg).with_budget(surface_budget),
-            );
-            // #1284: the untruncatable project map (crate/package units + curated
-            // purposes) — the navigation floor of the "IDE for LLMs" spine. A
-            // no-op on a non-project dir; drift-cached so a re-launch is cheap.
-            mgr.add_provider(newt_core::ProjectMapProvider::new());
-        }
+                .is_some_and(|p| p.enables("knowledge_base")),
+            mem_budget,
+        );
         // Smart mode selects from retained originals at the frame boundary.
         if smart_config.is_some() {
             mgr.add_provider(newt_core::RollingWindow::new(usize::MAX));
@@ -2700,17 +2835,6 @@ fn session_body(
                     mgr.add_provider(newt_core::RollingWindow::new(mem_cfg.window));
                 }
             }
-        }
-        // NoteStore is always active — manages system-prompt injection only.
-        mgr.add_provider(newt_core::NoteStore::default_path());
-        // Progressive-disclosure memory (Workstream A MVP, #319): under
-        // `[memory] disclosure = "index"` ONLY, add the budgeted MemoryIndex
-        // provider (note ids/titles in the prompt; bodies fetched on demand via
-        // `memory_fetch`). Default (`frozen`) registers nothing — bit-for-bit
-        // unchanged. System-prompt-only, so it never competes for the
-        // build_messages slot.
-        if mem_cfg.disclosure == newt_core::MemoryDisclosure::Index {
-            mgr.add_provider(newt_core::MemoryIndex::default_path());
         }
         mgr
     };
@@ -2791,19 +2915,23 @@ fn session_body(
     // Warm the model-free repository navigator in parallel with the remaining
     // session startup. The first consumer joins this handle; a failed task
     // leaves the existing synchronous ensure path as the honest fallback.
-    let mut nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
+    let mut nav_warmup = spawn_nav_warmup(
+        &rt,
+        workspace,
+        &cfg,
+        &index_status,
+        newt_core::config::context_index_enabled(&cfg),
+    );
     // Step 26.6a (#585): session-scoped experiential ledger. Unlike the others it
     // SURVIVES /new (cross-task reuse within the session) — see the /new handler.
     let experience_store = newt_core::SessionExperienceStore::default();
     // Step 26.6b (#586): session-scoped plan ledger for the scheduled view.
     // Task-specific → CLEARED on /new (like the scratchpad).
     let step_ledger = newt_core::SessionStepLedger::default();
-    // #1662: THE identity of this running Newt, stable for its whole lifetime
-    // and distinct from any conversation id. The previous scheme was
+    // #1662: `lifecycle_session` (minted above) replaced
     // `SystemTime::now().as_secs()`, so two Newts launched in the same second —
-    // a script, a tab restore, a Herdr layout opening several panes — shared
-    // one lifecycle identity and each answered to the other's events.
-    let lifecycle_session = newt_core::lifecycle::new_session_id();
+    // a script, a tab restore, a Herdr layout opening several panes — no longer
+    // share one lifecycle identity and answer to each other's events.
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: lifecycle_session.to_string(),
@@ -2823,14 +2951,77 @@ fn session_body(
         },
     );
 
-    // Build system prompt now that SoulProvider has loaded its soul file.
-    system = rebuild_system_prompt(
+    // Build the system prompt now that the memory providers have loaded.
+    system = rebuild_system_prompt_for(
         workspace,
         &memory,
         active_persona.as_ref(),
         &active_conversation_id,
+        &cfg,
         Some(&*report_sink),
     );
+    // #2938: the operator's system prompt file as the session last built its
+    // prompt from it. A set, reset or edited file rebuilds the prompt on the
+    // spot (and refreshes the footer), not at the next `/new`.
+    let mut last_override = crate::try_system_prompt_override();
+    // #2933: likewise for `[prompt] components`, which shape the soul.
+    let mut last_components = cfg.prompt_components().unwrap_or_default();
+    // `[skills] off` shapes the skill index the same way.
+    let skills_off = |cfg: &newt_core::Config| cfg.skills.as_ref().map(|s| s.off.clone());
+    let mut last_skills_off = skills_off(&cfg);
+    macro_rules! refresh_prompt_override {
+        () => {
+            let components_now = cfg.prompt_components().unwrap_or_default();
+            let skills_now = skills_off(&cfg);
+            if skills_now != last_skills_off {
+                last_skills_off = skills_now;
+                if reconcile_posture_skill(&cfg) {
+                    print_newt(
+                        "posture skill updated to match [skills] off",
+                        color,
+                        verbose,
+                    );
+                }
+                system = rebuild_system_prompt_for(
+                    workspace,
+                    &memory,
+                    active_persona.as_ref(),
+                    &active_conversation_id,
+                    &cfg,
+                    Some(&*report_sink),
+                );
+                print_newt("system prompt rebuilt (skills changed)", color, verbose);
+            }
+            if components_now != last_components {
+                last_components = components_now;
+                system = rebuild_system_prompt_for(
+                    workspace,
+                    &memory,
+                    active_persona.as_ref(),
+                    &active_conversation_id,
+                    &cfg,
+                    Some(&*report_sink),
+                );
+                print_newt("system prompt rebuilt (components changed)", color, verbose);
+            }
+            if crate::system_prompt_edit::refresh_override(
+                &mut last_override,
+                crate::try_system_prompt_override,
+                || {
+                    system = rebuild_system_prompt_for(
+                        workspace,
+                        &memory,
+                        active_persona.as_ref(),
+                        &active_conversation_id,
+                        &cfg,
+                        Some(&*report_sink),
+                    );
+                },
+            ) {
+                print_newt("system prompt rebuilt (override changed)", color, verbose);
+            }
+        };
+    }
 
     // 17.7: `/new` opts the SESSION out of auto-resume. Every auto-resume
     // consult goes through `should_auto_resume`, so an explicit /new is
@@ -2965,6 +3156,7 @@ fn session_body(
     let mut resumed_at_start = false;
     if let Some(store) = conversation_store.as_ref() {
         let mut resume_ctx = ConversationCommandContext {
+            cfg: &cfg,
             store,
             persona_store: &persona_store,
             workspace,
@@ -3078,6 +3270,7 @@ fn session_body(
                     verbose,
                 );
                 let mut reset_ctx = ConversationResetContext {
+                    cfg: &cfg,
                     memory: &mut memory,
                     system: &mut system,
                     conversation_id: &mut active_conversation_id,
@@ -3507,6 +3700,9 @@ fn session_body(
                     })
             };
             surface.set_runtime_context(&inf_model, &inf_url, token_gauge, &session_label);
+            // #2932: the tool profile rides the same refresh, from the same
+            // resolved config the turn will read its catalog from.
+            surface.set_tool_policy(cfg.tool_exposure().status_label());
             surface.set_background_jobs(
                 nav_warmup
                     .as_ref()
@@ -3593,9 +3789,7 @@ fn session_body(
                 continue;
             }
             ReadOutcome::Line(line) => {
-                // Rejoin `\`-continued lines (multi-line entry) into real
-                // newlines; a no-op for single-line input.
-                let task = line.replace("\\\n", "\n").trim().to_string();
+                let task = operator_task(&line);
                 if task.is_empty() {
                     continue;
                 }
@@ -3747,8 +3941,11 @@ fn session_body(
                     }
                     #[cfg(feature = "rich-tui")]
                     macro_rules! manage_mcp {
-                        () => {{
-                            cfg = crate::resolve_runtime_or_default();
+                        () => {
+                            manage_mcp!(crate::mcp_manager::run)
+                        };
+                        ($operation:path) => {{
+                            reresolve(&mut cfg, color, verbose);
                             let cancel =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let exit = std::sync::atomic::AtomicBool::new(false);
@@ -3792,7 +3989,7 @@ fn session_body(
                                         &newt_core::interaction_surface::SurfaceInteraction,
                                     ) -> PromptChoice,
                             };
-                            if let Err(error) = crate::mcp_manager::run(
+                            if let Err(error) = $operation(
                                 &mut mcp,
                                 surface.as_mut(),
                                 &mut gate,
@@ -3849,7 +4046,7 @@ fn session_body(
                                     }
                                     if !mcp.statuses.is_empty() {
                                         print_newt(
-                                            "usage: /mcp [on|off|enable|disable|auth] [name]",
+                                            "usage: /mcp [on|off|enable|disable|auth|login-all] [name]",
                                             color,
                                             verbose,
                                         );
@@ -3964,13 +4161,26 @@ fn session_body(
                                         Err(e) => print_newt(&format!("mcp {verb}: {e}"), color, verbose),
                                     }
                                 }
+                                // #3028: sign in to every server that needs it.
+                                ("login-all", "") => {
+                                    #[cfg(feature = "rich-tui")]
+                                    {
+                                        manage_mcp!(crate::mcp_manager::login_all);
+                                    }
+                                    #[cfg(not(feature = "rich-tui"))]
+                                    print_newt(
+                                        "run `newt auth --all` in a shell to sign in, then relaunch",
+                                        color,
+                                        verbose,
+                                    );
+                                }
                                 ("auth", n) if !n.is_empty() => print_newt(
                                     &format!("run `newt auth {n}` in a shell to (re)authenticate, then relaunch"),
                                     color,
                                     verbose,
                                 ),
                                 _ => print_newt(
-                                    "usage: /mcp [on|off|enable|disable|auth] [name]\n  on/off = this session (instant); enable/disable = config (durable)",
+                                    "usage: /mcp [on|off|enable|disable|auth|login-all] [name]\n  on/off = this session (instant); enable/disable = config (durable)",
                                     color,
                                     verbose,
                                 ),
@@ -4398,7 +4608,7 @@ fn session_body(
                                     verbose,
                                 ),
                             }
-                            cfg = crate::resolve_runtime_or_default();
+                            reresolve(&mut cfg, color, verbose);
                             surface.save_history();
                             println!();
                             continue;
@@ -4782,18 +4992,22 @@ fn session_body(
                                     ))
                                 } else {
                                     let spill = match command {
-                                        SpillCommand::Last => completed_spills.latest(),
-                                        SpillCommand::Open(id) => completed_spills.get(id),
-                                        _ => None,
+                                        SpillCommand::Open(tail) => completed_spills
+                                            .find(&tail)
+                                            .map_err(anyhow::Error::from),
+                                        _ => completed_spills.latest().ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "no spill is retained yet in this session"
+                                            )
+                                        }),
                                     };
-                                    spill.ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "that spill is not retained in this bounded session archive"
+                                    spill.and_then(|spill| {
+                                        crate::transcript_pager::run_output_pager(
+                                            &spill,
+                                            surface.as_mut(),
+                                            terminal_owns_turn,
                                         )
-                                    })
-                                    .and_then(|spill| {
-                                        crate::transcript_pager::run_output_pager(&spill, surface.as_mut(), terminal_owns_turn)
-                                            .map_err(anyhow::Error::from)
+                                        .map_err(anyhow::Error::from)
                                     })
                                 };
                                 #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
@@ -4941,6 +5155,7 @@ fn session_body(
                                         &mut where_is_index,
                                         &mut nav_session,
                                         &index_status,
+                                        newt_core::config::context_index_enabled(&cfg),
                                     );
                                 }
                                 let msg = handle_nav_command(
@@ -5099,16 +5314,8 @@ fn session_body(
                                         verbose,
                                     );
                                 } else {
-                                    let mut semantic_cfg = cfg
-                                        .context
-                                        .as_ref()
-                                        .map(|c| c.semantic.clone())
-                                        .unwrap_or_default();
-                                    semantic_cfg.embedding_model_path =
-                                        effective_embedding_model_path(
-                                            semantic_cfg.embedding_model_path.take(),
-                                            newt_inference::palette::embed_model_dir_if_present(),
-                                        );
+                                    let semantic_cfg =
+                                        crate::turn_system::session_semantic_config(&cfg);
                                     if let Some(reason) =
                                         semantic_embedder_unavailable_reason(&semantic_cfg)
                                     {
@@ -5374,6 +5581,214 @@ fn session_body(
                             ) {
                                 print_newt(&line, color, verbose);
                             }
+                        } else if rest == "request" {
+                            // #2959: preview the next request from an OWNED snapshot.
+                            // Shared borrows only: no sink write, store, queued-style
+                            // consumption, permission quarantine or inference call is
+                            // reachable from here.
+                            let posture = newt_core::posture::active_posture();
+                            let preview = permission_state
+                                .peek_recalled_caveats(
+                                    cap.caveats(),
+                                    cap.delegation().map(|d| d.caveats()),
+                                )
+                                .map_err(|e| e.to_string())
+                                .and_then(|recalled| {
+                                    let plan_active = conversation_mode_states.plan.is_active();
+                                    let caveats = operating_mode_caveats(
+                                        cfg.tool_exposure().read_only,
+                                        active_operating_mode,
+                                        plan_active,
+                                        meet_persona_caveats(
+                                            effective_caveats(&recalled, posture.as_ref()),
+                                            active_persona.as_ref(),
+                                        ),
+                                    );
+                                    // The task is not known yet, so resolve the style and
+                                    // disposition the way ordinary preparation does for a
+                                    // stand-in action-shaped task: style from the raw
+                                    // intake (a pending Auto selection is peeked, never
+                                    // taken), then the authority clamp.
+                                    let lexicon = cfg
+                                        .intake
+                                        .as_ref()
+                                        .map(newt_core::IntakeConfig::to_lexicon)
+                                        .unwrap_or_default();
+                                    let mut intake = newt_core::agentic::PromptIntake::analyze_with(
+                                        "Implement the requested change.",
+                                        &lexicon,
+                                    );
+                                    let auto_selected = (active_operating_mode
+                                        == OperatingMode::Auto
+                                        && !plan_active
+                                        && intake.disposition()
+                                            == newt_core::agentic::PromptDisposition::Act)
+                                        .then(|| {
+                                            conversation_mode_states
+                                                .auto
+                                                .pending_for(&active_conversation_id)
+                                        })
+                                        .flatten();
+                                    let style = effective_operating_mode(
+                                        active_operating_mode,
+                                        &intake,
+                                        plan_active,
+                                        auto_selected,
+                                    );
+                                    apply_operating_mode_to_intake(
+                                        if plan_active {
+                                            OperatingMode::Plan
+                                        } else {
+                                            active_operating_mode
+                                        },
+                                        &mut intake,
+                                    );
+                                    attribute_carried_plan_clamp(
+                                        &mut intake,
+                                        active_operating_mode,
+                                        plan_active,
+                                    );
+                                    let disposition = intake.disposition();
+                                    let turn_components = cfg.prompt_components().unwrap_or_default();
+                                    let ws_state =
+                                        workspace_state_block(workspace, &caveats.fs_read);
+                                    let runtime_ctx = runtime_context_parts(
+                                        &inf_model,
+                                        &inf_url,
+                                        inf_kind,
+                                        &session_identity,
+                                        disposition,
+                                    );
+                                    let controls = session_control_prompt(
+                                        active_operating_mode,
+                                        style,
+                                        posture.as_ref(),
+                                    );
+                                    let communication_style = tabs
+                                        .active()
+                                        .sidecar
+                                        .personality
+                                        .resolve(
+                                            active_persona
+                                                .as_ref()
+                                                .and_then(|p| p.profile.personality),
+                                        )
+                                        .prompt_block();
+                                    let turn = crate::turn_system::assemble_turn_system(
+                                        &crate::turn_system::TurnSystemParts {
+                                            ws_state: &ws_state,
+                                            session_cwd: &session_cwd,
+                                            runtime: &runtime_ctx,
+                            components: &turn_components,
+                                            system: &system,
+                                            session_controls: &controls,
+                                            communication_style: &communication_style,
+                                            is_clarification_answer: false,
+                                        },
+                                    );
+                                    // The same derivation the wire loops run, with each
+                                    // presence flag read from the same session state that
+                                    // fills the turn's `ChatCtx`.
+                                    let exposure =
+                                        newt_core::ExposureSettings::from(cfg.tool_exposure());
+                                    let features = context_features(
+                                        &cfg,
+                                        context_manager(&cfg, context_manager_override),
+                                        &context_features_override,
+                                        inf_kind,
+                                    );
+                                    let semantic =
+                                        crate::turn_system::session_semantic_config(&cfg);
+                                    let tools = newt_core::agentic::tool_set::exposed_tool_set(
+                                        &newt_core::agentic::tool_set::ToolSetInputs {
+                                            mcp: &mcp,
+                                            advertise: newt_core::agentic::tool_set::Advertise {
+                                                save_note: true,
+                                                recall: conversation_store.is_some(),
+                                                memory_fetch: true,
+                                                git_read_scope: None,
+                                                team: crew_runner.is_some()
+                                                    && exposure.operator_visible("crew"),
+                                                scratchpad: features.scratchpad,
+                                                code_search: features.semantic
+                                                    && semantic_embedder_unavailable_reason(
+                                                        &semantic,
+                                                    )
+                                                    .is_none(),
+                                                experiential: features.experiential,
+                                                scheduled: features.scheduled,
+                                                operating_mode: active_operating_mode
+                                                    == OperatingMode::Auto,
+                                                plan_mode: true,
+                                                plan_mode_active: plan_active,
+                                            },
+                                            command_budget,
+                                            shell_dialect,
+                                            persona_tools: active_persona
+                                                .as_ref()
+                                                .and_then(|p| p.profile.tools.as_deref()),
+                                            smart_harness: None,
+                                            disposition,
+                                            exposure: &exposure,
+                                            exposure_budget_tokens: last_exposure_budget,
+                                            estimation: cfg
+                                                .context
+                                                .as_ref()
+                                                .map(|c| c.estimation)
+                                                .unwrap_or_default(),
+                                            openai_compatible: inf_kind
+                                                == newt_core::BackendKind::Openai,
+                                        },
+                                    );
+                                    // Session annotations (identity/provider labels) plus
+                                    // this turn's; a later label replaces an earlier one,
+                                    // as `ReportSink::annotate` does.
+                                    let mut notes = report_sink.snapshot_notes();
+                                    for n in turn.notes {
+                                        notes.retain(|k| k.label != n.label);
+                                        notes.push(n);
+                                    }
+                                    // `card` off sends no second system message.
+                                    let mut system_texts = vec![turn.text];
+                                    if turn_components.is_on_id("card") {
+                                        system_texts.push(
+                                            newt_core::agentic::request_preview::active_prompt_card_preview(
+                                                &exposure, &intake,
+                                            ),
+                                        );
+                                    }
+                                    newt_core::agentic::request_preview::RequestSnapshot {
+                                        system_texts,
+                                        tools: newt_core::agentic::request_preview::wire_tools(
+                                            inf_kind, choice.api, &tools,
+                                        ),
+                                        notes,
+                                        omitted: "the per-turn head blocks (working memory, \
+                                            code evidence, experience, plan); the harness's \
+                                            observed-report system text; smart-harness tool \
+                                            changes. The active-prompt card uses placeholder \
+                                            prompt addresses and a stand-in action-shaped task, \
+                                            and the tool budget is the last turn's. Anthropic and \
+                                            Responses join system messages on the wire; they are \
+                                            listed separately here."
+                                            .to_string(),
+                                    }
+                                    .report()
+                                    .map_err(|e| e.to_string())
+                                });
+                            match preview {
+                                Ok(report) => {
+                                    print_newt(
+                                        "next request (preview; nothing sent):",
+                                        color,
+                                        verbose,
+                                    );
+                                    for line in report.to_markdown().lines() {
+                                        print_newt(line, color, verbose);
+                                    }
+                                }
+                                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                            }
                         } else if rest == "show" {
                             // Build the outbound message set fresh and render a
                             // compact per-message breakdown so the operator can
@@ -5548,6 +5963,7 @@ fn session_body(
                         }
                         turns_this_conversation = 0;
                         let mut reset_ctx = ConversationResetContext {
+                            cfg: &cfg,
                             memory: &mut memory,
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
@@ -5675,7 +6091,13 @@ fn session_body(
                         if let Some(warmup) = nav_warmup.take() {
                             warmup.abort();
                         }
-                        nav_warmup = Some(spawn_nav_warmup(&rt, workspace, &cfg, &index_status));
+                        nav_warmup = spawn_nav_warmup(
+                            &rt,
+                            workspace,
+                            &cfg,
+                            &index_status,
+                            newt_core::config::context_index_enabled(&cfg),
+                        );
                         // Step 26.6a (#585): the experiential ledger is INTENTIONALLY
                         // NOT cleared here — it is cross-task by design (a later task
                         // reuses earlier lessons). It is dropped only at session end.
@@ -5868,6 +6290,7 @@ fn session_body(
                         match conversation_store.as_ref() {
                             Some(store) => {
                                 let mut conversation_ctx = ConversationCommandContext {
+                                    cfg: &cfg,
                                     store,
                                     persona_store: &persona_store,
                                     workspace,
@@ -6207,6 +6630,7 @@ fn session_body(
                                                     let _ = store.release(&outgoing);
                                                 }
                                                 let mut resume_ctx = ConversationCommandContext {
+                                                    cfg: &cfg,
                                                     store,
                                                     persona_store: &persona_store,
                                                     workspace,
@@ -6451,6 +6875,7 @@ fn session_body(
                                                             active_conversation_id.clone();
                                                         let _ = store.release(&outgoing);
                                                         let mut ctx = ConversationCommandContext {
+                                                            cfg: &cfg,
                                                             store,
                                                             persona_store: &persona_store,
                                                             workspace,
@@ -6580,6 +7005,7 @@ fn session_body(
                         let persona_name_before = active_persona.as_ref().map(|p| p.name.clone());
                         let conversation_id_before = active_conversation_id.clone();
                         let mut reset_ctx = ConversationResetContext {
+                            cfg: &cfg,
                             memory: &mut memory,
                             system: &mut system,
                             conversation_id: &mut active_conversation_id,
@@ -6654,7 +7080,7 @@ fn session_body(
                         {
                             warn_on_missing_bound_skills(
                                 active_persona.as_ref(),
-                                &cfg.skill_search_dirs(),
+                                &cfg,
                                 color,
                                 verbose,
                             );
@@ -6746,6 +7172,63 @@ fn session_body(
                     // (Shared by the psyche panel gate here and the backend
                     // panel gate below, #1667.)
                     let panel_tokens: Vec<&str> = slash_body.split_whitespace().collect();
+                    // #2938: `/settings system-prompt edit` needs the terminal
+                    // (the editor) and the live system prompt, so it is the
+                    // session's, ahead of the typed form (which refuses it).
+                    if panel_tokens.as_slice() == ["settings", "system-prompt", "edit"] {
+                        use crate::system_prompt_edit::{self as spe, Outcome};
+                        let target = cfg.system_prompt_file().or_else(spe::default_target);
+                        let Some(target) = target else {
+                            print_newt(
+                                "no config directory to keep a system prompt in; set [prompt] file",
+                                color,
+                                verbose,
+                            );
+                            continue;
+                        };
+                        let mut io = spe::RealIo::new(|cmd: &str| {
+                            surface.run_bang_escape(cmd, color, verbose)
+                        });
+                        match spe::run(&mut io, &target, &system) {
+                            Ok(Outcome::Saved) => {
+                                let path = target.display().to_string();
+                                let _ = crate::settings_form::apply_and_record(
+                                    crate::settings_form::Field::SystemPrompt,
+                                    &path,
+                                    "/settings system-prompt edit",
+                                );
+                                refresh_prompt_override!();
+                                let keep = if cfg.prompt.as_ref().is_some_and(|p| p.file.is_some())
+                                {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " (add [prompt] file = \"{path}\" to keep it next session)"
+                                    )
+                                };
+                                print_newt(&format!("system prompt saved to {path}: the next request sends exactly this file{keep}"), color, verbose);
+                            }
+                            Ok(Outcome::Unchanged) => {
+                                print_newt(
+                                    "system prompt unchanged; nothing saved",
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(Outcome::Empty) => print_newt(
+                                "the editor left nothing; keeping the previous system prompt",
+                                color,
+                                verbose,
+                            ),
+                            Err(error) => print_newt(
+                                &format!("system prompt edit failed: {error:#}"),
+                                color,
+                                verbose,
+                            ),
+                        }
+                        println!();
+                        continue;
+                    }
                     // Bare `/settings` IS the panel on a rich-tui TTY — the
                     // chooser `slash_registry` has classified this family as
                     // since #1981, now that #1986/#2020 supply a region to draw
@@ -6759,6 +7242,122 @@ fn session_body(
                     // they had typed it — one commit path, not two.
                     #[cfg(feature = "rich-tui")]
                     let mut walked_to_backends = false;
+                    // #2932: the tool checklist. Opened by `/settings tools`
+                    // directly, or by Enter on the settings panel's `tools`
+                    // row. It REPORTS a choice; the write goes through
+                    // `settings_form::apply_and_record` — the one mutation
+                    // path, receipted — and then `cfg` is re-resolved so the
+                    // next turn's catalog, prompt and caveats all follow, and
+                    // the footer is told at once rather than at the next loop
+                    // head.
+                    #[cfg(feature = "rich-tui")]
+                    macro_rules! manage_tools {
+                        () => {{
+                            let window =
+                                surface.open_panel(PanelMode::Inline(crate::tools_panel::height()));
+                            let mut panel =
+                                crate::tools_panel::ToolsPanel::new(&cfg.tool_exposure());
+                            match crate::tools_panel::run(&mut panel, window) {
+                                Ok(Some(choice)) => {
+                                    let writes = choice
+                                        .tools
+                                        .map(|v| (crate::settings_form::Field::Tools, v))
+                                        .into_iter()
+                                        .chain(choice.read_only.map(|v| {
+                                            (crate::settings_form::Field::ReadOnly, v.to_string())
+                                        }));
+                                    for (field, value) in writes {
+                                        match crate::settings_form::apply_and_record(
+                                            field,
+                                            &value,
+                                            "/settings tools",
+                                        ) {
+                                            Ok(line) | Err(line) => {
+                                                print_newt(&line, color, verbose)
+                                            }
+                                        }
+                                    }
+                                    reresolve(&mut cfg, color, verbose);
+                                    surface.set_tool_policy(cfg.tool_exposure().status_label());
+                                }
+                                Ok(None) => print_newt("tools: cancelled", color, verbose),
+                                Err(error) => print_newt(
+                                    &format!(
+                                        "tools panel unavailable ({error}); \
+                                         use /settings tools <all|pi|a,b,c>"
+                                    ),
+                                    color,
+                                    verbose,
+                                ),
+                            }
+                        }};
+                    }
+                    // #2933: the system prompt component checklist. Like the tools
+                    // panel it REPORTS a choice; each change is one `on|off <id>`
+                    // through the receipted settings path, then `cfg` is
+                    // re-resolved and the prompt rebuilt before the next turn.
+                    #[cfg(feature = "rich-tui")]
+                    if panel_tokens.as_slice() == ["settings", "system-prompt", "components"]
+                        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    {
+                        let window = surface
+                            .open_panel(PanelMode::Inline(crate::components_panel::height()));
+                        // A config that does not resolve has no components to show.
+                        let set = match crate::prompt_components_form::current() {
+                            Ok(set) => set,
+                            Err(e) => {
+                                print_newt(
+                                    &format!("components panel unavailable: {e}"),
+                                    color,
+                                    verbose,
+                                );
+                                continue;
+                            }
+                        };
+                        let mut panel = crate::components_panel::ComponentsPanel::new(
+                            &set,
+                            &crate::prompt_components_form::visible,
+                        );
+                        match crate::components_panel::run(&mut panel, window) {
+                            Ok(Some(choice)) => {
+                                for (id, on) in choice {
+                                    let value = format!("{} {id}", if on { "on" } else { "off" });
+                                    match crate::settings_form::apply_and_record(
+                                        crate::settings_form::Field::SystemPrompt,
+                                        &value,
+                                        "/settings system-prompt components",
+                                    ) {
+                                        Ok(line) | Err(line) => print_newt(&line, color, verbose),
+                                    }
+                                }
+                                // The accepted-config path the Tools panel takes, also after
+                                // rejected writes: never defaults.
+                                reresolve(&mut cfg, color, verbose);
+                                refresh_prompt_override!();
+                            }
+                            Ok(None) => print_newt("components: cancelled", color, verbose),
+                            Err(error) => print_newt(
+                                &format!(
+                                    "components panel unavailable ({error}); \
+                                     use /settings system-prompt on|off <id>"
+                                ),
+                                color,
+                                verbose,
+                            ),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    #[cfg(feature = "rich-tui")]
+                    if panel_tokens.as_slice() == ["settings", "tools"]
+                        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    {
+                        manage_tools!();
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
                     #[cfg(feature = "rich-tui")]
                     if panel_tokens.as_slice() == ["settings"]
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
@@ -6792,6 +7391,7 @@ fn session_body(
                             let mut walked_to_permissions = false;
                             let mut walked_to_workspaces = false;
                             let mut walked_to_mcp = false;
+                            let mut walked_to_tools = false;
                             let window = surface
                                 .open_panel(PanelMode::Inline(settings_panel::panel_height()));
                             // #2009 PR13: the Audit section's rows. The fs read
@@ -6820,6 +7420,10 @@ fn session_body(
                                         }
                                         settings_panel::Outcome::OpenMcp { lines, model } => {
                                             walked_to_mcp = true;
+                                            (lines, model)
+                                        }
+                                        settings_panel::Outcome::OpenTools { lines, model } => {
+                                            walked_to_tools = true;
                                             (lines, model)
                                         }
                                         settings_panel::Outcome::OpenPermissions {
@@ -6874,7 +7478,12 @@ fn session_body(
                                     }
                                 }
                             }
-                            cfg = crate::resolve_runtime_or_default();
+                            reresolve(&mut cfg, color, verbose);
+                            if walked_to_tools {
+                                manage_tools!();
+                                initial_section = Some('s');
+                                continue;
+                            }
                             if walked_to_workspaces {
                                 manage_workspaces!();
                                 initial_section = Some('w');
@@ -6920,7 +7529,7 @@ fn session_body(
                                         verbose,
                                     ),
                                 }
-                                cfg = crate::resolve_runtime_or_default();
+                                reresolve(&mut cfg, color, verbose);
                                 initial_section = Some('p');
                                 continue;
                             }
@@ -7116,6 +7725,7 @@ fn session_body(
                                         }
                                         let conversation_id_before = active_conversation_id.clone();
                                         let mut reset_ctx = ConversationResetContext {
+                                            cfg: &cfg,
                                             memory: &mut memory,
                                             system: &mut system,
                                             conversation_id: &mut active_conversation_id,
@@ -7200,7 +7810,7 @@ fn session_body(
                                     // independently-mutated sources and could pair
                                     // the operator's provider with a persona
                                     // backend's model.
-                                    cfg = crate::resolve_runtime_or_default();
+                                    reresolve(&mut cfg, color, verbose);
                                     let _ = refresh_backend(
                                         &cfg,
                                         &mut choice,
@@ -7277,7 +7887,7 @@ fn session_body(
                     if models_panel::requested(panel_tokens.as_slice())
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
                     {
-                        let cfg_now = crate::resolve_runtime_or_default();
+                        let cfg_now = cfg.clone();
                         if let Ok(panel_choice) = crate::resolve_backend_choice(&cfg_now) {
                             let panel_window =
                                 surface.open_panel(PanelMode::Inline(models_panel::panel_height()));
@@ -7300,7 +7910,7 @@ fn session_body(
                                     // This panel returns before the normal
                                     // post-slash refresh. Repoint the live
                                     // session as well as the saved choice.
-                                    cfg = crate::resolve_runtime_or_default();
+                                    reresolve(&mut cfg, color, verbose);
                                     let _ = refresh_backend(
                                         &cfg,
                                         &mut choice,
@@ -7436,7 +8046,7 @@ fn session_body(
                             // re-probe telemetry only when the URL changed
                             // (verbose-only; dropping the old receiver stops
                             // the previous background sampler, #412/#414).
-                            cfg = crate::resolve_runtime_or_default();
+                            reresolve(&mut cfg, color, verbose);
                             let url_changed = refresh_backend(
                                 &cfg,
                                 &mut choice,
@@ -7518,7 +8128,8 @@ fn session_body(
                     // session picks up edits, then derive everything from it.
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
-                    cfg = crate::resolve_runtime_or_default();
+                    reresolve(&mut cfg, color, verbose);
+                    refresh_prompt_override!();
                     // Ephemeral is a session-wide decision (17.7): a config
                     // refresh never re-grows a store handle mid-session.
                     if !ephemeral_session {
@@ -8152,6 +8763,7 @@ fn session_body(
                     let eff_context_window = context_window.full_window;
                     let eff_safe_context = context_window.safe_context;
                     let eff_max_ok_input = context_window.max_ok_input;
+                    last_exposure_budget = eff_safe_context.map(|s| s as usize);
 
                     // Memory providers keep their history but follow the
                     // currently selected model's budget. Rebinding every turn
@@ -8238,62 +8850,42 @@ fn session_body(
                         ),
                     );
                     // #2937: name each piece so the request report can attribute it (TUI preview: #2959).
+                    refresh_prompt_override!();
+                    let turn_components = cfg.prompt_components().unwrap_or_default();
                     let ws_state = workspace_state_block(workspace, &turn_caveats.fs_read);
-                    let runtime_ctx = runtime_context_block(
+                    let runtime_ctx = runtime_context_parts(
                         &inf_model,
                         &inf_url,
                         inf_kind,
                         &session_identity,
                         turn_disposition,
                     );
-                    report_sink.annotate(
-                        "workspace state",
-                        "newt-tui workspace_state_block",
-                        &ws_state,
-                    );
-                    report_sink.annotate(
-                        "runtime context",
-                        "newt-tui runtime_context_block",
-                        &runtime_ctx,
-                    );
-                    report_sink.annotate(
-                        "session controls",
-                        "newt-tui session_control_prompt",
-                        &session_controls,
-                    );
-                    let mut turn_system = format!(
-                        "{ws_state}\n\nCurrent command working directory: {}. \
-                         run_command without cwd starts here. Explicit relative cwd and \
-                         relative file-tool paths resolve from the workspace root. \
-                         This does not change granted access.\n\n{runtime_ctx}\n\n{system}\n\n{session_controls}",
-                        serde_json::json!(session_cwd),
-                    );
-                    // Resolve current tab overrides against the current persona
-                    // on every accepted turn. Never bake style into the frozen
-                    // system/history: switching or clearing a persona must not
-                    // leave an old block behind. Unspecified style adds no bytes.
                     let communication_style = tabs
                         .active()
                         .sidecar
                         .personality
                         .resolve(active_persona.as_ref().and_then(|p| p.profile.personality))
                         .prompt_block();
-                    if !communication_style.is_empty() {
-                        report_sink.annotate(
-                            "communication style",
-                            "newt-tui personality prompt_block",
-                            &communication_style,
-                        );
-                        turn_system.push_str("\n\n");
-                        turn_system.push_str(&communication_style);
+                    // Resolve current tab overrides against the current persona
+                    // on every accepted turn. Never bake style into the frozen
+                    // system/history: switching or clearing a persona must not
+                    // leave an old block behind. Unspecified style adds no bytes.
+                    let assembled = crate::turn_system::assemble_turn_system(
+                        &crate::turn_system::TurnSystemParts {
+                            ws_state: &ws_state,
+                            session_cwd: &session_cwd,
+                            runtime: &runtime_ctx,
+                            components: &turn_components,
+                            system: &system,
+                            session_controls: &session_controls,
+                            communication_style: &communication_style,
+                            is_clarification_answer,
+                        },
+                    );
+                    for n in &assembled.notes {
+                        report_sink.annotate(&n.label, &n.source, &n.text);
                     }
-                    if is_clarification_answer {
-                        turn_system = format!(
-                            "<clarification_context>\n\
-                             This accepted operator line is a clarification continuation. The protected prompt card names its objective root; use prompt_read {{\"address\":\"root\"}} to re-read the original objective before acting whenever the answer alone is insufficient.\n\
-                             </clarification_context>\n\n{turn_system}"
-                        );
-                    }
+                    let mut turn_system = assembled.text;
                     // Step 26.4 / 27.4: the working-memory head (usage hints, then
                     // the <state> block) rides the ephemeral message[0] and is NEVER
                     // persisted to the log. Shared with the headless driver (#2314).
@@ -8464,6 +9056,16 @@ fn session_body(
                     let plan = scheduled_on
                         .then(|| newt_core::plan_block(&step_ledger))
                         .flatten();
+                    // #2938: the operator's file is the whole system message;
+                    // nothing the session assembled rides along.
+                    let turn_system = crate::system_prompt_edit::turn_system_text(
+                        last_override
+                            .as_ref()
+                            .ok()
+                            .and_then(Option::as_ref)
+                            .map(|o| o.text.as_str()),
+                        || turn_system,
+                    );
                     let messages = messages_with_plan(
                         memory.build_messages(&turn_system, &task),
                         plan.as_deref(),
@@ -8853,6 +9455,7 @@ fn session_body(
                             &mut where_is_index,
                             &mut nav_session,
                             &index_status,
+                            newt_core::config::context_index_enabled(&cfg),
                         );
                     }
                     // The core sees this collaborator only in human-selected
@@ -8990,9 +9593,15 @@ fn session_body(
                                         // Default `full` = identity (unchanged
                                         // advertised catalog); `auto`/`minimal`
                                         // size the schema set to the live budget.
-                                        exposure: newt_core::ExposureSettings::from(
-                                            cfg.tool_exposure(),
-                                        ),
+                                        exposure: newt_core::ExposureSettings {
+                                            // #2938: a system prompt file is the
+                                            // whole system message.
+                                            verbatim_system: matches!(last_override, Ok(Some(_))),
+                                            // `[prompt] components`: `card` off (config load
+                                            // checked its tools are hidden).
+                                            omit_card: !turn_components.is_on_id("card"),
+                                            ..newt_core::ExposureSettings::from(cfg.tool_exposure())
+                                        },
                                         // Step 26.6a (#585): the experiential store
                                         // for record/recall — Some only when on.
                                         experience_store: experiential_on.then_some(
@@ -9319,6 +9928,21 @@ fn session_body(
                                     turn_end_reason,
                                     turn_round_cap_hit,
                                 );
+                                // Same knob as tool output: `/spill summary`
+                                // folds the report, `/spill excerpt` shows it.
+                                #[cfg(feature = "live-spill")]
+                                let display_reply =
+                                    observed_report_folds(surface_is_rich, spill_summary_override)
+                                        .then(|| {
+                                            fold_observed_report(&display_reply, |report| {
+                                                use newt_core::agentic::CompletedSpillRenderer;
+                                                completed_spills
+                                                    .retain(report)
+                                                    .map(|id| completed_spills.recovery_hint(&id))
+                                            })
+                                        })
+                                        .flatten()
+                                        .unwrap_or(display_reply);
                                 if was_streamed && paused {
                                     // The model text was emitted incrementally;
                                     // only the deterministic footer remains to be

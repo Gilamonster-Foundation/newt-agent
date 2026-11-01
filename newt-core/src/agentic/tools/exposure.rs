@@ -82,6 +82,7 @@ const EXPOSURE_CLASSES: &[(&str, ExposureClass)] = &[
     ("render_report", ExposureClass::RecoveryOnly),
     // ByIntent: loaded when the task points at them.
     ("lifecycle", ExposureClass::ByIntent),
+    ("propose_config_edit", ExposureClass::ByIntent),
     ("save_note", ExposureClass::ByIntent),
     ("recall", ExposureClass::ByIntent),
     ("git", ExposureClass::ByIntent),
@@ -110,6 +111,7 @@ const EXPOSURE_CLASSES: &[(&str, ExposureClass)] = &[
     ("enter_plan_mode", ExposureClass::ByIntent),
     ("exit_plan_mode", ExposureClass::ByIntent),
     ("select_operating_mode", ExposureClass::ByIntent),
+    ("mcp_status", ExposureClass::ByIntent),
 ];
 
 /// The exposure class of a tool by name. Base tools are `Kernel`; a name found
@@ -159,6 +161,13 @@ pub struct ExposureSettings {
     /// When `true`, `write_file`, `edit_file`, and `delete_file` are hidden
     /// regardless of `profile` or `allow_list`.
     pub read_only: bool,
+    /// The operator's own system prompt file is in force (#2938): the request
+    /// carries that text as the only system message, so the harness adds none
+    /// of its own (active-prompt card, observed facts, output planning).
+    pub verbatim_system: bool,
+    /// `[prompt] components` switched `card` off (#2933): the driver adds no
+    /// active-prompt card, and only that; the rest of the harness text stays.
+    pub omit_card: bool,
 }
 
 impl Default for ExposureSettings {
@@ -169,6 +178,8 @@ impl Default for ExposureSettings {
             max_initial_tools: 0,
             allow_list: None,
             read_only: false,
+            verbatim_system: false,
+            omit_card: false,
         }
     }
 }
@@ -181,6 +192,8 @@ impl From<crate::config::ToolExposureConfig> for ExposureSettings {
             max_initial_tools: c.max_initial_tools,
             allow_list: c.allow_list,
             read_only: c.read_only,
+            verbatim_system: false,
+            omit_card: false,
         }
     }
 }
@@ -216,49 +229,27 @@ impl ExposureSettings {
         }
     }
 
-    /// Render an identity prompt so it names only operator-visible tools: the
-    /// `You have tools: …` line is rewritten to the visible subset and any
-    /// paragraph that names a hidden built-in is dropped. Identity without an
-    /// operator filter is returned unchanged.
+    /// The system prompt's identity and rules, built from the components `components`
+    /// leaves on and naming only operator-visible tools (#2932, #2933): a component
+    /// whose tools are hidden is dropped and the tool line lists the visible ones.
+    /// `coach` selects the coach altitude's set instead of the doer's.
     #[must_use]
-    pub fn render_identity<'a>(&self, identity: &'a str) -> std::borrow::Cow<'a, str> {
-        if !self.has_operator_filter() {
-            return std::borrow::Cow::Borrowed(identity);
-        }
-        let hidden_names = |text: &str| {
-            super::catalog::ALL_TOOL_NAMES
-                .iter()
-                .any(|name| !self.operator_visible(name) && mentions_tool(text, name))
-        };
-        let paragraphs: Vec<String> = identity
-            .split("\n\n")
-            .filter_map(|paragraph| {
-                // The tool sentence may sit mid-paragraph ("You are newt… You
-                // have tools: …"): rewrite it in place, then judge the rest.
-                let rewritten = match paragraph.find(TOOL_LINE_PREFIX) {
-                    Some(at) => {
-                        let (head, rest) = paragraph.split_at(at + TOOL_LINE_PREFIX.len());
-                        let (names, tail) = rest.split_once('.').unwrap_or((rest, ""));
-                        let kept: Vec<&str> = names
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|name| !name.is_empty() && self.operator_visible(name))
-                            .collect();
-                        format!("{head}{}.{tail}", kept.join(", "))
-                    }
-                    None => paragraph.to_owned(),
-                };
-                (!hidden_names(&rewritten)).then_some(rewritten)
-            })
-            .collect();
-        std::borrow::Cow::Owned(paragraphs.join("\n\n"))
+    pub fn render_soul(
+        &self,
+        components: &crate::prompt_components::ComponentSet,
+        coach: bool,
+    ) -> String {
+        crate::prompt_components::render_soul(
+            &|c| components.is_on(c),
+            &|tool| self.operator_visible(tool),
+            components.preset(),
+            coach,
+        )
     }
 }
 
-/// The sentence prefix an identity uses to enumerate its tools.
-const TOOL_LINE_PREFIX: &str = "You have tools: ";
-
 /// Whether `text` names `tool` as a whole word (`edit_file`, not `edit_files`).
+#[cfg(test)]
 fn mentions_tool(text: &str, tool: &str) -> bool {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
     text.match_indices(tool).any(|(at, _)| {
@@ -1176,18 +1167,19 @@ mod tests {
     /// #2950 review 1: the identity prompt names only operator-visible tools.
     #[test]
     fn identity_prompt_names_only_operator_visible_tools() {
-        let soul = crate::DEFAULT_SOUL;
-        assert_eq!(
-            ExposureSettings::default().render_identity(soul),
-            soul,
-            "no operator filter → identity unchanged"
-        );
+        let components = crate::prompt_components::ComponentSet::default();
+        // No operator filter: the registry's default soul, whole oracle minus the
+        // `present-findings` paragraph (a skill now).
+        let default = ExposureSettings::default().render_soul(&components, false);
+        assert_eq!(default, crate::prompt_components::default_soul(&|_| true));
+        assert!(!default.contains("**Present findings"));
+        assert!(crate::DEFAULT_SOUL.contains("**Present findings"));
 
         let read_only = ExposureSettings {
             read_only: true,
             ..Default::default()
         };
-        let rendered = read_only.render_identity(soul);
+        let rendered = read_only.render_soul(&components, false);
         for hidden in WRITE_TOOL_NAMES {
             assert!(
                 !mentions_tool(&rendered, hidden),
@@ -1205,10 +1197,10 @@ mod tests {
             ),
             ..Default::default()
         };
-        let rendered = four.render_identity(soul);
+        let rendered = four.render_soul(&components, false);
         let line = rendered
             .lines()
-            .find(|l| l.contains(TOOL_LINE_PREFIX))
+            .find(|l| l.contains("You have tools: "))
             .expect("tool line survives");
         assert!(
             line.contains("You have tools: run_command, read_file, write_file, edit_file."),
@@ -1216,6 +1208,43 @@ mod tests {
         );
         assert!(!mentions_tool(&rendered, "render_report"));
         assert!(!mentions_tool(&rendered, "list_dir"));
+    }
+
+    /// The coach altitude's set is chosen by the flag, with its own heading, and is the
+    /// doer's neither in text nor in tools.
+    #[test]
+    fn the_coach_soul_is_its_own_component_set() {
+        let components = crate::prompt_components::ComponentSet::default();
+        let coach = ExposureSettings::default().render_soul(&components, true);
+        assert_eq!(coach, crate::COACH_SOUL);
+        assert!(coach.contains("## How to coach") && !coach.contains("## How to work"));
+        assert!(!coach.contains("You have tools:"));
+    }
+
+    /// #2933 ratchet: a component's `requires_tools` is exactly the built-in tools its
+    /// text names, so the declaration cannot drift from the words the model reads.
+    #[test]
+    fn component_requirements_are_the_tools_the_text_names() {
+        use crate::prompt_components::{COACH, SOUL};
+        let all = |_: &str| true;
+        for c in SOUL.iter().chain(COACH).filter(|c| c.id != "tools") {
+            let text = crate::prompt_components::render_soul(
+                &|x| x.id == c.id,
+                &all,
+                crate::prompt_components::Preset::Default,
+                c.is_coach(),
+            );
+            let named: Vec<&str> = super::super::catalog::ALL_TOOL_NAMES
+                .iter()
+                .copied()
+                .filter(|t| mentions_tool(&text, t))
+                .collect();
+            let mut declared = c.requires_tools.to_vec();
+            declared.sort_unstable();
+            let mut named_sorted = named.clone();
+            named_sorted.sort_unstable();
+            assert_eq!(declared, named_sorted, "component `{}`", c.id);
+        }
     }
 
     #[test]

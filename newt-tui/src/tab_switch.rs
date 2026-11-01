@@ -285,6 +285,7 @@ impl TabSwitchCtx<'_> {
     fn reset_to_clean_conversation(&mut self) {
         self.compress_state.reset();
         let mut reset = crate::ConversationResetContext {
+            cfg: self.cfg,
             memory: self.memory,
             system: self.system,
             conversation_id: self.active_conversation_id,
@@ -317,6 +318,7 @@ impl TabSwitchCtx<'_> {
                 // Built WITHOUT the stores: commit cannot perform a fallible
                 // read because it has nothing to read from.
                 let mut commit = crate::CommitContext {
+                    cfg: self.cfg,
                     workspace: self.workspace,
                     memory: self.memory,
                     system: self.system,
@@ -348,11 +350,12 @@ impl TabSwitchCtx<'_> {
                     .and_then(|s| s.persona.clone());
                 *self.active_persona = seeded;
                 crate::seat_persona_dials(self.active_persona.as_ref());
-                *self.system = crate::rebuild_system_prompt(
+                *self.system = crate::rebuild_system_prompt_for(
                     self.workspace,
                     self.memory,
                     self.active_persona.as_ref(),
                     self.active_conversation_id,
+                    self.cfg,
                     self.report_sink,
                 );
             }

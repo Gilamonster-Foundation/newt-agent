@@ -329,6 +329,83 @@ fn matching_packs<'a>(repo_dir: &Path, packs: &'a [ToolingPack]) -> Vec<&'a Tool
         .collect()
 }
 
+/// #3040: the in-band note for a `pyo3` pick that only the two coexisting
+/// manifests made. The pick is unchanged; the note makes it visible.
+const DUAL_MANIFEST_NOTE: &str = "note: detected pyo3 pack — dual-manifest root (Cargo.toml and \
+     pyproject.toml, but no pyo3 dependency or Rust extension build backend); override with \
+     `[lifecycle]` in .newt/config.toml if unintended";
+
+/// #3040: `Some(note)` when `phase` at `repo_dir` resolves through the `pyo3`
+/// pack without real PyO3 evidence. A `[lifecycle]` override means no pack was
+/// used, so there is nothing to annotate. `read` returns a manifest's text
+/// only when the caller's own read authority admits it (#3050 review); a
+/// manifest it cannot read is unknown evidence, so no note is claimed.
+#[must_use]
+pub fn detection_note(
+    repo_dir: &Path,
+    phase: Phase,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Option<&'static str> {
+    if LIFECYCLE_OVERRIDE
+        .get()
+        .and_then(|c| c.get(phase))
+        .is_some()
+    {
+        return None;
+    }
+    let picked = matching_packs(repo_dir, &merged_packs())
+        .iter()
+        .any(|p| p.name == "pyo3");
+    if !picked {
+        return None;
+    }
+    let cargo = read(&repo_dir.join("Cargo.toml"))?;
+    let pyproject = read(&repo_dir.join("pyproject.toml"))?;
+    (!has_pyo3_evidence(&cargo, &pyproject)).then_some(DUAL_MANIFEST_NOTE)
+}
+
+/// What a real PyO3 root carries: a dependency on the `pyo3` crate in its
+/// Cargo.toml — by key or `package = "pyo3"` rename, in `[dependencies]`,
+/// `[workspace.dependencies]` or any `[target.*.dependencies]` — or a Rust
+/// extension build backend in pyproject.toml (maturin or setuptools-rust).
+/// Unparseable manifests count as no evidence.
+fn has_pyo3_evidence(cargo: &str, pyproject: &str) -> bool {
+    let cargo = toml::from_str::<toml::Value>(cargo).ok();
+    let pyproject = toml::from_str::<toml::Value>(pyproject).ok();
+    let names_pyo3 = |deps: Option<&toml::Value>| {
+        deps.and_then(toml::Value::as_table).is_some_and(|deps| {
+            deps.iter().any(|(key, spec)| {
+                key == "pyo3" || spec.get("package").and_then(toml::Value::as_str) == Some("pyo3")
+            })
+        })
+    };
+    let dependency = cargo.as_ref().is_some_and(|c| {
+        names_pyo3(c.get("dependencies"))
+            || names_pyo3(c.get("workspace").and_then(|w| w.get("dependencies")))
+            || c.get("target")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|targets| {
+                    targets
+                        .values()
+                        .any(|target| names_pyo3(target.get("dependencies")))
+                })
+    });
+    let build = pyproject.as_ref().and_then(|p| p.get("build-system"));
+    let backend = build
+        .and_then(|b| b.get("build-backend"))
+        .and_then(toml::Value::as_str);
+    let requires_rust_builder = build
+        .and_then(|b| b.get("requires"))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|requires| {
+            requires.iter().filter_map(toml::Value::as_str).any(|req| {
+                let name = req.trim_start().to_ascii_lowercase().replace('_', "-");
+                name.starts_with("setuptools-rust") || name.starts_with("maturin")
+            })
+        });
+    dependency || backend == Some("maturin") || requires_rust_builder
+}
+
 /// The repo's `[lifecycle]` override, published once when runtime settings apply.
 static LIFECYCLE_OVERRIDE: OnceLock<PhaseCommands> = OnceLock::new();
 

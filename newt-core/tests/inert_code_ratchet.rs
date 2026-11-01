@@ -842,13 +842,7 @@ const SANCTIONS: &[Unit] = &[
                 "newt-core/src/memory.rs",
                 "impl MemoryProvider for MemoryIndex",
                 "async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}",
-                "System-prompt-only (like NoteStore / SoulProvider)"
-            ),
-            scoped_explained(
-                "newt-core/src/memory.rs",
-                "impl MemoryProvider for SoulProvider",
-                "async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}",
-                "Soul is system-prompt-only"
+                "System-prompt-only (like NoteStore)"
             ),
             explained(
                 "newt-core/src/notes.rs",

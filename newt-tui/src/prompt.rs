@@ -143,6 +143,11 @@ pub const PROMPT_TOKENS: &[(&str, &str, &str)] = &[
     ("$WS", "\\w", "workspace basename"),
     ("$PATH", "\\W", "full workspace path"),
     ("$VERSION", "\\v", "newt version"),
+    (
+        "$TOOLS",
+        "\\T",
+        "tool profile (pi / read-only / N tools); empty when the model sees every tool",
+    ),
 ];
 
 /// Strip one matching pair of surrounding quotes (`"` or `'`), if present.
@@ -242,6 +247,26 @@ pub(crate) fn expand_prompt_tokens(
     model: &str,
     is_vi: bool,
 ) -> String {
+    // #2932: the tool profile rides the same per-turn config read the
+    // template itself comes from — resolved only when a template asks for it,
+    // so the common prompt costs nothing extra.
+    let tools = if template.contains("$TOOLS") || template.contains("\\T") {
+        crate::settings_form::tool_exposure_setting()
+            .status_label()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    expand_prompt_tokens_with(template, workspace, model, is_vi, &tools)
+}
+
+fn expand_prompt_tokens_with(
+    template: &str,
+    workspace: &str,
+    model: &str,
+    is_vi: bool,
+    tools: &str,
+) -> String {
     let ws_base = std::path::Path::new(workspace)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -266,6 +291,7 @@ pub(crate) fn expand_prompt_tokens(
         // (`$TIMESTAMP` before `$TIME`, `$MODEL` before `$MODE`) so a short
         // name never clobbers a longer one.
         .replace("$TIMESTAMP", &timestamp)
+        .replace("$TOOLS", tools)
         .replace("$DATE", &date)
         .replace("$TIME", &time)
         .replace("$MODEL", model)
@@ -280,6 +306,7 @@ pub(crate) fn expand_prompt_tokens(
         .replace("\\w", &ws_base)
         .replace("\\h", &host)
         .replace("\\u", &user)
+        .replace("\\T", tools)
         .replace("\\t", &timestamp)
         .replace("\\m", model)
         .replace("\\M", mode)
@@ -290,6 +317,23 @@ pub(crate) fn expand_prompt_tokens(
 mod footer_tests {
     use super::*;
     use newt_core::FooterMode;
+
+    /// #2932: `$TOOLS` / `\T` carry the tool profile, and expand to nothing
+    /// under the open default so a template that names them costs no width.
+    #[test]
+    fn the_tools_token_expands_to_the_profile_or_nothing() {
+        let shown = expand_prompt_tokens_with("[$TOOLS] \\T ❯ ", "/w", "m", false, "pi");
+        assert_eq!(shown, "[pi] pi ❯ ");
+        let open = expand_prompt_tokens_with("[$TOOLS] \\T ❯ ", "/w", "m", false, "");
+        assert_eq!(open, "[]  ❯ ");
+        // `\T` is distinct from `\t` (the timestamp): ordering must not let
+        // one clobber the other.
+        let both = expand_prompt_tokens_with("\\T|\\t", "/w", "m", false, "read-only");
+        assert!(both.starts_with("read-only|20"), "{both}");
+        assert!(PROMPT_TOKENS
+            .iter()
+            .any(|(name, terse, _)| *name == "$TOOLS" && *terse == "\\T"));
+    }
 
     #[test]
     fn rich_follows_mode_and_tty() {

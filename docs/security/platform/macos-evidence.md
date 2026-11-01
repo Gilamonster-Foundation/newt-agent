@@ -15,8 +15,9 @@ cargo test -p newt-core --features macos-seatbelt \
   --test macos_seatbelt_adversarial -- --ignored --test-threads=1
 ```
 
-Backend: agent-bridle 0.7.15 `SeatbeltSandbox` (feature `os-sandbox` →
-`macos-seatbelt`, compiled in on macOS). Confinement is a `sandbox-exec -p
+Backend: `SeatbeltSandbox` from the vendored agent-bridle 0.8.0-rc.6 (feature
+`os-sandbox` → `macos-seatbelt`, compiled in on macOS). The 16/16 run above was
+recorded against agent-bridle 0.7.15 and has not been repeated on rc.6. Confinement is a `sandbox-exec -p
 <SBPL profile>` wrapper the child inherits; every enforcement test pins
 `sandbox_kind == SandboxKind::Seatbelt` so a DENY can never be confused with
 command-not-found or a silent advisory downgrade.

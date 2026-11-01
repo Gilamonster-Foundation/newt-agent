@@ -93,6 +93,34 @@ fn transcript_pager_child() {
             let _ = std::io::stdin().read(&mut byte);
             panic!("synthetic failure after pager entry (#1677 restoration proof)");
         }
+        // #3016: the F4 fold list over one retained spill of ten lines.
+        #[cfg(feature = "live-spill")]
+        "folds" => {
+            use std::os::fd::AsFd as _;
+            let archive = crate::completed_spill::CompletedSpillArchive::default();
+            let body = (0..10).map(|i| format!("body-row-{i}")).collect::<Vec<_>>();
+            archive.retain(&body.join("\n"));
+            let out: std::fs::File = std::io::stdout()
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("dup the slave")
+                .into();
+            crate::transcript_pager::run_spill_picker(&archive.snapshot(), out)
+                .expect("fold list runs to a clean quit");
+        }
+        // #3023: F4 before anything is retained shows the empty notice.
+        #[cfg(feature = "live-spill")]
+        "empty-folds" => {
+            use std::os::fd::AsFd as _;
+            let archive = crate::completed_spill::CompletedSpillArchive::default();
+            let out: std::fs::File = std::io::stdout()
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("dup the slave")
+                .into();
+            crate::transcript_pager::run_spill_picker(&archive.snapshot(), out)
+                .expect("the empty fold list runs to a clean quit");
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -109,6 +137,17 @@ struct Outcome {
     exited_cleanly: bool,
 }
 
+fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().expect("the test binary re-invokes itself"))
+        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+        .env("NEWT_TRANSCRIPT_PTY_CHILD", mode)
+        .stdin(pty.slave_stdio())
+        .stdout(pty.slave_stdio())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the pty child")
+}
+
 /// Drive one child lifecycle end to end.
 ///
 /// `keys` are typed once the child has provably reached the alternate screen;
@@ -117,16 +156,7 @@ struct Outcome {
 /// so gets no signal from `TIOCSWINSZ` alone).
 fn drive(mode: &str, keys: &str, resize: bool) -> Outcome {
     let pty = Pty::open();
-    let mut child = std::process::Command::new(
-        std::env::current_exe().expect("the test binary re-invokes itself"),
-    )
-    .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
-    .env("NEWT_TRANSCRIPT_PTY_CHILD", mode)
-    .stdin(pty.slave_stdio())
-    .stdout(pty.slave_stdio())
-    .stderr(std::process::Stdio::null())
-    .spawn()
-    .expect("spawn the pty child");
+    let mut child = spawn_child(&pty, mode);
 
     let mut screen = String::new();
     let reached = {
@@ -261,4 +291,68 @@ fn a_panic_after_entry_still_restores_the_terminal() {
         out.screen
     );
     assert_terminal_restored("panic after entry", &out);
+}
+
+/// #3016: F4 is a fold list. Enter opens the selected spill; Space unfolds the selected item in place (the
+/// rows past the preview appear on the same screen), and `q` still hands the
+/// terminal back.
+#[cfg(feature = "live-spill")]
+#[serial_test::serial(transcript_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn space_unfolds_a_spill_in_place_in_the_f4_view() {
+    let pty = Pty::open();
+    let mut child = spawn_child(&pty, "folds");
+
+    // ratatui moves the cursor between words, so match one unbroken token.
+    let drew = pty.wait_for_screen("expand]", REACH_TIMEOUT);
+    assert!(
+        drew,
+        "the folded preview never drew; screen={:?}",
+        pty.screen()
+    );
+    assert!(
+        !pty.wait_for_screen("body-row-9", Duration::from_millis(200)),
+        "the last row must stay hidden while the item is folded"
+    );
+    pty.type_in(" ");
+    assert!(
+        pty.wait_for_screen("body-row-9", REACH_TIMEOUT),
+        "Space did not unfold the item in place"
+    );
+    assert!(
+        pty.wait_for_screen("\u{25be}", REACH_TIMEOUT),
+        "no unfolded marker"
+    );
+    pty.type_in("q");
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "child did not quit cleanly"
+    );
+    assert!(!pty.is_raw(), "the terminal was left in raw mode");
+}
+
+/// #3023 review: PageDown on the empty F4 view panicked in `FoldList::scroll`.
+#[cfg(feature = "live-spill")]
+#[serial_test::serial(transcript_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn paging_the_empty_f4_view_does_not_panic() {
+    let pty = Pty::open();
+    let mut child = spawn_child(&pty, "empty-folds");
+    assert!(
+        pty.wait_for_screen("retained", REACH_TIMEOUT),
+        "the empty notice never drew; screen={:?}",
+        pty.screen()
+    );
+    pty.type_in("\x1b[6~");
+    pty.type_in("\x1b[5~");
+    pty.type_in("q");
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the empty F4 view did not survive paging and quit cleanly"
+    );
+    assert!(!pty.is_raw(), "the terminal was left in raw mode");
 }

@@ -272,12 +272,6 @@ fn fuzzy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Convenience wrapper: apply a patch scoped to a single file's parent.
-pub fn edit(path: &Path, patch: &str) -> anyhow::Result<()> {
-    let root = path.parent().unwrap_or(Path::new("."));
-    apply_patch(root, patch)
-}
-
 /// Write a set of whole files into `workspace` atomically.
 ///
 /// For each `(relative_path, contents)` entry: create parent
@@ -1018,7 +1012,7 @@ mod tests {
 -line2
 +edited
 ";
-        edit(&file, diff).unwrap();
+        apply_patch(tmp.path(), diff).unwrap();
         let result = fs::read_to_string(&file).unwrap();
         assert_eq!(result, "line1\nedited\n");
     }
@@ -1099,7 +1093,7 @@ mod tests {
 @@ -1,1 +1,1 @@
  WRONG
 ";
-        let err = edit(&file, diff).unwrap_err();
+        let err = apply_patch(tmp.path(), diff).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("mismatch"), "expected mismatch error: {msg}");
     }

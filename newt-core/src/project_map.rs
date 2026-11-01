@@ -23,9 +23,7 @@ use std::path::Path;
 
 use crate::memory::{MemMessage, MemoryProvider, SessionContext};
 use crate::metrics::TurnMetrics;
-use crate::project_model::{
-    builtin_project_packs, scan_project, scan_project_cached, ProjectModel,
-};
+use crate::project_model::{builtin_project_packs, scan_project_persistent, ProjectModel};
 
 /// One curated pointer card from `.newt/workspace-map.toml` (spec §3.1). The
 /// `purpose` is the human one-line description a derive cannot infer.
@@ -127,11 +125,7 @@ impl MemoryProvider for ProjectMapProvider {
     async fn initialize(&mut self, ctx: &SessionContext) -> anyhow::Result<()> {
         let root = Path::new(&ctx.workspace);
         let packs = builtin_project_packs();
-        // Prefer the drift-cached scan (fast on a re-launch); fall back to a
-        // plain scan when the config dir is unavailable.
-        let model: Option<ProjectModel> = crate::Config::user_config_dir()
-            .and_then(|cfg| scan_project_cached(root, &packs, &cfg))
-            .or_else(|| scan_project(root, &packs));
+        let model = scan_project_persistent(root, &packs);
         self.block = model.and_then(|m| render_project_map(&m, &load_seed(root)));
         Ok(())
     }

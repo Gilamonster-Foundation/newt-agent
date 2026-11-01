@@ -147,6 +147,17 @@ fn run_platform() {
         "brush_deny_direct_denies_a_childs_socket",
         brush_deny_direct_denies_a_childs_socket,
     );
+    // agent-bridle#416 round-3 / newt#2673 regression: the trusted-worker
+    // control channel is now an audited stdio shape (ADR 0015 E7), so a
+    // `net: none` BrushShellTool spawn resolves a real bound instead of
+    // `Unknown` and admits. (A host-allowlist config stays out of scope —
+    // see the test's own doc comment.)
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    run_async_case(
+        &runtime,
+        "trusted_worker_net_none_runs_after_worker_control_audit",
+        trusted_worker_net_none_runs_after_worker_control_audit,
+    );
     run_async_case(
         &runtime,
         "command_substitution_keeps_inner_exec_independently_gated",
@@ -693,6 +704,84 @@ async fn brush_deny_direct_denies_a_childs_socket() {
         out["exit_code"], 0,
         "DenyDirect must deny the brush child's AF_INET socket creation: {out}"
     );
+}
+
+/// agent-bridle#416 round-3 / newt#2673 — the exact field-reported refusal
+/// this fix closes, reproduced with `net: none` (the `net_direct_denied`
+/// family this fix actually resolves — see the correction note below).
+/// Before ADR 0015 E7, the trusted-worker stdin control channel was
+/// `ConfinedStdio::Other` (never `Piped`/`Null`), so `stdio_audited` was
+/// false for EVERY `BrushShellTool` spawn; `SeatbeltSandbox::resolved_authority`
+/// (`agent_bridle_core::sandbox`) resolved `Unknown` for `net: none` under an
+/// incomplete deputy audit, and admission refused before the worker ever ran
+/// — even for a command that touches no network at all. Measured RED on
+/// agent-bridle main (`a37e78c`, before this fix): `Denied { reason:
+/// "...backend authority on the Net axis is not decidable..." }`, the exact
+/// field-reported shape. Green after: a purely local pipeline (`sed` piped
+/// to `grep`, no network touched) RUNS under `net: none`, because the
+/// control channel now audits as `ConfinedStdio::WorkerControl`.
+///
+/// **Narrowing (measured on the Mac test runner, 2026-10-02):** Bridle's own
+/// `seatbelt_net_projection` resolves `Unknown` for a RAW `Scope::Only` that
+/// is not `net_direct_denied` (every entry `unix:`/`mach:`-structural,
+/// including the empty set) REGARDLESS of `stdio_audited` — "Loopback and
+/// remote-host shapes stay Unknown under either state" (`sandbox.rs`,
+/// `seatbelt_net_projection`'s own doc comment). Verified empirically: the
+/// same test with `net: Scope::only(["127.0.0.1:65535"])` handed DIRECTLY to
+/// Bridle (no caller-side narrowing) still refuses on THIS fix's branch,
+/// identically to main. That is the pre-existing, separate, documented
+/// `#124` remote-host-allowlist frontier (ADR 0015's original 2026-06-30
+/// scope, predating #416/#405 entirely) — out of scope for this fix, which
+/// only closes the stdio-posture gap for the direct-denied family. **This
+/// is a limit on Bridle taking a raw host list directly, not on the
+/// operator's field config:** newt-agent's own `shell.rs`
+/// (`dispatch_caveats_for_command`/`spawn_net_scope`) narrows the operator's
+/// `[tui.permissions] net = ["host:port"]` allow-list to `net: none` before
+/// it ever reaches Bridle, so Bridle only ever sees the `net: none` shape
+/// this fix resolves — confirmed end-to-end on newt-agent #2680's Mac TUI
+/// probe under the operator's real config, no refusal. Resolving a RAW
+/// host-allowlist handed directly to Bridle still needs the
+/// local-egress-proxy mechanism wired into `TrustedWorker` admission, a
+/// separate, materially larger change (`#124`).
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+async fn trusted_worker_net_none_runs_after_worker_control_audit() {
+    use agent_bridle_core::seatbelt_is_supported;
+    if !seatbelt_is_supported() {
+        eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+        return;
+    }
+    let file = unique_temp("worker-control-net-none.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write fixture");
+
+    let caveats = Caveats {
+        exec: Scope::only(["sed".to_string(), "grep".to_string()]),
+        net: Scope::none(),
+        ..Caveats::top()
+    };
+    let out = tool()
+        .invoke(
+            serde_json::json!({ "cmd": format!("sed -n '1,3p' {} | grep two", file.display()) }),
+            &ctx(caveats),
+        )
+        .await
+        .expect("invoke");
+
+    assert_ne!(
+        out["denied"], true,
+        "a net:none spawn must admit once the worker control channel \
+         is audited (ADR 0015 E7): {out}"
+    );
+    assert_eq!(
+        out["exit_code"], 0,
+        "the local pipeline must actually run and succeed: {out}"
+    );
+    assert_eq!(
+        out["stdout"].as_str().unwrap_or_default().trim(),
+        "two",
+        "the piped command must have actually executed, not merely been admitted: {out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
 }
 
 /// Syntax consent is not exec consent: even when Brush interprets `$()`, the

@@ -52,6 +52,7 @@ fn skill_search_dirs_preserves_configured_order() {
         skills: Some(SkillsConfig {
             search: vec!["/abs/one".into(), "/abs/two".into()],
             bundled_dir: String::new(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -67,6 +68,7 @@ fn skill_search_dirs_expands_tilde() {
         skills: Some(SkillsConfig {
             search: vec!["~/skills-x".into()],
             bundled_dir: String::new(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -86,6 +88,7 @@ fn skill_search_dirs_appends_bundled_dir_last() {
         skills: Some(SkillsConfig {
             search: vec!["/abs/user".into()],
             bundled_dir: "/abs/bundled".into(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -104,6 +107,7 @@ fn skill_search_dirs_bundled_after_default_when_search_empty() {
         skills: Some(SkillsConfig {
             search: vec![],
             bundled_dir: "/abs/bundled".into(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -123,6 +127,7 @@ fn skill_search_dirs_bundled_after_default_when_search_empty() {
         skills: Some(SkillsConfig {
             search: vec![],
             bundled_dir: String::new(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -143,6 +148,7 @@ fn skill_search_dirs_append_the_checkout_bundled_default_when_unset() {
         skills: Some(SkillsConfig {
             search: vec!["/abs/user".into()],
             bundled_dir: String::new(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -166,6 +172,7 @@ fn a_configured_bundled_dir_beats_the_checkout_default() {
         skills: Some(SkillsConfig {
             search: vec![],
             bundled_dir: "/explicit/bundled".into(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -186,6 +193,7 @@ fn skill_install_dir_is_the_first_configured_root() {
         skills: Some(SkillsConfig {
             search: vec!["/abs/first".into(), "/abs/second".into()],
             bundled_dir: "/abs/bundled".into(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -220,6 +228,7 @@ fn skills_search_round_trips_through_toml() {
         skills: Some(SkillsConfig {
             search: vec!["~/.newt/skills".into(), "~/.claude/skills".into()],
             bundled_dir: String::new(),
+            ..Default::default()
         }),
         ..Config::default()
     };
@@ -229,4 +238,57 @@ fn skills_search_round_trips_through_toml() {
         back.skills.unwrap().search,
         vec!["~/.newt/skills".to_string(), "~/.claude/skills".to_string()]
     );
+}
+
+/// `[skills] off`: an off skill is not listed and cannot be loaded by name; the rest
+/// are untouched, and turning it back on restores both.
+#[test]
+fn an_off_skill_is_neither_listed_nor_loadable() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["alpha", "beta"] {
+        let skill = dir.path().join(name);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: the {name} skill\n---\nBody of {name}.\n"),
+        )
+        .unwrap();
+    }
+    let toml = |off: &str| {
+        format!(
+            "[skills]\nsearch = [{:?}]\n{off}",
+            dir.path().display().to_string()
+        )
+    };
+    let on: Config = toml::from_str(&toml("")).unwrap();
+    assert!(on
+        .load_skill_body("alpha")
+        .unwrap()
+        .contains("Body of alpha"));
+    assert!(on.skills_on().iter().any(|s| s.name == "alpha"));
+
+    let off: Config = toml::from_str(&toml("off = [\"alpha\"]\n")).unwrap();
+    let err = off.load_skill_body("alpha").unwrap_err().to_string();
+    assert!(
+        err.contains("switched off") && err.contains("/settings skills on alpha"),
+        "{err}"
+    );
+    assert!(off.load_skill_body("beta").is_ok());
+    let names: Vec<_> = off.skills_on().into_iter().map(|s| s.name).collect();
+    assert!(
+        names.contains(&"beta".to_string()) && !names.contains(&"alpha".to_string()),
+        "{names:?}"
+    );
+}
+
+/// The writer keeps comments and drops the key when nothing is off.
+#[test]
+fn with_skills_off_keeps_decoration_and_drops_an_empty_list() {
+    let text = "# mine\n[skills]\nsearch = [\"~/s\"] # where\noff = [\"a\"] # old\n";
+    let out = Config::with_skills_off(text, &["a", "b"]).unwrap();
+    assert!(out.contains("# mine") && out.contains("# where"), "{out}");
+    assert!(out.contains("\"a\", \"b\""), "{out}");
+    let cleared = Config::with_skills_off(&out, &[]).unwrap();
+    assert!(!cleared.contains("off"), "{cleared}");
+    assert!(cleared.contains("search"), "{cleared}");
 }

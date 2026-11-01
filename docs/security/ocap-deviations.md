@@ -65,7 +65,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
-| `governed-push-macos-net-unrestricted` | confined fetch uses net=none on every platform | 🟠 ACTIVE (macos) | (macOS-only: Seatbelt cannot kernel-enforce net=none; confined fetch uses net=Scope::All; fs is enforced via fd-based O_NOFOLLOW walk, exec not yet separately confined in copy; copy-side exec follow-up: #2661; net follow-up: #2662) |
+| `governed-push-macos-net-unrestricted` | confined fetch uses net=none on every platform | 🟠 ACTIVE (macos) | (macOS-only: the vendored agent-bridle 0.8.0-rc.6 admits net=none and reports net Kernel for an unprivileged spawn with audited (piped/null) stdio, but the confined fetch has not adopted it and still uses net=Scope::All; fs is enforced via fd-based O_NOFOLLOW walk, exec not yet separately confined in copy; copy-side exec follow-up: #2661; net follow-up: #2662) |
 | `governed-push-macos-copy-fence-path-bound` | the confined copy's read fence anchors on the held root objects | 🟠 ACTIVE (macos) | (macOS-only, residual #8: Seatbelt admits paths, so a root swapped between the identity check and the profile may be read by the confined fetch; what is pushed is fixed by oid. Linux anchors on the held descriptors) |
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
 | `local-deputy-egress` | no indirect egress via a host AF_UNIX / Windows named-pipe deputy | 🟠 ACTIVE (linux/windows) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
