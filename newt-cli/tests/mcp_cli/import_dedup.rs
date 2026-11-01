@@ -303,3 +303,64 @@ fn force_import_keeps_comments_and_counts_an_identical_entry_unchanged() {
         "{updated}"
     );
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn force_import_refuses_to_carry_headers_to_a_changed_endpoint() {
+    // #2915 review (P1): a new URL must not inherit the old destination's
+    // Authorization header. Refuse without echoing the header or the URLs.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let original = "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\nheaders = { Authorization = \"Bearer ${REVIEW_FAKE_TOKEN}\" }\n";
+    std::fs::write(&mcp, original).unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://new.example.test/mcp" } } }"#,
+    )
+    .failure()
+    .stderr(predicate::str::contains("refusing to send"))
+    .stderr(predicate::str::contains("REVIEW_FAKE_TOKEN").not())
+    .stderr(predicate::str::contains("example.test").not());
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), original);
+
+    // Headers the source supplies itself are not a transfer.
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://new.example.test/mcp",
+              "headers": { "Authorization": "Bearer ${NEW_FAKE_TOKEN}" } } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains("Endpoint changed for fs"));
+    let servers = newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&mcp).unwrap());
+    assert_eq!(
+        servers[0].headers.get("Authorization"),
+        Some(&newt_core::mcp::SecretValue::literal(
+            "Bearer ${NEW_FAKE_TOKEN}"
+        ))
+    );
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn force_import_names_the_auth_consequence_of_a_resource_change() {
+    // #2915: a saved login is bound to the exact resource, so `/mcp` → `/mcp/`
+    // makes it ineligible. Say so instead of generic overwrite advice.
+    let sb = sandbox();
+    std::fs::write(
+        sb.config_dir.join("mcp.toml"),
+        "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://api.example.test/mcp\"\n",
+    )
+    .unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://api.example.test/mcp/" } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "Endpoint changed for fs: a saved login for the previous endpoint is not used",
+    ));
+}

@@ -1747,9 +1747,10 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     if let Some(migration) = newt_core::psyche_import::migrate_config_text(&doc) {
         doc = migration.text;
     }
-    let existing: std::collections::BTreeSet<String> = parse_mcp_config(&doc, &target)?
-        .into_iter()
-        .map(|entry| entry.name)
+    let existing_entries = parse_mcp_config(&doc, &target)?;
+    let existing: std::collections::BTreeSet<String> = existing_entries
+        .iter()
+        .map(|entry| entry.name.clone())
         .collect();
     let breakout_existing: std::collections::BTreeSet<String> =
         if target_destination == breakout_destination {
@@ -1833,6 +1834,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let mut replaced = 0usize;
     let mut higher_precedence_replacements = 0usize;
     let mut unchanged = 0usize;
+    let mut moved: Vec<&str> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut adopted = Vec::new();
     for entry in &imported {
@@ -1868,6 +1870,16 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                     );
                 }
                 if exists_in_target {
+                    let previous_url = existing_entries
+                        .iter()
+                        .find(|existing| existing.name == entry.name)
+                        .and_then(|existing| existing.url.as_deref());
+                    if previous_url.is_some()
+                        && entry.url.is_some()
+                        && newt_core::mcp::mcp_endpoint_changed(previous_url, entry.url.as_deref())
+                    {
+                        moved.push(&entry.name);
+                    }
                     let previous = doc.clone();
                     doc = Config::with_mcp_server_merged(
                         &doc,
@@ -1935,6 +1947,12 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         writeln!(
             out,
             "Overwrote {owner_replacements} existing server(s); local settings absent from the source were preserved."
+        )?;
+    }
+    for name in &moved {
+        writeln!(
+            out,
+            "Endpoint changed for {name}: a saved login for the previous endpoint is not used; run `newt auth {name}`."
         )?;
     }
     if higher_precedence_replacements > 0 {

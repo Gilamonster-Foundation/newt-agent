@@ -19,3 +19,19 @@ fn canonical_http_url_rejects_credential_components_and_normalizes_hosts() {
     assert_eq!(idna.host, "xn--bcher-kva.example");
     assert_eq!(idna.url, "https://xn--bcher-kva.example/mcp");
 }
+
+#[test]
+fn endpoint_change_is_canonical_and_counts_a_resource_path_change() {
+    // #2915: a respelling is not a move; `/mcp` → `/mcp/` is, because a saved
+    // login is bound to the exact resource.
+    let changed = |a, b| mcp_endpoint_changed(a, b);
+    assert!(!changed(
+        Some("https://API.example.test/mcp"),
+        Some("https://api.example.test/mcp")
+    ));
+    assert!(changed(
+        Some("https://api.example.test/mcp"),
+        Some("https://api.example.test/mcp/")
+    ));
+    assert!(changed(None, Some("https://api.example.test/mcp")));
+}

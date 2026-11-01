@@ -2455,6 +2455,23 @@ impl Config {
         };
 
         let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
+        // Local headers the source leaves alone would follow a moved endpoint,
+        // sending its credential to a destination it was never set for.
+        let kept_headers = existing
+            .get("headers")
+            .and_then(toml_edit::Item::as_table_like)
+            .filter(|_| !fresh.contains_key("headers") && !provided.contains("headers"))
+            .map_or(0, |headers| headers.len());
+        let previous_url = existing.get("url").and_then(toml_edit::Item::as_str);
+        if entry.transport != crate::mcp::TransportKind::Stdio
+            && kept_headers > 0
+            && crate::mcp::mcp_endpoint_changed(previous_url, entry.url.as_deref())
+        {
+            return Err(NewtError::Config(format!(
+                "MCP server `{}` would move to a different endpoint while keeping {kept_headers} local header(s) the source does not provide; refusing to send them to the new endpoint. Supply the headers in the source, or remove them from the existing entry, then re-run the import",
+                entry.name
+            )));
+        }
         // `"args": []` or `"enabled": true` renders as no key at all, yet it is
         // the source's value: clear the local one instead of keeping it.
         for key in provided.iter().filter(|key| !fresh.contains_key(key)) {

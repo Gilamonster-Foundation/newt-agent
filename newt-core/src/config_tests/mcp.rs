@@ -190,6 +190,40 @@ fn with_mcp_server_merged_keeps_equal_items_and_comments() {
 }
 
 #[test]
+fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
+    // #2915 review (P1): a new URL must not inherit the credential configured
+    // for the old destination, and the refusal must not quote either.
+    let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nheaders = { Authorization = \"Bearer ${PRIVATE_MARKER}\" }\n";
+    let at = |url: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!(
+            "name = \"review\"\ntype = \"http\"\nurl = \"{url}\"\n"
+        ))
+        .unwrap()
+    };
+    let provided: std::collections::BTreeSet<&str> = ["type", "url"].into_iter().collect();
+
+    let error = Config::with_mcp_server_merged(text, &at("https://new.example/mcp"), &provided)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refusing to send them"), "{error}");
+    assert!(
+        !error.contains("PRIVATE_MARKER") && !error.contains("example"),
+        "{error}"
+    );
+
+    // The same endpoint, respelled, keeps its headers.
+    let respelled =
+        Config::with_mcp_server_merged(text, &at("https://OLD.example/mcp"), &provided).unwrap();
+    assert!(respelled.contains("PRIVATE_MARKER"), "{respelled}");
+
+    // Headers the source spells out (here: none) replace the local ones.
+    let with_headers = provided.iter().copied().chain(["headers"]).collect();
+    let moved = Config::with_mcp_server_merged(text, &at("https://new.example/mcp"), &with_headers)
+        .unwrap();
+    assert!(!moved.contains("PRIVATE_MARKER"), "{moved}");
+}
+
+#[test]
 fn with_mcp_server_removed_does_not_echo_malformed_config_contents() {
     let text = "[[mcp_servers]]\nname = \"private-marker\"\ncommand = =\n";
     let error = Config::with_mcp_server_removed(text, "private-marker").unwrap_err();

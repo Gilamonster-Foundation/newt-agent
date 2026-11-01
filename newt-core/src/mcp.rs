@@ -1069,6 +1069,18 @@ pub fn canonical_mcp_http_url(
     })
 }
 
+/// Whether `next` names a different MCP endpoint than `previous`. URLs are
+/// compared in canonical form, so a respelling is not a move but a resource
+/// path change (`/mcp` → `/mcp/`) is: a saved login is bound to the exact
+/// resource, and configured credentials to the destination they were set for.
+#[must_use]
+pub fn mcp_endpoint_changed(previous: Option<&str>, next: Option<&str>) -> bool {
+    let canonical = |url: Option<&str>| {
+        url.map(|url| canonical_mcp_http_url(url).map_or_else(|_| url.to_owned(), |c| c.url))
+    };
+    canonical(previous) != canonical(next)
+}
+
 fn portable_env_names<T>(values: &BTreeMap<String, T>) -> bool {
     let mut canonical = std::collections::BTreeSet::new();
     values
