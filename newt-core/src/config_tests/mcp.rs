@@ -115,7 +115,8 @@ fn with_mcp_server_merged_resets_a_changed_transport_to_default_stdio() {
     assert_eq!(parsed.mcp_servers[0].command.as_deref(), Some("review-mcp"));
     assert!(parsed.mcp_servers[0].url.is_none());
     assert!(parsed.mcp_servers[0].headers.is_empty());
-    assert!(!updated.contains("type ="));
+    // #3062 review: the reset is written in place so a comment on it survives.
+    assert!(updated.contains("type = \"stdio\""), "{updated}");
 }
 
 #[test]
@@ -266,6 +267,49 @@ fn with_mcp_server_merged_refuses_to_carry_env_to_a_different_program() {
     let moved =
         Config::with_mcp_server_merged(text, &supplied, &with(&["command", "env"])).unwrap();
     assert!(!moved.contains("PRIVATE_MARKER"), "{moved}");
+}
+
+#[test]
+fn with_mcp_server_merged_keeps_comments_on_defaults_and_resets() {
+    // #3062 review: a value reset to its default keeps the comment on its
+    // line, and an unchanged default-valued key is untouched even when another
+    // key in the same entry changes.
+    let merge = |text: &str, source: &str, provided: &[&'static str]| {
+        let entry: crate::mcp::McpServerEntry =
+            toml::from_str(&format!("name = \"review\"\n{source}")).unwrap();
+        let provided = provided.iter().copied().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let head = "[[mcp_servers]]\nname = \"review\"\ncommand = \"review-mcp\"\n";
+
+    let cleared = merge(
+        &format!("{head}args = [\"--old-target\"] # argument policy\n"),
+        "command = \"review-mcp\"\n",
+        &["command", "args"],
+    );
+    assert!(cleared.contains("args = [] # argument policy"), "{cleared}");
+
+    let enabled = merge(
+        &format!("{head}enabled = false # operator policy\n"),
+        "command = \"review-mcp\"\n",
+        &["command", "enabled"],
+    );
+    assert!(
+        enabled.contains("enabled = true # operator policy"),
+        "{enabled}"
+    );
+
+    let mixed = merge(
+        &format!("{head}enabled = true # enabled policy\ntype = \"stdio\" # transport policy\nrequest_timeout_secs = 90\n"),
+        "command = \"review-mcp\"\nrequest_timeout_secs = 30\n",
+        &["command", "enabled", "request_timeout_secs"],
+    );
+    assert!(mixed.contains("enabled = true # enabled policy"), "{mixed}");
+    assert!(
+        mixed.contains("type = \"stdio\" # transport policy"),
+        "{mixed}"
+    );
+    assert!(mixed.contains("request_timeout_secs = 30"), "{mixed}");
 }
 
 #[test]

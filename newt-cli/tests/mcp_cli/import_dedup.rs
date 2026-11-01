@@ -398,3 +398,49 @@ fn force_import_refuses_to_carry_env_to_a_different_program() {
     assert_eq!(servers[0].args, ["new-mcp"]);
     assert!(servers[0].env.is_empty());
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn force_import_keeps_comments_on_defaults_and_resets() {
+    // #3062 review: resetting a value to its default keeps the comment on its
+    // line, and an unchanged default-valued line survives a change elsewhere
+    // in the same entry.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let head = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    let cases = [
+        (
+            "args = [\"--old-target\"] # argument policy\n",
+            r#"{ "mcpServers": { "fs": { "command": "fs-mcp", "args": [] } } }"#,
+            &["args = [] # argument policy"][..],
+        ),
+        (
+            "enabled = false # operator policy\n",
+            r#"{ "mcpServers": { "fs": { "command": "fs-mcp", "enabled": true } } }"#,
+            &["enabled = true # operator policy"][..],
+        ),
+        (
+            "enabled = true # enabled policy\ntype = \"stdio\" # transport policy\nrequest_timeout_secs = 90\n",
+            r#"{ "mcpServers": { "fs": { "command": "fs-mcp", "enabled": true,
+                  "requestTimeoutSecs": 30 } } }"#,
+            &[
+                "enabled = true # enabled policy",
+                "type = \"stdio\" # transport policy",
+                "request_timeout_secs = 30",
+            ][..],
+        ),
+    ];
+    for (local, source, expected) in cases {
+        std::fs::write(&mcp, format!("{head}{local}")).unwrap();
+        force_import(&sb, source)
+            .success()
+            .stdout(predicate::str::contains(
+                "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+            ));
+        let updated = std::fs::read_to_string(&mcp).unwrap();
+        for line in expected {
+            assert!(updated.contains(line), "missing `{line}` in:\n{updated}");
+        }
+    }
+}

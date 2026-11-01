@@ -2454,14 +2454,10 @@ impl Config {
             return Self::with_mcp_server_added(text, entry);
         };
 
-        let entry_in = |text: &str| {
-            crate::mcp::parse_newt_mcp_toml_checked(text)
-                .ok()?
-                .into_iter()
-                .find(|server| server.name == entry.name)
-        };
         // `existing` was found by name, so only an invalid entry shape is None.
-        let previous = entry_in(text)
+        let previous = crate::mcp::parse_newt_mcp_toml_checked(text)
+            .ok()
+            .and_then(|servers| servers.into_iter().find(|server| server.name == entry.name))
             .ok_or_else(|| NewtError::Config(crate::mcp::McpConfigSyntaxError.to_string()))?;
         let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
         let sourced = |key: &str| fresh.contains_key(key) || provided.contains(key);
@@ -2498,48 +2494,56 @@ impl Config {
                 entry.name
             )));
         }
-        // `"args": []` or `"enabled": true` renders as no key at all, yet it is
-        // the source's value: clear the local one instead of keeping it.
-        for key in provided.iter().filter(|key| !fresh.contains_key(key)) {
-            let _ = existing.remove(key);
-        }
-        for (key, value) in fresh {
-            match existing.get_mut(&key) {
-                // An equal value keeps its item: spelling and comments intact.
-                Some(slot) if same_toml_value(slot, &value) => {}
-                // A changed value keeps the operator's comment on its line.
-                Some(slot) => {
+        // The source decides what it spelled out, what the entry renders, and
+        // the transport; a key `fresh` omits is the default. A key whose
+        // meaning does not change is left as written, comment included, even
+        // when it only restates a default (`enabled = true`, `type = "stdio"`).
+        let decided: std::collections::BTreeSet<&str> = fresh
+            .iter()
+            .map(|(key, _)| key)
+            .chain(provided.iter().copied())
+            .chain(["type"])
+            .collect();
+        for key in decided {
+            let wanted = fresh.get(key);
+            if same_mcp_field(key, existing.get(key), wanted) {
+                continue;
+            }
+            // A reset to a default the minimal rendering leaves out is written
+            // in place (`args = []`) so the line keeps its comment.
+            let wanted = wanted
+                .cloned()
+                .or_else(|| crate::mcp::implicit_default(key).map(toml_edit::Item::Value));
+            match (existing.get_mut(key), wanted) {
+                (Some(slot), Some(value)) => {
                     let decor = slot.as_value().map(|old| old.decor().clone());
                     *slot = value;
                     if let (Some(decor), Some(new)) = (decor, slot.as_value_mut()) {
                         *new.decor_mut() = decor;
                     }
                 }
-                None => {
-                    existing.insert(&key, value);
+                (None, Some(value)) => {
+                    existing.insert(key, value);
                 }
+                (Some(_), None) => {
+                    let _ = existing.remove(key);
+                }
+                (None, None) => {}
             }
         }
-        match entry.transport {
-            crate::mcp::TransportKind::Stdio => {
-                let _ = existing.remove("type");
-                let _ = existing.remove("url");
-                let _ = existing.remove("headers");
-            }
+        // The other transport's fields do not belong to this entry.
+        let foreign: &[&str] = match entry.transport {
+            crate::mcp::TransportKind::Stdio => &["url", "headers"],
             crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
-                let _ = existing.remove("command");
-                let _ = existing.remove("args");
-                let _ = existing.remove("env");
+                &["command", "args", "env"]
+            }
+        };
+        for key in foreign {
+            if !same_mcp_field(key, existing.get(key), None) {
+                let _ = existing.remove(key);
             }
         }
-        // Dropping a key that only restated a default (`type = "stdio"`,
-        // `enabled = true`) changes no setting: keep the operator's text.
-        let merged = doc.to_string();
-        Ok(if entry_in(&merged).as_ref() == Some(&previous) {
-            text.to_string()
-        } else {
-            merged
-        })
+        Ok(doc.to_string())
     }
 
     /// Remove the named `[[mcp_servers]]` entry from the TOML `text`, preserving
@@ -2708,15 +2712,18 @@ impl Config {
     }
 }
 
-/// Whether two TOML items hold the same value, whatever their quoting,
-/// spacing or comments.
-fn same_toml_value(a: &toml_edit::Item, b: &toml_edit::Item) -> bool {
-    let semantic = |item: &toml_edit::Item| {
+/// Whether two spellings of one `[[mcp_servers]]` key configure the same
+/// thing, whatever their quoting, spacing or comments; an absent key equals a
+/// written default.
+fn same_mcp_field(key: &str, a: Option<&toml_edit::Item>, b: Option<&toml_edit::Item>) -> bool {
+    let typed = |item: Option<&toml_edit::Item>| {
         let mut doc = toml_edit::DocumentMut::new();
-        doc.insert("v", item.clone());
-        toml::from_str::<toml::Value>(&doc.to_string()).ok()
+        if let Some(item) = item {
+            doc.insert(key, item.clone());
+        }
+        toml::from_str::<crate::mcp::McpServerEntry>(&doc.to_string()).ok()
     };
-    matches!((semantic(a), semantic(b)), (Some(a), Some(b)) if a == b)
+    matches!((typed(a), typed(b)), (Some(a), Some(b)) if a == b)
 }
 
 // ---------------------------------------------------------------------------

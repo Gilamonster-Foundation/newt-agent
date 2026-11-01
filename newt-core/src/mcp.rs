@@ -722,6 +722,19 @@ pub(crate) fn entry_to_toml_table(
     Ok(table)
 }
 
+/// The written form of a default [`entry_to_toml_table`] leaves out, so a local
+/// value reset to it can be overwritten in place with its comment kept. `None`
+/// for an optional field, whose only default is absence.
+pub(crate) fn implicit_default(key: &str) -> Option<toml_edit::Value> {
+    match key {
+        "enabled" => Some(true.into()),
+        "type" => Some(TransportKind::Stdio.as_str().into()),
+        "args" | "login_argv" => Some(toml_edit::Array::new().into()),
+        "env" | "headers" => Some(toml_edit::InlineTable::new().into()),
+        _ => None,
+    }
+}
+
 /// Render a `SecretValue` as a `toml_edit` value: a literal becomes a string, a
 /// reference becomes an inline table with only its set `{ env | file | cmd }`
 /// key — the inverse of the `untagged` deserialize, so a config round-trips.
