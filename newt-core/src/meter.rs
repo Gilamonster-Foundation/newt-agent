@@ -353,6 +353,32 @@ mod tests {
         );
     }
 
+    /// Review P1: the headers arrive at once, then the body stalls after one
+    /// byte. The deadline covers the body too, so the poll ends at it. The
+    /// outer 60x guard turns a hang into a failure.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_body_gives_unknown_at_the_deadline() {
+        use futures_util::{stream, StreamExt};
+        let deadline = Duration::from_secs(3);
+        let stalls = stream::iter([Ok::<_, std::io::Error>("{")]).chain(stream::pending());
+        let response = response(200, reqwest::Body::wrap_stream(stalls));
+        let started = tokio::time::Instant::now();
+        let read = read_key_response(async { Ok(response) }, deadline);
+        let status = tokio::time::timeout(60 * deadline, read).await;
+        assert_eq!(
+            (status, started.elapsed()),
+            (Ok(SpendStatus::Unknown), deadline)
+        );
+    }
+
+    /// Review P1: a valid key record padded to 1 MiB is not read.
+    #[tokio::test]
+    async fn oversized_body_gives_unknown() {
+        let mut body = json_body(49.8, 50.0, "2026-11-01T00:00:00.000Z");
+        body["padding"] = "x".repeat(1 << 20).into();
+        assert_eq!(read(200, body.to_string()).await, SpendStatus::Unknown);
+    }
+
     /// A response that lands 1 ms inside the deadline is read, on paused time.
     #[tokio::test(start_paused = true)]
     async fn response_inside_the_deadline_is_read() {

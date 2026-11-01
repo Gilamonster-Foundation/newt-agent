@@ -273,9 +273,11 @@ rusqlite.workspace = true
 # (Step 9.7) — same pattern as newt-inference / the old newt-tui suites.
 wiremock.workspace = true
 # #2909: build a `reqwest::Response` with no socket (`http::Response` into
-# `reqwest::Response`), so the meter's deadline tests run on paused time.
-# Already in the lockfile under reqwest; nothing new enters the build graph.
+# `reqwest::Response`), its body a stream that can stall after the headers, so
+# the meter's deadline tests run on paused time. Both are already in the
+# lockfile under reqwest; nothing new enters the build graph.
 http = "1"
+futures-util = "0.3"
 # Two independent needs, one dependency:
 # - #1301 trust-boundary integration tests (tests/mcp_project_trust.rs) drive the
 #   real `Config::resolve()` walk-up, which reads process-global env + cwd; they

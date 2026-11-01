@@ -4631,6 +4631,7 @@ dependencies = [
  "crossterm",
  "diffy",
  "dunce",
+ "futures-util",
  "globset",
  "grep-regex",
  "grep-searcher",
