@@ -503,7 +503,8 @@ pub(crate) fn add_to_config(
     let path = mcp_write_target(config_path, project, false)?;
     let (destination, _guard) = resolve_and_lock_write_target(&path)?;
     let text = read_config_text(destination.as_path())?;
-    let updated = Config::with_mcp_server_added(&text, entry)?;
+    let updated = Config::with_mcp_server_added(&text, entry)
+        .with_context(|| format!("updating {}", destination.as_path().display()))?;
     write_back(&destination, &updated)?;
     Ok(path)
 }
@@ -531,11 +532,14 @@ fn write_back(destination: &ResolvedPath, text: &str) -> anyhow::Result<()> {
 /// default scope, resolve the file that contributes the entry to the effective
 /// MCP list rather than guessing from file existence.
 fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
+    let removed = |destination: &ResolvedPath| {
+        let text = read_config_text(destination.as_path())?;
+        Config::with_mcp_server_removed(&text, name)
+            .with_context(|| format!("updating {}", destination.as_path().display()))
+    };
     if let Some(explicit) = strong_explicit_write_target(config_path, project)? {
         let (destination, _guard) = resolve_and_lock_write_target(&explicit)?;
-        let text = read_config_text(destination.as_path())?;
-        let updated = Config::with_mcp_server_removed(&text, name)?;
-        write_back(&destination, &updated)?;
+        write_back(&destination, &removed(&destination)?)?;
         return Ok(explicit);
     }
     let owner = Config::mcp_server_owner_path(name)?
@@ -548,9 +552,7 @@ fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyho
     if current_owner.as_ref() != Some(&destination) {
         bail!("MCP config ownership changed for `{name}`; no file was modified, retry the command");
     }
-    let text = read_config_text(destination.as_path())?;
-    let updated = Config::with_mcp_server_removed(&text, name)?;
-    write_back(&destination, &updated)?;
+    write_back(&destination, &removed(&destination)?)?;
     Ok(owner)
 }
 

@@ -146,6 +146,47 @@ fn remove_skips_a_same_name_entry_discovery_drops() {
 }
 
 #[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn mcp_config_errors_name_the_file_and_position_not_the_contents() {
+    // #3062 review (F13): `newt mcp add` writes to an ambient ./newt.toml; when
+    // that file does not parse, the error names it and where it stops, never
+    // the line, which here holds a credential.
+    let sb = sandbox();
+    let ambient = sb.cwd.join("newt.toml");
+    std::fs::write(
+        &ambient,
+        "[[mcp_servers]]\ncommand = \"SYNTHETIC_SECRET_MARKER\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "add", "foo", "--command", "foo-mcp"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("newt.toml"))
+        .stderr(predicate::str::contains(
+            "invalid MCP TOML syntax at line 2, column 35",
+        ))
+        .stderr(predicate::str::contains("SYNTHETIC_SECRET_MARKER").not());
+
+    // Valid TOML that does not fit the MCP schema is not a syntax error.
+    std::fs::remove_file(&ambient).unwrap();
+    std::fs::write(
+        sb.config_dir.join("mcp.toml"),
+        "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\nheaders = \"SYNTHETIC_SECRET_MARKER\"\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "list"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "invalid MCP config at line 4, column 11",
+        ))
+        .stderr(predicate::str::contains("SYNTHETIC_SECRET_MARKER").not());
+}
+
+#[test]
 fn list_reports_malformed_mcp_toml_without_echoing_its_contents() {
     let sb = sandbox();
     let marker = "private-mcp-marker";

@@ -2671,7 +2671,8 @@ impl Config {
         }
         let original = std::fs::read_to_string(destination.as_path())
             .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
-        let updated = Self::with_mcp_enabled(&original, name, enabled)?;
+        let updated = Self::with_mcp_enabled(&original, name, enabled)
+            .map_err(|error| anyhow::anyhow!("updating MCP config {}: {error}", path.display()))?;
         if updated == original {
             return Ok(());
         }
@@ -2692,8 +2693,13 @@ impl Config {
     fn read_mcp_source_value(path: &Path) -> anyhow::Result<toml::Value> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
-        toml::from_str(&text).map_err(|_| {
-            anyhow::anyhow!("{}: {}", path.display(), crate::mcp::McpConfigSyntaxError)
+        toml::from_str(&text).map_err(|error| {
+            let at = crate::mcp::McpConfigError::position(&text, error.span());
+            anyhow::anyhow!(
+                "{}: {}",
+                path.display(),
+                crate::mcp::McpConfigError::Syntax(at)
+            )
         })
     }
 
@@ -2734,9 +2740,10 @@ fn edit_mcp_toml(
     text: &str,
     edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
 ) -> Result<String> {
-    let mut doc = text
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        let at = crate::mcp::McpConfigError::position(text, error.span());
+        NewtError::Config(crate::mcp::McpConfigError::Syntax(at).to_string())
+    })?;
     let before = doc.to_string();
     edit(&mut doc)?;
     let mut after = doc.to_string();

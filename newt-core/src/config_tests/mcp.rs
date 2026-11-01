@@ -946,6 +946,27 @@ fn mcp_writer_error_branches_are_loud() {
 }
 
 #[test]
+fn mcp_writer_errors_name_the_position_not_the_contents() {
+    // #3062 review (F13): every MCP writer reports where the file stops
+    // parsing, never what is there: the parser's own message quotes the
+    // line, here a credential.
+    let text = "[[mcp_servers]]\nname = \"x\"\ncommand = \"SYNTHETIC_SECRET_MARKER\n";
+    let entry: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"x\"\ncommand = \"x-mcp\"\n").unwrap();
+    for error in [
+        Config::with_mcp_server_added(text, &entry).unwrap_err(),
+        Config::with_mcp_server_removed(text, "x").unwrap_err(),
+        Config::with_mcp_enabled(text, "x", false).unwrap_err(),
+        Config::with_mcp_server_merged(text, &entry, &Default::default()).unwrap_err(),
+    ] {
+        assert_eq!(
+            error.to_string(),
+            "config error: invalid MCP TOML syntax at line 3, column 35"
+        );
+    }
+}
+
+#[test]
 fn with_mcp_server_removed_errors_when_absent() {
     let text = "[[mcp_servers]]\nname = \"present\"\ncommand = \"x\"\n";
     let err = Config::with_mcp_server_removed(text, "ghost").unwrap_err();

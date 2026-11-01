@@ -979,19 +979,49 @@ fn provided_keys<'a>(
         .collect()
 }
 
-/// A value-independent syntax error for a Newt-owned MCP TOML file.
+/// A value-independent error for a Newt-owned MCP TOML file: what kind, and
+/// the 1-based line and column where parsing stopped, when known.
 ///
 /// TOML parser errors include the offending line, which may contain credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct McpConfigSyntaxError;
+pub enum McpConfigError {
+    /// The file is not valid TOML.
+    Syntax(Option<(usize, usize)>),
+    /// Valid TOML whose `mcp_servers` do not fit the MCP server schema.
+    Shape(Option<(usize, usize)>),
+}
 
-impl std::fmt::Display for McpConfigSyntaxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("invalid MCP TOML syntax")
+impl McpConfigError {
+    /// The 1-based line and column in `text` where a parser error `span`
+    /// starts; the position quotes nothing from the file.
+    pub(crate) fn position(
+        text: &str,
+        span: Option<std::ops::Range<usize>>,
+    ) -> Option<(usize, usize)> {
+        let before = text.get(..span?.start)?;
+        let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+        Some((
+            before.matches('\n').count() + 1,
+            before[line_start..].chars().count() + 1,
+        ))
     }
 }
 
-impl std::error::Error for McpConfigSyntaxError {}
+impl std::fmt::Display for McpConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (what, at) = match self {
+            Self::Syntax(at) => ("invalid MCP TOML syntax", at),
+            Self::Shape(at) => ("invalid MCP config", at),
+        };
+        f.write_str(what)?;
+        match at {
+            Some((line, column)) => write!(f, " at line {line}, column {column}"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for McpConfigError {}
 
 /// Secret-safe syntax error for borrowed Codex TOML. The original TOML parser
 /// error embeds the complete offending line, so it must never cross the CLI
@@ -1608,16 +1638,18 @@ pub fn parse_newt_mcp_toml(text: &str) -> Vec<McpServerEntry> {
 /// parser so malformed files cannot look empty and be overwritten.
 pub fn parse_newt_mcp_toml_checked(
     text: &str,
-) -> std::result::Result<Vec<McpServerEntry>, McpConfigSyntaxError> {
+) -> std::result::Result<Vec<McpServerEntry>, McpConfigError> {
     #[derive(Deserialize, Default)]
     struct Doc {
         #[serde(default)]
         mcp_servers: Vec<McpServerEntry>,
     }
 
+    let at = |error: toml::de::Error| McpConfigError::position(text, error.span());
+    toml::from_str::<toml::Table>(text).map_err(|error| McpConfigError::Syntax(at(error)))?;
     toml::from_str::<Doc>(text)
         .map(|doc| doc.mcp_servers)
-        .map_err(|_| McpConfigSyntaxError)
+        .map_err(|error| McpConfigError::Shape(at(error)))
 }
 
 /// Read + parse a newt-owned `~/.newt/mcp.toml`. A missing file is empty; one

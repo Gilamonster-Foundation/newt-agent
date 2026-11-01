@@ -112,9 +112,24 @@ fn checked_newt_mcp_parser_reports_malformed_toml_without_source_text() {
         "[[mcp_servers]]\nname = \"private-token-marker\"\ncommand = =\n",
     )
     .unwrap_err();
-    assert_eq!(error.to_string(), "invalid MCP TOML syntax");
+    assert_eq!(
+        error.to_string(),
+        "invalid MCP TOML syntax at line 3, column 11"
+    );
     assert!(!error.to_string().contains("private-token-marker"));
     assert!(parse_newt_mcp_toml_checked("other = 1").unwrap().is_empty());
+}
+
+#[test]
+fn checked_newt_mcp_parser_tells_a_shape_error_from_a_syntax_error() {
+    // #3062 review (F13): valid TOML whose entry does not fit the MCP schema
+    // is not a syntax error. Both say where, never what: the parser's own
+    // message quotes the line, here a credential.
+    let error = parse_newt_mcp_toml_checked(
+        "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\nheaders = \"SYNTHETIC_SECRET_MARKER\"\n",
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "invalid MCP config at line 4, column 11");
 }
 
 #[test]
