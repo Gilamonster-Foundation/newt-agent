@@ -603,3 +603,57 @@ fn uat_default_route_never_logs_a_malformed_dropin_line() {
         }
     }
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn import_reports_a_config_validation_error_as_itself() {
+    // #3062 review (F12, G7): only a TOML decode error quotes the file, so
+    // only it is withheld. A config that decodes but fails validation keeps
+    // the resolver's own message, which names the cause, and the import
+    // names the file it resolved.
+    let sb = sandbox();
+    let source = sb.cwd.join("borrowed.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "other": { "command": "/bin/true" } } }"#,
+    )
+    .unwrap();
+    let config = sb.config_dir.join("config.toml");
+    for (text, cause) in [
+        (
+            "[[backends]]\nname = \"local\"\nendpoint = \"http://127.0.0.1:9\"\n\n[[backends]]\nname = \"local\"\nendpoint = \"http://127.0.0.1:10\"\n",
+            "two backends share the name `local`",
+        ),
+        (
+            "[[providers]]\nname = \"p\"\ncommand = \"/bin/true\"\ntiers = []\n\n[[providers]]\nname = \"p\"\ncommand = \"/bin/true\"\ntiers = []\n",
+            "two providers share the name `p`",
+        ),
+    ] {
+        std::fs::write(&config, text).unwrap();
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap(), "--all"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(cause))
+            .stderr(predicate::str::contains(config.display().to_string()))
+            .stderr(predicate::str::contains("withheld").not());
+    }
+
+    // A legacy drop-in names itself in the resolver's message.
+    std::fs::remove_file(&config).unwrap();
+    std::fs::create_dir_all(sb.config_dir.join("backends")).unwrap();
+    std::fs::write(
+        sb.config_dir.join("backends/old.toml"),
+        "endpoint = \"http://127.0.0.1:9\"\nmodel = \"warm-pick\"\n\n[provenance]\nsource = \"newt adopt v0.5.0 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "import", source.to_str().unwrap(), "--all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("old.toml"))
+        .stderr(predicate::str::contains("newt-adopt probe marker"))
+        .stderr(predicate::str::contains("withheld").not());
+    assert!(!sb.config_dir.join("mcp.toml").exists());
+}

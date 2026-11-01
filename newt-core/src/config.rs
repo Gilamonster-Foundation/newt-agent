@@ -1549,7 +1549,7 @@ impl Config {
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
         held_locks: &[&crate::atomic_fs::LockGuard],
     ) -> Result<ResolvedConfig> {
-        let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
+        let base_path = Self::base_config_path();
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
         // root — `cd repo && newt` → same host-RCE class as the walk-up) rather
@@ -2615,9 +2615,7 @@ impl Config {
     /// drops an invalid entry, so one owns the name only when no file has a
     /// valid one; `newt mcp remove` can then still delete it.
     pub fn mcp_server_owner_path(name: &str) -> anyhow::Result<Option<PathBuf>> {
-        let base = Self::candidate_paths()
-            .into_iter()
-            .find(|path| path.is_file());
+        let base = Self::base_config_path();
         let project = Self::project_config_path().filter(|project| {
             base.as_ref().is_none_or(|base| {
                 match (
@@ -2751,6 +2749,15 @@ impl Config {
         Ok(entries
             .iter()
             .any(|entry| entry.name == name && (entry.is_valid() || !valid_only)))
+    }
+
+    /// The base config file the resolver reads: the first candidate that
+    /// exists (`$NEWT_CONFIG`, `./newt.toml`, the user config, the system
+    /// config). The project config, if any, is layered over it.
+    pub fn base_config_path() -> Option<PathBuf> {
+        Self::candidate_paths()
+            .into_iter()
+            .find(|path| path.is_file())
     }
 
     /// Build the ordered list of candidate config file paths.

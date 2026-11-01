@@ -1063,23 +1063,32 @@ fn import_namespace_sanitization(
 ) -> anyhow::Result<bool> {
     let user_mcp = Config::user_config_dir().map(|dir| dir.join("mcp.toml"));
     let cfg = if user_mcp.as_deref() == Some(target) && !strong_explicit_target {
+        let base = Config::base_config_path();
+        let project =
+            Config::project_config_path().filter(|project| base.as_ref() != Some(project));
+        let layers: Vec<PathBuf> = base.into_iter().chain(project).collect();
         crate::migration_notices::read(|report| {
             Config::resolve_runtime_unpublished_with_held_locks(report, held_locks)
                 .map(ResolvedConfig::into_config)
         })
-        .map_err(|_| {
-            // Name the layer that fails on its own; a failure only the merged
-            // view has gets the same withheld diagnostic without a path.
-            [
-                Config::user_config_path(),
-                ambient_newt_toml().ok().flatten(),
-                Config::project_config_path(),
-            ]
-            .into_iter()
-            .flatten()
-            .filter(|path| path.is_file())
-            .find_map(|path| load_consulted_config(&path, held_locks).err())
-            .unwrap_or_else(|| withheld_config_error(Path::new("the resolved Newt config")))
+        .map_err(|error| {
+            // A layer that fails to decode on its own quotes its contents, so
+            // it is withheld. Otherwise the layers decode and the resolver
+            // rejected what they say (a duplicate name, a legacy drop-in): its
+            // message quotes no contents and names the cause (#2915).
+            layers
+                .iter()
+                .find_map(|path| load_consulted_config(path, held_locks).err())
+                .unwrap_or_else(|| {
+                    let files: Vec<String> =
+                        layers.iter().map(|p| p.display().to_string()).collect();
+                    let context = if files.is_empty() {
+                        "resolving the Newt config".to_owned()
+                    } else {
+                        format!("resolving the Newt config from {}", files.join(" and "))
+                    };
+                    anyhow::Error::new(error).context(context)
+                })
         })?
     } else if target.is_file() {
         load_consulted_config(target, held_locks)?
