@@ -260,14 +260,28 @@ mod tests {
     /// loopback mock never races one.
     const NO_DEADLINE: Duration = Duration::MAX;
 
-    fn json_body(remaining: f64, limit: f64, resets_at: &str) -> serde_json::Value {
+    /// The documented `GET /api/v1/key` record: a $100 key limit with $74.50
+    /// left, and `data.effective_budget` (the budget that blocks first) as given.
+    fn key_record(effective_budget: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "data": {
+            "label": "sk-or-v1-test",
+            "limit": 100,
+            "limit_remaining": 74.5,
+            "limit_reset": "monthly",
+            "usage": 25.5,
+            "effective_budget": effective_budget,
+        }})
+    }
+
+    /// The documented member budget: $17.50 of $50 left, resetting weekly.
+    fn member_budget() -> serde_json::Value {
         serde_json::json!({
-            "effective_budget": {
-                "remaining_usd": remaining,
-                "limit_usd": limit,
-                "spend_usd": limit - remaining,
-                "resets_at": resets_at,
-            }
+            "scope": "member",
+            "limit_usd": 50,
+            "spend_usd": 32.5,
+            "remaining_usd": 17.5,
+            "reset_interval": "weekly",
+            "resets_at": "2026-10-12T00:00:00.000Z",
         })
     }
 
@@ -307,24 +321,24 @@ mod tests {
 
     /// The real client path: `GET <endpoint>/v1/key` with the bearer key.
     #[tokio::test]
-    async fn success_parses_known_spend() {
+    /// Review P2: the effective budget sits under `data`, and it wins over the
+    /// laxer key limit, reset included.
+    async fn success_reads_the_effective_budget_under_data() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/key"))
             .and(header("authorization", "Bearer test-key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json_body(
-                49.80,
-                50.0,
-                "2026-11-01T00:00:00.000Z",
-            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(key_record(member_budget())))
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
         let status = poll_openrouter_key(&client, &server.uri(), "test-key", NO_DEADLINE).await;
-        assert!(
-            matches!(status, SpendStatus::Known { remaining_usd, limit_usd, .. } if (remaining_usd - 49.80).abs() < 1e-6 && (limit_usd - 50.0).abs() < 1e-6),
-            "{status:?}"
-        );
+        let expected = SpendStatus::Known {
+            remaining_usd: 17.5,
+            limit_usd: 50.0,
+            resets_at: Some("2026-10-12T00:00:00.000Z".to_string()),
+        };
+        assert_eq!(status, expected);
     }
 
     #[tokio::test]
@@ -351,19 +365,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_shape_fields_are_read() {
-        let body = serde_json::json!({
-            "data": {
-                "limit_remaining": 12.5,
-                "limit": 100.0,
-                "limit_reset": "monthly"
-            }
-        });
-        let status = read(200, body.to_string()).await;
-        assert!(
-            matches!(status, SpendStatus::Known { remaining_usd, limit_usd, ref resets_at } if (remaining_usd - 12.5).abs() < 1e-6 && (limit_usd - 100.0).abs() < 1e-6 && resets_at.as_deref() == Some("monthly")),
-            "{status:?}"
-        );
+    /// No effective budget (`null`): the key limit is the fallback.
+    async fn key_limit_is_the_fallback() {
+        let status = read(200, key_record(serde_json::Value::Null).to_string()).await;
+        let expected = SpendStatus::Known {
+            remaining_usd: 74.5,
+            limit_usd: 100.0,
+            resets_at: Some("monthly".to_string()),
+        };
+        assert_eq!(status, expected);
     }
 
     /// Review P1: the headers arrive at once, then the body stalls after one
@@ -387,7 +397,7 @@ mod tests {
     /// Review P1: a valid key record padded to 1 MiB is not read.
     #[tokio::test]
     async fn oversized_body_gives_unknown() {
-        let mut body = json_body(49.8, 50.0, "2026-11-01T00:00:00.000Z");
+        let mut body = key_record(member_budget());
         body["padding"] = "x".repeat(1 << 20).into();
         assert_eq!(read(200, body.to_string()).await, SpendStatus::Unknown);
     }
@@ -396,7 +406,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn response_inside_the_deadline_is_read() {
         let deadline = Duration::from_secs(3);
-        let body = json_body(49.8, 50.0, "2026-11-01T00:00:00.000Z").to_string();
+        let body = key_record(member_budget()).to_string();
         let send = async {
             tokio::time::sleep(deadline - Duration::from_millis(1)).await;
             Ok(response(200, body))
