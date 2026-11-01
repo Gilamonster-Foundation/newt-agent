@@ -39,9 +39,9 @@ fn with_mcp_enabled_toggles_and_preserves_comments() {
     let off = Config::with_mcp_enabled(text, "modulex", false).unwrap();
     assert!(off.contains("enabled = false"));
     assert!(off.contains("# my config"));
-    // re-enable → key REMOVED (default is enabled; file stays minimal)
+    // re-enable → written in place, so a comment on the line would stay
     let on = Config::with_mcp_enabled(&off, "modulex", true).unwrap();
-    assert!(!on.contains("enabled"));
+    assert!(on.contains("enabled = true"), "{on}");
     // unknown name errors loudly
     assert!(Config::with_mcp_enabled(text, "nope", false).is_err());
     // entry parses with default enabled=true; explicit false honored
@@ -50,6 +50,49 @@ fn with_mcp_enabled_toggles_and_preserves_comments() {
     let d: crate::mcp::McpServerEntry =
         toml::from_str("name = \"x\"\ncommand = \"x\"\nenabled = false\n").unwrap();
     assert!(!d.enabled);
+}
+
+#[test]
+fn with_mcp_enabled_keeps_comments_and_leaves_a_settled_entry_alone() {
+    // #3062 review (F9): a toggle to the state the entry already has changes
+    // nothing, byte for byte; a real toggle writes the value in place, so the
+    // comments on and above the line stay, and so do CRLF line endings.
+    let head = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    for (text, enabled) in [
+        (
+            format!("{head}enabled = false # disabled: upstream leaks tokens\n"),
+            false,
+        ),
+        (
+            format!("{head}# pinned on for the review bot\nenabled = true # ask ops first\n"),
+            true,
+        ),
+        (
+            "# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n".to_owned(),
+            true,
+        ),
+    ] {
+        assert_eq!(
+            Config::with_mcp_enabled(&text, "fs", enabled).unwrap(),
+            text
+        );
+    }
+    let toggle = |line: &str, enabled: bool| {
+        Config::with_mcp_enabled(&format!("{head}# owner note\n{line}\n"), "fs", enabled).unwrap()
+    };
+    assert_eq!(
+        toggle("enabled = true # owner: platform team", false),
+        format!("{head}# owner note\nenabled = false # owner: platform team\n")
+    );
+    assert_eq!(
+        toggle("enabled = false # paused", true),
+        format!("{head}# owner note\nenabled = true # paused\n")
+    );
+    let crlf = "[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n";
+    assert_eq!(
+        Config::with_mcp_enabled(crlf, "fs", false).unwrap(),
+        format!("{crlf}enabled = false\r\n")
+    );
 }
 
 #[test]

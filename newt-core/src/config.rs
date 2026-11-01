@@ -2361,33 +2361,37 @@ impl Config {
     }
 
     /// Set `enabled` on the named `[[mcp_servers]]` entry, preserving comments
-    /// and formatting (`/mcp enable|disable`, #1149). PURE (no I/O) like
-    /// [`with_net_host`](Self::with_net_host); the caller does the read/write.
-    /// Errors when the server name isn't present.
+    /// and formatting (`/mcp enable|disable`, #1149). An entry already in that
+    /// state (absent means enabled) is left byte for byte; otherwise the value
+    /// is written in place, keeping the comments on and above its line. PURE
+    /// (no I/O) like [`with_net_host`](Self::with_net_host); the caller does
+    /// the read/write. Errors when the server name isn't present.
     pub fn with_mcp_enabled(text: &str, name: &str, enabled: bool) -> Result<String> {
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
-        let servers =
-            doc.as_table_mut()
-                .entry("mcp_servers")
-                .or_insert(toml_edit::Item::ArrayOfTables(
-                    toml_edit::ArrayOfTables::new(),
-                ));
-        let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
-            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-        })?;
-        let entry = arr
-            .iter_mut()
-            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
-            .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
-        if enabled {
-            // Default is enabled: remove the key so the file stays minimal.
-            entry.remove("enabled");
-        } else {
-            entry["enabled"] = toml_edit::value(false);
-        }
-        Ok(doc.to_string())
+        edit_mcp_toml(text, |doc| {
+            let servers =
+                doc.as_table_mut()
+                    .entry("mcp_servers")
+                    .or_insert(toml_edit::Item::ArrayOfTables(
+                        toml_edit::ArrayOfTables::new(),
+                    ));
+            let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
+                NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+            })?;
+            let entry = arr
+                .iter_mut()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+                .ok_or_else(|| {
+                    NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`"))
+                })?;
+            if entry
+                .get("enabled")
+                .map_or(Some(true), toml_edit::Item::as_bool)
+                != Some(enabled)
+            {
+                replace_in_place(entry, "enabled", toml_edit::value(enabled));
+            }
+            Ok(())
+        })
     }
 
     /// Append a `[[mcp_servers]]` entry to the TOML `text`, preserving comments
