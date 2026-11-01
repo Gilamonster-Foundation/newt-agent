@@ -402,6 +402,36 @@ fn force_import_refuses_to_carry_env_to_a_different_program() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_refuses_to_carry_args_to_a_different_program() {
+    // #3062 review (F1): local argv, a credential flag included, must not
+    // follow a changed command the source names without args.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let original = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"npx\"\nargs = [\"--api-key\", \"SYNTHETIC_SECRET_MARKER\"]\n";
+    std::fs::write(&mcp, original).unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "other-vendor-mcp" } } }"#,
+    )
+    .failure()
+    .stderr(predicate::str::contains("2 local argument(s)"))
+    .stderr(predicate::str::contains("SYNTHETIC_SECRET_MARKER").not());
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), original);
+
+    // Args the source supplies itself are not a transfer.
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "other-vendor-mcp", "args": ["--serve"] } } }"#,
+    )
+    .success();
+    let servers = newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&mcp).unwrap());
+    assert_eq!(servers[0].args, ["--serve"]);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_keeps_comments_on_defaults_and_resets() {
     // #3062 review: resetting a value to its default keeps the comment on its
     // line, and an unchanged default-valued line survives a change elsewhere

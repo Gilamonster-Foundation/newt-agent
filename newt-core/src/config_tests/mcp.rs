@@ -259,14 +259,60 @@ fn with_mcp_server_merged_refuses_to_carry_env_to_a_different_program() {
     }
 
     // The same program keeps its env; an env the source supplies replaces it.
+    // (The source supplies args too: the old program's argv is not carried
+    // either, see the args twin below.)
     let same =
         Config::with_mcp_server_merged(text, &runs("command = \"npx\""), &with(&["command"]))
             .unwrap();
     assert_eq!(same, text);
     let supplied = runs("command = \"new-mcp\"");
-    let moved =
-        Config::with_mcp_server_merged(text, &supplied, &with(&["command", "env"])).unwrap();
+    let moved = Config::with_mcp_server_merged(text, &supplied, &with(&["command", "args", "env"]))
+        .unwrap();
     assert!(!moved.contains("PRIVATE_MARKER"), "{moved}");
+}
+
+#[test]
+fn with_mcp_server_merged_refuses_to_carry_args_to_a_different_program() {
+    // #3062 review (F1): argv written for one program, a credential flag
+    // included, must not follow a changed command the source names without
+    // args. Any kept argument refuses: newt cannot tell a credential flag it
+    // does not know from any other.
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"npx\"\nargs = [\"--api-key\", \"SYNTHETIC_SECRET_MARKER\"]\n";
+    let runs = |argv: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!("name = \"review\"\n{argv}\n")).unwrap()
+    };
+    let with = |keys: &[&'static str]| keys.iter().copied().collect();
+
+    let error = Config::with_mcp_server_merged(
+        text,
+        &runs("command = \"other-vendor-mcp\""),
+        &with(&["command"]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("2 local argument(s)"), "{error}");
+    assert!(
+        error.contains("refusing to send them to the new command"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("SYNTHETIC_SECRET_MARKER") && !error.contains("--api-key"),
+        "{error}"
+    );
+
+    // Args the source supplies are not a transfer, and the same program keeps
+    // its own.
+    let supplied = Config::with_mcp_server_merged(
+        text,
+        &runs("command = \"other-vendor-mcp\"\nargs = [\"--serve\"]"),
+        &with(&["command", "args"]),
+    )
+    .unwrap();
+    assert_eq!(entry_of(&supplied).args, ["--serve"]);
+    let same =
+        Config::with_mcp_server_merged(text, &runs("command = \"npx\""), &with(&["command"]))
+            .unwrap();
+    assert_eq!(same, text);
 }
 
 #[test]

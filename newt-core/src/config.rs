@@ -2461,37 +2461,44 @@ impl Config {
             .ok_or_else(|| NewtError::Config(crate::mcp::McpConfigSyntaxError.to_string()))?;
         let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
         let sourced = |key: &str| fresh.contains_key(key) || provided.contains(key);
-        // Local credentials the source leaves alone would follow a moved
-        // destination: headers to a new endpoint, env to a different program.
+        // Local settings the source leaves alone would follow a moved
+        // destination: headers to a new endpoint; env, and argv written for
+        // the old program (a credential flag included), to a different one.
         // The program is the whole argv, since a launcher such as `npx` picks
         // it by its args.
-        let (field, kept, destination, noun, moved) = match entry.transport {
+        let kept = |key: &str, count: usize| if sourced(key) { 0 } else { count };
+        let (destination, moved, carried) = match entry.transport {
             crate::mcp::TransportKind::Stdio => {
                 let args = if sourced("args") {
                     &entry.args
                 } else {
                     &previous.args
                 };
-                let moved = previous.command != entry.command || previous.args != *args;
-                let kept = previous.env.len();
-                ("env", kept, "command", "environment variable(s)", moved)
-            }
-            crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
-                let moved =
-                    crate::mcp::mcp_endpoint_changed(previous.url.as_deref(), entry.url.as_deref());
                 (
-                    "headers",
-                    previous.headers.len(),
-                    "endpoint",
-                    "header(s)",
-                    moved,
+                    "command",
+                    previous.command != entry.command || previous.args != *args,
+                    vec![
+                        (kept("env", previous.env.len()), "environment variable(s)"),
+                        (kept("args", previous.args.len()), "argument(s)"),
+                    ],
                 )
             }
+            crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => (
+                "endpoint",
+                crate::mcp::mcp_endpoint_changed(previous.url.as_deref(), entry.url.as_deref()),
+                vec![(kept("headers", previous.headers.len()), "header(s)")],
+            ),
         };
-        if moved && kept > 0 && !sourced(field) {
+        let carried: Vec<String> = carried
+            .into_iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, noun)| format!("{count} local {noun}"))
+            .collect();
+        if moved && !carried.is_empty() {
             return Err(NewtError::Config(format!(
-                "MCP server `{}` would change its {destination} while keeping {kept} local {noun} the source does not provide; refusing to send them to the new {destination}. Supply them in the source, or remove them from the existing entry, then re-run the import",
-                entry.name
+                "MCP server `{}` would change its {destination} while keeping {} the source does not provide; refusing to send them to the new {destination}. Supply them in the source, or remove them from the existing entry, then re-run the import",
+                entry.name,
+                carried.join(" and ")
             )));
         }
         // The source decides what it spelled out, what the entry renders, and
