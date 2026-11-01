@@ -363,6 +363,70 @@ fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
 }
 
 #[test]
+fn with_mcp_server_merged_refuses_to_carry_oauth_settings_to_a_moved_endpoint() {
+    // #3062 review (G5): a static OAuth client, pinned scopes and callback
+    // port were registered with the old endpoint's authorization server; a
+    // moved endpoint must not present them to a new one.
+    let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\noauth_client_id = \"old-as-client\"\noauth_scopes = \"repo admin:org\"\noauth_callback_port = 8123\n";
+    let at = |url: &str, oauth: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!(
+            "name = \"review\"\ntype = \"http\"\nurl = \"{url}\"\n{oauth}"
+        ))
+        .unwrap()
+    };
+    let with = |keys: &[&'static str]| keys.iter().copied().collect();
+
+    let error = Config::with_mcp_server_merged(
+        text,
+        &at("https://new.example.test/mcp", ""),
+        &with(&["type", "url"]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("3 local OAuth setting(s)"), "{error}");
+    assert!(
+        error.contains("refusing to send them to the new endpoint"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("old-as-client") && !error.contains("example"),
+        "{error}"
+    );
+
+    // The same endpoint keeps them; settings the source supplies are not a
+    // transfer (Claude's `oauth` object decides all three).
+    let same = Config::with_mcp_server_merged(
+        text,
+        &at("https://old.example.test/mcp", ""),
+        &with(&["type", "url"]),
+    )
+    .unwrap();
+    assert_eq!(same, text);
+    let supplied = entry_of(
+        &Config::with_mcp_server_merged(
+            text,
+            &at(
+                "https://new.example.test/mcp",
+                "oauth_client_id = \"new-client\"\n",
+            ),
+            &with(&[
+                "type",
+                "url",
+                "oauth_client_id",
+                "oauth_scopes",
+                "oauth_callback_port",
+            ]),
+        )
+        .unwrap(),
+    );
+    assert_eq!(supplied.oauth_client_id.as_deref(), Some("new-client"));
+    assert_eq!(
+        (supplied.oauth_scopes, supplied.oauth_callback_port),
+        (None, None)
+    );
+}
+
+#[test]
 fn with_mcp_server_merged_keeps_the_operators_spelling_of_one_endpoint() {
     // #3062 review (F6): `https://h` and `https://h/` are one request target,
     // but a saved login is bound to the exact spelling. An import that only

@@ -2451,10 +2451,12 @@ impl Config {
         let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
         let sourced = |key: &str| fresh.contains_key(key) || provided.contains(key);
         // Local settings the source leaves alone would follow a moved
-        // destination: headers to a new endpoint; env, and argv written for
-        // the old program (a credential flag included), to a different one.
-        // The program is the whole argv, since a launcher such as `npx` picks
-        // it by its args.
+        // destination: headers, and a static OAuth client with its pinned
+        // scopes and callback port (registered with the old authorization
+        // server), to a new endpoint; env, and argv written for the old
+        // program (a credential flag included), to a different one. The
+        // program is the whole argv, since a launcher such as `npx` picks it
+        // by its args.
         let kept = |key: &str, count: usize| if sourced(key) { 0 } else { count };
         let (destination, moved, carried) = match entry.transport {
             crate::mcp::TransportKind::Stdio => {
@@ -2475,7 +2477,18 @@ impl Config {
             crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => (
                 "endpoint",
                 crate::mcp::mcp_endpoint_changed(previous.url.as_deref(), entry.url.as_deref()),
-                vec![(kept("headers", previous.headers.len()), "header(s)")],
+                vec![
+                    (kept("headers", previous.headers.len()), "header(s)"),
+                    (
+                        kept("oauth_client_id", previous.oauth_client_id.iter().count())
+                            + kept("oauth_scopes", previous.oauth_scopes.iter().count())
+                            + kept(
+                                "oauth_callback_port",
+                                previous.oauth_callback_port.iter().count(),
+                            ),
+                        "OAuth setting(s)",
+                    ),
+                ],
             ),
         };
         let carried: Vec<String> = carried

@@ -402,6 +402,46 @@ fn force_import_names_the_auth_consequence_of_a_resource_change() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_refuses_to_carry_oauth_settings_to_a_changed_endpoint() {
+    // #3062 review (G5): a static OAuth client, pinned scopes and callback
+    // port belong to the old endpoint's authorization server and must not
+    // follow a moved URL the source names without them.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let original = "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\noauth_client_id = \"old-as-client\"\noauth_scopes = \"repo admin:org\"\noauth_callback_port = 8123\n";
+    std::fs::write(&mcp, original).unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://new.example.test/mcp" } } }"#,
+    )
+    .failure()
+    .stderr(predicate::str::contains("3 local OAuth setting(s)"))
+    .stderr(predicate::str::contains("old-as-client").not());
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), original);
+
+    // An `oauth` object in the source decides all three.
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://new.example.test/mcp",
+              "oauth": { "clientId": "new-client" } } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains("Endpoint changed for fs"));
+    let servers = newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&mcp).unwrap());
+    assert_eq!(servers[0].oauth_client_id.as_deref(), Some("new-client"));
+    assert_eq!(
+        (
+            servers[0].oauth_scopes.as_deref(),
+            servers[0].oauth_callback_port
+        ),
+        (None, None)
+    );
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_keeps_a_bare_origin_url_as_written() {
     // #3062 review (F6): the import canonicalises `https://h` to `https://h/`,
     // the same request target, but a saved login is bound to the spelling the
