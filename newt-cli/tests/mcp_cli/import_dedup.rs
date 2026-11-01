@@ -444,3 +444,42 @@ fn force_import_keeps_comments_on_defaults_and_resets() {
         }
     }
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn force_import_updates_an_alias_spelled_field_in_place() {
+    // #3062 review: `requestTimeoutSecs` is an accepted spelling of
+    // `request_timeout_secs`. Importing a new value used to add the second
+    // spelling, and the next `newt mcp list` rejected the file.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\nrequestTimeoutSecs = 90 # timeout note\n",
+    )
+    .unwrap();
+    let list = || newt(&sb).args(["mcp", "list"]).assert().success();
+    list();
+
+    let source = r#"{ "mcpServers": { "fs": { "command": "fs-mcp", "requestTimeoutSecs": 30 } } }"#;
+    force_import(&sb, source)
+        .success()
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+        ));
+    let updated = std::fs::read_to_string(&mcp).unwrap();
+    assert!(
+        updated.contains("requestTimeoutSecs = 30 # timeout note"),
+        "{updated}"
+    );
+    assert!(!updated.contains("request_timeout_secs"), "{updated}");
+    list();
+
+    force_import(&sb, source)
+        .success()
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 0 replaced, 1 unchanged, 0 skipped.",
+        ));
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), updated);
+}

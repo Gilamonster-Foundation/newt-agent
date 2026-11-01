@@ -2506,7 +2506,10 @@ impl Config {
             .collect();
         for key in decided {
             let wanted = fresh.get(key);
-            if same_mcp_field(key, existing.get(key), wanted) {
+            // An accepted alias (`requestTimeoutSecs`) is this same field: it is
+            // updated where and as the operator spelled it, never doubled.
+            let local = local_mcp_spelling(existing, key, wanted);
+            if same_mcp_field(key, existing.get(&local), wanted) {
                 continue;
             }
             // A reset to a default the minimal rendering leaves out is written
@@ -2514,7 +2517,7 @@ impl Config {
             let wanted = wanted
                 .cloned()
                 .or_else(|| crate::mcp::implicit_default(key).map(toml_edit::Item::Value));
-            match (existing.get_mut(key), wanted) {
+            match (existing.get_mut(&local), wanted) {
                 (Some(slot), Some(value)) => {
                     let decor = slot.as_value().map(|old| old.decor().clone());
                     *slot = value;
@@ -2526,7 +2529,7 @@ impl Config {
                     existing.insert(key, value);
                 }
                 (Some(_), None) => {
-                    let _ = existing.remove(key);
+                    let _ = existing.remove(&local);
                 }
                 (None, None) => {}
             }
@@ -2539,11 +2542,16 @@ impl Config {
             }
         };
         for key in foreign {
-            if !same_mcp_field(key, existing.get(key), None) {
-                let _ = existing.remove(key);
+            let local = local_mcp_spelling(existing, key, None);
+            if !same_mcp_field(key, existing.get(&local), None) {
+                let _ = existing.remove(&local);
             }
         }
-        Ok(doc.to_string())
+        // Backstop: never hand back a document the MCP reader would reject.
+        let merged = doc.to_string();
+        crate::mcp::parse_newt_mcp_toml_checked(&merged)
+            .map_err(|error| NewtError::Config(error.to_string()))?;
+        Ok(merged)
     }
 
     /// Remove the named `[[mcp_servers]]` entry from the TOML `text`, preserving
@@ -2710,6 +2718,40 @@ impl Config {
         paths.push(PathBuf::from("/etc/newt/config.toml"));
         paths
     }
+}
+
+/// The key under which `table` already holds the field newt writes as `key`:
+/// `key` itself, or an alias serde accepts for it. An alias is recognised by
+/// what it means, not by a list: `name = value` (its own value, or the
+/// incoming one) deserializes and renders back under `key`.
+fn local_mcp_spelling(
+    table: &toml_edit::Table,
+    key: &str,
+    wanted: Option<&toml_edit::Item>,
+) -> String {
+    let renders_as = |name: &str, item: &toml_edit::Item| {
+        let mut doc = toml_edit::DocumentMut::new();
+        doc.insert(name, item.clone());
+        let entry = toml::from_str::<crate::mcp::McpServerEntry>(&doc.to_string()).ok()?;
+        let rendered = crate::mcp::entry_to_toml_table(&entry, None).ok()?;
+        let mut keys = rendered
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| *key != "name");
+        match (keys.next(), keys.next()) {
+            (Some(only), None) => Some(only == key),
+            _ => None,
+        }
+    };
+    table
+        .iter()
+        .find(|(name, item)| {
+            *name != key
+                && (renders_as(name, item) == Some(true)
+                    || wanted.is_some_and(|wanted| renders_as(name, wanted) == Some(true)))
+        })
+        .map_or(key, |(name, _)| name)
+        .to_owned()
 }
 
 /// Whether two spellings of one `[[mcp_servers]]` key configure the same

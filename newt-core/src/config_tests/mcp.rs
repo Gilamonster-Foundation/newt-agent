@@ -312,6 +312,118 @@ fn with_mcp_server_merged_keeps_comments_on_defaults_and_resets() {
     assert!(mixed.contains("request_timeout_secs = 30"), "{mixed}");
 }
 
+/// Every name serde accepts for an `McpServerEntry` field, aliases included,
+/// read from the derive itself so a new alias is covered without a list.
+fn accepted_mcp_field_names() -> &'static [&'static str] {
+    use serde::de::{Error, Visitor};
+    struct Names(std::cell::Cell<&'static [&'static str]>);
+    impl<'de> serde::Deserializer<'de> for &Names {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: Visitor<'de>>(
+            self,
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            Err(Error::custom("field names only"))
+        }
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            self.0.set(fields);
+            Err(Error::custom("field names only"))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+    let names = Names(std::cell::Cell::new(&[]));
+    let _ = <crate::mcp::McpServerEntry as serde::Deserialize>::deserialize(&names);
+    names.0.get()
+}
+
+#[test]
+fn with_mcp_server_merged_updates_an_alias_spelled_field_in_place() {
+    // #3062 review: `requestTimeoutSecs` is the same field as
+    // `request_timeout_secs`. A force import must update it where the
+    // operator wrote it, never add a second spelling the reader rejects.
+    let names = accepted_mcp_field_names();
+    assert!(names.contains(&"requestTimeoutSecs"), "{names:?}");
+    let samples = [
+        "30",
+        "90",
+        "'a'",
+        "'b'",
+        "false",
+        "['a']",
+        "['b']",
+        "{ A = 'a' }",
+        "{ B = 'b' }",
+    ];
+    let entry = |body: &str| -> Option<crate::mcp::McpServerEntry> {
+        toml::from_str(&format!("name = 'review'\ncommand = 'review-mcp'\n{body}")).ok()
+    };
+    let base = entry("").unwrap();
+    let mut aliases = 0;
+    for name in names {
+        // Values this spelling accepts, and the key newt itself would write.
+        let accepted: Vec<(&str, String)> = samples
+            .iter()
+            .filter_map(|value| {
+                let parsed = entry(&format!("{name} = {value}")).filter(|e| *e != base)?;
+                let rendered = crate::mcp::entry_to_toml_table(&parsed, None).ok()?;
+                let mut keys = rendered
+                    .iter()
+                    .map(|(key, _)| key)
+                    .filter(|key| !["name", "command"].contains(key));
+                Some((*value, keys.next()?.to_owned()))
+            })
+            .collect();
+        let [(old, canonical), (new, _), ..] = accepted.as_slice() else {
+            continue;
+        };
+        if canonical == name {
+            continue;
+        }
+        aliases += 1;
+        let text = format!(
+            "[[mcp_servers]]\nname = 'review'\ncommand = 'review-mcp'\n{name} = {old} # note\n"
+        );
+        let provided = [canonical.as_str()].into_iter().collect();
+        let merge = |incoming: &crate::mcp::McpServerEntry| {
+            let merged = Config::with_mcp_server_merged(&text, incoming, &provided).unwrap();
+            assert!(
+                crate::mcp::parse_newt_mcp_toml_checked(&merged).is_ok(),
+                "{name}: {merged}"
+            );
+            assert!(
+                !merged.contains(&format!("{canonical} =")),
+                "{name}: {merged}"
+            );
+            merged
+        };
+        let changed = merge(&entry(&format!("{name} = {new}")).unwrap());
+        assert!(
+            changed.contains(&format!("{name} = {new} # note")),
+            "{changed}"
+        );
+        let same = merge(&entry(&format!("{name} = {old}")).unwrap());
+        assert_eq!(same, text, "{name}: an unchanged value keeps its line");
+        let reset = merge(&base);
+        assert_eq!(entry_of(&reset), base, "{name}: reset to the default");
+    }
+    assert!(aliases > 0, "no alias found among {names:?}");
+}
+
+fn entry_of(text: &str) -> crate::mcp::McpServerEntry {
+    crate::mcp::parse_newt_mcp_toml_checked(text)
+        .unwrap()
+        .remove(0)
+}
+
 #[test]
 fn with_mcp_server_removed_does_not_echo_malformed_config_contents() {
     let text = "[[mcp_servers]]\nname = \"private-marker\"\ncommand = =\n";
