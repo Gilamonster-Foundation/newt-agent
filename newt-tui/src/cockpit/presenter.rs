@@ -441,9 +441,13 @@ impl Screen {
     /// Output other than a draw has moved, or is about to move, the cursor off the caret: the
     /// last draw's [`CaretFrame`] no longer says where it is, and unchanged geometry does not
     /// either (a full screen scrolls under `insert_rows` with `top` and `block_h` intact).
-    /// Only a fresh draw makes the frame trustworthy again (#3014).
+    /// Only a fresh draw makes the frame trustworthy again (#3014). Every caller also erases
+    /// the block or redraws it at once, so its painted rows are gone too: a resize before the
+    /// next draw has no block of its own to lift, and lifting by the old one erased transcript
+    /// rows (#3041).
     fn moved_cursor(&mut self) {
         self.caret_frame = None;
+        self.painted_widths.clear();
     }
 
     fn rebuild_term(&mut self) -> io::Result<()> {
@@ -598,8 +602,10 @@ impl Screen {
         // reply already includes where the reflow put the block, so only rows reflowed
         // BEFORE the caret (the rows above it, and its own row's text left of it) are still
         // unaccounted for; erasing a further `growth` rows up would eat transcript.
-        // Unmeasured: the old top is right only when nothing moved, and the whole reflow
-        // lifted the stale block above it.
+        // Unmeasured: the painted block kept its bottom row (the new last row, if the screen
+        // got shorter) and its reflow grew it upward, as tmux and libghostty-vt both do. The
+        // erase and the new block start at its top; putting the block back at the old top left
+        // the lifted rows blank above the prompt (#3041).
         let measured_top = measured_top.zip(self.caret_frame).and_then(|(top, frame)| {
             let row = usize::from(frame.y.saturating_sub(frame.top)).min(self.painted_widths.len());
             let own = caret_row_wrap(
@@ -609,17 +615,19 @@ impl Screen {
             )?;
             Some(top.saturating_sub(growth(&self.painted_widths[..row]).saturating_add(own)))
         });
-        let (old_top, lifted) = match measured_top {
-            Some(top) => (top, 0),
-            None => (self.top, growth(&self.painted_widths)),
-        };
+        let painted = self.painted_widths.len() as u16;
+        let old_top = measured_top.unwrap_or_else(|| {
+            (self.top.saturating_add(painted))
+                .min(rows.max(1))
+                .saturating_sub(painted.saturating_add(growth(&self.painted_widths)))
+        });
         let old_rows = self.rows;
         self.cols = cols.max(1);
         self.rows = rows.max(1);
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
         self.block_h = new_h;
         self.status_rows = status_rows;
-        self.top = resized_top(measured_top, self.top, old_rows, self.rows, new_h);
+        self.top = resize_new_top(old_top, old_rows, self.rows, new_h);
         self.caret_frame = None;
         // FORCED: the TERMINAL resized; the block's new position is a
         // consequence, not a request.
@@ -628,11 +636,10 @@ impl Screen {
             newt_core::tty::OnCollision::SuspendHolder,
         );
         // Erase from the topmost of the OLD and new block tops, not just the new
-        // one (#4), raised by the rows the old block reflowed onto. Whichever
-        // top is higher, nothing but block chrome sits below it (the block
-        // never moves past its own old or new position), so this wipes every
-        // stale status/editor row without losing transcript.
-        let erase_from = resize_erase_from(old_top, self.top, self.rows).saturating_sub(lifted);
+        // one (#4). Whichever top is higher, nothing but block chrome sits below
+        // it (the block never moves past its own old or new position), so this
+        // wipes every stale status/editor row without losing transcript.
+        let erase_from = resize_erase_from(old_top, self.top, self.rows);
         let mut buf = Vec::new();
         queue!(buf, MoveTo(0, erase_from), Clear(ClearType::FromCursorDown))?;
         self.tty.write_all(&buf)?;
@@ -643,6 +650,7 @@ impl Screen {
     /// Leave the terminal as a plain shell expects it: block erased, cursor
     /// at the block's top-left, wrap and cooked mode restored.
     fn shutdown(&mut self, trailing: &[u8]) -> io::Result<()> {
+        self.moved_cursor();
         let mut buf = Vec::new();
         queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
         if !trailing.is_empty() {
@@ -855,19 +863,6 @@ fn resize_new_top(old_top: u16, old_rows: u16, new_rows: u16, new_h: u16) -> u16
     } else {
         new_rows.saturating_sub(new_h)
     }
-}
-
-/// The block's top after a resize: a grow pins it to the bottom; otherwise the position the
-/// terminal reported when it was measured (#3014), else [`resize_new_top`]'s guess from the
-/// old top. Either way the block must fit the new screen.
-fn resized_top(
-    measured: Option<u16>,
-    current_top: u16,
-    old_rows: u16,
-    new_rows: u16,
-    new_h: u16,
-) -> u16 {
-    resize_new_top(measured.unwrap_or(current_top), old_rows, new_rows, new_h)
 }
 
 /// The block's top, from the row the terminal says its cursor is on and where the caret sits
@@ -2229,14 +2224,14 @@ mod tests {
         // pulls scrollback down, and one that never answers.
         for measured in [below, pulled, None] {
             assert_eq!(
-                resized_top(measured, old_top, old_rows, new_rows, new_h),
+                resize_new_top(measured.unwrap_or(old_top), old_rows, new_rows, new_h),
                 30
             );
         }
         // Not a grow: the measured position stands while it fits...
-        assert_eq!(resized_top(Some(12), 20, 34, 34, 4), 12);
+        assert_eq!(resize_new_top(12, 34, 34, 4), 12);
         // ...and a measured top that no longer fits the shrunk screen is clamped.
-        assert_eq!(resized_top(Some(30), 20, 34, 24, 4), 20);
+        assert_eq!(resize_new_top(30, 34, 24, 4), 20);
         // A reply above the caret's own offset cannot be this block's.
         assert_eq!(block_top_from_reply(0, 3), None);
     }
@@ -2433,6 +2428,62 @@ mod tests {
         let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], (5, 22));
         screen.resize(40, 24, 2, 1, None).unwrap();
         assert_eq!(first_erase_row(log), 20);
+    }
+
+    /// #3041: the guess erased from the lifted top but put the block back at the old one, so
+    /// the rows between stayed blank above the prompt and the next insert committed them to
+    /// scrollback. Taken from a live narrow (120 -> 60 columns) with a draft wider than the new
+    /// width: its caret sits past its row's text, so the measurement is refused. Seen in tmux
+    /// and in a libghostty-vt terminal multiplexer; both kept the block's bottom row and lifted
+    /// it by its reflow.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_unmeasured_narrow_puts_the_block_where_the_reflow_lifted_it_3041() {
+        let (mut screen, log) = screen_with_block(120, 40, 37, 3, &[11, 98, 75], (98, 38));
+        // The draft and the status row each wrap once: the old block now starts at 35.
+        screen.resize(60, 40, 3, 1, Some(36)).unwrap();
+        assert_eq!(
+            (first_erase_row(log), screen.top),
+            (35, 35),
+            "(erase origin, block top): row 34 is transcript, and no blank row may sit above the block"
+        );
+        drop(screen);
+
+        // A native split that also takes two rows for its frame (43 -> 41): the screen pushed
+        // the block up one row as well, so the stale header sits on 36. Live, the guess left it
+        // there above the new block.
+        let (mut screen, log) = screen_with_block(114, 43, 39, 3, &[11, 98, 75], (98, 40));
+        screen.resize(54, 41, 3, 1, Some(38)).unwrap();
+        assert_eq!((first_erase_row(log), screen.top), (36, 36));
+    }
+
+    /// #3041: a narrow that lands after the block was erased (output inserted before the next
+    /// draw, or a `!` command holding the terminal) lifted the erase by the widths of a block
+    /// no longer on screen and wiped committed rows. Live: narrowing during `! seq` lost the
+    /// command's last output line.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_unmeasured_narrow_after_the_block_was_erased_lifts_nothing_3041() {
+        let (mut screen, log) = screen_with_block(120, 40, 37, 3, &[11, 70, 75], (2, 38));
+        // Inserted output now sits on row 36, directly above the erased block.
+        screen.insert_rows(vec![b"OUTPUT".to_vec()]).unwrap();
+        screen.resize(60, 40, 2, 1, None).unwrap();
+        assert_eq!(
+            erase_rows(log).into_iter().min(),
+            Some(37),
+            "row 36 is the output"
+        );
+        drop(screen);
+
+        let (mut screen, log) = screen_with_block(120, 40, 37, 3, &[11, 70, 75], (2, 38));
+        // The bang path: the block is erased before the child runs.
+        screen.shutdown(&[]).unwrap();
+        screen.resize(60, 40, 2, 1, None).unwrap();
+        assert_eq!(
+            erase_rows(log).into_iter().min(),
+            Some(37),
+            "row 36 is the child's output"
+        );
     }
 
     /// The screen after a transcript of `lines` rows, a block of `block_h` rows under it, then an
