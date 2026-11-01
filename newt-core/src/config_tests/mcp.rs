@@ -73,7 +73,7 @@ fn with_mcp_server_merged_updates_imported_fields_and_keeps_local_fields() {
         origin: None,
     };
 
-    let updated = Config::with_mcp_server_merged(text, &incoming).unwrap();
+    let updated = Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap();
     assert!(updated.contains("# local MCP settings"));
     assert!(updated.contains("url = \"https://new.example/mcp/\""));
     assert!(updated.contains("enabled = false"));
@@ -95,7 +95,7 @@ fn with_mcp_server_merged_is_a_noop_when_source_fields_match() {
     let incoming: crate::mcp::McpServerEntry =
         toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\n").unwrap();
     assert_eq!(
-        Config::with_mcp_server_merged(text, &incoming).unwrap(),
+        Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap(),
         text
     );
 }
@@ -106,7 +106,7 @@ fn with_mcp_server_merged_resets_a_changed_transport_to_default_stdio() {
     let incoming: crate::mcp::McpServerEntry =
         toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\n").unwrap();
 
-    let updated = Config::with_mcp_server_merged(text, &incoming).unwrap();
+    let updated = Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap();
     let parsed: Config = toml::from_str(&updated).unwrap();
     assert_eq!(
         parsed.mcp_servers[0].transport,
@@ -125,7 +125,7 @@ fn with_mcp_server_merged_removes_stdio_fields_when_switching_to_http() {
         toml::from_str("name = \"review\"\ntype = \"http\"\nurl = \"https://new.example/mcp\"\n")
             .unwrap();
 
-    let updated = Config::with_mcp_server_merged(text, &incoming).unwrap();
+    let updated = Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap();
     let parsed: Config = toml::from_str(&updated).unwrap();
     let server = &parsed.mcp_servers[0];
     assert_eq!(server.transport, crate::mcp::TransportKind::Http);
@@ -133,6 +133,30 @@ fn with_mcp_server_merged_removes_stdio_fields_when_switching_to_http() {
     assert!(server.command.is_none());
     assert!(server.args.is_empty());
     assert!(server.env.is_empty());
+}
+
+#[test]
+fn with_mcp_server_merged_applies_explicit_empties_and_keeps_omitted_fields() {
+    // #2915 review: an explicit empty/default source value is applied; only a
+    // key the source omits keeps its local value.
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"review-mcp\"\nargs = [\"--old-target\"]\nenv = { RUST_LOG = \"debug\" }\nenabled = false\nrequest_timeout_secs = 90\n";
+    let incoming: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\n").unwrap();
+
+    let provided = ["command", "args", "env", "enabled"].into_iter().collect();
+    let updated = Config::with_mcp_server_merged(text, &incoming, &provided).unwrap();
+    let server = &toml::from_str::<Config>(&updated).unwrap().mcp_servers[0];
+    assert!(server.args.is_empty(), "{updated}");
+    assert!(server.env.is_empty(), "{updated}");
+    assert!(server.enabled, "{updated}");
+    assert_eq!(
+        server.request_timeout_secs,
+        Some(90),
+        "omitted by the source"
+    );
+
+    let omitted = Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap();
+    assert_eq!(omitted, text, "nothing provided, nothing changed");
 }
 
 #[test]

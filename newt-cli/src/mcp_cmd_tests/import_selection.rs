@@ -140,6 +140,7 @@ fn import_selection_never_silently_discards_rejected_entries() {
             name: Some("rejected".into()),
             issue: newt_core::mcp::McpImportIssue::UnknownField,
         }],
+        ..Default::default()
     };
     assert!(select_import_entries(
         report.clone(),
@@ -185,6 +186,7 @@ fn import_rejected_name_via_name_flag_never_passes_malicious_key_verbatim() {
     let report = McpImportParseReport {
         entries: vec![],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -216,6 +218,7 @@ fn import_without_selector_lists_names_as_commands() {
             stdio_entry("alpha", Some("a")),
         ],
         rejected: vec![],
+        ..Default::default()
     };
     let err = select_import_entries(report, None, false, Path::new("s.json"), "--from-claude")
         .unwrap_err()
@@ -239,6 +242,7 @@ fn import_listing_never_renders_untrusted_names_as_commands() {
             stdio_entry("\u{1b}[31m", Some("c")),
         ],
         rejected: vec![],
+        ..Default::default()
     };
     let err = select_import_entries(report, None, false, Path::new("s"), "my dir/.mcp.json")
         .unwrap_err()
@@ -265,6 +269,7 @@ fn import_chooser_names_each_rejection_with_safe_reason_and_no_value() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -293,6 +298,7 @@ fn import_chooser_gives_rejected_entry_no_runnable_command() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -321,6 +327,7 @@ fn import_chooser_escapes_rejected_names_with_control_chars() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -362,6 +369,7 @@ fn import_all_names_each_rejection_and_refuses() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -390,6 +398,7 @@ fn import_all_reports_unnamed_rejection_without_empty_name() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,

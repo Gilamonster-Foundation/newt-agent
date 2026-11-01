@@ -271,3 +271,34 @@ fn imported_oauth_restrictions_round_trip_through_trusted_toml() {
     assert_eq!(back[0].oauth_scopes.as_deref(), Some("files:read"));
     assert_eq!(back[0].oauth_callback_port, Some(8080));
 }
+
+#[test]
+fn strict_claude_import_records_which_keys_the_source_spelled_out() {
+    // #2915 review: `"args": []` must stay distinguishable from no `args`.
+    let report = parse_claude_mcp_for_import(&serde_json::json!({
+        "mcpServers": {
+            "explicit": { "command": "x", "args": [], "env": {}, "enabled": true,
+                          "requestTimeoutSecs": 5 },
+            "omitted": { "command": "x" },
+            "remote": { "type": "http", "url": "https://mcp.example.com/mcp",
+                        "headers": {}, "oauth": { "clientId": "public-client" } }
+        }
+    }));
+    let keys = |name: &str| report.provided[name].iter().copied().collect::<Vec<_>>();
+    assert_eq!(
+        keys("explicit"),
+        ["args", "command", "enabled", "env", "request_timeout_secs"]
+    );
+    assert_eq!(keys("omitted"), ["command"]);
+    assert_eq!(
+        keys("remote"),
+        [
+            "headers",
+            "oauth_callback_port",
+            "oauth_client_id",
+            "oauth_scopes",
+            "type",
+            "url"
+        ]
+    );
+}

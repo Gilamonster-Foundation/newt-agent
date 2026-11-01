@@ -1625,13 +1625,14 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     };
     let text = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {}", source.display()))?;
-    let imported = parse_import_entries(&text, format)
+    let mut parsed = parse_import_entries(&text, format)
         .with_context(|| format!("parsing {}", source.display()))?;
-    if imported.entries.is_empty() && imported.rejected.is_empty() {
+    if parsed.entries.is_empty() && parsed.rejected.is_empty() {
         bail!("no MCP server entries found in {}", source.display());
     }
+    let provided = std::mem::take(&mut parsed.provided);
     let mut imported =
-        select_import_entries(imported, request.name, request.all, &source, &selector)?;
+        select_import_entries(parsed, request.name, request.all, &source, &selector)?;
     let mut source_omissions = newt_core::mcp::codex_mcp_omitted_field_counts(&text);
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -1868,7 +1869,11 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                 }
                 if exists_in_target {
                     let previous = doc.clone();
-                    doc = Config::with_mcp_server_merged(&doc, entry)?;
+                    doc = Config::with_mcp_server_merged(
+                        &doc,
+                        entry,
+                        &provided.get(&entry.name).cloned().unwrap_or_default(),
+                    )?;
                     if doc == previous {
                         unchanged += 1;
                     } else {

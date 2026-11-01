@@ -2428,11 +2428,14 @@ impl Config {
 
     /// Replace the source-provided fields of a same-name `[[mcp_servers]]`
     /// entry while retaining local fields the source did not provide. Appends
-    /// the entry when it is not already present. Pure; the caller owns locking
-    /// and durable writeback.
+    /// the entry when it is not already present. `provided` names the keys the
+    /// source spelled out (see `McpImportParseReport::provided`), so an explicit
+    /// empty or default value is applied rather than mistaken for an omission.
+    /// Pure; the caller owns locking and durable writeback.
     pub fn with_mcp_server_merged(
         text: &str,
         entry: &crate::mcp::McpServerEntry,
+        provided: &std::collections::BTreeSet<&str>,
     ) -> Result<String> {
         crate::mcp::validate_entry_for_write(entry)?;
         let mut doc = text
@@ -2451,7 +2454,13 @@ impl Config {
             return Self::with_mcp_server_added(text, entry);
         };
 
-        for (key, value) in crate::mcp::entry_to_toml_table(entry, None)? {
+        let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
+        // `"args": []` or `"enabled": true` renders as no key at all, yet it is
+        // the source's value: clear the local one instead of keeping it.
+        for key in provided.iter().filter(|key| !fresh.contains_key(key)) {
+            let _ = existing.remove(key);
+        }
+        for (key, value) in fresh {
             existing.insert(&key, value);
         }
         match entry.transport {

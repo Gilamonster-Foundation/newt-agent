@@ -367,3 +367,17 @@ oauth_client_id = "public-client"
         .collect();
     assert_eq!(names, ["good"]);
 }
+
+#[test]
+fn strict_codex_import_records_which_keys_the_source_spelled_out() {
+    // #2915 review: an explicit empty Codex field maps to the newt key it sets.
+    let report = parse_codex_mcp_toml_for_import(
+        "[mcp_servers.local]\ncommand = \"x\"\nargs = []\nenv_vars = []\nenabled = true\n\n\
+         [mcp_servers.remote]\nurl = \"https://mcp.example.com/mcp\"\nenv_http_headers = {}\n\
+         auth = \"oauth\"\n",
+    )
+    .unwrap();
+    let keys = |name: &str| report.provided[name].iter().copied().collect::<Vec<_>>();
+    assert_eq!(keys("local"), ["args", "command", "enabled", "env"]);
+    assert_eq!(keys("remote"), ["headers", "url"]);
+}

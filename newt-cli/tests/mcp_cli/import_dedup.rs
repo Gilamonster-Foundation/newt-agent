@@ -218,3 +218,51 @@ fn import_targets_user_mcp_toml_even_with_an_ambient_project_newt_toml() {
         "the ambient ./newt.toml must not receive the import: {ambient}"
     );
 }
+
+/// Writes `source` as the borrowed config and runs `newt mcp import <source>
+/// --all --force`.
+fn force_import(sb: &Sandbox, json: &str) -> assert_cmd::assert::Assert {
+    let source = sb.cwd.join("c.json");
+    std::fs::write(&source, json).unwrap();
+    newt(sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--all",
+            "--force",
+        ])
+        .assert()
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn force_import_applies_an_explicit_empty_source_value() {
+    // #2915 review: `"args": []` is an explicit value, not an omitted field.
+    // Only a field the source omits keeps its local value.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\nargs = [\"--old-target\"]\nrequest_timeout_secs = 90\n",
+    )
+    .unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "fs-mcp", "args": [] } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+    ));
+
+    let servers = newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&mcp).unwrap());
+    assert!(servers[0].args.is_empty(), "explicit empty args applied");
+    assert_eq!(
+        servers[0].request_timeout_secs,
+        Some(90),
+        "omitted field kept"
+    );
+}

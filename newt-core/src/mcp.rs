@@ -18,7 +18,7 @@
 //! transport semantics must fail instead of being silently erased.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::agent_identity::{Secret, SecretRef};
@@ -903,6 +903,67 @@ pub struct McpImportRejection {
 pub struct McpImportParseReport {
     pub entries: Vec<McpServerEntry>,
     pub rejected: Vec<McpImportRejection>,
+    /// The newt `[[mcp_servers]]` keys each accepted entry's source spelled
+    /// out, by server name. Deserialization cannot tell `"args": []` from an
+    /// omitted `args`; a force import applies these keys even when empty or
+    /// default and keeps local values only for the keys the source omits.
+    pub provided: BTreeMap<String, BTreeSet<&'static str>>,
+}
+
+/// A source field and the newt `[[mcp_servers]]` keys it sets.
+type ImportField = (&'static str, &'static [&'static str]);
+
+/// Every field the strict Claude parser accepts, and the keys it sets.
+const CLAUDE_IMPORT_FIELDS: &[ImportField] = &[
+    ("enabled", &["enabled"]),
+    ("type", &["type"]),
+    ("command", &["command"]),
+    ("args", &["args"]),
+    ("env", &["env"]),
+    ("url", &["url"]),
+    ("headers", &["headers"]),
+    ("request_timeout_secs", &["request_timeout_secs"]),
+    ("requestTimeoutSecs", &["request_timeout_secs"]),
+    (
+        "oauth",
+        &["oauth_client_id", "oauth_scopes", "oauth_callback_port"],
+    ),
+];
+
+/// Every field the strict Codex parser accepts, and the keys it sets.
+const CODEX_IMPORT_FIELDS: &[ImportField] = &[
+    ("url", &["url"]),
+    ("command", &["command"]),
+    ("args", &["args"]),
+    ("env", &["env"]),
+    ("bearer_token_env_var", &["headers"]),
+    ("http_headers", &["headers"]),
+    ("env_http_headers", &["headers"]),
+    ("env_vars", &["env"]),
+    ("auth", &[]),
+    ("startup_timeout_sec", &[]),
+    ("tool_timeout_sec", &["request_timeout_secs"]),
+    ("required", &[]),
+    ("enabled", &["enabled"]),
+];
+
+fn import_field_supported(fields: &[ImportField], field: &str) -> bool {
+    fields.iter().any(|(name, _)| *name == field)
+}
+
+fn provided_keys<'a>(
+    fields: &[ImportField],
+    present: impl IntoIterator<Item = &'a String>,
+) -> BTreeSet<&'static str> {
+    present
+        .into_iter()
+        .flat_map(|field| {
+            fields
+                .iter()
+                .filter(move |(name, _)| *name == field.as_str())
+                .flat_map(|(_, keys)| keys.iter().copied())
+        })
+        .collect()
 }
 
 /// A value-independent syntax error for a Newt-owned MCP TOML file.
@@ -1040,19 +1101,6 @@ pub fn is_transport_owned_mcp_header(name: &str) -> bool {
 /// semantics before stamping an entry trusted.
 #[must_use]
 pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseReport {
-    const SUPPORTED_FIELDS: &[&str] = &[
-        "enabled",
-        "type",
-        "command",
-        "args",
-        "env",
-        "url",
-        "headers",
-        "request_timeout_secs",
-        "requestTimeoutSecs",
-        "oauth",
-    ];
-
     let Some(servers) = value.get("mcpServers") else {
         return McpImportParseReport::default();
     };
@@ -1063,6 +1111,7 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
                 name: None,
                 issue: McpImportIssue::InvalidShape,
             }],
+            provided: BTreeMap::new(),
         };
     };
 
@@ -1077,7 +1126,7 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
         };
         if object
             .keys()
-            .any(|field| !SUPPORTED_FIELDS.contains(&field.as_str()))
+            .any(|field| !import_field_supported(CLAUDE_IMPORT_FIELDS, field))
         {
             report.rejected.push(McpImportRejection {
                 name: Some(name.clone()),
@@ -1126,6 +1175,10 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
         };
         if semantics_preserved {
             report.entries.push(entry);
+            report.provided.insert(
+                name.clone(),
+                provided_keys(CLAUDE_IMPORT_FIELDS, object.keys()),
+            );
         } else {
             report.rejected.push(McpImportRejection {
                 name: Some(name.clone()),
@@ -1388,22 +1441,6 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
 pub fn parse_codex_mcp_toml_for_import(
     text: &str,
 ) -> std::result::Result<McpImportParseReport, McpImportSyntaxError> {
-    const SUPPORTED_FIELDS: &[&str] = &[
-        "url",
-        "command",
-        "args",
-        "env",
-        "bearer_token_env_var",
-        "http_headers",
-        "env_http_headers",
-        "env_vars",
-        "auth",
-        "startup_timeout_sec",
-        "tool_timeout_sec",
-        "required",
-        "enabled",
-    ];
-
     let document = toml::from_str::<toml::Value>(text).map_err(|_| McpImportSyntaxError)?;
     let Some(raw_servers) = document.get("mcp_servers") else {
         return Ok(McpImportParseReport::default());
@@ -1415,6 +1452,7 @@ pub fn parse_codex_mcp_toml_for_import(
                 name: None,
                 issue: McpImportIssue::InvalidShape,
             }],
+            provided: BTreeMap::new(),
         });
     };
 
@@ -1422,8 +1460,15 @@ pub fn parse_codex_mcp_toml_for_import(
     let accepted: std::collections::BTreeSet<&str> =
         entries.iter().map(|entry| entry.name.as_str()).collect();
     let mut rejected = Vec::new();
+    let mut provided = BTreeMap::new();
     for (name, raw) in raw_servers {
         if accepted.contains(name.as_str()) {
+            if let Some(table) = raw.as_table() {
+                provided.insert(
+                    name.clone(),
+                    provided_keys(CODEX_IMPORT_FIELDS, table.keys()),
+                );
+            }
             continue;
         }
         let issue = match raw.as_table() {
@@ -1431,7 +1476,7 @@ pub fn parse_codex_mcp_toml_for_import(
             Some(table)
                 if table
                     .keys()
-                    .any(|field| !SUPPORTED_FIELDS.contains(&field.as_str())) =>
+                    .any(|field| !import_field_supported(CODEX_IMPORT_FIELDS, field)) =>
             {
                 McpImportIssue::UnknownField
             }
@@ -1442,7 +1487,11 @@ pub fn parse_codex_mcp_toml_for_import(
             issue,
         });
     }
-    Ok(McpImportParseReport { entries, rejected })
+    Ok(McpImportParseReport {
+        entries,
+        rejected,
+        provided,
+    })
 }
 
 /// Count fields omitted by [`parse_codex_mcp_toml`] because Codex represents
