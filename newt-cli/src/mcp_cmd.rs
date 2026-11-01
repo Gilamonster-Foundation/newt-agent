@@ -1054,15 +1054,46 @@ fn import_namespace_sanitization(
         crate::migration_notices::read(|report| {
             Config::resolve_runtime_unpublished_with_held_locks(report, held_locks)
                 .map(ResolvedConfig::into_config)
+        })
+        .map_err(|_| {
+            // Name the layer that fails on its own; a failure only the merged
+            // view has gets the same withheld diagnostic without a path.
+            [
+                Config::user_config_path(),
+                ambient_newt_toml().ok().flatten(),
+                Config::project_config_path(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|path| path.is_file())
+            .find_map(|path| load_consulted_config(&path, held_locks).err())
+            .unwrap_or_else(|| withheld_config_error(Path::new("the resolved Newt config")))
         })?
     } else if target.is_file() {
-        crate::migration_notices::read(|report| {
-            Config::load_with_held_locks(target, held_locks, report)
-        })?
+        load_consulted_config(target, held_locks)?
     } else {
         Config::default()
     };
     Ok(cfg.tui.unwrap_or_default().sanitize_mcp_server_names)
+}
+
+/// Decode a config `newt mcp import` consults, under its held locks. I/O
+/// errors carry no file contents; a decode error does, so it is withheld.
+fn load_consulted_config(path: &Path, held_locks: &[&LockGuard]) -> anyhow::Result<Config> {
+    crate::migration_notices::read(|report| Config::load_with_held_locks(path, held_locks, report))
+        .map_err(|error| match error {
+            newt_core::NewtError::Io(error) => anyhow!("reading {}: {error}", path.display()),
+            _ => withheld_config_error(path),
+        })
+}
+
+/// A TOML parser error quotes the offending line, which may hold a credential
+/// (#2915): name the file, never its text.
+fn withheld_config_error(path: &Path) -> anyhow::Error {
+    anyhow!(
+        "{}: invalid Newt config (TOML diagnostic withheld: it would quote the file's contents)",
+        path.display()
+    )
 }
 
 fn valid_env_identifier(value: &str) -> bool {
@@ -1243,8 +1274,7 @@ fn project_replaces_base_mcp_servers(
     }
     let text = std::fs::read_to_string(&project)
         .with_context(|| format!("reading project config {}", project.display()))?;
-    let value: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("parsing project config {}", project.display()))?;
+    let value: toml::Value = toml::from_str(&text).map_err(|_| withheld_config_error(&project))?;
     let has_project_mcp_array = value
         .get("mcp_servers")
         .and_then(toml::Value::as_array)
@@ -1256,11 +1286,7 @@ fn project_replaces_base_mcp_servers(
     let base_strategy = base
         .as_path()
         .is_file()
-        .then(|| {
-            crate::migration_notices::read(|report| {
-                Config::load_with_held_locks(base.as_path(), held_locks, report)
-            })
-        })
+        .then(|| load_consulted_config(base.as_path(), held_locks))
         .transpose()?
         .and_then(|config| config.merge)
         .map(|merge| merge.arrays);
@@ -1285,8 +1311,7 @@ fn project_appends_to_base_mcp_servers(
     }
     let text = std::fs::read_to_string(&project)
         .with_context(|| format!("reading project config {}", project.display()))?;
-    let value: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("parsing project config {}", project.display()))?;
+    let value: toml::Value = toml::from_str(&text).map_err(|_| withheld_config_error(&project))?;
     if value
         .get("mcp_servers")
         .and_then(toml::Value::as_array)
@@ -1301,11 +1326,7 @@ fn project_appends_to_base_mcp_servers(
     let base_strategy = base
         .as_path()
         .is_file()
-        .then(|| {
-            crate::migration_notices::read(|report| {
-                Config::load_with_held_locks(base.as_path(), held_locks, report)
-            })
-        })
+        .then(|| load_consulted_config(base.as_path(), held_locks))
         .transpose()?
         .and_then(|config| config.merge)
         .map(|merge| merge.arrays);
@@ -1377,13 +1398,11 @@ fn outranking_import_sources(
     if user_config.is_file() {
         sources.push((
             user_config.clone(),
-            crate::migration_notices::read(|report| {
-                Config::load_with_held_locks(&user_config, held_locks, report)
-            })?
-            .mcp_servers
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect(),
+            load_consulted_config(&user_config, held_locks)?
+                .mcp_servers
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect(),
         ));
     }
     for source in [ambient_newt_toml()?, Config::project_config_path()]
@@ -1393,13 +1412,11 @@ fn outranking_import_sources(
         if source.is_file() {
             sources.push((
                 source.clone(),
-                crate::migration_notices::read(|report| {
-                    Config::load_with_held_locks(&source, held_locks, report)
-                })?
-                .mcp_servers
-                .into_iter()
-                .map(|entry| entry.name)
-                .collect(),
+                load_consulted_config(&source, held_locks)?
+                    .mcp_servers
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect(),
             ));
         }
     }
@@ -1776,11 +1793,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         project_path
             .as_ref()
             .map(ResolvedPath::as_path)
-            .map(|path| {
-                crate::migration_notices::read(|report| {
-                    Config::load_with_held_locks(path, &held_locks, report)
-                })
-            })
+            .map(|path| load_consulted_config(path, &held_locks))
             .transpose()?
             .map(|config| {
                 config

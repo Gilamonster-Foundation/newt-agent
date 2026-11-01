@@ -511,3 +511,51 @@ fn uat_import_rejects_every_url_query_without_echoing_it() {
         .stderr(predicate::str::contains("do-not-echo").not());
     assert!(!sb.config_dir.join("mcp.toml").exists());
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn uat_import_reports_a_malformed_config_without_quoting_its_line() {
+    // #2915 review: a TOML parser error quotes the offending line, which here
+    // carries a credential. Both the explicit `--config` route and the default
+    // route must name the file without echoing that line.
+    let sb = sandbox();
+    let marker = "SYNTHETIC_SECRET_MARKER";
+    let malformed = format!(
+        "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://review.example.test/mcp\"\nheaders = {{ Authorization = \"{marker}\" \n"
+    );
+    let source = sb.cwd.join("borrowed.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "other": { "command": "other-mcp" } } }"#,
+    )
+    .unwrap();
+
+    let target = sb.cwd.join("target.toml");
+    std::fs::write(&target, &malformed).unwrap();
+    newt(&sb)
+        .args(["--config", target.to_str().unwrap()])
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--all",
+            "--force",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target.toml"))
+        .stderr(predicate::str::contains(marker).not());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), malformed);
+
+    let user_config = sb.config_dir.join("config.toml");
+    std::fs::write(&user_config, &malformed).unwrap();
+    newt(&sb)
+        .args(["mcp", "import", source.to_str().unwrap(), "--all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config.toml"))
+        .stderr(predicate::str::contains(marker).not());
+    assert_eq!(std::fs::read_to_string(&user_config).unwrap(), malformed);
+    assert!(!sb.config_dir.join("mcp.toml").exists());
+}
