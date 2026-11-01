@@ -804,6 +804,14 @@ fn mcp_server_edit_path_refuses_a_project_owner() {
         "{error}"
     );
     assert_eq!(Config::mcp_server_edit_path("mine").unwrap(), mcp);
+
+    // Pinned as the base, the same file is the operator's named config, not
+    // a borrowed layer: the resolver reads it as the base, whatever its
+    // spelling, and so does the edit rule.
+    // SAFETY: the `real_fs` serial lane serializes env mutation; HomeSandbox
+    // restores NEWT_CONFIG on drop.
+    unsafe { std::env::set_var("NEWT_CONFIG", &owner) };
+    assert_eq!(Config::mcp_server_edit_path("proj").unwrap(), owner);
 }
 
 fn newt_core_lock_path(path: &std::path::Path) -> std::path::PathBuf {

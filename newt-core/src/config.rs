@@ -2668,15 +2668,19 @@ impl Config {
     /// enable|disable`) may change. A walked-up project config is borrowed
     /// and repo-tracked, and the system config is shared, so neither is edited
     /// unless named, as before owners were resolved (#2915): the error names
-    /// the explicit command.
+    /// the explicit command. A project file the operator pinned as the base
+    /// is their named config, as it is for the resolver.
     pub fn mcp_server_edit_path(name: &str) -> anyhow::Result<PathBuf> {
         let owner = Self::mcp_server_owner_path(name)?.ok_or_else(|| {
             anyhow::anyhow!("no MCP server named `{name}` in the effective Newt config")
         })?;
-        let kind = if Self::project_config_path().as_ref() == Some(&owner) {
-            "project"
-        } else if owner == Path::new(SYSTEM_CONFIG_PATH) {
+        let kind = if Self::base_config_path().as_ref() == Some(&owner) {
+            if owner != Path::new(SYSTEM_CONFIG_PATH) {
+                return Ok(owner);
+            }
             "system"
+        } else if Self::project_config_path().as_ref() == Some(&owner) {
+            "project"
         } else {
             return Ok(owner);
         };
