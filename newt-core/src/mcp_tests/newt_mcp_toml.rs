@@ -116,3 +116,29 @@ fn checked_newt_mcp_parser_reports_malformed_toml_without_source_text() {
     assert!(!error.to_string().contains("private-token-marker"));
     assert!(parse_newt_mcp_toml_checked("other = 1").unwrap().is_empty());
 }
+
+#[test]
+fn an_unloadable_newt_mcp_file_is_a_diagnostic_not_an_empty_list() {
+    // #2915 review: discovery used to turn a malformed `mcp.toml` into no
+    // servers. A missing file is still empty; anything else is named, without
+    // quoting the line (here, a credential) the parser stopped on.
+    let path = Path::new("cfg/mcp.toml");
+    let malformed = "[[mcp_servers]]\nname = \"docs\"\nheaders = { Authorization = \"SYNTHETIC_SECRET_MARKER\" \n";
+    let diagnostic = newt_mcp_file_servers(path, Ok(malformed.into())).unwrap_err();
+    assert!(diagnostic.contains("mcp.toml"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("invalid MCP TOML syntax"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("SYNTHETIC_SECRET_MARKER"),
+        "{diagnostic}"
+    );
+
+    let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+    assert!(newt_mcp_file_servers(path, Err(missing))
+        .unwrap()
+        .is_empty());
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(newt_mcp_file_servers(path, Err(denied)).is_err());
+}

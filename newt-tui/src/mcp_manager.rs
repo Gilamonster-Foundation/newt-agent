@@ -193,14 +193,16 @@ pub(crate) fn run<F>(
 where
     F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice,
 {
+    let report = discovery(&context);
     let mut panel = McpPanel::new(
-        views(mcp, &discovery(&context)),
+        views(mcp, &report),
         context
             .cfg
             .tui
             .as_ref()
             .is_none_or(|tui| tui.sanitize_mcp_server_names),
     );
+    panel.notices = report.diagnostics;
     let (color, verbose) = (gate.color, gate.verbose);
     let mut commit = |text: &str| crate::print_newt(text, color, verbose);
     loop {
@@ -274,7 +276,9 @@ where
             Err(error) => failure_message(&error),
         };
         outcome(&mut panel, message, &mut commit);
-        panel.refresh(views(mcp, &discovery(&context)));
+        let report = discovery(&context);
+        panel.refresh(views(mcp, &report));
+        panel.notices = report.diagnostics;
         if gate.exit.is_some_and(|exit| exit.load(Ordering::Relaxed)) {
             return Ok(());
         }

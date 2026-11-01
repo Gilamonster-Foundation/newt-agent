@@ -1587,14 +1587,7 @@ fn load_claude_file(path: &Path) -> Vec<McpServerEntry> {
 /// document yields an empty list (discovery is never fatal — mirrors
 /// [`load_claude_file`]). Pure.
 pub fn parse_newt_mcp_toml(text: &str) -> Vec<McpServerEntry> {
-    #[derive(Deserialize, Default)]
-    struct Doc {
-        #[serde(default)]
-        mcp_servers: Vec<McpServerEntry>,
-    }
-    toml::from_str::<Doc>(text)
-        .map(|d| d.mcp_servers)
-        .unwrap_or_default()
+    parse_newt_mcp_toml_checked(text).unwrap_or_default()
 }
 
 /// Parse a Newt-owned MCP TOML document without discarding syntax or shape
@@ -1614,13 +1607,25 @@ pub fn parse_newt_mcp_toml_checked(
         .map_err(|_| McpConfigSyntaxError)
 }
 
-/// Read + parse a newt-owned `~/.newt/mcp.toml`. Missing or malformed files
-/// yield an empty list (best-effort, never fatal).
-fn load_newt_mcp_toml(path: &Path) -> Vec<McpServerEntry> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    parse_newt_mcp_toml(&text)
+/// Read + parse a newt-owned `~/.newt/mcp.toml`. A missing file is empty; one
+/// that cannot be read or parsed is a value-independent diagnostic, so it never
+/// looks like a file with no servers (#2915).
+fn load_newt_mcp_toml(path: &Path) -> std::result::Result<Vec<McpServerEntry>, String> {
+    newt_mcp_file_servers(path, std::fs::read_to_string(path))
+}
+
+/// [`load_newt_mcp_toml`] over an already-attempted read. Pure.
+fn newt_mcp_file_servers(
+    path: &Path,
+    read: std::io::Result<String>,
+) -> std::result::Result<Vec<McpServerEntry>, String> {
+    let skipped = "its MCP servers were not loaded";
+    match read {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("{}: {error}; {skipped}", path.display())),
+        Ok(text) => parse_newt_mcp_toml_checked(&text)
+            .map_err(|error| format!("{}: {error}; {skipped}", path.display())),
+    }
 }
 
 /// Whether `entry` configures an `Authorization` header (any value).
@@ -1752,6 +1757,9 @@ pub struct McpDiscoveryReport {
     pub servers: Vec<DiscoveredMcpServer>,
     /// Valid entries shadowed by an earlier namespace.
     pub conflicts: Vec<McpConflict>,
+    /// Newt-owned sources that could not be loaded, as value-independent
+    /// messages. Discovery continues without them, but says so.
+    pub diagnostics: Vec<String>,
 }
 
 fn dedup_report(sources: Vec<DiscoveredMcpServer>, sanitize: bool) -> McpDiscoveryReport {
@@ -1828,17 +1836,21 @@ pub fn discover_with_namespace_mode(
     workspace: &Path,
     sanitize_server_names: bool,
 ) -> Vec<McpServerEntry> {
-    discover_report_with_namespace_mode(
+    let report = discover_report_with_namespace_mode(
         newt_servers,
         newt_mcp_toml,
         home,
         workspace,
         sanitize_server_names,
-    )
-    .servers
-    .into_iter()
-    .map(|server| server.entry)
-    .collect()
+    );
+    for diagnostic in &report.diagnostics {
+        tracing::warn!("{diagnostic}");
+    }
+    report
+        .servers
+        .into_iter()
+        .map(|server| server.entry)
+        .collect()
 }
 
 /// The same discovery and precedence used for connection, retaining origins and conflicts.
@@ -1860,8 +1872,11 @@ pub fn discover_report_with_namespace_mode(
         );
     };
     append(newt_servers.to_vec(), McpSource::Configuration);
-    if let Some(path) = newt_mcp_toml {
-        append(load_newt_mcp_toml(path), McpSource::UserMcpFile);
+    let mut diagnostics = Vec::new();
+    match newt_mcp_toml.map(load_newt_mcp_toml) {
+        Some(Ok(entries)) => append(entries, McpSource::UserMcpFile),
+        Some(Err(diagnostic)) => diagnostics.push(diagnostic),
+        None => {}
     }
     // Borrowed files record where they came from, so a refusal can name the
     // import command for that exact file.
@@ -1888,7 +1903,10 @@ pub fn discover_report_with_namespace_mode(
         ),
         McpSource::ClaudeProject,
     );
-    dedup_report(sources, sanitize_server_names)
+    McpDiscoveryReport {
+        diagnostics,
+        ..dedup_report(sources, sanitize_server_names)
+    }
 }
 
 #[cfg(test)]
