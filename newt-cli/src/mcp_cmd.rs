@@ -1827,8 +1827,11 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             .collect()
         };
 
-    let project_appends =
-        request.grant_net && project_appends_to_base_mcp_servers(&target_destination, &held_locks)?;
+    // Writing the base config (a grant, or a force import redirected to the
+    // owner): an appended project's entries follow the base's, so they do not
+    // outrank the target (#2915).
+    let project_appends = (request.grant_net || target_destination != breakout_destination)
+        && project_appends_to_base_mcp_servers(&target_destination, &held_locks)?;
     let project_path = Config::project_config_path()
         .map(|path| ResolvedPath::resolve(&path))
         .transpose()?;

@@ -151,6 +151,39 @@ fn import_force_updates_the_effective_config_owner() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_updates_an_owner_an_appended_project_does_not_outrank() {
+    // #3062 review (F5): with `[merge] arrays = "append"` the base entries
+    // come first, so config.toml's `alpha` is effective and the project's
+    // same-name entry does not outrank it. The import updates config.toml.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/true\"\nrequest_timeout_secs = 90\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    let project = sb.cwd.join(".newt/config.toml");
+    let project_text = "[merge]\narrays = \"append\"\n\n[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/false\"\n";
+    std::fs::write(&project, project_text).unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "alpha": { "command": "/bin/true", "requestTimeoutSecs": 30 } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+    ));
+    assert!(std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("request_timeout_secs = 30"));
+    assert_eq!(std::fs::read_to_string(&project).unwrap(), project_text);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_updates_the_owner_in_place_beside_a_shadowed_copy() {
     // #3062 review (F4, G3): config.toml owns `alpha` and mcp.toml holds an
     // older, shadowed copy. The import updates the owner in place, since the
