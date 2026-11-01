@@ -312,8 +312,8 @@ fn map_tenacity_value(item: &mut toml_edit::Item, key: &str, changes: &mut Vec<S
 
 #[path = "psyche_import_read.rs"]
 mod reader;
-#[cfg(test)]
-pub(crate) use reader::reset_lock_contention_warned_for_test;
+#[cfg(any(test, feature = "test-util"))]
+pub use reader::reset_lock_contention_warned_for_test;
 pub use reader::{read_config_file, read_persona_file};
 #[cfg(test)]
 use reader::{read_migrating, MigratingPath};

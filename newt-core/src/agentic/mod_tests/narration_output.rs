@@ -3,9 +3,9 @@ use super::*;
 #[derive(Default)]
 struct Retained(std::sync::Mutex<Vec<String>>);
 impl CompletedSpillRenderer for Retained {
-    fn retain_completed(&self, body: &str) -> Option<u64> {
+    fn retain_completed(&self, body: &str) -> Option<crate::agentic::SpillCid> {
         self.0.lock().unwrap().push(body.into());
-        Some(7)
+        Some(crate::agentic::session_output_cid([7; 16], "fold").unwrap())
     }
     fn render_completed(&self, _: &str, _: usize, _: usize) -> usize {
         0
@@ -42,7 +42,7 @@ fn narration_2799_emitter_budgets_rendered_rows() {
         assert_eq!(output[1].2, rendered[1]);
         assert_eq!(output[2].1, "▲");
         assert!(output[2].2.contains(&format!("{} lines hidden", rendered.len() - 2)), "{output:?}");
-        assert!(output[2].2.contains("/spill open 7"));
+        assert!(output[2].2.contains(&format!("/spill open {}", crate::agentic::session_output_cid([7; 16], "fold").unwrap().tail())));
     }
 }
 

@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "agent-bridle-fdguard"
-version = "0.8.0-rc.5"
+version = "0.8.0-rc.6"
 authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 build = false
 autolib = false

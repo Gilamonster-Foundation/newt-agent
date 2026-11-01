@@ -111,6 +111,7 @@ fn ctx<'a>(
         plan_mode_control: None,
         plan_draft_sink: None,
         steering: None,
+        report_sink: None,
         completed_spill_renderer: None,
         reader_source: None,
     }
@@ -913,7 +914,8 @@ async fn selected_target_anthropic_pin_is_on_the_final_request() {
     )
     .await
     .unwrap();
-    assert!(reply.starts_with("## Observed\n"), "{reply}");
+    // `.` is not a work-tree root, so this factless turn has no frame (#3009).
+    assert!(!reply.starts_with("## Observed\n"), "{reply}");
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert_one_plan_artifact(&artifacts, &turn);
 }

@@ -40,9 +40,46 @@ pub struct SkillsConfig {
     /// directory is scanned. `~/` is expanded to `$HOME`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bundled_dir: String,
+
+    /// Skills switched off (`/settings skills off <name>`): absent from the index
+    /// the model sees and refused by `use_skill`, a posture or a persona binding.
+    /// The skill stays installed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub off: Vec<String>,
 }
 
 impl Config {
+    /// Is `name` switched off by `[skills] off`?
+    #[must_use]
+    pub fn skill_is_off(&self, name: &str) -> bool {
+        self.skills
+            .as_ref()
+            .is_some_and(|s| s.off.iter().any(|n| n == name))
+    }
+
+    /// Every installed skill the operator has not switched off: the one list the
+    /// prompt index, `use_skill`, postures and persona bindings all read.
+    #[must_use]
+    pub fn skills_on(&self) -> Vec<newt_skills::Skill> {
+        newt_skills::discover_paths(&self.skill_search_dirs())
+            .into_iter()
+            .filter(|s| !self.skill_is_off(&s.name))
+            .collect()
+    }
+
+    /// The body of skill `name`, refused when it is switched off. The one loader
+    /// for `use_skill`, postures and persona bindings (#2331), so an off skill
+    /// cannot be reached by name any more than it is listed.
+    ///
+    /// # Errors
+    /// The skill is off, unknown, or its name is unsafe.
+    pub fn load_skill_body(&self, name: &str) -> newt_skills::Result<String> {
+        if self.skill_is_off(name) {
+            return Err(newt_skills::SkillError::Off(name.to_string()));
+        }
+        newt_skills::load_body_from(&self.skill_search_dirs(), name)
+    }
+
     /// The EFFECTIVE skill search path, with `~/` expanded — the ONE resolver
     /// every skill consumer uses (#2331): the prompt index, the `use_skill`
     /// loader, posture skills, persona binding checks, and `newt skills`.

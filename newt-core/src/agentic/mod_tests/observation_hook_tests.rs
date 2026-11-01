@@ -98,6 +98,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         plan_mode_control: None,
         plan_draft_sink: None,
         steering: None,
+        report_sink: None,
         completed_spill_renderer: None,
         reader_source: None,
     }
@@ -139,6 +140,7 @@ fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
         &mut wire_messages,
         prompt_read::PromptReadContext::new(Some(&receipt), task, None),
         None,
+        &Default::default(),
     );
     super::compression_loop_tests::add_observed_note(&mut wire_messages, task, ".");
     estimate_request_tokens(

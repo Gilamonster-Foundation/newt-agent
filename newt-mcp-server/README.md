@@ -1,16 +1,16 @@
 # newt-mcp-server
 
-Newt-Agent stdio MCP server — `code.read` / `code.edit` / `code.search` /
-`goal.run`.
+Newt-Agent stdio MCP server.
 
-A stdio JSON-RPC MCP server exposing the vi-minimal v0 tool surface:
+A stdio JSON-RPC MCP server exposing:
 
-- `code_read` — read a file
-- `code_edit` — apply a unified diff patch
-- `code_search` — regex search across a directory tree
+- `read_file` / `write_file` / `edit_file` / `list_dir` / `find` / `grep` —
+  newt-core's file tools, by the same name, schema and implementation the TUI
+  gives the model, under the granted `[caveats]` leash (#2956)
 - `git` — local embedded Git operations, available only with unrestricted
   filesystem read authority; legacy repository reads cannot yet honor a
   bounded read grant. Operation-class write checks still apply.
+- `shell_run` / `web_fetch` — agent-bridle's confined shell and fetch
 - `goal_run` — tier-routed inference (wired through the Router +
   BackendRegistry; discovers a local Ollama on startup)
 

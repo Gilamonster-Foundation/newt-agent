@@ -280,3 +280,40 @@ async fn physical_symlink_escape_write_is_denied_object_bound() {
     );
     assert!(sink.is_empty(), "a denied write records no artifact");
 }
+
+/// #3045 review: provenance names the file the tool touched. With the
+/// workspace under HOME, `~/project/file.txt` is the workspace's
+/// `file.txt`; the artifact used to record the raw `~/project/file.txt`,
+/// a different (nonexistent) workspace path.
+#[tokio::test]
+async fn tilde_paths_record_the_resolved_workspace_locator() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let home = tempfile::TempDir::new().unwrap();
+    let ws = home.path().join("project");
+    std::fs::create_dir(&ws).unwrap();
+    let _home = EnvVar::set("HOME", &home.path().to_string_lossy());
+    let sink = RecordingArtifactSink::default();
+    let caveats = caveats_rw(&ws);
+    for (tool, args) in [
+        (
+            "write_file",
+            serde_json::json!({"path": "~/project/file.txt", "content": "one\n"}),
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"path": "~/project/file.txt", "old_string": "one", "new_string": "two"}),
+        ),
+        (
+            "delete_file",
+            serde_json::json!({"path": "~/project/file.txt"}),
+        ),
+    ] {
+        let out = run_artifact_tool(tool, args, &ws, &caveats, None, &sink).await;
+        assert!(!out.contains("warning"), "{tool}: {out}");
+    }
+    assert!(!ws.join("file.txt").exists());
+    let artifacts = sink.artifacts.lock().unwrap();
+    let locators: Vec<_> = artifacts.iter().map(|a| a.locator()).collect();
+    assert_eq!(locators, vec![Some("file.txt"); 3]);
+}

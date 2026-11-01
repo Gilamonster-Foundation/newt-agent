@@ -316,6 +316,43 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     .expect("tool execution without a cancellation flag cannot be interrupted")
 }
 
+/// Run one tool for a host that owns its own stdout (an MCP server): nothing
+/// is printed, and success is the dispatcher's own verdict — the typed
+/// outcome when one was recorded, the result prefix otherwise ([`tool_ok`]) —
+/// so a refusal such as `user declined to write` is never reported as success.
+pub async fn execute_tool_quiet(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    caveats: &crate::caveats::Caveats,
+) -> (String, bool) {
+    let slot = std::sync::OnceLock::new();
+    let collab = ToolCollaborators {
+        execution: Some(&slot),
+        ..Default::default()
+    };
+    let mut display = ToolDisplay::new(std::io::sink(), false, 80, 20, false);
+    let text = execute_tool_with_display_cancellable(
+        &mut display,
+        name,
+        args,
+        workspace,
+        false,
+        20,
+        caveats,
+        &mut crate::agentic::NoMcp,
+        collab,
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .expect("quiet dispatch has no durable completion writer")
+    .expect("tool execution without a cancellation flag cannot be interrupted");
+    let ok = super::tool_ok(&text, slot.get().copied());
+    (text, ok)
+}
+
 /// Cancellation-aware loop entry point — the collaborator-struct core every
 /// public wrapper above flattens into. The header is written synchronously
 /// before the cancel-first race begins; an already-set interrupt therefore

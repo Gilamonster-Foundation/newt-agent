@@ -229,6 +229,7 @@ async fn overflow_smart_responses_projection_cannot_skip_elision_due_to_rounding
         false,
         Some(&harness),
         true,
+        &Default::default(),
     )
     .await;
     assert!(

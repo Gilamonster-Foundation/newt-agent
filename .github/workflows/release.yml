@@ -96,7 +96,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: ubuntu-latest
+          # Pinned, not ubuntu-latest: the binary links the builder's glibc,
+          # and 26.04's 2.43 is above the 2.39 floor in npm/platforms.json.
+          - platform: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
             archive_ext: tar.gz
@@ -123,7 +125,7 @@ jobs:
           cargo build --release --locked --target ${{ matrix.target }} -p newt-agent -p newt-mcp-server
 
       # platforms.json declares the glibc floor the npm shim enforces; the
-      # binary is built on a moving `ubuntu-latest`. If the builder's glibc
+      # binary is built on the pinned image above. If the builder's glibc
       # ever exceeds the declared floor, the shim would admit hosts that die
       # in ld.so. This runs here, not in build-npm, because build-binaries is
       # a release gate: a red floor check holds every registry (#2873),
@@ -483,6 +485,7 @@ jobs:
           - newt-coder
           - newt-mcp-server
           - newt-scheduler
+          - newt-flock
           - newt-tui
           - newt-acp-worker
           - newt-agent

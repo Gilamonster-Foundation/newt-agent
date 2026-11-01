@@ -7,6 +7,8 @@ fn fixture(test: impl FnOnce(&SmartHarnessConfig, &HarnessLaunch<'_>)) {
     let caveats = crate::confined_exec::build_tool_caveats(workspace.path());
     let config = SmartHarnessConfig {
         frame_dir: Some(private.path().join("frame")),
+        // These tests are about admission and retrieval, not the real-clock budget.
+        max_elapsed_ms: crate::test_guard::unbudgeted_session_config().max_elapsed_ms,
         ..Default::default()
     };
     let launch = HarnessLaunch {
@@ -17,6 +19,13 @@ fn fixture(test: impl FnOnce(&SmartHarnessConfig, &HarnessLaunch<'_>)) {
         hermetic: false,
     };
     test(&config, &launch);
+}
+
+/// Navigation time a loaded test box can charge: past the 30 s production
+/// budget. Regression: under load ~25 the retrieval test failed with
+/// `Budget("navigation elapsed time")` while proving nothing about the budget.
+fn past_production_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(agent_harness::SessionConfig::default().max_elapsed_ms + 1)
 }
 
 /// Grounds opt-in admission in real frame files and a cold conversation open.
@@ -193,6 +202,9 @@ fn legacy_admission_history_remains_retrievable_after_projection_and_restart() {
         ).unwrap();
         let mut messages = session.restored_messages().unwrap();
         messages.push(json!({"role":"user","content":"fresh operator instruction"}));
+        // A loaded test box charges real seconds to navigation; this test is about
+        // retrieval, so charge past the production budget and require it to pass.
+        session.account_navigation_elapsed(past_production_budget());
         let projected = session.project(&messages, 1024).unwrap();
         assert!(serde_json::to_vec(&projected).unwrap().len() <= 1024);
         assert!(!serde_json::to_string(&projected).unwrap().contains(marker));
@@ -213,6 +225,7 @@ fn legacy_admission_history_remains_retrievable_after_projection_and_restart() {
         let mut restored = config
             .open_conversation(launch, "legacy", true, json!({}))
             .unwrap();
+        restored.account_navigation_elapsed(past_production_budget());
         let slice = restored.re_read(&pointer, 0, 4096).unwrap();
         assert!(slice["text"].as_str().unwrap().contains(marker));
         let store =

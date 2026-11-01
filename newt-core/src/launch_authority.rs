@@ -4,8 +4,8 @@
 //!
 //! # Why this exists (`noninteractive-launch-policy` closure)
 //!
-//! The authority switches (`--disable-ocap`/`--yolo`, `--full-access`,
-//! `--unsafe-host-exec`) have env twins (`NEWT_DISABLE_OCAP`,
+//! The authority switches (`--disable-ocap`, `--full-access`, `--ambient`; `--yolo` asserts
+//! all three; and `--unsafe-host-exec`) have env twins (`NEWT_DISABLE_OCAP`,
 //! `NEWT_FULL_ACCESS`, `NEWT_UNSAFE_HOST_EXEC`) so a wrapper/pod can assert them.
 //! Historically deep libraries decided authority by reading those env vars
 //! *live* (`std::env::var(...)`) at the point of use — so a value that appeared
@@ -44,7 +44,7 @@
 /// [`meet`]: LaunchAuthority::meet
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LaunchAuthority {
-    /// `--disable-ocap` / `--yolo` (`NEWT_DISABLE_OCAP=1`): run `run_command`
+    /// `--disable-ocap` (and `--yolo`) (`NEWT_DISABLE_OCAP=1`): run `run_command`
     /// UNCONFINED on the host shell instead of the confined engine.
     ocap_disabled: bool,
     /// `--full-access` (`NEWT_FULL_ACCESS=1`): build the session policy from the
@@ -55,6 +55,10 @@ pub struct LaunchAuthority {
     unsafe_host_exec: bool,
     /// Explicit directory-scoped startup choice; never inferred from the env.
     workspace_access: bool,
+    /// `--ambient` (`NEWT_AMBIENT=1`): the operator's login shell and full process
+    /// environment. Its own axis: it lifts no confinement and no approvals (those are
+    /// the two bits above); `--yolo` asserts all three.
+    ambient: bool,
 }
 
 impl LaunchAuthority {
@@ -66,6 +70,7 @@ impl LaunchAuthority {
         full_access: false,
         unsafe_host_exec: false,
         workspace_access: false,
+        ambient: false,
     };
 
     /// Run commands with filesystem access confined to the selected workspace.
@@ -93,10 +98,11 @@ impl LaunchAuthority {
             full_access: Self::env_switch("NEWT_FULL_ACCESS"),
             unsafe_host_exec: Self::env_switch("NEWT_UNSAFE_HOST_EXEC"),
             workspace_access: false,
+            ambient: Self::env_switch("NEWT_AMBIENT"),
         }
     }
 
-    /// `--disable-ocap` / `--yolo` asserted for this process.
+    /// `--disable-ocap` (or `--yolo`) asserted for this process.
     #[must_use]
     pub const fn ocap_disabled(self) -> bool {
         self.ocap_disabled
@@ -121,6 +127,37 @@ impl LaunchAuthority {
         self.workspace_access
     }
 
+    /// `--ambient` asserted: `run_command`, where it runs on the host shell, runs the
+    /// operator's login shell, and the child and stdio MCP servers keep the full
+    /// process environment. Only this axis: `--yolo --full-access`,
+    /// `--unsafe-host-exec` and the confined default do not set it.
+    #[must_use]
+    pub const fn ambient(self) -> bool {
+        self.ambient
+    }
+
+    /// The three axes as given, for tests in other crates (banner wording).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_parts_for_test(
+        ocap_disabled: bool,
+        full_access: bool,
+        ambient: bool,
+    ) -> Self {
+        Self {
+            ocap_disabled,
+            full_access,
+            ambient,
+            ..Self::CONFINED
+        }
+    }
+
+    /// Only the ambient axis (what `--ambient` alone asks for).
+    pub const AMBIENT: Self = Self {
+        ambient: true,
+        ..Self::CONFINED
+    };
+
     /// Attenuate: the per-bit `meet` (logical AND) of two authorities. A switch
     /// is on in the result only if it was on in BOTH — so `meet` can drop
     /// authority but never add it. This is how a later context lowers authority
@@ -132,6 +169,7 @@ impl LaunchAuthority {
             full_access: self.full_access && other.full_access,
             unsafe_host_exec: self.unsafe_host_exec && other.unsafe_host_exec,
             workspace_access: self.workspace_access && other.workspace_access,
+            ambient: self.ambient && other.ambient,
         }
     }
 }
@@ -205,6 +243,53 @@ pub(crate) fn reset_for_test() {
     PROCESS_FROZEN.with(|c| c.set(None));
 }
 
+/// Test-only: pin the launch authority for THIS thread and restore the prior
+/// value on drop. Unlike publishing `NEWT_FULL_ACCESS`, nothing leaks to
+/// sibling tests, so tests that read [`current`] stay parallel-safe.
+#[cfg(test)]
+pub(crate) struct ScopedAuthority(Option<LaunchAuthority>);
+
+#[cfg(test)]
+impl ScopedAuthority {
+    pub(crate) fn new(full_access: bool, ocap_disabled: bool) -> Self {
+        let prior = PROCESS_FROZEN.with(std::cell::Cell::get);
+        PROCESS_FROZEN.with(|c| {
+            c.set(Some(LaunchAuthority {
+                full_access,
+                ocap_disabled,
+                ..LaunchAuthority::CONFINED
+            }));
+        });
+        Self(prior)
+    }
+}
+
+#[cfg(test)]
+impl ScopedAuthority {
+    /// Pin `--yolo` (all three axes) for this thread.
+    pub(crate) fn ambient_with_host_bypass() -> Self {
+        let prior = PROCESS_FROZEN.with(std::cell::Cell::get);
+        PROCESS_FROZEN
+            .with(|c| c.set(Some(LaunchAuthority::from_parts_for_test(true, true, true))));
+        Self(prior)
+    }
+
+    /// Pin the `--ambient` posture for this thread.
+    #[cfg(not(windows))]
+    pub(crate) fn ambient() -> Self {
+        let prior = PROCESS_FROZEN.with(std::cell::Cell::get);
+        PROCESS_FROZEN.with(|c| c.set(Some(LaunchAuthority::AMBIENT)));
+        Self(prior)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedAuthority {
+    fn drop(&mut self) {
+        PROCESS_FROZEN.with(|c| c.set(self.0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +350,7 @@ mod tests {
             full_access: true,
             unsafe_host_exec: true,
             workspace_access: true,
+            ambient: true,
         };
         // meeting with CONFINED clears everything…
         assert_eq!(
@@ -344,6 +430,7 @@ mod tests {
             full_access: true,
             unsafe_host_exec: true,
             workspace_access: true,
+            ambient: true,
         });
         assert_eq!(
             current(),
@@ -351,5 +438,38 @@ mod tests {
             "the first (confined) freeze wins"
         );
         reset_for_test();
+    }
+
+    /// Only `--ambient` sets the ambient axis, and it sets only that axis: the pair
+    /// `--yolo --full-access` and the bench lane's `--unsafe-host-exec` are not it, and
+    /// attenuation clears it like the other bits.
+    #[test]
+    fn only_the_ambient_flag_sets_the_ambient_axis() {
+        let _g = serial();
+        let _a = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let _b = EnvVar::set("NEWT_FULL_ACCESS", "1");
+        let _c = EnvVar::unset("NEWT_UNSAFE_HOST_EXEC");
+        let _d = EnvVar::unset("NEWT_AMBIENT");
+        assert!(
+            !LaunchAuthority::from_env().ambient(),
+            "--disable-ocap --full-access is not --ambient"
+        );
+        let _e = EnvVar::set("NEWT_AMBIENT", "true");
+        assert!(!LaunchAuthority::from_env().ambient(), "only \"1\" enables");
+        drop((_a, _b, _e));
+        let _f = EnvVar::set("NEWT_AMBIENT", "1");
+        let _a = EnvVar::unset("NEWT_DISABLE_OCAP");
+        let _b = EnvVar::unset("NEWT_FULL_ACCESS");
+        let alone = LaunchAuthority::from_env();
+        assert!(alone.ambient());
+        assert!(
+            !alone.ocap_disabled() && !alone.full_access(),
+            "its own axis only"
+        );
+        assert_eq!(alone, LaunchAuthority::AMBIENT);
+        assert!(!LaunchAuthority::AMBIENT
+            .meet(LaunchAuthority::CONFINED)
+            .ambient());
+        assert!(!LaunchAuthority::default().ambient());
     }
 }

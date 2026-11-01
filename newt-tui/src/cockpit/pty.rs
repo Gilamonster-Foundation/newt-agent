@@ -182,6 +182,19 @@ impl PtyCapture {
         Ok(n as usize)
     }
 
+    /// Ask the REAL terminal where its cursor is (#3014), without a second writer or a stray
+    /// byte in the transcript.
+    ///
+    /// The `ESC[6n` goes straight to the saved terminal handle, never through fd 1 (the
+    /// capture pty) or Rust's stdout lock: a session thread can hold that lock while its
+    /// write blocks on the full pty, and this thread is the one that drains the pty, so
+    /// waiting for the lock would deadlock both. The reply is read from stdin by
+    /// crossterm's own reader, so no event is stolen. Blocks for crossterm's own bound when
+    /// the terminal never answers.
+    pub(crate) fn query_cursor(&self) -> io::Result<(u16, u16)> {
+        crossterm::cursor::position_to(&mut &self.tty)
+    }
+
     /// Tell the pty the terminal's new size, so a child's `ioctl(1,
     /// TIOCGWINSZ)` — and anything else that sizes by fd 1 — sees the truth.
     pub(crate) fn resize(&self, cols: u16, rows: u16) {
@@ -573,5 +586,62 @@ mod tests {
             "the drainer saw {seen} of {want} bytes — the writer starved or the pty dropped output"
         );
         drop(cap);
+    }
+
+    /// #3014 review P1: `query_cursor` must not depend on the captured stdout. A session
+    /// thread can hold Rust's stdout lock while its write blocks on the full capture pty,
+    /// and the presenter, the only thread that drains that pty, is the one asking. If the
+    /// query waits for the lock, neither can move. The writer here outruns the pty buffer
+    /// with the lock held and nobody draining; the query must still return (Ok or Err, the
+    /// terminal answers nothing in a test). Bounded, and drains on failure so a regression
+    /// fails instead of hanging the run.
+    ///
+    /// Real-PTY tier: `#[ignore]`d in the unit run (it `dup2`s a pty over the process's own
+    /// stdout, so it must not share a process with libtest).
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+    fn a_cursor_query_returns_while_a_writer_holds_stdout_against_a_full_pty() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let cap = std::sync::Arc::new(PtyCapture::install(80, 24).expect("openpty"));
+        let writer = std::thread::spawn(|| {
+            let stdout = io::stdout();
+            let mut held = stdout.lock();
+            let _ = held.write_all(&vec![b'x'; 1 << 20]);
+            let _ = held.flush();
+        });
+        // Output is waiting: the pty buffer is filling and the writer is stuck behind it.
+        let mut pfd = libc::pollfd {
+            fd: cap.master_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll on one descriptor we own.
+        assert!(
+            unsafe { libc::poll(&mut pfd, 1, 5000) } > 0,
+            "writer produced output"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+
+        let (tx, rx) = mpsc::channel();
+        let asker = std::sync::Arc::clone(&cap);
+        std::thread::spawn(move || {
+            let _ = tx.send(asker.query_cursor().is_ok());
+        });
+        let answered = rx.recv_timeout(Duration::from_secs(8));
+        // Release the writer whatever happened, so no thread outlives the test.
+        let mut sink = [0u8; 8192];
+        while !writer.is_finished() {
+            let _ = cap.read_available(&mut sink);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer.join().expect("writer");
+        assert!(
+            answered.is_ok(),
+            "query_cursor blocked behind the stdout lock (presenter/writer deadlock)"
+        );
     }
 }

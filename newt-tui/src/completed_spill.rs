@@ -1,6 +1,7 @@
 //! Bounded, process-local archive for completed Rich-TUI tool output.
 
 use crate::spill_view::{SpillStream, SpillView};
+use newt_core::agentic::{session_output_cid, SpillCid, MIN_SPILL_TAIL_CHARS};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +19,7 @@ const MAX_ENTRY_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug)]
 pub(crate) struct CompletedSpill {
     #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
-    id: u64,
+    id: SpillCid,
     lines: Arc<[String]>,
     #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
     dropped_lines: usize,
@@ -26,7 +27,7 @@ pub(crate) struct CompletedSpill {
 
 #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
 impl CompletedSpill {
-    pub(crate) fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> SpillCid {
         self.id
     }
 
@@ -47,9 +48,34 @@ impl CompletedSpill {
     }
 }
 
+/// Why `/spill open <tail>` named no single retained result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpillLookupError {
+    TooShort,
+    Unknown,
+    Ambiguous,
+}
+
+impl std::error::Error for SpillLookupError {}
+
+impl std::fmt::Display for SpillLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => write!(
+                f,
+                "a spill id needs at least {MIN_SPILL_TAIL_CHARS} characters"
+            ),
+            Self::Unknown => write!(f, "no retained spill ends with that id"),
+            Self::Ambiguous => write!(f, "that id matches more than one spill; type more of it"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ArchiveState {
-    next_id: u64,
+    /// `None` when the platform refused entropy: nothing is retained then,
+    /// because a handle under a predictable scope would leak equality.
+    nonce: Option<[u8; 16]>,
     inspection_available: bool,
     bytes: usize,
     entries: VecDeque<CompletedSpill>,
@@ -65,6 +91,14 @@ pub(crate) struct CompletedSpillArchive {
     max_entry_bytes: usize,
 }
 
+/// The session scope for handles, or `None` if entropy is unavailable. A
+/// zeroed fallback would be one known scope shared by every such session, so
+/// equal output would get equal, computable handles across them (#3022).
+fn session_nonce() -> Option<[u8; 16]> {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).ok().map(|()| nonce)
+}
+
 impl Default for CompletedSpillArchive {
     fn default() -> Self {
         Self::with_limits(MAX_ENTRIES, MAX_TOTAL_BYTES, MAX_ENTRY_BYTES)
@@ -75,7 +109,7 @@ impl CompletedSpillArchive {
     fn with_limits(max_entries: usize, max_total_bytes: usize, max_entry_bytes: usize) -> Self {
         Self {
             state: Mutex::new(ArchiveState {
-                next_id: 1,
+                nonce: session_nonce(),
                 inspection_available: false,
                 bytes: 0,
                 entries: VecDeque::new(),
@@ -86,7 +120,7 @@ impl CompletedSpillArchive {
         }
     }
 
-    pub(crate) fn retain(&self, output: &str) -> u64 {
+    pub(crate) fn retain(&self, output: &str) -> Option<SpillCid> {
         let mut view = SpillView::with_limits(80, 1, SANITIZE_HISTORY_LINES, SANITIZE_LINE_CHARS);
         view.push_stream_bytes(SpillStream::Stdout, output.as_bytes());
         view.finish();
@@ -110,8 +144,17 @@ impl CompletedSpillArchive {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let id = state.next_id;
-        state.next_id = state.next_id.saturating_add(1);
+        // The id names the COMPLETE result, not the retained tail: two results
+        // with equal tails but different omitted prefixes are different
+        // records, and one must not rewrite what the other's marker claims.
+        let id = session_output_cid(state.nonce?, output).ok()?;
+        // Same bytes, same handle: a repeat result moves to the newest slot
+        // instead of leaving two entries that answer to one id.
+        if let Some(at) = state.entries.iter().position(|spill| spill.id == id) {
+            if let Some(old) = state.entries.remove(at) {
+                state.bytes = state.bytes.saturating_sub(old.bytes());
+            }
+        }
         let spill = CompletedSpill {
             id,
             lines: retained.into(),
@@ -124,18 +167,53 @@ impl CompletedSpillArchive {
                 state.bytes = state.bytes.saturating_sub(evicted.bytes());
             }
         }
-        id
+        Some(id)
     }
 
+    /// Resolve a full handle or a unique suffix of at least
+    /// [`MIN_SPILL_TAIL_CHARS`] characters.
     #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
-    pub(crate) fn get(&self, id: u64) -> Option<CompletedSpill> {
-        self.state
+    pub(crate) fn find(&self, tail: &str) -> Result<CompletedSpill, SpillLookupError> {
+        if tail.len() < MIN_SPILL_TAIL_CHARS {
+            return Err(SpillLookupError::TooShort);
+        }
+        self.lookup(tail)
+    }
+
+    fn lookup(&self, tail: &str) -> Result<CompletedSpill, SpillLookupError> {
+        let state = self
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut hits = state
             .entries
             .iter()
-            .find(|spill| spill.id == id)
-            .cloned()
+            .filter(|spill| spill.id.to_handle().ends_with(tail));
+        match (hits.next(), hits.next()) {
+            (Some(spill), None) => Ok(spill.clone()),
+            (None, _) => Err(SpillLookupError::Unknown),
+            (Some(_), Some(_)) => Err(SpillLookupError::Ambiguous),
+        }
+    }
+
+    /// `/spill open` completions, newest first: `(id tail, label)` where the
+    /// label is the body's first line, cut short.
+    #[cfg(feature = "rich-tui")]
+    pub(crate) fn choices(&self) -> Vec<(String, String)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .entries
+            .iter()
+            .rev()
+            .map(|spill| {
+                let first = spill.lines.iter().find(|l| !l.trim().is_empty());
+                let label: String = first.map_or("", |l| l.trim()).chars().take(40).collect();
+                (spill.id.tail(), label)
+            })
+            .collect()
     }
 
     /// Called only once the cockpit has installed its operator action.
@@ -191,21 +269,21 @@ impl CompletedSpillArchive {
 /// `render_completed` returns 0, which the trait already defines as "the
 /// viewport could not take the screen". That is the truth here, not a stub.
 impl newt_core::agentic::CompletedSpillRenderer for CompletedSpillArchive {
-    fn recovery_hint(&self, id: u64) -> String {
+    fn recovery_hint(&self, id: &SpillCid) -> String {
         let available = self
             .state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .inspection_available;
         if available {
-            format!("F4 inspect · /spill open {id}")
+            format!("F4 inspect · /spill open [{}]", id.tail())
         } else {
-            format!("/spill open {id}")
+            format!("/spill open [{}]", id.tail())
         }
     }
 
-    fn retain_completed(&self, output: &str) -> Option<u64> {
-        Some(self.retain(output))
+    fn retain_completed(&self, output: &str) -> Option<SpillCid> {
+        self.retain(output)
     }
 
     fn render_completed(&self, _output: &str, _width: usize, _max_height: usize) -> usize {
@@ -224,35 +302,67 @@ impl newt_core::agentic::CompletedSpillRenderer for CompletedSpillArchive {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn cid(archive: &CompletedSpillArchive, text: &str) -> SpillCid {
+        archive.retain(text).expect("cid")
+    }
+
     #[cfg(all(unix, feature = "rich-tui"))]
     #[test]
     fn markers_advertise_inspection_only_after_the_host_installs_it() {
         use newt_core::agentic::CompletedSpillRenderer;
-        let archive = super::CompletedSpillArchive::default();
-        assert_eq!(archive.recovery_hint(7), "/spill open 7");
+        let archive = CompletedSpillArchive::default();
+        let id = cid(&archive, "one\n");
+        let tail = id.tail();
+        assert_eq!(archive.recovery_hint(&id), format!("/spill open [{tail}]"));
         archive.enable_inspection();
-        assert_eq!(archive.recovery_hint(7), "F4 inspect · /spill open 7");
+        assert_eq!(
+            archive.recovery_hint(&id),
+            format!("F4 inspect · /spill open [{tail}]")
+        );
+    }
+
+    /// #3022: the completion list is the retained ids, newest first, each with
+    /// a short label from the body's first line.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn choices_are_newest_first_with_a_short_first_line_label() {
+        let archive = CompletedSpillArchive::default();
+        let first = cid(&archive, "first line\nmore\n");
+        let long = format!("{}\n", "x".repeat(200));
+        let second = cid(&archive, &long);
+        let choices = archive.choices();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].0, second.tail());
+        assert_eq!(choices[1], (first.tail(), "first line".to_string()));
+        assert!(choices[0].1.chars().count() <= 41, "{}", choices[0].1);
+    }
+
+    /// #3022: markers lead with F4 and the bare form; the id goes last.
+    #[test]
+    fn the_hint_leads_with_the_bare_form_and_ends_with_the_id() {
+        use newt_core::agentic::CompletedSpillRenderer;
+        let archive = CompletedSpillArchive::default();
+        let id = cid(&archive, "one\n");
+        let tail = id.tail();
+        assert_eq!(archive.recovery_hint(&id), format!("/spill open [{tail}]"));
     }
 
     #[test]
     fn inspection_snapshot_is_newest_first_and_survives_eviction() {
-        let archive = super::CompletedSpillArchive::with_limits(2, 1000, 500);
-        let first = archive.retain("first");
-        let second = archive.retain("second");
+        let archive = CompletedSpillArchive::with_limits(2, 1000, 500);
+        let first = cid(&archive, "first");
+        let second = cid(&archive, "second");
         let snapshot = archive.snapshot();
         assert_eq!(
-            snapshot
-                .iter()
-                .map(super::CompletedSpill::id)
-                .collect::<Vec<_>>(),
+            snapshot.iter().map(CompletedSpill::id).collect::<Vec<_>>(),
             [second, first]
         );
         archive.retain("third");
-        assert!(archive.get(first).is_none());
+        assert!(archive.find(&first.to_handle()).is_err());
         assert_eq!(snapshot[1].lines(), ["first"]);
     }
-    use super::*;
-
     /// The cockpit regression: an archive alone must mint ids, so a committed
     /// excerpt can name a real `/spill open <id>` on a surface that cannot
     /// paint an inline viewport.
@@ -261,10 +371,10 @@ mod tests {
         use newt_core::agentic::CompletedSpillRenderer;
 
         let archive = CompletedSpillArchive::default();
-        assert_eq!(archive.retain_completed("first\n"), Some(1));
-        assert_eq!(archive.retain_completed("second\n"), Some(2));
-        assert_eq!(archive.get(1).unwrap().lines(), &["first"]);
-        assert_eq!(archive.latest().unwrap().id(), 2);
+        let first = archive.retain_completed("first\n").expect("cid");
+        let second = archive.retain_completed("second\n").expect("cid");
+        assert_eq!(archive.find(&first.tail()).unwrap().lines(), &["first"]);
+        assert_eq!(archive.latest().unwrap().id(), second);
         assert_eq!(
             archive.render_completed("first\n", 80, 10),
             0,
@@ -272,20 +382,94 @@ mod tests {
         );
     }
 
+    /// #3016: handles are content ids, not a session counter. Same bytes, same
+    /// handle (one entry, newest); different bytes, different handle; a unique
+    /// tail of at least six characters or the full id resolves.
     #[test]
-    fn ids_are_stable_and_latest_tracks_the_newest_result() {
+    fn handles_are_content_ids_and_resolve_by_unique_tail() {
         let archive = CompletedSpillArchive::default();
-        assert_eq!(archive.retain("first\n"), 1);
-        assert_eq!(archive.retain("second\n"), 2);
-        assert_eq!(archive.get(1).unwrap().lines(), &["first"]);
-        assert_eq!(archive.latest().unwrap().id(), 2);
+        let first = cid(&archive, "first\n");
+        let second = cid(&archive, "second\n");
+        assert_ne!(first, second);
+        assert_eq!(cid(&archive, "first\n"), first, "same bytes, same handle");
+        assert_eq!(
+            archive.snapshot().len(),
+            2,
+            "a repeat is not a second entry"
+        );
+        assert_eq!(
+            archive.latest().unwrap().id(),
+            first,
+            "the repeat is newest"
+        );
+        assert!(first.to_handle().starts_with("bafy"), "{first}");
+        assert_eq!(archive.find(&first.to_handle()).unwrap().id(), first);
+        assert_eq!(archive.find(&second.tail()).unwrap().id(), second);
+    }
+
+    /// #3022 review: equal retained tails with different omitted prefixes
+    /// used to share one id, so the later result rewrote the earlier marker's
+    /// record (it then claimed nothing was dropped).
+    #[test]
+    fn equal_retained_tails_do_not_rewrite_an_older_record() {
+        let archive = CompletedSpillArchive::default();
+        let tail = "retained row\n".repeat(SANITIZE_HISTORY_LINES);
+        let first = cid(&archive, &format!("omitted prefix\n{tail}"));
+        assert_eq!(archive.find(&first.to_handle()).unwrap().dropped_lines(), 1);
+        let second = cid(&archive, &tail);
+        assert_ne!(first, second, "different results, different handles");
+        assert_eq!(archive.find(&first.to_handle()).unwrap().dropped_lines(), 1);
+        assert_eq!(
+            archive.find(&second.to_handle()).unwrap().dropped_lines(),
+            0
+        );
+    }
+
+    /// #3022 review: without entropy the archive retains nothing rather than
+    /// minting handles under a zero, cross-session-predictable scope.
+    #[test]
+    fn without_entropy_nothing_is_retained() {
+        let archive = CompletedSpillArchive::default();
+        archive.state.lock().unwrap().nonce = None;
+        assert!(archive.retain("secret\n").is_none());
+        assert!(archive.latest().is_none());
+    }
+
+    #[test]
+    fn a_short_or_unknown_tail_is_a_clear_error() {
+        let archive = CompletedSpillArchive::default();
+        let id = cid(&archive, "first\n");
+        let handle = id.to_handle();
+        let short = &handle[handle.len() - (MIN_SPILL_TAIL_CHARS - 1)..];
+        assert_eq!(archive.find(short).unwrap_err(), SpillLookupError::TooShort);
+        assert_eq!(
+            archive.find("aaaaaaaa").unwrap_err(),
+            SpillLookupError::Unknown
+        );
+    }
+
+    /// Two entries sharing a tail are ambiguous, not "first wins".
+    #[test]
+    fn a_tail_shared_by_two_spills_is_ambiguous() {
+        let archive = CompletedSpillArchive::default();
+        let mut last_chars = std::collections::HashSet::new();
+        let shared = (0..200)
+            .find_map(|n| {
+                let last = cid(&archive, &format!("body {n}\n")).to_handle().pop()?;
+                (!last_chars.insert(last)).then_some(last)
+            })
+            .expect("pigeonhole: 32 base32 chars, 200 bodies");
+        assert_eq!(
+            archive.lookup(&shared.to_string()).unwrap_err(),
+            SpillLookupError::Ambiguous
+        );
     }
 
     #[test]
     fn retained_text_is_terminal_safe() {
         let archive = CompletedSpillArchive::default();
-        let id = archive.retain("\x1b[31mred\x1b[0m\nline\twith-control\n");
-        let spill = archive.get(id).unwrap();
+        let id = cid(&archive, "\x1b[31mred\x1b[0m\nline\twith-control\n");
+        let spill = archive.find(&id.to_handle()).unwrap();
         assert_eq!(spill.lines(), &["red", "line    with-control"]);
         assert!(spill
             .lines()
@@ -296,13 +480,13 @@ mod tests {
     #[test]
     fn bounds_evict_old_entries_and_keep_the_tail_of_large_results() {
         let archive = CompletedSpillArchive::with_limits(2, 64, 20);
-        let first = archive.retain("first\n");
-        let second = archive.retain("older-line-that-will-not-fit\ntail\n");
-        let third = archive.retain("third\n");
-        assert!(archive.get(first).is_none());
-        let second = archive.get(second).unwrap();
+        let first = cid(&archive, "first\n");
+        let second = cid(&archive, "older-line-that-will-not-fit\ntail\n");
+        let third = cid(&archive, "third\n");
+        assert!(archive.find(&first.to_handle()).is_err());
+        let second = archive.find(&second.to_handle()).unwrap();
         assert_eq!(second.lines(), &["tail"]);
         assert_eq!(second.dropped_lines(), 1);
-        assert!(archive.get(third).is_some());
+        assert!(archive.find(&third.to_handle()).is_ok());
     }
 }

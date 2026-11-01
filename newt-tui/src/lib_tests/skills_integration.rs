@@ -76,3 +76,6 @@ mod save_paths;
 #[cfg(test)]
 #[path = "skills_integration/system_prompt.rs"]
 mod system_prompt;
+#[cfg(test)]
+#[path = "skills_integration/system_prompt_golden.rs"]
+mod system_prompt_golden;

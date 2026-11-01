@@ -45,6 +45,7 @@ fn mid_sized_pair_budget(task: &str, responses_wire: bool) -> usize {
         &mut messages,
         prompt_read::PromptReadContext::new(None, task, None),
         None,
+        &Default::default(),
     );
     let head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
     let chat_tools = merged_tool_definitions(

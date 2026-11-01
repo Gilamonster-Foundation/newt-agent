@@ -32,6 +32,7 @@ mod final_reply;
 pub(crate) mod observed_report;
 use final_reply::FinalReply;
 pub use observed_report::assistant_prose as model_reply_for_history;
+pub use observed_report::split_report as split_observed_report;
 mod selected_target;
 mod semantic_pins;
 pub use claim_check::{
@@ -188,7 +189,10 @@ pub mod smart_harness;
 mod prompt_intake;
 mod prompt_read;
 mod recall;
+pub mod request_preview;
+pub mod request_report;
 mod tool_args;
+pub mod tool_set;
 // #952/#1669: operator steering submitted mid-turn, drained at the next
 // round boundary as a genuine operator message.
 mod steering;
@@ -244,8 +248,8 @@ pub use compress::{
     Summarizer, CONTINUATION_PREFIX, PLAN_APPROVAL_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use content_spill::{
-    SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1, SpillScope,
-    SpillStore,
+    session_output_cid, SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1,
+    SpillScope, SpillStore, MIN_SPILL_TAIL_CHARS,
 };
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
@@ -253,8 +257,8 @@ pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, interactive_recovery, newt_line,
     print_harness_notice, print_list_item, print_newt, reply_cols, set_mouse_recovery,
-    set_spill_lines, set_spill_summary, set_time_marker_secs, Fold, GaugeLevel, Hidden, Recovery,
-    ThinkingFold, NEWT_ORANGE_CT, REPLY_MARKER,
+    set_spill_lines, set_spill_summary, set_time_marker_secs, spill_summary, Fold, GaugeLevel,
+    Hidden, Recovery, ThinkingFold, NEWT_ORANGE_CT, REPLY_MARKER,
 };
 pub use driver::{
     HeadlessCodeSearch, InstantiatedFeatures, TurnDriver, TurnDriverConfig, TurnDriverError,
@@ -350,12 +354,15 @@ pub use resume::resume_context_tool_definition;
 pub use send_budget::{initial_context_input_budget, is_truncation_suspect};
 pub use steering::{ReplaceRejected, Rev, SessionSteeringInbox, SteeringInbox};
 pub use tools::{
-    execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
+    ambient_interpreter_description, builtin_tool_names, execute_tool, execute_tool_quiet,
+    execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
     exit_plan_mode_result, filter_advertised_tools, filter_tools_for_disposition,
     full_access_requested, ocap_disabled, persona_tool_allowed, plan_phase_clamp,
-    preserve_mcp_resource_url_affinity, run_command_dialect_sentence, set_max_output_tokens,
-    set_output_cap_chars_per_token, set_output_head_tokens, shell_dialect_sentence, tool_allowed,
-    tool_definitions, venv_cmd_prefix, ExposureSettings, MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    preserve_mcp_resource_url_affinity, read_only_clamp, read_only_hidden_tool,
+    run_command_dialect_sentence, set_max_output_tokens, set_output_cap_chars_per_token,
+    set_output_head_tokens, shell_dialect_sentence, tool_allowed, tool_definitions,
+    venv_cmd_prefix, ExposureSettings, CHILD_STRIPPED_AUTHORITY_ENV,
+    MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -389,7 +396,9 @@ use send_budget::{
     recovered_input_budget, resolve_responses_budget, responses_context_remaining_report,
 };
 use std::io::{self, Write as _};
-use tools::{is_hallucination, merged_tool_definitions};
+use tools::is_hallucination;
+#[cfg(test)]
+use tools::merged_tool_definitions;
 use trim::{
     estimate_request_tokens, estimate_tokens, estimate_value_tokens, merge_round_usage,
     protected_prompt_head_len, PromptTracker,
@@ -628,6 +637,7 @@ async fn compact_responses_input(
     color: bool,
     smart_harness: Option<&smart_harness::SmartHarness>,
     overflow_recovery: bool,
+    exposure: &tools::ExposureSettings,
 ) -> ResponsesCompaction {
     // #2766: the task location outlives lossy history. Reuse the continuation
     // marker so repeated compactions replace the old hint; include its bytes
@@ -638,7 +648,7 @@ async fn compact_responses_input(
         {
             candidate.retain(|item| !compress::is_continuation_message(item));
             candidate.push(serde_json::json!({"role":"user", "content":
-                format!("{} {}", compress::CONTINUATION_PREFIX, workflow_guidance(hint))}));
+                format!("{} {}", compress::CONTINUATION_PREFIX, workflow_guidance(hint, exposure))}));
         }
         candidate
     };
@@ -1255,6 +1265,8 @@ pub struct ChatCtx<'a> {
     /// `None` (every headless / eval caller) ⇒ nothing is ever drained and the
     /// request bodies are bit-for-bit today's.
     pub steering: Option<&'a dyn SteeringInbox>,
+    /// #2937: session-owned prompt-report capture sink. `None` disables capture.
+    pub report_sink: Option<&'a request_report::ReportSink>,
 }
 
 /// Drain operator steering into `messages` as genuine user turns (#952/#1669).
@@ -1534,6 +1546,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         emits_leading_reasoning,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -1589,7 +1602,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     // Native Git is the default interface; the injected adapter remains internal.
     let advertise_git = false;
-    let advertise_team = crew_runner.is_some();
+    // The delegate hint names `crew`/`team`; advertise them only when the operator left `crew` visible (#2932).
+    let advertise_team = crew_runner.is_some() && exposure.operator_visible("crew");
     let advertise_operating_mode = operating_mode_control.is_some();
     let advertise_plan_mode = plan_mode_control.is_some();
     let advertise_plan_mode_active =
@@ -1619,7 +1633,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake, &exposure);
     // #2313: one ledger attempt per primary request, keyed at the send.
     let attempt_turn = turn_prompt_context
         .map(|turn| turn.active_operator_prompt().id().to_string())
@@ -1640,7 +1654,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // user turns with zero organic save_note use, append a one-line reminder
     // to this turn's user message. Only when a sink exists — without one the
     // save_note tool isn't even advertised.
-    if note_sink.is_some() {
+    if note_sink.is_some() && exposure.operator_visible("save_note") {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
             if let Some(harness) = smart_harness {
                 harness.host_message(&line)?;
@@ -1717,43 +1731,32 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
-    let tools = merged_tool_definitions(
+    let (mut tools, hidden_tools) = tool_set::derive_tool_set(&tool_set::ToolSetInputs {
         mcp,
-        advertise_save_note,
-        advertise_recall,
-        advertise_memory_fetch,
-        advertise_git.then_some(&caveats.fs_read),
-        advertise_team,
-        advertise_scratchpad,
-        advertise_code_search,
-        advertise_experiential,
-        advertise_scheduled,
-        advertise_operating_mode,
-        advertise_plan_mode,
-        advertise_plan_mode_active,
+        advertise: tool_set::Advertise {
+            save_note: advertise_save_note,
+            recall: advertise_recall,
+            memory_fetch: advertise_memory_fetch,
+            git_read_scope: advertise_git.then_some(&caveats.fs_read),
+            team: advertise_team,
+            scratchpad: advertise_scratchpad,
+            code_search: advertise_code_search,
+            experiential: advertise_experiential,
+            scheduled: advertise_scheduled,
+            operating_mode: advertise_operating_mode,
+            plan_mode: advertise_plan_mode,
+            plan_mode_active: advertise_plan_mode_active,
+        },
         command_budget,
         shell_dialect,
-    );
-    // Put the persona's preferred tools first without removing other tools.
-    // Dispatch separately checks explicit permissions and delegation authority.
-    let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(
-        smart_harness::advertise(tools, smart_harness),
-        prompt_disposition,
-    );
-    // #TEC Pass 1: the exposure stage. Clip the AUTHORIZED catalog to what the
-    // model's LIVE usable budget can afford (probed `safe_context` → send
-    // budget), never by model name. `ExposureProfile::Full` (the default) is
-    // identity, so this is bit-for-bit unchanged unless `[tool_exposure]` opts
-    // in. Applied before the token estimate so what we count equals what we
-    // send. Dispatch still authorizes on the full set — exposure ≠ authority.
-    let (mut tools, hidden_tools) = crate::agentic::tools::select_exposed(
-        tools,
-        &exposure,
-        exposure_budget_tokens(send_budget, safe_context),
-        &std::collections::BTreeSet::new(),
+        persona_tools,
+        smart_harness,
+        disposition: prompt_disposition,
+        exposure: &exposure,
+        exposure_budget_tokens: exposure_budget_tokens(send_budget, safe_context),
         estimation,
-    );
+        openai_compatible: false,
+    });
     let mut tool_tokens = estimate_value_tokens(&tools, estimation);
     // Price the stable tool catalog in real-token space. Reprice it whenever
     // usage or an overflow updates the session's calibration.
@@ -1856,12 +1859,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        observed_facts.verbatim = exposure.verbatim_system;
         observed_facts.planning = output_budget::guidance(
             output_allowance,
             step_ledger,
             &selected_target::root(workspace, worktree_session),
             &caveats.fs_read,
             estimation,
+            &exposure,
         );
         semantic_pins::refresh(
             &mut observed_facts,
@@ -1960,7 +1965,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             );
         }
         if round > 0 && action_nudges {
-            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+            if let Some(ptr) = step_ledger.and_then(|ledger| plan_reseat_pointer(ledger, &exposure))
+            {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
         }
@@ -1991,6 +1997,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     remaining,
                     step_ledger,
                     delegate_hint.as_deref(),
+                    &exposure,
                 )
             }));
             read_only_rounds = 0;
@@ -2156,6 +2163,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
+                        &exposure,
                         round > 0 && action_nudges,
                         |candidate| {
                             preflight_full_message_request(
@@ -2251,6 +2259,28 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if !tools_supported {
                 if let Some(o) = body_no_stream.as_object_mut() {
                     o.remove("tools");
+                }
+            }
+            // #2937: capture exact final body per-round, after the tools gate.
+            if let Some(sink) = report_sink {
+                let sys_texts: Vec<&str> = messages
+                    .iter()
+                    .filter(|m| m["role"] == "system")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect();
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    Some(tools.as_array().map(|a| a.as_slice()).unwrap_or(&[]))
+                } else {
+                    None
+                };
+                sink.observe_request(&sys_texts, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
+                    }
                 }
             }
 
@@ -2530,6 +2560,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
+                                    &exposure,
                                     round > 0 && action_nudges,
                                     |candidate| {
                                         preflight_full_message_request(
@@ -2615,6 +2646,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // single prompt, output = sum — Step 18.1) and anchor the context-size
         // tracker on the backend-reported prompt size of this dispatch.
         let round_usage = ollama_usage(&json);
+        // The model that actually answered this round, so commit credit names it
+        // (a router such as `openrouter/auto` serves a different one).
+        let round_model =
+            attribution::served_or_requested(json["model"].as_str(), model).to_owned();
+        if let Some(tool) = git_tool {
+            tool.note_served_model(&round_model);
+        }
         if let Some(prompt_tokens) = json["prompt_eval_count"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -2816,12 +2854,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     workflow_grace_rounds,
                 );
                 let control = harness
-                    .classify(&probe_content, narration_nudge_cap, more, cancel)
+                    .classify(&probe_content, narration_nudge_cap, more, cancel, &exposure)
                     .await?;
                 let control = harness
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            exposure: &exposure,
                             messages: &messages,
                             workspace,
                             task,
@@ -2921,7 +2960,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             workflow_classifier_text(&messages, content);
                         let workflow_hint = nudge_classification
                             .is_plan_update()
-                            .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text))
+                            .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text, &exposure))
                             .flatten();
                         let classifier_plan_direction = nudge_classification
                             .is_plan_update()
@@ -2970,6 +3009,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 step_ledger,
                                 nudge_classification.is_plan_update(),
                                 plan_nudge_hint.as_deref(),
+                                &exposure,
                             ) {
                                 if debug {
                                     print_debug(
@@ -3013,7 +3053,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(&exposure)
                     ),
                             }));
                             stale_file_nudges += 1;
@@ -3049,13 +3089,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             let direction = if narration_nudges == 0 {
                                 nudge_classifier
                                     .direction_for(nudge_classification.class)
-                                    .map(workflow_guidance)
-                                    .unwrap_or_else(narration_action_nudge)
+                                    .map(|direction| workflow_guidance(direction, &exposure))
+                                    .unwrap_or_else(|| narration_action_nudge(&exposure))
                             } else {
                                 escalated_narration_action_nudge(
                                     narration_nudges + 1,
                                     narration_nudge_cap,
                                     step_ledger,
+                                    &exposure,
                                 )
                             };
                             messages.push(serde_json::json!({
@@ -3269,6 +3310,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             outcome.action,
                             step_ledger,
                             prompt_context,
+                            &exposure,
                             round > 0 && action_nudges,
                             |candidate| {
                                 preflight_full_message_request(
@@ -3614,7 +3656,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             let governed_pr = std::sync::OnceLock::new();
             let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
-            let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
+            let attribution_epoch =
+                AttributionEpoch::new(attribution, git_tool, &round_model, name);
             // #727: intercept the read-only budget self-read here. Its answer is
             // dynamic per-turn loop state — the num_ctx input ceiling and the
             // conversation's token estimate — which are in scope in the loop, not
@@ -3899,6 +3942,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             smart_harness.is_some() && smart_verify,
             current_tool_round_limit,
             solve_obs.as_deref_mut(),
+            &exposure,
         )
         .await;
     if let Some(hit) = &mut round_cap_hit {
@@ -3945,7 +3989,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         prompt_measurement: Default::default(),
         fell_back: Default::default(),
     };
-    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts).await;
+    let result = final_summary_ollama(
+        &client,
+        &chat_url,
+        model,
+        trimmed,
+        &cap,
+        attempts,
+        report_sink,
+    )
+    .await;
     let (text, streamed, usage) = cap.recover_rejection(
         result,
         &mut solve_obs,
@@ -4398,7 +4451,8 @@ async fn progress_workspace_state(
     let target = matches!(name, "write_file" | "edit_file" | "delete_file")
         .then(|| args.get("path").and_then(serde_json::Value::as_str))
         .flatten()
-        .map(|path| lexical_normalize(&root.join(path)));
+        .and_then(|path| tools::resolve_tool_path(&root, path).ok())
+        .map(|full| lexical_normalize(&full));
     let fs_read = fs_read.clone();
     tokio::task::spawn_blocking(move || {
         if let Some(target) = target {
@@ -4647,6 +4701,7 @@ impl WorkflowRuntimeState {
         hard_rounds_remaining: Option<usize>,
         step_ledger: Option<&dyn scheduled::StepLedger>,
         delegate_hint: Option<&str>,
+        exposure: &tools::ExposureSettings,
     ) -> Option<String> {
         if self.consecutive_read_only_rounds < self.initiative.read_only_nudge_after() {
             return None;
@@ -4656,6 +4711,7 @@ impl WorkflowRuntimeState {
             hard_rounds_remaining,
             step_ledger,
             delegate_hint,
+            exposure,
         );
         self.consecutive_read_only_rounds = 0;
         Some(nudge)
@@ -4792,18 +4848,39 @@ fn active_step_description(step_ledger: Option<&dyn scheduled::StepLedger>) -> O
         .map(|step| step.description.clone())
 }
 
-fn workflow_guidance(direction: impl std::fmt::Display) -> String {
+/// The shared tail of every harness steer. Every producer that names a tool
+/// renders through here and so must hold the resolved policy (#2932): the
+/// `update_plan` recipe rides only when the operator left that tool visible;
+/// the advisory, stop and plan-preservation advice always does.
+fn workflow_guidance(
+    direction: impl std::fmt::Display,
+    exposure: &tools::ExposureSettings,
+) -> String {
+    let reconcile = if exposure.operator_visible("update_plan") {
+        "Reconcile changed plans with update_plan"
+    } else {
+        "Reconcile changed plans"
+    };
     format!(
         "{direction} {REFACTOR_PUBLISH_GUIDANCE} Guidance is advisory: follow the latest operator instruction, including \
-         newer steering. Honor stop or report-only requests. Reconcile changed plans with \
-         update_plan; preserve completed work."
+         newer steering. Honor stop or report-only requests. {reconcile}; preserve completed work."
     )
 }
 
-const PERMISSION_RECOVERY_GUIDANCE: &str =
-    "Use an already-authorized alternative if permitted. For an exact requestable grant with \
-     an available operator, call request_permissions once. Never re-ask for or retry a permission \
-     the operator declined, or ask again with no operator available. Do not bypass a refusal.";
+/// Permission-recovery advice; the `request_permissions` recipe rides only
+/// when the operator left that tool visible.
+fn permission_recovery_guidance(exposure: &tools::ExposureSettings) -> String {
+    let request = if exposure.operator_visible("request_permissions") {
+        " For an exact requestable grant with an available operator, call request_permissions once."
+    } else {
+        ""
+    };
+    format!(
+        "Use an already-authorized alternative if permitted.{request} Never re-ask for or retry a \
+         permission the operator declined, or ask again with no operator available. Do not bypass \
+         a refusal."
+    )
+}
 
 /// Render saved plan, scratchpad and task worktree at a cap exit, so partial
 /// work is salvaged into the final summary / fallback instead of being lost
@@ -4834,6 +4911,7 @@ fn is_read_only_tool(name: &str) -> bool {
                 | "recall"
                 | "prompt_read"
                 | "artifact_read"
+                | "mcp_status"
         )
 }
 
@@ -4957,6 +5035,7 @@ fn is_workspace_inert_tool(name: &str) -> bool {
             | "render_report"
             | "request_permissions"
             | "request_user_input"
+            | "propose_config_edit"
             | "select_operating_mode"
             | "enter_plan_mode"
             | "exit_plan_mode"
@@ -5484,15 +5563,38 @@ fn looks_like_unverified_stale_file_blocker(content: &str) -> bool {
         && BLOCKER_CUES.iter().any(|c| tail.contains(c))
 }
 
+/// The operator-visible names among `candidates`, phrased for a "for example"
+/// clause (`a`, `a or b`, `a, b, or c`). `None` when the policy hides them all,
+/// so a nudge never steers toward a tool the model cannot call (#2932): every
+/// recipe below is drawn from the same resolved set the catalog was.
+fn visible_examples(exposure: &tools::ExposureSettings, candidates: &[&str]) -> Option<String> {
+    let names: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|name| exposure.operator_visible(name))
+        .collect();
+    match names.as_slice() {
+        [] => None,
+        [one] => Some((*one).to_string()),
+        [a, b] => Some(format!("{a} or {b}")),
+        [init @ .., last] => Some(format!("{}, or {last}", init.join(", "))),
+    }
+}
+
 /// The corrective injected when the model narrated its next action but emitted
 /// no tool call (the narrate-then-stop stall). Sibling of [`read_only_action_nudge`].
-fn narration_action_nudge() -> String {
+fn narration_action_nudge(exposure: &tools::ExposureSettings) -> String {
+    let example = visible_examples(exposure, &["edit_file", "write_file"])
+        .map(|names| format!(" (for example {names} with the real arguments)"))
+        .unwrap_or_default();
     workflow_guidance(
-        "You described what you were about to do but did not call any tool, so \
-     nothing actually happened. If you intended to act, emit the tool call now \
-     (for example edit_file or write_file with the real arguments) — do not just \
-     describe it. If you are genuinely finished, say so explicitly in one \
-     sentence.",
+        format!(
+            "You described what you were about to do but did not call any tool, so \
+         nothing actually happened. If you intended to act, emit the tool call now\
+         {example} — do not just describe it. If you are genuinely finished, say so \
+         explicitly in one sentence."
+        ),
+        exposure,
     )
 }
 
@@ -5514,6 +5616,7 @@ fn post_compaction_continuation(
     worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     prompt_context: prompt_read::PromptReadContext<'_>,
+    exposure: &tools::ExposureSettings,
 ) -> String {
     // Retain every step and status after compaction without making the saved
     // plan override a newer operator correction.
@@ -5522,44 +5625,66 @@ fn post_compaction_continuation(
         .map(|plan| {
             format!(
                 " Your saved plan is below. Continue from the `→` step when it still \
-                 matches the operator's request; otherwise reconcile it with update_plan:\n{plan}\n"
+                 matches the operator's request; otherwise reconcile it{}:\n{plan}\n",
+                if exposure.operator_visible("update_plan") {
+                    " with update_plan"
+                } else {
+                    ""
+                }
             )
         })
         .unwrap_or_default();
     // The exact prompt is already protected in the active-prompt metadata/user pair;
     // point at its immutable identity instead of injecting a lossy 400-char
-    // quote as a fresh user message.
+    // quote as a fresh user message. The recovery recipes name a tool only
+    // when the operator left it visible (#2932): the card is still there to
+    // re-read either way.
+    let prompt_read_visible = exposure.operator_visible("prompt_read");
     let instruction_clause = prompt_context.active_receipt().map_or_else(
         || {
-            " Re-read the protected [NEWT ACTIVE PROMPT v1] prompt pair (or call \
-             prompt_read with address `current`) before continuing."
-                .to_string()
+            if prompt_read_visible {
+                " Re-read the protected [NEWT ACTIVE PROMPT v1] prompt pair (or call \
+                 prompt_read with address `current`) before continuing."
+            } else {
+                " Re-read the protected [NEWT ACTIVE PROMPT v1] prompt pair before continuing."
+            }
+            .to_string()
         },
         |receipt| {
             format!(
                 " The authoritative operator prompt is protected in the [NEWT ACTIVE \
-                 PROMPT v1] metadata/user pair at address {} with model digest {}; call prompt_read \
-                 with address `current` to recover it verbatim before continuing.",
+                 PROMPT v1] metadata/user pair at address {} with model digest {}; {} \
+                 before continuing.",
                 receipt.id(),
-                receipt.model_digest()
+                receipt.model_digest(),
+                if prompt_read_visible {
+                    "call prompt_read with address `current` to recover it verbatim"
+                } else {
+                    "re-read it there"
+                }
             )
         },
     );
+    let artifact_clause = if exposure.operator_visible("artifact_read") {
+        " For prompt-rooted work, use artifact_read {\"address\":\"root\"} before deciding \
+         what remains."
+    } else {
+        ""
+    };
     let task_clause = worktree_session
         .and_then(crate::worktree_adoption::WorktreeSession::task_hint)
         .map(|hint| format!("\n{hint}\n"))
         .unwrap_or_default();
     workflow_guidance(format!(
         "{} You are mid-task: the context above was just compacted, not \
-         completed.{instruction_clause}{plan_clause}{task_clause} For prompt-rooted work, \
-         use artifact_read {{\"address\":\"root\"}} before deciding what remains. \
+         completed.{instruction_clause}{plan_clause}{task_clause}{artifact_clause} \
          When continuing, your next output should be the next concrete tool call; re-read \
-         files before editing. To re-anchor on ground truth, check the current git branch and the last few \
+         files before editing. To re-anchor on ground truth, check the current branch and the last few \
          commits: earlier work may already be COMMITTED, so a clean working tree does NOT mean \
          no work happened. Preserve completed work; \
          do not repeat work the log shows is done or silently narrow the task.",
         compress::CONTINUATION_PREFIX
-    ))
+    ), exposure)
 }
 
 /// After a compaction pass replaced the middle with a summary (or the static
@@ -5589,6 +5714,7 @@ fn apply_post_compaction_continuation(
     action: CompressAction,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     prompt_context: prompt_read::PromptReadContext<'_>,
+    exposure: &tools::ExposureSettings,
     enabled_mid_turn: bool,
     admit: impl FnOnce(&[serde_json::Value]) -> bool,
 ) {
@@ -5607,7 +5733,7 @@ fn apply_post_compaction_continuation(
     candidate.retain(|m| !compress::is_continuation_message(m));
     candidate.push(serde_json::json!({
         "role": "user",
-        "content": post_compaction_continuation(worktree_session, step_ledger, prompt_context),
+        "content": post_compaction_continuation(worktree_session, step_ledger, prompt_context, exposure),
     }));
     if admit(&candidate) {
         *messages = candidate;
@@ -5623,29 +5749,51 @@ fn escalated_narration_action_nudge(
     attempt: usize,
     cap: usize,
     step_ledger: Option<&dyn scheduled::StepLedger>,
+    exposure: &tools::ExposureSettings,
 ) -> String {
     let step_clause = active_step_description(step_ledger)
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
-    workflow_guidance(format!(
-        "Reminder {attempt}/{cap}: you again described an action without calling \
+    let example = visible_examples(exposure, &["read_file", "edit_file", "run_command"])
+        .map(|names| format!(" (for example {names} with real arguments)"))
+        .unwrap_or_default();
+    workflow_guidance(
+        format!(
+            "Reminder {attempt}/{cap}: you again described an action without calling \
          a tool, so nothing has happened.{step_clause} Your NEXT output must be \
-         exactly one tool call that starts that action (for example read_file, \
-         edit_file, or run_command with real arguments) — no prose before it. \
+         exactly one tool call that starts that action{example} — no prose before it. \
          If you are blocked, state the one concrete blocker in a single \
          sentence instead of announcing more intentions."
-    ))
+        ),
+        exposure,
+    )
 }
 
-fn stale_file_ground_truth_nudge() -> String {
+fn stale_file_ground_truth_nudge(exposure: &tools::ExposureSettings) -> String {
+    // The git probes run through run_command (or the git tool); without either
+    // the model can only re-read, so the recipe says so (#2932).
+    let can_probe = exposure.operator_visible("run_command") || exposure.operator_visible("git");
+    let probe = if can_probe {
+        "run read-only verification: git status --short, git diff -- <file>, wc -l <file>, \
+         and re-read the exact target range"
+    } else {
+        "re-read the exact target range with the read tools you have"
+    };
+    let revert = if can_probe {
+        "Never recommend git checkout/revert unless git diff proves unwanted changes and the \
+         operator approves."
+    } else {
+        "Never recommend a checkout or revert unless a diff proves unwanted changes and the \
+         operator approves."
+    };
     workflow_guidance(
-        "You claimed the file changed under you or that your edit context is stale, \
-     but you did not prove that with ground truth. Before stopping or asking the \
-     operator to restore/revert anything, run read-only verification: git status \
-     --short, git diff -- <file>, wc -l <file>, and re-read the exact target \
-     range. If those checks do not prove an actual concurrent change, continue \
-     from the verified file contents. Never recommend git checkout/revert unless \
-     git diff proves unwanted changes and the operator approves.",
+        format!(
+            "You claimed the file changed under you or that your edit context is stale, \
+             but you did not prove that with ground truth. Before stopping or asking the \
+             operator to restore/revert anything, {probe}. If those checks do not prove an \
+             actual concurrent change, continue from the verified file contents. {revert}"
+        ),
+        exposure,
     )
 }
 
@@ -5695,6 +5843,7 @@ fn pending_plan_completion_nudge(
     step_ledger: Option<&dyn scheduled::StepLedger>,
     needs_plan_update: bool,
     workflow_hint: Option<&str>,
+    exposure: &tools::ExposureSettings,
 ) -> Option<String> {
     let snapshot = step_ledger?.snapshot();
     let total = snapshot.steps.len();
@@ -5728,23 +5877,41 @@ fn pending_plan_completion_nudge(
         .filter(|hint| !hint.is_empty())
         .map(|hint| format!("\n\n{hint}"))
         .unwrap_or_default();
+    // The plan is harness-owned either way; the tool recipe rides only when
+    // the operator left update_plan visible (#2932).
+    let plan_tool = exposure.operator_visible("update_plan");
     if needs_plan_update {
-        Some(workflow_guidance(format!(
-            "You ended with a findings/next-steps summary while the agent-maintained, advisory plan still has \
-             {unfinished}/{total} unfinished {step_word}.{active_clause} Your summary says \
-             immediate prerequisite repair work now blocks the active step. Call update_plan now \
-             with the full ordered plan: mark completed steps completed, make the immediate \
-             blocker repair the active step, and keep later feature work pending. Then call the \
-             next concrete tool for that active repair. Do not repeat the findings summary or \
-             claim a tool-round limit while this nudge is giving you another round.{workflow_clause}"
-        )))
+        let restate = if plan_tool {
+            "Call update_plan now"
+        } else {
+            "Restate the plan now"
+        };
+        Some(workflow_guidance(
+            format!(
+                "You ended with a findings/next-steps summary while the agent-maintained, advisory plan still has \
+                 {unfinished}/{total} unfinished {step_word}.{active_clause} Your summary says \
+                 immediate prerequisite repair work now blocks the active step. {restate} \
+                 with the full ordered plan: mark completed steps completed, make the immediate \
+                 blocker repair the active step, and keep later feature work pending. Then call the \
+                 next concrete tool for that active repair. Do not repeat the findings summary or \
+                 claim a tool-round limit while this nudge is giving you another round.{workflow_clause}"
+            ),
+            exposure,
+        ))
     } else {
-        Some(workflow_guidance(format!(
-            "You ended the turn while the agent-maintained, advisory plan still has {unfinished}/{total} unfinished \
-             {step_word}.{active_clause} Either call update_plan with completed steps marked \
-             completed, call the next tool for the active step, or state the concrete blocker. \
-             Do not hand off by only describing remaining work."
-        )))
+        let mark = if plan_tool {
+            "call update_plan with completed steps marked completed"
+        } else {
+            "restate the plan with completed steps marked completed"
+        };
+        Some(workflow_guidance(
+            format!(
+                "You ended the turn while the agent-maintained, advisory plan still has {unfinished}/{total} unfinished \
+                 {step_word}.{active_clause} Either {mark}, call the next tool for the active step, \
+                 or state the concrete blocker. Do not hand off by only describing remaining work."
+            ),
+            exposure,
+        ))
     }
 }
 
@@ -5753,8 +5920,23 @@ fn read_only_action_nudge(
     hard_rounds_remaining: Option<usize>,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     delegate_hint: Option<&str>,
+    exposure: &tools::ExposureSettings,
 ) -> String {
-    let plan_clause = if step_ledger.and_then(plan_reseat_pointer).is_some() {
+    // Steer toward the write tools only when the operator left them visible;
+    // under `read_only` the change the model can still make is its answer.
+    let act_clause = visible_examples(exposure, &["edit_file", "write_file"])
+        .map(|names| format!("call {names} now"))
+        .unwrap_or_else(|| "act on it now with the tools you have, or answer".to_string());
+    let edit_clause = if exposure.operator_visible("edit_file") {
+        " Before edit_file, read the ONE file you are about to change so old_string \
+         matches exact text; never guess old_string or repeat a failed edit."
+    } else {
+        ""
+    };
+    let plan_clause = if step_ledger
+        .and_then(|ledger| plan_reseat_pointer(ledger, exposure))
+        .is_some()
+    {
         " You have an active multi-step plan; continue the ACTIVE step when it still \
          matches the operator's request."
     } else {
@@ -5772,15 +5954,18 @@ fn read_only_action_nudge(
             )
         })
         .unwrap_or_default();
-    workflow_guidance(format!(
-        "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
+    let permission_recovery = permission_recovery_guidance(exposure);
+    workflow_guidance(
+        format!(
+            "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
          making the change. This is a nudge, not a limit — you may still read, but if \
-         you have enough context, call edit_file or write_file now. {PERMISSION_RECOVERY_GUIDANCE} \
+         you have enough context, {act_clause}. {permission_recovery} \
          If you truly cannot proceed yet, state the \
-         exact blocker. Before edit_file, read the ONE file you are about to change so \
-         old_string matches exact text; never guess old_string or repeat a failed edit.\
+         exact blocker.{edit_clause}\
          {plan_clause}{delegate_clause}{round_clause}]"
-    ))
+        ),
+        exposure,
+    )
 }
 
 /// Append the memory-nudge line to the current user message — the last
@@ -6362,6 +6547,7 @@ async fn final_summary_ollama(
     mut messages: Vec<serde_json::Value>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     if !cap.fits(&messages, model) {
@@ -6373,6 +6559,15 @@ async fn final_summary_ollama(
         "messages": &messages,
         "stream": false,
     });
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(s) = sink {
+        let sys_texts: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        s.observe_request(&sys_texts, None)?;
+    }
     if let Some(options) = &cap.ollama_options {
         body["options"] = options.clone();
     }
@@ -6517,12 +6712,22 @@ async fn final_summary_openai(
     context_window: Option<u32>,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     let (count_client, stream_client) = clients;
     cap.push_nudge(&mut messages);
     let messages = openai_chat_wire_messages(&messages)?;
     if !cap.fits(&messages, model) {
         return Ok(cap.fallback());
+    }
+    // #2937: capture summary send (no tools field).
+    if let Some(s) = sink {
+        let sys_texts: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        s.observe_request(&sys_texts, None)?;
     }
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
     let mut body = serde_json::json!({
@@ -6713,6 +6918,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // #2372: the primary content is filtered with the stream filter's
         // policy — a lone `</think>` is answer text unless the backend
@@ -6791,7 +6997,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     // Native Git is the default interface; the injected adapter remains internal.
     let advertise_git = false;
-    let advertise_team = crew_runner.is_some();
+    // The delegate hint names `crew`/`team`; advertise them only when the operator left `crew` visible (#2932).
+    let advertise_team = crew_runner.is_some() && exposure.operator_visible("crew");
     let advertise_operating_mode = operating_mode_control.is_some();
     let advertise_plan_mode = plan_mode_control.is_some();
     let advertise_plan_mode_active =
@@ -6828,7 +7035,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake, &exposure);
     // #2313: one ledger attempt per primary request, keyed at the send.
     let attempt_turn = turn_prompt_context
         .map(|turn| turn.active_operator_prompt().id().to_string())
@@ -6846,7 +7053,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     });
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
-    if note_sink.is_some() {
+    if note_sink.is_some() && exposure.operator_visible("save_note") {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
             if let Some(harness) = smart_harness {
                 harness.host_message(&line)?;
@@ -6905,46 +7112,33 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
-    let tools = merged_tool_definitions(
+    let (tools, hidden_tools) = tool_set::derive_tool_set(&tool_set::ToolSetInputs {
         mcp,
-        advertise_save_note,
-        advertise_recall,
-        advertise_memory_fetch,
-        advertise_git.then_some(&caveats.fs_read),
-        advertise_team,
-        advertise_scratchpad,
-        advertise_code_search,
-        advertise_experiential,
-        advertise_scheduled,
-        advertise_operating_mode,
-        advertise_plan_mode,
-        advertise_plan_mode_active,
+        advertise: tool_set::Advertise {
+            save_note: advertise_save_note,
+            recall: advertise_recall,
+            memory_fetch: advertise_memory_fetch,
+            git_read_scope: advertise_git.then_some(&caveats.fs_read),
+            team: advertise_team,
+            scratchpad: advertise_scratchpad,
+            code_search: advertise_code_search,
+            experiential: advertise_experiential,
+            scheduled: advertise_scheduled,
+            operating_mode: advertise_operating_mode,
+            plan_mode: advertise_plan_mode,
+            plan_mode_active: advertise_plan_mode_active,
+        },
         command_budget,
         shell_dialect,
-    );
-    // Put the persona's preferred tools first without removing other tools.
-    // Dispatch separately checks explicit permissions and delegation authority.
-    let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(
-        smart_harness::advertise(tools, smart_harness),
-        prompt_disposition,
-    );
-    // #TEC Pass 1: exposure stage — clip the authorized catalog to the live
-    // usable budget (identity under `ExposureProfile::Full`). See the Ollama
-    // path for the full rationale.
-    let (tools, hidden_tools) = crate::agentic::tools::select_exposed(
-        tools,
-        &exposure,
-        exposure_budget_tokens(send_budget, safe_context),
-        &std::collections::BTreeSet::new(),
+        persona_tools,
+        smart_harness,
+        disposition: prompt_disposition,
+        exposure: &exposure,
+        exposure_budget_tokens: exposure_budget_tokens(send_budget, safe_context),
         estimation,
-    );
-    // The endpoint speaks the OpenAI function-tool wire even when the serving
-    // model is hosted behind vLLM/LiteLLM/NIM. Enforce that wire's 128-function
-    // envelope after authorization + exposure, keeping Kernel tools ahead of
-    // optional MCP schemas. Retain omitted schemas in the same controller for
-    // exact-name activation without changing dispatch authority.
-    let mut tools = crate::agentic::tools::select_openai_compatible_tools(tools, &hidden_tools);
+        openai_compatible: true,
+    });
+    let mut tools = tools;
     let mut tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
@@ -7020,6 +7214,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        observed_facts.verbatim = exposure.verbatim_system;
         observed_facts.planning = output_budget::guidance(
             Some(generation_bounds::output_cap(
                 generation_policy.output_allowance,
@@ -7030,6 +7225,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             &selected_target::root(workspace, worktree_session),
             &caveats.fs_read,
             estimation,
+            &exposure,
         );
         semantic_pins::refresh(
             &mut observed_facts,
@@ -7122,7 +7318,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             );
         }
         if round > 0 && action_nudges {
-            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+            if let Some(ptr) = step_ledger.and_then(|ledger| plan_reseat_pointer(ledger, &exposure))
+            {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
             // Initiative action-forcing: the OpenAI-chat loop had no read-only
@@ -7131,7 +7328,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // nudge once the initiative level's read-only budget is spent.
             let remaining = (workflow_grace_rounds == 0)
                 .then_some(current_tool_round_limit.saturating_sub(round + 1));
-            if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
+            if let Some(nudge) =
+                workflow_runtime.action_forcing_nudge(remaining, step_ledger, None, &exposure)
             {
                 if debug {
                     print_debug(
@@ -7283,6 +7481,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
+                        &exposure,
                         round > 0 && action_nudges,
                         |candidate| {
                             openai_chat_wire_messages(candidate).is_ok_and(|wire| {
@@ -7377,6 +7576,38 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 if let Some(o) = body.as_object_mut() {
                     o.remove("tools");
                     o.remove("tool_choice");
+                }
+            }
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                // Annotate active card before wire_messages coalesces the
+                // message boundary (mirrors the Anthropic path at line ~10321).
+                for msg in &messages {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
+                let sys_texts: Vec<&str> = wire_messages
+                    .iter()
+                    .filter(|m| m["role"] == "system")
+                    .filter_map(|m| m["content"].as_str())
+                    .collect();
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    Some(tools.as_array().map(|a| a.as_slice()).unwrap_or(&[]))
+                } else {
+                    None
+                };
+                sink.observe_request(&sys_texts, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
+                    }
                 }
             }
             // OpenAI-compatible endpoints do not accept a `num_ctx` request field,
@@ -7723,6 +7954,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
+                                    &exposure,
                                     round > 0 && action_nudges,
                                     |candidate| {
                                         openai_chat_wire_messages(candidate).is_ok_and(|wire| {
@@ -7808,6 +8040,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // Merge per-round token usage (input = max single prompt, output =
         // sum — Step 18.1) and anchor the context-size tracker.
         let round_usage = openai_usage(&json["usage"]);
+        // The model that actually answered this round, so commit credit names it
+        // (a router such as `openrouter/auto` serves a different one).
+        let round_model =
+            attribution::served_or_requested(json["model"].as_str(), model).to_owned();
+        if let Some(tool) = git_tool {
+            tool.note_served_model(&round_model);
+        }
         if let Some(prompt_tokens) = json["usage"]["prompt_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -8057,12 +8296,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     workflow_grace_rounds,
                 );
                 let control = harness
-                    .classify(&oa_content, narration_nudge_cap, more, cancel)
+                    .classify(&oa_content, narration_nudge_cap, more, cancel, &exposure)
                     .await?;
                 let control = harness
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            exposure: &exposure,
                             messages: &messages,
                             workspace,
                             task,
@@ -8161,7 +8401,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let workflow_hint = nudge_classification
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
-                .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
+                .and_then(|_| {
+                    workflow_steerer.plan_update_hint(&workflow_classifier_text, &exposure)
+                });
             let classifier_plan_direction = nudge_classification
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
@@ -8214,6 +8456,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     step_ledger,
                     needs_plan_update,
                     plan_nudge_hint.as_deref(),
+                    &exposure,
                 ) {
                     if debug {
                         print_debug(
@@ -8252,7 +8495,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(&exposure)
                     ),
                 }));
                 stale_file_nudges += 1;
@@ -8288,13 +8531,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         .and_then(|classification| {
                             nudge_classifier.direction_for(classification.class)
                         })
-                        .map(workflow_guidance)
-                        .unwrap_or_else(narration_action_nudge)
+                        .map(|direction| workflow_guidance(direction, &exposure))
+                        .unwrap_or_else(|| narration_action_nudge(&exposure))
                 } else {
                     escalated_narration_action_nudge(
                         narration_nudges + 1,
                         narration_nudge_cap,
                         step_ledger,
+                        &exposure,
                     )
                 };
                 messages.push(serde_json::json!({
@@ -8321,6 +8565,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if verification.result_aware() && action_nudges && !content.is_empty() {
                 match self_verify::conclude_turn(
                     self_verify::Concluding {
+                        exposure: &exposure,
                         messages: &messages,
                         workspace,
                         task: active_task,
@@ -8366,7 +8611,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     .applicable_checks(workspace, active_task, &cmds)
                     .await
                     .unwrap_or_default();
-                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
+                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds, &exposure) {
                     if debug {
                         print_debug(
                             "concluding with unrun verification — self-verify nudge",
@@ -8716,7 +8961,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let governed_pr = std::sync::OnceLock::new();
             let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
-            let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
+            let attribution_epoch =
+                AttributionEpoch::new(attribution, git_tool, &round_model, name);
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // OpenAI-compatible endpoints do not receive `num_ctx`, but a local
             // endpoint's operator-declared window still provides the displayed
@@ -8993,6 +9239,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             },
             current_tool_round_limit,
             solve_obs.as_deref_mut(),
+            &exposure,
         )
         .await;
     if let Some(hit) = &mut round_cap_hit {
@@ -9049,6 +9296,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         generation_window,
         &cap,
         attempts,
+        report_sink,
     );
     let Some(result) = cancellable(cancel, summary).await else {
         cap.learn_measurement(compress_state)?;
@@ -9415,11 +9663,17 @@ async fn final_summary_anthropic(
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
     attempts: Option<attempt_capture::AttemptScope<'_>>,
+    sink: Option<&request_report::ReportSink>,
 ) -> anyhow::Result<(FinalReply, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
     if !cap.fits(&wire_messages, model) {
         return Ok(cap.fallback());
+    }
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(s) = sink {
+        let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
+        s.observe_request(&sys_arr, None)?;
     }
     // Omit `tools` => the model cannot emit tool_use blocks (mirrors the
     // OpenAI path's tools-disabled summary).
@@ -9559,6 +9813,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // Anthropic streams reasoning in its own wire fields, not as a lone
         // leading `</think>` closer, so this loop never starts the filter
@@ -9665,7 +9920,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     // Native Git is the default interface; the injected adapter remains internal.
     let advertise_git = false;
-    let advertise_team = crew_runner.is_some();
+    // The delegate hint names `crew`/`team`; advertise them only when the operator left `crew` visible (#2932).
+    let advertise_team = crew_runner.is_some() && exposure.operator_visible("crew");
     let advertise_operating_mode = operating_mode_control.is_some();
     let advertise_plan_mode = plan_mode_control.is_some();
     let advertise_plan_mode_active =
@@ -9702,7 +9958,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake, &exposure);
     // #2313: one ledger attempt per primary request, keyed at the send.
     let attempt_turn = turn_prompt_context
         .map(|turn| turn.active_operator_prompt().id().to_string())
@@ -9720,7 +9976,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     });
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
-    if note_sink.is_some() {
+    if note_sink.is_some() && exposure.operator_visible("save_note") {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
             if let Some(harness) = smart_harness {
                 harness.host_message(&line)?;
@@ -9784,36 +10040,32 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
-    let tools = merged_tool_definitions(
+    let (mut tools, hidden_tools) = tool_set::derive_tool_set(&tool_set::ToolSetInputs {
         mcp,
-        advertise_save_note,
-        advertise_recall,
-        advertise_memory_fetch,
-        advertise_git.then_some(&caveats.fs_read),
-        advertise_team,
-        advertise_scratchpad,
-        advertise_code_search,
-        advertise_experiential,
-        advertise_scheduled,
-        advertise_operating_mode,
-        advertise_plan_mode,
-        advertise_plan_mode_active,
+        advertise: tool_set::Advertise {
+            save_note: advertise_save_note,
+            recall: advertise_recall,
+            memory_fetch: advertise_memory_fetch,
+            git_read_scope: advertise_git.then_some(&caveats.fs_read),
+            team: advertise_team,
+            scratchpad: advertise_scratchpad,
+            code_search: advertise_code_search,
+            experiential: advertise_experiential,
+            scheduled: advertise_scheduled,
+            operating_mode: advertise_operating_mode,
+            plan_mode: advertise_plan_mode,
+            plan_mode_active: advertise_plan_mode_active,
+        },
         command_budget,
         shell_dialect,
-    );
-    let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(
-        smart_harness::advertise(tools, smart_harness),
-        prompt_disposition,
-    );
-    // #TEC Pass 1: exposure stage — mirrors the OpenAI path.
-    let (mut tools, hidden_tools) = crate::agentic::tools::select_exposed(
-        tools,
-        &exposure,
-        exposure_budget_tokens(send_budget, safe_context),
-        &std::collections::BTreeSet::new(),
+        persona_tools,
+        smart_harness,
+        disposition: prompt_disposition,
+        exposure: &exposure,
+        exposure_budget_tokens: exposure_budget_tokens(send_budget, safe_context),
         estimation,
-    );
+        openai_compatible: false,
+    });
     // The Anthropic tool catalog, converted from the exposed catalog
     // (`input_schema` copied wholesale, no `function` nesting), and again only
     // when a hidden tool is promoted.
@@ -9891,12 +10143,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             worktree_session,
             false,
         );
+        observed_facts.verbatim = exposure.verbatim_system;
         observed_facts.planning = output_budget::guidance(
             Some(max_tokens),
             step_ledger,
             &selected_target::root(workspace, worktree_session),
             &caveats.fs_read,
             estimation,
+            &exposure,
         );
         semantic_pins::refresh(
             &mut observed_facts,
@@ -9986,13 +10240,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             );
         }
         if round > 0 && action_nudges {
-            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+            if let Some(ptr) = step_ledger.and_then(|ledger| plan_reseat_pointer(ledger, &exposure))
+            {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
             // Initiative action-forcing — mirrors the OpenAI path.
             let remaining = (workflow_grace_rounds == 0)
                 .then_some(current_tool_round_limit.saturating_sub(round + 1));
-            if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
+            if let Some(nudge) =
+                workflow_runtime.action_forcing_nudge(remaining, step_ledger, None, &exposure)
             {
                 if debug {
                     print_debug(
@@ -10124,6 +10380,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
+                        &exposure,
                         round > 0 && action_nudges,
                         |candidate| {
                             anthropic_wire::anthropic_wire_messages(candidate).is_ok_and(
@@ -10214,6 +10471,33 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 use_tools.then_some(tools_anthropic.as_slice()),
                 streaming_enabled,
             );
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                // Annotate active card before the join loses the message boundary.
+                for msg in &messages {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
+                let sys_arr: Vec<&str> = system.as_deref().into_iter().collect();
+                let send_tools: Option<&[serde_json::Value]> = if use_tools {
+                    Some(&tools_anthropic)
+                } else {
+                    None
+                };
+                sink.observe_request(&sys_arr, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
+                    }
+                }
+            }
             let dispatch = anthropic_dispatch_round(
                 &dispatcher,
                 &body,
@@ -10432,6 +10716,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
+                                    &exposure,
                                     round > 0 && action_nudges,
                                     |candidate| {
                                         anthropic_wire::anthropic_wire_messages(candidate)
@@ -10518,6 +10803,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // Merge per-round token usage (input = max single prompt, output =
         // sum — Step 18.1) and anchor the context-size tracker.
         let round_usage = model_reply.usage;
+        // The model that actually answered this round, so commit credit names it
+        // (a router such as `openrouter/auto` serves a different one).
+        let round_model =
+            attribution::served_or_requested(model_reply.model.as_deref(), model).to_owned();
+        if let Some(tool) = git_tool {
+            tool.note_served_model(&round_model);
+        }
         if let Some(u) = round_usage {
             compress_state
                 .calibration
@@ -10893,12 +11185,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     workflow_grace_rounds,
                 );
                 let control = harness
-                    .classify(&oa_content, narration_nudge_cap, more, cancel)
+                    .classify(&oa_content, narration_nudge_cap, more, cancel, &exposure)
                     .await?;
                 let control = harness
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            exposure: &exposure,
                             messages: &messages,
                             workspace,
                             task,
@@ -10996,7 +11289,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let workflow_hint = nudge_classification
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
-                .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
+                .and_then(|_| {
+                    workflow_steerer.plan_update_hint(&workflow_classifier_text, &exposure)
+                });
             let classifier_plan_direction = nudge_classification
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
@@ -11049,6 +11344,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     step_ledger,
                     needs_plan_update,
                     plan_nudge_hint.as_deref(),
+                    &exposure,
                 ) {
                     if debug {
                         print_debug(
@@ -11087,7 +11383,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(&exposure)
                     ),
                 }));
                 stale_file_nudges += 1;
@@ -11120,13 +11416,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         .and_then(|classification| {
                             nudge_classifier.direction_for(classification.class)
                         })
-                        .map(workflow_guidance)
-                        .unwrap_or_else(narration_action_nudge)
+                        .map(|direction| workflow_guidance(direction, &exposure))
+                        .unwrap_or_else(|| narration_action_nudge(&exposure))
                 } else {
                     escalated_narration_action_nudge(
                         narration_nudges + 1,
                         narration_nudge_cap,
                         step_ledger,
+                        &exposure,
                     )
                 };
                 messages.push(serde_json::json!({
@@ -11143,6 +11440,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if verification.result_aware() && action_nudges && !content.is_empty() {
                 match self_verify::conclude_turn(
                     self_verify::Concluding {
+                        exposure: &exposure,
                         messages: &messages,
                         workspace,
                         task: active_task,
@@ -11188,7 +11486,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     .applicable_checks(workspace, active_task, &cmds)
                     .await
                     .unwrap_or_default();
-                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
+                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds, &exposure) {
                     if debug {
                         print_debug(
                             "concluding with unrun verification — self-verify nudge",
@@ -11505,7 +11803,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let governed_pr = std::sync::OnceLock::new();
             let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
-            let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
+            let attribution_epoch =
+                AttributionEpoch::new(attribution, git_tool, &round_model, name);
             // #727: intercept the read-only budget self-read (mirrors the
             // OpenAI path — `num_ctx` never rides this wire either).
             let result = if tools::is_context_remaining_call(name) {
@@ -11776,6 +12075,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             },
             current_tool_round_limit,
             solve_obs.as_deref_mut(),
+            &exposure,
         )
         .await;
     if let Some(hit) = &mut round_cap_hit {
@@ -11831,6 +12131,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         generation_policy,
         &cap,
         attempts,
+        report_sink,
     )
     .await;
     let (text, streamed, usage) = cap.recover_rejection(
@@ -12228,6 +12529,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         plan_mode_control,
         plan_draft_sink,
         steering,
+        report_sink,
         completed_spill_renderer,
         // The Responses wire carries reasoning in its own items, never as a
         // lone leading `</think>` closer, so the declared #528 shape does not
@@ -12288,7 +12590,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let advertise_scheduled = step_ledger.is_some();
     // Native Git is the default interface; the injected adapter remains internal.
     let advertise_git = false;
-    let advertise_team = crew_runner.is_some();
+    // The delegate hint names `crew`/`team`; advertise them only when the operator left `crew` visible (#2932).
+    let advertise_team = crew_runner.is_some() && exposure.operator_visible("crew");
     let advertise_operating_mode = operating_mode_control.is_some();
     let advertise_plan_mode = plan_mode_control.is_some();
     let advertise_plan_mode_active =
@@ -12315,7 +12618,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
-    prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context, prompt_intake);
+    prompt_read::ensure_active_prompt_card(
+        &mut msgs_json,
+        prompt_context,
+        prompt_intake,
+        &exposure,
+    );
     // #2313: one ledger attempt per primary request, keyed at the send.
     let attempt_turn = turn_prompt_context
         .map(|turn| turn.active_operator_prompt().id().to_string())
@@ -12340,30 +12648,6 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             input.insert(0, serde_json::json!({"role":"system", "content":text}));
         }
     }
-    let tools_chat = merged_tool_definitions(
-        mcp,
-        advertise_save_note,
-        advertise_recall,
-        advertise_memory_fetch,
-        advertise_git.then_some(&caveats.fs_read),
-        advertise_team,
-        advertise_scratchpad,
-        advertise_code_search,
-        advertise_experiential,
-        advertise_scheduled,
-        advertise_operating_mode,
-        advertise_plan_mode,
-        advertise_plan_mode_active,
-        command_budget,
-        shell_dialect,
-    );
-    // FR-1 part 2 (#997): scope the advertised catalog to the active persona
-    // (Responses wire). No-op when `persona_tools` is `None`.
-    let tools_chat = filter_advertised_tools(tools_chat, persona_tools);
-    let tools_chat = filter_tools_for_disposition(
-        smart_harness::advertise(tools_chat, smart_harness),
-        prompt_disposition,
-    );
     // #TEC Pass 1: exposure stage on the chat-shaped catalog before it is
     // projected to Responses tools, so the estimate and the wire agree.
     // Identity under `ExposureProfile::Full`. The send budget is computed just
@@ -12405,15 +12689,33 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         generation_policy.output_allowance,
     );
     observability::observe_output_allowance(&mut solve_obs, budget_state.output_reserve(), false);
-    let (tools_chat, hidden_tools) = crate::agentic::tools::select_exposed(
-        tools_chat,
-        &exposure,
-        budget_state.exposure_budget(),
-        &std::collections::BTreeSet::new(),
+    let (tools_chat, hidden_tools) = tool_set::derive_tool_set(&tool_set::ToolSetInputs {
+        mcp,
+        advertise: tool_set::Advertise {
+            save_note: advertise_save_note,
+            recall: advertise_recall,
+            memory_fetch: advertise_memory_fetch,
+            git_read_scope: advertise_git.then_some(&caveats.fs_read),
+            team: advertise_team,
+            scratchpad: advertise_scratchpad,
+            code_search: advertise_code_search,
+            experiential: advertise_experiential,
+            scheduled: advertise_scheduled,
+            operating_mode: advertise_operating_mode,
+            plan_mode: advertise_plan_mode,
+            plan_mode_active: advertise_plan_mode_active,
+        },
+        command_budget,
+        shell_dialect,
+        persona_tools,
+        smart_harness,
+        disposition: prompt_disposition,
+        exposure: &exposure,
+        exposure_budget_tokens: budget_state.exposure_budget(),
         estimation,
-    );
-    let mut tools_chat =
-        crate::agentic::tools::select_openai_compatible_tools(tools_chat, &hidden_tools);
+        openai_compatible: true,
+    });
+    let mut tools_chat = tools_chat;
     let mut tools = tools_to_responses(&tools_chat);
     let mut tools_for_estimate = serde_json::Value::Array(tools.clone());
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
@@ -12537,6 +12839,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             worktree_session,
             true,
         );
+        observed_facts.verbatim = exposure.verbatim_system;
         observed_facts.planning = output_budget::guidance(
             Some(generation_bounds::output_cap(
                 generation_policy.output_allowance,
@@ -12547,6 +12850,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             &selected_target::root(workspace, worktree_session),
             &caveats.fs_read,
             estimation,
+            &exposure,
         );
         semantic_pins::refresh(
             &mut observed_facts,
@@ -12679,6 +12983,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         color,
                         smart_harness,
                         false,
+                        &exposure,
                     );
                     let Some(outcome) = cancellable(cancel, compression).await else {
                         return Ok((
@@ -12711,6 +13016,40 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 harness.record_responses_messages(instructions.as_deref(), &input)?;
             }
             let mut body = build_body(&input, if tools_supported { &tools } else { &[] });
+            // #2937: capture per-round final body after tools gate.
+            if let Some(sink) = report_sink {
+                // Annotate active card before the body join loses the message boundary.
+                for msg in &msgs_json {
+                    if let Some(content) = msg["content"].as_str() {
+                        if content.starts_with(prompt_read::ACTIVE_PROMPT_PREFIX) {
+                            sink.annotate("card", "agentic::prompt_read", content);
+                            break;
+                        }
+                    }
+                }
+                let ins_str: &str = body["instructions"].as_str().unwrap_or("");
+                let sys_arr: &[&str] = if ins_str.is_empty() {
+                    &[]
+                } else {
+                    std::slice::from_ref(&ins_str)
+                };
+                let send_tools: Option<&[serde_json::Value]> = if tools_supported {
+                    body.get("tools")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.as_slice())
+                } else {
+                    None
+                };
+                sink.observe_request(sys_arr, send_tools)?;
+                if sink.take_show_flag() {
+                    if let Some(r) = sink.last_report() {
+                        crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                            use std::io::Write;
+                            writeln!(w, "{}", r.to_markdown())
+                        });
+                    }
+                }
+            }
             let output_cap = generation_bounds::apply_responses(
                 &mut body,
                 output_recovery.allowance(generation_policy.output_allowance),
@@ -12876,6 +13215,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 color,
                                 smart_harness,
                                 true,
+                                &exposure,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
                                 context_recovery::record(
@@ -12966,6 +13306,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // failed / incomplete / non-terminal status, malformed/empty body) is
         // surfaced — never mistaken for a benign empty reply.
         let decoded = crate::responses_wire::decode_response(&json);
+        // The model that actually answered this round, so commit credit names it
+        // (a router such as `openrouter/auto` serves a different one).
+        let round_model =
+            attribution::served_or_requested(json["model"].as_str(), model).to_owned();
+        if let Some(tool) = git_tool {
+            tool.note_served_model(&round_model);
+        }
         complete_responses_attempt(attempt.as_ref(), &json, &decoded);
         if generation_bounds::output_limited(&json) {
             let usage = crate::responses_wire::decode_usage(&json["usage"]);
@@ -13108,12 +13455,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     workflow_grace_rounds,
                 );
                 let control = harness
-                    .classify(&text, narration_nudge_cap, more, cancel)
+                    .classify(&text, narration_nudge_cap, more, cancel, &exposure)
                     .await?;
                 let control = harness
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            exposure: &exposure,
                             messages: &input,
                             workspace,
                             task,
@@ -13427,7 +13775,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let governed_pr = std::sync::OnceLock::new();
             let report_capture = std::sync::Mutex::new(observed_report::Capture::default());
             let command_directory = std::sync::OnceLock::new();
-            let attribution_epoch = AttributionEpoch::new(attribution, git_tool, model, name);
+            let attribution_epoch =
+                AttributionEpoch::new(attribution, git_tool, &round_model, name);
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // The Responses loop has no PromptTracker, so `used` is the chars/4
             // estimate of the ACTUAL Responses request; num_ctx is normally unset
@@ -13706,6 +14055,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             smart_harness.is_some() && smart_verify,
             current_tool_round_limit,
             solve_obs.as_deref_mut(),
+            &exposure,
         )
         .await;
     if let Some(hit) = &mut round_cap_hit {
@@ -13777,6 +14127,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 color,
                 smart_harness,
                 false,
+                &exposure,
             );
             let Some(outcome) = cancellable(cancel, compression).await else {
                 return Ok((
@@ -13803,6 +14154,24 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // final summary can carry NO tools; a proactive-compaction reason (if any) rides
     // its error chain. Only a `ValidatedResponsesRequest` reaches the dispatcher.
     let mut body = build_body(&input, &[]);
+    // #2937: capture summary send (no tools field — None distinguishes from []).
+    if let Some(sink) = report_sink {
+        let body_instr = body["instructions"].as_str().unwrap_or("");
+        let sys_arr: &[&str] = if body_instr.is_empty() {
+            &[]
+        } else {
+            &[body_instr]
+        };
+        sink.observe_request(sys_arr, None)?;
+        if sink.take_show_flag() {
+            if let Some(r) = sink.last_report() {
+                crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, |w| {
+                    use std::io::Write;
+                    writeln!(w, "{}", r.to_markdown())
+                });
+            }
+        }
+    }
     let output_cap = generation_bounds::apply_responses(
         &mut body,
         generation_policy.output_allowance,
@@ -14084,7 +14453,7 @@ fn commit_reasoning_fold(
     let retained = retain.and_then(|r| r.retain_completed(fold.body()));
     let hint = retained
         .zip(retain)
-        .map(|(id, renderer)| renderer.recovery_hint(id));
+        .map(|(id, renderer)| renderer.recovery_hint(&id));
     let recovery = hint
         .as_deref()
         .map_or_else(display::Recovery::default, display::Recovery::Command);
@@ -14173,7 +14542,7 @@ fn emit_tool_round_narration(
     let retained = retain.and_then(|r| r.retain_completed(&body));
     let hint = retained
         .zip(retain)
-        .map(|(id, renderer)| renderer.recovery_hint(id));
+        .map(|(id, renderer)| renderer.recovery_hint(&id));
     let recovery = hint
         .as_deref()
         .map_or_else(display::Recovery::default, display::Recovery::Command);
@@ -14240,7 +14609,7 @@ impl ReasoningTrickle {
         let retained = retain.and_then(|r| r.retain_completed(self.fold.body()));
         let hint = retained
             .zip(retain)
-            .map(|(id, renderer)| renderer.recovery_hint(id));
+            .map(|(id, renderer)| renderer.recovery_hint(&id));
         let recovery = hint
             .as_deref()
             .map_or_else(display::Recovery::default, display::Recovery::Command);
@@ -14306,6 +14675,10 @@ mod repeat_call_guard_tests;
 #[path = "mod_tests/cap_exit_unit_tests.rs"]
 mod cap_exit_unit_tests;
 
+#[cfg(test)]
+#[path = "mod_tests/guidance_policy_sweep.rs"]
+mod guidance_policy_sweep;
+
 // ---------------------------------------------------------------------------
 // Tool-call round cap + graceful cap-exit (issue: configurable max_tool_rounds)
 // ---------------------------------------------------------------------------
@@ -14336,7 +14709,7 @@ mod cap_exit_unit_tests;
 #[cfg(test)]
 pub(crate) fn builtin_catalog_tokens(disposition: PromptDisposition) -> usize {
     let tools = filter_tools_for_disposition(
-        merged_tool_definitions(
+        tools::merged_tool_definitions(
             &NoMcp,
             false,
             false,

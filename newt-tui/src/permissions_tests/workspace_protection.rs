@@ -298,6 +298,53 @@ fn recalled_alias_is_not_discarded_as_an_already_covered_lexical_child() {
     assert_eq!(state.recalled_caveats(&base, None).unwrap(), base);
 }
 
+/// #2959 regression: the `/context request` preview recalls authority through
+/// `peek_recalled_caveats`. The committing form quarantines a grant that fails
+/// validation (and `denied` then refuses it for the rest of the session), so a
+/// preview made while a durable root was briefly invalid used to poison it.
+/// The peek returns the same caveats and leaves every set it can reach as it
+/// found it; a later committing recall still behaves as before.
+#[cfg(unix)]
+#[test]
+fn peeking_recalled_caveats_does_not_quarantine_a_failing_grant() {
+    let fixture = Fixture::new();
+    let outside = fixture._temp.path().canonicalize().unwrap().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let alias = fixture.workspace.join("alias");
+    std::os::unix::fs::symlink(&outside, &alias).unwrap();
+    let mut state = fixture.state();
+    state
+        .durable_grants
+        .insert((DenialKind::FsRead, alias.to_string_lossy().into_owned()));
+    let base = fixture.caveats();
+    let before = (
+        state.rejected_durable_grants.borrow().clone(),
+        state.durable_grants.clone(),
+        state.session_grants.clone(),
+        state.session_denials.clone(),
+    );
+    for _ in 0..2 {
+        assert_eq!(state.peek_recalled_caveats(&base, None).unwrap(), base);
+        assert_eq!(
+            before,
+            (
+                state.rejected_durable_grants.borrow().clone(),
+                state.durable_grants.clone(),
+                state.session_grants.clone(),
+                state.session_denials.clone(),
+            ),
+            "a peek must not change permission state"
+        );
+    }
+    assert!(state.rejected_durable_grants.borrow().is_empty());
+    assert_eq!(state.recalled_caveats(&base, None).unwrap(), base);
+    assert_eq!(
+        state.rejected_durable_grants.borrow().len(),
+        1,
+        "the committing recall still quarantines"
+    );
+}
+
 /// A dead exact approval under an existing same-axis root is redundant too.
 #[test]
 fn dead_covered_grants_do_not_add_unstable_nested_roots() {

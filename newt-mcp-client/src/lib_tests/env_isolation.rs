@@ -20,6 +20,9 @@ async fn stdio_spawn_does_not_leak_secret_env() {
         headers: std::collections::BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -81,6 +84,9 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
         headers: BTreeMap::new(),
         request_timeout_secs: None,
         login_argv: Vec::new(),
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -141,6 +147,9 @@ async fn stdio_spawn_under_net_none_does_not_l3_bound_refuse() {
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -183,6 +192,9 @@ async fn stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: newt_core::mcp::McpTrust::Trusted,
         origin: None,
     };
@@ -195,4 +207,63 @@ async fn stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_
         "a host-scoped net grant must be narrowed to net:none for the spawn, \
          not L3-BOUND-refused",
     );
+}
+
+/// #3033 GROUNDING TEST (macOS, weekly/release lane). Grounds the mocked
+/// `confined_spawn_helper_tests::mcp_spawn_declares_audited_piped_piped_null_stdio`:
+/// with the stdio declared `ConfinedStdio::Piped/Piped/Null` by name, a real
+/// stdio MCP child under `net:none` passes Seatbelt admission, and the report
+/// for the mechanism it ran under says net `Kernel`. Admission refuses an
+/// `Unknown` net projection regardless of floor, so the spawn succeeding is
+/// itself the witness; before #3033 (raw `Stdio`, i.e. `ConfinedStdio::Other`)
+/// both shapes below were refused. The host-list session shape is the one
+/// operators hit: `spawn_caveats` narrows it to `net:none` before admission.
+/// Requires an unprivileged caller (bridle's Seatbelt witness precondition).
+///
+/// ```text
+/// cargo test -p newt-mcp-client --lib -- --ignored --test-threads=1 \
+///   stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt
+/// ```
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "real Seatbelt stdio subprocess; macOS weekly/release lane, single-threaded"]
+async fn stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt() {
+    use agent_bridle::{enforcement_report, AxisEnforcement, ConfinementMechanism, StdioPosture};
+    use newt_core::caveats::Scope;
+    let entry = McpServerEntry {
+        name: "seatbelt-net-none-probe".into(),
+        enabled: true,
+        transport: TransportKind::Stdio,
+        command: Some("/bin/cat".into()),
+        args: vec![],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+        login_argv: Vec::new(),
+        request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
+        trust: newt_core::mcp::McpTrust::Trusted,
+        origin: None,
+    };
+    let admitted = newt_core::mcp::admit(&entry).unwrap();
+    for session_net in [Scope::none(), Scope::only(["api.github.com".to_string()])] {
+        let caveats = Caveats {
+            net: session_net.clone(),
+            ..Caveats::top()
+        };
+        let t = StdioTransport::spawn(&admitted, &caveats).unwrap_or_else(|e| {
+            panic!("session net {session_net:?}: stdio MCP must be admitted under net:none: {e:#}")
+        });
+        assert_eq!(t.sandbox_kind(), SandboxKind::Seatbelt);
+        let spawned = spawn_caveats(&caveats, "/bin/cat");
+        let mechanism = ConfinementMechanism::new(t.sandbox_kind(), ChildNetworkPolicy::DenyDirect)
+            .with_stdio_posture(StdioPosture::Audited);
+        assert_eq!(
+            enforcement_report(&spawned, mechanism).net,
+            Some(AxisEnforcement::Kernel),
+            "session net {session_net:?}: the admitted spawn's net axis must be Kernel"
+        );
+    }
 }

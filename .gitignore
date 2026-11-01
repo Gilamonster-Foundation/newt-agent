@@ -112,3 +112,4 @@ formal/tla/states/
 
 # Build output from building a vendored crate standalone.
 vendor/*/target/
+!site/*.js

@@ -724,6 +724,13 @@ impl ShellRoute {
 /// Capture the session-default route. Brokers, leases and exec floors are
 /// command-specific: execution re-evaluates them before dispatch.
 pub fn run_command_dialect_sentence() -> &'static str {
+    session_default_route().sentence()
+}
+
+/// The route `run_command` takes by default in this session (no broker, no lease, no exec
+/// floor): the one decision the dialect guidance and the `--ambient` banner both read, the
+/// same `select_shell_route` dispatch calls per command.
+fn session_default_route() -> ShellRoute {
     select_shell_route(
         ocap_disabled(),
         false,
@@ -734,7 +741,37 @@ pub fn run_command_dialect_sentence() -> &'static str {
         crate::ambient_brush::installed(),
         shell_engine(),
     )
-    .sentence()
+}
+
+/// What `run_command` actually runs under the ambient posture on this platform, for the
+/// session banner. Derived from the same route dispatch selects, so Windows names the
+/// Brush/cmd shell that runs rather than a unix `/bin/sh`.
+pub fn ambient_interpreter_description(shell: &crate::ambient_shell::AmbientShell) -> String {
+    interpreter_for(session_default_route(), shell)
+}
+
+pub(super) fn interpreter_for(
+    route: ShellRoute,
+    shell: &crate::ambient_shell::AmbientShell,
+) -> String {
+    use crate::ambient_shell::AmbientShell;
+    match route {
+        ShellRoute::BashSh => match shell {
+            AmbientShell::Login { .. } => format!("your {}", shell.describe()),
+            AmbientShell::Fallback { .. } => shell.describe(),
+        },
+        ShellRoute::AmbientBrush => {
+            "the carried Brush shell (the login shell is unix-only; it keeps your full environment)"
+                .to_string()
+        }
+        ShellRoute::Cmd => {
+            "cmd.exe /C (the login shell is unix-only; it keeps your full environment)".to_string()
+        }
+        ShellRoute::Bridled(_) => {
+            "the confined shell (the host shell, and so your login shell, applies only where the exec floor permits)"
+                .to_string()
+        }
+    }
 }
 
 /// Pure session-default guidance with injected platform/authority and an installed runner.
@@ -1873,13 +1910,11 @@ pub(super) fn dispatch_wall(
 }
 
 /// What the `run_command` description tells the model about its wall, up front.
-/// One owner with [`timed_out_note`], so the two cannot disagree (U6).
+/// The lane for long builds (`lifecycle` action=build) is coached by
+/// [`timed_out_note`] on the result that needs it, not here (#2949).
 pub(super) fn run_command_limit_sentence(command_budget: crate::RunCommandBudget) -> String {
     format!(
-        "Ordinary calls are killed after {} seconds (wall clock); classified builds get 30 minutes. Override with timeout_secs up to \
-         {} seconds; the result carries the exit code. For an offline build use \
-         `lifecycle` action=build, i.e. call the tool with {LIFECYCLE_BUILD_CALL} (`phase` is \
-         never `build`), or narrow the command (one test filter, one crate).",
+        "Ordinary calls are killed after {} seconds; timeout_secs raises the limit up to {} seconds.",
         command_budget.seconds(None),
         RUN_COMMAND_MAX_SECS
     )
@@ -2151,7 +2186,7 @@ async fn drain_host_pipe<R: tokio::io::AsyncRead + Unpin>(
 /// shell ran, so [`venv_cmd_prefix`]'s `export …;` prefix works unchanged.
 ///
 /// Hardened (#297) so a hung child can never wedge the turn:
-/// - `kill_on_drop(true)` + `process_group(0)` (own process group); on every
+/// - `kill_on_drop(true)` + `setsid` (own session and process group); on every
 ///   exit but a normal finish [`supervise_host_child`] `killpg`s the whole
 ///   group, because `kill_on_drop` alone kills only the immediate `bash`
 ///   (#2882).
@@ -2193,10 +2228,11 @@ pub(super) async fn host_shell_output(
 /// `--disable-ocap` lane is the operator's explicit "run with my ambient
 /// authority" opt-out, so provider credentials etc. are their deliberate grant;
 /// only newt's OWN control plane is excised.
-pub(super) const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
+pub const CHILD_STRIPPED_AUTHORITY_ENV: &[&str] = &[
     "NEWT_DISABLE_OCAP",
     "NEWT_FULL_ACCESS",
     "NEWT_UNSAFE_HOST_EXEC",
+    "NEWT_AMBIENT",
     "NEWT_BENCH_OCAP",
     "NEWT_SHELL_ENGINE",
     "NEWT_WINDOWS_CMD",
@@ -2223,13 +2259,45 @@ fn strip_child_authority_env(c: &mut tokio::process::Command) {
     }
 }
 
+/// The program and argv of the `--ambient` shell for `cmd`: the operator's login shell
+/// (`-l -i -c` / `-l -c`), or `/bin/sh -c` when `$SHELL` cannot be used or the login shell
+/// was not found (`fallback`). The command text gets the portable `which` helper.
+fn bash_sh_argv(
+    shell: &crate::ambient_shell::AmbientShell,
+    fallback: bool,
+    cmd: &str,
+) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    use crate::ambient_shell::AmbientShell;
+    let command = agent_bridle_tool_shell::with_posix_command_discovery(cmd);
+    match shell {
+        AmbientShell::Login { program, args } if !fallback => {
+            let mut argv: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+            argv.push(command.into());
+            (program.clone().into_os_string(), argv)
+        }
+        _ => ("/bin/sh".into(), vec!["-c".into(), command.into()]),
+    }
+}
+
+/// Say once per process, on stderr, that `--ambient` could not use the login shell and
+/// `/bin/sh` runs instead (the startup banner says it too; this covers a `$SHELL` that
+/// changed or vanished since).
+fn note_ambient_fallback(shell: &crate::ambient_shell::AmbientShell) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if matches!(shell, crate::ambient_shell::AmbientShell::Fallback { .. })
+        && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!("--ambient: {}", shell.describe());
+    }
+}
+
 /// Build the host-shell child command, stripping newt's whole control plane
 /// (authority switches, newt's own secrets, config redirects —
 /// [`strip_child_authority_env`]) so
 /// none can flow into the child and re-assert authority the session did not
 /// grant it or leak newt's credentials (#8 / step-7.1a, invariant 9). The child
 /// inherits the rest of the environment (the Yolo lane's explicit ambient-
-/// authority grant). Own process group (setsid-equivalent) + `kill_on_drop`.
+/// authority grant). Own session and process group (`setsid`) + `kill_on_drop`.
 /// `kill_on_drop` kills only the direct child: on unix the whole group is
 /// killed by [`supervise_host_child`]'s drop guard on every exit but a normal
 /// finish, and on Windows the ambient-Brush route's job object kills the tree
@@ -2268,8 +2336,19 @@ fn host_shell_command_at(
             ))
         }
     };
+    // `--ambient` (#978): the operator's login shell. Every other posture builds exactly
+    // the argv it always did.
+    let login =
+        (route == ShellRoute::BashSh && crate::launch_authority::current().ambient()).then(|| {
+            let shell = crate::ambient_shell::AmbientShell::resolve_host();
+            note_ambient_fallback(&shell);
+            bash_sh_argv(&shell, fallback, cmd)
+        });
+    let program = login.as_ref().map_or(program, |(p, _)| p.as_os_str());
     let mut c = tokio::process::Command::new(program);
-    if route != ShellRoute::AmbientBrush {
+    if let Some((_, args)) = &login {
+        c.args(args);
+    } else if route != ShellRoute::AmbientBrush {
         c.arg(flag);
     }
     if route == ShellRoute::AmbientBrush {
@@ -2295,6 +2374,8 @@ fn host_shell_command_at(
         }
         let path = std::env::join_paths(paths).map_err(std::io::Error::other)?;
         c.env("PATH", path);
+    } else if login.is_some() {
+        // Already in the argv above.
     } else if route == ShellRoute::BashSh {
         c.arg(agent_bridle_tool_shell::with_posix_command_discovery(cmd));
     } else {
@@ -2309,8 +2390,21 @@ fn host_shell_command_at(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // A new SESSION, not just a process group (#3005): `process_group(0)` leaves the child
+    // in the terminal's session as a background group, so an interactive shell
+    // (`--ambient`'s `bash -l -i`) or a `/dev/tty` prompt (git, ssh) is stopped by SIGTTIN
+    // and the call hangs to the wall. The session leader's pgid is still its pid, so the
+    // group kill (#2882) is unchanged.
     #[cfg(not(windows))]
-    c.process_group(0);
+    // SAFETY: `setsid` is async-signal-safe and touches no memory the parent shares.
+    unsafe {
+        c.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     strip_child_authority_env(&mut c);
     Ok(c)
 }
@@ -2436,6 +2530,23 @@ pub(super) async fn host_shell_output_with_timeout(
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     timeout: std::time::Duration,
 ) -> std::io::Result<HostShellRun> {
+    let mut run = host_shell_output_raw(route, cmd, cwd, live, timeout).await?;
+    // `--ambient`: an interactive bash with no terminal announces itself on stderr
+    // every time; that is noise in the model's view, not the command's output.
+    if route == ShellRoute::BashSh && crate::launch_authority::current().ambient() {
+        run.stderr = crate::ambient_shell::strip_interactive_noise(&run.stderr);
+    }
+    Ok(run)
+}
+
+#[cfg(not(windows))]
+async fn host_shell_output_raw(
+    route: ShellRoute,
+    cmd: &str,
+    cwd: &str,
+    live: Option<std::sync::Arc<LiveOutputRelay>>,
+    timeout: std::time::Duration,
+) -> std::io::Result<HostShellRun> {
     async fn run_one(
         mut child: tokio::process::Child,
         live: Option<std::sync::Arc<LiveOutputRelay>>,
@@ -2449,7 +2560,7 @@ pub(super) async fn host_shell_output_with_timeout(
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("host shell stderr was not piped"))?;
-        // The child leads its own process group (`process_group(0)`), so its
+        // The child leads its own process group (`setsid`), so its
         // pid is the pgid every descendant inherits.
         let pgid = child.id();
         let wait = async {
@@ -2470,12 +2581,26 @@ pub(super) async fn host_shell_output_with_timeout(
     match host_shell_command(route, false, cmd, cwd)?.spawn() {
         Ok(child) => run_one(child, live, timeout).await,
         Err(e) if route == ShellRoute::BashSh && e.kind() == std::io::ErrorKind::NotFound => {
-            run_one(
+            // `--ambient`: the login shell file exists but cannot start (a missing
+            // interpreter). The call runs `/bin/sh` (still POSIX, like the guidance) and says so.
+            let ambient = crate::launch_authority::current().ambient()
+                && matches!(
+                    crate::ambient_shell::AmbientShell::resolve_host(),
+                    crate::ambient_shell::AmbientShell::Login { .. }
+                );
+            let mut run = run_one(
                 host_shell_command(route, true, cmd, cwd)?.spawn()?,
                 live,
                 timeout,
             )
-            .await
+            .await?;
+            if ambient {
+                tracing::warn!("--ambient: the login shell could not be started; using /bin/sh");
+                run.stderr.extend_from_slice(
+                    b"[newt: --ambient could not start your login shell; this command ran under /bin/sh -c]\n",
+                );
+            }
+            Ok(run)
         }
         Err(e) => Err(e),
     }

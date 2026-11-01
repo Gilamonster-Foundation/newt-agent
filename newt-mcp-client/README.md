@@ -18,6 +18,8 @@ Stdio servers inherit the parent's explicit `TZ` through the existing closed
 environment allowlist. Absent and empty values remain distinct; a server's
 configured `env.TZ` takes precedence. The child runtime interprets the value,
 and the value grants no additional filesystem access.
+Under `--ambient` (or `--yolo`) a stdio server instead gets the parent's full
+environment, minus newt's own secrets and switches.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
 free, friendly, local agentic coder.

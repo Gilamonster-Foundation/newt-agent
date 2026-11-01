@@ -229,13 +229,18 @@ fn escalated_narration_nudge_names_attempt_cap_and_active_step() {
             },
         ],
     });
-    let text = escalated_narration_action_nudge(2, 3, Some(&ledger as &dyn StepLedger));
+    let text = escalated_narration_action_nudge(
+        2,
+        3,
+        Some(&ledger as &dyn StepLedger),
+        &Default::default(),
+    );
     assert!(text.contains("Reminder 2/3"), "{text}");
     assert!(text.contains("fix conflict markers"), "{text}");
     assert!(text.contains("tool call"), "{text}");
 
     // No ledger: no step clause, the demand still stands.
-    let bare = escalated_narration_action_nudge(2, 2, None);
+    let bare = escalated_narration_action_nudge(2, 2, None, &Default::default());
     assert!(bare.contains("Reminder 2/2"), "{bare}");
     assert!(!bare.contains("Active step"), "{bare}");
 }

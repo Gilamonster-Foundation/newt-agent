@@ -397,6 +397,7 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
             plan_mode_control: None,
             plan_draft_sink: None,
             steering: None,
+            report_sink: None,
             completed_spill_renderer: None,
             reader_source: None,
         },
@@ -451,8 +452,10 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_options: ollama_options(Some(4_096), None),
             prompt_measurement: Default::default(),
+
             fell_back: Default::default(),
         },
+        None,
         None,
     )
     .await
@@ -530,6 +533,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
             prompt_measurement: Default::default(),
             fell_back: Default::default(),
         },
+        None,
         None,
     )
     .await
@@ -612,6 +616,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             fell_back: Default::default(),
         },
         None,
+        None,
     )
     .await
     .expect("oversized cap exit returns deterministic fallback");
@@ -675,6 +680,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             prompt_measurement: Default::default(),
             fell_back: Default::default(),
         },
+        None,
         None,
     )
     .await
@@ -830,6 +836,7 @@ async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
             plan_mode_control: None,
             plan_draft_sink: None,
             steering: None,
+            report_sink: None,
             completed_spill_renderer: None,
             reader_source: None,
         },
@@ -997,6 +1004,7 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
             plan_mode_control: None,
             plan_draft_sink: None,
             steering: None,
+            report_sink: None,
             completed_spill_renderer: None,
             reader_source: None,
         },
@@ -1143,6 +1151,7 @@ async fn cap_exit_fallback_when_final_summary_errors() {
             plan_mode_control: None,
             plan_draft_sink: None,
             steering: None,
+            report_sink: None,
             completed_spill_renderer: None,
             reader_source: None,
         },
@@ -1288,6 +1297,7 @@ async fn accumulated_usage_survives_summary_failure() {
             plan_mode_control: None,
             plan_draft_sink: None,
             steering: None,
+            report_sink: None,
             completed_spill_renderer: None,
             reader_source: None,
         },

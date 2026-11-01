@@ -1,22 +1,16 @@
-//! Newt-Agent tool surface.
+//! Unified-diff and whole-file landing pads for model emissions:
+//! `apply_patch` and `apply_whole_files`, used by `newt-coder`,
+//! `newt-acp-worker` and the Python module.
 //!
-//! vi-minimal v0 set: `read`, `edit`, `search`, `apply_patch`.
-//! Thin wrappers — when `thoon-fileops` publishes, this crate delegates
-//! to it rather than reimplementing.
+//! The file tools a model calls by name (`read_file`, `edit_file`,
+//! `list_dir`, `grep`, …) live in `newt-core/src/agentic/tools/` and are
+//! served from there to the TUI, headless and the MCP server alike (#2956).
 
-pub mod ls;
 pub mod patch;
-pub mod read;
-pub mod search;
 
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
-pub use ls::{list_dir, DirEntry, EntryKind};
 #[cfg(feature = "applier-diffy")]
 pub use patch::DiffyApplier;
-pub use patch::{
-    applier_from_env, apply_patch, apply_whole_files, edit, FuzzyApplier, PatchApplier,
-};
-pub use read::read;
-pub use search::{search, Hit};
+pub use patch::{applier_from_env, apply_patch, apply_whole_files, FuzzyApplier, PatchApplier};

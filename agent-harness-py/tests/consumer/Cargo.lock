@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-frame"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "content-addressable",
  "serde",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "agent-harness-py"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "agent-frame",
  "content-addressable",
@@ -122,9 +122,9 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "content-addressable"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56f67d2c6abc332e3ce3121527028af12a71794cc059308d344aa0b88b9ac204"
+checksum = "d38e6c825208377cc35be2f02896c22fa43247b654aba55b183d2c5f7cd07744"
 dependencies = [
  "blake3",
  "ipld-core",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "newt-harness"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "agent-frame",
  "content-addressable",

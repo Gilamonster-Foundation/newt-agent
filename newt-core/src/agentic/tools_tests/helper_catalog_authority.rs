@@ -311,14 +311,12 @@ fn explicit_plan_filters_catalog_without_treating_response_style_as_authority() 
         props.get("show_lines").is_some(),
         "Research find schema must expose show_lines: {find_def}"
     );
+    // #2949: the `code` alias is no longer advertised (category=source is the
+    // one spelling), and the source-first policy is steered per prompt by
+    // prompt_intake's `source_filter:` line rather than the description.
     assert!(
-        props.get("code").is_some(),
-        "Research find schema must expose code (source-only filter): {find_def}"
-    );
-    let desc = find_def["function"]["description"].as_str().unwrap_or("");
-    assert!(
-        desc.contains("category") && desc.contains("source"),
-        "find description must teach category=source for source rankings: {desc}"
+        props.get("code").is_none(),
+        "Research find schema must not advertise the code alias: {find_def}"
     );
     // #1406: GFM-table response steering moved out of the tool description
     // into the prompt-intake layer (see prompt_intake.rs
@@ -333,16 +331,6 @@ fn explicit_plan_filters_catalog_without_treating_response_style_as_authority() 
     assert!(
         props.get("category").is_some() && props.get("language").is_some(),
         "Research find schema must teach the harness source category + language filter: \
-             {find_def}"
-    );
-    assert!(
-        find_def["function"]["description"]
-            .as_str()
-            .is_some_and(|description| {
-                description.contains("repository code investigation")
-                    && description.contains("source by default")
-            }),
-        "the tool catalog must reinforce the standing source-first repository policy: \
              {find_def}"
     );
     // #1259: the formal ask-the-human escalation IS admitted in evidence

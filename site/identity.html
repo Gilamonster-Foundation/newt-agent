@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newt-Agent: identity</title>
+<meta name="description" content="Two separate things carry identity. A key chain decides what a session may do. A ledger decides who is credited on a commit. They are not the same mec">
+<link rel="icon" href="favicon.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="topnav" aria-label="Site">
+  <a href="index.html">Newt-Agent</a>
+  <a href="context.html">Context</a>
+  <a href="ocap.html">OCAP</a>
+  <a href="frame.html">Agent-frame</a>
+  <a href="identity.html" aria-current="page">Identity</a>
+  <a href="mesh.html">Mesh</a>
+  <a href="https://github.com/Gilamonster-Foundation/newt-agent">Source</a>
+</nav>
+<main>
+
+<h1 style="margin-top:28px">How Newt tracks who is acting</h1>
+<p class="lede">Two separate things carry identity. A key chain decides what a session may do. A ledger decides who is credited on a commit. They are not the same mechanism, and the animation keeps them apart.</p>
+
+<section class="demo" aria-labelledby="stage-title">
+  <div class="stage-head">
+    <h2 class="stage-title" id="stage-title" style="margin:0;font-size:1.1rem"></h2>
+    <span class="stage-count" id="stage-count"></span>
+  </div>
+  <p class="caption" id="caption" aria-live="polite"></p>
+  <div class="scene" id="scene"></div>
+  <div class="zones" id="zones"></div>
+  <div class="controls">
+    <button id="prev" type="button">Back</button>
+    <button id="play" type="button" aria-pressed="false">Play</button>
+    <button id="next" type="button">Next</button>
+    <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
+  </div>
+  <p class="fine">Names and versions are placeholders. Types come from <code>newt-identity/</code> and <code>newt-core/src/attribution.rs</code>. Keys: left/right arrows step, space plays or pauses.</p>
+</section>
+
+<h2>What each stage maps to</h2>
+<div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
+<tr><td>Operator key</td><td>Per-user UserKey generated on first run.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-identity/src/lib.rs"><code>newt-identity/src/lib.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Session key</td><td>session_root and attenuate; widening is refused.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-identity/src/delegation.rs"><code>newt-identity/src/delegation.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Commit identity</td><td>Layered config resolution with a built-in default.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agent_identity.rs"><code>newt-core/src/agent_identity.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Operator by-line</td><td>From git config, only as a matched pair.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agent_identity.rs"><code>newt-core/src/agent_identity.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Ledger</td><td>Ordered, deduplicated contributors.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/attribution.rs"><code>newt-core/src/attribution.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Byline and commit</td><td>One finalizer for preview and commit.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-git/src/lib.rs"><code>newt-git/src/lib.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Signing</td><td>Off, Harness or Operator.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/commit_signing.rs"><code>newt-core/src/commit_signing.rs</code></a></td><td class="status"><span class="impl">Implemented, off by default</span></td></tr>
+</tbody></table></div>
+<h2>What this does not show</h2>
+<ul>
+<li>Trailers are plain text. They come from runtime state, not from a signature by each model, so they are not proof of authorship.</li>
+<li>Models are not individually authenticated. The model name is the configured backend. Newt's own contributions default to its configured harness address; contributors from other harnesses keep their own.</li>
+<li>The key chain gates tool authority. Showing a key signing a trailer would be inaccurate.</li>
+<li>Mesh peers are not credited on commits.</li>
+</ul>
+</main>
+<footer>Apache-2.0. <a href="https://github.com/Gilamonster-Foundation/newt-agent">Gilamonster Foundation / newt-agent</a>.</footer>
+</div>
+<script src="stepper.js"></script>
+<script src="diagram.js"></script>
+<script>
+var SPEC = {
+ "nodes": [
+  {
+   "id": "uk",
+   "label": "UserKey",
+   "x": 15,
+   "y": 12,
+   "sub": "Ed25519, ~/.newt/identity.pem"
+  },
+  {
+   "id": "ak",
+   "label": "AgentKey",
+   "x": 50,
+   "y": 12,
+   "sub": "session_root, attenuate()"
+  },
+  {
+   "id": "id",
+   "label": "AgentIdentity",
+   "x": 85,
+   "y": 12,
+   "sub": "agent-identity.toml, default newt-agent"
+  },
+  {
+   "id": "opr",
+   "label": "Operator",
+   "x": 15,
+   "y": 50,
+   "sub": "git user.name + user.email"
+  },
+  {
+   "id": "led",
+   "label": "AttributionLedger",
+   "x": 50,
+   "y": 50,
+   "sub": "ordered, deduplicated"
+  },
+  {
+   "id": "com",
+   "label": "Commit",
+   "x": 85,
+   "y": 50,
+   "sub": "trailers"
+  },
+  {
+   "id": "by",
+   "label": "/byline",
+   "x": 15,
+   "y": 88,
+   "sub": "preview"
+  },
+  {
+   "id": "sg",
+   "label": "Signer",
+   "x": 50,
+   "y": 88,
+   "sub": "optional, off by default"
+  }
+ ],
+ "stages": [
+  {
+   "title": "The operator key is the root of trust",
+   "cap": "On first run Newt makes a per-user Ed25519 key with mode 0600. Everything about tool authority chains back to it.",
+   "show": [
+    "uk"
+   ],
+   "hot": [
+    "uk"
+   ],
+   "edges": [],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: newt-identity"
+  },
+  {
+   "title": "The session gets a narrower key",
+   "cap": "The session root is an AgentKey, and attenuate() mints an operating key whose signed caveats can only shrink. This chain gates tool authority. It does not feed commit trailers.",
+   "show": [
+    "uk",
+    "ak"
+   ],
+   "hot": [
+    "ak"
+   ],
+   "edges": [
+    [
+     "uk",
+     "ak",
+     "attenuate: only narrower"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: newt-identity"
+  },
+  {
+   "title": "The commit identity is resolved",
+   "cap": "Separately, AgentIdentity is resolved from workspace, then user, then system config, then the built-in default (the newt-agent account with a noreply address). The file holds references, never key material.",
+   "show": [
+    "ak",
+    "id"
+   ],
+   "hot": [
+    "id"
+   ],
+   "edges": [],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: agent_identity.rs"
+  },
+  {
+   "title": "The human is read from git",
+   "cap": "The operator's name and email come from git config as a matched pair. If either is missing, no operator line is written. An email is never invented.",
+   "show": [
+    "id",
+    "opr"
+   ],
+   "hot": [
+    "opr"
+   ],
+   "edges": [
+    [
+     "opr",
+     "id",
+     "name + email pair",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: host_operator_identity"
+  },
+  {
+   "title": "Every contributor is recorded",
+   "cap": "As work lands, the runtime records each model and harness, with version and build. Switch models mid-session and both stay credited. Order is kept and duplicates are dropped.",
+   "show": [
+    "id",
+    "opr",
+    "led"
+   ],
+   "hot": [
+    "led"
+   ],
+   "edges": [
+    [
+     "led",
+     "id",
+     "harness + version",
+     1
+    ]
+   ],
+   "state": {},
+   "tag": {
+    "led": "Model A, then /model, Model B"
+   },
+   "note": "Implemented: AttributionLedger"
+  },
+  {
+   "title": "Preview, then stamp",
+   "cap": "/byline runs the same finalizer a commit runs, so the preview matches. The commit gets one Co-authored-by per contributor, the operator line, and a Harness line. The ledger cursor then advances so the next commit does not re-credit.",
+   "show": [
+    "led",
+    "opr",
+    "by",
+    "com"
+   ],
+   "hot": [
+    "com"
+   ],
+   "edges": [
+    [
+     "led",
+     "by",
+     "same finalizer"
+    ],
+    [
+     "led",
+     "com",
+     "Co-authored-by x N"
+    ],
+    [
+     "opr",
+     "com",
+     "operator line"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented: finalize_message_with"
+  },
+  {
+   "title": "Signing is optional",
+   "cap": "Commit signing is off by default. In Harness mode the harness signs in-process, outside the sandbox, so the model cannot read the key. In Operator mode it uses the operator's own git signing setup.",
+   "show": [
+    "com",
+    "sg"
+   ],
+   "hot": [
+    "sg"
+   ],
+   "edges": [
+    [
+     "sg",
+     "com",
+     "SSHSIG"
+    ]
+   ],
+   "state": {},
+   "tag": {},
+   "note": "Implemented, off by default: commit_signing.rs"
+  }
+ ]
+};
+var onShow = Diagram(document.getElementById('scene'), SPEC);
+Stepper({ stages: SPEC.stages, onShow: onShow });
+</script>
+</body>
+</html>

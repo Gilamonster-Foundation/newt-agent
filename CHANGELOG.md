@@ -9,6 +9,226 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-10-27
+
+### Added
+
+- `--ambient` (#978, #3005): the operator's login shell and full environment. Where `run_command`
+  runs on the host shell it runs your login shell (`$SHELL -l -i -c`, so zsh functions,
+  aliases and rc-set `PATH` work; an unset or relative `$SHELL` falls back to `/bin/sh` and
+  the banner says so), and child processes and stdio MCP servers get your full environment
+  (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` reach a
+  browser launch); newt's own secrets and switches are still withheld. Alone it changes only
+  that axis. Interactive `newt` / `newt code`, unix shells.
+- Prompt components (#2933): `[prompt] preset` (`default` or `pi`) and
+  `[prompt] components = { on = [...], off = [...] }`, with `/settings system-prompt
+  components | on <id> | off <id> | preset <name>` and a `[prompt: …]` footer badge
+  (#2989, #2990, #2991, #2992, #2993). `/context request` labels each piece by id.
+- `/settings skills [on|off <name>]` and `[skills] off` (#3002). An off skill is left out of
+  the skill index and refused by `use_skill`, postures and personas.
+- `propose_config_edit` (#3004): newt proposes a `config.toml` edit as a diff; only the
+  operator's `apply` writes it.
+- MCP servers with a static OAuth public client id (Claude `oauth.clientId`) can log in (#3000).
+- `newt auth --all` and `/mcp login-all` log in every HTTP server that needs it (#3030).
+- `[context] index = "off"` (and `/settings index on|off`) skips the navigator warm-up (#3029).
+- F4 opens a fold list of spills: Space toggles one in place, Enter opens the inspector (#3023).
+
+### Changed
+
+- `--yolo` is now everything off: `--disable-ocap --full-access --ambient`, no longer an
+  alias of `--disable-ocap` (#3005). If you used `--yolo` for approvals-off alone, use
+  `--disable-ocap`; `--yolo` now also lifts confinement and runs your login shell with
+  your full environment, and its banner lists what is off.
+- The soul is retired (#2997). `soul.md` and `[memory] soul_file` are ignored, with a
+  one-time notice pointing at `[prompt] file`. The `present-findings`, `commit-attribution`
+  and `three-cs` rules moved to bundled skills. `newt headless` now sends the TUI's
+  component prompt (`--prompt-preset headless` keeps the bare one), so headless
+  requests and eval baselines grow.
+- A config that does not resolve is refused at startup instead of falling back to
+  defaults (#2990).
+- `--full-access` pre-approves MCP tool calls for the session (#2996).
+- Spill handles are content ids: `/spill open <cid | tail>`; numeric ids are gone (#3022).
+- The drift cache uses content-addressable ids and atomic per-save writes, and the
+  navigator warm-up reads it (#3031).
+- A turn that observed nothing gets no Observed frame; on the Rich surface the report
+  folds behind `/spill` (#3010).
+- agent-bridle 0.8.0-rc.6 and agent-mesh 0.7.1 / 0.8.1 (RUSTSEC-2026-0387) (#3007).
+- CI and the commit-msg hook refuse placeholder commit identities such as `x@y` (#3008);
+  the real-PTY tier runs when `newt-tui/src/lib.rs` changes (#3001).
+
+### Fixed
+
+- `run_command` under `--ambient` / `--yolo` no longer hangs: host-shell children start in
+  a new session (#3025).
+- A resize measures where the terminal put the prompt block instead of guessing (#3021);
+  a narrow-then-widen resize no longer erases transcript rows (regression test #3044).
+- Each prompt-block frame is one synchronized write, so the cursor no longer flickers
+  out under a compositor (#3017).
+- Closing an inline panel reclaims the rows it scrolled out, leaving no blank band (#3020).
+- The navigator warm-up walk is bounded (50,000 entries) and reports itself incomplete (#3029).
+- MCP: a refused OAuth bearer is recorded so `newt auth --all` and `/mcp login-all` select
+  the server, and `invalid_grant` is typed (#3032); only a refused grant or a missing
+  refresh token records the rejection, not a transient failure (#3035).
+- `/mcp` Test, Reconnect and Login outcomes reach scrollback (#3018); the vi NORMAL hint
+  no longer stacks in scrollback (#3019).
+- The patched crossterm builds without warnings (#2994).
+
+## [0.8.4] — 2026-10-22
+
+### Added
+
+- `/settings tools` and `/settings read-only` (#2932): choose which tools the
+  model sees (checklist panel on a rich TTY, `all|pi|none|a,b,c` typed), with a
+  `[tools: …]` footer segment and a `$TOOLS` prompt token. A write that a
+  pinned `NEWT_CONFIG` or project overlay overrides is refused, naming the layer.
+- TUI `/context request` previews the next request's system messages and tools
+  without sending anything or touching the session (#2959). It resolves the
+  working style and disposition as an ordinary turn would (so `/mode plan`, an
+  allow list and read-only narrow the preview like the request). The report is
+  labelled partial: it omits the turn-head blocks and the observed-report text.
+- A system prompt you can prune by hand (#2938). `[prompt] file = "…"` (or
+  `newt headless --system-prompt-file FILE`, which wins) makes that file's
+  bytes the whole system message: newt builds no prompt of its own and adds no
+  active-prompt card or observed-facts note behind it. A missing or empty file
+  fails a headless run; the TUI says so and sends its own prompt. In the TUI,
+  `/settings system-prompt edit` opens the prompt newt would send (or your
+  file) in `$VISUAL`/`$EDITOR` and saves what you change; `/settings
+  system-prompt <path>` and `reset` set it for the session. The footer shows
+  `[prompt: <file>]` while an override is in force.
+
+### Changed
+
+- One file-tool implementation (#2956). The MCP server now serves newt-core's
+  `read_file` / `write_file` / `edit_file` / `list_dir` / `find` / `grep`,
+  with newt-core's schemas, through its governed executor under the granted
+  `[caveats]` leash. Before, `code_read` / `code_edit` / `code_search` /
+  `fs_list` ran unconfined `newt-tools` primitives; those tools and the
+  `newt_agent.tools.read` / `edit` / `search` Python bindings are removed.
+  `find` / `grep` now refuse (rather than walk) a read scope narrower than the
+  workspace, and `find show_lines` no longer follows a symlink to count lines.
+  MCP file tools print nothing on stdout (it is the JSON-RPC wire) and report
+  refusals such as `user declined to write` as tool errors.
+- Per-PR CI now compiles every test target under the feature combinations the real-resource
+  tiers run (`newt-tui`: `native-permission-test`, `rich-tui`, `rich-tui,live-spill`;
+  `newt-core`: `ast`), so a struct change can no longer break a feature-gated test unseen (#2971).
+
+### Fixed
+
+- `plan_approval_turn` no longer fails under a narrow terminal: the child runs in its
+  own session, so crossterm cannot read the test runner's PTY width (#2972).
+
+## [0.8.3] — 2026-10-20
+
+### Security
+
+- `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10: certificate verification
+  could accept distrusted intermediates (RUSTSEC-2026-0382), and the bundled
+  roots trusted distrusted emSign intermediates (RUSTSEC-2026-0381) (#2968).
+
+### Added
+
+- `newt headless --dump-request FILE` writes the first provider request as a
+  Markdown report — the system messages, every tool schema as sent with its
+  size, and the totals — then exits before any inference. The same
+  session-owned capture records each round's provider body in all four wire
+  loops, summary sends included (#2937).
+
+### Changed
+
+- Tool descriptions state what each tool does and its arguments. Guidance a
+  model only needs after a failure now lives in the result that failure
+  returns: the capability-denied result names the exact `request_permissions`
+  call, the timed-out result carries the literal `lifecycle action=build`
+  call, and the `render_report` acknowledgement carries the correction rules.
+  `find` no longer advertises its `code` alias (use `category=source`) or
+  `show_size`; both are still accepted. For the measured 30-tool headless request,
+  the serialized tool schemas drop from 26,296 to 19,057 characters (#2949).
+- The READMEs of `newt-git`, `agent-toolchain` and `newt-tools` are short
+  pointers: what the crate is, who uses it, where it sits and where it is
+  heading. `newt-git`'s behaviour and grant rules moved unchanged to
+  `docs/design/newt-git.md` (#2957).
+
+### Fixed
+
+- `--altitude coach` replaced the whole system-prompt addition with the coach
+  identity, so coach mode silently lost AGENTS.md / CLAUDE.md, notes, the
+  memory index and the project map. Altitude now replaces only the identity;
+  project context is always appended, in its usual place before the
+  `Workspace:` line (#2934).
+- `--persona coder` sent the built-in identity twice, as the identity and
+  again as the persona overlay (about 5 kB per request). `coder` is now seeded
+  from `personas/coder.md`, a three-line placeholder. An installed `coder.md`
+  that matches the old seed after trimming surrounding whitespace is migrated
+  on the next start; other edits are preserved. The prompt builder no longer injects the default
+  identity on its own when no soul provider is installed (#2935).
+
+### Release/CI
+
+- The native Git broker real tier also runs on pull requests that touch
+  `newt-core`, `agent-toolchain`, `Cargo.lock` or its workflow, with a
+  30-minute job timeout; before, only the weekly run and `v*` tags exercised
+  it, so a break on `main` surfaced only at the next weekly run (#2947).
+- The dock hub-restart test binds the old port once, straight after `close`,
+  instead of polling it for up to five seconds; agent-mesh#156 makes `close`
+  return only after the socket is released (#2946).
+
+## [0.8.2] — 2026-10-18
+
+### Security
+
+- A cloned repository can no longer supply inference endpoints. A project's
+  `.newt/backends/*.toml` and `.newt/dgx/*.toml` drop-ins are no longer merged
+  (before, one could replace an operator backend of the same name, endpoint
+  included); newt warns that they are ignored. `newt doctor` no longer parses
+  or probes them with the operator's credentials, and a project's
+  `.newt/providers/` presets no longer replace built-in or operator ones
+  (#2929).
+- A project config can no longer set `[context.semantic].embeddings_endpoint`,
+  `intake.adjudicator` or `smart_harness.backend`, in any shape TOML accepts.
+  Each names an endpoint that receives source text or a credential (#2930).
+
+### Fixed
+
+- Commit attribution credits the model that actually served each round, not
+  the model the request named. With a router such as `openrouter/auto`, commits
+  now name the routed model (#2936).
+- `newt mcp import` respects the config locks it already holds instead of
+  contending with itself, and migrates an old config before taking its
+  snapshot (#2911).
+- `newt mcp import` names each rejected server and never offers it a runnable
+  command (#2912).
+- Import, `newt doctor`, `newt auth` and `/mcp` share one readiness
+  classification. It never resolves a secret or runs a command, follows the
+  runtime's precedence between an explicit Authorization header and a saved
+  OAuth login, and never tells a stdio server to run `newt auth` (#2913).
+- A reply cut off at the output limit is recovered up to twice in a row
+  instead of stopping the turn. A capped tool batch is never partly run: it is
+  retried with a raised cap, or with guidance when no headroom is left, and
+  truncated text is continued. A reasoning-only stop still ends the turn
+  (#2874). On Anthropic the raised cap is bounded by the model card's new
+  `output_ceiling_tokens` or the probed `max_tokens`, else the existing
+  default; on every wire it is clamped to the context window when the window
+  and input size are known (#2907).
+- OpenAI-compatible streams accept a repeated finish chunk that only adds
+  usage, as OpenRouter sends for some providers (#2908).
+
+### Added
+
+- Commits that land through `run_command` are reviewed when newt can read the
+  repository's Git metadata: a deterministic check of newt's trailers and a
+  leak scan, plus a model content review when the smart harness and its review
+  budget are available. Up to 16 commits are checked per command, with model
+  review for up to four. Findings are flagged in the tool result, never
+  rejected (#2905).
+- Groundwork, read but not yet acted on: an optional `[meter]` block on
+  backends (#2909) and the `[inference] pin` policy for sovereign inference
+  (#2927).
+
+### Release/CI
+
+- `cargo audit` accepts three `zip` advisories reached only through
+  `candle-core`, which never calls the affected `extract()` (#656).
+
 ## [0.8.1] — 2026-10-14
 
 ### Added

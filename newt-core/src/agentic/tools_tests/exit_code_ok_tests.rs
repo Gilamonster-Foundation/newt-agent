@@ -437,16 +437,22 @@ fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
         .find(|d| d["function"]["name"] == "run_command")
         .unwrap();
     let description = run_command["function"]["description"].as_str().unwrap();
+    // #2949: the description states the wall; the build lane is coached on
+    // the timed-out result, where a model first needs it.
     assert!(
-        description.contains(&format!("{limit} seconds")) && description.contains("action=build"),
+        description.contains(&format!("{limit} seconds")),
         "the description must state the wall up front: {description}"
+    );
+    assert!(
+        !description.contains("action=build"),
+        "build-lane coaching belongs to the timed-out result, not the description: {description}"
     );
 }
 
 /// U6d: a model followed "use lifecycle action=build" by calling
 /// `phase="build"` ("unknown lifecycle phase"). The coaching must give the
-/// LITERAL call, with a real phase, in both the timeout result and the tool
-/// description (one owner for the text).
+/// LITERAL call, with a real phase, in the timeout result (#2949 moved the
+/// copy out of the tool description; the result is the one owner).
 #[test]
 fn timeout_coaching_gives_the_literal_lifecycle_call() {
     let _env = crate::process_env::lock();
@@ -463,20 +469,6 @@ fn timeout_coaching_gives_the_literal_lifecycle_call() {
         "the result must show the call shape: {text}"
     );
     assert!(text.contains("not `build`"), "phase is not `build`: {text}");
-    let defs = crate::agentic::tools::tool_definitions();
-    let description = defs
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|d| d["function"]["name"] == "run_command")
-        .unwrap()["function"]["description"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        description.contains(CALL),
-        "the description must too: {description}"
-    );
 }
 
 // ---------------------------------------------------------------------------

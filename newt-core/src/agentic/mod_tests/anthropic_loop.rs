@@ -237,6 +237,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         plan_mode_control: None,
         plan_draft_sink: None,
         steering: None,
+        report_sink: None,
         completed_spill_renderer: None,
         reader_source: None,
     }
@@ -1111,7 +1112,7 @@ async fn final_summary_provider_contracts() {
             let policy = generation_policy::GenerationPolicy::default();
             let result = match provider {
                 "ollama" => {
-                    final_summary_ollama(&client, &url, "test", Vec::new(), &cap, None).await
+                    final_summary_ollama(&client, &url, "test", Vec::new(), &cap, None, None).await
                 }
                 "openai" => {
                     final_summary_openai(
@@ -1123,6 +1124,7 @@ async fn final_summary_provider_contracts() {
                         policy,
                         None,
                         &cap,
+                        None,
                         None,
                     )
                     .await
@@ -1136,6 +1138,7 @@ async fn final_summary_provider_contracts() {
                         Vec::new(),
                         policy,
                         &cap,
+                        None,
                         None,
                     )
                     .await

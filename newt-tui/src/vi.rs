@@ -66,6 +66,9 @@ pub(crate) struct Vi {
     jfwd: Vec<(usize, usize)>,
     /// A one-shot message to print to scrollback (e.g. `:jumps` output).
     pub(crate) msg: Option<String>,
+    /// A transient nudge for the footer, never committed to scrollback
+    /// (#3015). The next key clears it.
+    pub(crate) hint: Option<&'static str>,
     /// Last `f`/`F`/`t`/`T` search as `(kind, target)`, for `;` (repeat) and
     /// `,` (repeat reversed).
     last_find: Option<(char, char)>,
@@ -83,6 +86,7 @@ impl Vi {
             jback: Vec::new(),
             jfwd: Vec::new(),
             msg: None,
+            hint: None,
             last_find: None,
         }
     }
@@ -252,6 +256,7 @@ impl Vi {
     }
 
     pub(crate) fn input(&mut self, key: KeyEvent, ta: &mut TextArea) -> Step {
+        self.hint = None;
         if let Some(what) = self.confirm {
             return self.confirm_input(key, what);
         }
@@ -489,10 +494,9 @@ impl Vi {
             ':' => self.ex = Some(String::new()),
             // #530: an unbound NORMAL key (e.g. `q`) used to do nothing at all,
             // leaving a user who didn't realise the prompt is modal stuck with
-            // no feedback. Nudge them toward INSERT.
-            _ => {
-                self.msg = Some("vi NORMAL — press i to insert · :help for commands".to_string());
-            }
+            // no feedback. Nudge them toward INSERT — in the footer, not
+            // scrollback, so repeated keys don't stack copies (#3015).
+            _ => self.hint = Some("press i to insert · :help for commands"),
         }
         Step::Continue
     }

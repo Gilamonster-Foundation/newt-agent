@@ -98,7 +98,7 @@ common "no skills installed" case and is treated as *empty*, never an error.
     file paths, resolved across an ordered search path. The original unused
     single-directory wrapper was retired in Stage D batch 1.
 - **`newt-tui`** wires three things:
-  1. **Index injection** in `build_system_prompt_with_soul`: if any skills
+  1. **Index injection** in `build_system_prompt_with_persona`: if any skills
      exist, an `Available skills (call use_skill to load one):` block of
      one-line entries is appended. ONLY names + descriptions — never bodies.
   2. **`use_skill` tool** in `tool_definitions()` (input `{ "name": string }`),

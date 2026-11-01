@@ -1496,7 +1496,7 @@ async fn configure_hosted(
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<ConfiguredBackend> {
-    let presets = provider_preset::resolve_presets(None);
+    let presets = provider_preset::resolve_presets();
     match select_hosted_provider(op, &presets)? {
         HostedProviderChoice::Preset(preset) => {
             configure_preset(op, client, &preset, config_path).await

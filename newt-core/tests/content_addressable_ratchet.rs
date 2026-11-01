@@ -79,7 +79,7 @@ use std::collections::BTreeMap;
 /// raise it — a new hand-rolled digest is the defect this file exists to
 /// prevent, and "I needed one" is what every one of the current sites also
 /// believed.
-const KNOWN_HAND_ROLLED_DIGESTS: usize = 20;
+const KNOWN_HAND_ROLLED_DIGESTS: usize = 19;
 
 /// Per-file expected counts, so a conversion in one file cannot be masked by
 /// a new site appearing in another — the aggregate alone would net to zero
@@ -105,7 +105,6 @@ fn expected_by_file() -> BTreeMap<&'static str, usize> {
         ("newt-core/src/store.rs", 1),
         ("newt-core/src/prune.rs", 1),
         ("newt-core/src/navigator/ledger.rs", 1),
-        ("newt-core/src/drift_cache.rs", 1),
         ("newt-core/src/conversation.rs", 1),
         ("newt-core/src/agentic/prompt_intake.rs", 1),
         ("newt-core/src/agentic/mod_tests/artifact_provenance.rs", 1),

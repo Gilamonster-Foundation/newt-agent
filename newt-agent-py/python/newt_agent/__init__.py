@@ -4,7 +4,7 @@ Submodules
 ----------
 - ``newt_agent.core``        Tier router, config, session/model ids, errors
 - ``newt_agent.data``        load_csv_to_sqlite / query / summarize (SQLite EDA)
-- ``newt_agent.tools``       read / edit / search / apply_patch / apply_whole_files
+- ``newt_agent.tools``       apply_patch / apply_whole_files
 - ``newt_agent.coder``       prompt builder + emission normalizer
 - ``newt_agent.eval``        TestCase + evaluators + scorecard
 - ``newt_agent.inference``   ChatRequest/ChatReply + LocalOllamaBackend (async)

@@ -52,7 +52,7 @@ impl RunAllowance {
     /// attempt's audit trail requires.
     pub fn try_reserve(&self) -> Result<(), RunAllowanceExhausted> {
         // `AtomicU32::fetch_update` is deprecated since Rust 1.99 in favour of
-        // `try_update`, which exists only from 1.95; the declared MSRV is 1.90,
+        // `try_update`, which exists only from 1.95; the declared MSRV is 1.91,
         // so this is `fetch_update`'s own compare-exchange loop, spelled out.
         let mut remaining = self.remaining.load(Ordering::Relaxed);
         loop {

@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 pub(crate) struct Projection {
     previous: Option<String>,
     pub(super) planning: String,
+    /// The operator's system prompt is the whole system message (#2938): the
+    /// observed-facts note is not added.
+    pub(super) verbatim: bool,
 }
 
 impl Projection {
@@ -42,6 +45,50 @@ pub(super) fn refresh(
             messages.remove(index);
         }
     }
+    // The operator's own system prompt is the whole system material (#2938):
+    // no observed-facts note, with or without the smart harness.
+    let report_index = (!projection.verbatim)
+        .then(|| insert_observed_note(projection, messages, claims, workspace, read));
+    let Some(smart) = smart else {
+        return Ok(());
+    };
+    // These bytes come from the trusted producers, never a prefix classifier.
+    let objective = prompt
+        .active_receipt()
+        .map(|p| p.root_prompt_id().to_string())
+        .map(Ok)
+        .unwrap_or_else(|| {
+            content_addressable::canonical::to_canonical_dagcbor(&prompt.active_text()).map(
+                |bytes| content_addressable::ContentId::from_canonical_bytes(&bytes).to_string(),
+            )
+        })?;
+    let mut pins = vec![HostPin {
+        class: PinClass::Objective,
+        index: ensure_objective(messages, prompt.active_text()),
+    }];
+    if let Some(text) = selected {
+        pins.push(HostPin {
+            class: PinClass::SelectedTarget,
+            index: ensure_message(messages, text),
+        });
+    }
+    if let Some(index) = report_index {
+        pins.push(HostPin {
+            class: PinClass::ObservedFacts,
+            index,
+        });
+    }
+    smart.register_semantic_pins(&objective, messages, &pins)
+}
+
+/// Add the observed-facts note to the system head, returning its index.
+fn insert_observed_note(
+    projection: &mut Projection,
+    messages: &mut Vec<Value>,
+    claims: &TurnClaims<'_>,
+    workspace: &str,
+    read: &crate::Scope<String>,
+) -> usize {
     let report = claims.observed_report(workspace, read, "");
     let report = report
         .strip_suffix("\n## Model explanation\n\n")
@@ -72,34 +119,7 @@ pub(super) fn refresh(
         })
         .unwrap_or(leading);
     messages.insert(report_index, json!({"role":"system", "content":report}));
-    let Some(smart) = smart else {
-        return Ok(());
-    };
-    // These bytes come from the trusted producers, never a prefix classifier.
-    let objective = prompt
-        .active_receipt()
-        .map(|p| p.root_prompt_id().to_string())
-        .map(Ok)
-        .unwrap_or_else(|| {
-            content_addressable::canonical::to_canonical_dagcbor(&prompt.active_text()).map(
-                |bytes| content_addressable::ContentId::from_canonical_bytes(&bytes).to_string(),
-            )
-        })?;
-    let mut pins = vec![HostPin {
-        class: PinClass::Objective,
-        index: ensure_objective(messages, prompt.active_text()),
-    }];
-    if let Some(text) = selected {
-        pins.push(HostPin {
-            class: PinClass::SelectedTarget,
-            index: ensure_message(messages, text),
-        });
-    }
-    pins.push(HostPin {
-        class: PinClass::ObservedFacts,
-        index: report_index,
-    });
-    smart.register_semantic_pins(&objective, messages, &pins)
+    report_index
 }
 
 fn ensure_message(messages: &mut Vec<Value>, text: &str) -> usize {
@@ -169,6 +189,7 @@ mod tests {
                 false,
                 None,
                 false,
+                &Default::default(),
             )
             .await;
             if owned {

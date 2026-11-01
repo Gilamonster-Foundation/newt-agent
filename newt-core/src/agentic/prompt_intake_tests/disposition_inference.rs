@@ -653,6 +653,46 @@ fn a_direct_verb_behind_a_collaborative_opener_still_acts() {
     );
 }
 
+/// #2937 P2-1: documents the root cause of the capture-turn clarification bug.
+/// The `/context request` command injects an empty-string task into the
+/// preparation path. `PromptIntake::analyze_with("")` produces an `Ask`
+/// disposition with a pending "Provide a non-empty task" decision, which causes
+/// the preparation loop to exit before reaching the wire — no report is
+/// produced, and session clarification state is mutated as a side effect.
+/// The fix bypasses `comprehend_accepted_prompt` entirely for capture turns,
+/// passing a synthetic "act" text instead, verified by the companion test.
+#[test]
+fn empty_task_intake_is_ask_documents_capture_turn_p2_1_root_cause() {
+    let intake = PromptIntake::analyze_with("", &Default::default());
+    assert_eq!(
+        intake.disposition(),
+        PromptDisposition::Ask,
+        "empty task must yield Ask — capture turns must bypass comprehend_accepted_prompt"
+    );
+    assert!(
+        intake.manifest().pending_decision_count() > 0,
+        "empty task must have a pending decision that would block the preparation loop"
+    );
+}
+
+/// The bypass text `"act"` used by the capture-turn short-circuit must produce
+/// an `Act` disposition so it passes through the intake gate without touching
+/// clarification state.
+#[test]
+fn capture_bypass_act_text_is_act() {
+    let intake = PromptIntake::analyze_with("act", &Default::default());
+    assert_eq!(
+        intake.disposition(),
+        PromptDisposition::Act,
+        "capture bypass text must yield Act to skip the Ask gate"
+    );
+    assert_eq!(
+        intake.manifest().pending_decision_count(),
+        0,
+        "capture bypass intake must have no pending decisions"
+    );
+}
+
 /// The openers are lexicon data, droppable like every other list: with the
 /// list emptied, the action needle decides exactly as it did before.
 #[test]

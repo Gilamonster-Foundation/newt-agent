@@ -160,7 +160,8 @@ pub fn terminal(
             | TurnEndReason::NarrationCapExhausted
             | TurnEndReason::NarrationFinalRound
             | TurnEndReason::RepairExhausted
-            | TurnEndReason::VerificationIncomplete),
+            | TurnEndReason::VerificationIncomplete
+            | TurnEndReason::PrepareOnly),
         ) => Terminal::StoppedShort(reason),
         Some(TurnEndReason::Completed) | None => Terminal::Completed,
         // `Failed` implies an error, so `clean` is false and this is
@@ -227,7 +228,9 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         ) => "model_error",
         // The remaining variants cannot construct `StoppedShort`; listed so a
         // new one fails to compile rather than inheriting a bucket.
-        Terminal::StoppedShort(TurnEndReason::Completed | TurnEndReason::Failed) => "harness_error",
+        Terminal::StoppedShort(
+            TurnEndReason::Completed | TurnEndReason::Failed | TurnEndReason::PrepareOnly,
+        ) => "harness_error",
         Terminal::Failed(Some(ErrorClass::Model)) => "model_error",
         Terminal::Failed(Some(ErrorClass::ContextExceeded)) => "context_exceeded",
         Terminal::Failed(Some(ErrorClass::Transport)) => "transport_error",
@@ -1080,6 +1083,7 @@ mod tests {
             TurnEndReason::VerificationIncomplete => 9,
             TurnEndReason::RunAllowance => 10,
             TurnEndReason::NoProgress => 11,
+            TurnEndReason::PrepareOnly => 12,
         }
     }
 

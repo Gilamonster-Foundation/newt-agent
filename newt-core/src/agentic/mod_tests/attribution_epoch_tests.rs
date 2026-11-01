@@ -246,3 +246,13 @@ fn confirmed_native_epoch_is_observed_when_tool_scope_is_cancelled() {
     }
     assert_eq!(pending_models(&ledger), ["active-model"]);
 }
+
+/// The served model wins; a reply that names none (or a blank one) falls
+/// back to the requested model.
+#[test]
+fn served_or_requested_prefers_the_served_model() {
+    use super::attribution::served_or_requested;
+    assert_eq!(served_or_requested(Some("routed/x"), "asked"), "routed/x");
+    assert_eq!(served_or_requested(Some("  "), "asked"), "asked");
+    assert_eq!(served_or_requested(None, "asked"), "asked");
+}

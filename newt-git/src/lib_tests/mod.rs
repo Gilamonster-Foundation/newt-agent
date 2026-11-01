@@ -140,6 +140,7 @@ fn tool(dir: &Path) -> LocalGitTool {
         commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         signer: None,
+        served_model: Default::default(),
     }
 }
 
@@ -327,3 +328,109 @@ mod tool_dispatch;
 mod tool_surface;
 #[path = "worktree_cwd.rs"]
 mod worktree_cwd;
+
+/// #2936 review: the trailer a commit carries must name the model that served
+/// the round, not the requested one captured at turn start. A router such as
+/// `openrouter/auto` serves a different model. RED before: both the git tool
+/// and its native commit policy finalized with the requested `qwen3:30b`.
+#[test]
+fn commit_trailer_credits_the_served_model() {
+    // Finalizing touches no repository, so no directory is needed.
+    let tool = tool(Path::new("unused"));
+    assert!(tool
+        .finalize_commit_message("subject")
+        .contains("qwen3:30b"));
+
+    tool.note_served_model("routed/model-x");
+    let direct = tool.finalize_commit_message("subject");
+    let native = tool
+        .native_commit_policy()
+        .unwrap()
+        .finalize_message("subject")
+        .unwrap();
+    for message in [direct, native] {
+        assert!(message.contains("routed/model-x"), "{message}");
+        assert!(!message.contains("qwen3:30b"), "{message}");
+    }
+}
+
+/// #2936 review round 2: a router can serve model A for an edit and model B
+/// for the round that commits, in one turn. The commit credits both. RED
+/// before: only the active model B (and the turn-start snapshot) appeared.
+#[test]
+fn commit_credits_every_served_model_that_did_work_this_turn() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/a");
+    tool.note_contribution("routed/a");
+    tool.note_served_model("routed/b");
+    let message = tool.finalize_commit_message("subject");
+    assert!(message.contains("routed/a"), "{message}");
+    assert!(message.contains("routed/b"), "{message}");
+}
+
+/// #2936 review round 2: a native commit snapshot freezes the served model at
+/// preparation, like the rest of the policy. RED before: a later round's
+/// model leaked into the commit prepared under the earlier one.
+#[test]
+fn a_native_commit_snapshot_freezes_the_served_model() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/a");
+    let snapshot = tool
+        .native_commit_policy()
+        .unwrap()
+        .snapshot_for_commit()
+        .unwrap();
+    tool.note_served_model("routed/b");
+    let message = snapshot.finalize_message("subject").unwrap();
+    assert!(message.contains("routed/a"), "{message}");
+    assert!(!message.contains("routed/b"), "{message}");
+}
+
+/// A landed commit consumes the served contributors it credited, so the next
+/// commit does not credit them again.
+#[test]
+fn a_landed_commit_consumes_served_contributors() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/b");
+    tool.note_contribution("routed/a");
+    tool.native_commit_policy().unwrap().committed();
+    let message = tool.finalize_commit_message("subject");
+    assert!(!message.contains("routed/a"), "{message}");
+    assert!(message.contains("routed/b"), "{message}");
+}
+
+/// #2936 review round 3: work a model does after a native commit was prepared
+/// is credited to the next commit, even when the same model's earlier work
+/// was in the prepared one. RED before: consumption matched by model name and
+/// erased the later work too.
+#[test]
+fn later_work_by_the_same_model_survives_an_earlier_commit() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/b");
+    tool.note_contribution("routed/a");
+    let snapshot = tool
+        .native_commit_policy()
+        .unwrap()
+        .snapshot_for_commit()
+        .unwrap();
+    tool.note_contribution("routed/a");
+    snapshot.committed();
+    let next = tool.finalize_commit_message("subject");
+    assert!(next.contains("routed/a"), "{next}");
+}
+
+/// #2936 review round 4: on the embedded route, a contribution recorded
+/// between rendering a commit message and consuming after the commit landed
+/// is kept for the next commit. RED before: consumption used the live cutoff.
+#[test]
+fn embedded_consumption_uses_the_rendered_cutoff() {
+    let tool = tool(Path::new("unused"));
+    tool.note_served_model("routed/b");
+    tool.note_contribution("routed/a");
+    let _ = tool.finalize_commit_message("subject");
+    tool.note_contribution("routed/c");
+    tool.consume_contributors();
+    let next = tool.finalize_commit_message("subject");
+    assert!(next.contains("routed/c"), "{next}");
+    assert!(!next.contains("routed/a"), "{next}");
+}

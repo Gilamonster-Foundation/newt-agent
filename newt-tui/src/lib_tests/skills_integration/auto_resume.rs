@@ -69,7 +69,7 @@ async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     let workspace_str = workspace.path().to_str().unwrap().to_string();
-    let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session");
+    let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = newt_core::new_conversation_id();
     let mut compress_state = newt_core::CompressState::new();
@@ -77,6 +77,7 @@ async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -89,6 +90,7 @@ async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     let banner = auto_resume_latest(&mut ctx).unwrap().expect("a banner");
@@ -125,6 +127,7 @@ fn auto_resume_empty_workspace_is_silent_fresh_start() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -137,6 +140,7 @@ fn auto_resume_empty_workspace_is_silent_fresh_start() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     assert_eq!(auto_resume_latest(&mut ctx).unwrap(), None);
@@ -160,7 +164,7 @@ async fn resume_exact_restores_that_conversation() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     let workspace_str = workspace.path().to_str().unwrap().to_string();
-    let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session");
+    let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = newt_core::new_conversation_id();
     let mut compress_state = newt_core::CompressState::new();
@@ -168,6 +172,7 @@ async fn resume_exact_restores_that_conversation() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -180,6 +185,7 @@ async fn resume_exact_restores_that_conversation() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &target).unwrap();
@@ -212,7 +218,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     let workspace_str = workspace.path().to_str().unwrap().to_string();
-    let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session");
+    let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = newt_core::new_conversation_id();
     let mut compress_state = newt_core::CompressState::new();
@@ -222,6 +228,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
     // A stale key from a "prior conversation" the boundary must drop.
     scratchpad_store.set("stale", "from before".to_string());
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -234,6 +241,7 @@ async fn resume_rehydrates_scratchpad_state_into_live_store() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -285,7 +293,7 @@ async fn resume_rehydrates_plan_into_live_ledger() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     let workspace_str = workspace.path().to_str().unwrap().to_string();
-    let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session");
+    let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session", None);
     let mut active_persona = None;
     let mut active_conversation_id = newt_core::new_conversation_id();
     let mut compress_state = newt_core::CompressState::new();
@@ -295,6 +303,7 @@ async fn resume_rehydrates_plan_into_live_ledger() {
     // A stale plan from a "prior conversation" the boundary must drop.
     step_ledger.set_plan(&["stale step".to_string()]);
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -307,6 +316,7 @@ async fn resume_rehydrates_plan_into_live_ledger() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -352,6 +362,7 @@ fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
     let step_ledger = newt_core::SessionStepLedger::default();
     let mut active_prompt_context = None;
     let mut ctx = ConversationCommandContext {
+        cfg: &crate::test_session_config(),
         store: &store,
         persona_store: &persona_store,
         workspace: &workspace_str,
@@ -364,6 +375,7 @@ fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
         step_ledger: &step_ledger,
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
+        sink: None,
     };
 
     for id in [newt_core::new_conversation_id(), foreign_id] {

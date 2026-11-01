@@ -113,8 +113,12 @@ L3 (ADR 0005). Coverage is backend- and scope-shaped:
 - Landlock confines both filesystem axes, narrows direct exec (reported
   `Interceptor` because the loader trampoline remains), and can deny all TCP on
   ABI-v4 kernels.
-- Seatbelt confines both filesystem axes, restricted exec, and empty or
-  loopback-only network scopes.
+- Seatbelt confines both filesystem axes and restricted exec. On the network
+  axis, with an unprivileged caller and audited stdio, zero-grant `net:none`
+  reports kernel strength and `unix:`/`mach:` grants project exactly but report
+  `Advisory` (only a kernel net floor rejects them). Loopback and remote-host
+  scopes, and any root or unaudited-stdio launch, resolve `Unknown` and are
+  refused at admission whatever the floor.
 - AppContainer confines filesystem paths, empty or loopback-only network
   scopes, and exec deny-all for supported subprocess engines; the Brush private
   transport is currently unavailable on Windows, so hosts select `ShellTool`.

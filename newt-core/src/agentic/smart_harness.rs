@@ -978,6 +978,7 @@ impl SmartHarness {
         nudge_cap: usize,
         more_rounds: bool,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        exposure: &super::tools::ExposureSettings,
     ) -> anyhow::Result<Control> {
         let (reply, request, prompt) = {
             let mut s = self.state()?;
@@ -1048,7 +1049,7 @@ impl SmartHarness {
                 let nudge = format!(
                     "{} {}\n\n{}",
                     super::compress::LOOP_GUIDANCE_PREFIX,
-                    super::workflow_guidance(&self.settings.nudge),
+                    super::workflow_guidance(&self.settings.nudge, exposure),
                     Self::grounding_guidance(&Self::tool_evidence(&s.session)?)
                 );
                 s.session.record_host_message(&nudge, reply)?;
@@ -1158,7 +1159,9 @@ impl SmartHarness {
                 .applicable_checks(workspace, task, &commands)
                 .await
                 .unwrap_or_default();
-            if let Some(text) = super::self_verify::verify_gate_nudge(&checks, &commands) {
+            if let Some(text) =
+                super::self_verify::verify_gate_nudge(&checks, &commands, turn.exposure)
+            {
                 let text = format!("{} {text}", super::compress::LOOP_GUIDANCE_PREFIX);
                 self.intervention(&text)?;
                 self.state()?.verified = true;
@@ -1948,14 +1951,16 @@ mod tests {
         let h = harness(&["\"narration\"", "\"answer\""], Default::default());
         observation(&h, "Let me calculate that.");
         assert!(matches!(
-            h.classify("Let me calculate that.", 1, true, None)
+            h.classify("Let me calculate that.", 1, true, None, &Default::default())
                 .await
                 .unwrap(),
             Control::Continue(_)
         ));
         observation(&h, "Three.");
         assert!(matches!(
-            h.classify("Three.", 1, true, None).await.unwrap(),
+            h.classify("Three.", 1, true, None, &Default::default())
+                .await
+                .unwrap(),
             Control::Answer
         ));
     }
@@ -1965,7 +1970,7 @@ mod tests {
         let h = harness(&["\"question\"", "\"narration\""], Default::default());
         observation(&h, "Which repository?");
         assert!(matches!(
-            h.classify("Which repository?", 1, true, None)
+            h.classify("Which repository?", 1, true, None, &Default::default())
                 .await
                 .unwrap(),
             Control::Finish {
@@ -1975,7 +1980,9 @@ mod tests {
         ));
         observation(&h, "I am finished.");
         assert!(matches!(
-            h.classify("I am finished.", 1, false, None).await.unwrap(),
+            h.classify("I am finished.", 1, false, None, &Default::default())
+                .await
+                .unwrap(),
             Control::Finish {
                 reason: crate::TurnEndReason::NarrationFinalRound,
                 ..
@@ -1986,11 +1993,16 @@ mod tests {
     #[tokio::test]
     async fn unrecorded_and_malformed_verdicts_cannot_complete() {
         let h = harness(&["Here is your answer: \"answer\""], Default::default());
-        assert!(h.classify("done", 1, true, None).await.is_err());
+        assert!(h
+            .classify("done", 1, true, None, &Default::default())
+            .await
+            .is_err());
         observation(&h, "done");
         let before = h.head().unwrap();
         assert!(matches!(
-            h.classify("done", 1, true, None).await.unwrap(),
+            h.classify("done", 1, true, None, &Default::default())
+                .await
+                .unwrap(),
             Control::Finish {
                 reason: crate::TurnEndReason::Failed,
                 ..
@@ -2031,7 +2043,9 @@ mod tests {
             } else {
                 observation(&h, "Three.");
                 assert!(matches!(
-                    h.classify("Three.", 1, true, None).await.unwrap(),
+                    h.classify("Three.", 1, true, None, &Default::default())
+                        .await
+                        .unwrap(),
                     Control::Finish {
                         reason: crate::TurnEndReason::Failed,
                         ..
@@ -2085,7 +2099,9 @@ mod tests {
         .unwrap();
         observation(&h, "pending");
         assert!(matches!(
-            h.classify("pending", 1, true, None).await.unwrap(),
+            h.classify("pending", 1, true, None, &Default::default())
+                .await
+                .unwrap(),
             Control::Finish {
                 reason: crate::TurnEndReason::Failed,
                 ..
@@ -2094,7 +2110,9 @@ mod tests {
         observation(&h, "pending");
         let cancel = std::sync::atomic::AtomicBool::new(true);
         assert!(matches!(
-            h.classify("pending", 1, true, Some(&cancel)).await.unwrap(),
+            h.classify("pending", 1, true, Some(&cancel), &Default::default())
+                .await
+                .unwrap(),
             Control::Finish {
                 reason: crate::TurnEndReason::Cancelled,
                 ..

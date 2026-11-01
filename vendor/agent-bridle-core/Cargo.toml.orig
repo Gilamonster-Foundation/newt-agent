@@ -34,10 +34,11 @@ linux-landlock = ["dep:landlock", "dep:seccompiler", "dep:libc"]
 # the `sandbox-exec(1)` wrapper — no extra dependency and no FFI (core forbids
 # `unsafe`), so the feature is empty here. It confines both filesystem axes and
 # restricted exec. Expressible restricted-net profiles add direct-network rules;
-# `net:none` additionally adds the E4 Mach-lookup floor. Every restricted macOS
-# net scope still resolves Unknown and admission refuses it until ambient and
-# allow-listed IPC deputies have a deputy-complete native proof. The demonstrated
-# nsurlsessiond close is defense in depth, not a net:none/loopback/proxy support
+# the network-denied shapes additionally install a ZERO Mach-lookup floor with
+# named `mach:<service>` operator grants (#405). Every restricted macOS net scope
+# still resolves Unknown and admission refuses it until every ambient IPC route
+# has a deputy-complete native proof. The zero floor and the demonstrated
+# nsurlsessiond close are defense in depth, not a net:none/loopback/proxy support
 # promotion. Without this feature/off-macOS, another native backend may apply or
 # the honest NoopSandbox reports SandboxKind::None. ADR 0006/0009/0014/0015/0016.
 macos-seatbelt = []
@@ -85,7 +86,7 @@ agent-mesh-protocol = { workspace = true }
 # identity of the admitted fence, verified at the admit→apply handoff. This is the
 # SAME machinery agent-mesh-protocol uses for AuthorityId/GrantId — not a parallel
 # hash format. Already in the lockfile (transitive via agent-mesh-protocol).
-content-addressable = "0.1.0"
+content-addressable = "0.1.2"
 
 # Optional: the production `Ed25519Verifier`, gated by `verifier-ed25519`. NOT in
 # the default build — core stays lean (`cargo build` with no features does not
@@ -102,7 +103,7 @@ sha2 = { version = "0.10", optional = true }
 # Optional: P-256 ECDSA verification for the ES256 WebAuthn verifier, gated by
 # `verifier-webauthn-es256`. `default-features = false` + `ecdsa` keeps it lean
 # (verification + deterministic RFC6979 signing for tests; no PEM/PKCS8).
-p256 = { version = "0.13", optional = true, default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdsa"] }
 
 # Optional: tokio-native pipe ends for `ConfinedCommand::spawn_tokio`, gated by
 # `spawn-tokio`. Inherits the workspace tokio features (rt/macros/…) and adds
@@ -124,7 +125,7 @@ tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
 # `forbid(unsafe_code)`, so the signal cannot be a raw `libc` FFI call; rustix
 # provides it as a safe fn. Same primitive `agent-bridle-tool-shell` already
 # uses to reap a Brush worker tree, and already in the lockfile.
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 agent-bridle-fdguard = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

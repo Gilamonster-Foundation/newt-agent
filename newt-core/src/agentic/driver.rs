@@ -131,6 +131,10 @@ pub struct TurnDriverConfig {
     pub workspace: String,
     /// Permission caveats enforced for this turn's tool calls.
     pub caveats: crate::caveats::Caveats,
+    /// `[tool_exposure]` policy for driven turns (#2932). Default is the
+    /// identity (full catalog); `read_only` also attenuates `caveats` at the
+    /// turn boundary through [`ExposureSettings::attenuate`].
+    pub exposure: crate::agentic::tools::ExposureSettings,
     /// Initial tool-call round allowance; recent concrete progress may renew it.
     /// Explicit inference budgets and cancellation remain binding.
     pub max_tool_rounds: usize,
@@ -193,6 +197,8 @@ pub struct TurnDriverConfig {
     /// #2313: explicit run-level call-count allowance for driven turns.
     /// `None` keeps dispatch unbudgeted (today's default behavior).
     pub run_allowance: Option<u32>,
+    /// #2937: session-owned prompt-report capture sink. `None` disables capture.
+    pub report_sink: Option<Arc<super::request_report::ReportSink>>,
 }
 
 impl TurnDriverConfig {
@@ -225,6 +231,7 @@ impl TurnDriverConfig {
             emits_leading_reasoning: false,
             workspace: workspace.into(),
             caveats: crate::caveats::Caveats::top(),
+            exposure: Default::default(),
             max_tool_rounds: 40,
             narration_nudge_cap: 1,
             workflow_grace_rounds: 5,
@@ -248,6 +255,7 @@ impl TurnDriverConfig {
             output_allowance: None,
             overflow_retry: Default::default(),
             run_allowance: None,
+            report_sink: None,
         }
     }
 
@@ -691,7 +699,9 @@ async fn run_one_turn(
     // The working-memory head is ephemeral like the TUI's: it leads this turn's
     // message[0] and never enters the driver transcript.
     let messages: std::borrow::Cow<'_, [MemMessage]> =
-        match working_memory_head(runtime.scratchpad.as_deref(), false) {
+        match working_memory_head(runtime.scratchpad.as_deref(), false)
+            .filter(|_| !config.exposure.verbatim_system)
+        {
             None => messages.into(),
             Some(head) => {
                 let mut turn = messages.to_vec();
@@ -712,6 +722,9 @@ async fn run_one_turn(
     let run_allowance = config
         .run_allowance
         .map(super::run_allowance::RunAllowance::new);
+    // #2932: `read_only` narrows authority here, at the turn boundary, so the
+    // hidden write tools and the shell share one `fs_write` floor.
+    let turn_caveats = config.exposure.attenuate(config.caveats.clone());
     let ctx = ChatCtx {
         shell_dialect: config.shell_dialect,
         command_budget: config.command_budget,
@@ -764,13 +777,12 @@ async fn run_one_turn(
         // it from the leaf's gather) — the where_is tool degrades honestly.
         where_is: None,
         nav: None,
-        // Headless driver: identity exposure (advertise the full authorized
-        // catalog, unchanged). The `[tool_exposure]` controller is a TUI-session
-        // concern; the driver keeps bit-for-bit behaviour.
-        exposure: crate::agentic::tools::ExposureSettings::default(),
+        // #2932: the configured `[tool_exposure]` policy drives headless turns
+        // too, so a four-tool-versus-full comparison measures what it claims.
+        exposure: config.exposure.clone(),
         experience_store: None,
         step_ledger: None,
-        caveats: &config.caveats,
+        caveats: &turn_caveats,
         // Headless cowork carries no persona surface (FR-1 part 2, #997). The
         // driver captured the effective cognition before spawning this thread,
         // preserving semantic intent independently of supported wire controls.
@@ -844,6 +856,7 @@ async fn run_one_turn(
         plan_mode_control: None,
         plan_draft_sink: None,
         steering: None,
+        report_sink: config.report_sink.as_deref(),
         reader_source: Some(&crate::commit_review::HostReaders),
     };
     let features = InstantiatedFeatures::of(&ctx);
@@ -892,6 +905,34 @@ async fn run_one_turn(
             attempt_lines,
         }),
         Err(e) => {
+            // #2937: a successful dump-and-stop is a TYPED clean completion, not a
+            // failure. No inference was sent; the file was written before this error.
+            if e.chain().any(|c| {
+                c.downcast_ref::<super::request_report::RequestDumped>()
+                    .is_some()
+            }) {
+                return Ok(TurnOutcome {
+                    reply: String::new(),
+                    was_streamed: false,
+                    usage: None,
+                    hallucinations: 0,
+                    tool_events,
+                    end_reason: Some(crate::TurnEndReason::PrepareOnly),
+                    error: None,
+                    error_class: None,
+                    served_model: solve_obs.served_model,
+                    parse_signals: solve_obs.parse_signals,
+                    behavior_signals: solve_obs.behavior_signals,
+                    features,
+                    semantic_cognition: runtime.cognition,
+                    responses_capability: solve_obs.responses_capability,
+                    reasoning_effort: solve_obs.reasoning_effort,
+                    output_allowance: solve_obs.output_allowance,
+                    harness_reply: false,
+                    attempts,
+                    attempt_lines,
+                });
+            }
             // #2313 / U4a: an exhausted `--run-allowance` is a budget WALL, not a
             // failure. Type it like the round cap (a clean stop, `RunAllowance`),
             // and let the HARNESS write the notice: a model summary is a call the

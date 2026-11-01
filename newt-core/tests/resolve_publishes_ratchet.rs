@@ -32,7 +32,7 @@ const KNOWN_PUBLISHING_RESOLVES: &[(&str, usize)] = &[
     ("newt-cli/src/dgx.rs", 2),
     ("newt-cli/src/doctor.rs", 1),
     ("newt-cli/src/lib.rs", 3),
-    ("newt-cli/src/mcp_cmd.rs", 2),
+    ("newt-cli/src/mcp_cmd.rs", 1),
     ("newt-cli/src/mcp_probe_cmd.rs", 1),
     ("newt-cli/src/skills.rs", 1),
     ("newt-core/src/pyo3_module.rs", 1),
@@ -40,7 +40,7 @@ const KNOWN_PUBLISHING_RESOLVES: &[(&str, usize)] = &[
     ("newt-tui/src/auth_command.rs", 1),
     ("newt-tui/src/commands/meta.rs", 1),
     ("newt-tui/src/crew_form/mod.rs", 1),
-    ("newt-tui/src/lib.rs", 3),
+    ("newt-tui/src/lib.rs", 2),
     ("newt-tui/src/settings_form.rs", 2),
     ("newt-tui/src/wizard.rs", 1),
 ];

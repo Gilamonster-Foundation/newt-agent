@@ -25,8 +25,9 @@ pub struct MemoryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
 
-    /// Explicit path to a soul file (overrides workspace + global resolution).
-    /// Default: auto-resolve from `.newt/soul.md` → `~/.newt/soul.md`.
+    /// RETIRED (#2933): the soul is built from components now and this path is no
+    /// longer read. Kept so an old config still parses; resolving a config that sets
+    /// it prints a one-release notice pointing at `[prompt] file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soul_file: Option<String>,
 

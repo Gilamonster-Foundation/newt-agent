@@ -34,7 +34,6 @@ newt-git.workspace = true
 newt-inference.workspace = true
 newt-scheduler.workspace = true
 newt-skills.workspace = true
-newt-tools.workspace = true
 newt-tui.workspace = true
 newt-acp-worker.workspace = true
 newt-mcp-server.workspace = true
@@ -107,6 +106,12 @@ tests-pty.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 async-trait.workspace = true
+# `newt-core`'s test-support hooks (`lock_attempts_for_test`,
+# `reset_lock_contention_warned_for_test`) are gated behind
+# `cfg(any(test, feature = "test-util"))`; enable it here so newt-cli's own
+# test suite (self_lock.rs) can observe them without shipping them in
+# production builds.
+newt-core = { workspace = true, features = ["test-util"] }
 # #2161: the purity suites locate the binary with `env!("CARGO_BIN_EXE_newt")`,
 # the path cargo just built, so `[build] target-dir` (newt-agent#64),
 # `CARGO_TARGET_DIR` and llvm-cov's isolated dir are handled by construction.

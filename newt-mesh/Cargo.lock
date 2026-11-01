@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "agent-frame"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "content-addressable",
  "serde",
@@ -4118,7 +4118,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "newt-core"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "age",
  "agent-bridle",
@@ -4166,7 +4166,7 @@ dependencies = [
 
 [[package]]
 name = "newt-identity"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "agent-mesh-protocol 0.6.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "base64 0.22.1",
@@ -4179,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4197,7 +4197,7 @@ dependencies = [
 
 [[package]]
 name = "newt-interaction"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "content-addressable",
  "serde",
@@ -4233,7 +4233,7 @@ dependencies = [
 
 [[package]]
 name = "newt-skills"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -4242,7 +4242,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tuner"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -4878,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "plugins-protocol"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "async-trait",
  "serde",
@@ -6384,7 +6384,7 @@ dependencies = [
 
 [[package]]
 name = "tests-common"
-version = "0.8.1"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "async-trait",

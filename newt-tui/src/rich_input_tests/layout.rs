@@ -492,11 +492,32 @@ fn row_text(editor: &Editor) -> String {
 }
 
 fn footer_text(editor: &Editor, model: &str, endpoint: &str) -> String {
-    footer_line(editor, model, endpoint, None, true)
+    footer_line(editor, model, endpoint, None, "", true)
         .spans
         .iter()
         .map(|s| s.content.as_ref())
         .collect()
+}
+
+/// #2932: the footer names the tool profile only when the operator narrowed
+/// it — under the open default the row is byte-identical to before.
+#[test]
+fn footer_shows_the_tool_profile_only_when_narrowed() {
+    let ed = vi_editor();
+    let text = |tools: &str| -> String {
+        footer_line(&ed, "m", "e", None, tools, true)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    };
+    assert!(!text("").contains("tools"), "{}", text(""));
+    assert!(text("pi").contains(" [tools: pi]"), "{}", text("pi"));
+    assert!(
+        text("pi · read-only").contains("[tools: pi · read-only]"),
+        "{}",
+        text("pi · read-only")
+    );
 }
 
 fn header_text(session: &str, headline: &str) -> String {
@@ -565,11 +586,38 @@ fn no_region_draws_a_horizontal_rule() {
     }
 }
 
+/// #2938: the footer says when the operator's own system prompt file is what
+/// the next request sends, and stops saying so when it is not. The only test
+/// that touches the process-wide override marker.
+#[test]
+fn footer_shows_an_active_system_prompt_override() {
+    let ed = vi_editor();
+    assert!(!footer_text(&ed, "m", "e").contains("[prompt:"));
+    crate::system_prompt_edit::set_active(Some("/home/x/.newt/system-prompt.md".into()));
+    let shown = footer_text(&ed, "m", "e");
+    crate::system_prompt_edit::set_active(None);
+    assert!(shown.contains("[prompt: system-prompt.md]"), "{shown}");
+    assert!(!footer_text(&ed, "m", "e").contains("[prompt:"));
+    // #2933: dropped components read `custom`; a file override wins over them.
+    crate::system_prompt_edit::set_components_badge(Some("custom"));
+    let custom = footer_text(&ed, "m", "e");
+    crate::system_prompt_edit::set_active(Some("/home/x/.newt/system-prompt.md".into()));
+    let both = footer_text(&ed, "m", "e");
+    crate::system_prompt_edit::set_active(None);
+    crate::system_prompt_edit::set_components_badge(None);
+    assert!(custom.contains("[prompt: custom]"), "{custom}");
+    assert!(
+        both.contains("[prompt: system-prompt.md]") && !both.contains("custom"),
+        "{both}"
+    );
+    assert!(!footer_text(&ed, "m", "e").contains("[prompt:"));
+}
+
 #[test]
 fn header_shows_context_budget_gauge_when_known() {
     let ed = vi_editor();
     let text = |g| -> String {
-        footer_line(&ed, "m", "e", g, true)
+        footer_line(&ed, "m", "e", g, "", true)
             .spans
             .iter()
             .map(|s| s.content.as_ref())

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// How long a writer waits on a locked database before erroring. Two newts
 /// sharing `~/.newt/conversations.db` serialize their write transactions
@@ -110,7 +110,7 @@ pub(super) fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              parent_prompt_id   TEXT REFERENCES prompt_receipts(id), -- explicit semantic ancestry
              root_prompt_id     TEXT NOT NULL REFERENCES prompt_receipts(id),
              active_operator_id TEXT REFERENCES prompt_receipts(id), -- nearest operator authority; v1 rows are NULL
-             origin             TEXT NOT NULL CHECK (origin IN ('operator', 'harness_retry')),
+             origin             TEXT NOT NULL CHECK (origin IN ('operator', 'harness_retry', 'flock')),
              raw_text           BLOB NOT NULL,
              model_text         BLOB NOT NULL,
              raw_digest         TEXT NOT NULL,
@@ -406,6 +406,20 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "conversation_inbox",
+        &[
+            // Where a row came from: 'web' (an attach surface) or 'flock' (a
+            // verified agent-mesh task). Existing rows are web by definition.
+            ("source", "TEXT NOT NULL DEFAULT 'web'"),
+            // A flock row's identity: the flock and the event, as content ids,
+            // and the content id of the evidence the row was built from.
+            ("flock_cid", "TEXT"),
+            ("event_cid", "TEXT"),
+            ("evidence_cid", "TEXT"),
+            ("evidence", "TEXT"),
+        ],
+    ),
+    (
         "writer_clock",
         &[
             ("writer_fingerprint", "TEXT"),
@@ -428,21 +442,148 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
 /// ... ADD COLUMN` any additive drift. Removed/renamed columns are NOT
 /// handled here — destructive migrations get their own explicit step.
 pub(super) fn reconcile_schema(conn: &Connection) -> anyhow::Result<()> {
-    for (table, expected) in EXPECTED_COLUMNS {
+    fn missing(
+        conn: &Connection,
+        table: &str,
+        expected: &[(&'static str, &'static str)],
+    ) -> anyhow::Result<Vec<(&'static str, &'static str)>> {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let present: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
-        for (name, decl) in *expected {
-            if !present.iter().any(|c| c == name) {
+        Ok(expected
+            .iter()
+            .filter(|(name, _)| !present.iter().any(|c| c == name))
+            .copied()
+            .collect())
+    }
+    for (table, expected) in EXPECTED_COLUMNS {
+        if missing(conn, table, expected)?.is_empty() {
+            continue;
+        }
+        // Another opener may add the same columns first: take the write lock,
+        // then look again, so a column is only ever added by one of them.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let run = (|| -> anyhow::Result<()> {
+            for (name, decl) in missing(conn, table, expected)? {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"))?;
                 tracing::info!(
                     table = *table,
-                    column = *name,
+                    column = name,
                     "schema migration: added missing column"
                 );
             }
+            Ok(())
+        })();
+        match run {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
     }
+    Ok(())
+}
+
+/// One flock task per (conversation, flock, event): the dedupe key across
+/// restarts. Created after [`reconcile_schema`] has added the columns.
+pub(super) fn create_flock_inbox_index(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_inbox_flock
+           ON conversation_inbox (conversation_id, flock_cid, event_cid)
+           WHERE flock_cid IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
+/// A database made before the `flock` origin has a CHECK that refuses it, and
+/// SQLite cannot alter a CHECK in place: rebuild `prompt_receipts` with the
+/// widened one (the documented 12-step procedure: foreign keys off outside
+/// the transaction, copy every row with its `receipt_order`, swap, recreate
+/// the indexes, check the keys, back on). A no-op once the table allows it.
+pub(super) fn migrate_prompt_origin_flock(conn: &Connection) -> anyhow::Result<()> {
+    fn allows_flock(conn: &Connection) -> anyhow::Result<bool> {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'prompt_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(sql.is_none_or(|sql| sql.contains("'flock'")))
+    }
+    if allows_flock(conn)? {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let rebuilt = (|| -> anyhow::Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let run = (|| -> anyhow::Result<()> {
+            // another opener may have finished first
+            if allows_flock(conn)? {
+                return Ok(());
+            }
+            conn.execute_batch(
+                "CREATE TABLE prompt_receipts_new (
+                     receipt_order      INTEGER PRIMARY KEY AUTOINCREMENT,
+                     id                 TEXT NOT NULL UNIQUE,
+                     conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                     writer_fingerprint TEXT NOT NULL,
+                     seq                INTEGER NOT NULL,
+                     previous_prompt_id TEXT REFERENCES prompt_receipts(id),
+                     parent_prompt_id   TEXT REFERENCES prompt_receipts(id),
+                     root_prompt_id     TEXT NOT NULL REFERENCES prompt_receipts(id),
+                     active_operator_id TEXT REFERENCES prompt_receipts(id),
+                     origin             TEXT NOT NULL CHECK (origin IN ('operator', 'harness_retry', 'flock')),
+                     raw_text           BLOB NOT NULL,
+                     model_text         BLOB NOT NULL,
+                     raw_digest         TEXT NOT NULL,
+                     model_digest       TEXT NOT NULL,
+                     receipt_hash       TEXT NOT NULL,
+                     ts_claim           INTEGER NOT NULL,
+                     encoding_version   INTEGER NOT NULL DEFAULT 1,
+                     UNIQUE (conversation_id, writer_fingerprint, seq)
+                 );
+                 INSERT INTO prompt_receipts_new
+                     (receipt_order, id, conversation_id, writer_fingerprint, seq,
+                      previous_prompt_id, parent_prompt_id, root_prompt_id,
+                      active_operator_id, origin, raw_text, model_text, raw_digest,
+                      model_digest, receipt_hash, ts_claim, encoding_version)
+                 SELECT receipt_order, id, conversation_id, writer_fingerprint, seq,
+                        previous_prompt_id, parent_prompt_id, root_prompt_id,
+                        active_operator_id, origin, raw_text, model_text, raw_digest,
+                        model_digest, receipt_hash, ts_claim, encoding_version
+                   FROM prompt_receipts;
+                 DROP TABLE prompt_receipts;
+                 ALTER TABLE prompt_receipts_new RENAME TO prompt_receipts;
+                 CREATE INDEX IF NOT EXISTS idx_prompt_receipts_conversation_order
+                     ON prompt_receipts (conversation_id, receipt_order);
+                 CREATE INDEX IF NOT EXISTS idx_prompt_receipts_root
+                     ON prompt_receipts (root_prompt_id);
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_receipts_conversation_id
+                     ON prompt_receipts (conversation_id, id);",
+            )?;
+            let broken: i64 =
+                conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })?;
+            if broken != 0 {
+                anyhow::bail!("prompt_receipts rebuild left {broken} dangling foreign keys");
+            }
+            Ok(())
+        })();
+        match run {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    rebuilt?;
+    tracing::info!("migrated prompt_receipts to allow the flock origin");
     Ok(())
 }

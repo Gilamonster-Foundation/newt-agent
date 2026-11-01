@@ -148,6 +148,9 @@ pub(crate) fn corpus_entries() -> &'static [PaletteEntry] {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaletteState {
     entries: Vec<PaletteEntry>,
+    /// #3022: retained spill ids as `/spill open <tail>` rows, newest first;
+    /// they replace `entries` while the filter is `spill open …`.
+    spill_entries: Vec<PaletteEntry>,
     open: bool,
     filter: String,
     /// Indices into `entries`, prefix matches first (corpus order within tier).
@@ -165,6 +168,7 @@ impl PaletteState {
     pub(crate) fn new(entries: Vec<PaletteEntry>) -> Self {
         Self {
             entries,
+            spill_entries: Vec::new(),
             open: false,
             filter: String::new(),
             matched: Vec::new(),
@@ -177,6 +181,48 @@ impl PaletteState {
     /// Seed from the shared `help_lines()` corpus.
     pub(crate) fn from_corpus() -> Self {
         Self::new(corpus_entries().to_vec())
+    }
+
+    /// Offer the retained spills (`(id tail, label)`, newest first) as the
+    /// completions of `/spill open `. Empty keeps the plain usage row.
+    /// An open palette re-ranks, so its matches never index a stale list.
+    #[cfg(feature = "live-spill")]
+    pub(crate) fn set_spill_choices(&mut self, choices: Vec<(String, String)>) {
+        let entries: Vec<PaletteEntry> = choices
+            .into_iter()
+            .map(|(tail, label)| PaletteEntry {
+                cmd: format!("/spill open {tail}"),
+                args: String::new(),
+                desc: label,
+            })
+            .collect();
+        if entries != self.spill_entries {
+            self.spill_entries = entries;
+            if self.open {
+                let filter = std::mem::take(&mut self.filter);
+                self.set_filter(&filter);
+            }
+        }
+    }
+
+    pub(crate) fn take_spill_entries(&mut self) -> Vec<PaletteEntry> {
+        std::mem::take(&mut self.spill_entries)
+    }
+
+    pub(crate) fn restore_spill_entries(&mut self, entries: Vec<PaletteEntry>) {
+        self.spill_entries = entries;
+    }
+
+    /// The rows the filter ranks over: the retained spills once the operator
+    /// is typing `/spill o…`, otherwise the command corpus. Switching at
+    /// `spill o`, not `spill open `, matters: no corpus row matches
+    /// `spill o`, so a palette still on the corpus closes there for good.
+    fn list(&self) -> &[PaletteEntry] {
+        if !self.spill_entries.is_empty() && self.filter.to_lowercase().starts_with("spill o") {
+            &self.spill_entries
+        } else {
+            &self.entries
+        }
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -218,7 +264,7 @@ impl PaletteState {
     /// the palette is not open; the typed text is untouched.
     fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
-        self.matched = ranked_matches(&self.entries, filter);
+        self.matched = ranked_matches(self.list(), filter);
         self.highlight = 0;
         self.scroll = 0;
         if self.matched.is_empty() {
@@ -287,7 +333,7 @@ impl PaletteState {
         if !self.open {
             return None;
         }
-        let e = &self.entries[*self.matched.get(self.highlight)?];
+        let e = &self.list()[*self.matched.get(self.highlight)?];
         Some(if e.args.is_empty() {
             e.cmd.clone()
         } else {
@@ -425,7 +471,7 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
     let col = state
         .matched
         .iter()
-        .map(|&i| head_w(&state.entries[i]))
+        .map(|&i| head_w(&state.list()[i]))
         .max()
         .unwrap_or(0)
         .min(36);
@@ -439,7 +485,7 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
         .iter()
         .enumerate()
         .map(|(offset, &idx)| {
-            let e = &state.entries[idx];
+            let e = &state.list()[idx];
             let hl = state.scroll + offset == state.highlight;
             let (marker, cmd_style, desc_style) = if hl {
                 (
@@ -504,8 +550,102 @@ mod tests {
     fn matched_cmds(s: &PaletteState) -> Vec<&str> {
         s.matched
             .iter()
-            .map(|&i| s.entries[i].cmd.as_str())
+            .map(|&i| s.list()[i].cmd.as_str())
             .collect()
+    }
+
+    /// #3022: after `/spill open ` the palette lists the retained ids, newest
+    /// first, each labelled; Tab completes the highlighted id. Mocked choices —
+    /// the palette never sees the archive.
+    #[cfg(feature = "live-spill")]
+    #[test]
+    fn spill_open_completes_retained_ids_newest_first() {
+        let mut s = PaletteState::new(vec![PaletteEntry {
+            cmd: "/spill open".into(),
+            args: "<ID>".into(),
+            desc: "open a retained result".into(),
+        }]);
+        s.set_spill_choices(vec![
+            ("newest22".into(), "run_command: cargo test".into()),
+            ("older333".into(), "read_file: src/lib.rs".into()),
+        ]);
+        s.on_buffer_change("", "/");
+        s.on_buffer_change("/", "/spill open ");
+        assert!(s.is_open());
+        assert_eq!(
+            matched_cmds(&s),
+            ["/spill open newest22", "/spill open older333"]
+        );
+        assert_eq!(s.list()[0].desc, "run_command: cargo test");
+        assert_eq!(
+            palette_step(&mut s, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            PaletteStep::CompleteTo("/spill open newest22".to_string())
+        );
+        // Typing narrows by the id the operator is spelling.
+        let mut s = PaletteState::new(fixture());
+        s.set_spill_choices(vec![
+            ("newest22".into(), "a".into()),
+            ("older333".into(), "b".into()),
+        ]);
+        s.on_buffer_change("", "/");
+        s.on_buffer_change("/", "/spill open ol");
+        assert_eq!(matched_cmds(&s), ["/spill open older333"]);
+    }
+
+    /// #3022: the cockpit refreshes choices on every key. A result retained
+    /// while the palette is open re-ranks it, so Tab completes the newest id
+    /// rather than whatever a stale index now points at.
+    #[cfg(feature = "live-spill")]
+    #[test]
+    fn new_spill_choices_rerank_an_open_palette() {
+        let mut s = PaletteState::new(fixture());
+        s.set_spill_choices(vec![("older333".into(), "b".into())]);
+        s.on_buffer_change("", "/");
+        s.on_buffer_change("/", "/spill open ");
+        assert_eq!(matched_cmds(&s), ["/spill open older333"]);
+        s.set_spill_choices(vec![
+            ("newest22".into(), "a".into()),
+            ("older333".into(), "b".into()),
+        ]);
+        assert_eq!(
+            matched_cmds(&s),
+            ["/spill open newest22", "/spill open older333"]
+        );
+        assert_eq!(
+            palette_step(&mut s, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            PaletteStep::CompleteTo("/spill open newest22".to_string())
+        );
+    }
+
+    /// #3022 review: typed one key at a time against the real corpus, the
+    /// palette closed at `/spill o` (no corpus row matches it) and Tab then
+    /// inserted spaces. It must stay open through to the retained ids.
+    #[cfg(feature = "live-spill")]
+    #[test]
+    fn typing_spill_open_key_by_key_reaches_the_retained_ids() {
+        let mut s = PaletteState::from_corpus();
+        s.set_spill_choices(vec![("abcdefgh".into(), "x".into())]);
+        let mut prev = String::new();
+        for c in "/spill open ".chars() {
+            let now = format!("{prev}{c}");
+            s.on_buffer_change(&prev, &now);
+            assert!(s.is_open(), "palette closed at {now:?}");
+            prev = now;
+        }
+        assert_eq!(matched_cmds(&s), ["/spill open abcdefgh"]);
+    }
+
+    /// With nothing retained the palette keeps today's `/spill open <ID>` row.
+    #[test]
+    fn spill_open_without_retained_ids_shows_the_usage_row() {
+        let mut s = PaletteState::new(vec![PaletteEntry {
+            cmd: "/spill open".into(),
+            args: "<ID>".into(),
+            desc: "open".into(),
+        }]);
+        s.on_buffer_change("", "/");
+        s.on_buffer_change("/", "/spill open ");
+        assert_eq!(matched_cmds(&s), ["/spill open"]);
     }
 
     #[test]

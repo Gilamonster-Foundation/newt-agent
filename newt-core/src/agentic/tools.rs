@@ -44,6 +44,7 @@ pub use output_budget::{
 
 mod build_shell;
 mod catalog;
+mod config_edit;
 mod dependency_fetch;
 mod dispatch;
 pub(super) mod file_capture;
@@ -55,10 +56,12 @@ mod path_suggest;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
 pub use dispatch::{
-    execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
+    execute_tool, execute_tool_quiet, execute_tool_with_offload,
+    execute_tool_with_offload_and_prompt_and_artifacts,
 };
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
-use path_suggest::FileIoError;
+pub(crate) use path_suggest::resolve_tool_path;
+use path_suggest::{artifact_locator, FileIoError};
 pub(crate) mod exposure;
 mod grep_tool;
 mod live_output;
@@ -67,7 +70,9 @@ pub(crate) mod output_budget;
 mod read_history;
 pub(crate) use read_history::ReadHistory;
 mod shell;
-pub use shell::{run_command_dialect_sentence, shell_dialect_sentence};
+pub use shell::{
+    ambient_interpreter_description, run_command_dialect_sentence, shell_dialect_sentence,
+};
 /// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
 /// silent tool is never a blank row, and the first live byte takes the row
 /// for good. Unix-only — it needs a real pty pair.
@@ -77,6 +82,9 @@ use live_output::LiveOutputSession;
 #[cfg(test)]
 pub(crate) use shell::absent_binary_refusal;
 pub use shell::venv_cmd_prefix;
+/// newt's control plane, which no host child receives (also what `--ambient` strips from
+/// the full environment it hands run_command and stdio MCP servers).
+pub use shell::CHILD_STRIPPED_AUTHORITY_ENV;
 #[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
@@ -89,10 +97,7 @@ use shell::{
     permits_filesystem_request, resolve_exec_cwd, split_leading_cd,
 };
 #[cfg(all(test, not(windows)))]
-use shell::{
-    host_shell_command, host_shell_output, host_shell_output_with_timeout,
-    CHILD_STRIPPED_AUTHORITY_ENV,
-};
+use shell::{host_shell_command, host_shell_output, host_shell_output_with_timeout};
 pub(crate) use shell::{ABSENT_BINARY_MARKER, NOT_ON_HOST_MARKER};
 
 #[cfg(test)]
@@ -115,6 +120,20 @@ use catalog::{
 };
 pub use exposure::ExposureSettings;
 pub(crate) use exposure::{select_exposed, select_openai_compatible_tools, HiddenTools};
+
+/// Every built-in tool newt can dispatch by name, in catalog order — the
+/// checklist `/settings tools` offers (#2932). Dynamic MCP `server__tool`
+/// names are not included; an allow list may still name them.
+pub fn builtin_tool_names() -> &'static [&'static str] {
+    &catalog::ALL_TOOL_NAMES
+}
+
+/// Whether `[tool_exposure] read_only` hides `name` — the same set the
+/// exposure filter uses, so the checklist cannot explain one list while the
+/// wire enforces another.
+pub fn read_only_hidden_tool(name: &str) -> bool {
+    exposure::WRITE_TOOL_NAMES.contains(&name)
+}
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///
@@ -124,6 +143,17 @@ pub(crate) use exposure::{select_exposed, select_openai_compatible_tools, Hidden
 /// `NEWT_VENV` (set from `--venv` or auto-detected from `$VIRTUAL_ENV` by the
 /// CLI) takes precedence; falls back to `$VIRTUAL_ENV` if the TUI was invoked
 /// directly without going through the CLI's `dispatch`.
+/// Redact every string value inside `value` in place (#3036), keeping the
+/// JSON structure intact.
+fn redact_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = super::compress::redact_secrets(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_strings),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(redact_json_strings),
+        _ => {}
+    }
+}
+
 /// Atomically validate a model-emitted tool call **before any side effect**
 /// (invariant #3: no malformed tool call reaches a tool). Both the name and the
 /// arguments are checked up front; the caller receives EITHER a ready-to-dispatch
@@ -368,7 +398,7 @@ pub(crate) fn validate_tool_call_batch(
 /// INTERIM (#297): is the ocap exec bypass asserted for this invocation?
 ///
 /// True only when `NEWT_DISABLE_OCAP=1` — set by the CLI's `--disable-ocap`
-/// flag (alias `--yolo`) or exported directly for harness/pod use. The value
+/// flag (`--yolo` sets it with the other two axes) or exported directly for harness/pod use. The value
 /// must be exactly `"1"`: a security bypass reads fail-closed, so anything
 /// else (including `true`) leaves confinement on. Deliberately env-only —
 /// there is NO config-file key, so the bypass can never silently persist; it
@@ -419,12 +449,12 @@ pub fn ocap_disabled() -> bool {
 /// widening switch reads fail-closed — and it is deliberately env-only, so
 /// the override can never silently persist.
 ///
-/// This is a DISTINCT switch from [`ocap_disabled`] (`--yolo`): the two
-/// compose but never alias. `--full-access` widens the session *authority*
+/// This is a DISTINCT switch from [`ocap_disabled`] (`--disable-ocap`): the two
+/// compose but never alias (`--yolo` asserts both, plus `--ambient`). `--full-access` widens the session *authority*
 /// (fs fence, net leash, exec allowlist → unrestricted, which also empties
-/// the #774 exec floor); `--yolo` changes the exec *mechanism* (host shell
+/// the #774 exec floor); `--disable-ocap` changes the exec *mechanism* (host shell
 /// instead of the confined shell) and still honors whatever floor is in
-/// force. `--yolo --full-access` together yield an unrestricted host shell.
+/// force. `--disable-ocap --full-access` together yield an unrestricted host shell.
 pub fn full_access_requested() -> bool {
     // Frozen `LaunchAuthority` (resolved once from `NEWT_FULL_ACCESS` at
     // startup), never the live env — a later-appearing switch cannot widen the
@@ -446,6 +476,21 @@ pub fn plan_phase_clamp() -> crate::caveats::Caveats {
         net: Scope::none(),
         max_calls: CountBound::Unlimited,
         valid_for_generation: Scope::All,
+    }
+}
+
+/// The authority `[tool_exposure] read_only = true` clamps a session to
+/// (#2932): no filesystem writes, every other axis untouched. MEETing this
+/// into the session caveats is what makes the toggle attenuate authority and
+/// not merely hide `write_file` / `edit_file` / `delete_file` — the confined
+/// shell enforces the same `fs_write` floor, so `run_command` cannot write
+/// what the hidden tools could not. Exec and net stay as granted: read-only
+/// still runs builds and tests. Only narrows; never widens.
+pub fn read_only_clamp() -> crate::caveats::Caveats {
+    use crate::caveats::Scope;
+    crate::caveats::Caveats {
+        fs_write: Scope::none(),
+        ..crate::caveats::Caveats::top()
     }
 }
 
@@ -849,6 +894,29 @@ fn find_root_contained(
         // Can't canonicalize — keep the old permissive behaviour (deny only on a
         // proven escape).
         _ => true,
+    }
+}
+
+/// `find`/`grep` walk with a legacy walker that reopens every path by name,
+/// so only the workspace fence (object-bound, above) holds for the walk. A
+/// narrower `fs_read` scope cannot be enforced there — a symlink inside the
+/// scope can lead to a denied sibling (#2980) — so the walkers fail closed
+/// unless the read scope covers the whole workspace.
+const SCOPE_NOT_WALKABLE: &str = "capability denied: find/grep walk the whole workspace and cannot enforce a narrower fs_read scope. Use list_dir/read_file inside the granted scope, or run_command within your granted authority.";
+
+fn read_scope_covers_workspace(scope: &crate::caveats::Scope<String>, workspace: &str) -> bool {
+    match scope {
+        crate::caveats::Scope::All => true,
+        crate::caveats::Scope::Only(set) => {
+            let Ok(ws) = std::path::Path::new(workspace).canonicalize() else {
+                return false;
+            };
+            set.iter().any(|root| {
+                std::path::Path::new(root)
+                    .canonicalize()
+                    .is_ok_and(|root| ws.starts_with(root))
+            })
+        }
     }
 }
 
@@ -1664,7 +1732,7 @@ pub(super) fn authorized_read(
     caveats: &crate::caveats::Caveats,
     permission_gate: Option<&mut (dyn PermissionGate + '_)>,
 ) -> Result<String, String> {
-    let full = std::path::Path::new(workspace).join(path);
+    let full = resolve_tool_path(std::path::Path::new(workspace), path)?;
     let full_str = full.to_string_lossy();
     let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
     if !scope_permits {
@@ -1710,6 +1778,17 @@ fn fs_gate_allows(
     full_path: &str,
     axis: impl Fn(&crate::caveats::Caveats) -> &crate::caveats::Scope<String>,
 ) -> bool {
+    fs_gate_widened(gate, tool, kind, full_path, axis).is_some()
+}
+
+/// The caveats the operator granted for `full_path`, or `None` when refused.
+fn fs_gate_widened(
+    gate: &mut dyn PermissionGate,
+    tool: &str,
+    kind: DenialKind,
+    full_path: &str,
+    axis: impl Fn(&crate::caveats::Caveats) -> &crate::caveats::Scope<String>,
+) -> Option<crate::caveats::Caveats> {
     let request = PermissionRequest {
         tool: tool.to_string(),
         kind,
@@ -1718,8 +1797,36 @@ fn fs_gate_allows(
         harness_bound: false,
     };
     match gate.ask(std::slice::from_ref(&request)) {
-        PermissionDecision::Allow(widened) => tui_permits_path(axis(&widened), full_path),
-        PermissionDecision::Deny => false,
+        PermissionDecision::Allow(widened) => {
+            tui_permits_path(axis(&widened), full_path).then_some(widened)
+        }
+        PermissionDecision::Deny => None,
+    }
+}
+
+/// The ONE decision whether `find`/`grep` may walk `full_str`: the root must be
+/// readable under the EFFECTIVE `fs_read` (the baseline, or what the operator
+/// granted when asked), and that scope must cover the whole workspace, because
+/// the walker reopens paths by name and cannot keep to a subtree (#2980).
+fn walker_read_gate(
+    tool: &str,
+    caveats: &crate::caveats::Caveats,
+    workspace: &str,
+    full_str: &str,
+    gate: &mut Option<&mut dyn PermissionGate>,
+) -> Result<(), String> {
+    let effective = if tui_permits_path(&caveats.fs_read, full_str) {
+        caveats.fs_read.clone()
+    } else {
+        gate.as_deref_mut()
+            .and_then(|g| fs_gate_widened(g, tool, DenialKind::FsRead, full_str, |c| &c.fs_read))
+            .map(|widened| widened.fs_read)
+            .ok_or_else(|| denied_fs_result("fs_read", full_str))?
+    };
+    if read_scope_covers_workspace(&effective, workspace) {
+        Ok(())
+    } else {
+        Err(SCOPE_NOT_WALKABLE.to_string())
     }
 }
 
@@ -2937,6 +3044,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "web_fetch" => string("url", ""),
         "request_permissions" => string("capability", ""),
         "request_user_input" => string("question", ""),
+        "propose_config_edit" => string("key", ""),
         "select_operating_mode" => string("mode", ""),
         "prompt_read" | "artifact_read" => string("address", "current"),
         "tool_search" | "recall" | "code_search" | "experience_recall" => string("query", ""),
@@ -2964,6 +3072,7 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         | "update_plan"
         | "plan_get"
         | "get_context_remaining"
+        | "mcp_status"
         | "enter_plan_mode"
         | "exit_plan_mode" => String::new(),
         _ => args.to_string(),
@@ -3177,7 +3286,7 @@ fn find_walk(
             if is_dir {
                 0
             } else {
-                count_lines(entry.path())
+                count_lines(workspace_root, entry.path())
             }
         } else if want_size {
             entry.metadata().map(|m| m.len()).unwrap_or(0)
@@ -3196,11 +3305,70 @@ fn find_walk(
 /// evidence question and the walk is already bounded to a source workspace. The
 /// counting itself is factored into [`count_newlines`] so it stays unit-testable
 /// without touching the filesystem (the mocked tier).
-fn count_lines(path: &std::path::Path) -> u64 {
-    match std::fs::read(path) {
-        Ok(bytes) => count_newlines(&bytes),
-        Err(_) => 0,
+/// Open one file found by a `find`/`grep` walk through the same platform
+/// boundary `read_file` and artifact capture use: beneath the workspace as the
+/// only read scope, never following a final link. Platforms without a
+/// race-safe opener refuse; there is no ambient `fs::read` fallback.
+pub(super) fn open_workspace_file(
+    workspace_root: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    open_workspace_file_via(walk_open_route(), workspace_root, path)
+}
+
+/// Which opener a `find`/`grep` content read may use on this platform. Named
+/// so the choice is explicit and pinned by a test: a broader shared helper
+/// (`open_for_scope` falls back to a pathname open on every other Unix) must
+/// never silently set the policy here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkOpenRoute {
+    /// Linux/macOS: descriptor-relative open beneath the workspace.
+    ObjectBound,
+    /// Windows: physical containment check, then a reparse-point-aware leaf open.
+    PhysicalCheckReparseLeaf,
+    /// No race-safe opener: refuse.
+    Unsupported,
+}
+
+const fn walk_open_route() -> WalkOpenRoute {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        WalkOpenRoute::ObjectBound
+    } else if cfg!(windows) {
+        WalkOpenRoute::PhysicalCheckReparseLeaf
+    } else {
+        WalkOpenRoute::Unsupported
     }
+}
+
+fn open_workspace_file_via(
+    route: WalkOpenRoute,
+    workspace_root: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    match route {
+        WalkOpenRoute::Unsupported => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no race-safe file opener on this platform",
+        )),
+        WalkOpenRoute::ObjectBound | WalkOpenRoute::PhysicalCheckReparseLeaf => {
+            let scope =
+                crate::caveats::Scope::only([workspace_root.to_string_lossy().into_owned()]);
+            file_capture::open_for_scope(&scope, path, true)
+        }
+    }
+}
+
+fn count_lines(workspace_root: &std::path::Path, path: &std::path::Path) -> u64 {
+    use std::io::Read;
+    // One handle, opened beneath the workspace without following a final
+    // link: a leaf swapped for a symlink after the walk saw it fails the open
+    // instead of being read (#2980).
+    let counted = open_workspace_file(workspace_root, path).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(count_newlines(&bytes))
+    });
+    counted.unwrap_or(0)
 }
 
 /// Pure `wc -l` newline count over raw bytes: the number of `\n` bytes, so a
@@ -3802,8 +3970,17 @@ async fn execute_authorized_tool(
             reason: "Approve this remote MCP operation. Persona preferences and server tool hints do not grant permission.".into(),
             harness_bound: false,
         };
-        let grant = matches!(gate.ask(&[request]), PermissionDecision::Allow(_))
-            .then_some(McpGrant::HumanApproved);
+        // #2995: `--full-access` is the operator's own launch-time grant of
+        // unrestricted authority (frozen `LaunchAuthority`, never config or a
+        // persona), so the gate is asked to skip the PROMPT, not its vetoes.
+        // Hints and personas still grant nothing.
+        let decision = if full_access_requested() {
+            gate.ask_full_access(&[request])
+        } else {
+            gate.ask(&[request])
+        };
+        let approved = matches!(decision, PermissionDecision::Allow(_));
+        let grant = approved.then_some(McpGrant::HumanApproved);
         return match leash_mcp_call(name, args, grant) {
             Ok(leased) => mcp.call(&leased).await,
             Err(_) => host_return(executed((
@@ -4004,6 +4181,18 @@ async fn execute_authorized_tool(
             None => {
                 "unknown tool: code_search (semantic retrieval is off this session)".to_string()
             }
+        },
+
+        // #3036: per-server MCP health. Error text is server- and
+        // transport-authored, so each string value passes the credential
+        // redaction table before serializing; redacting the serialized array
+        // could eat a closing quote or the rest of the document.
+        "mcp_status" => match mcp.server_status() {
+            Some(mut status) => {
+                redact_json_strings(&mut status);
+                status.to_string()
+            }
+            None => "no MCP servers configured".to_string(),
         },
 
         // #1285: exact, typed-verdict symbol lookup — presence-gated on the
@@ -4291,6 +4480,15 @@ async fn execute_authorized_tool(
             execute_request_user_input(args, permission_gate, color, tool_output_lines)
         }
 
+        // #144: an edit to newt's own config, applied only on the operator's
+        // explicit `apply`. No gate (headless / eval / ACP) refuses.
+        "propose_config_edit" => config_edit::execute_propose_config_edit(
+            args,
+            permission_gate,
+            crate::Config::user_config_path().as_deref(),
+            crate::settings_receipt::receipt_path().as_deref(),
+        ),
+
         // #725: tool discovery — search THIS session's advertised catalog by
         // intent so a model that half-remembers a capability finds the real tool
         // name instead of fabricating one. Advertised always; the catalog is
@@ -4305,8 +4503,13 @@ async fn execute_authorized_tool(
             // An exact known name is an explicit schema request through an
             // already-exposed tool. Reuse only the controller's admitted
             // definitions; fuzzy search never activates or executes anything.
+            // An operator-hidden name is not an explicit schema request: it
+            // falls through to the search, which does not list it (#2932).
             if let Some(message) = hidden_tools
-                .filter(|_| tool_allowed(disposition, query.trim()))
+                .filter(|hidden| {
+                    tool_allowed(disposition, query.trim())
+                        && !hidden.is_operator_hidden(query.trim())
+                })
                 .and_then(|hidden| hidden.promote(query.trim()).message(query.trim()))
             {
                 return host_return(message);
@@ -4963,6 +5166,19 @@ async fn execute_authorized_tool(
                 return crate::tooling::unconfigured_phase_message(phase, &nested);
             }
             let joined = cmds.join(" && ");
+            // #3040: a `pyo3` pick made only by coexisting manifests is said
+            // in-band on every outcome, so the session sees the misdetection.
+            // #3050 review: manifests are read through the same scoped,
+            // object-bound, size-bounded, regular-file-only capture the file
+            // tools use; anything it cannot read is unknown, so no note.
+            let note = crate::tooling::detection_note(effective_path, phase, |manifest| {
+                match file_capture::capture(&caveats.fs_read, manifest) {
+                    file_capture::TextSnapshot::Present(text) => Some(text),
+                    _ => None,
+                }
+            })
+                .map(|note| format!("\n{note}"))
+                .unwrap_or_default();
             // Inspect exactly the retained source used by both execution lanes.
             // Never re-resolve mutable tooling configuration after this check.
             if action != "list"
@@ -4983,7 +5199,7 @@ async fn execute_authorized_tool(
             } else {
                 action
             };
-            match action {
+            let out = match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
                 "build" => {
                     let (program, argv) = build_check_argv(&joined);
@@ -5033,7 +5249,8 @@ async fn execute_authorized_tool(
                 other => format!(
                     "error: unknown lifecycle action '{other}'. Use 'run' (default), 'list', or 'build'."
                 ),
-            }
+            };
+            out + &note
         }
 
         // facade P4 build route (§4, `super::routing::build_lane_route`):
@@ -5288,7 +5505,8 @@ async fn execute_authorized_tool(
                         (moved.source.as_str(), super::artifact_hooks::ArtifactFileState::from_bytes(moved.before.as_bytes()), moved.parent.as_str()),
                         (path, super::artifact_hooks::ArtifactFileState::absent(), moved.child.as_str()),
                     ] {
-                        artifacts.push_str(&record_governed_file_change(artifact_sink, artifact_context, label, "write_file",
+                        // #3045 review: record the resolved files, not `~` spellings.
+                        artifacts.push_str(&record_governed_file_change(artifact_sink, artifact_context, &artifact_locator(workspace, label), "write_file",
                             Some(before), super::artifact_hooks::ArtifactFileState::from_bytes(after.as_bytes()), color, tool_output_lines));
                     }
                     return format!("Moved functions from {} into {}; confined cargo check --lib exited 0. Parent: {} lines; child: {} lines. Displaced entries retained as .newt-move-*.saved beside changed files; inspect before removing.{}",
@@ -5334,7 +5552,10 @@ async fn execute_authorized_tool(
                 }
                 None => content,
             };
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // Scope- vs #263-gate-authorised, same split as read_file (step-52.2):
             // decides whether the write below is object-bound.
@@ -5474,7 +5695,7 @@ async fn execute_authorized_tool(
                                 Ok(true) => record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
-                                    path,
+                                    &artifact_locator(workspace, path),
                                     "write_file",
                                     artifact_before,
                                     super::artifact_hooks::ArtifactFileState::from_bytes(
@@ -5505,7 +5726,7 @@ async fn execute_authorized_tool(
                     Err(tool_output) => receipt.present(file_capture::failure(tool_output.render(workspace, &caveats.fs_read), ""), "", presentation),
                 }
             } else {
-                format!("user declined to write {path}")
+                executed((format!("user declined to write {path}"), crate::ExecOutcome::Denied))
             }
         }
 
@@ -5514,7 +5735,10 @@ async fn execute_authorized_tool(
             if path.trim().is_empty() {
                 return "error: path is required".to_string();
             }
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // step-52.6: same scope-vs-#263-gate split — decides whether the
             // removal below is object-bound (via unlinkat on the resolved parent).
@@ -5606,7 +5830,7 @@ async fn execute_authorized_tool(
                                 record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
-                                    path,
+                                    &artifact_locator(workspace, path),
                                     "delete_file",
                                     artifact_before,
                                     super::artifact_hooks::ArtifactFileState::absent(),
@@ -5661,7 +5885,10 @@ async fn execute_authorized_tool(
                 return "error: old_string must not be empty — use write_file to create new files"
                     .to_string();
             }
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // step-52.5: same scope-vs-#263-gate split as write_file — decides
             // whether the read of `existing` and the write of `updated` below are
@@ -5809,7 +6036,7 @@ async fn execute_authorized_tool(
                             Ok(true) => record_governed_file_change(
                                 artifact_sink,
                                 artifact_context,
-                                path,
+                                &artifact_locator(workspace, path),
                                 "edit_file",
                                 artifact_before,
                                 super::artifact_hooks::ArtifactFileState::from_bytes(
@@ -5846,7 +6073,10 @@ async fn execute_authorized_tool(
 
         "list_dir" => {
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             // Scope- vs #263-gate-authorised, same split as read_file (step-52.2).
             let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
@@ -5900,19 +6130,23 @@ async fn execute_authorized_tool(
             },
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             const WORKSPACE_ONLY: &str = "capability denied: find is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
                 return WORKSPACE_ONLY.to_string();
             }
-            if !tui_permits_path(&caveats.fs_read, &full_str) {
-                let allowed = permission_gate.is_some_and(|gate| {
-                    fs_gate_allows(gate, "find", DenialKind::FsRead, &full_str, |c| &c.fs_read)
-                });
-                if !allowed {
-                    return denied_fs_result("fs_read", &full_str);
-                }
+            if let Err(refusal) = walker_read_gate(
+                "find",
+                caveats,
+                workspace,
+                &full_str,
+                &mut permission_gate,
+            ) {
+                return refusal;
             }
             // #1176: shadow-OCAP — record the search root under --full-access
             // (the fuzzer's "find the 10 largest files" is a canonical case).
@@ -5985,19 +6219,23 @@ async fn execute_authorized_tool(
             // no subprocess, so a run_command refusal can't take the agent's
             // grep with it.
             let path = args["path"].as_str().unwrap_or(".");
-            let full = std::path::Path::new(workspace).join(path);
+            let full = match resolve_tool_path(std::path::Path::new(workspace), path) {
+                Ok(full) => full,
+                Err(error) => return error,
+            };
             let full_str = full.to_string_lossy();
             const WORKSPACE_ONLY: &str = "capability denied: grep is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
                 return WORKSPACE_ONLY.to_string();
             }
-            if !tui_permits_path(&caveats.fs_read, &full_str) {
-                let allowed = permission_gate.is_some_and(|gate| {
-                    fs_gate_allows(gate, "grep", DenialKind::FsRead, &full_str, |c| &c.fs_read)
-                });
-                if !allowed {
-                    return denied_fs_result("fs_read", &full_str);
-                }
+            if let Err(refusal) = walker_read_gate(
+                "grep",
+                caveats,
+                workspace,
+                &full_str,
+                &mut permission_gate,
+            ) {
+                return refusal;
             }
             // #1176: shadow-OCAP — record the search root under --full-access.
             if full_access_requested() {
@@ -6066,12 +6304,13 @@ async fn execute_authorized_tool(
             // governed by the session caveats. The same first-directory-wins
             // precedence as the index means we load the copy the model was
             // actually shown.
-            let dirs = super::display::with_migration_notices(crate::Config::resolve_unpublished)
-                .map(|c| c.skill_search_dirs())
-                .unwrap_or_default();
-            match newt_skills::load_body_from(&dirs, skill_name) {
-                Ok(body) => body,
-                Err(e) => format!("error: {e}"),
+            // A skill the operator switched off (`[skills] off`) is refused here too.
+            match super::display::with_migration_notices(crate::Config::resolve_unpublished) {
+                Ok(cfg) => match cfg.load_skill_body(skill_name) {
+                    Ok(body) => body,
+                    Err(e) => format!("error: {e}"),
+                },
+                Err(e) => format!("error: config does not resolve: {e}"),
             }
         }
 

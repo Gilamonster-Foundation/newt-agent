@@ -18,10 +18,11 @@ fn migration_library_child() {
     match scenario.as_str() {
         "config" => {
             std::fs::write(&path, old).unwrap();
-            let loaded = newt_core::psyche_import::read_config_file(&path, false, &mut |notice| {
-                notices.push(notice);
-            })
-            .unwrap();
+            let loaded =
+                newt_core::psyche_import::read_config_file(&path, false, &[], &mut |notice| {
+                    notices.push(notice);
+                })
+                .unwrap();
             assert_eq!(
                 loaded,
                 newt_core::psyche_import::migrate_config_text(old)
@@ -169,7 +170,7 @@ fn migration_notice_names_the_callers_path_not_the_resolved_one() {
     let via_link = link.join("config.toml");
 
     let mut notices = Vec::new();
-    newt_core::psyche_import::read_config_file(&via_link, true, &mut |notice| {
+    newt_core::psyche_import::read_config_file(&via_link, true, &[], &mut |notice| {
         notices.push(notice);
     })
     .unwrap();

@@ -244,7 +244,10 @@ pub fn plan_block(ledger: &dyn StepLedger) -> Option<String> {
 /// so trivial/single-step turns pay nothing. Descriptions remain in the source
 /// plan; repeating agent-authored claims here would promote them to host guidance.
 #[must_use]
-pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
+pub fn plan_reseat_pointer(
+    ledger: &dyn StepLedger,
+    exposure: &super::tools::ExposureSettings,
+) -> Option<String> {
     let steps = ledger.steps();
     if steps.len() < 2 {
         return None; // no plan, or a single-step plan that needs no re-seat
@@ -259,12 +262,15 @@ pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
         .iter()
         .filter(|s| s.status == StepStatus::Done)
         .count();
-    Some(super::workflow_guidance(format!(
+    Some(super::workflow_guidance(
+        format!(
         "[Plan progress: {done}/{} done (agent-maintained, advisory). ACTIVE \u{2192} step {}. \
          Continue this step when it still matches the operator's request.{target}]",
         steps.len(),
         active + 1
-    )))
+    ),
+        exposure,
+    ))
 }
 
 /// The operator's one-row view of an `update_plan` that moved an EXISTING
@@ -645,7 +651,7 @@ mod tests {
         let claim = "CI gate BLOCKED: cargo absent; Build declined by the operator (exit 40032)";
         ledger.set_plan(&["inspect".into(), claim.into()]);
         ledger.advance();
-        let pointer = plan_reseat_pointer(&ledger).unwrap();
+        let pointer = plan_reseat_pointer(&ledger, &Default::default()).unwrap();
         assert!(
             !pointer.contains(claim),
             "agent-authored text is not a host reminder: {pointer}"
@@ -667,11 +673,17 @@ mod tests {
     #[test]
     fn reseat_pointer_compact_and_gated_to_multistep_in_progress() {
         let l = SessionStepLedger::default();
-        assert!(plan_reseat_pointer(&l).is_none(), "empty → none");
+        assert!(
+            plan_reseat_pointer(&l, &Default::default()).is_none(),
+            "empty → none"
+        );
         l.set_plan(&["only".to_string()]);
-        assert!(plan_reseat_pointer(&l).is_none(), "single step → none");
+        assert!(
+            plan_reseat_pointer(&l, &Default::default()).is_none(),
+            "single step → none"
+        );
         l.set_plan(&["a".to_string(), "b".to_string(), "c".to_string()]);
-        let p = plan_reseat_pointer(&l).expect("multi-step → pointer");
+        let p = plan_reseat_pointer(&l, &Default::default()).expect("multi-step → pointer");
         assert!(p.contains("step 1"), "indexes the active step: {p}");
         assert!(p.contains("0/3 done"), "shows progress: {p}");
         assert_eq!(p.lines().count(), 1, "compact (one line): {p}");
@@ -679,11 +691,14 @@ mod tests {
         assert!(p.contains("update_plan"), "{p}");
         assert!(!p.contains("do not restart or re-plan them"), "{p}");
         l.advance(); // a Done, b Active
-        let ptr = plan_reseat_pointer(&l).unwrap();
+        let ptr = plan_reseat_pointer(&l, &Default::default()).unwrap();
         assert!(ptr.contains("step 2") && ptr.contains("1/3 done"), "{ptr}");
         l.advance();
         l.advance(); // all done, no Active
-        assert!(plan_reseat_pointer(&l).is_none(), "complete plan → none");
+        assert!(
+            plan_reseat_pointer(&l, &Default::default()).is_none(),
+            "complete plan → none"
+        );
     }
 
     #[test]

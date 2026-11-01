@@ -1935,8 +1935,11 @@ fn third(z: u32) -> u32 {
         let anchor = MOD_RS
             .find("\nfn strip_trailing_nudge_exchange(")
             .expect("fixture function");
+        // The tail of the nearest preceding `workflow_guidance(…, exposure)`
+        // call: an unmatched `)` then the fn's closing brace, so the page
+        // opens mid-block.
         let start = MOD_RS[..anchor]
-            .rfind("\n    ))\n}\n")
+            .rfind("\n    )\n}\n")
             .expect("preceding unmatched-delimiter tail")
             + 1;
         let offset = MOD_RS[..start].bytes().filter(|&b| b == b'\n').count() + 1;
@@ -1949,7 +1952,7 @@ fn third(z: u32) -> u32 {
             None,
         );
         assert!(
-            page.starts_with("    ))\n}\n"),
+            page.starts_with("    )\n}\n"),
             "fixture must start mid-block"
         );
         let (next_offset, _) = parse_offset_and_char_offset(&page);

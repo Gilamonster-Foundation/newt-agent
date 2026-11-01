@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "agent-bridle-tool-shell"
-version = "0.8.0-rc.5"
+version = "0.8.0-rc.6"
 authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 build = false
 autolib = false
@@ -123,13 +123,13 @@ name = "windows_env_isolation"
 path = "tests/windows_env_isolation.rs"
 
 [dependencies.agent-bridle-core]
-version = "0.8.0-rc.5"
+version = "0.8.0-rc.6"
 
 [dependencies.anyhow]
 version = "1"
 
 [dependencies.async-trait]
-version = "0.1"
+version = "0.1.92"
 
 [dependencies.brush-ocap-builtins]
 version = "=0.3.0-rc.1"
@@ -217,4 +217,4 @@ version = "0.14.11"
 optional = true
 
 [target."cfg(unix)".dependencies.agent-bridle-fdguard]
-version = "0.8.0-rc.5"
+version = "0.8.0-rc.6"

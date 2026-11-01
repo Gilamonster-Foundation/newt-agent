@@ -1729,21 +1729,16 @@ mod tests {
         let store =
             newt_core::ConversationStore::new(host_dir.path(), host_dir.path(), 100).unwrap();
         store.create("long-lived session", None).unwrap();
-        // Rebinding the closed hub's port waits, within a bound, for the old
-        // endpoint to release it.
+        // `close` returns only after the old endpoint has released its socket
+        // (agent-mesh#152), so the restarted hub binds the same port at once.
+        // No retry: a busy port here is the regression (#2946).
         async fn start_hub(user: &UserKey, dir: &Path, port: u16) -> DockClient {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                let key = dock_agent(user, DockRole::Hub, "home-hub");
-                match DockClient::bind(user, key, port, dir).await {
-                    Ok(hub) => {
-                        hub.serve_uplinks(dir.to_path_buf());
-                        return hub;
-                    }
-                    Err(e) if tokio::time::Instant::now() > deadline => panic!("rebind: {e}"),
-                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-                }
-            }
+            let key = dock_agent(user, DockRole::Hub, "home-hub");
+            let hub = DockClient::bind(user, key, port, dir)
+                .await
+                .unwrap_or_else(|e| panic!("rebind: {e}"));
+            hub.serve_uplinks(dir.to_path_buf());
+            hub
         }
         async fn served(hub: &DockClient, host: Fingerprint) -> bool {
             let uplinks = hub.uplinks();

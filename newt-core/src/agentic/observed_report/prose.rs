@@ -1,5 +1,8 @@
 //! Copied report envelopes are model prose, never another source of facts.
-use super::{CHECKS_HEADING, FILES_HEADING, NOTICES_HEADING, PUBLICATIONS_HEADING};
+use super::{
+    CHECKS_HEADING, FILES_HEADING, NOTICES_HEADING, NOT_A_WORK_TREE, PUBLICATIONS_HEADING,
+    UNAVAILABLE,
+};
 
 /// Remove only complete report-shaped envelopes outside quoted examples.
 /// This is presentation cleanup, never verification of a displayed CID.
@@ -52,7 +55,7 @@ pub(crate) fn replay_messages(messages: &[crate::MemMessage]) -> Vec<crate::MemM
 
 /// One conservative recognizer for display artifacts, persistence and replay.
 /// Any partial, fenced or extra prose inside the candidate makes us abstain.
-pub(crate) fn split_report(text: &str) -> Option<(&str, &str)> {
+pub fn split_report(text: &str) -> Option<(&str, &str)> {
     if !text.starts_with("## Observed\n\n") {
         return None;
     }
@@ -162,13 +165,10 @@ fn section(text: &str, heading: &str, checks: bool) -> bool {
 fn report_row(row: &str, heading: &str) -> bool {
     match heading {
         FILES_HEADING => {
-            matches!(
-                row,
-                "No content changes observed."
-                    | "File counts unavailable: incomplete or unauthorized snapshot."
-            ) || row
-                .strip_suffix(" additional file rows omitted.")
-                .is_some_and(|n| n.parse::<usize>().is_ok())
+            ["No content changes observed.", NOT_A_WORK_TREE, UNAVAILABLE].contains(&row)
+                || row
+                    .strip_suffix(" additional file rows omitted.")
+                    .is_some_and(|n| n.parse::<usize>().is_ok())
                 || after_literal(row)
                     .and_then(|s| s.strip_prefix(": "))
                     .and_then(|s| s.split_once(" → "))

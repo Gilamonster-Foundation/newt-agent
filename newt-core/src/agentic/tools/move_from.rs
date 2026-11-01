@@ -36,7 +36,7 @@ pub(super) fn execute(
     let launch = Path::new(workspace)
         .canonicalize()
         .map_err(|e| format!("workspace: {e}"))?;
-    let source = launch.join(source_label);
+    let source = super::resolve_tool_path(&launch, source_label)?;
     let source_parent = source.parent().ok_or("source has no parent")?;
     // Locate the owning package before selecting its fence: with fs_write=All,
     // the shared selector deliberately fences just the requested build cwd.
@@ -48,7 +48,10 @@ pub(super) fn execute(
     let (root, _) = super::build_shell::build_directory(workspace, cwd, caveats)
         .map_err(|(reason, _)| reason)?;
     let source = local_path(&root, &source.to_string_lossy())?;
-    let child = launch.join(args["path"].as_str().ok_or("missing destination path")?);
+    let child = super::resolve_tool_path(
+        &launch,
+        args["path"].as_str().ok_or("missing destination path")?,
+    )?;
     let child = local_path(&root, &child.to_string_lossy())?;
     let module = child
         .file_stem()

@@ -36,6 +36,13 @@ repository_evidence: source_first\n\
 source_definition: resolved_language_packs\n\
 repository_instruction: inspect source first via find category=source; narrow by language; docs/manifests/lockfiles/generated only if requested or necessary; never replace code evidence with metadata";
 
+/// The policy block the card carries when the operator hid `find`: its one
+/// tool recipe (`find category=source`) rides only when the model can see the
+/// tool (#2932); the source-first rule itself always does.
+fn response_repository_policy_without_find() -> String {
+    RESPONSE_REPOSITORY_POLICY.replace(" via find category=source", "")
+}
+
 #[cfg(test)]
 pub(crate) fn response_repository_policy_tokens() -> usize {
     crate::tokens::TokenEstimation::default()
@@ -154,6 +161,12 @@ impl SessionPromptStore {
         let active_operator = match (prompt.origin(), parent.as_ref()) {
             // A fresh operator submission is its own active authority.
             (PromptOrigin::Operator, None) => None,
+            // A flock task roots its own objective and carries itself as the
+            // active prompt; it never has a parent.
+            (PromptOrigin::Flock, None) => None,
+            (PromptOrigin::Flock, Some(_)) => {
+                anyhow::bail!("a flock task roots its own objective and has no parent")
+            }
             // bug/steering-regressions: an operator CONTINUATION (a decision
             // or clarification reply bound to a parent ask) REFINES the parent
             // objective — it must not usurp it as the active operator prompt.
@@ -264,11 +277,11 @@ fn validate_session_objective_root(
         )
     })?;
     root.verify_integrity()?;
-    if root.origin() != PromptOrigin::Operator
+    if !matches!(root.origin(), PromptOrigin::Operator | PromptOrigin::Flock)
         || root.root_prompt_id() != root.id()
         || root.active_operator_id() != Some(root.id())
     {
-        anyhow::bail!("prompt root {root_id} is not a self-rooted operator prompt");
+        anyhow::bail!("prompt root {root_id} is not a self-rooted operator or flock prompt");
     }
     Ok(root)
 }
@@ -454,35 +467,44 @@ pub(crate) fn ensure_active_prompt_card(
     messages: &mut Vec<serde_json::Value>,
     context: PromptReadContext<'_>,
     intake: Option<&PromptIntake>,
+    exposure: &super::tools::ExposureSettings,
 ) {
-    let base_card = active_prompt_card(context);
+    // An operator-owned system prompt is the whole system message (#2938).
+    if exposure.verbatim_system {
+        return;
+    }
+    // `[prompt] components` switched `card` off (#2933); config load already
+    // checked that the tools which read it are hidden.
+    if exposure.omit_card {
+        return;
+    }
+    let base_card = active_prompt_card(context, exposure);
     let card = match intake {
-        Some(intake) => active_prompt_card_with_intake(base_card.clone(), intake),
-        None => base_card.clone(),
+        Some(intake) => active_prompt_card_with_intake(base_card, intake),
+        None => base_card,
     };
-    insert_active_prompt_card(messages, context, &base_card, card);
+    insert_active_prompt_card(messages, context, card);
 }
 
 fn insert_active_prompt_card(
     messages: &mut Vec<serde_json::Value>,
     context: PromptReadContext<'_>,
-    base_card: &str,
     card: String,
 ) {
+    let head = active_prompt_card_head(context);
     let mut cleaned = Vec::with_capacity(messages.len());
     let mut index = 0;
     while index < messages.len() {
-        // Remove only this harness instance's exact base/current card or a
-        // marker-validated comprehension extension of that exact base. A
-        // configured system prompt is untrusted presentation data: matching the
-        // public active-prompt prefix alone could mistake it for our card and
-        // erase the live user message that follows it.
+        // Remove only this harness instance's card — its exact head plus one
+        // of our own policy renderings, or a marker-validated comprehension
+        // extension of that. A configured system prompt is untrusted
+        // presentation data: matching the public active-prompt prefix alone
+        // could mistake it for our card and erase the live user message that
+        // follows it.
         let is_owned_card = messages[index]["role"] == "system"
-            && messages[index]["content"].as_str().is_some_and(|content| {
-                content == base_card
-                    || content == card.as_str()
-                    || is_augmented_active_prompt_card(content, base_card)
-            });
+            && messages[index]["content"]
+                .as_str()
+                .is_some_and(|content| is_owned_active_prompt_card(content, &head));
         let is_owned_pair = index + 1 < messages.len()
             && is_owned_card
             && messages[index + 1]["role"] == "user"
@@ -513,7 +535,7 @@ fn insert_active_prompt_card(
     );
 }
 
-fn active_prompt_card_with_intake(base_card: String, intake: &PromptIntake) -> String {
+pub(crate) fn active_prompt_card_with_intake(base_card: String, intake: &PromptIntake) -> String {
     append_prompt_comprehension_model_card(base_card, &intake.model_card())
 }
 
@@ -530,18 +552,28 @@ fn append_prompt_comprehension_model_card(mut active_card: String, model_card: &
     active_card
 }
 
-fn is_augmented_active_prompt_card(content: &str, base_card: &str) -> bool {
-    content
-        .strip_prefix(base_card)
-        .and_then(|suffix| suffix.strip_prefix('\n'))
-        .is_some_and(has_prompt_comprehension_marker)
-}
-
 fn has_prompt_comprehension_marker(content: &str) -> bool {
     content.lines().next() == Some(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX)
 }
 
-pub(crate) fn active_prompt_card(context: PromptReadContext<'_>) -> String {
+/// The protected active-prompt card. Its recovery recipes name `prompt_read`
+/// and `artifact_read`, so each rides only when the operator's tool policy
+/// lets the model see that tool (#2932); provenance and policy always ride.
+pub(crate) fn active_prompt_card(
+    context: PromptReadContext<'_>,
+    exposure: &super::tools::ExposureSettings,
+) -> String {
+    format!(
+        "{}{}",
+        active_prompt_card_head(context),
+        active_prompt_card_policy(exposure)
+    )
+}
+
+/// The exposure-independent head of the card: the marker and the receipt
+/// lineage, ending in a newline. What `is_owned_active_prompt_card` matches
+/// exactly.
+fn active_prompt_card_head(context: PromptReadContext<'_>) -> String {
     let (address, root, digest) = context.active_receipt().map_or_else(
         || {
             (
@@ -591,11 +623,54 @@ pub(crate) fn active_prompt_card(context: PromptReadContext<'_>) -> String {
          address: {address}\n\
          objective_root: {root}\n\
          model_digest: {digest}\n\
-         {submitted_block}\n\
-         recovery: prompt_read current\n\
-         artifact_recovery: for prompt-rooted work, artifact_read {{\"address\":\"root\"}}\n\
-         {RESPONSE_REPOSITORY_POLICY}"
+         {submitted_block}\n"
     )
+}
+
+/// The policy tail of the card, rendered for one visibility of the three
+/// tools it may name. `active_prompt_card_policy` picks the visibility from
+/// the operator's policy; `is_owned_active_prompt_card` enumerates it.
+fn render_card_policy(prompt_read: bool, artifact_read: bool, find: bool) -> String {
+    let mut out = String::new();
+    if prompt_read {
+        out.push_str("recovery: prompt_read current\n");
+    }
+    if artifact_read {
+        out.push_str(
+            "artifact_recovery: for prompt-rooted work, artifact_read {\"address\":\"root\"}\n",
+        );
+    }
+    if find {
+        out.push_str(RESPONSE_REPOSITORY_POLICY);
+    } else {
+        out.push_str(&response_repository_policy_without_find());
+    }
+    out
+}
+
+fn active_prompt_card_policy(exposure: &super::tools::ExposureSettings) -> String {
+    render_card_policy(
+        exposure.operator_visible("prompt_read"),
+        exposure.operator_visible("artifact_read"),
+        exposure.operator_visible("find"),
+    )
+}
+
+/// Whether `content` is a card THIS harness rendered for `context` — under
+/// the current operator tool policy or any earlier one (#2932: `/settings
+/// tools` can change the policy between turns, and a card rendered under the
+/// old policy must still be recognised as ours or the pair would be inserted
+/// twice). The head (marker and receipt lineage) must match exactly; the tail
+/// must be one of the eight policy renderings, optionally extended by an
+/// intake projection. A configured system prompt that merely wears the public
+/// marker is therefore still not mistaken for our card.
+fn is_owned_active_prompt_card(content: &str, head: &str) -> bool {
+    let Some(tail) = content.strip_prefix(head) else {
+        return false;
+    };
+    let boundary = format!("\n{PROMPT_COMPREHENSION_MODEL_CARD_PREFIX}\n");
+    let policy = tail.find(&boundary).map_or(tail, |at| &tail[..at]);
+    (0..8u8).any(|bits| render_card_policy(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) == policy)
 }
 
 /// The two projections of a `prompt_read` result.
@@ -858,6 +933,7 @@ fn prompt_origin_name(origin: PromptOrigin) -> &'static str {
     match origin {
         PromptOrigin::Operator => "operator",
         PromptOrigin::HarnessRetry => "harness_retry",
+        PromptOrigin::Flock => "flock",
     }
 }
 
@@ -1193,8 +1269,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":"act now"}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
 
         let cards: Vec<_> = messages
             .iter()
@@ -1231,11 +1307,71 @@ mod tests {
         );
     }
 
+    /// #2932 (second PR): `/settings tools` changes the operator policy
+    /// between turns. A card rendered under the OLD policy must still be
+    /// recognised as ours and replaced, or the pair is inserted twice — and
+    /// a system message that merely wears our head with a foreign body must
+    /// still be left alone.
+    #[test]
+    fn a_card_rendered_under_an_earlier_tool_policy_is_replaced_not_duplicated() {
+        let exact = "PRIVATE OPERATOR PROMPT";
+        let context = PromptReadContext::new(None, exact, None);
+        let open = super::super::tools::ExposureSettings::default();
+        let four = super::super::tools::ExposureSettings {
+            allow_list: Some(
+                crate::config::PI_PRESET_TOOLS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let foreign = format!(
+            "{}something else entirely",
+            active_prompt_card_head(context)
+        );
+        let mut messages = vec![
+            serde_json::json!({"role":"system", "content":"base"}),
+            serde_json::json!({"role":"system", "content":foreign}),
+            serde_json::json!({"role":"user", "content":exact}),
+        ];
+
+        ensure_active_prompt_card(&mut messages, context, None, &open);
+        let before = messages.len();
+        ensure_active_prompt_card(&mut messages, context, None, &four);
+
+        assert_eq!(messages.len(), before, "{messages:#?}");
+        let cards: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .filter(|c| c.starts_with(ACTIVE_PROMPT_PREFIX))
+            .collect();
+        assert_eq!(cards.len(), 2, "ours plus the foreign one: {cards:#?}");
+        assert!(cards.iter().any(|c| c.ends_with("something else entirely")));
+        let ours = cards
+            .iter()
+            .find(|c| !c.ends_with("something else entirely"))
+            .unwrap();
+        assert!(
+            !ours.contains("prompt_read"),
+            "re-rendered under the new policy: {ours}"
+        );
+        assert!(!ours.contains("find category=source"), "{ours}");
+        // The pair is intact: our card is immediately followed by the exact text.
+        let at = messages
+            .iter()
+            .position(|m| m["content"].as_str() == Some(ours))
+            .unwrap();
+        assert_eq!(messages[at + 1]["role"], "user");
+        assert_eq!(messages[at + 1]["content"], exact);
+    }
+
     #[test]
     fn comprehension_projection_replaces_base_and_prior_projection_in_one_active_card() {
         let exact = "PRIVATE OPERATOR PROMPT that remains at user priority";
         let context = PromptReadContext::new(None, exact, None);
-        let base_card = active_prompt_card(context);
+        let base_card = active_prompt_card(context, &Default::default());
         let research_card = append_prompt_comprehension_model_card(
             base_card.clone(),
             &format!(
@@ -1259,9 +1395,9 @@ mod tests {
             serde_json::json!({"role":"user", "content":exact}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        insert_active_prompt_card(&mut messages, context, &base_card, research_card);
-        insert_active_prompt_card(&mut messages, context, &base_card, act_card);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        insert_active_prompt_card(&mut messages, context, research_card);
+        insert_active_prompt_card(&mut messages, context, act_card);
 
         let cards: Vec<_> = messages
             .iter()
@@ -1309,13 +1445,45 @@ mod tests {
         );
     }
 
+    /// #2950 review 2 (P2): the card's recovery recipes derive from the same
+    /// operator-visible set as the catalog. Hidden recovery tools are not
+    /// named; provenance and the response policy stay.
+    #[test]
+    fn active_prompt_card_omits_recovery_recipes_for_operator_hidden_tools() {
+        let context = PromptReadContext::new(None, "task", None);
+        let open = active_prompt_card(context, &Default::default());
+        assert!(
+            open.contains("recovery: prompt_read current") && open.contains("artifact_read"),
+            "{open}"
+        );
+        let fenced = active_prompt_card(
+            context,
+            &super::super::tools::ExposureSettings {
+                allow_list: Some(vec!["read_file".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(fenced.starts_with(ACTIVE_PROMPT_PREFIX));
+        assert!(
+            !fenced.contains("prompt_read") && !fenced.contains("artifact_read"),
+            "{fenced}"
+        );
+        assert!(
+            fenced.contains("response_format: gfm_markdown"),
+            "the policy stays: {fenced}"
+        );
+    }
+
     #[test]
     fn active_prompt_card_always_steers_markdown_and_source_first_repository_evidence() {
-        let card = active_prompt_card(PromptReadContext::new(
-            None,
-            "How does authentication work in this repository?",
-            None,
-        ));
+        let card = active_prompt_card(
+            PromptReadContext::new(
+                None,
+                "How does authentication work in this repository?",
+                None,
+            ),
+            &Default::default(),
+        );
 
         assert!(
             card.contains("response_format: gfm_markdown"),
@@ -1359,9 +1527,9 @@ mod tests {
 
         // Intake runs after receipt/card creation. Repeated insertion models a
         // retry or compression rebuild and must still replace, not accumulate.
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, Some(&intake));
-        ensure_active_prompt_card(&mut messages, context, Some(&intake));
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, Some(&intake), &Default::default());
+        ensure_active_prompt_card(&mut messages, context, Some(&intake), &Default::default());
 
         let cards = messages
             .iter()
@@ -1425,8 +1593,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":user_data}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
 
         assert!(messages.iter().any(|message| {
             message["role"] == "user"
@@ -1463,8 +1631,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":current}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
 
         assert_eq!(
             messages.last(),
@@ -1493,8 +1661,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":current}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context, None);
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
 
         assert!(messages.iter().any(|message| {
             message["role"] == "system" && message["content"].as_str() == Some(collision.as_str())
@@ -1600,7 +1768,7 @@ mod tests {
             serde_json::json!({"role":"system", "content":"base"}),
             serde_json::json!({"role":"user", "content":"continue"}),
         ];
-        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None, &Default::default());
         let card = messages[1]["content"].as_str().unwrap();
         assert!(
             card.contains(&format!("submitted_previous_address: {original_id}")),
@@ -1639,5 +1807,34 @@ mod tests {
         assert_eq!(previous_json["address"], original_id.to_string());
         assert_eq!(previous_json["origin"], "operator");
         assert_eq!(previous_json["model_text"], original_text);
+    }
+
+    /// #2933 PR5: `card` off removes the card and nothing else; on, it is added.
+    #[test]
+    fn omit_card_adds_no_card_and_the_default_adds_one() {
+        let context = PromptReadContext::new(None, "task", None);
+        let base = || {
+            vec![
+                serde_json::json!({"role":"system", "content":"base"}),
+                serde_json::json!({"role":"user", "content":"task"}),
+            ]
+        };
+        let mut with = base();
+        ensure_active_prompt_card(&mut with, context, None, &Default::default());
+        assert!(
+            with.iter().any(|m| m["role"] == "system"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(ACTIVE_PROMPT_PREFIX))),
+            "the card is inserted: {with:?}"
+        );
+
+        let mut without = base();
+        let omit = super::super::tools::ExposureSettings {
+            omit_card: true,
+            ..Default::default()
+        };
+        ensure_active_prompt_card(&mut without, context, None, &omit);
+        assert_eq!(without, base(), "no card: the messages are untouched");
     }
 }

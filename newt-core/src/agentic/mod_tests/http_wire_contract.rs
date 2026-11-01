@@ -520,6 +520,7 @@ async fn capable_chat_bodies(
                 std::path::Path::new(NO_CHECKS_WORKSPACE),
                 &crate::Scope::All,
                 crate::tokens::TokenEstimation::default(),
+                &Default::default(),
             );
             let mut found = 0;
             for message in body["messages"].as_array_mut().unwrap() {

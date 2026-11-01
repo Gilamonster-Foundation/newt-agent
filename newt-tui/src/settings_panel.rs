@@ -218,8 +218,13 @@ impl SettingRow {
             }
             ValueSpace::Text { .. } => (Vec::new(), Vec::new(), None),
         };
-        let not_dialable = matches!(field.value_space(), ValueSpace::Text { .. })
-            .then(|| format!("edit with /settings {} \"<template>\"", field.name()));
+        let not_dialable = matches!(field.value_space(), ValueSpace::Text { .. }).then(|| {
+            if field == Field::Tools {
+                "Enter opens the checklist · /settings tools <all|pi|a,b,c>".to_string()
+            } else {
+                format!("edit with /settings {} \"<template>\"", field.name())
+            }
+        });
         Self {
             field,
             options,
@@ -343,6 +348,12 @@ pub(crate) enum Outcome {
         lines: Vec<String>,
         model: Option<String>,
     },
+    /// #2932: Enter on the `tools` row opens the checklist. A list is not a
+    /// dial, so the row cannot be edited here; it links instead.
+    OpenTools {
+        lines: Vec<String>,
+        model: Option<String>,
+    },
 }
 
 pub(crate) struct SettingsPanel {
@@ -350,6 +361,8 @@ pub(crate) struct SettingsPanel {
     sel: usize,
     /// Set by Enter on a door; read by [`run`] once the panel closes.
     walk_through: bool,
+    /// Set by Enter on the `tools` row (#2932).
+    walk_to_tools: bool,
 }
 
 impl SettingsPanel {
@@ -376,6 +389,7 @@ impl SettingsPanel {
             rows,
             sel: 0,
             walk_through: false,
+            walk_to_tools: false,
         }
     }
 
@@ -503,6 +517,10 @@ impl Screen for SettingsPanel {
                 // the caller does next, which is why it is reported rather
                 // than acted on here.
                 self.walk_through = matches!(self.rows.get(self.sel), Some(Row::Door(_)));
+                self.walk_to_tools = matches!(
+                    self.rows.get(self.sel),
+                    Some(Row::Setting(row)) if row.field == Field::Tools
+                );
                 return Flow::Close(true);
             }
             // `Char` is plain by construction, so Ctrl-Q no longer cancels —
@@ -646,6 +664,12 @@ pub(crate) fn run(
     let mut messages = panel.commit();
     messages.extend(theme_panel.applied);
     let model = panel.picked_model();
+    if panel.walk_to_tools {
+        return Ok(Outcome::OpenTools {
+            lines: messages,
+            model,
+        });
+    }
     if panel.walk_through {
         // Pending dial changes are applied on the way through, not discarded:
         // the operator asked for both, and dropping half of it because they
@@ -967,6 +991,29 @@ mod tests {
         let mut panel = panel();
         panel.sel = index_of(&panel, Field::Tenacity);
         assert_eq!(panel.key(Key::Enter), Flow::Close(true));
+        assert!(!panel.walk_through);
+        assert!(!panel.walk_to_tools);
+    }
+
+    /// #2932: the `tools` row is a list, not a dial — ←→ leave it alone, its
+    /// provenance names the checklist, and Enter on it links there rather
+    /// than applying.
+    #[test]
+    fn the_tools_row_links_to_the_checklist() {
+        let _g = GlobalSettingsGuard::acquire();
+        let mut panel = panel();
+        let at = index_of(&panel, Field::Tools);
+        panel.sel = at;
+        let before = row_of(&panel, Field::Tools).value.clone();
+        panel.key(Key::Right);
+        assert_eq!(row_of(&panel, Field::Tools).value, before);
+        assert!(
+            panel.view_rows()[at].provenance.contains("checklist"),
+            "{:?}",
+            panel.view_rows()[at].provenance
+        );
+        assert_eq!(panel.key(Key::Enter), Flow::Close(true));
+        assert!(panel.walk_to_tools);
         assert!(!panel.walk_through);
     }
 

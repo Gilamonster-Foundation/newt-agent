@@ -72,7 +72,7 @@ fn providers_table(rows: &[[String; 5]]) -> String {
 }
 
 fn list() -> anyhow::Result<()> {
-    let roster = resolve_presets(None);
+    let roster = resolve_presets();
     let builtins = builtin_presets();
     let mut rows: Vec<[String; 5]> = Vec::new();
     for p in &roster {

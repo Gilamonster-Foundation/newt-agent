@@ -963,21 +963,29 @@ fn initiative_action_forcing_nudge_fires_at_the_budget_and_resets_on_a_write() {
         ..Default::default()
     };
     // Nothing spent yet → no nudge.
-    assert!(state.action_forcing_nudge(Some(5), None, None).is_none());
+    assert!(state
+        .action_forcing_nudge(Some(5), None, None, &Default::default())
+        .is_none());
     // One read-only round → at the Eager budget → fires.
     state.record_round_outcome(false, false);
     let nudge = state
-        .action_forcing_nudge(Some(5), None, None)
+        .action_forcing_nudge(Some(5), None, None, &Default::default())
         .expect("eager initiative must force action after one read-only round");
     assert!(nudge.contains("edit_file or write_file"), "{nudge}");
     // Firing resets the counter; a follow-up read-only round re-accumulates.
-    assert!(state.action_forcing_nudge(Some(5), None, None).is_none());
+    assert!(state
+        .action_forcing_nudge(Some(5), None, None, &Default::default())
+        .is_none());
     state.record_round_outcome(false, false);
-    assert!(state.action_forcing_nudge(Some(5), None, None).is_some());
+    assert!(state
+        .action_forcing_nudge(Some(5), None, None, &Default::default())
+        .is_some());
     // A workspace-write round clears the counter entirely.
     state.record_round_outcome(true, true);
     assert!(
-        state.action_forcing_nudge(Some(5), None, None).is_none(),
+        state
+            .action_forcing_nudge(Some(5), None, None, &Default::default())
+            .is_none(),
         "a write must reset the read-only streak"
     );
 
@@ -987,11 +995,15 @@ fn initiative_action_forcing_nudge_fires_at_the_budget_and_resets_on_a_write() {
         standard.record_round_outcome(false, false);
     }
     assert!(
-        standard.action_forcing_nudge(Some(5), None, None).is_none(),
+        standard
+            .action_forcing_nudge(Some(5), None, None, &Default::default())
+            .is_none(),
         "measured must not fire before 3 read-only rounds"
     );
     standard.record_round_outcome(false, false);
-    assert!(standard.action_forcing_nudge(Some(5), None, None).is_some());
+    assert!(standard
+        .action_forcing_nudge(Some(5), None, None, &Default::default())
+        .is_some());
 }
 
 #[test]

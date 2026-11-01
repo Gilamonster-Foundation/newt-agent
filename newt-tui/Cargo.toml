@@ -22,10 +22,11 @@ newt-interaction.workspace = true
 newt-git.workspace = true
 newt-identity.workspace = true
 newt-inference.workspace = true
-newt-tools.workspace = true
 newt-skills.workspace = true
 newt-mcp-client.workspace = true
 anyhow.workspace = true
+# The editor scratch file for `/settings system-prompt edit` (#2938).
+tempfile.workspace = true
 # #2005 rung 7: the Esc/Ctrl-C precedence table. The crate decodes no keys and
 # owns no terminal — `esc_ladder.rs` supplies the trigger NAME and the claim
 # set, and the ladder answers who owns it. See assets/esc_ladder.toml.
@@ -64,6 +65,9 @@ getrandom.workspace = true
 # feature adds only this one crate.
 tui-textarea = { version = "0.7.0", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+newt-flock = { workspace = true, optional = true }
+
 # #1746 Windows-cockpit feasibility spike (docs/decisions/windows_cockpit_conpty.md):
 # raw Win32 bindings for the ConPTY probes (CreatePseudoConsole + a child hosted
 # under it, and the pipe-is-not-a-console counter-probe). Same crate + version
@@ -87,6 +91,11 @@ native-permission-test = []
 # TTY-only active-tool viewport (#1235). It has no dependency cost, but remains
 # independently severable from headless/wyvern builds.
 live-spill = []
+
+# Native flock inbox (12b): verified briefs and reviews addressed to this member
+# become durable, flock-origin prompts. Unix only, off by default: it pulls the
+# agent-mesh flock crates and needs Rust 1.91.
+flock = ["dep:newt-flock"]
 
 # The TTY rich inline input surface (ratatui Viewport::Inline + tui-textarea):
 # status row, live clock, multi-line vi/emacs editing. OFF by default — the
@@ -112,6 +121,9 @@ embedded = ["newt-inference/embedded"]
 # module that uses it.
 [target.'cfg(unix)'.dev-dependencies]
 tests-pty.workspace = true
+# 13e flock_ui tests: a signer double speaks the signer's wire format.
+agent-mesh-flock-server = { version = "0.8.0", default-features = false }
+content-addressable.workspace = true
 
 [dev-dependencies]
 # Paused-time metadata retry tests; no wall-clock sleeps.

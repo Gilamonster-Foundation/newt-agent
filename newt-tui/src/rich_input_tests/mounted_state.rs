@@ -232,3 +232,34 @@ fn ctrl_d_during_a_turn_is_acknowledged_not_dropped() {
         "idle Ctrl-D is still EOF"
     );
 }
+
+#[test]
+fn vi_unbound_normal_keys_do_not_stack_hints_in_scrollback() {
+    // #3015: every unbound NORMAL key committed "vi NORMAL — press i to
+    // insert" to durable scrollback, so identical lines stacked up. The
+    // nudge is transient chrome: it shows in the footer, never the transcript.
+    let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "hi");
+    let mut sink = RecordingSink::default();
+    mounted_key(&mut mounted, &mut sink, special(KeyCode::Esc)); // → NORMAL
+    sink.batches.clear();
+    mounted_chars(&mut mounted, &mut sink, "qqq");
+    let text = sink_text(&sink);
+    assert!(
+        !text.contains("press i to insert"),
+        "unbound keys must not write the hint to scrollback: {text:?}"
+    );
+    let footer: String = footer_line(&mounted.editor, "m", "e", None, "", true)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        footer.contains("press i to insert"),
+        "the hint is still shown, transiently, in the footer: {footer:?}"
+    );
+    mounted_key(&mut mounted, &mut sink, key('l')); // a bound key clears it
+    assert!(
+        mounted.editor.vi.hint.is_none(),
+        "the next key clears the hint"
+    );
+}

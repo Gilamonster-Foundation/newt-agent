@@ -147,6 +147,17 @@ fn drive(mode: &str) -> Outcome {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
+    // The guard sets raw mode first and writes the paste-on bytes after, so
+    // seeing raw does not mean the bytes have arrived: wait for them (a slow
+    // runner lost this race). The deadline only bounds a build that never
+    // enables paste, which the control below then reports.
+    if raw_during {
+        let deadline = Instant::now() + REACH_TIMEOUT;
+        while !screen.contains(PASTE_ON) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            screen.push_str(&pty.screen());
+        }
+    }
     let paste_during = screen.contains(PASTE_ON);
 
     // Release the child's blocking read so it proceeds to its exit path.

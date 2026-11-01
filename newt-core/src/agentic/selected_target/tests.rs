@@ -114,6 +114,7 @@ fn selected_target_projection_survives_compaction_continue_and_done_plan() {
         &mut messages,
         super::super::prompt_read::PromptReadContext::new(None, "Original task", None),
         None,
+        &Default::default(),
     );
     let mut projection = Projection::default();
     projection.refresh(

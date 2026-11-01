@@ -258,3 +258,372 @@ fn an_unknown_persisted_option_reads_as_none_not_error() {
         Some(newt_interaction::Audience::Web)
     );
 }
+
+fn flock_task(event: &str, body: &str) -> NewFlockTask {
+    NewFlockTask {
+        body: body.to_owned(),
+        flock_cid: "flock-1".into(),
+        event_cid: event.to_owned(),
+        evidence_cid: format!("evidence-of-{event}"),
+        evidence: format!("{{\"event\":\"{event}\"}}"),
+    }
+}
+
+/// A flock task is deduped by (flock, event) across restarts, even once it is
+/// delivered or rejected, and the web's dequeue never sees it.
+#[test]
+fn flock_tasks_dedupe_across_restarts_and_stay_out_of_the_web_queue() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+    let conv = store.create("session", None).unwrap();
+    assert_eq!(
+        store
+            .enqueue_flock_task(&conv, &flock_task("e1", "do e1"))
+            .unwrap(),
+        InjectOutcome::Enqueued
+    );
+    assert_eq!(
+        store
+            .enqueue_flock_task(&conv, &flock_task("e1", "do e1"))
+            .unwrap(),
+        InjectOutcome::Duplicate
+    );
+    store.inject_prompt(&conv, "from the web", None).unwrap();
+    // each queue sees only its own rows
+    assert_eq!(
+        store.take_injected_prompt(&conv).unwrap().unwrap().body,
+        "from the web"
+    );
+    assert_eq!(store.take_injected_prompt(&conv).unwrap(), None);
+    let first = store.peek_flock_task(&conv).unwrap().unwrap();
+    assert_eq!(first.task.body, "do e1");
+    // peeking leaves it queued
+    assert_eq!(store.peek_flock_task(&conv).unwrap().unwrap().id, first.id);
+
+    // a restart: a fresh store on the same database; replaying the same
+    // event is a duplicate whether it is queued, delivered or rejected
+    drop(store);
+    let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+    assert_eq!(
+        store
+            .enqueue_flock_task(&conv, &flock_task("e1", "do e1"))
+            .unwrap(),
+        InjectOutcome::Duplicate
+    );
+    store.reject_flock_task(&first).unwrap();
+    assert_eq!(
+        store.peek_flock_task(&conv).unwrap(),
+        None,
+        "rejected is never offered"
+    );
+    assert_eq!(
+        store
+            .enqueue_flock_task(&conv, &flock_task("e1", "do e1"))
+            .unwrap(),
+        InjectOutcome::Duplicate
+    );
+    // another event of the same flock, and the same event of another flock, are new
+    assert_eq!(
+        store
+            .enqueue_flock_task(&conv, &flock_task("e2", "do e2"))
+            .unwrap(),
+        InjectOutcome::Enqueued
+    );
+    let mut other = flock_task("e1", "other flock");
+    other.flock_cid = "flock-2".into();
+    assert_eq!(
+        store.enqueue_flock_task(&conv, &other).unwrap(),
+        InjectOutcome::Enqueued
+    );
+    // FIFO
+    let next = store.peek_flock_task(&conv).unwrap().unwrap();
+    assert_eq!(next.task.event_cid, "e2");
+    assert!(next.seq > first.seq);
+}
+
+#[test]
+fn a_flock_task_is_workspace_fenced() {
+    let root = tempfile::tempdir().unwrap();
+    let (ws_a, ws_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+    let b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+    let conv = a.create("session", None).unwrap();
+    assert!(b.enqueue_flock_task(&conv, &flock_task("e1", "x")).is_err());
+    a.enqueue_flock_task(&conv, &flock_task("e1", "x")).unwrap();
+    assert_eq!(b.peek_flock_task(&conv).unwrap(), None);
+}
+
+/// Accepting mints a `flock`-origin receipt (never `operator`) and marks the
+/// row delivered with that receipt's id in one transaction.
+#[test]
+fn accepting_a_flock_task_mints_a_flock_receipt_and_marks_delivery_together() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+    let conv = store.create("session", None).unwrap();
+    store
+        .enqueue_flock_task(&conv, &flock_task("e1", "the brief"))
+        .unwrap();
+    let task = store.peek_flock_task(&conv).unwrap().unwrap();
+
+    let ctx = store
+        .accept_flock_task(&conv, "session", None, &task)
+        .unwrap();
+    let receipt = store
+        .load_prompt(ctx.submitted_prompt().id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.origin(), PromptOrigin::Flock);
+    assert_eq!(receipt.raw_text(), b"the brief");
+    assert_eq!(
+        receipt.parent_prompt_id(),
+        None,
+        "it roots its own objective"
+    );
+    assert_eq!(receipt.root_prompt_id(), receipt.id());
+    assert_eq!(
+        store.latest_prompt(&conv).unwrap().unwrap().id(),
+        receipt.id()
+    );
+    // delivered, with the back-link
+    assert_eq!(store.peek_flock_task(&conv).unwrap(), None);
+    let conn = store.lock_conn();
+    let (delivered, link): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT delivered, delivered_receipt_id FROM conversation_inbox WHERE id = ?1",
+            [&task.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(delivered, 1);
+    assert_eq!(link.as_deref(), Some(receipt.id().to_string().as_str()));
+    drop(conn);
+
+    // a second accept of the same row mints nothing more
+    assert!(store
+        .accept_flock_task(&conv, "session", None, &task)
+        .is_err());
+    let receipts: i64 = store
+        .lock_conn()
+        .query_row("SELECT COUNT(*) FROM prompt_receipts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(receipts, 1, "a refused accept left a receipt behind");
+}
+
+/// The dequeue -> receipt crash window: when the receipt cannot be minted the
+/// row is still queued (nothing was marked), and when the row cannot be
+/// marked the receipt is rolled back. Neither half survives alone.
+#[test]
+fn a_failed_accept_leaves_no_receipt_and_the_task_still_queued() {
+    let root = tempfile::tempdir().unwrap();
+    let (ws_a, ws_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let store = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+    let other = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+    let conv = store.create("session", None).unwrap();
+    store
+        .enqueue_flock_task(&conv, &flock_task("e1", "the brief"))
+        .unwrap();
+    let task = store.peek_flock_task(&conv).unwrap().unwrap();
+
+    // receipt side fails (another workspace's fence): the row stays queued
+    assert!(other
+        .accept_flock_task(&conv, "session", None, &task)
+        .is_err());
+    assert_eq!(store.peek_flock_task(&conv).unwrap().unwrap().id, task.id);
+    assert_eq!(store.latest_prompt(&conv).unwrap(), None);
+
+    // mark side fails (the row was rejected meanwhile): the receipt rolls back
+    store.reject_flock_task(&task).unwrap();
+    assert!(store
+        .accept_flock_task(&conv, "session", None, &task)
+        .is_err());
+    assert_eq!(
+        store.latest_prompt(&conv).unwrap(),
+        None,
+        "a receipt survived the failed delivery mark"
+    );
+
+    // and a task that was peeked but never accepted (the process died) is
+    // offered again to the next store
+    store
+        .enqueue_flock_task(&conv, &flock_task("e2", "second"))
+        .unwrap();
+    let peeked = store.peek_flock_task(&conv).unwrap().unwrap();
+    drop(store);
+    let again = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+    assert_eq!(again.peek_flock_task(&conv).unwrap().unwrap().id, peeked.id);
+}
+
+/// A database made before the `flock` origin existed (its CHECK refuses it)
+/// is rebuilt on open with every receipt intact, and then takes flock tasks.
+#[test]
+fn an_older_database_is_migrated_to_allow_the_flock_origin() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let (conv, old_id) = {
+        let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("session", None).unwrap();
+        let ctx = store
+            .begin_prompt(&conv, "session", None, NewPrompt::operator("old", "old"))
+            .unwrap();
+        (conv, ctx.submitted_prompt().id())
+    };
+    // put the table back as an older binary made it: the narrow CHECK
+    {
+        let db = rusqlite::Connection::open(root.path().join(DB_FILE)).unwrap();
+        let sql: String = db
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'prompt_receipts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("'flock'"), "the fresh schema allows flock");
+        db.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA writable_schema = ON;")
+            .unwrap();
+        db.execute(
+            "UPDATE sqlite_master SET sql = replace(sql, ', ''flock''', '') WHERE name = 'prompt_receipts'",
+            [],
+        )
+        .unwrap();
+        db.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
+    }
+    {
+        let db = rusqlite::Connection::open(root.path().join(DB_FILE)).unwrap();
+        let sql: String = db
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'prompt_receipts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !sql.contains("'flock'"),
+            "the fixture is the older table: {sql}"
+        );
+    }
+    // reopening migrates it
+    let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+    let old = store
+        .load_prompt(old_id)
+        .unwrap()
+        .expect("the old receipt survived");
+    assert_eq!(old.raw_text(), b"old");
+    assert_eq!(old.origin(), PromptOrigin::Operator);
+    store
+        .enqueue_flock_task(&conv, &flock_task("e1", "new"))
+        .unwrap();
+    let task = store.peek_flock_task(&conv).unwrap().unwrap();
+    let ctx = store
+        .accept_flock_task(&conv, "session", None, &task)
+        .unwrap();
+    let new = store
+        .load_prompt(ctx.submitted_prompt().id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.origin(), PromptOrigin::Flock);
+    // chronology is intact across the rebuild
+    assert_eq!(
+        new.previous_prompt_id(),
+        Some(old_id),
+        "the rebuilt table kept receipt order"
+    );
+    let violations: i64 = store
+        .lock_conn()
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+}
+
+/// Review 2976 r1 finding 1: a self-rooted flock receipt must be readable by
+/// every lineage reader: context rebuild (resume), an operator continuation,
+/// a harness retry (durable and ephemeral) and an artifact write.
+#[test]
+fn a_flock_rooted_objective_can_be_resumed_continued_retried_and_annotated() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+    let conv = store.create("session", None).unwrap();
+    store
+        .enqueue_flock_task(&conv, &flock_task("e1", "the brief"))
+        .unwrap();
+    let task = store.peek_flock_task(&conv).unwrap().unwrap();
+    let ctx = store
+        .accept_flock_task(&conv, "session", None, &task)
+        .unwrap();
+    let id = ctx.submitted_prompt().id();
+
+    // resume: the context rebuilds, and the flock receipt is its own authority
+    let again = store.turn_prompt_context(&conv, id).unwrap().unwrap();
+    assert_eq!(again.submitted_prompt().id(), id);
+    assert_eq!(again.active().id(), id);
+    assert_eq!(again.active().receipt().origin(), PromptOrigin::Flock);
+
+    // an operator continuation and a harness retry attach to it
+    let cont = store
+        .begin_prompt(
+            &conv,
+            "session",
+            None,
+            NewPrompt::operator_continuation("go on", "go on", id),
+        )
+        .unwrap();
+    assert_eq!(cont.submitted_prompt().receipt().root_prompt_id(), id);
+    let retry = store
+        .begin_prompt(
+            &conv,
+            "session",
+            None,
+            NewPrompt::harness_retry("retry", "retry", id),
+        )
+        .unwrap();
+    assert_eq!(retry.active().id(), id, "authority stays the task");
+
+    // an ephemeral retry from the rebuilt context
+    let eph =
+        crate::TurnPromptContext::ephemeral_harness_retry(conv.clone(), "r", "r", &again).unwrap();
+    assert_eq!(eph.active().id(), id);
+
+    // an artifact can be written against it
+    store
+        .append_prompt_artifact(
+            &conv,
+            id,
+            crate::NewPromptArtifact::new(
+                crate::ArtifactKind::Decision,
+                crate::ArtifactRelation::DerivedFrom,
+            ),
+        )
+        .unwrap();
+}
+
+/// Review 2976 CI: concurrent openers of one fresh database race the additive
+/// column migration (`duplicate column name: ...`). Every opener must
+/// succeed, over many rounds, each released together by a barrier.
+#[test]
+fn concurrent_openers_of_a_fresh_database_all_succeed() {
+    for _ in 0..40 {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (root, ws, gate) = (
+                    root.path().to_path_buf(),
+                    ws.path().to_path_buf(),
+                    std::sync::Arc::clone(&gate),
+                );
+                std::thread::spawn(move || {
+                    gate.wait();
+                    ConversationStore::new(&root, &ws, 100).map(drop)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+}

@@ -140,6 +140,7 @@ impl Harness {
             input_stash: &mut self.input_stash,
             color: false,
             verbose: false,
+            report_sink: None,
         }
     }
 
@@ -1811,6 +1812,7 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
         preset_name: "strict".into(),
         clamp: newt_core::Caveats::default(),
         clamp_summary: "deny writes".into(),
+        skill: None,
         skill_body: Some("Inspect only.".into()),
         framing: Some("Keep the session clamp across conversations.".into()),
     }));
@@ -1890,6 +1892,7 @@ fn materialized_persona_fixture() -> (Harness, TabSet) {
         &h.memory,
         h.active_persona.as_ref(),
         &h.active_conversation_id,
+        None,
     );
     (h, tabs)
 }
@@ -2000,6 +2003,7 @@ fn materialized_tab_preserves_synthetic_altitude_without_loading_its_display_nam
         &h.memory,
         h.active_persona.as_ref(),
         &h.active_conversation_id,
+        None,
     );
     let b = h.durable("B");
     h.open_tab_on(&mut tabs, &b);
@@ -2046,7 +2050,7 @@ fn materialized_tab_keeps_a_known_absent_persona_instead_of_resurrecting_birth()
     let (mut h, mut tabs) = materialized_persona_fixture();
     let a = h.active_conversation_id.clone();
     h.active_persona = None;
-    h.system = crate::rebuild_system_prompt(&h.workspace, &h.memory, None, &a);
+    h.system = crate::rebuild_system_prompt(&h.workspace, &h.memory, None, &a, None);
     let b = h.durable("B");
     h.open_tab_on(&mut tabs, &b);
 

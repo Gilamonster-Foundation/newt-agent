@@ -61,9 +61,12 @@ impl Filter for EventFilter {
     }
 }
 
+// Only the tests construct it; outside `cfg(test)` it is dead code.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct InternalEventFilter;
 
+#[cfg(test)]
 impl Filter for InternalEventFilter {
     fn eval(&self, _: &InternalEvent) -> bool {
         true

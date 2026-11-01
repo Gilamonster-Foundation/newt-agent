@@ -453,15 +453,14 @@ pub(crate) use terminal::run_output_pager;
 pub(crate) use terminal::run_pager;
 #[cfg(all(unix, feature = "rich-tui", feature = "live-spill"))]
 pub(crate) use terminal::run_spill_picker;
-/// Re-exported for the real-PTY acceptance test only (#1677): it drops the
-/// guard mid-unwind in a child process to prove the restoration claim against
-/// an actual terminal. Nothing in the shipping path constructs it directly —
-/// `run_pager` owns its lifetime.
-// unix as well as test: the sole consumer is `transcript_pager_pty_test`,
-// which is itself `cfg(all(test, unix, feature = "rich-tui"))` because a pty
-// pair is unix-only. Without the `unix` here the re-export is an unused
-// import on Windows, and this repo runs `-D warnings`.
-#[cfg(all(test, unix, feature = "rich-tui"))]
+/// Re-exported for the cockpit presenter, which holds one while an operator's
+/// panel draws on the alternate screen (#3056), and for the real-PTY
+/// acceptance test (#1677), which drops it mid-unwind in a child process to
+/// prove the restoration claim against an actual terminal.
+// unix: both consumers are unix-only (the presenter, and a pty pair). Without
+// it the re-export is an unused import on Windows, and this repo runs
+// `-D warnings`.
+#[cfg(all(unix, feature = "rich-tui"))]
 pub(crate) use terminal::AltScreenGuard;
 
 #[cfg(feature = "rich-tui")]
@@ -487,9 +486,10 @@ mod terminal {
     /// panic included. Leaking the alternate screen would strand the whole
     /// session invisible, a worse failure than any pager bug.
     ///
-    /// `pub(crate)` solely for `transcript_pager_pty_test` (#1677): the real-PTY
-    /// error-path test drops this guard mid-unwind in a child process to prove
-    /// the restoration claim above against an actual terminal.
+    /// `pub(crate)` for the cockpit presenter's operator panels (#3056), and for
+    /// `transcript_pager_pty_test` (#1677): the real-PTY error-path test drops
+    /// this guard mid-unwind in a child process to prove the restoration claim
+    /// above against an actual terminal.
     ///
     /// **Composed onto [`RawModeGuard`] (#1905).** The alternate screen is
     /// this type's own; raw mode is the shared, nesting-aware owner held as a
@@ -534,7 +534,7 @@ mod terminal {
             Self::enter_on(out, window)
         }
 
-        fn enter_on(out: PanelOut, window: Option<PanelWindow>) -> io::Result<Self> {
+        pub(crate) fn enter_on(out: PanelOut, window: Option<PanelWindow>) -> io::Result<Self> {
             let raw = RawModeGuard::enter()?;
             // `SuspendHolder`, and it is the honest policy rather than the
             // convenient one: the alternate screen genuinely DOES suspend
@@ -703,6 +703,17 @@ mod terminal {
     ) -> io::Result<()> {
         let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(&mut guard.out))?;
         terminal.clear()?;
+        let mut folds = crate::fold_list::FoldList::default();
+        if picker {
+            for s in spills {
+                folds.push_finished(
+                    s.id().to_string(),
+                    format!("spill {} · {} lines", s.id(), s.total_lines()),
+                    s.lines().iter().cloned(),
+                );
+            }
+        }
+        // The spill the open inspector shows (a picker's selection, or the one spill).
         let mut selected = 0usize;
         let mut view = if picker {
             None
@@ -711,9 +722,10 @@ mod terminal {
         };
         loop {
             let mut page_rows = 1usize;
+            let mut width = 1usize;
             terminal.draw(|f| {
                 let title = if view.is_some() {
-                    format!("spill {}", spills[selected].id())
+                    format!("spill {}", spills[selected].id().tail())
                 } else {
                     "inspect retained output".into()
                 };
@@ -731,10 +743,12 @@ mod terminal {
                     &crate::modal::Chrome {
                         title: &title,
                         subtitle,
-                        hint: Some("Esc back · ↑↓ select · Enter inspect"),
+                        hint: Some("Esc back · ↑↓ select · Space fold/unfold · Enter open · PgUp/PgDn scroll"),
                     },
                 );
                 page_rows = usize::from(body.height.saturating_sub(1)).max(1);
+                // One column goes to the selection marker.
+                width = usize::from(body.width.saturating_sub(1)).max(1);
                 if let Some(view) = &mut view {
                     view.draw(f, body);
                 } else {
@@ -743,24 +757,15 @@ mod terminal {
                             "No output retained in this session. Older entries may have expired.",
                         )]
                     } else {
-                        let top = selected.saturating_sub(page_rows - 1);
-                        spills
-                            .iter()
-                            .enumerate()
-                            .skip(top)
-                            .take(page_rows)
-                            .map(|(i, s)| {
-                                let preview =
-                                    s.lines().first().map(String::as_str).unwrap_or("(empty)");
+                        let selected = folds.selected_item();
+                        folds
+                            .render(width, page_rows)
+                            .into_iter()
+                            .map(|r| {
+                                let on = r.header && r.item == selected;
                                 Line::styled(
-                                    format!(
-                                        "{} spill {} · {} lines · {}",
-                                        if i == selected { ">" } else { " " },
-                                        s.id(),
-                                        s.total_lines(),
-                                        preview
-                                    ),
-                                    if i == selected {
+                                    format!("{}{}", if on { ">" } else { " " }, r.text),
+                                    if on {
                                         Style::default().add_modifier(Modifier::REVERSED)
                                     } else {
                                         Style::default()
@@ -792,12 +797,19 @@ mod terminal {
                 KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(())
                 }
-                KeyCode::Up => selected = selected.saturating_sub(1),
-                KeyCode::Down => selected = (selected + 1).min(spills.len().saturating_sub(1)),
+                KeyCode::Up => folds.select_prev(),
+                KeyCode::Down => folds.select_next(),
+                KeyCode::Char(' ') => folds.toggle_selected(),
+                KeyCode::PageUp => folds.scroll(-(page_rows as isize), width),
+                KeyCode::PageDown => folds.scroll(page_rows as isize, width),
                 KeyCode::Enter => {
-                    view = spills
-                        .get(selected)
-                        .map(|s| super::OutputView::new(s.lines()));
+                    if let Some(i) = spills
+                        .iter()
+                        .position(|s| Some(s.id().to_string().as_str()) == folds.selected_key())
+                    {
+                        selected = i;
+                        view = Some(super::OutputView::new(spills[i].lines()));
+                    }
                 }
                 _ => {}
             }

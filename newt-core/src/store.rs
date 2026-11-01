@@ -165,6 +165,7 @@
 //! `BEGIN IMMEDIATE` transaction so tick allocation, chain extension, and the
 //! row insert are atomic.
 
+use crate::prompt::{NewPrompt, TurnPromptContext};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -204,7 +205,10 @@ use prompts::{
 mod schema;
 #[cfg(test)]
 use schema::wal_fallback_eligible;
-use schema::{apply_journal_mode, create_schema, reconcile_schema, BUSY_TIMEOUT};
+use schema::{
+    apply_journal_mode, create_flock_inbox_index, create_schema, migrate_prompt_origin_flock,
+    reconcile_schema, BUSY_TIMEOUT,
+};
 
 mod turn_chain;
 use turn_chain::{
@@ -296,6 +300,8 @@ impl ConversationStore {
                     // #1086: rebuild a legacy id-only-PK roadmaps table to the
                     // composite (id, workspace_key) key. No-op once composite.
                     .and_then(|fb| migrate_roadmaps_pk(&conn).map(|()| fb))
+                    .and_then(|fb| migrate_prompt_origin_flock(&conn).map(|()| fb))
+                    .and_then(|fb| create_flock_inbox_index(&conn).map(|()| fb))
                     // After reconciliation: the FTS view reads `events`,
                     // which on a drifted pre-17.1b db exists only once the
                     // column reconciliation above has run.
@@ -1229,6 +1235,7 @@ impl ConversationStore {
             .query_row(
                 "SELECT id, body, seq FROM conversation_inbox
                   WHERE conversation_id = ?1 AND workspace_key = ?2 AND delivered = 0
+                    AND source = 'web'
                   ORDER BY seq ASC LIMIT 1",
                 rusqlite::params![conversation_id, self.workspace_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1244,6 +1251,150 @@ impl ConversationStore {
         )?;
         tx.commit()?;
         Ok(Some(InjectedPrompt { id, body, seq }))
+    }
+
+    /// Enqueue a verified flock task for the running session. Idempotent on
+    /// (conversation, flock, event): a second call for the same event, from
+    /// a restart or a replay, is a no-op ([`InjectOutcome::Duplicate`]) even
+    /// after the first was delivered or rejected. Workspace-fenced like
+    /// [`inject_prompt`](Self::inject_prompt). `task.evidence` is stored as
+    /// given beside `task.evidence_cid`; the consumer verifies one against
+    /// the other before the task becomes a prompt.
+    pub fn enqueue_flock_task(
+        &self,
+        conversation_id: &str,
+        task: &NewFlockTask,
+    ) -> anyhow::Result<InjectOutcome> {
+        validate_record_id(conversation_id)?;
+        let now = (self.claim_clock)();
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT workspace_key FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match owner.as_deref() {
+            None => anyhow::bail!("cannot enqueue into unknown conversation `{conversation_id}`"),
+            Some(key) if key != self.workspace_id => {
+                anyhow::bail!("conversation `{conversation_id}` belongs to another workspace")
+            }
+            _ => {}
+        }
+        let seen = tx
+            .query_row(
+                "SELECT 1 FROM conversation_inbox
+                  WHERE conversation_id = ?1 AND flock_cid = ?2 AND event_cid = ?3",
+                rusqlite::params![conversation_id, task.flock_cid, task.event_cid],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if seen {
+            tx.commit()?;
+            return Ok(InjectOutcome::Duplicate);
+        }
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM conversation_inbox WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO conversation_inbox
+               (id, conversation_id, workspace_key, seq, body, idem_key, delivered,
+                injected_at_claim, source, flock_cid, event_cid, evidence_cid, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, ?6, 'flock', ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                new_conversation_id(),
+                conversation_id,
+                self.workspace_id,
+                seq,
+                task.body,
+                now,
+                task.flock_cid,
+                task.event_cid,
+                task.evidence_cid,
+                task.evidence,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(InjectOutcome::Enqueued)
+    }
+
+    /// The next undelivered flock task for `conversation_id`, left in the
+    /// queue: it is only marked delivered by
+    /// [`accept_flock_task`](Self::accept_flock_task), in the transaction that
+    /// mints its receipt. A crash between the two loses nothing.
+    pub fn peek_flock_task(&self, conversation_id: &str) -> anyhow::Result<Option<FlockTask>> {
+        let conn = self.lock_conn();
+        Ok(conn
+            .query_row(
+                "SELECT id, seq, body, flock_cid, event_cid, evidence_cid, evidence
+                   FROM conversation_inbox
+                  WHERE conversation_id = ?1 AND workspace_key = ?2 AND delivered = 0
+                    AND source = 'flock'
+                  ORDER BY seq ASC LIMIT 1",
+                rusqlite::params![conversation_id, self.workspace_id],
+                |row| {
+                    Ok(FlockTask {
+                        id: row.get(0)?,
+                        seq: row.get(1)?,
+                        task: NewFlockTask {
+                            body: row.get(2)?,
+                            flock_cid: row.get(3)?,
+                            event_cid: row.get(4)?,
+                            evidence_cid: row.get(5)?,
+                            evidence: row.get(6)?,
+                        },
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Accept a peeked flock task: mint its prompt receipt (origin `flock`,
+    /// never `operator`) and mark the row delivered with the receipt's id,
+    /// in ONE transaction. Either both happen or neither: there is no state
+    /// in which the row is delivered without a receipt or the receipt exists
+    /// with the row still queued.
+    ///
+    /// # Errors
+    /// The row is gone, already delivered or rejected (the receipt is rolled
+    /// back with it), or the receipt cannot be created.
+    pub fn accept_flock_task(
+        &self,
+        conversation_id: &str,
+        title: &str,
+        persona: Option<&str>,
+        task: &FlockTask,
+    ) -> anyhow::Result<TurnPromptContext> {
+        let prompt = NewPrompt::flock(task.task.body.as_bytes(), task.task.body.as_bytes());
+        let workspace = self.workspace_id.clone();
+        self.begin_prompt_with(conversation_id, title, persona, prompt, &mut |conn, ctx| {
+            let changed = conn.execute(
+                "UPDATE conversation_inbox
+                    SET delivered = 1, delivered_receipt_id = ?2
+                  WHERE id = ?1 AND workspace_key = ?3 AND delivered = 0 AND source = 'flock'",
+                rusqlite::params![task.id, ctx.submitted_prompt().id().to_string(), workspace],
+            )?;
+            anyhow::ensure!(changed == 1, "flock task {} is no longer queued", task.id);
+            Ok(())
+        })
+    }
+
+    /// Refuse a flock task that failed verification: it is marked rejected
+    /// (`delivered = 2`), keeps its evidence for inspection, and is never
+    /// offered again.
+    pub fn reject_flock_task(&self, task: &FlockTask) -> anyhow::Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE conversation_inbox SET delivered = 2
+              WHERE id = ?1 AND workspace_key = ?2 AND delivered = 0 AND source = 'flock'",
+            rusqlite::params![task.id, self.workspace_id],
+        )?;
+        Ok(())
     }
 
     /// Record the durable turn a delivered injection became — the additive,
@@ -2274,6 +2425,33 @@ pub enum InjectOutcome {
     /// An `idem_key` match already existed — no new row (a safe retry / a
     /// double-submit / an SSE reconnect that re-POSTed the same prompt).
     Duplicate,
+}
+
+/// A verified flock task as it is queued: its text, its identity as content
+/// ids, and the evidence it was built from with that evidence's id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewFlockTask {
+    /// The prompt text (already rendered inert; untrusted content).
+    pub body: String,
+    /// The flock's content id.
+    pub flock_cid: String,
+    /// The brief or review event's content id.
+    pub event_cid: String,
+    /// The content id of `evidence`.
+    pub evidence_cid: String,
+    /// The evidence, as bytes the consumer re-hashes.
+    pub evidence: String,
+}
+
+/// A queued flock task, from [`ConversationStore::peek_flock_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlockTask {
+    /// The inbox row id.
+    pub id: String,
+    /// Per-conversation FIFO sequence.
+    pub seq: i64,
+    /// What was queued.
+    pub task: NewFlockTask,
 }
 
 /// One dequeued injected prompt, from [`ConversationStore::take_injected_prompt`].

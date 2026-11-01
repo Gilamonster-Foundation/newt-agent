@@ -301,11 +301,15 @@ pub(crate) fn execute_tool_search_for_disposition(
         r.loaded = !hidden.is_some_and(|hidden| hidden.is_hidden(r.name));
         r
     }
+    // A tool the operator's policy excludes is not in this session's surface
+    // at all: discovery never names it, loaded or not (#2932).
+    let offered = |r: &ToolRec<'_>| !hidden.is_some_and(|hidden| hidden.is_operator_hidden(r.name));
     if disposition == super::PromptDisposition::Act {
         return search(
             query,
             records(catalog)
                 .into_iter()
+                .filter(offered)
                 .map(|r| mark(r, hidden))
                 .collect(),
         );
@@ -315,11 +319,13 @@ pub(crate) fn execute_tool_search_for_disposition(
     let visible = super::tools::filter_tools_for_disposition(catalog.clone(), disposition);
     let mut tools: Vec<ToolRec<'_>> = records(&visible)
         .into_iter()
+        .filter(offered)
         .map(|r| mark(r, hidden))
         .collect();
     tools.extend(
         records(catalog)
             .into_iter()
+            .filter(offered)
             .filter(|r| !super::tools::tool_allowed(disposition, r.name))
             .map(|r| ToolRec {
                 callable: false,

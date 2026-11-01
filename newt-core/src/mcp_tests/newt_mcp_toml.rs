@@ -65,6 +65,26 @@ url = "https://x/mcp"
     assert!(parse_newt_mcp_toml("other = 1").is_empty());
 }
 #[test]
+fn parse_newt_mcp_toml_reads_static_oauth_client_id() {
+    let text = r#"
+[[mcp_servers]]
+name = "example"
+type = "http"
+url = "https://mcp.example.com/mcp"
+oauth_client_id = "public-client-abc123"
+oauth_scopes = "files:read"
+oauth_callback_port = 8080
+"#;
+    let got = parse_newt_mcp_toml(text);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0].oauth_client_id.as_deref(),
+        Some("public-client-abc123")
+    );
+    assert_eq!(got[0].oauth_scopes.as_deref(), Some("files:read"));
+    assert_eq!(got[0].oauth_callback_port, Some(8080));
+}
+#[test]
 fn parse_newt_mcp_toml_reads_secret_refs_and_literals() {
     let text = r#"
 [[mcp_servers]]

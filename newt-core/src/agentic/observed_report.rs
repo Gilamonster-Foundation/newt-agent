@@ -5,7 +5,8 @@ mod files;
 mod prose;
 pub(crate) mod review;
 pub use prose::assistant_prose;
-pub(crate) use prose::{replay_messages, split_report};
+pub(crate) use prose::replay_messages;
+pub use prose::split_report;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -29,6 +30,8 @@ pub(crate) struct State {
     /// Canonical bytes of the latest pinned report; replaced, never mistaken for history.
     pinned: Option<(ContentId, Vec<u8>)>,
     review: Option<review::Review>,
+    /// Set by `render`: the envelope it built carries no fact worth showing.
+    factless: bool,
 }
 
 #[derive(Debug)]
@@ -74,6 +77,9 @@ impl ContentAddressable for Report<'_> {
 }
 
 const NOTICES_HEADING: &str = "Last turn harness notices (historical, not assistant-authored):";
+
+const NOT_A_WORK_TREE: &str = "File counts unavailable: root is not a Git work tree.";
+const UNAVAILABLE: &str = "File counts unavailable: incomplete or unauthorized snapshot.";
 
 const FILES_HEADING: &str = "Files since objective/adoption snapshot (LF counts; absence is 0):";
 const CHECKS_HEADING: &str = "Last observed checks per exact command/cwd (historical observations, not current-tree certification):";
@@ -191,6 +197,7 @@ impl State {
 
     pub(crate) fn render(&mut self, root: &Path, scope: &Scope<String>, prose: &str) -> String {
         self.pinned = None;
+        self.factless = false;
         self.review = Some(review::review(
             prose,
             review::Facts {
@@ -217,8 +224,18 @@ impl State {
         ));
         let rows = match (&state.baseline, &current) {
             (Some(before), Some(after)) => files::changes(before, after),
-            _ => vec!["File counts unavailable: incomplete or unauthorized snapshot.".into()],
+            _ if crate::agentic::claim_check::workspace_is_confirmed_not_a_repo(
+                &root.to_string_lossy(),
+                scope,
+            ) =>
+            {
+                vec![NOT_A_WORK_TREE.into()]
+            }
+            _ => vec![UNAVAILABLE.into()],
         };
+        // "No content changes" is still evidence against a claimed edit, so
+        // only an unavailable file snapshot can make the report factless.
+        let files_known = state.baseline.is_some() && current.is_some();
         let mut rows = rows;
         if rows.len() > 64 {
             let omitted = rows.len() - 64;
@@ -240,6 +257,12 @@ impl State {
             limited: state.limited,
             notices: &state.notices,
         };
+        self.factless = !files_known
+            && report.ambiguous.is_empty()
+            && state.checks.is_empty()
+            && state.publications.is_empty()
+            && state.notices.is_empty()
+            && !state.limited;
         let Ok(bytes) = report.canonical_form() else {
             return "## Observed\n\nFacts unavailable: content encoding failed.\n\n## Model explanation\n\n".into();
         };

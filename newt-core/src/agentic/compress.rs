@@ -1468,11 +1468,15 @@ pub(crate) fn protect_active_prompt_for_compression(
     messages: &[Value],
     active_task: &str,
 ) -> Vec<Value> {
+    // The transient pair is inserted and stripped under the same default
+    // policy; it never meets the loop's exposure-rendered card, because the
+    // histories compacted here carry no card.
     let mut protected = messages.to_vec();
     ensure_active_prompt_card(
         &mut protected,
         PromptReadContext::new(None, active_task, None),
         None,
+        &Default::default(),
     );
     protected
 }
@@ -1480,7 +1484,10 @@ pub(crate) fn protect_active_prompt_for_compression(
 /// Remove the harness-owned card and exactly its immediately following user
 /// message. Matching is structural, never by operator text.
 pub(crate) fn strip_active_prompt_pair(messages: Vec<Value>, active_task: &str) -> Vec<Value> {
-    let expected_card = active_prompt_card(PromptReadContext::new(None, active_task, None));
+    let expected_card = active_prompt_card(
+        PromptReadContext::new(None, active_task, None),
+        &Default::default(),
+    );
     let mut cleaned = Vec::with_capacity(messages.len());
     let mut index = 0;
     while index < messages.len() {

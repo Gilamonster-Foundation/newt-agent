@@ -94,6 +94,13 @@ class ChangedScopeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "")
 
+    def test_site_only_skips(self):
+        self.commit(".github/workflows/pages.yml", "name: Pages\n")
+        local = self.commit("site/index.html", "<!doctype html>\n")
+        result = self.run_script(local, self.base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
+
     def test_crate_a_change_selects_crate_a(self):
         local = self.commit("crate-a/src/lib.rs", "pub fn f() { 2; }\n")
         result = self.run_script(local, self.base)

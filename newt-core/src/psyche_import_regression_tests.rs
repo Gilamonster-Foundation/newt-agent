@@ -1,4 +1,5 @@
 use super::*;
+use crate::tty::Level;
 use std::cell::{Cell, RefCell};
 
 /// PR #2445: a config edited after the migration read must keep the new bytes.
@@ -139,7 +140,7 @@ fn psyche_split_fix_config_migration_respects_the_save_lock() {
     std::fs::write(&path, old).unwrap();
     let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
     let lock = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
-    let loaded = read_config_file(&path, true, &mut |_| {}).unwrap();
+    let loaded = read_config_file(&path, true, &[], &mut |_| {}).unwrap();
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         old,
@@ -147,10 +148,101 @@ fn psyche_split_fix_config_migration_respects_the_save_lock() {
     );
     assert_eq!(loaded, migrate_config_text(old).unwrap().text);
     drop(lock);
-    assert_eq!(read_config_file(&path, true, &mut |_| {}).unwrap(), loaded);
+    assert_eq!(
+        read_config_file(&path, true, &[], &mut |_| {}).unwrap(),
+        loaded
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), loaded);
     assert!(
         !destination.lock_path().exists(),
         "release the migration lock"
     );
+}
+
+/// MCP import holds the transaction lock before it re-reads consulted configs.
+/// A read that passes the held lock must not re-acquire it: no retry loop, no
+/// false contention warning, and no "changes were not saved" claim.
+#[test]
+#[serial_test::serial(lock_contention_notice)]
+fn import_read_respects_held_lock_no_retry() {
+    crate::atomic_fs::reset_lock_attempts_for_test();
+    crate::psyche_import::reset_lock_contention_warned_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "# current operator bytes\n").unwrap();
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
+    let guard = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+    crate::atomic_fs::reset_lock_attempts_for_test();
+    let held: &[&crate::atomic_fs::LockGuard] = &[&guard];
+    let mut notices = Vec::new();
+    let loaded = read_config_file(&path, true, held, &mut |n| notices.push(n)).unwrap();
+    assert_eq!(loaded, "# current operator bytes\n");
+    assert!(notices.is_empty(), "clean read under a held lock is quiet");
+    assert_eq!(
+        crate::atomic_fs::lock_attempts_for_test(),
+        0,
+        "the held lock must bypass acquire_lock entirely"
+    );
+    drop(guard);
+    assert!(!destination.lock_path().exists());
+}
+
+/// A reader that does NOT hold the lock still contends normally. This is the
+/// negative case for the held-lock optimization: genuine exclusion is
+/// preserved, and the caller still gets the current bytes in memory once the
+/// retry budget exhausts.
+#[test]
+#[serial_test::serial(lock_contention_notice)]
+fn unheld_config_reader_still_exhausts_lock_budget() {
+    crate::atomic_fs::reset_lock_attempts_for_test();
+    crate::psyche_import::reset_lock_contention_warned_for_test();
+    let _zero_delay = crate::atomic_fs::set_lock_retry_delay_for_test(std::time::Duration::ZERO);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "# current operator bytes\n").unwrap();
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
+    let guard = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+    crate::atomic_fs::reset_lock_attempts_for_test();
+    let mut notices = Vec::new();
+    let loaded = read_config_file(&path, true, &[], &mut |n| notices.push(n)).unwrap();
+    assert_eq!(loaded, "# current operator bytes\n");
+    assert_eq!(
+        crate::atomic_fs::lock_attempts_for_test(),
+        100,
+        "a reader without the held lock must retry to exhaustion"
+    );
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].line().contains("cannot lock config"));
+    drop(guard);
+}
+
+/// A migration that actually writes under a held lock succeeds silently; there
+/// is no "changes were not saved" warning. This is the positive side of the
+/// false-warning fix.
+#[test]
+#[serial_test::serial(lock_contention_notice)]
+fn held_lock_migration_reports_success_not_unsaved_warning() {
+    crate::psyche_import::reset_lock_contention_warned_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let old = "[tenacity]\ndefault = \"standard\"\n";
+    std::fs::write(&path, old).unwrap();
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
+    let guard = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+    let held: &[&crate::atomic_fs::LockGuard] = &[&guard];
+    let mut notices = Vec::new();
+    let loaded = read_config_file(&path, true, held, &mut |n| notices.push(n)).unwrap();
+    let migrated = migrate_config_text(old).unwrap().text;
+    assert_eq!(loaded, migrated);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), migrated);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].level, Level::Ok);
+    assert!(notices[0].line().contains("migrated config"));
+    assert!(
+        !notices[0]
+            .line()
+            .contains("config changes from this command were not saved"),
+        "successful migration must not claim changes were not saved"
+    );
+    drop(guard);
 }

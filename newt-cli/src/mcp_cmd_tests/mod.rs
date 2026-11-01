@@ -25,6 +25,9 @@ fn stdio_entry(name: &str, command: Option<&str>) -> McpServerEntry {
         headers: BTreeMap::new(),
         login_argv: Vec::new(),
         request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
         trust: McpTrust::Trusted,
         origin: None,
     }
@@ -52,5 +55,11 @@ mod invocation;
 #[path = "listing.rs"]
 mod listing;
 #[cfg(test)]
+#[path = "next_steps.rs"]
+mod next_steps;
+#[cfg(test)]
 #[path = "registration_entry.rs"]
 mod registration_entry;
+#[cfg(test)]
+#[path = "self_lock.rs"]
+mod self_lock;

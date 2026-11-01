@@ -3,6 +3,7 @@
 use agent_bridle_fdguard::{GrantedRoot, RootIdentity};
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -52,6 +53,7 @@ impl HeldRoot {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         match self {
             Self::Directory(root) => root.as_fd(),
