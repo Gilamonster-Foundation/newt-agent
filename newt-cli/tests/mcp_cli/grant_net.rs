@@ -463,48 +463,43 @@ fn explicit_grant_uses_the_explicit_base_merge_strategy() {
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
 fn force_grant_net_refuses_a_cross_file_legacy_override() {
-    for target_also_exists in [false, true] {
-        let sb = sandbox();
-        let breakout = sb.config_dir.join("mcp.toml");
-        let breakout_text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\n";
-        std::fs::write(&breakout, breakout_text).unwrap();
-        let config = sb.config_dir.join("config.toml");
-        let config_text = target_also_exists.then_some(
-            "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://active.example.test/mcp\"\n",
-        );
-        if let Some(text) = config_text {
-            std::fs::write(&config, text).unwrap();
-        }
-        let source = sb.cwd.join("source.json");
-        std::fs::write(
-            &source,
-            r#"{ "mcpServers": {
-                  "review": { "type": "http", "url": "https://new.example.test/mcp" }
-            } }"#,
-        )
-        .unwrap();
+    // Adding `review` to config.toml would shadow the mcp.toml copy. When
+    // config.toml already holds it, the update is in place instead (#3062
+    // review, F4; see force_import_updates_the_owner_in_place_beside_a_shadowed_copy).
+    let sb = sandbox();
+    let breakout = sb.config_dir.join("mcp.toml");
+    let breakout_text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\n";
+    std::fs::write(&breakout, breakout_text).unwrap();
+    let config = sb.config_dir.join("config.toml");
+    let source = sb.cwd.join("source.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "review": { "type": "http", "url": "https://new.example.test/mcp" }
+        } }"#,
+    )
+    .unwrap();
 
-        newt(&sb)
-            .args([
-                "mcp",
-                "import",
-                source.to_str().unwrap(),
-                "--name",
-                "review",
-                "--grant-net",
-                "--force",
-            ])
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("cross-file overwrite"))
-            .stderr(predicate::str::contains("Remove the existing server first"));
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--name",
+            "review",
+            "--grant-net",
+            "--force",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cross-file overwrite"))
+        .stderr(predicate::str::contains(format!(
+            "`newt --config {} mcp remove review`",
+            breakout.display()
+        )));
 
-        assert_eq!(std::fs::read_to_string(breakout).unwrap(), breakout_text);
-        match config_text {
-            Some(text) => assert_eq!(std::fs::read_to_string(config).unwrap(), text),
-            None => assert!(!config.exists()),
-        }
-    }
+    assert_eq!(std::fs::read_to_string(breakout).unwrap(), breakout_text);
+    assert!(!config.exists());
 }
 
 #[test]

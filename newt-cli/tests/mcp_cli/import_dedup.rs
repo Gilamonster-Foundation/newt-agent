@@ -151,6 +151,57 @@ fn import_force_updates_the_effective_config_owner() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_updates_the_owner_in_place_beside_a_shadowed_copy() {
+    // #3062 review (F4, G3): config.toml owns `alpha` and mcp.toml holds an
+    // older, shadowed copy. The import updates the owner in place, since the
+    // copy predates it, and names the command that removes that copy: the
+    // default `newt mcp remove alpha` deletes the owner instead.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let shadowed = "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/true\"\nargs = [\"--stale\"]\nenv = { API_TOKEN = { env = \"OLD_TOKEN\" } }\n";
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "alpha": { "command": "/bin/true", "args": ["--live"], "requestTimeoutSecs": 30 } } }"#,
+    )
+    .unwrap();
+    for extra in [&[][..], &["--grant-net"][..]] {
+        std::fs::write(
+            &config,
+            "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/true\"\nargs = [\"--live\"]\nlogin_argv = [\"/bin/true\", \"login\"] # operator login\n",
+        )
+        .unwrap();
+        std::fs::write(&mcp, shadowed).unwrap();
+        newt(&sb)
+            .args([
+                "mcp",
+                "import",
+                source.to_str().unwrap(),
+                "--all",
+                "--force",
+            ])
+            .args(extra)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("1 replaced"))
+            .stdout(predicate::str::contains(format!(
+                "`newt --config {} mcp remove alpha`",
+                mcp.display()
+            )));
+        let updated = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            updated.contains("login_argv = [\"/bin/true\", \"login\"] # operator login"),
+            "{updated}"
+        );
+        assert!(updated.contains("request_timeout_secs = 30"), "{updated}");
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), shadowed);
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_refuses_a_batch_with_multiple_owners_without_writing() {
     let sb = sandbox();
     let config_path = sb.config_dir.join("config.toml");

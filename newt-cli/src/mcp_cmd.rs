@@ -527,6 +527,13 @@ fn write_back(destination: &ResolvedPath, text: &str) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", destination.as_path().display()))
 }
 
+/// The command that removes `name` from exactly `path`. Advice names this, not
+/// the default `newt mcp remove`, which edits the owning file: when a refusal
+/// is about a shadowed or outranking copy, that is another entry (#2915).
+fn remove_from(path: &Path, name: &str) -> String {
+    format!("`newt --config {} mcp remove {name}`", path.display())
+}
+
 /// Remove `name`, resolving the target the same way `add` does. An explicit
 /// target (`--project`/`--config`/`$NEWT_CONFIG`) is acted on directly. At the
 /// default scope, resolve the file that contributes the entry to the effective
@@ -1884,6 +1891,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let mut higher_precedence_replacements = 0usize;
     let mut unchanged = 0usize;
     let mut moved: Vec<&str> = Vec::new();
+    let mut shadowed: Vec<&str> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut adopted = Vec::new();
     for entry in &imported {
@@ -1895,10 +1903,11 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             .find(|(_, names)| names.contains(&entry.name))
         {
             bail!(
-                "`{}` is already defined in {}, which outranks or can outrank {} — an import here would be ineffective. Remove it there first, or re-run with an explicit --config target",
+                "`{}` is already defined in {}, which outranks or can outrank {} — an import here would be ineffective. Remove it there first with {}, or re-run with an explicit --config target",
                 entry.name,
                 path.display(),
-                target.display()
+                target.display(),
+                remove_from(path, &entry.name)
             );
         }
         let exists_in_target = existing.contains(&entry.name);
@@ -1910,13 +1919,19 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                 continue;
             }
             if request.force {
+                // An entry the target already holds is updated in place: its
+                // shadowed copy predates the import, so it is named, not refused.
                 if target_destination != breakout_destination && exists_in_breakout {
-                    bail!(
-                        "MCP server `{}` exists in {} but the import writes atomically to {}; refusing a cross-file overwrite that would leave a dormant duplicate. Remove the existing server first, then re-run the import",
-                        entry.name,
-                        breakout_target.display(),
-                        target.display()
-                    );
+                    if !exists_in_target {
+                        bail!(
+                            "MCP server `{}` exists in {} but the import writes atomically to {}; refusing a cross-file overwrite that would leave a dormant duplicate. Remove that copy with {}, then re-run the import",
+                            entry.name,
+                            breakout_target.display(),
+                            target.display(),
+                            remove_from(&breakout_target, &entry.name)
+                        );
+                    }
+                    shadowed.push(entry.name.as_str());
                 }
                 if exists_in_target {
                     let previous_url = existing_entries
@@ -2044,6 +2059,14 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         "Results: {added} added, {replaced} replaced, {unchanged} unchanged, {} skipped.",
         skipped.len()
     )?;
+    for name in &shadowed {
+        writeln!(
+            out,
+            "warning: MCP server `{name}` also has a shadowed copy in {}, left as it was; remove it with {}",
+            breakout_target.display(),
+            remove_from(&breakout_target, name)
+        )?;
+    }
     if !hosts.is_empty() {
         writeln!(
             out,
