@@ -50,6 +50,64 @@ fn merge_does_not_grant_network_authority_for_a_skipped_server() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_grants_and_reports_the_entry_it_saved() {
+    // #3062 review (F2, G4): a force import keeps a local `enabled = false`
+    // the source omits, so the saved server stays disabled. Its host must not
+    // be granted, and the next steps must not call it admitted.
+    let sb = sandbox();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "remote": { "type": "http", "url": "https://mcp.example.test/mcp" },
+              "docs": { "command": "/bin/true" }
+        } }"#,
+    )
+    .unwrap();
+    let config = sb.config_dir.join("config.toml");
+    let config_text = "[[mcp_servers]]\nname = \"remote\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nenabled = false # keep off until review\n";
+    std::fs::write(&config, config_text).unwrap();
+
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--name",
+            "remote",
+            "--force",
+            "--grant-net",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remote — not admitted"))
+        .stdout(predicate::str::contains("Granted").not());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), config_text);
+
+    let mcp = sb.config_dir.join("mcp.toml");
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"docs\"\ncommand = \"/bin/true\"\nenabled = false # paused by operator\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--name",
+            "docs",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docs — not admitted"))
+        .stdout(predicate::str::contains("docs — admitted").not());
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn grant_net_merge_under_a_project_config_recognizes_the_user_owned_server() {
     let sb = sandbox();
     std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();

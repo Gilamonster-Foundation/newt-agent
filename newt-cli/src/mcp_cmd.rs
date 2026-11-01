@@ -1915,7 +1915,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                         added += 1;
                     }
                 }
-                adopted.push(entry.clone());
+                adopted.push(entry.name.as_str());
                 continue;
             }
             let existing_path = if exists_in_target {
@@ -1937,8 +1937,16 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         }
         doc = Config::with_mcp_server_added(&doc, entry)?;
         added += 1;
-        adopted.push(entry.clone());
+        adopted.push(entry.name.as_str());
     }
+    // A merge keeps local settings the source omits (`enabled = false`, a
+    // timeout, OAuth pins), so grants and readiness describe each server as
+    // the document now holds it, not as the source spelled it (#2915).
+    let saved = parse_mcp_config(&doc, &target)?;
+    let adopted: Vec<McpServerEntry> = adopted
+        .iter()
+        .filter_map(|name| saved.iter().find(|entry| entry.name == *name).cloned())
+        .collect();
     let hosts = if request.grant_net {
         imported_http_hosts(&adopted)?
     } else {
