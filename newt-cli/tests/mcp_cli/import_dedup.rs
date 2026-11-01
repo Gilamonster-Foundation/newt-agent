@@ -103,7 +103,8 @@ fn import_dedup_errors_on_clash_unless_force_or_merge() {
 #[serial_test::serial(real_fs)]
 fn import_force_updates_the_effective_config_owner() {
     // config.toml outranks ~/.newt/mcp.toml. --force must update that owner,
-    // while non-mutating modes continue to refuse a shadowed default target.
+    // a plain import refuses a shadowed default target, and --merge keeps
+    // the existing entry as its help says (#3062 review, G6).
     let sb = sandbox();
     std::fs::write(
         sb.config_dir.join("config.toml"),
@@ -117,16 +118,25 @@ fn import_force_updates_the_effective_config_owner() {
     )
     .unwrap();
 
-    for extra in [&[][..], &["--merge"][..]] {
-        let mut args = vec!["mcp", "import", claude.to_str().unwrap(), "--all"];
-        args.extend_from_slice(extra);
-        newt(&sb)
-            .args(&args)
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("outranks"))
-            .stderr(predicate::str::contains("scrybe"));
-    }
+    newt(&sb)
+        .args(["mcp", "import", claude.to_str().unwrap(), "--all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("outranks"))
+        .stderr(predicate::str::contains("scrybe"));
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            claude.to_str().unwrap(),
+            "--all",
+            "--merge",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 0 replaced, 0 unchanged, 1 skipped.",
+        ));
     newt(&sb)
         .args([
             "mcp",
@@ -145,6 +155,48 @@ fn import_force_updates_the_effective_config_owner() {
     assert!(
         !sb.config_dir.join("mcp.toml").exists(),
         "force should replace the existing owner, not create a duplicate"
+    );
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn merge_import_skips_a_name_a_higher_precedence_file_defines() {
+    // #3062 review (G6): --merge promises "import only names not already
+    // present (no error)". A name config.toml already defines is present, so
+    // it is skipped and counted while the new name is imported.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let config_text = "[[mcp_servers]]\nname = \"docs\"\ncommand = \"/bin/true\"\n";
+    std::fs::write(&config, config_text).unwrap();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "docs": { "command": "/bin/false" }, "fresh": { "command": "/bin/true" } } }"#,
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--all",
+            "--merge",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped 1 already present: docs"))
+        .stdout(predicate::str::contains(
+            "Results: 1 added, 0 replaced, 0 unchanged, 1 skipped.",
+        ));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), config_text);
+    let imported = newt_core::mcp::parse_newt_mcp_toml(
+        &std::fs::read_to_string(sb.config_dir.join("mcp.toml")).unwrap(),
+    );
+    assert_eq!(
+        imported.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+        ["fresh"]
     );
 }
 

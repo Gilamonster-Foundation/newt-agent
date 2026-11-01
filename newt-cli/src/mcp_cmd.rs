@@ -98,7 +98,8 @@ pub enum McpCmd {
     Serve,
     /// Import selected MCP servers from Claude Code, Codex, or a config file.
     /// The equivalent trusted newt TOML is written to `~/.newt/mcp.toml`
-    /// (created if absent). Literal or active secret-bearing values make the
+    /// (created if absent), or with --force to the file that already defines
+    /// a selected server. Literal or active secret-bearing values make the
     /// selected import fail; environment references survive.
     Import {
         /// Path to a Claude JSON or Codex TOML MCP config. An alternative to
@@ -125,7 +126,9 @@ pub enum McpCmd {
         /// `[tui.permissions] net`.
         #[arg(long)]
         grant_net: bool,
-        /// Overwrite entries whose name already exists (default: error on a clash).
+        /// Update entries whose name already exists: the source's fields
+        /// replace the local ones, other local settings are kept (default:
+        /// error on a clash).
         #[arg(long)]
         force: bool,
         /// Keep existing entries — import only names not already present (no error).
@@ -1898,13 +1901,18 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let mut skipped: Vec<String> = Vec::new();
     let mut adopted = Vec::new();
     for entry in &imported {
-        // A clash with an actually outranking config is always fatal. The
+        // A clash with an actually outranking config is fatal, except that
+        // `--merge` keeps it as an existing entry, as its help says. The
         // authoritative write target itself was filtered above, so its entries
         // retain the normal `--force` / `--merge` behavior.
         if let Some((path, _)) = outranking
             .iter()
             .find(|(_, names)| names.contains(&entry.name))
         {
+            if request.merge {
+                skipped.push(entry.name.clone());
+                continue;
+            }
             bail!(
                 "`{}` is already defined in {}, which outranks or can outrank {} — an import here would be ineffective. Remove it there first with {}, or re-run with an explicit --config target",
                 entry.name,
