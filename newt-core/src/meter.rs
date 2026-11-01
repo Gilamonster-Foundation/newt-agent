@@ -50,31 +50,27 @@ impl SpendStatus {
     }
 }
 
-/// OpenRouter `GET /api/v1/key` response shape. Only the fields we read are
-/// modeled; unknown fields are ignored by serde.
-#[derive(Deserialize, Default)]
+/// OpenRouter `GET /api/v1/key` response: everything sits under `data`. Only
+/// the fields we read are modeled; serde ignores the rest.
+#[derive(Deserialize)]
 struct OpenRouterKeyResponse {
-    data: Option<KeyData>,
-    effective_budget: Option<EffectiveBudget>,
+    data: KeyData,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct KeyData {
-    #[serde(default)]
+    /// The budget that blocks requests first; `null` when none applies.
+    effective_budget: Option<KeyBudget>,
     limit_remaining: Option<f64>,
-    #[serde(default)]
     limit: Option<f64>,
-    #[serde(default)]
     limit_reset: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
-struct EffectiveBudget {
-    #[serde(default)]
-    remaining_usd: Option<f64>,
-    #[serde(default)]
-    limit_usd: Option<f64>,
-    #[serde(default)]
+#[derive(Deserialize)]
+struct KeyBudget {
+    remaining_usd: f64,
+    limit_usd: f64,
+    /// `null` for a lifetime budget.
     resets_at: Option<String>,
 }
 
@@ -126,31 +122,23 @@ async fn read_key_response(
 }
 
 fn parse_key_body(body: &[u8]) -> SpendStatus {
-    let parsed: OpenRouterKeyResponse = match serde_json::from_slice(body) {
-        Ok(parsed) => parsed,
-        Err(_) => return SpendStatus::Unknown,
+    let Ok(OpenRouterKeyResponse { data }) = serde_json::from_slice(body) else {
+        return SpendStatus::Unknown;
     };
-    let remaining = parsed
-        .effective_budget
-        .as_ref()
-        .and_then(|b| b.remaining_usd)
-        .or_else(|| parsed.data.as_ref().and_then(|d| d.limit_remaining));
-    let limit = parsed
-        .effective_budget
-        .as_ref()
-        .and_then(|b| b.limit_usd)
-        .or_else(|| parsed.data.as_ref().and_then(|d| d.limit));
-    let resets_at = parsed
-        .effective_budget
-        .as_ref()
-        .and_then(|b| b.resets_at.as_deref())
-        .or_else(|| parsed.data.as_ref().and_then(|d| d.limit_reset.as_deref()))
-        .map(String::from);
-    match (remaining, limit) {
-        (Some(remaining), Some(limit)) => SpendStatus::Known {
-            remaining_usd: remaining,
-            limit_usd: limit,
-            resets_at,
+    // Read whole: the effective budget's numbers never pair with the key
+    // limit's reset.
+    if let Some(budget) = data.effective_budget {
+        return SpendStatus::Known {
+            remaining_usd: budget.remaining_usd,
+            limit_usd: budget.limit_usd,
+            resets_at: budget.resets_at,
+        };
+    }
+    match (data.limit_remaining, data.limit) {
+        (Some(remaining_usd), Some(limit_usd)) => SpendStatus::Known {
+            remaining_usd,
+            limit_usd,
+            resets_at: data.limit_reset,
         },
         _ => SpendStatus::Unknown,
     }
@@ -372,6 +360,21 @@ mod tests {
             remaining_usd: 74.5,
             limit_usd: 100.0,
             resets_at: Some("monthly".to_string()),
+        };
+        assert_eq!(status, expected);
+    }
+
+    /// A lifetime effective budget (`resets_at: null`) has no reset; it never
+    /// borrows the key limit's "monthly".
+    #[tokio::test]
+    async fn lifetime_budget_keeps_its_own_reset() {
+        let mut budget = member_budget();
+        budget["resets_at"] = serde_json::Value::Null;
+        let status = read(200, key_record(budget).to_string()).await;
+        let expected = SpendStatus::Known {
+            remaining_usd: 17.5,
+            limit_usd: 50.0,
+            resets_at: None,
         };
         assert_eq!(status, expected);
     }
