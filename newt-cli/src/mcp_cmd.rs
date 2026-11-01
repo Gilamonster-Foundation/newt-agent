@@ -540,7 +540,8 @@ fn remove_from(path: &Path, name: &str) -> String {
 /// Remove `name`, resolving the target the same way `add` does. An explicit
 /// target (`--project`/`--config`/`$NEWT_CONFIG`) is acted on directly. At the
 /// default scope, resolve the file that contributes the entry to the effective
-/// MCP list rather than guessing from file existence.
+/// MCP list rather than guessing from file existence; a project or system
+/// owner must be named ([`Config::mcp_server_edit_path`]).
 fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
     let removed = |destination: &ResolvedPath| {
         let text = read_config_text(destination.as_path())?;
@@ -552,8 +553,7 @@ fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyho
         write_back(&destination, &removed(&destination)?)?;
         return Ok(explicit);
     }
-    let owner = Config::mcp_server_owner_path(name)?
-        .ok_or_else(|| anyhow!("no MCP server named `{name}` in the effective Newt config"))?;
+    let owner = Config::mcp_server_edit_path(name)?;
     let (destination, _guard) = resolve_and_lock_write_target(&owner)?;
     let current_owner = Config::mcp_server_owner_path(name)?
         .as_deref()

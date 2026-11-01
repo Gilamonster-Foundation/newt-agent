@@ -125,6 +125,37 @@ fn remove_edits_the_file_that_owns_the_effective_server() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn remove_edits_a_project_owner_only_when_named() {
+    // #3062 review (G2): the walked-up project config is repo-tracked. A
+    // default-scope remove never wrote it on main; it refuses and names the
+    // explicit command, and --project still removes the entry there.
+    let sb = sandbox();
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    let project = sb.cwd.join(".newt/config.toml");
+    let project_text =
+        "# shared team config\n[[mcp_servers]]\nname = \"proj\"\ncommand = \"/bin/true\"\n";
+    std::fs::write(&project, project_text).unwrap();
+
+    newt(&sb)
+        .args(["mcp", "remove", "proj"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("project config"))
+        .stderr(predicate::str::contains("mcp remove proj`"));
+    assert_eq!(std::fs::read_to_string(&project).unwrap(), project_text);
+
+    newt(&sb)
+        .args(["mcp", "remove", "--project", "proj"])
+        .assert()
+        .success();
+    assert!(
+        newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&project).unwrap()).is_empty()
+    );
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn remove_skips_a_same_name_entry_discovery_drops() {
     // #3062 review (F11): config.toml's `docs` has no url, so discovery drops
     // it and the mcp.toml `docs` is the live server; remove acts on that one.

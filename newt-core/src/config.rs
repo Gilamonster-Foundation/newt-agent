@@ -106,6 +106,9 @@ use tools::{
 /// Process-scoped user config root override, set by the CLI's `--config-dir`.
 pub const NEWT_CONFIG_DIR_ENV: &str = "NEWT_CONFIG_DIR";
 
+/// The shared system config, the last base candidate.
+const SYSTEM_CONFIG_PATH: &str = "/etc/newt/config.toml";
+
 // ---------------------------------------------------------------------------
 // Config types
 // ---------------------------------------------------------------------------
@@ -2662,6 +2665,29 @@ impl Config {
         Ok(None)
     }
 
+    /// The owner of `name` that a default-scope edit (`newt mcp remove`, `/mcp
+    /// enable|disable`) may change. A walked-up project config is borrowed
+    /// and repo-tracked, and the system config is shared, so neither is edited
+    /// unless named, as before owners were resolved (#2915): the error names
+    /// the explicit command.
+    pub fn mcp_server_edit_path(name: &str) -> anyhow::Result<PathBuf> {
+        let owner = Self::mcp_server_owner_path(name)?.ok_or_else(|| {
+            anyhow::anyhow!("no MCP server named `{name}` in the effective Newt config")
+        })?;
+        let kind = if Self::project_config_path().as_ref() == Some(&owner) {
+            "project"
+        } else if owner == Path::new(SYSTEM_CONFIG_PATH) {
+            "system"
+        } else {
+            return Ok(owner);
+        };
+        anyhow::bail!(
+            "MCP server `{name}` is defined in the {kind} config {}, which newt edits only when named: `newt --config {} mcp remove {name}` removes it there",
+            owner.display(),
+            owner.display()
+        )
+    }
+
     /// Change an MCP entry under the shared config lock and atomically replace
     /// the file only if its contents still match the snapshot read under lock.
     pub fn set_mcp_server_enabled_in_file(
@@ -2740,7 +2766,7 @@ impl Config {
             paths.push(path);
         }
 
-        paths.push(PathBuf::from("/etc/newt/config.toml"));
+        paths.push(PathBuf::from(SYSTEM_CONFIG_PATH));
         paths
     }
 }

@@ -764,6 +764,48 @@ fn mcp_server_owner_path_skips_an_entry_discovery_drops() {
     assert_eq!(Config::mcp_server_owner_path("docs").unwrap(), Some(config));
 }
 
+/// #3062 review (G2): `newt mcp remove` and `/mcp enable|disable` edit the
+/// owning file by default, but never a walked-up project config, which is
+/// repo-tracked: main never wrote one implicitly. The refusal names the
+/// explicit command. Grounds the rule both callers share on real files.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn mcp_server_edit_path_refuses_a_project_owner() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    std::fs::write(
+        workspace.join(".newt/config.toml"),
+        "[[mcp_servers]]\nname = \"proj\"\ncommand = \"proj-mcp\"\n",
+    )
+    .unwrap();
+    let mcp = dir.path().join("mcp.toml");
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"mine\"\ncommand = \"mine-mcp\"\n",
+    )
+    .unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+
+    let owner = Config::mcp_server_owner_path("proj").unwrap().unwrap();
+    assert!(owner.ends_with(Path::new(".newt").join("config.toml")));
+    let error = Config::mcp_server_edit_path("proj")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("project config"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "`newt --config {} mcp remove proj`",
+            owner.display()
+        )),
+        "{error}"
+    );
+    assert_eq!(Config::mcp_server_edit_path("mine").unwrap(), mcp);
+}
+
 fn newt_core_lock_path(path: &std::path::Path) -> std::path::PathBuf {
     crate::atomic_fs::ResolvedPath::resolve(path)
         .unwrap()

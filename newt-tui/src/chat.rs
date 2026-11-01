@@ -4123,12 +4123,7 @@ fn session_body(
                                 ("enable", n) | ("disable", n) if !n.is_empty() => {
                                     let on = verb == "enable";
                                     let updated_path = (|| -> anyhow::Result<std::path::PathBuf> {
-                                        let path = newt_core::Config::mcp_server_owner_path(n)?
-                                            .ok_or_else(|| {
-                                                anyhow::anyhow!(
-                                                    "no MCP server named `{n}` in the effective Newt config"
-                                                )
-                                            })?;
+                                        let path = newt_core::Config::mcp_server_edit_path(n)?;
                                         newt_core::Config::set_mcp_server_enabled_in_file(
                                             &path, n, on,
                                         )?;
