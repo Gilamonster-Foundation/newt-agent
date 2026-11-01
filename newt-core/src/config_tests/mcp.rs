@@ -224,6 +224,51 @@ fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
 }
 
 #[test]
+fn with_mcp_server_merged_refuses_to_carry_env_to_a_different_program() {
+    // #2915: the stdio twin of the header transfer. The program is the argv,
+    // so a launcher running other args counts as a different program too.
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"npx\"\nargs = [\"old-mcp\"]\nenv = { API_TOKEN = { env = \"PRIVATE_MARKER\" } }\n";
+    let runs = |argv: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!("name = \"review\"\n{argv}\n")).unwrap()
+    };
+    let with = |keys: &[&'static str]| {
+        keys.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    for (argv, provided) in [
+        ("command = \"new-mcp\"", with(&["command"])),
+        (
+            "command = \"npx\"\nargs = [\"new-mcp\"]",
+            with(&["command", "args"]),
+        ),
+    ] {
+        let error = Config::with_mcp_server_merged(text, &runs(argv), &provided)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing to send them to the new command"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("PRIVATE_MARKER") && !error.contains("API_TOKEN"),
+            "{error}"
+        );
+    }
+
+    // The same program keeps its env; an env the source supplies replaces it.
+    let same =
+        Config::with_mcp_server_merged(text, &runs("command = \"npx\""), &with(&["command"]))
+            .unwrap();
+    assert_eq!(same, text);
+    let supplied = runs("command = \"new-mcp\"");
+    let moved =
+        Config::with_mcp_server_merged(text, &supplied, &with(&["command", "env"])).unwrap();
+    assert!(!moved.contains("PRIVATE_MARKER"), "{moved}");
+}
+
+#[test]
 fn with_mcp_server_removed_does_not_echo_malformed_config_contents() {
     let text = "[[mcp_servers]]\nname = \"private-marker\"\ncommand = =\n";
     let error = Config::with_mcp_server_removed(text, "private-marker").unwrap_err();

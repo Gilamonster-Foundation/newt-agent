@@ -364,3 +364,37 @@ fn force_import_names_the_auth_consequence_of_a_resource_change() {
         "Endpoint changed for fs: a saved login for the previous endpoint is not used",
     ));
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn force_import_refuses_to_carry_env_to_a_different_program() {
+    // #2915: the stdio twin of the header transfer. A changed command, or the
+    // same launcher running different args, must not inherit local `env`.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let original = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"npx\"\nargs = [\"old-mcp\"]\nenv = { API_TOKEN = { env = \"PRIVATE_MARKER_TOKEN\" } }\n";
+    std::fs::write(&mcp, original).unwrap();
+
+    for source in [
+        r#"{ "mcpServers": { "fs": { "command": "new-mcp" } } }"#,
+        r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["new-mcp"] } } }"#,
+    ] {
+        force_import(&sb, source)
+            .failure()
+            .stderr(predicate::str::contains("refusing to send"))
+            .stderr(predicate::str::contains("PRIVATE_MARKER_TOKEN").not())
+            .stderr(predicate::str::contains("API_TOKEN").not());
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), original);
+    }
+
+    // An env the source supplies itself (here: none) is not a transfer.
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["new-mcp"], "env": {} } } }"#,
+    )
+    .success();
+    let servers = newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&mcp).unwrap());
+    assert_eq!(servers[0].args, ["new-mcp"]);
+    assert!(servers[0].env.is_empty());
+}

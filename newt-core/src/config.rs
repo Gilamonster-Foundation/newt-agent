@@ -2454,21 +2454,47 @@ impl Config {
             return Self::with_mcp_server_added(text, entry);
         };
 
+        let entry_in = |text: &str| {
+            crate::mcp::parse_newt_mcp_toml_checked(text)
+                .ok()?
+                .into_iter()
+                .find(|server| server.name == entry.name)
+        };
+        // `existing` was found by name, so only an invalid entry shape is None.
+        let previous = entry_in(text)
+            .ok_or_else(|| NewtError::Config(crate::mcp::McpConfigSyntaxError.to_string()))?;
         let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
-        // Local headers the source leaves alone would follow a moved endpoint,
-        // sending its credential to a destination it was never set for.
-        let kept_headers = existing
-            .get("headers")
-            .and_then(toml_edit::Item::as_table_like)
-            .filter(|_| !fresh.contains_key("headers") && !provided.contains("headers"))
-            .map_or(0, |headers| headers.len());
-        let previous_url = existing.get("url").and_then(toml_edit::Item::as_str);
-        if entry.transport != crate::mcp::TransportKind::Stdio
-            && kept_headers > 0
-            && crate::mcp::mcp_endpoint_changed(previous_url, entry.url.as_deref())
-        {
+        let sourced = |key: &str| fresh.contains_key(key) || provided.contains(key);
+        // Local credentials the source leaves alone would follow a moved
+        // destination: headers to a new endpoint, env to a different program.
+        // The program is the whole argv, since a launcher such as `npx` picks
+        // it by its args.
+        let (field, kept, destination, noun, moved) = match entry.transport {
+            crate::mcp::TransportKind::Stdio => {
+                let args = if sourced("args") {
+                    &entry.args
+                } else {
+                    &previous.args
+                };
+                let moved = previous.command != entry.command || previous.args != *args;
+                let kept = previous.env.len();
+                ("env", kept, "command", "environment variable(s)", moved)
+            }
+            crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
+                let moved =
+                    crate::mcp::mcp_endpoint_changed(previous.url.as_deref(), entry.url.as_deref());
+                (
+                    "headers",
+                    previous.headers.len(),
+                    "endpoint",
+                    "header(s)",
+                    moved,
+                )
+            }
+        };
+        if moved && kept > 0 && !sourced(field) {
             return Err(NewtError::Config(format!(
-                "MCP server `{}` would move to a different endpoint while keeping {kept_headers} local header(s) the source does not provide; refusing to send them to the new endpoint. Supply the headers in the source, or remove them from the existing entry, then re-run the import",
+                "MCP server `{}` would change its {destination} while keeping {kept} local {noun} the source does not provide; refusing to send them to the new {destination}. Supply them in the source, or remove them from the existing entry, then re-run the import",
                 entry.name
             )));
         }
@@ -2509,15 +2535,10 @@ impl Config {
         // Dropping a key that only restated a default (`type = "stdio"`,
         // `enabled = true`) changes no setting: keep the operator's text.
         let merged = doc.to_string();
-        let entry_in = |text: &str| {
-            crate::mcp::parse_newt_mcp_toml_checked(text)
-                .ok()?
-                .into_iter()
-                .find(|server| server.name == entry.name)
-        };
-        Ok(match (entry_in(text), entry_in(&merged)) {
-            (Some(before), Some(after)) if before == after => text.to_string(),
-            _ => merged,
+        Ok(if entry_in(&merged).as_ref() == Some(&previous) {
+            text.to_string()
+        } else {
+            merged
         })
     }
 
