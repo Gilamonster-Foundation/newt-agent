@@ -123,6 +123,29 @@ fn remove_edits_the_file_that_owns_the_effective_server() {
 }
 
 #[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn remove_skips_a_same_name_entry_discovery_drops() {
+    // #3062 review (F11): config.toml's `docs` has no url, so discovery drops
+    // it and the mcp.toml `docs` is the live server; remove acts on that one.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let dead = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n";
+    std::fs::write(&config, dead).unwrap();
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\n",
+    )
+    .unwrap();
+
+    newt(&sb).args(["mcp", "remove", "docs"]).assert().success();
+
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), dead);
+    assert!(newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(mcp).unwrap()).is_empty());
+}
+
+#[test]
 fn list_reports_malformed_mcp_toml_without_echoing_its_contents() {
     let sb = sandbox();
     let marker = "private-mcp-marker";

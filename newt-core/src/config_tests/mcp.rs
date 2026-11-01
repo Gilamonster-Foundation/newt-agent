@@ -663,6 +663,43 @@ fn set_mcp_server_enabled_in_file_uses_atomic_writeback() {
     assert!(!newt_core_lock_path(&path).exists());
 }
 
+/// Grounds the owner rule on real files (#3062 review, F11): the owner is
+/// the file that supplies the effective entry, so a same-name entry that
+/// discovery drops as invalid owns the name only when no valid one exists.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn mcp_server_owner_path_skips_an_entry_discovery_drops() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let config = dir.path().join("config.toml");
+    let mcp = dir.path().join("mcp.toml");
+    // An http entry with its url commented out: discovery drops it.
+    let dead = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n# url = \"https://docs.example.test/mcp\"\n";
+    std::fs::write(&config, dead).unwrap();
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        Config::mcp_server_owner_path("docs").unwrap().as_ref(),
+        Some(&mcp)
+    );
+    Config::set_mcp_server_enabled_in_file(&mcp, "docs", false).unwrap();
+    assert!(std::fs::read_to_string(&mcp)
+        .unwrap()
+        .contains("enabled = false"));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), dead);
+
+    // With no valid `docs` left, the broken one still owns the name, so
+    // `newt mcp remove` can delete it.
+    std::fs::write(&mcp, "").unwrap();
+    assert_eq!(Config::mcp_server_owner_path("docs").unwrap(), Some(config));
+}
+
 fn newt_core_lock_path(path: &std::path::Path) -> std::path::PathBuf {
     crate::atomic_fs::ResolvedPath::resolve(path)
         .unwrap()

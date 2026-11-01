@@ -2594,7 +2594,9 @@ impl Config {
     /// Find the first file that contributes `name` to the effective Newt MCP
     /// list. A project array replaces the base by default; with `arrays =
     /// "append"`, base entries retain precedence over project entries. The
-    /// dedicated user `mcp.toml` follows the resolved config layers.
+    /// dedicated user `mcp.toml` follows the resolved config layers. Discovery
+    /// drops an invalid entry, so one owns the name only when no file has a
+    /// valid one; `newt mcp remove` can then still delete it.
     pub fn mcp_server_owner_path(name: &str) -> anyhow::Result<Option<PathBuf>> {
         let base = Self::candidate_paths()
             .into_iter()
@@ -2628,28 +2630,20 @@ impl Config {
             .map(|(project, base)| layering::array_merge_strategy(project, base))
             .unwrap_or_default();
 
-        if project_declares_mcp && strategy == ArrayMergeStrategy::Replace {
-            if let Some(path) = project.as_deref() {
-                if Self::mcp_file_contains(path, name)? {
-                    return Ok(Some(path.to_path_buf()));
-                }
-            }
+        let layers = if project_declares_mcp && strategy == ArrayMergeStrategy::Replace {
+            vec![project]
         } else {
-            if let Some(path) = base.as_deref() {
-                if Self::mcp_file_contains(path, name)? {
-                    return Ok(Some(path.to_path_buf()));
+            vec![base, project]
+        };
+        let mcp_toml = Self::user_config_dir()
+            .map(|dir| dir.join("mcp.toml"))
+            .filter(|path| path.is_file());
+        let files: Vec<PathBuf> = layers.into_iter().flatten().chain(mcp_toml).collect();
+        for valid_only in [true, false] {
+            for path in &files {
+                if Self::mcp_file_contains(path, name, valid_only)? {
+                    return Ok(Some(path.clone()));
                 }
-            }
-            if let Some(path) = project.as_deref() {
-                if Self::mcp_file_contains(path, name)? {
-                    return Ok(Some(path.to_path_buf()));
-                }
-            }
-        }
-
-        if let Some(path) = Self::user_config_dir().map(|dir| dir.join("mcp.toml")) {
-            if path.is_file() && Self::mcp_file_contains(&path, name)? {
-                return Ok(Some(path));
             }
         }
         Ok(None)
@@ -2703,12 +2697,14 @@ impl Config {
         })
     }
 
-    fn mcp_file_contains(path: &Path, name: &str) -> anyhow::Result<bool> {
+    fn mcp_file_contains(path: &Path, name: &str, valid_only: bool) -> anyhow::Result<bool> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
         let entries = crate::mcp::parse_newt_mcp_toml_checked(&text)
             .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
-        Ok(entries.iter().any(|entry| entry.name == name))
+        Ok(entries
+            .iter()
+            .any(|entry| entry.name == name && (entry.is_valid() || !valid_only)))
     }
 
     /// Build the ordered list of candidate config file paths.
