@@ -467,3 +467,37 @@ fn import_flags_stdio_command_that_resolves_to_nothing() {
     http.transport = TransportKind::Http;
     assert!(missing_stdio_command(&http, &dirs, false, has).is_none());
 }
+
+/// #3062 review (F8): the import's "preserved" sentence names what a merge
+/// removed although the source did not name it, by name only.
+#[test]
+fn removed_local_settings_names_dropped_map_members_and_foreign_fields() {
+    let mut previous = stdio_entry("fs", Some("fs-mcp"));
+    previous.args = vec!["--token".into(), "SYNTHETIC_SECRET_MARKER".into()];
+    previous.env = BTreeMap::from([
+        ("KEEP".into(), SecretValue::literal("a")),
+        (
+            "LOG_LEVEL".into(),
+            SecretValue::literal("SYNTHETIC_SECRET_MARKER"),
+        ),
+    ]);
+    let mut saved = previous.clone();
+    saved.args = vec![];
+    saved.env.remove("LOG_LEVEL");
+    // Same transport: emptied args were the source's own value, not a removal.
+    assert_eq!(removed_local_settings(&previous, &saved), ["env LOG_LEVEL"]);
+
+    let mut http = stdio_entry("fs", None);
+    http.transport = TransportKind::Http;
+    http.url = Some("https://new.example.test/mcp".into());
+    assert_eq!(
+        removed_local_settings(&previous, &http),
+        ["command", "args", "env KEEP", "env LOG_LEVEL"]
+    );
+    assert_eq!(
+        removed_local_settings(&http, &previous),
+        ["url"],
+        "an HTTP entry has no args or env to lose"
+    );
+    assert!(removed_local_settings(&previous, &previous).is_empty());
+}

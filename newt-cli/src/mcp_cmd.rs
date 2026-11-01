@@ -1244,6 +1244,40 @@ fn canonicalize_import_http_url(entry: &mut McpServerEntry) -> anyhow::Result<Op
     Ok(Some(canonical.host))
 }
 
+/// Local settings a merge removed although the source does not name them: the
+/// other transport's fields when the transport changes, and members of an
+/// `env` or `headers` map the source replaced. Names only; a value may be a
+/// credential.
+fn removed_local_settings(previous: &McpServerEntry, saved: &McpServerEntry) -> Vec<String> {
+    let mut removed: Vec<String> = [
+        ("url", previous.url.is_some() && saved.url.is_none()),
+        (
+            "command",
+            previous.command.is_some() && saved.command.is_none(),
+        ),
+        (
+            "args",
+            previous.transport != saved.transport && !previous.args.is_empty(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, gone)| *gone)
+    .map(|(field, _)| field.to_string())
+    .collect();
+    for (kind, before, after) in [
+        ("env", &previous.env, &saved.env),
+        ("header", &previous.headers, &saved.headers),
+    ] {
+        removed.extend(
+            before
+                .keys()
+                .filter(|name| !after.contains_key(*name))
+                .map(|name| format!("{kind} {name}")),
+        );
+    }
+    removed
+}
+
 fn imported_http_hosts(entries: &[McpServerEntry]) -> anyhow::Result<Vec<String>> {
     let mut hosts = std::collections::BTreeSet::new();
     for entry in entries {
@@ -1967,10 +2001,23 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     )?;
     let owner_replacements = replaced - higher_precedence_replacements;
     if owner_replacements > 0 {
+        let removed: Vec<String> = adopted
+            .iter()
+            .filter_map(|saved| {
+                let previous = existing_entries.iter().find(|e| e.name == saved.name)?;
+                let removed = removed_local_settings(previous, saved);
+                (!removed.is_empty())
+                    .then(|| format!("  {}: removed {}", saved.name, removed.join(", ")))
+            })
+            .collect();
+        let except = if removed.is_empty() { "." } else { ", except:" };
         writeln!(
             out,
-            "Overwrote {owner_replacements} existing server(s); local settings absent from the source were preserved."
+            "Overwrote {owner_replacements} existing server(s); local settings absent from the source were preserved{except}"
         )?;
+        for line in removed {
+            writeln!(out, "{line}")?;
+        }
     }
     for name in &moved {
         writeln!(

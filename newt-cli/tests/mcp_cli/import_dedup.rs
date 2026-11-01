@@ -531,6 +531,73 @@ fn force_import_refuses_to_carry_args_to_a_different_program() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_names_the_local_settings_it_removed() {
+    // #3062 review (F8): a source's `headers` replace the local map, and a
+    // transport change drops the other transport's fields. Name what went,
+    // never its value, instead of claiming every local setting was kept.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let tenant = "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nheaders = { Authorization = \"Bearer ${SYNTHETIC_OLD_TOKEN}\", X-Tenant-Id = \"tenant-a\" }\n";
+    let codex = sb.cwd.join("codex.toml");
+    std::fs::write(
+        &codex,
+        "[mcp_servers.fs]\nurl = \"https://mcp.example.test/mcp\"\nbearer_token_env_var = \"NEW_TOKEN\"\n",
+    )
+    .unwrap();
+    let codex_import = || {
+        newt(&sb)
+            .args(["mcp", "import", codex.to_str().unwrap(), "--all", "--force"])
+            .assert()
+    };
+    let cases: [(&str, &dyn Fn() -> assert_cmd::assert::Assert, &str); 3] = [
+        (
+            tenant,
+            &|| {
+                force_import(
+                    &sb,
+                    r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://mcp.example.test/mcp",
+                          "headers": { "Authorization": "Bearer ${NEW_TOKEN}" } } } }"#,
+                )
+            },
+            "fs: removed header X-Tenant-Id",
+        ),
+        (tenant, &codex_import, "fs: removed header X-Tenant-Id"),
+        (
+            "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\nheaders = { Authorization = { env = \"SYNTHETIC_TOKEN_VAR\" } } # auth policy\n",
+            &|| force_import(&sb, r#"{ "mcpServers": { "fs": { "command": "fs-mcp" } } }"#),
+            "fs: removed url, header Authorization",
+        ),
+    ];
+    for (local, import, removed) in cases {
+        std::fs::write(&mcp, local).unwrap();
+        import()
+            .success()
+            .stdout(predicate::str::contains("preserved, except:"))
+            .stdout(predicate::str::contains(removed))
+            .stdout(predicate::str::contains("tenant-a").not())
+            .stdout(predicate::str::contains("SYNTHETIC").not())
+            .stdout(predicate::str::contains("example.test").not());
+    }
+
+    // Nothing removed: the sentence stands as it was.
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\nenv = { LOG_LEVEL = \"debug\" }\n",
+    )
+    .unwrap();
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "fs-mcp", "requestTimeoutSecs": 30 } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "local settings absent from the source were preserved.\n",
+    ));
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_keeps_comments_on_defaults_and_resets() {
     // #3062 review: resetting a value to its default keeps the comment on its
     // line, and an unchanged default-valued line survives a change elsewhere
