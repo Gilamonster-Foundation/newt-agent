@@ -101,6 +101,49 @@ fn with_mcp_server_merged_is_a_noop_when_source_fields_match() {
 }
 
 #[test]
+fn mcp_writers_keep_the_file_style() {
+    // #3062 review (F3): a merge that changes no setting hands back the text
+    // byte for byte, whatever toml_edit would re-render; a real change keeps
+    // the file's missing final newline, CRLF line endings and BOM.
+    let server = |name: &str, command: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!("name = \"{name}\"\ncommand = \"{command}\"\n")).unwrap()
+    };
+    let merge = |text: &str, command: &str| {
+        let provided = ["command"].into_iter().collect();
+        Config::with_mcp_server_merged(text, &server("fs", command), &provided).unwrap()
+    };
+    for text in [
+        "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"",
+        "# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n\r\n[[mcp_servers]]\r\nname = \"other\"\r\ncommand = \"other-mcp\"\r\n",
+        "\u{feff}[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n",
+    ] {
+        assert_eq!(merge(text, "fs-mcp"), text, "unchanged");
+        assert_eq!(
+            merge(text, "fs-v2"),
+            text.replacen("\"fs-mcp\"", "\"fs-v2\"", 1),
+            "changed"
+        );
+    }
+    // Layouts toml_edit respaces or reorders stay as written on a no-op.
+    for text in [
+        "[[ mcp_servers ]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n\n[[mcp_servers]]\nname = \"other\"\ncommand = \"other-mcp\"\n",
+        "[[mcp_servers]]\nname = \"fs\"\nenv.A = \"a\"\ncommand = \"fs-mcp\"\nenv.B = \"b\"\n",
+    ] {
+        assert_eq!(merge(text, "fs-mcp"), text);
+    }
+    // Adding and removing a server keep the style too.
+    let styled =
+        "\u{feff}# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n";
+    let added = Config::with_mcp_server_added(styled, &server("other", "other-mcp")).unwrap();
+    assert!(added.starts_with('\u{feff}'), "{added:?}");
+    assert_eq!(added.matches('\n').count(), added.matches("\r\n").count());
+    assert_eq!(
+        Config::with_mcp_server_removed(&added, "other").unwrap(),
+        styled
+    );
+}
+
+#[test]
 fn with_mcp_server_merged_resets_a_changed_transport_to_default_stdio() {
     let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nheaders = { Authorization = \"Bearer old\" }\n";
     let incoming: crate::mcp::McpServerEntry =

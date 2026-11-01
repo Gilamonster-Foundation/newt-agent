@@ -2400,30 +2400,29 @@ impl Config {
     /// server never lands in the file.
     pub fn with_mcp_server_added(text: &str, entry: &crate::mcp::McpServerEntry) -> Result<String> {
         crate::mcp::validate_entry_for_write(entry)?;
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
-        let servers =
-            doc.as_table_mut()
-                .entry("mcp_servers")
-                .or_insert(toml_edit::Item::ArrayOfTables(
-                    toml_edit::ArrayOfTables::new(),
-                ));
-        let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
-            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-        })?;
-        if arr
-            .iter()
-            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(entry.name.as_str()))
-        {
-            return Err(NewtError::Config(format!(
-                "an [[mcp_servers]] entry named `{}` already exists (remove it first, \
-                 or toggle it with `/mcp enable|disable`)",
-                entry.name
-            )));
-        }
-        arr.push(crate::mcp::entry_to_toml_table(entry, None)?);
-        Ok(doc.to_string())
+        edit_mcp_toml(text, |doc| {
+            let servers =
+                doc.as_table_mut()
+                    .entry("mcp_servers")
+                    .or_insert(toml_edit::Item::ArrayOfTables(
+                        toml_edit::ArrayOfTables::new(),
+                    ));
+            let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
+                NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+            })?;
+            if arr
+                .iter()
+                .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(entry.name.as_str()))
+            {
+                return Err(NewtError::Config(format!(
+                    "an [[mcp_servers]] entry named `{}` already exists (remove it first, \
+                     or toggle it with `/mcp enable|disable`)",
+                    entry.name
+                )));
+            }
+            arr.push(crate::mcp::entry_to_toml_table(entry, None)?);
+            Ok(())
+        })
     }
 
     /// Replace the source-provided fields of a same-name `[[mcp_servers]]`
@@ -2438,27 +2437,13 @@ impl Config {
         provided: &std::collections::BTreeSet<&str>,
     ) -> Result<String> {
         crate::mcp::validate_entry_for_write(entry)?;
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
-        let Some(item) = doc.as_table_mut().get_mut("mcp_servers") else {
-            return Self::with_mcp_server_added(text, entry);
-        };
-        let servers = item.as_array_of_tables_mut().ok_or_else(|| {
-            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-        })?;
-        let Some(existing) = servers
-            .iter_mut()
-            .find(|table| table.get("name").and_then(|value| value.as_str()) == Some(&entry.name))
+        let Some(previous) = crate::mcp::parse_newt_mcp_toml_checked(text)
+            .map_err(|error| NewtError::Config(error.to_string()))?
+            .into_iter()
+            .find(|server| server.name == entry.name)
         else {
             return Self::with_mcp_server_added(text, entry);
         };
-
-        // `existing` was found by name, so only an invalid entry shape is None.
-        let previous = crate::mcp::parse_newt_mcp_toml_checked(text)
-            .ok()
-            .and_then(|servers| servers.into_iter().find(|server| server.name == entry.name))
-            .ok_or_else(|| NewtError::Config(crate::mcp::McpConfigSyntaxError.to_string()))?;
         let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
         let sourced = |key: &str| fresh.contains_key(key) || provided.contains(key);
         // Local settings the source leaves alone would follow a moved
@@ -2511,51 +2496,66 @@ impl Config {
             .chain(provided.iter().copied())
             .chain(["type"])
             .collect();
-        for key in decided {
-            let wanted = fresh.get(key);
-            // An accepted alias (`requestTimeoutSecs`) is this same field: it is
-            // updated where and as the operator spelled it, never doubled.
-            let local = local_mcp_spelling(existing, key, wanted);
-            if same_mcp_field(key, existing.get(&local), wanted) {
-                continue;
-            }
-            // A reset to a default the minimal rendering leaves out is written
-            // in place (`args = []`) so the line keeps its comment.
-            let wanted = wanted
-                .cloned()
-                .or_else(|| crate::mcp::implicit_default(key).map(toml_edit::Item::Value));
-            match (existing.get_mut(&local), wanted) {
-                (Some(slot), Some(value)) => {
-                    let decor = slot.as_value().map(|old| old.decor().clone());
-                    *slot = value;
-                    if let (Some(decor), Some(new)) = (decor, slot.as_value_mut()) {
-                        *new.decor_mut() = decor;
+        let merged = edit_mcp_toml(text, |doc| {
+            // The typed parse above found the entry, so only an inline-array
+            // `mcp_servers` (which this writer cannot edit) misses here.
+            let existing = doc
+                .get_mut("mcp_servers")
+                .and_then(toml_edit::Item::as_array_of_tables_mut)
+                .and_then(|servers| {
+                    servers.iter_mut().find(|table| {
+                        table.get("name").and_then(|value| value.as_str()) == Some(&entry.name)
+                    })
+                })
+                .ok_or_else(|| {
+                    NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+                })?;
+            for key in decided {
+                let wanted = fresh.get(key);
+                // An accepted alias (`requestTimeoutSecs`) is this same field: it
+                // is updated where and as the operator spelled it, never doubled.
+                let local = local_mcp_spelling(existing, key, wanted);
+                if same_mcp_field(key, existing.get(&local), wanted) {
+                    continue;
+                }
+                // A reset to a default the minimal rendering leaves out is
+                // written in place (`args = []`) so the line keeps its comment.
+                let wanted = wanted
+                    .cloned()
+                    .or_else(|| crate::mcp::implicit_default(key).map(toml_edit::Item::Value));
+                match (existing.get_mut(&local), wanted) {
+                    (Some(slot), Some(value)) => {
+                        let decor = slot.as_value().map(|old| old.decor().clone());
+                        *slot = value;
+                        if let (Some(decor), Some(new)) = (decor, slot.as_value_mut()) {
+                            *new.decor_mut() = decor;
+                        }
                     }
+                    (None, Some(value)) => {
+                        existing.insert(key, value);
+                    }
+                    (Some(_), None) => {
+                        let _ = existing.remove(&local);
+                    }
+                    (None, None) => {}
                 }
-                (None, Some(value)) => {
-                    existing.insert(key, value);
+            }
+            // The other transport's fields do not belong to this entry.
+            let foreign: &[&str] = match entry.transport {
+                crate::mcp::TransportKind::Stdio => &["url", "headers"],
+                crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
+                    &["command", "args", "env"]
                 }
-                (Some(_), None) => {
+            };
+            for key in foreign {
+                let local = local_mcp_spelling(existing, key, None);
+                if !same_mcp_field(key, existing.get(&local), None) {
                     let _ = existing.remove(&local);
                 }
-                (None, None) => {}
             }
-        }
-        // The other transport's fields do not belong to this entry.
-        let foreign: &[&str] = match entry.transport {
-            crate::mcp::TransportKind::Stdio => &["url", "headers"],
-            crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
-                &["command", "args", "env"]
-            }
-        };
-        for key in foreign {
-            let local = local_mcp_spelling(existing, key, None);
-            if !same_mcp_field(key, existing.get(&local), None) {
-                let _ = existing.remove(&local);
-            }
-        }
+            Ok(())
+        })?;
         // Backstop: never hand back a document the MCP reader would reject.
-        let merged = doc.to_string();
         crate::mcp::parse_newt_mcp_toml_checked(&merged)
             .map_err(|error| NewtError::Config(error.to_string()))?;
         Ok(merged)
@@ -2565,27 +2565,26 @@ impl Config {
     /// comments and formatting (`newt mcp remove`). PURE (no I/O); the caller
     /// does the read/write. Errors when the server name isn't present.
     pub fn with_mcp_server_removed(text: &str, name: &str) -> Result<String> {
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
-        // Distinguish "no section" (→ the entry is absent) from "a section this
-        // writer cannot edit" (e.g. the inline-array form, which the serde
-        // reader accepts) — misreporting the latter as absent would be a lie.
-        let item = doc
-            .as_table_mut()
-            .get_mut("mcp_servers")
-            .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
-        let arr = item.as_array_of_tables_mut().ok_or_else(|| {
-            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-        })?;
-        let before = arr.len();
-        arr.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
-        if arr.len() == before {
-            return Err(NewtError::Config(format!(
-                "no [[mcp_servers]] entry named `{name}`"
-            )));
-        }
-        Ok(doc.to_string())
+        edit_mcp_toml(text, |doc| {
+            // Distinguish "no section" (→ the entry is absent) from "a section
+            // this writer cannot edit" (e.g. the inline-array form, which the
+            // serde reader accepts) — misreporting the latter as absent would
+            // be a lie.
+            let item = doc.as_table_mut().get_mut("mcp_servers").ok_or_else(|| {
+                NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`"))
+            })?;
+            let arr = item.as_array_of_tables_mut().ok_or_else(|| {
+                NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+            })?;
+            let before = arr.len();
+            arr.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
+            if arr.len() == before {
+                return Err(NewtError::Config(format!(
+                    "no [[mcp_servers]] entry named `{name}`"
+                )));
+            }
+            Ok(())
+        })
     }
 
     /// Find the first file that contributes `name` to the effective Newt MCP
@@ -2725,6 +2724,35 @@ impl Config {
         paths.push(PathBuf::from("/etc/newt/config.toml"));
         paths
     }
+}
+
+/// Apply `edit` to the MCP TOML `text`, the one parse-and-render path of the
+/// `[[mcp_servers]]` writers. An edit that changes nothing hands back `text`
+/// itself; a real one keeps the missing final newline, CRLF line endings and
+/// BOM that `toml_edit` drops when it renders a document.
+fn edit_mcp_toml(
+    text: &str,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+) -> Result<String> {
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| NewtError::Config("invalid MCP TOML syntax".to_string()))?;
+    let before = doc.to_string();
+    edit(&mut doc)?;
+    let mut after = doc.to_string();
+    if after == before {
+        return Ok(text.to_owned());
+    }
+    if !text.is_empty() && !text.ends_with('\n') && after.ends_with('\n') {
+        after.pop();
+    }
+    if 2 * text.matches("\r\n").count() > text.matches('\n').count() {
+        after = after.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    if text.starts_with('\u{feff}') {
+        after.insert(0, '\u{feff}');
+    }
+    Ok(after)
 }
 
 /// The key under which `table` already holds the field newt writes as `key`:

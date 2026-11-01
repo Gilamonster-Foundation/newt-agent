@@ -307,6 +307,40 @@ fn force_import_keeps_comments_and_counts_an_identical_entry_unchanged() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_keeps_the_file_style() {
+    // #3062 review (F3): an identical entry counts as unchanged and leaves the
+    // file byte for byte, whatever toml_edit would re-render; a real change
+    // keeps the missing final newline, CRLF line endings and BOM.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    for original in [
+        "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"",
+        "# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n\r\n[[mcp_servers]]\r\nname = \"other\"\r\ncommand = \"other-mcp\"\r\n",
+        "\u{feff}[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n",
+    ] {
+        std::fs::write(&mcp, original).unwrap();
+        force_import(&sb, r#"{ "mcpServers": { "fs": { "command": "fs-mcp" } } }"#)
+            .success()
+            .stdout(predicate::str::contains(
+                "Results: 0 added, 0 replaced, 1 unchanged, 0 skipped.",
+            ));
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), original);
+
+        force_import(&sb, r#"{ "mcpServers": { "fs": { "command": "fs-v2" } } }"#)
+            .success()
+            .stdout(predicate::str::contains(
+                "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+            ));
+        assert_eq!(
+            std::fs::read_to_string(&mcp).unwrap(),
+            original.replacen("\"fs-mcp\"", "\"fs-v2\"", 1)
+        );
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_refuses_to_carry_headers_to_a_changed_endpoint() {
     // #2915 review (P1): a new URL must not inherit the old destination's
     // Authorization header. Refuse without echoing the header or the URLs.
