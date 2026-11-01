@@ -2461,7 +2461,21 @@ impl Config {
             let _ = existing.remove(key);
         }
         for (key, value) in fresh {
-            existing.insert(&key, value);
+            match existing.get_mut(&key) {
+                // An equal value keeps its item: spelling and comments intact.
+                Some(slot) if same_toml_value(slot, &value) => {}
+                // A changed value keeps the operator's comment on its line.
+                Some(slot) => {
+                    let decor = slot.as_value().map(|old| old.decor().clone());
+                    *slot = value;
+                    if let (Some(decor), Some(new)) = (decor, slot.as_value_mut()) {
+                        *new.decor_mut() = decor;
+                    }
+                }
+                None => {
+                    existing.insert(&key, value);
+                }
+            }
         }
         match entry.transport {
             crate::mcp::TransportKind::Stdio => {
@@ -2475,7 +2489,19 @@ impl Config {
                 let _ = existing.remove("env");
             }
         }
-        Ok(doc.to_string())
+        // Dropping a key that only restated a default (`type = "stdio"`,
+        // `enabled = true`) changes no setting: keep the operator's text.
+        let merged = doc.to_string();
+        let entry_in = |text: &str| {
+            crate::mcp::parse_newt_mcp_toml_checked(text)
+                .ok()?
+                .into_iter()
+                .find(|server| server.name == entry.name)
+        };
+        Ok(match (entry_in(text), entry_in(&merged)) {
+            (Some(before), Some(after)) if before == after => text.to_string(),
+            _ => merged,
+        })
     }
 
     /// Remove the named `[[mcp_servers]]` entry from the TOML `text`, preserving
@@ -2642,6 +2668,17 @@ impl Config {
         paths.push(PathBuf::from("/etc/newt/config.toml"));
         paths
     }
+}
+
+/// Whether two TOML items hold the same value, whatever their quoting,
+/// spacing or comments.
+fn same_toml_value(a: &toml_edit::Item, b: &toml_edit::Item) -> bool {
+    let semantic = |item: &toml_edit::Item| {
+        let mut doc = toml_edit::DocumentMut::new();
+        doc.insert("v", item.clone());
+        toml::from_str::<toml::Value>(&doc.to_string()).ok()
+    };
+    matches!((semantic(a), semantic(b)), (Some(a), Some(b)) if a == b)
 }
 
 // ---------------------------------------------------------------------------

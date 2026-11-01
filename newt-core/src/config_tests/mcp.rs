@@ -160,6 +160,36 @@ fn with_mcp_server_merged_applies_explicit_empties_and_keeps_omitted_fields() {
 }
 
 #[test]
+fn with_mcp_server_merged_keeps_equal_items_and_comments() {
+    // #2915 review: a same-value import is a no-op, even when the local entry
+    // restates a default; a changed value keeps the comment on its line.
+    let text = "[[mcp_servers]]\nname = \"review\" # identity note\ntype = \"stdio\"\ncommand = 'review-mcp' # operator note\nargs = [ \"--a\" ]\n";
+    let same: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\nargs = [\"--a\"]\n").unwrap();
+    let provided = ["command", "args"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(text, &same, &provided).unwrap(),
+        text
+    );
+
+    let changed: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-v2\"\nargs = [\"--a\"]\n").unwrap();
+    let updated = Config::with_mcp_server_merged(text, &changed, &provided).unwrap();
+    assert!(
+        updated.contains("name = \"review\" # identity note"),
+        "{updated}"
+    );
+    assert!(
+        updated.contains("command = \"review-v2\" # operator note"),
+        "{updated}"
+    );
+    assert!(
+        updated.contains("args = [ \"--a\" ]"),
+        "equal item untouched: {updated}"
+    );
+}
+
+#[test]
 fn with_mcp_server_removed_does_not_echo_malformed_config_contents() {
     let text = "[[mcp_servers]]\nname = \"private-marker\"\ncommand = =\n";
     let error = Config::with_mcp_server_removed(text, "private-marker").unwrap_err();

@@ -266,3 +266,40 @@ fn force_import_applies_an_explicit_empty_source_value() {
         "omitted field kept"
     );
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn force_import_keeps_comments_and_counts_an_identical_entry_unchanged() {
+    // #2915 review: a same-value import is a no-op, not a replacement that
+    // erases the operator's comments; a changed value keeps them too.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let original = "[[mcp_servers]]\nname = \"fs\" # identity note\ncommand = \"fs-mcp\" # operator note\nargs = [\"--a\"]\n";
+    std::fs::write(&mcp, original).unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "fs-mcp", "args": ["--a"] } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "Results: 0 added, 0 replaced, 1 unchanged, 0 skipped.",
+    ));
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), original);
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "fs-mcp-v2", "args": ["--a"] } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+    ));
+    let updated = std::fs::read_to_string(&mcp).unwrap();
+    assert!(updated.contains("# identity note"), "{updated}");
+    assert!(
+        updated.contains("command = \"fs-mcp-v2\" # operator note"),
+        "{updated}"
+    );
+}
