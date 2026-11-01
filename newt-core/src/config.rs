@@ -2527,21 +2527,21 @@ impl Config {
                 let wanted = wanted
                     .cloned()
                     .or_else(|| crate::mcp::implicit_default(key).map(toml_edit::Item::Value));
-                match (existing.get_mut(&local), wanted) {
-                    (Some(slot), Some(value)) => {
-                        let decor = slot.as_value().map(|old| old.decor().clone());
-                        *slot = value;
-                        if let (Some(decor), Some(new)) = (decor, slot.as_value_mut()) {
-                            *new.decor_mut() = decor;
-                        }
-                    }
-                    (None, Some(value)) => {
-                        existing.insert(key, value);
-                    }
-                    (Some(_), None) => {
+                match wanted {
+                    Some(value) => match (
+                        existing
+                            .get_mut(&local)
+                            .and_then(toml_edit::Item::as_table_like_mut),
+                        value.as_table_like(),
+                    ) {
+                        // A map (`env`, `headers`) is updated member by member,
+                        // so its layout and each member's comments stay.
+                        (Some(map), Some(members)) => merge_mcp_map(key, map, members),
+                        _ => replace_in_place(existing, &local, value),
+                    },
+                    None => {
                         let _ = existing.remove(&local);
                     }
-                    (None, None) => {}
                 }
             }
             // The other transport's fields do not belong to this entry.
@@ -2793,6 +2793,34 @@ fn local_mcp_spelling(
         .to_owned()
 }
 
+/// Update the map field `key` (`env`, `headers`) to `wanted` member by member,
+/// so a sub-table, dotted keys or an inline table keeps its layout, and each
+/// member its comments: a dropped member goes, a changed one is replaced in
+/// place, a new one is added.
+fn merge_mcp_map(key: &str, map: &mut dyn toml_edit::TableLike, wanted: &dyn toml_edit::TableLike) {
+    let dropped: Vec<String> = map
+        .iter()
+        .map(|(name, _)| name.to_owned())
+        .filter(|name| !wanted.contains_key(name))
+        .collect();
+    for name in &dropped {
+        let _ = map.remove(name);
+    }
+    for (name, value) in wanted.iter() {
+        let member = |item: &toml_edit::Item| {
+            let mut one = toml_edit::Table::new();
+            one.insert(name, item.clone());
+            toml_edit::Item::Table(one)
+        };
+        if !map
+            .get(name)
+            .is_some_and(|old| same_mcp_field(key, Some(&member(old)), Some(&member(value))))
+        {
+            replace_in_place(map, name, value.clone());
+        }
+    }
+}
+
 /// Whether two spellings of one `[[mcp_servers]]` key configure the same
 /// thing, whatever their quoting, spacing or comments; an absent key equals a
 /// written default. Two URLs of one endpoint (`https://h`, `https://h/`) are
@@ -2958,8 +2986,9 @@ fn dir_has_toml(dir: &Path) -> bool {
 
 /// Set `key` to `item`, keeping the key and the old value's decoration (comments,
 /// spacing) when the key already exists: the key's own comment lives with the key,
-/// so replace the item in place rather than inserting a fresh key.
-fn replace_in_place(table: &mut toml_edit::Table, key: &str, mut item: toml_edit::Item) {
+/// so replace the item in place rather than inserting a fresh key. `table` may be
+/// a table, dotted keys or an inline table.
+fn replace_in_place(table: &mut dyn toml_edit::TableLike, key: &str, mut item: toml_edit::Item) {
     match table.get_mut(key) {
         Some(existing) => {
             if let (Some(new), Some(old)) = (item.as_value_mut(), existing.as_value()) {

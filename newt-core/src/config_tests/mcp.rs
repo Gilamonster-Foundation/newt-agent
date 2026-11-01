@@ -277,6 +277,58 @@ fn with_mcp_server_merged_keeps_equal_items_and_comments() {
 }
 
 #[test]
+fn with_mcp_server_merged_updates_a_map_member_by_member() {
+    // #3062 review (F10): changing one `env` or `headers` member keeps the
+    // map's layout (a sub-table, dotted keys, a multi-line inline table) and
+    // every member's comments, instead of rewriting it as one inline table.
+    let merge = |text: &str, source: &str, provided: &[&'static str]| {
+        let entry: crate::mcp::McpServerEntry =
+            toml::from_str(&format!("name = \"fs\"\n{source}")).unwrap();
+        let provided = provided.iter().copied().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let stdio = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    let env = "command = \"fs-mcp\"\nenv = { A = \"${SYNTHETIC_A}\", B = \"${SYNTHETIC_B2}\" }\n";
+    for map in [
+        "\n[mcp_servers.env]\n# staging token\nA = \"${SYNTHETIC_A}\" # keep A\nB = \"${SYNTHETIC_B}\" # b note\n",
+        "env.A = \"${SYNTHETIC_A}\" # keep A\nenv.B = \"${SYNTHETIC_B}\" # b note\n",
+        "env = {\n  A = \"${SYNTHETIC_A}\", # keep A\n  B = \"${SYNTHETIC_B}\", # b note\n}\n",
+    ] {
+        let text = format!("{stdio}{map}");
+        assert_eq!(
+            merge(&text, env, &["command", "env"]),
+            text.replace("SYNTHETIC_B}", "SYNTHETIC_B2}")
+        );
+    }
+
+    // A member the source drops goes, a new one is added, the rest stay.
+    let text = format!("{stdio}\n[mcp_servers.env]\n# staging token\nA = \"${{SYNTHETIC_A}}\" # keep A\nB = \"${{SYNTHETIC_B}}\"\n");
+    let reshaped = merge(
+        &text,
+        "command = \"fs-mcp\"\nenv = { A = \"${SYNTHETIC_A}\", C = \"${SYNTHETIC_C}\" }\n",
+        &["command", "env"],
+    );
+    assert!(
+        reshaped.contains("[mcp_servers.env]\n# staging token\nA = \"${SYNTHETIC_A}\" # keep A\n"),
+        "{reshaped}"
+    );
+    assert_eq!(
+        entry_of(&reshaped).env.keys().collect::<Vec<_>>(),
+        ["A", "C"]
+    );
+
+    let http = "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\n\n[mcp_servers.headers]\nX-Tenant = \"tenant-a\" # tenant note\nAuthorization = \"Bearer ${SYNTHETIC_TOKEN}\"\n";
+    assert_eq!(
+        merge(
+            http,
+            "type = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nheaders = { X-Tenant = \"tenant-a\", Authorization = \"Bearer ${SYNTHETIC_TOKEN2}\" }\n",
+            &["type", "url", "headers"],
+        ),
+        http.replace("SYNTHETIC_TOKEN}", "SYNTHETIC_TOKEN2}")
+    );
+}
+
+#[test]
 fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
     // #2915 review (P1): a new URL must not inherit the credential configured
     // for the old destination, and the refusal must not quote either.
