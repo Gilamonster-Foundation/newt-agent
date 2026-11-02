@@ -99,8 +99,10 @@ pub enum McpCmd {
     /// Import selected MCP servers from Claude Code, Codex, or a config file.
     /// The equivalent trusted newt TOML is written to `~/.newt/mcp.toml`
     /// (created if absent), or with --force to the file that already defines
-    /// a selected server. Literal or active secret-bearing values make the
-    /// selected import fail; environment references survive.
+    /// a selected server. --grant-net writes `~/.newt/config.toml` instead,
+    /// with the grants, and refuses to update a server `~/.newt/mcp.toml`
+    /// defines. Literal or active secret-bearing values make the selected
+    /// import fail; environment references survive.
     Import {
         /// Path to a Claude JSON or Codex TOML MCP config. An alternative to
         /// --from-claude / --from-codex: give exactly one source.

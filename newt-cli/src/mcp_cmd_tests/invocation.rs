@@ -39,3 +39,26 @@ fn bare_mcp_action_serves_when_stdin_is_piped() {
 fn bare_mcp_action_prints_help_when_stdin_is_a_terminal() {
     assert_eq!(bare_mcp_action(true), BareMcpAction::Help);
 }
+
+/// #3062 review (R1-14): the import help names every destination. A plain
+/// import writes `~/.newt/mcp.toml`, but --grant-net writes the connector
+/// and its grants to `~/.newt/config.toml`, and refuses to update a server
+/// `~/.newt/mcp.toml` defines.
+#[test]
+fn import_help_names_the_grant_net_destination() {
+    use clap::CommandFactory;
+    let cli = crate::Cli::command();
+    let import = cli
+        .find_subcommand("mcp")
+        .and_then(|mcp| mcp.find_subcommand("import"))
+        .unwrap();
+    let help = import
+        .get_long_about()
+        .or(import.get_about())
+        .unwrap()
+        .to_string();
+    assert!(
+        help.contains("--grant-net writes `~/.newt/config.toml`"),
+        "{help}"
+    );
+}
