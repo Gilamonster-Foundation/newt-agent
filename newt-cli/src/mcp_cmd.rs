@@ -1953,12 +1953,21 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                 skipped.push(entry.name.clone());
                 continue;
             }
+            // Removing the entry drops its local settings; --force, where it
+            // updates the owner in place, keeps them.
+            let remove = remove_from(path, &entry.name);
+            let advice = if Config::mcp_server_owner_path(&entry.name)?.as_ref() == Some(path)
+                && Config::user_config_path().as_ref() == Some(path)
+            {
+                format!("Re-run with --force to update it there or --merge to skip it, or remove it there first with {remove}")
+            } else {
+                format!("Remove it there first with {remove}, or re-run with an explicit --config target")
+            };
             bail!(
-                "`{}` is already defined in {}, which outranks or can outrank {} — an import here would be ineffective. Remove it there first with {}, or re-run with an explicit --config target",
+                "`{}` is already defined in {}, which outranks or can outrank {} — an import here would be ineffective. {advice}",
                 entry.name,
                 path.display(),
-                target.display(),
-                remove_from(path, &entry.name)
+                target.display()
             );
         }
         let exists_in_target = existing.contains(&entry.name);

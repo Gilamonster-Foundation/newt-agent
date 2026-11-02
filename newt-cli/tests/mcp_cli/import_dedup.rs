@@ -104,7 +104,9 @@ fn import_dedup_errors_on_clash_unless_force_or_merge() {
 fn import_force_updates_the_effective_config_owner() {
     // config.toml outranks ~/.newt/mcp.toml. --force must update that owner,
     // a plain import refuses a shadowed default target, and --merge keeps
-    // the existing entry as its help says (#3062 review, G6).
+    // the existing entry as its help says (#3062 review, G6). The refusal
+    // offers those two first: removing the operator's entry would drop its
+    // local settings, which --force keeps (R1-10).
     let sb = sandbox();
     std::fs::write(
         sb.config_dir.join("config.toml"),
@@ -123,7 +125,9 @@ fn import_force_updates_the_effective_config_owner() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("outranks"))
-        .stderr(predicate::str::contains("scrybe"));
+        .stderr(predicate::str::contains(
+            "Re-run with --force to update it there or --merge to skip it, or remove it there first with",
+        ));
     newt(&sb)
         .args([
             "mcp",
