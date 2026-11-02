@@ -1195,6 +1195,36 @@ fn the_toggle_accepts_an_entry_already_in_that_state_in_a_borrowed_file() {
     }
 }
 
+/// #3062 review (R3-5): advice that would send the operator to `/mcp
+/// enable|disable` gives the toggle's own refusal where the toggle refuses,
+/// so it never names a toggle that cannot help. Where the toggle would edit
+/// the file, find the entry already set, or find no entry, there is none.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn advice_gives_the_toggle_refusal_where_the_toggle_refuses() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    let disabled = |name: &str| {
+        format!("[[mcp_servers]]\nname = \"{name}\"\ncommand = \"x\"\nenabled = false\n")
+    };
+    std::fs::write(workspace.join(".newt/config.toml"), disabled("proj")).unwrap();
+    std::fs::write(dir.path().join("mcp.toml"), disabled("mine")).unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+
+    let refusal = Config::set_mcp_server_enabled("proj", true).unwrap_err();
+    assert_eq!(
+        Config::mcp_toggle_refusal("proj", true),
+        Some(refusal.to_string())
+    );
+    assert_eq!(Config::mcp_toggle_refusal("proj", false), None);
+    assert_eq!(Config::mcp_toggle_refusal("mine", true), None);
+    assert_eq!(Config::mcp_toggle_refusal("absent", true), None);
+}
+
 /// #3062 review (R1-13): a config the operator pinned with `--config` or
 /// `$NEWT_CONFIG` is named, so it stays editable even when it is the system
 /// config; unpinned, the system config, a project layer and an ambient

@@ -2700,19 +2700,40 @@ impl Config {
     /// is never refused; a change to a file newt edits only when named is,
     /// with the edit to make there by hand (#2915).
     pub fn set_mcp_server_enabled(name: &str, enabled: bool) -> anyhow::Result<PathBuf> {
+        let (path, set) = Self::mcp_toggle_target(name, enabled)?;
+        if !set {
+            Self::set_mcp_server_enabled_in_file(&path, name, enabled)?;
+        }
+        Ok(path)
+    }
+
+    /// What [`Self::set_mcp_server_enabled`] answers instead of setting
+    /// `enabled` on `name`, or `None` when it would set it, find it set, or
+    /// find no such server. Advice that would send the operator to `/mcp
+    /// enable|disable` gives this instead, so it never names a toggle that
+    /// refuses (#2915).
+    pub fn mcp_toggle_refusal(name: &str, enabled: bool) -> Option<String> {
+        Self::mcp_server_owner_path(name).ok().flatten()?;
+        Self::mcp_toggle_target(name, enabled)
+            .err()
+            .map(|refusal| refusal.to_string())
+    }
+
+    /// The file the toggle edits for `name`, and whether its entry already
+    /// holds `enabled`, which needs no edit and so is never refused.
+    fn mcp_toggle_target(name: &str, enabled: bool) -> anyhow::Result<(PathBuf, bool)> {
         if let Some(owner) = Self::mcp_server_owner_path(name)? {
             let text = std::fs::read_to_string(&owner).map_err(|error| {
                 anyhow::anyhow!("reading MCP config {}: {error}", owner.display())
             })?;
             if Self::with_mcp_enabled(&text, name, enabled)? == text {
-                return Ok(owner);
+                return Ok((owner, true));
             }
         }
         let path = Self::mcp_server_edit_path(name, false, |_| {
             format!("set `enabled = {enabled}` there by hand")
         })?;
-        Self::set_mcp_server_enabled_in_file(&path, name, enabled)?;
-        Ok(path)
+        Ok((path, false))
     }
 
     /// Change an MCP entry under the shared config lock and atomically replace

@@ -4037,7 +4037,11 @@ fn session_body(
                                     // `McpState::status_lines`, so the verb
                                     // and the cockpit's MCP view cannot
                                     // disagree about whether a server is muted.
-                                    let mut lines = mcp.status_lines().into_iter();
+                                    let mut lines = mcp
+                                        .status_lines(|n| {
+                                            newt_core::Config::mcp_toggle_refusal(n, true)
+                                        })
+                                        .into_iter();
                                     if let Some(first) = lines.next() {
                                         print_newt(&first, color, verbose);
                                     }
@@ -4112,8 +4116,9 @@ fn session_body(
                                         );
                                     } else {
                                         print_newt(
-                                            &format!(
-                                                "no connected MCP server `{n}` — config-disabled servers need `/mcp enable {n}` then Reconnect in /settings → MCP"
+                                            &crate::mcp::Mcp::not_connected(
+                                                n,
+                                                newt_core::Config::mcp_toggle_refusal(n, true),
                                             ),
                                             color,
                                             verbose,

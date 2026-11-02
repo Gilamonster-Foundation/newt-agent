@@ -535,8 +535,16 @@ pub(crate) fn add_to_config(
                 "MCP server `{name}` already exists in {here}, a copy shadowed by the one newt uses in {owner}: remove that copy with {remove}, or change the server in {owner}"
             );
         }
+        // Where `/mcp enable|disable` would refuse this file, its own refusal
+        // names the hand edit instead (#2915).
+        let toggle = match Config::mcp_toggle_refusal(name, true)
+            .or_else(|| Config::mcp_toggle_refusal(name, false))
+        {
+            Some(refusal) => format!(". {refusal}"),
+            None => ", or toggle it with `/mcp enable|disable`".to_string(),
+        };
         bail!(
-            "MCP server `{name}` already exists in {here}: remove it first with {remove}, or toggle it with `/mcp enable|disable`"
+            "MCP server `{name}` already exists in {here}: remove it first with {remove}{toggle}"
         );
     }
     let updated = Config::with_mcp_server_added(&text, entry)

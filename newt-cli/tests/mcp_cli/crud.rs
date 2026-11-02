@@ -118,6 +118,57 @@ fn a_duplicate_add_names_the_remove_for_the_file_it_writes() {
 }
 
 #[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_duplicate_add_offers_the_toggle_only_where_it_may_edit_the_file() {
+    // #3062 review (R3-5): `/mcp enable|disable` refuses a project or an
+    // ambient ./newt.toml it was not named for, so a duplicate add there
+    // gives the toggle's own hand edit instead of sending the operator to it.
+    let sb = sandbox();
+    let disabled = |name: &str| {
+        format!("[[mcp_servers]]\nname = \"{name}\"\ncommand = \"/bin/echo\"\nenabled = false\n")
+    };
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    for (file, flags, kind) in [
+        (
+            sb.cwd.join(".newt/config.toml"),
+            &["--project"][..],
+            "project",
+        ),
+        (sb.cwd.join("newt.toml"), &[][..], "ambient"),
+    ] {
+        std::fs::write(&file, disabled("borrowed")).unwrap();
+        newt(&sb)
+            .args(["mcp", "add", "borrowed", "--command", "/bin/echo"])
+            .args(flags)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("/mcp enable|disable").not())
+            .stderr(predicate::str::contains(format!(
+                "defined in the {kind} config"
+            )))
+            .stderr(predicate::str::contains(
+                "set `enabled = true` there by hand",
+            ));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            disabled("borrowed")
+        );
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    // The operator's own config.toml is one the toggle edits.
+    std::fs::write(sb.config_dir.join("config.toml"), disabled("mine")).unwrap();
+    newt(&sb)
+        .args(["mcp", "add", "mine", "--command", "/bin/echo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "or toggle it with `/mcp enable|disable`",
+        ));
+}
+
+#[test]
 fn remove_deletes_the_entry_and_an_absent_name_errors() {
     let sb = sandbox();
     newt(&sb)

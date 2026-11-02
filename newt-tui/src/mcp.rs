@@ -779,7 +779,13 @@ impl Mcp {
     ///
     /// Pure over `self`, so the unit tier checks every status arm — including
     /// the auth hint — with no connection and no config.
-    pub(crate) fn status_lines(&self) -> Vec<String> {
+    ///
+    /// `toggle_refusal` is [`newt_core::Config::mcp_toggle_refusal`] in a
+    /// session: a disabled row names `/mcp enable` only where it would work.
+    pub(crate) fn status_lines(
+        &self,
+        toggle_refusal: impl Fn(&str) -> Option<String>,
+    ) -> Vec<String> {
         if self.statuses.is_empty() {
             return vec![
                 "no MCP servers configured — add [[mcp_servers]] to ~/.newt/config.toml"
@@ -813,11 +819,26 @@ impl Mcp {
                     "  {n}  ✗ skipped: {r} — {LOGIN_REMEDIATION} (shell: `newt auth {n}`)"
                 ),
                 McpStatus::Disabled => {
-                    format!("  {n}  ⏸ disabled in config (/mcp enable {n})")
+                    let fix = toggle_refusal(n).unwrap_or_else(|| format!("/mcp enable {n}"));
+                    format!("  {n}  ⏸ disabled in config ({fix})")
                 }
             });
         }
         out
+    }
+
+    /// What `/mcp on <name>` says when `name` is not connected. A disabled
+    /// server is turned on with `/mcp enable`, or, where that toggle refuses
+    /// the file that defines it, by the hand edit its refusal names (#2915).
+    pub(crate) fn not_connected(name: &str, toggle_refusal: Option<String>) -> String {
+        match toggle_refusal {
+            Some(refusal) => format!(
+                "no connected MCP server `{name}` — {refusal}, then Reconnect in /settings → MCP"
+            ),
+            None => format!(
+                "no connected MCP server `{name}` — config-disabled servers need `/mcp enable {name}` then Reconnect in /settings → MCP"
+            ),
+        }
     }
 
     /// The same statuses as [`Self::status_lines`], as data for the model's
@@ -2239,7 +2260,7 @@ mod tests {
                 ("off".to_string(), McpStatus::Disabled),
             ];
 
-        let lines = mcp.status_lines();
+        let lines = mcp.status_lines(|_| None);
         assert_eq!(lines[0], "MCP servers:");
         assert!(lines[1].contains("github") && lines[1].contains("✓ connected (12 tools)"));
 
@@ -2260,6 +2281,30 @@ mod tests {
             lines[3]
         );
         assert!(lines[4].contains("disabled in config"), "{:?}", lines[4]);
+    }
+
+    /// #3062 review (R3-5): `/mcp enable` refuses a server that a project,
+    /// an ambient ./newt.toml or the system config defines, unless named. A
+    /// disabled row and `/mcp on`'s miss then give the toggle's own refusal,
+    /// with its hand edit, instead of sending the operator to the toggle.
+    #[test]
+    fn a_disabled_server_names_the_toggle_only_where_it_may_edit_the_file() {
+        let refusal = "MCP server `proj` is defined in the project config ws/.newt/config.toml, \
+                       which newt edits only when named: set `enabled = true` there by hand";
+        let mut mcp = Mcp::empty();
+        mcp.statuses = vec![
+            ("proj".to_string(), McpStatus::Disabled),
+            ("mine".to_string(), McpStatus::Disabled),
+        ];
+        let lines = mcp.status_lines(|name| (name == "proj").then(|| refusal.to_string()));
+        assert!(lines[1].contains(refusal), "{}", lines[1]);
+        assert!(!lines[1].contains("/mcp enable"), "{}", lines[1]);
+        assert!(lines[2].contains("/mcp enable mine"), "{}", lines[2]);
+
+        let miss = Mcp::not_connected("proj", Some(refusal.to_string()));
+        assert!(miss.contains(refusal), "{miss}");
+        assert!(!miss.contains("/mcp enable"), "{miss}");
+        assert!(Mcp::not_connected("mine", None).contains("`/mcp enable mine`"));
     }
 
     /// #3036: the model's `mcp_status` reads the same statuses as `/mcp`,
@@ -2336,7 +2381,7 @@ mod tests {
             private: true,
         };
         mcp.statuses = vec![("review".into(), McpStatus::Skipped(denial.to_string()))];
-        let line = &mcp.status_lines()[1];
+        let line = &mcp.status_lines(|_| None)[1];
         assert!(line.contains("authorization.example.test"));
         assert!(line.contains("[tui.permissions] net"));
         assert!(line.contains("restart"));
@@ -2359,10 +2404,10 @@ mod tests {
                 net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
             },
         )];
-        assert!(mcp.status_lines()[1].contains("✓ connected"));
+        assert!(mcp.status_lines(|_| None)[1].contains("✓ connected"));
 
         mcp.mute("github");
-        let muted = mcp.status_lines()[1].clone();
+        let muted = mcp.status_lines(|_| None)[1].clone();
         assert!(muted.contains("⏸ muted this session"), "{muted}");
         assert!(
             muted.contains("still connected"),
@@ -2378,7 +2423,7 @@ mod tests {
     /// configured" and "the view is broken" must not look the same.
     #[test]
     fn no_servers_says_where_they_would_be_configured() {
-        let lines = Mcp::empty().status_lines();
+        let lines = Mcp::empty().status_lines(|_| None);
         assert_eq!(lines.len(), 1);
         assert!(
             lines[0].contains("no MCP servers configured"),
