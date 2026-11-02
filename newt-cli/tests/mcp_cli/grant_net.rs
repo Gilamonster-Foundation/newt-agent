@@ -632,6 +632,67 @@ fn a_grant_import_does_not_revive_a_dropped_stub_over_the_live_copy() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn the_cross_file_refusal_leads_with_the_route_that_keeps_the_copy() {
+    // #3062 review (R3-6): a --grant-net import writes config.toml, so it
+    // refuses a name the break-out mcp.toml holds. Its one remedy, removing
+    // that copy, dropped `enabled = false` and the timeout: the re-run added
+    // the server enabled and granted its host, or, with a dropped stub in
+    // config.toml, revived the stub (R2-7). The refusal leads with the re-run
+    // without --grant-net, which keeps the copy as it is, names the host to
+    // grant and the stub, and says what the remove, last, loses.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let live = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://review.example.test/mcp\"\nenabled = false # paused: security review pending\nrequest_timeout_secs = 90\n";
+    let stub = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\n# url = \"https://review.example.test/mcp\"\n";
+    let source = sb.cwd.join("s.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "review": { "type": "http", "url": "https://review.example.test/mcp" } } }"#,
+    )
+    .unwrap();
+    let import = |extra: &[&str]| {
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap()])
+            .args(["--name", "review", "--force"])
+            .args(extra)
+            .assert()
+    };
+
+    for held in [None, Some(stub)] {
+        std::fs::write(&mcp, live).unwrap();
+        match held {
+            Some(text) => std::fs::write(&config, text).unwrap(),
+            None => assert!(!config.exists()),
+        }
+        let output = import(&["--grant-net"]).failure().get_output().clone();
+        let refusal = String::from_utf8(output.stderr).unwrap();
+        let rerun = refusal.find("Re-run without --grant-net").expect(&refusal);
+        let remove = refusal.find("mcp remove review`").expect(&refusal);
+        assert!(rerun < remove, "{refusal}");
+        assert!(
+            refusal[rerun..remove].contains("review.example.test in trusted [tui.permissions] net"),
+            "{refusal}"
+        );
+        assert!(refusal[remove..].contains("`enabled = false`"), "{refusal}");
+        assert_eq!(
+            refusal.contains("only a `review` entry that discovery drops"),
+            held.is_some(),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), live);
+
+        // Following it keeps the paused, tuned copy as it was.
+        import(&[])
+            .success()
+            .stdout(predicate::str::contains("1 unchanged"));
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), live);
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn a_grant_import_is_not_blocked_by_an_entry_discovery_drops() {
     // #3062 review (R2-3): C2's rule, that an entry discovery drops counts
     // for nothing, also holds for the other files a --grant-net import

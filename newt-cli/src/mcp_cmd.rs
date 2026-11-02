@@ -583,6 +583,46 @@ fn remove_from(path: &Path, name: &str) -> String {
     )
 }
 
+/// Why a --grant-net import does not write `entry` to `target` while the
+/// break-out file `breakout` holds a `copy` of it and `target` holds none
+/// discovery keeps (only a dropped `stub`, if any). The route that keeps the
+/// copy's local settings leads; the remove, which loses them, is last (#2915).
+fn cross_file_refusal(
+    entry: &McpServerEntry,
+    copy: Option<&McpServerEntry>,
+    stub: bool,
+    breakout: &Path,
+    target: &Path,
+) -> anyhow::Result<String> {
+    let name = &entry.name;
+    let stub = if stub {
+        format!(", which holds only a `{name}` entry that discovery drops")
+    } else {
+        String::new()
+    };
+    // Worded as newt asks for a missing grant (`HttpNetGrantRequired`).
+    let grant = imported_http_hosts(std::slice::from_ref(entry))?
+        .first()
+        .map(|host| {
+            format!(
+                ", then grant the exact hostname {host} in trusted [tui.permissions] net of {}",
+                target.display()
+            )
+        })
+        .unwrap_or_default();
+    let paused = if copy.is_some_and(|copy| !copy.enabled) {
+        ", `enabled = false` included"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "MCP server `{name}` exists in {} but the import writes atomically to {}{stub}; refusing a cross-file overwrite that would leave a dormant duplicate. Re-run without --grant-net to update that copy in place, keeping its local settings{grant}. Removing that copy with {} before the re-run instead loses those settings{paused}",
+        breakout.display(),
+        target.display(),
+        remove_from(breakout, name)
+    ))
+}
+
 /// Remove `name`, resolving the target the same way `add` does. An explicit
 /// target (`--project`/`--config`/`$NEWT_CONFIG`) is acted on directly. At the
 /// default scope, resolve the file that contributes the entry to the effective
@@ -2035,12 +2075,21 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                     if !effective(&existing_entries, &entry.name)
                         .is_some_and(|held| held.is_valid())
                     {
+                        let copies = parse_mcp_config(
+                            read_optional(breakout_destination.as_path())?
+                                .as_deref()
+                                .unwrap_or_default(),
+                            &breakout_target,
+                        )?;
                         bail!(
-                            "MCP server `{}` exists in {} but the import writes atomically to {}; refusing a cross-file overwrite that would leave a dormant duplicate. Remove that copy with {}, then re-run the import",
-                            entry.name,
-                            breakout_target.display(),
-                            target.display(),
-                            remove_from(&breakout_target, &entry.name)
+                            "{}",
+                            cross_file_refusal(
+                                entry,
+                                effective(&copies, &entry.name).as_ref(),
+                                exists_in_target,
+                                &breakout_target,
+                                &target
+                            )?
                         );
                     }
                     shadowed.push(entry.name.as_str());
