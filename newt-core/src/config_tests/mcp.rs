@@ -1225,6 +1225,30 @@ fn advice_gives_the_toggle_refusal_where_the_toggle_refuses() {
     assert_eq!(Config::mcp_toggle_refusal("absent", true), None);
 }
 
+/// #3062 review (R4-7): only the toggle's ownership refusal is advice. Any
+/// other error, here the inline-array writer's, names no edit to make, and a
+/// hint that appended it read as one.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn advice_gives_no_writer_error_as_the_toggle_refusal() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    std::fs::write(
+        dir.path().join("mcp.toml"),
+        "mcp_servers = [ { name = \"inline\", command = \"x\", enabled = false } ]\n",
+    )
+    .unwrap();
+
+    let error = Config::set_mcp_server_enabled("inline", true).unwrap_err();
+    assert!(
+        error.to_string().contains("not an array of tables"),
+        "{error}"
+    );
+    assert_eq!(Config::mcp_toggle_refusal("inline", true), None);
+}
+
 /// #3062 review (R1-13): a config the operator pinned with `--config` or
 /// `$NEWT_CONFIG` is named, so it stays editable even when it is the system
 /// config; unpinned, the system config, a project layer and an ambient

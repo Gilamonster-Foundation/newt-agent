@@ -169,6 +169,55 @@ fn a_duplicate_add_offers_the_toggle_only_where_it_may_edit_the_file() {
 }
 
 #[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_duplicate_add_offers_to_enable_only_a_disabled_server() {
+    // #3062 review (R4-7): the duplicate-add advice appended whatever the
+    // toggle check returned. An enabled project server got "set `enabled =
+    // false` there by hand", an order to disable the server being added, and
+    // an inline-array config.toml got the writer's own error. Only a disabled
+    // server is offered enabling, as an alternative to the remove, and only
+    // the toggle's ownership refusal counts as advice.
+    let sb = sandbox();
+    let add = |name: &str, flags: &[&str]| {
+        let output = newt(&sb)
+            .args(["mcp", "add", name, "--command", "/bin/echo"])
+            .args(flags)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        String::from_utf8(output.stderr).unwrap()
+    };
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    let project = sb.cwd.join(".newt/config.toml");
+    let proj = |enabled: bool| {
+        format!("[[mcp_servers]]\nname = \"proj\"\ncommand = \"/bin/echo\"\nenabled = {enabled}\n")
+    };
+    std::fs::write(&project, proj(true)).unwrap();
+    let refusal = add("proj", &["--project"]);
+    assert!(!refusal.contains("enabled = "), "{refusal}");
+    assert!(!refusal.contains("/mcp enable"), "{refusal}");
+    std::fs::write(&project, proj(false)).unwrap();
+    let refusal = add("proj", &["--project"]);
+    assert!(
+        refusal.contains(
+            "mcp remove proj`, or enable it (MCP server `proj` is defined in the project config"
+        ),
+        "{refusal}"
+    );
+
+    std::fs::write(
+        sb.config_dir.join("config.toml"),
+        "mcp_servers = [ { name = \"alpha\", command = \"/bin/echo\" } ]\n",
+    )
+    .unwrap();
+    let refusal = add("alpha", &[]);
+    assert!(refusal.contains("already exists"), "{refusal}");
+    assert!(!refusal.contains("config error"), "{refusal}");
+}
+
+#[test]
 fn remove_deletes_the_entry_and_an_absent_name_errors() {
     let sb = sandbox();
     newt(&sb)

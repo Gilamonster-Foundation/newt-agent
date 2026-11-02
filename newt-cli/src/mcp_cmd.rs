@@ -520,9 +520,8 @@ pub(crate) fn add_to_config(
     let text = read_config_text(destination.as_path())?;
     // The default `newt mcp remove` edits the owner, which may be another
     // file, so name the command for this one, and the copy newt uses (#2915).
-    if newt_core::mcp::parse_newt_mcp_toml_checked(&text)
-        .is_ok_and(|held| held.iter().any(|held| held.name == entry.name))
-    {
+    let held = newt_core::mcp::parse_newt_mcp_toml_checked(&text).unwrap_or_default();
+    if let Some(index) = newt_core::mcp::effective_entry_index(&held, &entry.name) {
         let (name, here) = (&entry.name, path.display());
         let remove = remove_from(&path, name);
         let owner = Config::mcp_server_owner_path(name)
@@ -535,13 +534,15 @@ pub(crate) fn add_to_config(
                 "MCP server `{name}` already exists in {here}, a copy shadowed by the one newt uses in {owner}: remove that copy with {remove}, or change the server in {owner}"
             );
         }
-        // Where `/mcp enable|disable` would refuse this file, its own refusal
-        // names the hand edit instead (#2915).
-        let toggle = match Config::mcp_toggle_refusal(name, true)
-            .or_else(|| Config::mcp_toggle_refusal(name, false))
-        {
-            Some(refusal) => format!(". {refusal}"),
-            None => ", or toggle it with `/mcp enable|disable`".to_string(),
+        // A disabled copy can be enabled instead; where `/mcp enable` would
+        // refuse this file, its own refusal names the hand edit (#2915).
+        let toggle = if held[index].enabled {
+            String::new()
+        } else {
+            match Config::mcp_toggle_refusal(name, true) {
+                Some(refusal) => format!(", or enable it ({refusal})"),
+                None => ", or toggle it with `/mcp enable|disable`".to_string(),
+            }
         };
         bail!(
             "MCP server `{name}` already exists in {here}: remove it first with {remove}{toggle}"

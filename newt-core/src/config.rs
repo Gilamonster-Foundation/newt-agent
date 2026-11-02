@@ -2699,11 +2699,12 @@ impl Config {
         ) else {
             return Ok(owner);
         };
-        anyhow::bail!(
+        Err(UnnamedOwnerRefusal(format!(
             "MCP server `{name}` is defined in the {kind} config {}, which newt edits only when named: {}",
             owner.display(),
             remedy(&owner)
-        )
+        ))
+        .into())
     }
 
     /// `/mcp enable|disable`: set `enabled` on `name` in its owning file and
@@ -2718,16 +2719,18 @@ impl Config {
         Ok(path)
     }
 
-    /// What [`Self::set_mcp_server_enabled`] answers instead of setting
-    /// `enabled` on `name`, or `None` when it would set it, find it set, or
-    /// find no such server. Advice that would send the operator to `/mcp
-    /// enable|disable` gives this instead, so it never names a toggle that
-    /// refuses (#2915).
+    /// The refusal [`Self::set_mcp_server_enabled`] gives instead of setting
+    /// `enabled` on `name` in a file newt edits only when named, or `None`:
+    /// it would set it, find it set, find no such server, or fail for another
+    /// reason, which names no edit to make. Advice that would send the
+    /// operator to `/mcp enable|disable` gives this instead, so it never
+    /// names a toggle that refuses (#2915).
     pub fn mcp_toggle_refusal(name: &str, enabled: bool) -> Option<String> {
-        Self::mcp_server_owner_path(name).ok().flatten()?;
-        Self::mcp_toggle_target(name, enabled)
-            .err()
-            .map(|refusal| refusal.to_string())
+        let error = Self::mcp_toggle_target(name, enabled).err()?;
+        error
+            .downcast::<UnnamedOwnerRefusal>()
+            .ok()
+            .map(|refusal| refusal.0)
     }
 
     /// The file the toggle edits for `name`, and whether its entry already
@@ -2871,6 +2874,13 @@ fn mcp_entry_table(
         .and_then(|servers| servers.get_mut(index))
         .ok_or_else(|| NewtError::Config("[[mcp_servers]] is not an array of tables".to_string()))
 }
+
+/// A default-scope MCP edit refused because newt edits the owning file only
+/// when it is named ([`Config::mcp_server_edit_path`]). Advice repeats this
+/// refusal and no other error (#2915).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct UnnamedOwnerRefusal(String);
 
 /// The kind of config a default-scope MCP edit leaves alone unless the
 /// operator names it, or `None` when it may edit `owner`. A file pinned with
