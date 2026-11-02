@@ -96,6 +96,41 @@ fn with_mcp_enabled_keeps_comments_and_leaves_a_settled_entry_alone() {
 }
 
 #[test]
+fn mcp_writers_edit_the_entry_discovery_keeps() {
+    // #3062 review (R1-5): within one file, discovery drops a same-name entry
+    // that is invalid and keeps the first valid one. The writers edit that
+    // one too, never a dropped stub ahead of it.
+    let stub = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n\n";
+    let live = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nenabled = false # paused by operator\n";
+    let text = format!("{stub}{live}");
+
+    let enabled = Config::with_mcp_enabled(&text, "docs", true).unwrap();
+    assert_eq!(
+        enabled,
+        format!(
+            "{stub}{}",
+            live.replace("enabled = false", "enabled = true")
+        )
+    );
+    assert_eq!(
+        Config::with_mcp_enabled(&text, "docs", false).unwrap(),
+        text,
+        "the live entry is already off"
+    );
+
+    let source: crate::mcp::McpServerEntry = toml::from_str(
+        "name = \"docs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\n",
+    )
+    .unwrap();
+    let provided = ["type", "url"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(&text, &source, &provided).unwrap(),
+        text,
+        "the live entry already matches; the stub stays as it is"
+    );
+}
+
+#[test]
 fn with_mcp_server_merged_updates_imported_fields_and_keeps_local_fields() {
     let text = "# local MCP settings\n[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nenabled = false\nlogin_argv = [\"client\", \"login\"]\nrequest_timeout_secs = 90\n";
     let incoming = crate::mcp::McpServerEntry {

@@ -1665,6 +1665,23 @@ pub fn parse_newt_mcp_toml_checked(
         .map_err(|error| McpConfigError::Shape(at(error)))
 }
 
+/// Which of one file's `entries` is the one named `name`: the first valid
+/// entry, which discovery keeps, else the first, which `newt mcp list` flags
+/// as dropped. The writers and the import read and edit this one (#2915).
+#[must_use]
+pub fn effective_entry_index(entries: &[McpServerEntry], name: &str) -> Option<usize> {
+    let named = || {
+        entries
+            .iter()
+            .enumerate()
+            .filter(move |(_, entry)| entry.name == name)
+    };
+    named()
+        .find(|(_, entry)| entry.is_valid())
+        .or_else(|| named().next())
+        .map(|(index, _)| index)
+}
+
 /// Read + parse a newt-owned `~/.newt/mcp.toml`. A missing file is empty; one
 /// that cannot be read or parsed is a value-independent diagnostic, so it never
 /// looks like a file with no servers (#2915).

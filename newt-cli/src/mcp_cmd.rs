@@ -1842,6 +1842,10 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         doc = migration.text;
     }
     let existing_entries = parse_mcp_config(&doc, &target)?;
+    // Where a file holds one name twice, the entry discovery keeps (#2915).
+    let effective = |entries: &[McpServerEntry], name: &str| {
+        newt_core::mcp::effective_entry_index(entries, name).map(|index| entries[index].clone())
+    };
     let existing: std::collections::BTreeSet<String> = existing_entries
         .iter()
         .map(|entry| entry.name.clone())
@@ -1989,13 +1993,14 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                     shadowed.push(entry.name.as_str());
                 }
                 if exists_in_target {
-                    let previous_url = existing_entries
-                        .iter()
-                        .find(|existing| existing.name == entry.name)
-                        .and_then(|existing| existing.url.as_deref());
+                    let previous_url =
+                        effective(&existing_entries, &entry.name).and_then(|existing| existing.url);
                     if previous_url.is_some()
                         && entry.url.is_some()
-                        && newt_core::mcp::mcp_endpoint_changed(previous_url, entry.url.as_deref())
+                        && newt_core::mcp::mcp_endpoint_changed(
+                            previous_url.as_deref(),
+                            entry.url.as_deref(),
+                        )
                     {
                         moved.push(&entry.name);
                     }
@@ -2049,7 +2054,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let saved = parse_mcp_config(&doc, &target)?;
     let adopted: Vec<McpServerEntry> = adopted
         .iter()
-        .filter_map(|name| saved.iter().find(|entry| entry.name == *name).cloned())
+        .filter_map(|name| effective(&saved, name))
         .collect();
     let hosts = if request.grant_net {
         imported_http_hosts(&adopted)?
@@ -2079,8 +2084,8 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         let removed: Vec<String> = adopted
             .iter()
             .filter_map(|saved| {
-                let previous = existing_entries.iter().find(|e| e.name == saved.name)?;
-                let removed = removed_local_settings(previous, saved);
+                let previous = effective(&existing_entries, &saved.name)?;
+                let removed = removed_local_settings(&previous, saved);
                 (!removed.is_empty())
                     .then(|| format!("  {}: removed {}", saved.name, removed.join(", ")))
             })
@@ -2090,8 +2095,8 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         let kept: Vec<&str> = adopted
             .iter()
             .filter_map(|saved| {
-                let previous = existing_entries.iter().find(|e| e.name == saved.name)?;
-                kept_login_argv_for_a_new_command(previous, saved).then_some(saved.name.as_str())
+                let previous = effective(&existing_entries, &saved.name)?;
+                kept_login_argv_for_a_new_command(&previous, saved).then_some(saved.name.as_str())
             })
             .collect();
         let except = if removed.is_empty() { "." } else { ", except:" };

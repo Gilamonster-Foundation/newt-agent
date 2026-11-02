@@ -2371,22 +2371,10 @@ impl Config {
     /// (no I/O) like [`with_net_host`](Self::with_net_host); the caller does
     /// the read/write. Errors when the server name isn't present.
     pub fn with_mcp_enabled(text: &str, name: &str, enabled: bool) -> Result<String> {
+        let index = mcp_entry_index(text, name)?
+            .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
         edit_mcp_toml(text, |doc| {
-            let servers =
-                doc.as_table_mut()
-                    .entry("mcp_servers")
-                    .or_insert(toml_edit::Item::ArrayOfTables(
-                        toml_edit::ArrayOfTables::new(),
-                    ));
-            let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
-                NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-            })?;
-            let entry = arr
-                .iter_mut()
-                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
-                .ok_or_else(|| {
-                    NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`"))
-                })?;
+            let entry = mcp_entry_table(doc, index)?;
             if entry
                 .get("enabled")
                 .map_or(Some(true), toml_edit::Item::as_bool)
@@ -2445,13 +2433,12 @@ impl Config {
         provided: &std::collections::BTreeSet<&str>,
     ) -> Result<String> {
         crate::mcp::validate_entry_for_write(entry)?;
-        let Some(previous) = crate::mcp::parse_newt_mcp_toml_checked(text)
-            .map_err(|error| NewtError::Config(error.to_string()))?
-            .into_iter()
-            .find(|server| server.name == entry.name)
-        else {
+        let entries = crate::mcp::parse_newt_mcp_toml_checked(text)
+            .map_err(|error| NewtError::Config(error.to_string()))?;
+        let Some(index) = crate::mcp::effective_entry_index(&entries, &entry.name) else {
             return Self::with_mcp_server_added(text, entry);
         };
+        let previous = &entries[index];
         let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
         let sourced = |key: &str| fresh.contains_key(key) || provided.contains(key);
         // Local settings the source leaves alone would follow a moved
@@ -2518,19 +2505,7 @@ impl Config {
             .chain(["type"])
             .collect();
         let merged = edit_mcp_toml(text, |doc| {
-            // The typed parse above found the entry, so only an inline-array
-            // `mcp_servers` (which this writer cannot edit) misses here.
-            let existing = doc
-                .get_mut("mcp_servers")
-                .and_then(toml_edit::Item::as_array_of_tables_mut)
-                .and_then(|servers| {
-                    servers.iter_mut().find(|table| {
-                        table.get("name").and_then(|value| value.as_str()) == Some(&entry.name)
-                    })
-                })
-                .ok_or_else(|| {
-                    NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-                })?;
+            let existing = mcp_entry_table(doc, index)?;
             for key in decided {
                 let wanted = fresh.get(key);
                 // An accepted alias (`requestTimeoutSecs`) is this same field: it
@@ -2795,6 +2770,26 @@ impl Config {
         paths.push(PathBuf::from(SYSTEM_CONFIG_PATH));
         paths
     }
+}
+
+/// The index of the `[[mcp_servers]]` entry named `name` that the writers
+/// edit ([`crate::mcp::effective_entry_index`]), from the typed parse.
+fn mcp_entry_index(text: &str, name: &str) -> Result<Option<usize>> {
+    crate::mcp::parse_newt_mcp_toml_checked(text)
+        .map(|entries| crate::mcp::effective_entry_index(&entries, name))
+        .map_err(|error| NewtError::Config(error.to_string()))
+}
+
+/// The `[[mcp_servers]]` table at `index`, which the typed parse found, so
+/// only an inline-array `mcp_servers` (which the writers cannot edit) misses.
+fn mcp_entry_table(
+    doc: &mut toml_edit::DocumentMut,
+    index: usize,
+) -> Result<&mut toml_edit::Table> {
+    doc.get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .and_then(|servers| servers.get_mut(index))
+        .ok_or_else(|| NewtError::Config("[[mcp_servers]] is not an array of tables".to_string()))
 }
 
 /// The kind of config a default-scope MCP edit leaves alone unless the

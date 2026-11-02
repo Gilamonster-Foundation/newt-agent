@@ -417,6 +417,38 @@ fn force_import_updates_the_owner_in_place_beside_a_shadowed_copy() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_updates_the_entry_discovery_keeps_not_a_dropped_stub() {
+    // #3062 review (R1-5): the file holds a stale `docs` with no url, which
+    // discovery drops, then the live one, paused. The import compares with,
+    // updates and reports the live entry: nothing to change, still paused,
+    // so it is not admitted and gets no network grant.
+    let sb = sandbox();
+    let config = sb.cwd.join("cfg.toml");
+    let text = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n\n[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nenabled = false # paused by operator\n";
+    std::fs::write(&config, text).unwrap();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "docs": { "type": "http", "url": "https://mcp.example.test/mcp" } } }"#,
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args(["--config", config.to_str().unwrap(), "mcp", "import"])
+        .args([source.to_str().unwrap(), "--all", "--force", "--grant-net"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 0 replaced, 1 unchanged, 0 skipped.",
+        ))
+        .stdout(predicate::str::contains("docs — not admitted"))
+        .stdout(predicate::str::contains("Granted").not());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_refuses_a_batch_with_multiple_owners_without_writing() {
     let sb = sandbox();
     let config_path = sb.config_dir.join("config.toml");
