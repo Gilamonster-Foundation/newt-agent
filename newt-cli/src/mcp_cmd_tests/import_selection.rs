@@ -501,3 +501,37 @@ fn removed_local_settings_names_dropped_map_members_and_foreign_fields() {
     );
     assert!(removed_local_settings(&previous, &previous).is_empty());
 }
+
+/// #3062 review (G5 follow-up): a merge keeps a local `login_argv`, which no
+/// source can supply, and the notice names it when the stdio command, the
+/// whole argv, is not the one it was written for.
+#[test]
+fn a_kept_login_argv_is_named_only_when_the_command_changed() {
+    let mut previous = stdio_entry("fs", Some("npx"));
+    previous.args = vec!["old-mcp".into()];
+    previous.login_argv = vec!["old-mcp".into(), "login".into()];
+    let mut saved = previous.clone();
+    saved.request_timeout_secs = Some(30);
+    assert!(!kept_login_argv_for_a_new_command(&previous, &saved));
+
+    saved.args = vec!["new-mcp".into()];
+    assert!(kept_login_argv_for_a_new_command(&previous, &saved));
+    saved.args = previous.args.clone();
+    saved.command = Some("new-mcp".into());
+    assert!(kept_login_argv_for_a_new_command(&previous, &saved));
+
+    let mut http = stdio_entry("fs", None);
+    http.transport = TransportKind::Http;
+    http.url = Some("https://mcp.example.test/mcp".into());
+    http.login_argv = previous.login_argv.clone();
+    assert!(
+        kept_login_argv_for_a_new_command(&http, &previous),
+        "an HTTP entry's login_argv starts to run for the new command"
+    );
+    assert!(
+        !kept_login_argv_for_a_new_command(&previous, &http),
+        "an HTTP entry never runs its login_argv"
+    );
+    saved.login_argv.clear();
+    assert!(!kept_login_argv_for_a_new_command(&previous, &saved));
+}

@@ -734,6 +734,44 @@ fn force_import_names_the_local_settings_it_removed() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_names_a_login_argv_it_kept_for_a_changed_command() {
+    // #3062 review (G5 follow-up): no source can supply `login_argv`, so a
+    // command change keeps the local one, but the notice names it, by key
+    // only: it runs host-side and was written for the previous command.
+    let sb = sandbox();
+    let mcp = sb.config_dir.join("mcp.toml");
+    let login = "login_argv = [\"old-mcp\", \"login\", \"--write-token\"] # operator login";
+    std::fs::write(
+        &mcp,
+        format!("[[mcp_servers]]\nname = \"fs\"\ncommand = \"old-mcp\"\n{login}\n"),
+    )
+    .unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "new-mcp" } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "preserved.\n  fs: kept login_argv, though the command changed\n",
+    ))
+    .stdout(predicate::str::contains("--write-token").not());
+    let updated = std::fs::read_to_string(&mcp).unwrap();
+    assert!(updated.contains(login), "{updated}");
+
+    // The same command: nothing to name.
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "new-mcp", "requestTimeoutSecs": 30 } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains("1 replaced"))
+    .stdout(predicate::str::contains("login_argv").not());
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_keeps_comments_on_defaults_and_resets() {
     // #3062 review: resetting a value to its default keeps the comment on its
     // line, and an unchanged default-valued line survives a change elsewhere

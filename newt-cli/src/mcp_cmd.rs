@@ -1297,6 +1297,16 @@ fn removed_local_settings(previous: &McpServerEntry, saved: &McpServerEntry) -> 
     removed
 }
 
+/// Whether a merge kept a local `login_argv` although the stdio command
+/// changed. No source can supply one, and it runs host-side, so the notice
+/// names it (#2915). As in the moved-command refusal, the command is the
+/// whole argv: a launcher such as `npx` picks the program by its args.
+fn kept_login_argv_for_a_new_command(previous: &McpServerEntry, saved: &McpServerEntry) -> bool {
+    saved.transport == TransportKind::Stdio
+        && !saved.login_argv.is_empty()
+        && (&previous.command, &previous.args) != (&saved.command, &saved.args)
+}
+
 fn imported_http_hosts(entries: &[McpServerEntry]) -> anyhow::Result<Vec<String>> {
     let mut hosts = std::collections::BTreeSet::new();
     for entry in entries {
@@ -2045,12 +2055,21 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                     .then(|| format!("  {}: removed {}", saved.name, removed.join(", ")))
             })
             .collect();
+        let kept = adopted.iter().filter_map(|saved| {
+            let previous = existing_entries.iter().find(|e| e.name == saved.name)?;
+            kept_login_argv_for_a_new_command(previous, saved).then(|| {
+                format!(
+                    "  {}: kept login_argv, though the command changed",
+                    saved.name
+                )
+            })
+        });
         let except = if removed.is_empty() { "." } else { ", except:" };
         writeln!(
             out,
             "Overwrote {owner_replacements} existing server(s); local settings absent from the source were preserved{except}"
         )?;
-        for line in removed {
+        for line in removed.into_iter().chain(kept) {
             writeln!(out, "{line}")?;
         }
     }
