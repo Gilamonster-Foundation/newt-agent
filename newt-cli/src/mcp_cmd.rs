@@ -133,7 +133,10 @@ pub enum McpCmd {
         /// error on a clash).
         #[arg(long)]
         force: bool,
-        /// Keep existing entries — import only names not already present (no error).
+        /// Keep existing entries: skip names already defined instead of
+        /// failing. A name that only a project config or an ambient
+        /// `./newt.toml` defines still fails a default import, since the
+        /// import would not take effect.
         #[arg(long, conflicts_with = "force")]
         merge: bool,
         /// Rejected for imports: project config is borrowed and untrusted.

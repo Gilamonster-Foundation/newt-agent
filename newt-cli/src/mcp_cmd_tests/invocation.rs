@@ -62,3 +62,32 @@ fn import_help_names_the_grant_net_destination() {
         "{help}"
     );
 }
+
+/// #3062 review (R2-11): --merge skips a name already defined, except one
+/// that only a borrowed project config or an ambient `./newt.toml` defines,
+/// which it refuses (C1). Its help no longer promises "no error".
+#[test]
+fn import_merge_help_names_the_clash_it_still_refuses() {
+    use clap::CommandFactory;
+    let cli = crate::Cli::command();
+    let merge = cli
+        .find_subcommand("mcp")
+        .and_then(|mcp| mcp.find_subcommand("import"))
+        .and_then(|import| {
+            import
+                .get_arguments()
+                .find(|arg| arg.get_id() == "merge")
+                .cloned()
+        })
+        .unwrap();
+    let help = merge
+        .get_long_help()
+        .or(merge.get_help())
+        .unwrap()
+        .to_string();
+    assert!(!help.contains("no error"), "{help}");
+    assert!(
+        help.contains("project config or an ambient `./newt.toml`"),
+        "{help}"
+    );
+}
