@@ -2824,7 +2824,8 @@ fn unnamed_owner_kind(
 /// Apply `edit` to the MCP TOML `text`, the one parse-and-render path of the
 /// `[[mcp_servers]]` writers. An edit that changes nothing hands back `text`
 /// itself; a real one keeps the missing final newline, CRLF line endings and
-/// BOM that `toml_edit` drops when it renders a document.
+/// BOM that `toml_edit` drops when it renders a document, never at the cost
+/// of a value.
 fn edit_mcp_toml(
     text: &str,
     edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
@@ -2843,7 +2844,13 @@ fn edit_mcp_toml(
         after.pop();
     }
     if 2 * text.matches("\r\n").count() > text.matches('\n').count() {
-        after = after.replace("\r\n", "\n").replace('\n', "\r\n");
+        // A raw newline inside a multi-line string is part of its value, so
+        // CRLF comes back only where every value stays as written.
+        let crlf = after.replace("\r\n", "\n").replace('\n', "\r\n");
+        let values = |text: &str| toml::from_str::<toml::Table>(text).ok();
+        if values(&crlf) == values(&after) {
+            after = crlf;
+        }
     }
     if text.starts_with('\u{feff}') {
         after.insert(0, '\u{feff}');

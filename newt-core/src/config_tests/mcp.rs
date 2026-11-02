@@ -187,6 +187,41 @@ fn mcp_writers_keep_the_file_style() {
 }
 
 #[test]
+fn mcp_writers_never_change_a_value_to_keep_crlf() {
+    // #3062 review (R1-4): a raw newline inside a multi-line string is part of
+    // its value, so restoring CRLF line endings must not rewrite it, in a new
+    // value, in a merged one, or in an entry the edit did not touch.
+    let args = |text: &str, name: &str| {
+        crate::mcp::parse_newt_mcp_toml_checked(text)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .unwrap()
+            .args
+    };
+    let banner: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"banner\"\ncommand = \"/bin/echo\"\nargs = [\"line1\\nline2\"]\n")
+            .unwrap();
+    let crlf = "# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"/bin/true\"\r\nargs = [\"--banner\", \"\"\"\nline1\nline2\"\"\"]\r\n\r\n[[mcp_servers]]\r\nname = \"other\"\r\ncommand = \"/bin/true\"\r\n";
+
+    let added = Config::with_mcp_server_added(crlf, &banner).unwrap();
+    assert_eq!(args(&added, "banner"), ["line1\nline2"], "{added:?}");
+    assert_eq!(args(&added, "fs"), ["--banner", "line1\nline2"], "{added:?}");
+
+    let removed = Config::with_mcp_server_removed(crlf, "other").unwrap();
+    assert_eq!(
+        args(&removed, "fs"),
+        ["--banner", "line1\nline2"],
+        "{removed:?}"
+    );
+
+    let stored = "# servers\r\n[[mcp_servers]]\r\nname = \"banner\"\r\ncommand = \"/bin/echo\"\r\nargs = [\"\"\"\r\nline1\r\nline2\"\"\"]\r\n";
+    let provided = ["command", "args"].into_iter().collect();
+    let merged = Config::with_mcp_server_merged(stored, &banner, &provided).unwrap();
+    assert_eq!(args(&merged, "banner"), ["line1\nline2"], "{merged:?}");
+}
+
+#[test]
 fn with_mcp_server_merged_resets_a_changed_transport_to_default_stdio() {
     let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nheaders = { Authorization = \"Bearer old\" }\n";
     let incoming: crate::mcp::McpServerEntry =
