@@ -2672,6 +2672,26 @@ impl Config {
         )
     }
 
+    /// `/mcp enable|disable`: set `enabled` on `name` in its owning file and
+    /// return that file. An entry already in that state needs no edit, so it
+    /// is never refused; a change to a file newt edits only when named is,
+    /// with the edit to make there by hand (#2915).
+    pub fn set_mcp_server_enabled(name: &str, enabled: bool) -> anyhow::Result<PathBuf> {
+        if let Some(owner) = Self::mcp_server_owner_path(name)? {
+            let text = std::fs::read_to_string(&owner).map_err(|error| {
+                anyhow::anyhow!("reading MCP config {}: {error}", owner.display())
+            })?;
+            if Self::with_mcp_enabled(&text, name, enabled)? == text {
+                return Ok(owner);
+            }
+        }
+        let path = Self::mcp_server_edit_path(name, false, |_| {
+            format!("set `enabled = {enabled}` there by hand")
+        })?;
+        Self::set_mcp_server_enabled_in_file(&path, name, enabled)?;
+        Ok(path)
+    }
+
     /// Change an MCP entry under the shared config lock and atomically replace
     /// the file only if its contents still match the snapshot read under lock.
     pub fn set_mcp_server_enabled_in_file(

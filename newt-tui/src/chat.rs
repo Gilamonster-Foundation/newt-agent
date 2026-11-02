@@ -4122,18 +4122,7 @@ fn session_body(
                                 }
                                 ("enable", n) | ("disable", n) if !n.is_empty() => {
                                     let on = verb == "enable";
-                                    let updated_path = (|| -> anyhow::Result<std::path::PathBuf> {
-                                        let path = newt_core::Config::mcp_server_edit_path(
-                                            n,
-                                            false,
-                                            |_| format!("set `enabled = {on}` there by hand"),
-                                        )?;
-                                        newt_core::Config::set_mcp_server_enabled_in_file(
-                                            &path, n, on,
-                                        )?;
-                                        Ok(path)
-                                    })();
-                                    match updated_path {
+                                    match newt_core::Config::set_mcp_server_enabled(n, on) {
                                         Ok(path) if on => print_newt(
                                             &format!(
                                                 "{n} enabled in {} — choose Reconnect in /settings → MCP, or `/mcp on {n}` if already connected.",

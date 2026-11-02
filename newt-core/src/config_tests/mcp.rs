@@ -1020,11 +1020,9 @@ fn the_toggle_refusal_does_not_advise_a_remove() {
     std::env::set_current_dir(&workspace).unwrap();
 
     let owner = Config::mcp_server_owner_path("proj").unwrap().unwrap();
-    let error = Config::mcp_server_edit_path("proj", false, |_| {
-        "set `enabled = true` there by hand".into()
-    })
-    .unwrap_err()
-    .to_string();
+    let error = Config::set_mcp_server_enabled("proj", true)
+        .unwrap_err()
+        .to_string();
     assert_eq!(
         error,
         format!(
@@ -1032,6 +1030,40 @@ fn the_toggle_refusal_does_not_advise_a_remove() {
             owner.display()
         )
     );
+}
+
+/// #3062 review (R2-6): an entry already in the requested state needs no
+/// edit, so `/mcp enable|disable` reports it set wherever it is defined and
+/// writes nothing. Only a real change to a file newt edits only when named
+/// is refused; advising a hand edit to the value it already has misleads.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn the_toggle_accepts_an_entry_already_in_that_state_in_a_borrowed_file() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+    let entry = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    for borrowed in [
+        workspace.join(".newt").join("config.toml"),
+        workspace.join("newt.toml"),
+    ] {
+        std::fs::write(&borrowed, entry).unwrap();
+        let owner = Config::mcp_server_owner_path("fs").unwrap().unwrap();
+        assert_eq!(Config::set_mcp_server_enabled("fs", true).unwrap(), owner);
+        let error = Config::set_mcp_server_enabled("fs", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.ends_with("set `enabled = false` there by hand"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&borrowed).unwrap(), entry);
+        std::fs::remove_file(&borrowed).unwrap();
+    }
 }
 
 /// #3062 review (R1-13): a config the operator pinned with `--config` or
