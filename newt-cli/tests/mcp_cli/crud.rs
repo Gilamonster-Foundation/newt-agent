@@ -281,3 +281,109 @@ fn list_reports_malformed_mcp_toml_without_echoing_its_contents() {
         .stderr(predicate::str::contains("invalid MCP TOML syntax"))
         .stderr(predicate::str::contains("SYNTHETIC_SECRET_MARKER").not());
 }
+
+/// A config holding `[[mcp_servers]]` whose `headers` line, here with a
+/// credential, does not decode: unterminated (`syntax`), or the wrong type
+/// (`shape`), each on line 5.
+fn malformed_config(marker: &str) -> (String, String) {
+    let head = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\nurl = \"https://docs.example.test/mcp\"\n";
+    (
+        format!("{head}headers = {{ Authorization = \"Bearer {marker}\" \n"),
+        format!("{head}headers = \"Bearer {marker}\"\n"),
+    )
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn list_reports_a_malformed_config_by_file_and_position_not_its_contents() {
+    // #3062 review (R3-9): a config that did not decode failed `newt mcp
+    // list` with the parser's own message, which quotes the offending line,
+    // here a credential, and names no file. Every file the resolver reads
+    // (the user config, `--config`, a walked-up project config, an ambient
+    // ./newt.toml) is named with where it stops, never its contents.
+    let sb = sandbox();
+    let marker = "SYNTHETIC_SECRET_MARKER";
+    let (syntax, shape) = malformed_config(marker);
+    let user = sb.config_dir.join("config.toml");
+    let pinned = sb.cwd.join("pinned.toml");
+    let project = sb.cwd.join("proj").join(".newt").join("config.toml");
+    let nested = sb.cwd.join("proj").join("sub");
+    let ambient = sb.cwd.join("newt.toml");
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let list = |cwd: &Path, args: &[&str], shown: &str, error: &str| {
+        newt(&sb)
+            .current_dir(cwd)
+            .args(args)
+            .args(["mcp", "list"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!("{shown}: {error}")))
+            .stdout(predicate::str::contains(marker).not())
+            .stderr(predicate::str::contains(marker).not());
+    };
+    let shown = |path: &Path| path.display().to_string();
+    let syntax_at = "TOML parse error at line 5, column 61";
+
+    std::fs::write(&user, &syntax).unwrap();
+    list(&sb.cwd, &[], &shown(&user), syntax_at);
+    std::fs::write(&user, &shape).unwrap();
+    list(
+        &sb.cwd,
+        &[],
+        &shown(&user),
+        "TOML parse error at line 5, column 11",
+    );
+    std::fs::remove_file(&user).unwrap();
+
+    std::fs::write(&pinned, &syntax).unwrap();
+    let pinned_arg = pinned.to_str().unwrap();
+    list(
+        &sb.cwd,
+        &["--config", pinned_arg],
+        &shown(&pinned),
+        syntax_at,
+    );
+    std::fs::remove_file(&pinned).unwrap();
+
+    // The walk-up and the ambient base are named as the resolver found them.
+    let project_shown = shown(&Path::new("proj").join(".newt").join("config.toml"));
+    for (text, error) in [(&syntax, syntax_at), (&shape, "TOML parse error")] {
+        std::fs::write(&project, text).unwrap();
+        list(&nested, &[], &project_shown, error);
+    }
+    std::fs::remove_file(&project).unwrap();
+    for (text, error) in [(&syntax, syntax_at), (&shape, "TOML parse error")] {
+        std::fs::write(&ambient, text).unwrap();
+        list(&sb.cwd, &[], "newt.toml", error);
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn doctor_reports_a_malformed_config_by_file_and_position_not_its_contents() {
+    // #3062 review (R3-9): `newt doctor` reports a config that did not
+    // decode as a finding, and printed the parser's message, the credential
+    // on the offending line included. The finding names the file and where
+    // it stops, by default and with `--config`.
+    let sb = sandbox();
+    let marker = "SYNTHETIC_SECRET_MARKER";
+    let config = sb.config_dir.join("config.toml");
+    std::fs::write(&config, malformed_config(marker).0).unwrap();
+    let config_arg = config.to_str().unwrap();
+    for args in [&["doctor"][..], &["--config", config_arg, "doctor"][..]] {
+        newt(&sb)
+            .env("OLLAMA_HOST", "http://127.0.0.1:1")
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "FINDING: config did not resolve — config error: {}: TOML parse error at line 5, column 61",
+                config.display()
+            )))
+            .stdout(predicate::str::contains(marker).not())
+            .stderr(predicate::str::contains(marker).not());
+    }
+}
