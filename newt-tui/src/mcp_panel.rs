@@ -643,9 +643,8 @@ mod tests {
         let mut listed = McpPanel::new(vec![server("documents")], true);
         listed.notices = vec![notice.into()];
         let text = render(&listed, 100, 12);
-        assert!(
-            text.find("invalid MCP TOML syntax") < text.find("documents"),
-            "{text}"
-        );
+        // Both must be found: `None < Some(_)` would pass with no notice.
+        let notice = text.find("invalid MCP TOML syntax").expect(&text);
+        assert!(notice < text.find("documents").expect(&text), "{text}");
     }
 }
