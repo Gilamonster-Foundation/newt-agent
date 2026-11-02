@@ -2588,17 +2588,7 @@ impl Config {
     /// valid one; `newt mcp remove` can then still delete it.
     pub fn mcp_server_owner_path(name: &str) -> anyhow::Result<Option<PathBuf>> {
         let base = Self::base_config_path();
-        let project = Self::project_config_path().filter(|project| {
-            base.as_ref().is_none_or(|base| {
-                match (
-                    crate::atomic_fs::ResolvedPath::resolve(project),
-                    crate::atomic_fs::ResolvedPath::resolve(base),
-                ) {
-                    (Ok(project), Ok(base)) => project != base,
-                    _ => project.as_path() != base.as_path(),
-                }
-            })
-        });
+        let project = Self::project_layer_path(base.as_deref());
 
         let base_value = base
             .as_deref()
@@ -2636,6 +2626,23 @@ impl Config {
         Ok(None)
     }
 
+    /// The walked-up project config when it is a layer of its own. One that
+    /// is also `base` (a config dir that is an ancestor's `.newt`) is read
+    /// once, as the trusted base, as the resolver reads it (#2915).
+    fn project_layer_path(base: Option<&Path>) -> Option<PathBuf> {
+        Self::project_config_path().filter(|project| {
+            base.is_none_or(|base| {
+                match (
+                    crate::atomic_fs::ResolvedPath::resolve(project),
+                    crate::atomic_fs::ResolvedPath::resolve(base),
+                ) {
+                    (Ok(project), Ok(base)) => project != base,
+                    _ => project.as_path() != base,
+                }
+            })
+        })
+    }
+
     /// The owner of `name` that a default-scope edit (`newt mcp remove`, `/mcp
     /// enable|disable`) may change; see `unnamed_owner_kind` for the files
     /// it leaves alone (#2915). `ambient_is_default` says whether this edit
@@ -2653,7 +2660,7 @@ impl Config {
         let Some(kind) = unnamed_owner_kind(
             &owner,
             Self::pinned_config_path().as_deref(),
-            Self::project_config_path().as_deref(),
+            Self::project_layer_path(Self::base_config_path().as_deref()).as_deref(),
             !ambient_is_default && layering::base_is_ambient_newt_toml(Some(&owner)),
         ) else {
             return Ok(owner);
@@ -2792,8 +2799,9 @@ fn mcp_entry_table(
 /// The kind of config a default-scope MCP edit leaves alone unless the
 /// operator names it, or `None` when it may edit `owner`. A file pinned with
 /// `--config` or `$NEWT_CONFIG` is named. The system config is shared, and a
-/// walked-up project config and an `ambient` `./newt.toml` are borrowed and
-/// may be repo-tracked; main never wrote them implicitly (#2915). Pure.
+/// `project` layer (a walked-up file other than the base) and an `ambient`
+/// `./newt.toml` are borrowed and may be repo-tracked; main never wrote them
+/// implicitly (#2915). Pure.
 fn unnamed_owner_kind(
     owner: &Path,
     pinned: Option<&Path>,

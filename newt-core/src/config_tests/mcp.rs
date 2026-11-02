@@ -926,6 +926,45 @@ fn mcp_server_edit_path_refuses_a_project_owner() {
     assert_eq!(edit("proj").unwrap(), owner);
 }
 
+/// #3062 review (R2-1): a config dir that is an ancestor's `.newt` holds the
+/// operator's own config, which the resolver reads as the trusted base. The
+/// walk-up finds the same file, but a project layer is a file other than the
+/// base, so default-scope `newt mcp remove` and `/mcp enable|disable` edit
+/// it, as on main, whatever the cwd.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn the_base_config_the_walk_up_also_finds_is_not_a_project_config() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let config_dir = dir.path().join("data").join(".newt");
+    let workspace = dir.path().join("data").join("ws").join("sub");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = config_dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"mine\"\ncommand = \"mine-mcp\"\n",
+    )
+    .unwrap();
+    // SAFETY: the `real_fs` serial lane serializes env mutation; HomeSandbox
+    // restores NEWT_CONFIG_DIR on drop.
+    unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, &config_dir) };
+    std::env::set_current_dir(&workspace).unwrap();
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+    assert_eq!(
+        Config::project_config_path().as_deref().map(canonical),
+        Some(canonical(&config))
+    );
+
+    for ambient_is_default in [true, false] {
+        let edit =
+            Config::mcp_server_edit_path("mine", ambient_is_default, |_| "edit it by hand".into());
+        assert_eq!(edit.unwrap(), config, "{ambient_is_default}");
+    }
+}
+
 /// #3062 review (R1-1): an unpinned `./newt.toml` is the resolver's ambient
 /// base, which a cloned repo can ship, and its MCP entries are untrusted
 /// (#1301). `/mcp enable|disable` never wrote it on main, so the toggle
