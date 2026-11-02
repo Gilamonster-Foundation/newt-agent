@@ -965,6 +965,14 @@ fn import_field_supported(fields: &[ImportField], field: &str) -> bool {
     fields.iter().any(|(name, _)| *name == field)
 }
 
+/// Whether every import source format has a field that sets the newt `key`,
+/// so advice to supply it in the source can be followed whatever the source.
+pub(crate) fn every_import_format_sets(key: &str) -> bool {
+    [CLAUDE_IMPORT_FIELDS, CODEX_IMPORT_FIELDS]
+        .iter()
+        .all(|fields| fields.iter().any(|(_, keys)| keys.contains(&key)))
+}
+
 fn provided_keys<'a>(
     fields: &[ImportField],
     present: impl IntoIterator<Item = &'a String>,

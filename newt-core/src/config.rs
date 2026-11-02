@@ -2447,8 +2447,16 @@ impl Config {
         // server), to a new endpoint; env, and argv written for the old
         // program (a credential flag included), to a different one. The
         // program is the whole argv, since a launcher such as `npx` picks it
-        // by its args.
-        let kept = |key: &str, count: usize| if sourced(key) { 0 } else { count };
+        // by its args. A refusal says to supply a kept setting in the source
+        // only when every import format has a field for it.
+        let mut suppliable = true;
+        let mut kept = |key: &str, count: usize| {
+            if sourced(key) || count == 0 {
+                return 0;
+            }
+            suppliable &= crate::mcp::every_import_format_sets(key);
+            count
+        };
         let (destination, moved, carried) = match entry.transport {
             crate::mcp::TransportKind::Stdio => {
                 let args = if sourced("args") {
@@ -2488,8 +2496,13 @@ impl Config {
             .map(|(count, noun)| format!("{count} local {noun}"))
             .collect();
         if moved && !carried.is_empty() {
+            let remedy = if suppliable {
+                "Supply them in the source, or remove them"
+            } else {
+                "Remove them"
+            };
             return Err(NewtError::Config(format!(
-                "MCP server `{}` would change its {destination} while keeping {} the source does not provide; refusing to send them to the new {destination}. Supply them in the source, or remove them from the existing entry, then re-run the import",
+                "MCP server `{}` would change its {destination} while keeping {} the source does not provide; refusing to send them to the new {destination}. {remedy} from the existing entry, then re-run the import",
                 entry.name,
                 carried.join(" and ")
             )));

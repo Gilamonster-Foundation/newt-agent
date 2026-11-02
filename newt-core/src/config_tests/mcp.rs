@@ -584,6 +584,44 @@ fn with_mcp_server_merged_refuses_to_carry_oauth_settings_to_a_moved_endpoint() 
 }
 
 #[test]
+fn a_moved_destination_refusal_offers_only_remedies_every_source_can_follow() {
+    // #3062 review (R2-2): every import format can supply headers, env, args
+    // and an OAuth client id, but a Codex source has no field for OAuth
+    // scopes or a callback port. A refusal that keeps such a pin offers only
+    // removing it, so its advice can always be followed.
+    let local = "[[mcp_servers]]\nname = \"remote\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\n";
+    let moved: crate::mcp::McpServerEntry = toml::from_str(
+        "name = \"remote\"\ntype = \"http\"\nurl = \"https://new.example.test/mcp\"\n",
+    )
+    .unwrap();
+    let provided = ["type", "url"].into_iter().collect();
+    let refusal = |pins: &str| {
+        Config::with_mcp_server_merged(&format!("{local}{pins}"), &moved, &provided)
+            .unwrap_err()
+            .to_string()
+    };
+    let supply = "Supply them in the source, or remove them from the existing entry";
+    for pins in [
+        "oauth_scopes = \"read write\"\n",
+        "oauth_client_id = \"old-client\"\noauth_callback_port = 3118\n",
+    ] {
+        let error = refusal(pins);
+        assert!(!error.contains("Supply"), "{error}");
+        assert!(
+            error.ends_with("Remove them from the existing entry, then re-run the import"),
+            "{error}"
+        );
+    }
+    for pins in [
+        "oauth_client_id = \"old-client\"\n",
+        "headers = { X-Tenant = \"${TENANT}\" }\n",
+    ] {
+        let error = refusal(pins);
+        assert!(error.contains(supply), "{error}");
+    }
+}
+
+#[test]
 fn with_mcp_server_merged_keeps_the_operators_spelling_of_one_endpoint() {
     // #3062 review (F6): `https://h` and `https://h/` are one request target,
     // but a saved login is bound to the exact spelling. An import that only
