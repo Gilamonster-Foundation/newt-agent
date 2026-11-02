@@ -877,6 +877,9 @@ fn a_moved_destination_refusal_names_the_file_holding_the_entry() {
     std::fs::write(&config, owner).unwrap();
     std::fs::write(&mcp, shadowed).unwrap();
 
+    // The import names the owner it resolved: canonical, so a symlinked
+    // temp dir (macOS) or a verbatim prefix (Windows) spells it that way.
+    let resolved = std::fs::canonicalize(&config).unwrap();
     force_import(
         &sb,
         r#"{ "mcpServers": { "alpha": { "command": "other-vendor-mcp" } } }"#,
@@ -884,7 +887,7 @@ fn a_moved_destination_refusal_names_the_file_holding_the_entry() {
     .failure()
     .stderr(predicate::str::contains(format!(
         "updating {}",
-        config.display()
+        resolved.display()
     )))
     .stderr(predicate::str::contains("3 local argument(s)"))
     .stderr(predicate::str::contains("SYNTHETIC_SECRET_MARKER").not());
