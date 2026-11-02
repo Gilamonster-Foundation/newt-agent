@@ -592,6 +592,32 @@ impl BackendArgs {
     }
 }
 
+/// Put last run's provider and model (#545) into the env, each only where
+/// nothing this invocation set already owns that axis.
+fn apply_sticky_restore(
+    session: &newt_core::settings::Session,
+    known_backend: impl Fn(&str) -> bool,
+) {
+    let current_provider = std::env::var("NEWT_PROVIDER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let restore = session.restore(
+        current_provider.as_deref(),
+        // #3066: a model already in effect, or one this invocation named.
+        // `--backend-model` never sets `NEWT_DGX_MODEL`, so only the recorded
+        // model axis shows it.
+        std::env::var_os("NEWT_DGX_MODEL").is_some()
+            || newt_core::runtime::cli_preference_axes().model,
+        known_backend,
+    );
+    if let Some(provider) = restore.provider {
+        newt_core::process_env::set_var("NEWT_PROVIDER", &provider);
+    }
+    if let Some(model) = restore.model {
+        newt_core::process_env::set_var("NEWT_DGX_MODEL", &model);
+    }
+}
+
 /// Which posture axes the `--backend-*` flag group owns for THIS invocation.
 ///
 /// #1668 review-2 finding 4. Axis ownership asks what the operator NAMED on
@@ -1367,9 +1393,10 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
     // conversation's stored preference pin never overwrites the flag the
     // operator just typed (the same precedence the `--backend-*` doc above
     // states). An ambient `NEWT_PROVIDER`/`NEWT_DGX_MODEL` exported by the
-    // operator counts too — config.rs already documents it as always-wins —
-    // but the #545 sticky settings restore below deliberately does NOT: that
-    // is last run's choice, and this conversation's pin outranks it.
+    // operator counts too — the settings.toml header documents it as
+    // always-wins — but the #545 sticky settings restore below deliberately
+    // does NOT: that is last run's choice, and this conversation's pin
+    // outranks it. That restore reads the model axis (#3066), so record first.
     newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
         backend: std::env::var_os("NEWT_PROVIDER").is_some(),
         model: std::env::var_os("NEWT_DGX_MODEL").is_some(),
@@ -1568,8 +1595,9 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
             // last chose via `/backends`/`/model` are restored from
             // ~/.newt/settings.toml so the next start picks up where they left
             // off. LOWEST precedence — an explicit NEWT_PROVIDER/NEWT_DGX_MODEL
-            // (env) or a --loadout axis (set just above) always wins, and a
-            // provider naming a since-removed [[backends]] entry is ignored.
+            // (env), a --backend-* flag or a --loadout axis (set above) always
+            // wins, and a provider naming a since-removed [[backends]] entry is
+            // ignored.
             {
                 // Key on the session workspace, not the launch directory.
                 if let Some(dir) = &path {
@@ -1580,26 +1608,10 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
                     let cfg =
                         crate::migration_notices::read(|report| newt_core::Config::resolve(report))
                             .ok();
-                    let current_provider = std::env::var("NEWT_PROVIDER")
-                        .ok()
-                        .filter(|s| !s.is_empty());
-                    let restore = session.restore(
-                        current_provider.as_deref(),
-                        std::env::var_os("NEWT_DGX_MODEL").is_some(),
-                        |name| {
-                            cfg.as_ref()
-                                .is_some_and(|c| c.backends.iter().any(|b| b.name == name))
-                        },
-                    );
-                    // SAFETY: single-threaded before the TUI starts async work.
-                    unsafe {
-                        if let Some(provider) = restore.provider {
-                            std::env::set_var("NEWT_PROVIDER", provider);
-                        }
-                        if let Some(model) = restore.model {
-                            std::env::set_var("NEWT_DGX_MODEL", model);
-                        }
-                    }
+                    apply_sticky_restore(&session, |name| {
+                        cfg.as_ref()
+                            .is_some_and(|c| c.backends.iter().any(|b| b.name == name))
+                    });
                 }
             }
             // --ephemeral threads to the TUI the same way (Step 17.7): the
@@ -2325,6 +2337,74 @@ mod backend_flag_axis_tests {
                 ..over()
             })
             .backend
+        );
+    }
+
+    /// `dispatch`'s steps up to the sticky restore, for `flags` and an
+    /// `exported` `NEWT_DGX_MODEL`: record the exported model and the
+    /// `--backend-*` axes, and set `NEWT_PROVIDER` from `--backend-name`. Then
+    /// restore a project whose `settings.toml` entry remembers a model and no
+    /// provider, and return the model left in `NEWT_DGX_MODEL`.
+    fn restored_model(exported: Option<&str>, flags: &[&str]) -> Option<String> {
+        use clap::Parser;
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        newt_core::process_env::remove_var("NEWT_PROVIDER");
+        newt_core::process_env::set_or_remove("NEWT_DGX_MODEL", exported);
+        let cli = super::Cli::try_parse_from(std::iter::once("newt").chain(flags.iter().copied()))
+            .expect("flags parse");
+        let over = cli.backend.to_override();
+        newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+            model: exported.is_some(),
+            ..Default::default()
+        });
+        newt_core::runtime::record_cli_preference_axes(backend_flag_axes(&over));
+        if let Some(name) = &over.name {
+            newt_core::process_env::set_var("NEWT_PROVIDER", name);
+        }
+        let doc: toml::Table = toml::from_str("[projects.\"/repo\"]\nmodel = \"ornith-1.5-35b\"\n")
+            .expect("settings parse");
+        let session = newt_core::settings::Session::for_project(&doc, "/repo");
+        super::apply_sticky_restore(&session, |_| true);
+        std::env::var("NEWT_DGX_MODEL").ok()
+    }
+
+    /// #3066: a project's remembered model must not be restored over
+    /// `--backend-model`. The restore treated the model as pinned only when
+    /// `NEWT_DGX_MODEL` was set, which the flag never does, so the project's
+    /// model won and the session ran on the backend file's model instead.
+    #[test]
+    fn a_backend_model_flag_keeps_the_remembered_project_model_out() {
+        assert_eq!(
+            restored_model(
+                None,
+                &[
+                    "--backend-name",
+                    "openrouter",
+                    "--backend-model",
+                    "z-ai/glm-5.3"
+                ]
+            ),
+            None
+        );
+    }
+
+    /// The control: naming only a backend leaves the model axis open, so the
+    /// project's remembered model is still restored.
+    #[test]
+    fn without_a_model_flag_the_project_model_is_still_restored() {
+        assert_eq!(
+            restored_model(None, &["--backend-name", "openrouter"]).as_deref(),
+            Some("ornith-1.5-35b")
+        );
+    }
+
+    /// An exported `NEWT_DGX_MODEL` stays: the restore never replaces a model
+    /// already in effect.
+    #[test]
+    fn an_exported_model_is_not_replaced_by_the_remembered_one() {
+        assert_eq!(
+            restored_model(Some("qwen3-coder"), &[]).as_deref(),
+            Some("qwen3-coder")
         );
     }
 

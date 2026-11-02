@@ -280,10 +280,12 @@ pub enum BackendAxisAction {
 
 /// A set of posture axes, used to say which ones somebody else already owns
 /// (#1668). Recorded at launch for THIS invocation's explicit inputs — an
-/// `NEWT_PROVIDER`/`NEWT_DGX_MODEL` the operator exported or a `--backend-*`
-/// with a destination, a `--loadout` axis, `--cognition`, `--tenacity`,
-/// `--initiative`, `--obsessive` — and consulted by [`OperatorPreferencePin::apply_plan`], which refuses
-/// to overwrite an axis the operator just typed with a stored pin.
+/// `NEWT_PROVIDER`/`NEWT_DGX_MODEL` the operator exported, `--backend-name` or
+/// a destination (backend), `--backend-model` (model), a `--loadout` axis,
+/// `--cognition`, `--tenacity`, `--initiative`, `--obsessive` — and consulted
+/// by [`OperatorPreferencePin::apply_plan`], which refuses to overwrite an axis
+/// the operator just typed with a stored pin, and by the #545 sticky restore,
+/// which leaves a named model alone (#3066).
 ///
 /// Deliberately NOT recorded: the #545 sticky `~/.newt/settings.toml` restore,
 /// which is documented as the lowest-precedence rung — it is last run's choice,
@@ -292,7 +294,7 @@ pub enum BackendAxisAction {
 pub struct PreferenceAxes {
     /// The named backend (`NEWT_PROVIDER`).
     pub backend: bool,
-    /// The session model override (`NEWT_DGX_MODEL`).
+    /// The session model (`NEWT_DGX_MODEL`, `--backend-model`).
     pub model: bool,
     /// The `/cognition` dial.
     pub cognition: bool,
@@ -401,7 +403,8 @@ static PREFERENCE_ACTIONS: Mutex<PreferenceActions> = Mutex::new(PreferenceActio
 });
 
 // #1668: the axes THIS INVOCATION's explicit inputs own (see [`PreferenceAxes`]).
-// Recorded once at launch by `newt-cli`, read by every pin apply.
+// Recorded once at launch by `newt-cli`, read by every pin apply and by the
+// #545 sticky restore.
 static CLI_PREFERENCE_AXES: Mutex<PreferenceAxes> = Mutex::new(PreferenceAxes {
     backend: false,
     model: false,

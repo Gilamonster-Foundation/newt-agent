@@ -37,9 +37,9 @@
 //! # Design
 //!
 //! * **Lowest precedence on restore.** An explicit `NEWT_PROVIDER` /
-//!   `NEWT_DGX_MODEL` in the environment, or a `--loadout`'s provider/model
-//!   axis, always wins. `settings.toml` only fills an axis nothing else
-//!   pinned ([`Session::restore`]).
+//!   `NEWT_DGX_MODEL` in the environment, a `--backend-*` flag, or a
+//!   `--loadout`'s provider/model axis, always wins. `settings.toml` only
+//!   fills an axis nothing else pinned ([`Session::restore`]).
 //! * **Defensive.** A `provider` naming a `[[backends]]` entry that no longer
 //!   exists is ignored, so editing config out from under the file can never
 //!   break startup.
@@ -145,12 +145,14 @@ impl Session {
     }
 
     /// Decide what to restore. `current_provider` is the value `NEWT_PROVIDER`
-    /// already holds (an explicit env var or a `--loadout`'s provider) — `None`
-    /// if unset; a pinned provider is left untouched. `model_pinned` is whether
-    /// `NEWT_DGX_MODEL` is already set. `known_backend` guards the recorded
-    /// provider so a stale name (backend since removed from config) is dropped
-    /// rather than producing a dangling pin. Pure — the caller owns the env and
-    /// config lookups, keeping this fully unit-testable.
+    /// already holds (an explicit env var, `--backend-name` or a destination
+    /// flag, or a `--loadout`'s provider) — `None` if unset; a pinned provider
+    /// is left untouched. `model_pinned` is whether
+    /// this invocation already named a model: `NEWT_DGX_MODEL`,
+    /// `--backend-model` or a `--loadout` model (#3066). `known_backend` guards
+    /// the recorded provider so a stale name (backend since removed from
+    /// config) is dropped rather than producing a dangling pin. Pure — the
+    /// caller owns the env and config lookups, keeping this fully unit-testable.
     ///
     /// A recorded model belongs to the provider it was chosen under
     /// (`self.provider`), so it is restored only when that provider is the one
