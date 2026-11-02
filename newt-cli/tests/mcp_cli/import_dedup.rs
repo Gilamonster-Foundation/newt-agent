@@ -246,6 +246,67 @@ fn merge_import_refuses_a_name_only_a_borrowed_config_defines() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn the_outranking_refusal_names_every_copy_and_offers_merge_for_the_operators_own() {
+    // #3062 review (R3-7): config.toml and a walked-up project or an ambient
+    // ./newt.toml both define `alpha`. The refusal named only config.toml and
+    // led with removing it there, which lost its tuned timeout and left the
+    // import refused again, now naming the other file. --merge keeps the
+    // operator's entry and works, but was not offered. The refusal names
+    // every file, offers --merge, offers --force only where it takes effect
+    // (here the borrowed file owns the name), and lists the removes last.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let tuned = "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/true\"\nrequest_timeout_secs = 90 # tuned\n";
+    let borrowed_entry = "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/false\"\n";
+    std::fs::write(&config, tuned).unwrap();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "alpha": { "command": "/bin/echo" } } }"#,
+    )
+    .unwrap();
+    let import = |extra: &[&str]| {
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap(), "--all"])
+            .args(extra)
+            .assert()
+    };
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    // The cwd-derived path may be spelled through a symlink (macOS) or
+    // without one, so the borrowed file is matched by its last components.
+    for (borrowed, tail) in [
+        (
+            sb.cwd.join(".newt").join("config.toml"),
+            Path::new(".newt").join("config.toml"),
+        ),
+        (sb.cwd.join("newt.toml"), Path::new("ws").join("newt.toml")),
+    ] {
+        std::fs::write(&borrowed, borrowed_entry).unwrap();
+        let output = import(&[]).failure().get_output().clone();
+        let refusal = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            refusal.contains(&format!("already defined in {} and ", config.display())),
+            "{refusal}"
+        );
+        assert!(refusal.contains(&tail.display().to_string()), "{refusal}");
+        assert_eq!(refusal.matches("mcp remove alpha`").count(), 2, "{refusal}");
+        let merge = refusal.find("--merge").expect(&refusal);
+        assert!(merge < refusal.find("mcp remove").unwrap(), "{refusal}");
+        assert!(!refusal.contains("--force"), "{refusal}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), tuned);
+
+        import(&["--merge"])
+            .success()
+            .stdout(predicate::str::contains("Skipped 1 already present: alpha"));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), tuned);
+        assert_eq!(std::fs::read_to_string(&borrowed).unwrap(), borrowed_entry);
+        std::fs::remove_file(&borrowed).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn import_is_not_outranked_by_an_entry_discovery_drops() {
     // #3062 review (C2): config.toml's `docs` has no url, so discovery drops
     // it and it outranks nothing, as for the owner (F11). --merge imports the

@@ -2032,30 +2032,47 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         // borrowed one (an ambient ./newt.toml, a project) is named instead.
         // The authoritative write target itself was filtered above, so its
         // entries retain the normal `--force` / `--merge` behavior.
-        if let Some((path, _)) = outranking
+        // Every such file is named: removing one copy leaves the next (#2915).
+        let holders: Vec<&PathBuf> = outranking
             .iter()
-            .find(|(_, names)| names.contains(&entry.name))
-        {
-            let user_owned = Config::user_config_path().as_ref() == Some(path);
+            .filter(|(_, names)| names.contains(&entry.name))
+            .map(|(path, _)| path)
+            .collect();
+        if !holders.is_empty() {
+            let user_config = Config::user_config_path();
+            let user_owned = holders
+                .iter()
+                .any(|path| user_config.as_ref() == Some(*path));
             if request.merge && user_owned {
                 skipped.push(entry.name.clone());
                 continue;
             }
-            // Removing the entry drops its local settings; --force, where it
-            // updates the owner in place, keeps them.
-            let remove = remove_from(path, &entry.name);
-            let advice = if user_owned
-                && Config::mcp_server_owner_path(&entry.name)?.as_ref() == Some(path)
+            // Removing an entry drops its local settings; --merge keeps the
+            // operator's own, and --force, where it updates the owner in
+            // place, keeps them too. So the removes come last.
+            let rerun = if user_owned && Config::mcp_server_owner_path(&entry.name)? == user_config
             {
-                format!("Re-run with --force to update it there or --merge to skip it, or remove it there first with {remove}")
+                "Re-run with --force to update it there or --merge to skip it"
+            } else if user_owned {
+                "Re-run with --merge to skip it, or with an explicit --config target"
             } else {
-                format!("Remove it there first with {remove}, or re-run with an explicit --config target")
+                "Re-run with an explicit --config target"
+            };
+            let (files, removes): (Vec<_>, Vec<_>) = holders
+                .iter()
+                .map(|path| (path.display().to_string(), remove_from(path, &entry.name)))
+                .unzip();
+            let outrank = if holders.len() == 1 {
+                "outranks"
+            } else {
+                "outrank"
             };
             bail!(
-                "`{}` is already defined in {}, which outranks or can outrank {} — an import here would be ineffective. {advice}",
+                "`{}` is already defined in {}, which {outrank} or can outrank {} — an import here would be ineffective. {rerun}, or remove it there first with {}",
                 entry.name,
-                path.display(),
-                target.display()
+                files.join(" and "),
+                target.display(),
+                removes.join(" and ")
             );
         }
         let exists_in_target = existing.contains(&entry.name);
