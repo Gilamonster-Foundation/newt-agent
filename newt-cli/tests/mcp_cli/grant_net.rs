@@ -158,6 +158,46 @@ fn a_grant_withheld_from_a_disabled_server_is_named_with_its_host() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn a_host_already_granted_is_not_named_as_withheld() {
+    // #3062 review (R4-1): the withheld line named the host of a disabled
+    // server even when the same import granted it to an enabled one, or the
+    // target's net already held it, so it asked for a grant that is there.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let remote = "[[mcp_servers]]\nname = \"remote\"\ntype = \"http\"\nurl = \"https://shared.example.test/a/mcp\"\nenabled = false # keep off until review\n";
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "remote": { "type": "http", "url": "https://shared.example.test/a/mcp" },
+              "open": { "type": "http", "url": "https://shared.example.test/b/mcp" }
+        } }"#,
+    )
+    .unwrap();
+    let import = |selection: &[&str]| {
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap()])
+            .args(selection)
+            .args(["--force", "--grant-net"])
+            .assert()
+            .success()
+    };
+
+    // Granted in this run, to `open` on the same host.
+    std::fs::write(&config, remote).unwrap();
+    import(&["--all"])
+        .stdout(predicate::str::contains(": shared.example.test\n"))
+        .stdout(predicate::str::contains("Withheld").not());
+    // Already in the target's net.
+    let granted = format!("{remote}\n[tui.permissions]\nnet = [\"shared.example.test\"]\n");
+    std::fs::write(&config, &granted).unwrap();
+    import(&["--name", "remote"]).stdout(predicate::str::contains("Withheld").not());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), granted);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn grant_net_merge_under_a_project_config_recognizes_the_user_owned_server() {
     let sb = sandbox();
     std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();

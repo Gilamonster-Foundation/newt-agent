@@ -2187,23 +2187,26 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     } else {
         Vec::new()
     };
-    // A server the document keeps disabled gets no grant; --grant-net asked
-    // for one, so each withheld host is named below (#2915).
-    let mut withheld = Vec::new();
-    for entry in adopted
-        .iter()
-        .filter(|entry| request.grant_net && !entry.enabled)
-    {
-        if let Some(host) = http_host(entry)? {
-            withheld.push((entry.name.as_str(), host));
-        }
-    }
     let mut granted = Vec::new();
     for host in &hosts {
         let with_host = Config::with_net_host(&doc, host)?;
         if with_host != doc {
             granted.push(host.as_str());
             doc = with_host;
+        }
+    }
+    // A server the document keeps disabled gets no grant; --grant-net asked
+    // for one, so each host it withholds is named below, unless the net
+    // already holds it, granted now for another server or before (#2915).
+    let mut withheld = Vec::new();
+    for entry in adopted
+        .iter()
+        .filter(|entry| request.grant_net && !entry.enabled)
+    {
+        if let Some(host) = http_host(entry)? {
+            if !Config::with_net_host(&doc, &host).is_ok_and(|with_host| with_host == doc) {
+                withheld.push((entry.name.as_str(), host));
+            }
         }
     }
     if !adopted.is_empty() && target_original.as_deref() != Some(doc.as_str()) {
