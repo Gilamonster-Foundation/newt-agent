@@ -1,185 +1,225 @@
-"""newt_agent.py — Harbor installed-agent adapter for ``newt solve`` (WS3, #1419).
+"""newt_agent.py — Harbor installed-agent adapter that drives the newt TUI (#1419).
 
-The bridge that lets Terminal-Bench (Harbor) drive newt on real, containerized
-tasks — the entry to the release-champion ceremony's reproducible lane.
+Terminal-Bench measures the TUI a person runs, not a separate headless lane, so
+bench behaviour cannot drift from TUI behaviour. Each trial:
 
-It injects the locally-built ``newt`` binary + a pinned backend profile into each
-task container, then drives ``newt solve`` headless in the task's working
-directory (Harbor's ``task_env_config.workdir``, else the container's ``pwd``) and writes the
-trace to ``/logs/agent``. Two lanes, chosen by ``NEWT_BENCH_OCAP``:
+1. ``install`` adds tmux (apt, as Harbor's own Terminus-2 agent does) and
+   uploads the newt binary, the backend profile as ``~/.newt/config.toml``, the
+   on-host summarizer model a set-up TUI already has, and a herdr stand-in;
+2. ``run`` starts ``newt --no-splash`` in a detached tmux pane in the task's
+   working directory. newt's herdr lifecycle reporting goes to the stand-in,
+   which appends each idle/working/blocked report to /logs/agent/lifecycle.log;
+3. once newt reports idle, the instruction goes in as one bracketed paste and
+   Enter, like a person pasting it;
+4. when newt has stayed idle for ``SETTLE_SEC`` (a retry or an approved plan
+   starts its next turn without a person), or stops for a person (``blocked``:
+   a question, a clarification, an approval), the driver closes any prompt with
+   Ctrl-C and sends ``/exit``. newt's own records (``~/.newt/conversations.db``,
+   ``usage.jsonl``) and the screen are copied to /logs/agent.
 
-- unset / off — the ``--unsafe-host-exec`` lane: OCAP off, ambient host
-  shell, no prompts. The lane the published floor was set on (deliberate
-  variable isolation). Since #1582 a plain ``newt solve`` is confined, so the
-  adapter must pass the opt-in explicitly; before that fix every "off" run
-  silently measured the confined lane.
-- ``on`` — the ``--confined`` lane: OCAP stays ON, writes fenced to the
-  workspace + the container's mutable roots, reads/exec/net open. The 0.7.6
-  parity gate runs the SAME suite once per lane and requires the scores match.
+The driver types nothing but the instruction, that Ctrl-C and ``/exit``. A stop
+for a person is newt's behaviour, so the trial ends there and is graded. A
+failed last turn, or newt exiting non-zero at any point after the paste, raises
+``NonZeroAgentExitCodeError`` (Harbor records it and still grades). newt never
+getting ready, or a pasted instruction never starting a turn, raises
+``RuntimeError``, which Harbor does not grade: the apparatus failed, not the
+model. Both happen within ``READY_TIMEOUT_SEC + START_TIMEOUT_SEC``, under the
+shortest Terminal-Bench agent timeout (600 s).
 
-Inference reaches the pinned endpoint from *inside* the container (verified
-reachable). The binary is *injected* rather than package-installed because newt
-has no public crates/npm release yet — that is the only reason this isn't a
-stock ``harbor adapter``.
+The host polls /logs/agent through Harbor's bind mount, so this adapter needs
+Harbor's docker environment.
 
 Run it:
 
-    NEWT_BENCH_BIN=~/bin/newt \\
+    NEWT_BENCH_BIN=/path/to/glibc-2.36-built/newt \\
     NEWT_BENCH_PROFILE=/path/to/bench.toml \\
     NEWT_BENCH_INITIATIVE=decisive \\
-    NEWT_BENCH_OCAP=on \\        # omit / off for the --unsafe-host-exec lane
-    NEWT_BENCH_SELF_VERIFY=0 \\  # ablation: the self-verify gate is on by default
     PYTHONPATH=scripts/eval/harbor \\
-    harbor run -a newt_agent:NewtAgent -m newt/qwen3-coder_30b <task-or-dataset...>
+    harbor run -a newt_agent:NewtAgent -m newt/<model> <task-or-dataset...>
 
-Robustness/capability knobs injected INTO the container (the harbor process's env
-does not cross the container boundary): NEWT_BENCH_HTTP_RETRIES (default 10 — a
-more patient retry window so a transient router drop doesn't zero a task on a
-pure infra fault) and NEWT_BENCH_SELF_VERIFY (0 turns the default-on self-verify gate off).
-
-The backend (endpoint + model) is pinned by NEWT_BENCH_PROFILE (host-secret,
-local); ``-m`` is required by Harbor but the profile is authoritative here.
+The profile (endpoint + model) is host-secret and local; ``-m`` is only Harbor's
+label. Harbor's own environment does not cross into the container, so every
+knob below is applied inside it by this module.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import re
 import shlex
 import tempfile
+import time
+from pathlib import Path
 from typing import override
 
-from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
+from harbor.agents.installed.base import (
+    BaseInstalledAgent,
+    NonZeroAgentExitCodeError,
+    with_prompt_template,
+)
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-# The locally-built binary + the pinned backend profile to inject. Host-secret:
-# the endpoint lives only in the profile toml (RATCHET.md invariant).
 _NEWT_BIN = os.environ.get("NEWT_BENCH_BIN", os.path.expanduser("~/bin/newt"))
 _NEWT_PROFILE = os.environ.get("NEWT_BENCH_PROFILE", "")
-# Optional API-key file to inject for hosted backends (e.g. OpenAI). Uploaded
-# into the container at /etc/newt/api-key; a profile then reads it via
-# `api_key_file = "/etc/newt/api-key"`. Host-secret: the key stays in a local
-# file (never an env value or a committed literal). Empty = local endpoint, no key.
+# Hosted backends: a key file uploaded to /etc/newt/api-key, which the profile
+# names with `api_key_file`. Never an env value or a committed literal.
 _API_KEY_FILE = os.environ.get("NEWT_BENCH_API_KEY_FILE", "")
-# Optional psyche dials and round cap: initiative (patient|measured|decisive|eager)
-# sets how soon the model is nudged to act; tenacity (normal|relentless) lifts
-# the round cap. Pre-split `insistent` is `NEWT_BENCH_INITIATIVE=decisive` now.
+# The on-host context summarizer the default build compacts with. A set-up TUI
+# already has it; without it the first TUI start downloads ~470 MB.
+_SUMMARIZER = os.environ.get(
+    "NEWT_BENCH_SUMMARIZER", os.path.expanduser("~/.newt/models/qwen2.5-0.5b")
+)
 _TENACITY = os.environ.get("NEWT_BENCH_TENACITY", "")
 _INITIATIVE = os.environ.get("NEWT_BENCH_INITIATIVE", "")
-_MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "40")
-# The served model's FULL context window (dgx1 serves qwen3-coder at
-# --ctx-size 65536 as of 2026-07-28; the router's global `-c` is the ctx knob —
-# per-model preset `ctx-size` is ignored in that build). newt reserves ~20% of
-# this for the reply, so the input budget becomes 0.8x — leaving KV headroom so
-# generation doesn't overrun the window. Set this to match whatever `--ctx-size`
-# the endpoint actually serves. Overrideable; empty disables the pin.
-_CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "65536")
-# OCAP lane: ``on`` runs the confined lane (OCAP enabled, writes fenced to the
-# workspace + the container's mutable roots, reads/exec/net open); anything else
-# runs the ``--unsafe-host-exec`` full-access lane. This is the variable the parity gate
-# flips: the SAME suite is run once per model with NEWT_BENCH_OCAP unset (off)
-# and once with ``on``, and the two scores must match before 0.7.6 tags.
+# The TUI applies its own round cap (`[tui] max_tool_rounds`, default 40, raised
+# by --tenacity). Unset or 40 restates that default, so it is accepted.
+_MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "")
 _OCAP = os.environ.get("NEWT_BENCH_OCAP", "")
-
-
-def _lane_flag(ocap: str) -> str:
-    """The `newt solve` flag that selects the lane. `newt solve` is confined by
-    default (#1582), so BOTH lanes are explicit: ``--confined`` flips OCAP on and
-    seeds the workspace-fenced caveat; ``--unsafe-host-exec`` is the opt-in to
-    the OCAP-off ambient-host lane. Returning "" for the off lane ran the
-    confined lane under the off label — the bug this function makes testable."""
-    return " --confined" if ocap.strip().lower() == "on" else " --unsafe-host-exec"
-# Inference-robustness knob. The local llama.cpp router drops connections under
-# memory pressure (co-hosted vLLM near the 121G ceiling), and a task that
-# exhausts newt's retry window scores 0 on a pure infra fault — not the agent.
-# Bench runs get a MORE patient retry budget than the interactive default so a
-# brief router restart doesn't zero a task. `newt`'s `RetryPolicy::from_env`
-# reads these; overridable, empty keeps newt's own default.
-_HTTP_RETRIES = os.environ.get("NEWT_BENCH_HTTP_RETRIES", "10")
-# Self-verify gate (the measured #1 capability lever): make the agent RUN the
-# workspace's own checks before declaring done. newt arms it by default (#1961),
-# so the baseline already runs it and =1 changes nothing. NEWT_BENCH_SELF_VERIFY=0
-# (off/false) injects NEWT_SELF_VERIFY=0: the ablation.
 _SELF_VERIFY = os.environ.get("NEWT_BENCH_SELF_VERIFY", "")
-# Result-aware verification (#2315): set NEWT_BENCH_VERIFY_OUTCOMES=1 to inject
-# NEWT_VERIFY_OUTCOMES=1, so the gate repairs a check that ran and FAILED instead
-# of accepting any attempt. It is a mode of the default-on self-verify gate; newt reports the
-# mode it ran in the contract record's receipt.verification.
 _VERIFY_OUTCOMES = os.environ.get("NEWT_BENCH_VERIFY_OUTCOMES", "")
-# Smart-harness arm (#2260/#2263): set NEWT_BENCH_SMART=1 to run `newt solve
-# --smart-harness`. The frame lives under /logs/agent so it is outside every
-# workspace tool grant AND survives the container for the cross-tab. The
-# profile must carry a `[smart_harness]` block; the adapter only adds the flag.
-_SMART = os.environ.get("NEWT_BENCH_SMART", "")
-
-
-def _smart_on() -> bool:
-    """Whether the smart-harness arm is selected (one predicate for the flag and
-    for the write-root request below)."""
-    return _SMART.strip() in ("1", "on", "true")
-# Operator-declared model digest (#2318): newt records NEWT_MODEL_DIGEST in its
-# contract's `model_digest`. Declared, not verified — the server exposes none.
 _MODEL_DIGEST = os.environ.get("NEWT_BENCH_MODEL_DIGEST", "")
-# Features a treatment requires (#2356): comma-separated receipt keys, each passed
-# as `--require-feature`, so a default-off feature the run cannot supply refuses
-# before inference instead of silently measuring the baseline. Set by
-# tb-campaign.sh from the treatment's `requires`; empty for the baseline.
+_SMART = os.environ.get("NEWT_BENCH_SMART", "")
 _REQUIRE_FEATURES = os.environ.get("NEWT_BENCH_REQUIRE_FEATURES", "")
+# NEWT_BENCH_CONTEXT_WINDOW is not read: the TUI takes the window the server
+# reports, which tb-campaign.sh checks against the pinned ctx before each cell.
+
+SESSION = "newt"
+LIFECYCLE = "lifecycle.log"
+HERDR_SHIM = "/usr/local/bin/newt-bench-herdr"
+READY_TIMEOUT_SEC = 180
+# newt reports `working` as soon as it accepts a submitted line.
+START_TIMEOUT_SEC = 120
+SETTLE_SEC = 30
+EXIT_TIMEOUT_SEC = 60
+
+# herdr's CLI fallback: newt runs `$HERDR_BIN_PATH pane report-agent ...` on each
+# state change (newt-tui/src/herdr/transport.rs) and needs exit 0.
+_SHIM = f"""#!/bin/sh
+echo "$(date +%s) $*" >> /logs/agent/{LIFECYCLE}
+"""
+
+_KILL_NEWT = (
+    'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = newt ] '
+    '&& kill -9 "${p#/proc/}" 2>/dev/null; done; true'
+)
 
 
-def _container_env_prefix() -> str:
-    """Env vars exported INSIDE the task container ahead of `newt solve` — the
-    harbor process's own env does NOT cross into the container, so anything newt
-    must read (retry budget, self-verify) is injected here as a `K=V ` prefix."""
-    parts = []
-    if _HTTP_RETRIES.strip():
-        # More patient retry window: 10 retries over the 2s→30s backoff rides a
-        # ~5 min router blip instead of the default ~90s.
-        parts.append(f"NEWT_HTTP_MAX_RETRIES={shlex.quote(_HTTP_RETRIES)}")
-        parts.append("NEWT_HTTP_BACKOFF_BASE_MS=2000")
-        parts.append("NEWT_HTTP_BACKOFF_MAX_MS=30000")
-    if _SELF_VERIFY.strip().lower() in ("1", "true", "on", "yes"):
-        parts.append("NEWT_SELF_VERIFY=1")
-    elif _SELF_VERIFY.strip().lower() in ("0", "false", "off", "no"):
-        parts.append("NEWT_SELF_VERIFY=0")
-    if _VERIFY_OUTCOMES.strip().lower() in ("1", "true", "on", "yes"):
-        parts.append("NEWT_VERIFY_OUTCOMES=1")
-    if _OCAP.strip().lower() == "on" and not _smart_on():
-        # The confined lane's fence is workspace + /tmp by default (a default must
-        # be safe on a developer host). This container is disposable and tasks
-        # install packages (#1487), so ASK for the broad roots the fence used to
-        # list built in. Not for the smart-harness arm: its isolation refuses a
-        # grant with a model-writable ancestor (/usr above /usr/local), so the
-        # roots would stop it launching. Not granted for any other lane.
-        parts.append("NEWT_WRITE_PATHS=/usr:/usr/local:/var:/etc:/opt:/root:/home")
+def _on(raw: str) -> bool:
+    return raw.strip().lower() in ("1", "true", "on", "yes")
+
+
+def _off(raw: str) -> bool:
+    return raw.strip().lower() in ("0", "false", "off", "no")
+
+
+def _refusals() -> list[str]:
+    """Headless-lane knobs the TUI cannot honour. Refused before the trial, so
+    a treatment never silently measures the baseline."""
+    out = []
+    if _OCAP.strip().lower() == "on":
+        out.append("NEWT_BENCH_OCAP=on: the confined lane was headless-only; the TUI has no twin yet")
+    if _on(_SMART):
+        out.append("NEWT_BENCH_SMART: no TUI arm is defined yet")
+    if _REQUIRE_FEATURES.strip():
+        out.append("NEWT_BENCH_REQUIRE_FEATURES: the TUI has no --require-feature")
+    if _MAX_ROUNDS.strip() not in ("", "40"):
+        out.append("NEWT_BENCH_MAX_ROUNDS: set `[tui] max_tool_rounds` in the profile instead")
+    return out
+
+
+def _newt_argv() -> list[str]:
+    """The command a person would type. OCAP off is the headless
+    `--unsafe-host-exec` lane's pair of switches (newt-cli/src/headless.rs)."""
+    argv = ["newt", "--no-splash", "--disable-ocap", "--full-access"]
+    if _INITIATIVE.strip():
+        argv += ["--initiative", _INITIATIVE.strip()]
+    if _TENACITY.strip():
+        argv += ["--tenacity", _TENACITY.strip()]
+    return argv
+
+
+def _pane_env() -> dict[str, str]:
+    env = {
+        "LANG": "C.UTF-8",
+        "HERDR_ENV": "1",
+        "HERDR_PANE_ID": "bench",
+        "HERDR_BIN_PATH": HERDR_SHIM,
+    }
+    if _on(_SELF_VERIFY):
+        env["NEWT_SELF_VERIFY"] = "1"
+    elif _off(_SELF_VERIFY):
+        env["NEWT_SELF_VERIFY"] = "0"
+    if _on(_VERIFY_OUTCOMES):
+        env["NEWT_VERIFY_OUTCOMES"] = "1"
     if _MODEL_DIGEST.strip():
-        parts.append(f"NEWT_MODEL_DIGEST={shlex.quote(_MODEL_DIGEST.strip())}")
-    return (" ".join(parts) + " ") if parts else ""
+        env["NEWT_MODEL_DIGEST"] = _MODEL_DIGEST.strip()
+    return env
 
 
-def _solve_command(workdir: str) -> str:
-    """The `newt solve` invocation for one trial, from this module's knobs."""
-    tenacity = f" --tenacity {shlex.quote(_TENACITY)}" if _TENACITY else ""
-    tenacity += f" --initiative {shlex.quote(_INITIATIVE)}" if _INITIATIVE else ""
-    ctx = f" --context-window {shlex.quote(_CONTEXT_WINDOW)}" if _CONTEXT_WINDOW else ""
-    smart = " --smart-harness --frame-dir /logs/agent/frame" if _smart_on() else ""
-    required = "".join(
-        f" --require-feature {shlex.quote(f.strip())}" for f in _REQUIRE_FEATURES.split(",") if f.strip()
+def _tmux(*commands: str) -> str:
+    """One tmux client running `commands` in order."""
+    return "LANG=C.UTF-8 tmux -u " + " \\; ".join(commands)
+
+
+def _start_command(workdir: str) -> str:
+    """Start newt in a detached pane. The pane's shell outlives newt (`sleep`):
+    if that shell exited, the kernel would hang up the terminal's foreground
+    process group, killing background servers a task asked the agent to leave
+    running, which the headless lane never did."""
+    env = " ".join(shlex.quote(f"{k}={v}") for k, v in _pane_env().items())
+    newt = " ".join(shlex.quote(a) for a in _newt_argv())
+    inner = f"env {env} {newt}; echo $? > /logs/agent/newt.exit; exec sleep infinity"
+    return f"mkdir -p {shlex.quote(workdir)} && " + _tmux(
+        "start-server",
+        "set-option -g history-limit 100000",
+        "set-option -g default-terminal xterm-256color",
+        f"new-session -d -s {SESSION} -x 200 -y 50 -c {shlex.quote(workdir)} {shlex.quote(inner)}",
+        f"pipe-pane -o -t {SESSION} 'cat >> /logs/agent/tui.pane'",
     )
-    # --non-interactive defaults true in `newt solve`, so it's omitted here
-    # (passing it bare requires a value under the current arg definition).
-    return (
-        f"mkdir -p /logs/agent {shlex.quote(workdir)}; "
-        f"{_container_env_prefix()}newt solve --cwd {shlex.quote(workdir)} "
-        "--instruction-file /tmp/newt-task.md "
-        "--config /etc/newt/bench.toml "
-        "--events /logs/agent/newt-events.jsonl "
-        f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}{ctx}{_lane_flag(_OCAP)}{smart}{required}"
+
+
+def _states(text: str) -> list[str]:
+    """The `--state` of each report-agent line in order, with its `--message`
+    when there is one (`idle:failed`)."""
+    out = []
+    for line in text.splitlines():
+        if " report-agent " not in line:
+            continue
+        state = re.search(r"--state (\S+)", line)
+        message = re.search(r"--message (\S+)", line)
+        if state:
+            out.append(state.group(1) + (f":{message.group(1)}" if message else ""))
+    return out
+
+
+def _stop_reason(state: str) -> str:
+    """What ended the drive, from the last state seen."""
+    if state.startswith("idle:"):
+        return "turn-" + state.split(":", 1)[1]
+    return {"idle": "turn-ended", "blocked": "waiting-for-a-person", "exited": "newt-exited"}.get(
+        state.split(":")[0], state
     )
+
+
+def _probe(instruction: str) -> str:
+    """The end of the instruction's last line, whitespace collapsed: the part of
+    a long paste still on screen, next to the cursor."""
+    last = next((ln for ln in reversed(instruction.splitlines()) if ln.strip()), "")
+    return " ".join(last.split())[-16:]
 
 
 class NewtAgent(BaseInstalledAgent):
-    """Drive ``newt solve`` inside a Harbor task container."""
+    """Drive the newt TUI inside a Harbor task container."""
+
+    def __init__(self, *args, **kwargs):
+        # Before Harbor builds the task container, not in install().
+        refused = _refusals()
+        if refused:
+            raise ValueError("newt TUI drive: " + "; ".join(refused))
+        super().__init__(*args, **kwargs)
 
     @staticmethod
     @override
@@ -192,26 +232,81 @@ class NewtAgent(BaseInstalledAgent):
 
     @override
     def parse_version(self, stdout: str) -> str:
-        # e.g. "newt 0.7.5"
-        return stdout.strip().split()[-1] if stdout.strip() else stdout
+        # "newt 0.8.5 (bc618a3630e2)" -> "0.8.5 (bc618a3630e2)"
+        return stdout.strip().removeprefix("newt").strip()
 
     @override
     async def install(self, environment: BaseEnvironment) -> None:
         if not _NEWT_PROFILE:
-            raise ValueError(
-                "NEWT_BENCH_PROFILE must point at a backend profile toml "
-                "(the pinned endpoint + model)."
-            )
-        # Inject the binary + profile; the container reaches the endpoint over
-        # the network (verified). No package manager needed.
+            raise ValueError("NEWT_BENCH_PROFILE must point at a backend profile toml.")
+        gguf = sorted(Path(_SUMMARIZER).glob("*.gguf"))
+        tokenizer = Path(_SUMMARIZER) / "tokenizer.json"
+        if not gguf or not tokenizer.is_file():
+            raise ValueError(f"NEWT_BENCH_SUMMARIZER: no GGUF + tokenizer.json in {_SUMMARIZER}")
+        await self.exec_as_root(
+            environment,
+            command="command -v tmux >/dev/null || { export DEBIAN_FRONTEND=noninteractive; "
+            "apt-get update -qq && apt-get install -y -qq --no-install-recommends tmux; } >/dev/null 2>&1; "
+            "command -v tmux",
+        )
         await environment.upload_file(_NEWT_BIN, "/usr/local/bin/newt")
-        await self.exec_as_root(environment, command="chmod 0755 /usr/local/bin/newt")
-        await self.exec_as_root(environment, command="mkdir -p /etc/newt")
-        await environment.upload_file(_NEWT_PROFILE, "/etc/newt/bench.toml")
-        # Hosted backends: inject the API key as a file (never an env literal).
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(_SHIM)
+        try:
+            await environment.upload_file(fh.name, HERDR_SHIM)
+        finally:
+            os.unlink(fh.name)
+        await self.exec_as_root(environment, command=f"chmod 0755 /usr/local/bin/newt {HERDR_SHIM}")
+        probe = await self.exec_as_agent(environment, command='printf %s "$HOME"')
+        home = (getattr(probe, "stdout", None) or "").strip() or "/root"
+        models = f"{home}/.newt/models/{Path(_SUMMARIZER).name}"
+        await self.exec_as_root(environment, command=f"mkdir -p {shlex.quote(models)}")
+        await environment.upload_file(_NEWT_PROFILE, f"{home}/.newt/config.toml")
+        await environment.upload_file(str(gguf[0]), f"{models}/{gguf[0].name}")
+        await environment.upload_file(str(tokenizer), f"{models}/tokenizer.json")
         if _API_KEY_FILE:
+            await self.exec_as_root(environment, command="mkdir -p /etc/newt")
             await environment.upload_file(_API_KEY_FILE, "/etc/newt/api-key")
             await self.exec_as_root(environment, command="chmod 0600 /etc/newt/api-key")
+
+    async def _screen(self, environment: BaseEnvironment, history: bool = False) -> str:
+        scope = " -S -" if history else ""
+        result = await self.exec_as_agent(
+            environment, command=_tmux(f"capture-pane -p -J{scope} -t {SESSION}") + " 2>/dev/null; true"
+        )
+        return getattr(result, "stdout", None) or ""
+
+    async def _type(self, environment: BaseEnvironment, *commands: str) -> None:
+        await self.exec_as_agent(environment, command=_tmux(*commands))
+
+    def _log(self, event: str, **detail: object) -> None:
+        with open(self.logs_dir / "driver.jsonl", "a") as fh:
+            fh.write(json.dumps({"t": round(time.time(), 1), "event": event, **detail}) + "\n")
+
+    def _lifecycle(self) -> list[str]:
+        path = self.logs_dir / LIFECYCLE
+        text = path.read_text(errors="replace") if path.exists() else ""
+        return _states(text[: text.rfind("\n") + 1])  # complete lines only
+
+    def _exit_code(self) -> int | None:
+        path = self.logs_dir / "newt.exit"
+        text = path.read_text().strip() if path.exists() else ""
+        return int(text) if text.lstrip("-").isdigit() else None
+
+    async def _wait(self, seen: int, want: set[str], timeout: float) -> tuple[str | None, int]:
+        """The first lifecycle state in `want` after the first `seen` reports,
+        and how many reports that consumes. `exited` once newt has exited (it
+        reports nothing on the way out); `None` on timeout."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            states = self._lifecycle()
+            for i in range(seen, len(states)):
+                if states[i].split(":")[0] in want:
+                    return states[i], i + 1
+            if self._exit_code() is not None:
+                return "exited", len(states)
+            await asyncio.sleep(1)
+        return None, seen
 
     @override
     @with_prompt_template
@@ -221,23 +316,90 @@ class NewtAgent(BaseInstalledAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        # Land the instruction inside the container, then solve headless.
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
-            fh.write(instruction)
+            fh.write(instruction.rstrip())
             local_instr = fh.name
         try:
             await environment.upload_file(local_instr, "/tmp/newt-task.md")
         finally:
             os.unlink(local_instr)
-
-        # The task's working directory is NOT always /app: terminal-bench's
-        # prove-plus-comm declares WORKDIR /workspace and copies its partial proof
-        # there, and its verifier checks paths relative to that. Hardcoding /app
-        # sent the legacy loop off to improvise under /tmp (verifier never saw the
-        # work) and made smart mode refuse a workspace that did not exist -- both
-        # arms scored 0 for an apparatus reason. Ask Harbor, then the container.
+        # prove-plus-comm works in /workspace, not /app: ask Harbor, then the
+        # container, before falling back.
         workdir = (getattr(getattr(environment, "task_env_config", None), "workdir", None) or "").strip()
         if not workdir:
             probe = await self.exec_as_agent(environment, command="pwd")
             workdir = ((getattr(probe, "stdout", None) or "").strip().splitlines() or ["/app"])[0] or "/app"
-        await self.exec_as_agent(environment, command=_solve_command(workdir))
+
+        meta: dict[str, object] = {"driver": "newt-tui", "argv": _newt_argv(), "workdir": workdir}
+        context.metadata = meta  # filled in as the drive goes
+        await self.exec_as_agent(environment, command=_start_command(workdir))
+        self._log("started", workdir=workdir)
+        finished = False
+        try:
+            state, seen = await self._wait(0, {"idle"}, READY_TIMEOUT_SEC)
+            if state != "idle":
+                raise RuntimeError(f"newt TUI never reported ready ({state or 'timeout'}):\n"
+                                   + (await self._screen(environment))[-2000:])
+            self._log("ready")
+
+            await self._type(environment, "load-buffer -b task /tmp/newt-task.md",
+                             f"paste-buffer -p -d -b task -t {SESSION}")
+            probe = _probe(instruction)
+            for _ in range(10):
+                if probe in " ".join((await self._screen(environment)).split()):
+                    break
+                await asyncio.sleep(1)
+            else:
+                self._log("paste-not-seen", probe=probe)
+            await self._type(environment, f"send-keys -t {SESSION} Enter")
+            self._log("submitted")
+
+            state, seen = await self._wait(seen, {"working", "blocked"}, START_TIMEOUT_SEC)
+            if state is None:
+                raise RuntimeError("newt never started a turn:\n" + (await self._screen(environment))[-2000:])
+            while state.startswith("working"):
+                self._log("working")
+                # Runs until Harbor's agent timeout cancels the wait.
+                state, seen = await self._wait(seen, {"idle", "blocked"}, float("inf"))
+                if state.startswith("idle"):
+                    nxt, after = await self._wait(seen, {"working", "blocked"}, SETTLE_SEC)
+                    if nxt is not None:
+                        state, seen = nxt, after
+            meta["stop"] = _stop_reason(state)
+            self._log("stopped", stop=meta["stop"])
+            finished = True
+        finally:
+            await self._finish(environment, meta, graceful=finished)
+        if meta["stop"] == "turn-failed":
+            raise NonZeroAgentExitCodeError("newt's last turn failed; see /logs/agent/tui-screen.txt")
+        if meta["newt_exit"] != 0:
+            # tb_campaign reads the status as `exit N` (137 is an infra kill).
+            raise NonZeroAgentExitCodeError(f"newt exit {meta['newt_exit']}")
+
+    async def _finish(self, environment: BaseEnvironment, meta: dict[str, object], graceful: bool) -> None:
+        """Save the screen, /exit newt (or kill it after a failure, a timeout,
+        or an /exit it ignores), and copy its own records to /logs/agent. tmux
+        stays up: see `_start_command`."""
+        (self.logs_dir / "tui-screen.txt").write_text(await self._screen(environment, history=True))
+        if graceful and self._exit_code() is None:
+            if meta.get("stop") == "waiting-for-a-person":
+                await self._type(environment, f"send-keys -t {SESSION} C-c")
+                await asyncio.sleep(1)
+            await self._type(environment, "set-buffer -b quit /exit",
+                             f"paste-buffer -p -d -b quit -t {SESSION}", f"send-keys -t {SESSION} Enter")
+            deadline = time.monotonic() + EXIT_TIMEOUT_SEC
+            while self._exit_code() is None and time.monotonic() < deadline:
+                await asyncio.sleep(1)
+        code = self._exit_code()
+        if code is not None:
+            meta["newt_exit"] = code
+        else:
+            meta["newt_exit"] = "killed"
+            await self.exec_as_root(environment, command=_KILL_NEWT)
+        meta["states"] = self._lifecycle()
+        self._log("finished", newt_exit=meta["newt_exit"])
+        await self.exec_as_agent(
+            environment,
+            command='mkdir -p /logs/agent/newt-home && cd "$HOME/.newt" && '
+            "cp -p conversations.db* history *.jsonl /logs/agent/newt-home/ 2>/dev/null; true",
+        )
