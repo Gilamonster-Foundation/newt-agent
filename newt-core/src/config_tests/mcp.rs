@@ -1517,6 +1517,36 @@ command = \"drop-mcp\"
 }
 
 #[test]
+fn an_edit_that_changes_nothing_in_an_inline_array_section_is_no_edit() {
+    // #3062 review (R3-4): the reader accepts an inline-array `mcp_servers`,
+    // which the writers cannot edit in place. Whether an edit changes
+    // anything is decided from the typed entry first, so a toggle to the
+    // entry's state or a same-source merge hands the text back, as for
+    // `[[mcp_servers]]`. A real change is still refused.
+    let on = "mcp_servers = [ { name = \"alpha\", command = \"echo\" } ]\n";
+    let off = "mcp_servers = [ { name = \"alpha\", command = \"echo\", enabled = false } ]\n";
+    assert_eq!(Config::with_mcp_enabled(on, "alpha", true).unwrap(), on);
+    assert_eq!(Config::with_mcp_enabled(off, "alpha", false).unwrap(), off);
+    let source = |command: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!("name = \"alpha\"\ncommand = \"{command}\"\n")).unwrap()
+    };
+    let provided = ["command"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(on, &source("echo"), &provided).unwrap(),
+        on
+    );
+    for error in [
+        Config::with_mcp_enabled(on, "alpha", false).unwrap_err(),
+        Config::with_mcp_server_merged(on, &source("echo-v2"), &provided).unwrap_err(),
+    ] {
+        assert!(
+            error.to_string().contains("not an array of tables"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn with_mcp_server_removed_reports_a_non_array_section_accurately() {
     // The inline-array form is valid TOML the serde reader accepts; the
     // writer must say it cannot edit that shape, not falsely claim the

@@ -2371,17 +2371,16 @@ impl Config {
     /// (no I/O) like [`with_net_host`](Self::with_net_host); the caller does
     /// the read/write. Errors when the server name isn't present.
     pub fn with_mcp_enabled(text: &str, name: &str, enabled: bool) -> Result<String> {
-        let index = mcp_entry_index(text, name)?
+        let (index, entry) = mcp_entry(text, name)?
             .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
+        // Decided from the typed entry, so a section the writers cannot edit
+        // (an inline array) refuses only a real change.
+        if entry.enabled == enabled {
+            return Ok(text.to_owned());
+        }
         edit_mcp_toml(text, |doc| {
             let entry = mcp_entry_table(doc, index)?;
-            if entry
-                .get("enabled")
-                .map_or(Some(true), toml_edit::Item::as_bool)
-                != Some(enabled)
-            {
-                replace_in_place(entry, "enabled", toml_edit::value(enabled));
-            }
+            replace_in_place(entry, "enabled", toml_edit::value(enabled));
             Ok(())
         })
     }
@@ -2517,6 +2516,26 @@ impl Config {
             .chain(provided.iter().copied())
             .chain(["type"])
             .collect();
+        // The other transport's fields do not belong to this entry.
+        let foreign: &[&str] = match entry.transport {
+            crate::mcp::TransportKind::Stdio => &["url", "headers"],
+            crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
+                &["command", "args", "env"]
+            }
+        };
+        // Whether anything changes is decided from the typed entry, so a
+        // section the writers cannot edit (an inline array) refuses only a
+        // real change.
+        let held = crate::mcp::entry_to_toml_table(previous, None)?;
+        if decided
+            .iter()
+            .all(|key| same_mcp_field(key, held.get(key), fresh.get(key)))
+            && foreign
+                .iter()
+                .all(|key| same_mcp_field(key, held.get(key), None))
+        {
+            return Ok(text.to_owned());
+        }
         let merged = edit_mcp_toml(text, |doc| {
             let existing = mcp_entry_table(doc, index)?;
             for key in decided {
@@ -2546,13 +2565,6 @@ impl Config {
                     }
                 }
             }
-            // The other transport's fields do not belong to this entry.
-            let foreign: &[&str] = match entry.transport {
-                crate::mcp::TransportKind::Stdio => &["url", "headers"],
-                crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
-                    &["command", "args", "env"]
-                }
-            };
             for key in foreign {
                 let local = local_mcp_spelling(existing, key, None);
                 if !same_mcp_field(key, existing.get(&local), None) {
@@ -2809,12 +2821,13 @@ impl Config {
     }
 }
 
-/// The index of the `[[mcp_servers]]` entry named `name` that the writers
-/// edit ([`crate::mcp::effective_entry_index`]), from the typed parse.
-fn mcp_entry_index(text: &str, name: &str) -> Result<Option<usize>> {
-    crate::mcp::parse_newt_mcp_toml_checked(text)
-        .map(|entries| crate::mcp::effective_entry_index(&entries, name))
-        .map_err(|error| NewtError::Config(error.to_string()))
+/// The `[[mcp_servers]]` entry named `name` that the writers edit
+/// ([`crate::mcp::effective_entry_index`]) and its index, from the typed parse.
+fn mcp_entry(text: &str, name: &str) -> Result<Option<(usize, crate::mcp::McpServerEntry)>> {
+    let mut entries = crate::mcp::parse_newt_mcp_toml_checked(text)
+        .map_err(|error| NewtError::Config(error.to_string()))?;
+    Ok(crate::mcp::effective_entry_index(&entries, name)
+        .map(|index| (index, entries.swap_remove(index))))
 }
 
 /// The `[[mcp_servers]]` table at `index`, which the typed parse found, so
