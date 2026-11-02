@@ -1577,6 +1577,33 @@ fn an_edit_that_changes_nothing_in_an_inline_array_section_is_no_edit() {
 }
 
 #[test]
+fn a_header_differing_only_in_case_is_no_edit_in_an_inline_array_section() {
+    // #3062 review (R4-6): R3-3 made `authorization` and `Authorization` one
+    // header, so a `[[mcp_servers]]` merge reports it unchanged. R3-4's early
+    // no-op check compared the typed header maps case-sensitively, so the
+    // inline-array form was refused for a change that is none. A changed
+    // value is still a real change, and still refused.
+    let text = "mcp_servers = [ { name = \"web\", type = \"http\", url = \"https://mcp.example.test/mcp\", headers = { authorization = \"Bearer ${SYNTHETIC_TOKEN}\" } } ]\n";
+    let source = |value: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!(
+            "name = \"web\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nheaders = {{ Authorization = \"Bearer ${{{value}}}\" }}\n"
+        ))
+        .unwrap()
+    };
+    let provided = ["type", "url", "headers"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(text, &source("SYNTHETIC_TOKEN"), &provided).unwrap(),
+        text
+    );
+    let error =
+        Config::with_mcp_server_merged(text, &source("OTHER_TOKEN"), &provided).unwrap_err();
+    assert!(
+        error.to_string().contains("not an array of tables"),
+        "{error}"
+    );
+}
+
+#[test]
 fn with_mcp_server_removed_reports_a_non_array_section_accurately() {
     // The inline-array form is valid TOML the serde reader accepts; the
     // writer must say it cannot edit that shape, not falsely claim the

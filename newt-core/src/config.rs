@@ -2525,11 +2525,20 @@ impl Config {
         };
         // Whether anything changes is decided from the typed entry, so a
         // section the writers cannot edit (an inline array) refuses only a
-        // real change.
+        // real change. A map is compared member by member, as it is merged.
         let held = crate::mcp::entry_to_toml_table(previous, None)?;
-        if decided
-            .iter()
-            .all(|key| same_mcp_field(key, held.get(key), fresh.get(key)))
+        let same = |key: &str| {
+            let (have, wanted) = (held.get(key), fresh.get(key));
+            same_mcp_field(key, have, wanted)
+                || have
+                    .and_then(toml_edit::Item::as_table_like)
+                    .zip(wanted.and_then(toml_edit::Item::as_table_like))
+                    .is_some_and(|(have, wanted)| {
+                        let (changed, dropped) = mcp_map_edits(key, have, wanted);
+                        changed.is_empty() && dropped.is_empty()
+                    })
+        };
+        if decided.iter().all(|key| same(key))
             && foreign
                 .iter()
                 .all(|key| same_mcp_field(key, held.get(key), None))
@@ -2971,18 +2980,18 @@ fn local_mcp_spelling(
         .to_owned()
 }
 
-/// Update the map field `key` (`env`, `headers`) to `wanted` member by member,
-/// so a sub-table, dotted keys or an inline table keeps its layout, and each
-/// member its comments: a dropped member goes, a changed one is replaced in
-/// place under the operator's spelling of its name, a new one is added.
-fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::TableLike) {
+/// What merging `wanted` into the local map field `key` (`env`, `headers`)
+/// changes: each wanted member whose value differs, under the local spelling
+/// of the member it matches, and each local member none matches, which goes.
+fn mcp_map_edits<'a>(
+    key: &str,
+    have: &dyn toml_edit::TableLike,
+    wanted: &'a dyn toml_edit::TableLike,
+) -> (Vec<(String, &'a toml_edit::Item)>, Vec<String>) {
     let member = |name: &str, item: &toml_edit::Item| {
         let mut one = toml_edit::Table::new();
         one.insert(name, item.clone());
         toml_edit::Item::Table(one)
-    };
-    let Some(have) = map.as_table_like() else {
-        return;
     };
     // Each wanted member is one local member at most: a header name in any
     // case (`authorization` for `Authorization`). Any other local one goes.
@@ -2999,7 +3008,18 @@ fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::T
             changed.push((local.unwrap_or(name).to_owned(), value));
         }
     }
-    let dropped: Vec<String> = unmatched.into_iter().map(str::to_owned).collect();
+    (changed, unmatched.into_iter().map(str::to_owned).collect())
+}
+
+/// Update the map field `key` (`env`, `headers`) to `wanted` member by member,
+/// so a sub-table, dotted keys or an inline table keeps its layout, and each
+/// member its comments: a dropped member goes, a changed one is replaced in
+/// place under the operator's spelling of its name, a new one is added.
+fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::TableLike) {
+    let Some(have) = map.as_table_like() else {
+        return;
+    };
+    let (changed, dropped) = mcp_map_edits(key, have, wanted);
     match map {
         toml_edit::Item::Value(toml_edit::Value::InlineTable(map)) => {
             for name in &dropped {
