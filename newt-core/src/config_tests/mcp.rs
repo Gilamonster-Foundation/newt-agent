@@ -588,45 +588,12 @@ fn with_mcp_server_merged_keeps_comments_on_defaults_and_resets() {
     assert!(mixed.contains("request_timeout_secs = 30"), "{mixed}");
 }
 
-/// Every name serde accepts for an `McpServerEntry` field, aliases included,
-/// read from the derive itself so a new alias is covered without a list.
-fn accepted_mcp_field_names() -> &'static [&'static str] {
-    use serde::de::{Error, Visitor};
-    struct Names(std::cell::Cell<&'static [&'static str]>);
-    impl<'de> serde::Deserializer<'de> for &Names {
-        type Error = serde::de::value::Error;
-        fn deserialize_any<V: Visitor<'de>>(
-            self,
-            _: V,
-        ) -> std::result::Result<V::Value, Self::Error> {
-            Err(Error::custom("field names only"))
-        }
-        fn deserialize_struct<V: Visitor<'de>>(
-            self,
-            _: &'static str,
-            fields: &'static [&'static str],
-            _: V,
-        ) -> std::result::Result<V::Value, Self::Error> {
-            self.0.set(fields);
-            Err(Error::custom("field names only"))
-        }
-        serde::forward_to_deserialize_any! {
-            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-            bytes byte_buf option unit unit_struct newtype_struct seq tuple
-            tuple_struct map enum identifier ignored_any
-        }
-    }
-    let names = Names(std::cell::Cell::new(&[]));
-    let _ = <crate::mcp::McpServerEntry as serde::Deserialize>::deserialize(&names);
-    names.0.get()
-}
-
 #[test]
 fn with_mcp_server_merged_updates_an_alias_spelled_field_in_place() {
     // #3062 review: `requestTimeoutSecs` is the same field as
     // `request_timeout_secs`. A force import must update it where the
     // operator wrote it, never add a second spelling the reader rejects.
-    let names = accepted_mcp_field_names();
+    let names = crate::mcp::serde_field_names::<crate::mcp::McpServerEntry>();
     assert!(names.contains(&"requestTimeoutSecs"), "{names:?}");
     let samples = [
         "30",

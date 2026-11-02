@@ -302,3 +302,14 @@ fn strict_claude_import_records_which_keys_the_source_spelled_out() {
         ]
     );
 }
+
+/// #3062 review (G8): the strict Claude parser accepts exactly the
+/// `CLAUDE_IMPORT_FIELDS` names, so each must be a field `McpServerEntry`
+/// reads (`oauth` is folded by its own parser), or its value is dropped.
+#[test]
+fn claude_import_fields_are_fields_the_entry_reads() {
+    let entry = crate::mcp::serde_field_names::<McpServerEntry>();
+    for (name, _) in CLAUDE_IMPORT_FIELDS {
+        assert!(*name == "oauth" || entry.contains(name), "{name}");
+    }
+}

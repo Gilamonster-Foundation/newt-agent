@@ -381,3 +381,42 @@ fn strict_codex_import_records_which_keys_the_source_spelled_out() {
     assert_eq!(keys("local"), ["args", "command", "enabled", "env"]);
     assert_eq!(keys("remote"), ["headers", "url"]);
 }
+
+/// #3062 review (G8): `CODEX_IMPORT_FIELDS` decides which keys a source
+/// provided and how a rejected entry is labelled, so it must name every field
+/// the strict parser accepts. It is held to the serde derive itself.
+#[test]
+fn codex_import_fields_name_every_field_the_codex_parser_accepts() {
+    let table: BTreeSet<&str> = CODEX_IMPORT_FIELDS.iter().map(|(name, _)| *name).collect();
+    let accepted: BTreeSet<&str> = crate::mcp::serde_field_names::<CodexEntry>()
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(table, accepted);
+}
+
+/// #3062 review (F17): a rejected entry is labelled by its cause. A valid
+/// `oauth_client_id` beside `required = true` is not an unsupported field,
+/// and an invalid client id is a shape error, as in a Claude source.
+#[test]
+fn strict_codex_import_labels_an_entry_with_an_oauth_client_id_by_its_cause() {
+    let report = parse_codex_mcp_toml_for_import(
+        "[mcp_servers.required]\nurl = \"https://mcp.example.test/mcp\"\n\
+         oauth_client_id = \"public-client\"\nrequired = true\n\n\
+         [mcp_servers.invalid]\nurl = \"https://mcp.example.test/mcp\"\n\
+         oauth_client_id = \"has space\"\n",
+    )
+    .unwrap();
+    let issue = |name: &str| {
+        report
+            .rejected
+            .iter()
+            .find(|rejected| rejected.name.as_deref() == Some(name))
+            .map(|rejected| rejected.issue)
+    };
+    assert_eq!(
+        issue("required"),
+        Some(McpImportIssue::UnsupportedSemantics)
+    );
+    assert_eq!(issue("invalid"), Some(McpImportIssue::InvalidShape));
+}

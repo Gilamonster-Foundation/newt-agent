@@ -954,6 +954,7 @@ const CODEX_IMPORT_FIELDS: &[ImportField] = &[
     ("env_http_headers", &["headers"]),
     ("env_vars", &["env"]),
     ("auth", &[]),
+    ("oauth_client_id", &["oauth_client_id"]),
     ("startup_timeout_sec", &[]),
     ("tool_timeout_sec", &["request_timeout_secs"]),
     ("required", &[]),
@@ -1244,6 +1245,54 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
     report
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcedCodexEnvVar {
+    name: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CodexEnvVar {
+    Name(String),
+    Sourced(SourcedCodexEnvVar),
+}
+
+impl CodexEnvVar {
+    fn local_name(self) -> Option<String> {
+        match self {
+            Self::Name(name) => Some(name),
+            Self::Sourced(SourcedCodexEnvVar { name, source }) => match source.as_deref() {
+                None | Some("local") => Some(name),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A Codex `[mcp_servers.<name>]` table. [`CODEX_IMPORT_FIELDS`] has a row
+/// for each field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexEntry {
+    url: Option<String>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
+    bearer_token_env_var: Option<String>,
+    http_headers: Option<BTreeMap<String, String>>,
+    env_http_headers: Option<BTreeMap<String, String>>,
+    env_vars: Option<Vec<CodexEnvVar>>,
+    auth: Option<String>,
+    oauth_client_id: Option<String>,
+    startup_timeout_sec: Option<u64>,
+    tool_timeout_sec: Option<u64>,
+    required: Option<bool>,
+    enabled: Option<bool>,
+}
+
 /// Parse Codex's `[mcp_servers.<name>]` TOML tables into newt's shared MCP
 /// representation.
 ///
@@ -1266,52 +1315,6 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
 /// `newt mcp import` is required before its process or endpoint may be used.
 #[must_use]
 pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct SourcedCodexEnvVar {
-        name: String,
-        #[serde(default)]
-        source: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum CodexEnvVar {
-        Name(String),
-        Sourced(SourcedCodexEnvVar),
-    }
-
-    impl CodexEnvVar {
-        fn local_name(self) -> Option<String> {
-            match self {
-                Self::Name(name) => Some(name),
-                Self::Sourced(SourcedCodexEnvVar { name, source }) => match source.as_deref() {
-                    None | Some("local") => Some(name),
-                    _ => None,
-                },
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct CodexEntry {
-        url: Option<String>,
-        command: Option<String>,
-        args: Option<Vec<String>>,
-        env: Option<BTreeMap<String, String>>,
-        bearer_token_env_var: Option<String>,
-        http_headers: Option<BTreeMap<String, String>>,
-        env_http_headers: Option<BTreeMap<String, String>>,
-        env_vars: Option<Vec<CodexEnvVar>>,
-        auth: Option<String>,
-        oauth_client_id: Option<String>,
-        startup_timeout_sec: Option<u64>,
-        tool_timeout_sec: Option<u64>,
-        required: Option<bool>,
-        enabled: Option<bool>,
-    }
-
     let Ok(document) = toml::from_str::<toml::Value>(text) else {
         return Vec::new();
     };
@@ -1534,6 +1537,14 @@ pub fn parse_codex_mcp_toml_for_import(
                     .any(|field| !import_field_supported(CODEX_IMPORT_FIELDS, field)) =>
             {
                 McpImportIssue::UnknownField
+            }
+            // As in a Claude source, an unusable client id is a bad value.
+            Some(table)
+                if table
+                    .get("oauth_client_id")
+                    .is_some_and(|id| !id.as_str().is_some_and(valid_oauth_client_id)) =>
+            {
+                McpImportIssue::InvalidShape
             }
             Some(_) => McpImportIssue::UnsupportedSemantics,
         };
@@ -1952,6 +1963,40 @@ pub fn discover_report_with_namespace_mode(
         diagnostics,
         ..dedup_report(sources, sanitize_server_names)
     }
+}
+
+/// Every name serde accepts for a field of `T`, aliases included, read from
+/// the derive itself, so a test can hold a hand-kept field list to it.
+#[cfg(test)]
+pub(crate) fn serde_field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    use serde::de::{Error, Visitor};
+    struct Names(std::cell::Cell<&'static [&'static str]>);
+    impl<'de> serde::Deserializer<'de> for &Names {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: Visitor<'de>>(
+            self,
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            Err(Error::custom("field names only"))
+        }
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            self.0.set(fields);
+            Err(Error::custom("field names only"))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+    let names = Names(std::cell::Cell::new(&[]));
+    let _ = T::deserialize(&names);
+    names.0.get()
 }
 
 #[cfg(test)]
