@@ -1415,19 +1415,24 @@ fn kept_login_argv_for_a_new_command(previous: &McpServerEntry, saved: &McpServe
 
 fn imported_http_hosts(entries: &[McpServerEntry]) -> anyhow::Result<Vec<String>> {
     let mut hosts = std::collections::BTreeSet::new();
-    for entry in entries {
-        if !entry.enabled || entry.transport != TransportKind::Http {
-            continue;
-        }
-        let raw = entry
-            .url
-            .as_deref()
-            .ok_or_else(|| anyhow!("MCP server `{}` has no HTTP URL", entry.name))?;
-        let canonical = newt_core::mcp::canonical_mcp_http_url(raw)
-            .map_err(|issue| anyhow!("MCP server `{}` has {issue}", entry.name))?;
-        hosts.insert(canonical.host);
+    for entry in entries.iter().filter(|entry| entry.enabled) {
+        hosts.extend(http_host(entry)?);
     }
     Ok(hosts.into_iter().collect())
+}
+
+/// The exact host an HTTP `entry` connects to; `None` for another transport.
+fn http_host(entry: &McpServerEntry) -> anyhow::Result<Option<String>> {
+    if entry.transport != TransportKind::Http {
+        return Ok(None);
+    }
+    let raw = entry
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("MCP server `{}` has no HTTP URL", entry.name))?;
+    let canonical = newt_core::mcp::canonical_mcp_http_url(raw)
+        .map_err(|issue| anyhow!("MCP server `{}` has {issue}", entry.name))?;
+    Ok(Some(canonical.host))
 }
 
 /// Whether an active walked-up project config structurally replaces the base
@@ -2182,6 +2187,17 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     } else {
         Vec::new()
     };
+    // A server the document keeps disabled gets no grant; --grant-net asked
+    // for one, so each withheld host is named below (#2915).
+    let mut withheld = Vec::new();
+    for entry in adopted
+        .iter()
+        .filter(|entry| request.grant_net && !entry.enabled)
+    {
+        if let Some(host) = http_host(entry)? {
+            withheld.push((entry.name.as_str(), host));
+        }
+    }
     let mut granted = Vec::new();
     for host in &hosts {
         let with_host = Config::with_net_host(&doc, host)?;
@@ -2275,6 +2291,13 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             "Granted exact MCP network host(s) in {}: {}",
             target.display(),
             granted.join(", ")
+        )?;
+    }
+    for (name, host) in &withheld {
+        writeln!(
+            out,
+            "Withheld the network grant for `{name}`, which stays disabled: once it is enabled, grant the exact hostname {host} in trusted [tui.permissions] net of {}.",
+            target.display()
         )?;
     }
     print_next_steps(out, &adopted)

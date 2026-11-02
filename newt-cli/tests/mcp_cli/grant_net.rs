@@ -108,6 +108,56 @@ fn force_import_grants_and_reports_the_entry_it_saved() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn a_grant_withheld_from_a_disabled_server_is_named_with_its_host() {
+    // #3062 review (R3-8): --grant-net grants no host to a server the merge
+    // keeps disabled (F2), and said nothing of it, so the grant the operator
+    // asked for went missing without a word. Each withheld host is named,
+    // with how to grant it once the server is enabled.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"remote\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nenabled = false # keep off until review\n",
+    )
+    .unwrap();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "remote": { "type": "http", "url": "https://mcp.example.test/mcp" },
+              "open": { "type": "http", "url": "https://open.example.test/mcp" }
+        } }"#,
+    )
+    .unwrap();
+    let import = |extra: &[&str]| {
+        newt(&sb)
+            .args([
+                "mcp",
+                "import",
+                source.to_str().unwrap(),
+                "--all",
+                "--force",
+            ])
+            .args(extra)
+            .assert()
+            .success()
+    };
+
+    import(&["--grant-net"])
+        .stdout(predicate::str::contains("host(s) in").and(predicate::str::contains(
+            ": open.example.test\n",
+        )))
+        .stdout(predicate::str::contains(
+            "Withheld the network grant for `remote`, which stays disabled: once it is enabled, grant the exact hostname mcp.example.test in trusted [tui.permissions] net",
+        ))
+        .stdout(predicate::str::contains("for `open`").not());
+    // Nothing was asked for without --grant-net, so nothing is withheld.
+    import(&[]).stdout(predicate::str::contains("Withheld").not());
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn grant_net_merge_under_a_project_config_recognizes_the_user_owned_server() {
     let sb = sandbox();
     std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
