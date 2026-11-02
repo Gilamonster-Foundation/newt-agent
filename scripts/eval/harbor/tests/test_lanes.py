@@ -19,7 +19,7 @@ import newt_agent as na
 from harbor.agents.installed.base import NonZeroAgentExitCodeError
 
 KNOBS = ("_OCAP", "_SMART", "_REQUIRE_FEATURES", "_MAX_ROUNDS", "_SELF_VERIFY",
-         "_VERIFY_OUTCOMES", "_MODEL_DIGEST", "_INITIATIVE", "_TENACITY")
+         "_VERIFY_OUTCOMES", "_INITIATIVE", "_TENACITY")
 
 
 class Knobs(unittest.TestCase):
@@ -80,15 +80,14 @@ class Refusals(Knobs):
 
 class PaneEnv(Knobs):
     def test_reports_go_to_the_shim_and_set_knobs_reach_the_pane(self):
-        na._SELF_VERIFY, na._VERIFY_OUTCOMES, na._MODEL_DIGEST = "off", "1", "sha256:abc"
+        na._SELF_VERIFY, na._VERIFY_OUTCOMES = "off", "1"
         env = na._pane_env()
         self.assertEqual((env["HERDR_ENV"], env["HERDR_BIN_PATH"]), ("1", na.HERDR_SHIM))
         self.assertNotIn("HERDR_SOCKET_PATH", env)  # a socket would win over the shim
         self.assertEqual((env["NEWT_SELF_VERIFY"], env["NEWT_VERIFY_OUTCOMES"]), ("0", "1"))
-        self.assertEqual(env["NEWT_MODEL_DIGEST"], "sha256:abc")
 
     def test_unset_knobs_stay_absent_and_retries_stay_newts_own(self):
-        na._SELF_VERIFY = na._VERIFY_OUTCOMES = na._MODEL_DIGEST = ""
+        na._SELF_VERIFY = na._VERIFY_OUTCOMES = ""
         env = na._pane_env()
         for key in ("NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES", "NEWT_MODEL_DIGEST", "NEWT_HTTP_MAX_RETRIES"):
             self.assertNotIn(key, env)

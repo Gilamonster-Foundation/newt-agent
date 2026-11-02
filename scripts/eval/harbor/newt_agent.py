@@ -80,11 +80,11 @@ _MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "")
 _OCAP = os.environ.get("NEWT_BENCH_OCAP", "")
 _SELF_VERIFY = os.environ.get("NEWT_BENCH_SELF_VERIFY", "")
 _VERIFY_OUTCOMES = os.environ.get("NEWT_BENCH_VERIFY_OUTCOMES", "")
-_MODEL_DIGEST = os.environ.get("NEWT_BENCH_MODEL_DIGEST", "")
 _SMART = os.environ.get("NEWT_BENCH_SMART", "")
 _REQUIRE_FEATURES = os.environ.get("NEWT_BENCH_REQUIRE_FEATURES", "")
-# NEWT_BENCH_CONTEXT_WINDOW is not read: the TUI takes the window the server
-# reports, which tb-campaign.sh checks against the pinned ctx before each cell.
+# Not read: NEWT_BENCH_CONTEXT_WINDOW (the TUI takes the window the server
+# reports, which tb-campaign.sh checks against the pinned ctx before each cell)
+# and NEWT_BENCH_MODEL_DIGEST (only the headless contract records a digest).
 
 SESSION = "newt"
 LIFECYCLE = "lifecycle.log"
@@ -154,8 +154,6 @@ def _pane_env() -> dict[str, str]:
         env["NEWT_SELF_VERIFY"] = "0"
     if _on(_VERIFY_OUTCOMES):
         env["NEWT_VERIFY_OUTCOMES"] = "1"
-    if _MODEL_DIGEST.strip():
-        env["NEWT_MODEL_DIGEST"] = _MODEL_DIGEST.strip()
     return env
 
 
