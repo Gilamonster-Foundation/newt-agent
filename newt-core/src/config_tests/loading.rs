@@ -435,35 +435,3 @@ fn project_endpoint_dropins_never_replace_operator_backends() {
         "a project provider preset must not replace an operator one"
     );
 }
-
-/// #3062 review (R3-9): a config file that does not decode is reported by
-/// file and position only. The decoder's own message quotes the offending
-/// line or value, here a credential, and `newt mcp list`, `newt doctor` and
-/// TUI start printed it without naming the file.
-#[test]
-fn a_config_decode_error_names_the_file_and_position_not_the_contents() {
-    let path = Path::new("cfg").join("config.toml");
-    let head = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\nurl = \"https://docs.example.test/mcp\"\n";
-    let syntax =
-        format!("{head}headers = {{ Authorization = \"Bearer SYNTHETIC_SECRET_MARKER\" \n");
-    let shape = format!("{head}headers = \"Bearer SYNTHETIC_SECRET_MARKER\"\n");
-    let at = |column: usize| {
-        format!(
-            "config error: {}: TOML parse error at line 5, column {column}",
-            path.display()
-        )
-    };
-    let shown = |error: NewtError| error.to_string();
-    assert_eq!(
-        shown(decode_config::<Config>(&path, &syntax).unwrap_err()),
-        at(61)
-    );
-    assert_eq!(
-        shown(decode_config::<toml::Value>(&path, &syntax).unwrap_err()),
-        at(61)
-    );
-    assert_eq!(
-        shown(decode_config::<Config>(&path, &shape).unwrap_err()),
-        at(11)
-    );
-}

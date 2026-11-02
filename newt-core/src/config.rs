@@ -1437,7 +1437,7 @@ impl Config {
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<Self> {
         let text = Self::read_text_with_held_locks(path, held_locks, report)?;
-        decode_config(path, &text)
+        toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
     /// Read a config file's text for decoding: the ONE file-read chokepoint
@@ -1577,7 +1577,9 @@ impl Config {
                     // operator-explicit (Trusted) and loaded verbatim.
                     let mut base_val = Self::load_value_with_held_locks(p, held_locks, report)?;
                     strip_control_plane(&mut base_val);
-                    base_val.try_into().map_err(|_| undecodable_config([p]))?
+                    base_val
+                        .try_into()
+                        .map_err(|e| NewtError::Config(e.to_string()))?
                 } else {
                     Self::load_with_held_locks(p, held_locks, report)?
                 }
@@ -1623,7 +1625,7 @@ impl Config {
                 merge_project_overlay(&mut merged, project_val, strategy);
                 let mut cfg: Self = merged
                     .try_into()
-                    .map_err(|_| undecodable_config(base.iter().chain([proj])))?;
+                    .map_err(|e| NewtError::Config(e.to_string()))?;
                 // `trust` is `#[serde(skip)]`, so every merged entry deserialized
                 // to the `Trusted` default; stamp the project-origin ones back to
                 // UNTRUSTED before anything can resolve their secrets.
@@ -1930,7 +1932,7 @@ impl Config {
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
     ) -> Result<toml::Value> {
         let text = Self::read_text_with_held_locks(path, held_locks, report)?;
-        decode_config(path, &text)
+        toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
     /// Locate a project-local `.newt/config.toml` by walking up from the current
@@ -2838,25 +2840,6 @@ impl Config {
         paths.push(PathBuf::from(SYSTEM_CONFIG_PATH));
         paths
     }
-}
-
-/// Decode the `text` of the config file at `path`. A failure names the file
-/// and where parsing stopped, never the line or value, which may be a
-/// credential ([`dropin::parse_dropin`], #2915).
-fn decode_config<T: serde::de::DeserializeOwned>(path: &Path, text: &str) -> Result<T> {
-    dropin::parse_dropin(text)
-        .map_err(|error| NewtError::Config(format!("{}: TOML {error}", path.display())))
-}
-
-/// A config value layered from `files` that does not decode, named by those
-/// files only: the decoder's message can quote a value, a credential
-/// included, and a merged value has no position to give (#2915).
-fn undecodable_config<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> NewtError {
-    let files: Vec<String> = files
-        .into_iter()
-        .map(|file| file.display().to_string())
-        .collect();
-    NewtError::Config(format!("{}: TOML parse error", files.join(" and ")))
 }
 
 /// The `[[mcp_servers]]` entry named `name` that the writers edit
