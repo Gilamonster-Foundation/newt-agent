@@ -417,6 +417,25 @@ fn with_net_host_is_idempotent_no_duplicate() {
 }
 
 #[test]
+fn with_net_host_keeps_the_file_style() {
+    // #3062 review (R1-6): `mcp import --grant-net` runs the import's document
+    // through this writer. A host already granted changes nothing, byte for
+    // byte; a new one keeps the BOM and CRLF line endings, as the MCP writers
+    // do (F3).
+    let text = "\u{feff}# my config\r\n[tui.permissions]\r\nnet = [\"mcp.example.test\"]\r\n";
+    assert_eq!(
+        Config::with_net_host(text, "mcp.example.test").unwrap(),
+        text
+    );
+    let added = Config::with_net_host(text, "docs.example.test").unwrap();
+    assert_eq!(
+        added,
+        text.replace("\"]", "\", \"docs.example.test\"]"),
+        "{added:?}"
+    );
+}
+
+#[test]
 fn with_net_host_rejects_invalid_toml() {
     assert!(Config::with_net_host("this = = not toml", "github.com").is_err());
 }

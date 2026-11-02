@@ -404,6 +404,7 @@ impl Config {
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
             .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let before = doc.to_string();
         let tui = doc
             .as_table_mut()
             .entry("tui")
@@ -418,7 +419,7 @@ impl Config {
             .as_table_mut()
             .ok_or_else(|| NewtError::Config("[tui.permissions] is not a table".to_string()))?;
         update(perms_tbl)?;
-        Ok(doc.to_string())
+        Ok(super::in_file_style(text, &before, doc.to_string()))
     }
 
     /// Durably grant a net host by appending it to `[tui.permissions] net` in the

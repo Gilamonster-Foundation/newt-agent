@@ -602,6 +602,37 @@ fn force_import_keeps_the_file_style() {
             original.replacen("\"fs-mcp\"", "\"fs-v2\"", 1)
         );
     }
+
+    // --grant-net runs the document through the grant writer too (R1-6). A
+    // host already granted changes nothing and is not reported as granted;
+    // a new one keeps the BOM and CRLF.
+    let config = sb.cwd.join("cfg.toml");
+    let styled = "\u{feff}# my config\r\n[[mcp_servers]]\r\nname = \"docs\"\r\ntype = \"http\"\r\nurl = \"https://mcp.example.test/mcp\"\r\n\r\n[tui.permissions]\r\nnet = [\"mcp.example.test\"]\r\n";
+    std::fs::write(&config, styled).unwrap();
+    let source = sb.cwd.join("c.json");
+    let grant = |json: &str| {
+        std::fs::write(&source, json).unwrap();
+        newt(&sb)
+            .args(["--config", config.to_str().unwrap(), "mcp", "import"])
+            .args([source.to_str().unwrap(), "--all", "--force", "--grant-net"])
+            .assert()
+            .success()
+    };
+    grant(r#"{ "mcpServers": { "docs": { "type": "http", "url": "https://mcp.example.test/mcp" } } }"#)
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 0 replaced, 1 unchanged, 0 skipped.",
+        ))
+        .stdout(predicate::str::contains("Granted").not());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), styled);
+    grant(r#"{ "mcpServers": { "wiki": { "type": "http", "url": "https://wiki.example.test/mcp" } } }"#)
+        .stdout(predicate::str::contains("Granted exact MCP network host(s)"));
+    let granted = std::fs::read_to_string(&config).unwrap();
+    assert!(granted.starts_with('\u{feff}'), "{granted:?}");
+    assert_eq!(
+        granted.matches('\n').count(),
+        granted.matches("\r\n").count(),
+        "{granted:?}"
+    );
 }
 
 #[test]

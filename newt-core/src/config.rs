@@ -2822,10 +2822,7 @@ fn unnamed_owner_kind(
 }
 
 /// Apply `edit` to the MCP TOML `text`, the one parse-and-render path of the
-/// `[[mcp_servers]]` writers. An edit that changes nothing hands back `text`
-/// itself; a real one keeps the missing final newline, CRLF line endings and
-/// BOM that `toml_edit` drops when it renders a document, never at the cost
-/// of a value.
+/// `[[mcp_servers]]` writers, keeping the file's style ([`in_file_style`]).
 fn edit_mcp_toml(
     text: &str,
     edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
@@ -2836,9 +2833,17 @@ fn edit_mcp_toml(
     })?;
     let before = doc.to_string();
     edit(&mut doc)?;
-    let mut after = doc.to_string();
+    Ok(in_file_style(text, &before, doc.to_string()))
+}
+
+/// `after`, `toml_edit`'s rendering of an edit to `text` (`before` renders
+/// it unedited), in the file's own style. An edit that changes nothing hands
+/// back `text` itself; a real one keeps the missing final newline, CRLF line
+/// endings and BOM that `toml_edit` drops when it renders a document, never
+/// at the cost of a value.
+fn in_file_style(text: &str, before: &str, mut after: String) -> String {
     if after == before {
-        return Ok(text.to_owned());
+        return text.to_owned();
     }
     // A file holding only a BOM is empty: it has no last line to keep open.
     let body = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -2857,7 +2862,7 @@ fn edit_mcp_toml(
     if body.len() < text.len() {
         after.insert(0, '\u{feff}');
     }
-    Ok(after)
+    after
 }
 
 /// The key under which `table` already holds the field newt writes as `key`:

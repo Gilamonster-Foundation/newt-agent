@@ -2056,8 +2056,13 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     } else {
         Vec::new()
     };
+    let mut granted = Vec::new();
     for host in &hosts {
-        doc = Config::with_net_host(&doc, host)?;
+        let with_host = Config::with_net_host(&doc, host)?;
+        if with_host != doc {
+            granted.push(host.as_str());
+            doc = with_host;
+        }
     }
     if !adopted.is_empty() && target_original.as_deref() != Some(doc.as_str()) {
         atomic_import_commit(&target_destination, target_original.as_deref(), &doc)?;
@@ -2138,12 +2143,12 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             remove_from(&breakout_target, name)
         )?;
     }
-    if !hosts.is_empty() {
+    if !granted.is_empty() {
         writeln!(
             out,
             "Granted exact MCP network host(s) in {}: {}",
             target.display(),
-            hosts.join(", ")
+            granted.join(", ")
         )?;
     }
     print_next_steps(out, &adopted)
