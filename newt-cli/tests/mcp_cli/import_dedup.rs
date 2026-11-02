@@ -600,13 +600,17 @@ fn force_import_refuses_to_carry_oauth_settings_to_a_changed_endpoint() {
     .stderr(predicate::str::contains("old-as-client").not());
     assert_eq!(std::fs::read_to_string(&mcp).unwrap(), original);
 
-    // An `oauth` object in the source decides all three.
+    // An `oauth` object in the source decides all three, and the notice names
+    // the pins it dropped (R1-2).
     force_import(
         &sb,
         r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://new.example.test/mcp",
               "oauth": { "clientId": "new-client" } } } }"#,
     )
     .success()
+    .stdout(predicate::str::contains(
+        "fs: removed oauth_scopes, oauth_callback_port",
+    ))
     .stdout(predicate::str::contains("Endpoint changed for fs"));
     let servers = newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&mcp).unwrap());
     assert_eq!(servers[0].oauth_client_id.as_deref(), Some("new-client"));
@@ -729,7 +733,9 @@ fn force_import_names_the_local_settings_it_removed() {
             .args(["mcp", "import", codex.to_str().unwrap(), "--all", "--force"])
             .assert()
     };
-    let cases: [(&str, &dyn Fn() -> assert_cmd::assert::Assert, &str); 3] = [
+    // An `oauth` object decides all three OAuth pins (R1-2).
+    let pinned = "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\noauth_client_id = \"pinned-client\"\noauth_scopes = \"read:repo\" # least privilege\noauth_callback_port = 8123\n";
+    let cases: [(&str, &dyn Fn() -> assert_cmd::assert::Assert, &str); 5] = [
         (
             tenant,
             &|| {
@@ -747,6 +753,28 @@ fn force_import_names_the_local_settings_it_removed() {
             &|| force_import(&sb, r#"{ "mcpServers": { "fs": { "command": "fs-mcp" } } }"#),
             "fs: removed url, header Authorization",
         ),
+        (
+            pinned,
+            &|| {
+                force_import(
+                    &sb,
+                    r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://mcp.example.test/mcp",
+                          "oauth": { "clientId": "pinned-client", "callbackPort": 8123 } } } }"#,
+                )
+            },
+            "fs: removed oauth_scopes\n",
+        ),
+        (
+            pinned,
+            &|| {
+                force_import(
+                    &sb,
+                    r#"{ "mcpServers": { "fs": { "type": "http", "url": "https://mcp.example.test/mcp",
+                          "oauth": {} } } }"#,
+                )
+            },
+            "fs: removed oauth_client_id, oauth_scopes, oauth_callback_port",
+        ),
     ];
     for (local, import, removed) in cases {
         std::fs::write(&mcp, local).unwrap();
@@ -755,6 +783,7 @@ fn force_import_names_the_local_settings_it_removed() {
             .stdout(predicate::str::contains("preserved, except:"))
             .stdout(predicate::str::contains(removed))
             .stdout(predicate::str::contains("tenant-a").not())
+            .stdout(predicate::str::contains("read:repo").not())
             .stdout(predicate::str::contains("SYNTHETIC").not())
             .stdout(predicate::str::contains("example.test").not());
     }

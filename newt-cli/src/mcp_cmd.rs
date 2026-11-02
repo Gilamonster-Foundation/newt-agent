@@ -1264,9 +1264,9 @@ fn canonicalize_import_http_url(entry: &mut McpServerEntry) -> anyhow::Result<Op
 }
 
 /// Local settings a merge removed although the source does not name them: the
-/// other transport's fields when the transport changes, and members of an
-/// `env` or `headers` map the source replaced. Names only; a value may be a
-/// credential.
+/// other transport's fields when the transport changes, OAuth pins an `oauth`
+/// object left out, and members of an `env` or `headers` map the source
+/// replaced. Names only; a value may be a credential.
 fn removed_local_settings(previous: &McpServerEntry, saved: &McpServerEntry) -> Vec<String> {
     let mut removed: Vec<String> = [
         ("url", previous.url.is_some() && saved.url.is_none()),
@@ -1277,6 +1277,18 @@ fn removed_local_settings(previous: &McpServerEntry, saved: &McpServerEntry) -> 
         (
             "args",
             previous.transport != saved.transport && !previous.args.is_empty(),
+        ),
+        (
+            "oauth_client_id",
+            previous.oauth_client_id.is_some() && saved.oauth_client_id.is_none(),
+        ),
+        (
+            "oauth_scopes",
+            previous.oauth_scopes.is_some() && saved.oauth_scopes.is_none(),
+        ),
+        (
+            "oauth_callback_port",
+            previous.oauth_callback_port.is_some() && saved.oauth_callback_port.is_none(),
         ),
     ]
     .into_iter()

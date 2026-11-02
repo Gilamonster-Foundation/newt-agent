@@ -502,6 +502,35 @@ fn removed_local_settings_names_dropped_map_members_and_foreign_fields() {
     assert!(removed_local_settings(&previous, &previous).is_empty());
 }
 
+/// #3062 review (R1-2): a Claude `oauth` object decides the client id, scopes
+/// and callback port together, so a member it omits removes the local pin.
+/// The notice names each pin that went, never its value; a changed value is
+/// the source's own, not a removal.
+#[test]
+fn removed_local_settings_names_the_oauth_pins_a_merge_dropped() {
+    let mut previous = stdio_entry("api", None);
+    previous.transport = TransportKind::Http;
+    previous.url = Some("https://mcp.example.test/mcp".into());
+    previous.oauth_client_id = Some("pinned-client".into());
+    previous.oauth_scopes = Some("read:repo".into());
+    previous.oauth_callback_port = Some(8123);
+    let mut saved = previous.clone();
+    saved.oauth_scopes = None;
+    assert_eq!(removed_local_settings(&previous, &saved), ["oauth_scopes"]);
+
+    saved.oauth_client_id = None;
+    saved.oauth_callback_port = None;
+    assert_eq!(
+        removed_local_settings(&previous, &saved),
+        ["oauth_client_id", "oauth_scopes", "oauth_callback_port"]
+    );
+    saved.oauth_client_id = Some("other-client".into());
+    assert_eq!(
+        removed_local_settings(&previous, &saved),
+        ["oauth_scopes", "oauth_callback_port"]
+    );
+}
+
 /// #3062 review (G5 follow-up): a merge keeps a local `login_argv`, which no
 /// source can supply, and the notice names it when the stdio command, the
 /// whole argv, is not the one it was written for.
