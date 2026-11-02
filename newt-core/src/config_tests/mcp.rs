@@ -187,6 +187,23 @@ fn mcp_writers_keep_the_file_style() {
 }
 
 #[test]
+fn a_bom_only_file_counts_as_empty() {
+    // #3062 review (R1-8): Notepad saves an empty UTF-8 file as just a BOM.
+    // That file has no last line missing its newline, so an added entry
+    // ends with one, as it does in an empty file, and the BOM stays.
+    let entry: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"fs\"\ncommand = \"/bin/true\"\n").unwrap();
+    let added = Config::with_mcp_server_added("\u{feff}", &entry).unwrap();
+    assert_eq!(
+        added,
+        format!(
+            "\u{feff}{}",
+            Config::with_mcp_server_added("", &entry).unwrap()
+        )
+    );
+}
+
+#[test]
 fn mcp_writers_never_change_a_value_to_keep_crlf() {
     // #3062 review (R1-4): a raw newline inside a multi-line string is part of
     // its value, so restoring CRLF line endings must not rewrite it, in a new

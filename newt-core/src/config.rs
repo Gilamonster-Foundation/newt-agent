@@ -2840,10 +2840,12 @@ fn edit_mcp_toml(
     if after == before {
         return Ok(text.to_owned());
     }
-    if !text.is_empty() && !text.ends_with('\n') && after.ends_with('\n') {
+    // A file holding only a BOM is empty: it has no last line to keep open.
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if !body.is_empty() && !body.ends_with('\n') && after.ends_with('\n') {
         after.pop();
     }
-    if 2 * text.matches("\r\n").count() > text.matches('\n').count() {
+    if 2 * body.matches("\r\n").count() > body.matches('\n').count() {
         // A raw newline inside a multi-line string is part of its value, so
         // CRLF comes back only where every value stays as written.
         let crlf = after.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -2852,7 +2854,7 @@ fn edit_mcp_toml(
             after = crlf;
         }
     }
-    if text.starts_with('\u{feff}') {
+    if body.len() < text.len() {
         after.insert(0, '\u{feff}');
     }
     Ok(after)
