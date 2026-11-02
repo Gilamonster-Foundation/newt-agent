@@ -278,6 +278,20 @@ fn mcp_writers_never_change_a_value_to_keep_crlf() {
 }
 
 #[test]
+fn a_crlf_inside_a_string_value_does_not_decide_the_line_endings() {
+    // #3062 review (R2-5): the line-ending style is the file's own, so the
+    // CRLFs inside a multi-line string value do not count toward it. An LF
+    // file whose one string holds more raw CRLFs than the file has lines
+    // keeps its LF lines on an unrelated add, and the string its CRLFs.
+    let lf = "# servers\n[[mcp_servers]]\nname = \"banner\"\ncommand = \"/bin/echo\"\nargs = [\"\"\"\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nl7\"\"\"]\n";
+    let fs: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"fs\"\ncommand = \"/bin/true\"\n").unwrap();
+    let added = Config::with_mcp_server_added(lf, &fs).unwrap();
+    assert!(added.starts_with(lf), "{added:?}");
+    assert_eq!(added.matches("\r\n").count(), 7, "{added:?}");
+}
+
+#[test]
 fn with_mcp_server_merged_resets_a_changed_transport_to_default_stdio() {
     let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nheaders = { Authorization = \"Bearer old\" }\n";
     let incoming: crate::mcp::McpServerEntry =

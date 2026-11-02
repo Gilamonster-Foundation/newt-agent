@@ -2870,7 +2870,12 @@ fn in_file_style(text: &str, before: &str, mut after: String) -> String {
     if !body.is_empty() && !body.ends_with('\n') && after.ends_with('\n') {
         after.pop();
     }
-    if 2 * body.matches("\r\n").count() > body.matches('\n').count() {
+    // A CRLF inside a multi-line string is part of its value, which `before`
+    // keeps as written, so only the file's own line endings decide its style.
+    let in_values = before.matches("\r\n").count();
+    if 2 * body.matches("\r\n").count().saturating_sub(in_values)
+        > body.matches('\n').count().saturating_sub(in_values)
+    {
         // A raw newline inside a multi-line string is part of its value, so
         // CRLF comes back only where every value stays as written.
         let crlf = after.replace("\r\n", "\n").replace('\n', "\r\n");
