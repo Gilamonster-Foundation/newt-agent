@@ -2065,39 +2065,50 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             .collect();
         if !holders.is_empty() {
             let user_config = Config::user_config_path();
-            let user_owned = holders
+            let user_copy = holders
                 .iter()
-                .any(|path| user_config.as_ref() == Some(*path));
-            if request.merge && user_owned {
+                .find(|path| user_config.as_ref() == Some(**path));
+            if request.merge && user_copy.is_some() {
                 skipped.push(entry.name.clone());
                 continue;
             }
-            // Removing an entry drops its local settings; --merge keeps the
-            // operator's own, and --force, where it updates the owner in
-            // place, keeps them too. So the removes come last.
-            let rerun = if user_owned && Config::mcp_server_owner_path(&entry.name)? == user_config
-            {
-                "Re-run with --force to update it there or --merge to skip it"
-            } else if user_owned {
-                "Re-run with --merge to skip it, or with an explicit --config target"
-            } else {
-                "Re-run with an explicit --config target"
-            };
             let (files, removes): (Vec<_>, Vec<_>) = holders
                 .iter()
                 .map(|path| (path.display().to_string(), remove_from(path, &entry.name)))
                 .unzip();
+            let removes = removes.join(" and ");
+            // Removing an entry drops its local settings; --merge keeps the
+            // operator's own, and --force, where it updates the owner in
+            // place, keeps them too. So the removes come last, except where
+            // newt does not consult that copy (neither the base config nor
+            // the owner): --merge would keep a copy that is not in use.
+            let owned =
+                user_copy.is_some() && Config::mcp_server_owner_path(&entry.name)? == user_config;
+            let advice = match user_copy {
+                None => format!(
+                    "Re-run with an explicit --config target, or remove it there first with {removes}"
+                ),
+                Some(_) if owned => format!(
+                    "Re-run with --force to update it there or --merge to skip it, or remove it there first with {removes}"
+                ),
+                Some(_) if Config::base_config_path() == user_config => format!(
+                    "Re-run with --merge to skip it, or with an explicit --config target, or remove it there first with {removes}"
+                ),
+                Some(copy) => format!(
+                    "{} is not consulted from this directory: remove it there first with {removes}, or re-run with an explicit --config target",
+                    copy.display()
+                ),
+            };
             let outrank = if holders.len() == 1 {
                 "outranks"
             } else {
                 "outrank"
             };
             bail!(
-                "`{}` is already defined in {}, which {outrank} or can outrank {} — an import here would be ineffective. {rerun}, or remove it there first with {}",
+                "`{}` is already defined in {}, which {outrank} or can outrank {} — an import here would be ineffective. {advice}",
                 entry.name,
                 files.join(" and "),
-                target.display(),
-                removes.join(" and ")
+                target.display()
             );
         }
         let exists_in_target = existing.contains(&entry.name);
