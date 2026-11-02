@@ -1933,22 +1933,24 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let mut adopted = Vec::new();
     for entry in &imported {
         // A clash with an actually outranking config is fatal, except that
-        // `--merge` keeps it as an existing entry, as its help says. The
-        // authoritative write target itself was filtered above, so its entries
-        // retain the normal `--force` / `--merge` behavior.
+        // `--merge` keeps the operator's own entry, as its help says; a
+        // borrowed one (an ambient ./newt.toml, a project) is named instead.
+        // The authoritative write target itself was filtered above, so its
+        // entries retain the normal `--force` / `--merge` behavior.
         if let Some((path, _)) = outranking
             .iter()
             .find(|(_, names)| names.contains(&entry.name))
         {
-            if request.merge {
+            let user_owned = Config::user_config_path().as_ref() == Some(path);
+            if request.merge && user_owned {
                 skipped.push(entry.name.clone());
                 continue;
             }
             // Removing the entry drops its local settings; --force, where it
             // updates the owner in place, keeps them.
             let remove = remove_from(path, &entry.name);
-            let advice = if Config::mcp_server_owner_path(&entry.name)?.as_ref() == Some(path)
-                && Config::user_config_path().as_ref() == Some(path)
+            let advice = if user_owned
+                && Config::mcp_server_owner_path(&entry.name)?.as_ref() == Some(path)
             {
                 format!("Re-run with --force to update it there or --merge to skip it, or remove it there first with {remove}")
             } else {

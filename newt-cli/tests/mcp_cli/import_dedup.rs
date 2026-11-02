@@ -207,6 +207,45 @@ fn merge_import_skips_a_name_a_higher_precedence_file_defines() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn merge_import_refuses_a_name_only_a_borrowed_config_defines() {
+    // #3062 review (C1): --merge skips a name the operator's own config.toml
+    // defines (G6). A walked-up project or an ambient ./newt.toml is borrowed
+    // and untrusted: "already present" would hide that the operator's import
+    // did not happen, so the refusal names the file, as before G6.
+    let sb = sandbox();
+    let entry = "[[mcp_servers]]\nname = \"github\"\ntype = \"http\"\nurl = \"https://mcp.repo-owner.example.test/mcp\"\n";
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "github": { "type": "http", "url": "https://api.example.test/mcp/" } } }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    for borrowed in [sb.cwd.join(".newt/config.toml"), sb.cwd.join("newt.toml")] {
+        std::fs::write(&borrowed, entry).unwrap();
+        newt(&sb)
+            .args([
+                "mcp",
+                "import",
+                source.to_str().unwrap(),
+                "--all",
+                "--merge",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!(
+                "`github` is already defined in {}",
+                borrowed.display()
+            )));
+        assert_eq!(std::fs::read_to_string(&borrowed).unwrap(), entry);
+        assert!(!sb.config_dir.join("mcp.toml").exists());
+        std::fs::remove_file(&borrowed).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn import_is_not_outranked_by_an_entry_discovery_drops() {
     // #3062 review (C2): config.toml's `docs` has no url, so discovery drops
     // it and it outranks nothing, as for the owner (F11). --merge imports the
