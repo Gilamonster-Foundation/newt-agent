@@ -109,3 +109,32 @@ fn import_url_validation_is_independent_of_network_grants_and_rejects_fragments(
         assert!(!error.to_string().contains("never-echo-this"));
     }
 }
+
+#[test]
+fn the_cross_file_refusal_grants_a_paused_copy_once_it_is_enabled() {
+    // #3062 review (R4-2): the refusal told the operator to grant the host of
+    // a copy that stays paused, the grant F2 withholds and R3-8 words as
+    // "once it is enabled". Both now give that one wording.
+    let entry = McpServerEntry {
+        transport: TransportKind::Http,
+        url: Some("https://review.example.test/mcp".into()),
+        ..stdio_entry("review", None)
+    };
+    let refusal = |enabled: bool| {
+        let copy = McpServerEntry {
+            enabled,
+            ..entry.clone()
+        };
+        let (breakout, target) = (Path::new("mcp.toml"), Path::new("config.toml"));
+        cross_file_refusal(&entry, Some(&copy), false, breakout, target).unwrap()
+    };
+    let grant =
+        "grant the exact hostname review.example.test in trusted [tui.permissions] net of config.toml.";
+    let paused = refusal(false);
+    assert!(
+        paused.contains(&format!("settings, then once it is enabled, {grant}")),
+        "{paused}"
+    );
+    let live = refusal(true);
+    assert!(live.contains(&format!("settings, then {grant}")), "{live}");
+}

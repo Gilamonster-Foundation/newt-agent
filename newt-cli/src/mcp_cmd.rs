@@ -600,20 +600,15 @@ fn cross_file_refusal(
     } else {
         String::new()
     };
-    // Worded as newt asks for a missing grant (`HttpNetGrantRequired`).
+    let enabled = copy.is_none_or(|copy| copy.enabled);
     let grant = imported_http_hosts(std::slice::from_ref(entry))?
         .first()
-        .map(|host| {
-            format!(
-                ", then grant the exact hostname {host} in trusted [tui.permissions] net of {}",
-                target.display()
-            )
-        })
+        .map(|host| format!(", then {}", hand_grant(host, enabled, target)))
         .unwrap_or_default();
-    let paused = if copy.is_some_and(|copy| !copy.enabled) {
-        ", `enabled = false` included"
-    } else {
+    let paused = if enabled {
         ""
+    } else {
+        ", `enabled = false` included"
     };
     Ok(format!(
         "MCP server `{name}` exists in {} but the import writes atomically to {}{stub}; refusing a cross-file overwrite that would leave a dormant duplicate. Re-run without --grant-net to update that copy in place, keeping its local settings{grant}. Removing that copy with {} before the re-run instead loses those settings{paused}",
@@ -621,6 +616,17 @@ fn cross_file_refusal(
         target.display(),
         remove_from(breakout, name)
     ))
+}
+
+/// How to grant `host` in `target` by hand, worded as newt asks for a
+/// missing grant (`HttpNetGrantRequired`). A disabled server gets no grant
+/// from an import, so it is granted once it is enabled (#2915).
+fn hand_grant(host: &str, enabled: bool, target: &Path) -> String {
+    let once = if enabled { "" } else { "once it is enabled, " };
+    format!(
+        "{once}grant the exact hostname {host} in trusted [tui.permissions] net of {}",
+        target.display()
+    )
 }
 
 /// Remove `name`, resolving the target the same way `add` does. An explicit
@@ -2299,8 +2305,8 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     for (name, host) in &withheld {
         writeln!(
             out,
-            "Withheld the network grant for `{name}`, which stays disabled: once it is enabled, grant the exact hostname {host} in trusted [tui.permissions] net of {}.",
-            target.display()
+            "Withheld the network grant for `{name}`, which stays disabled: {}.",
+            hand_grant(host, false, &target)
         )?;
     }
     print_next_steps(out, &adopted)
