@@ -382,6 +382,35 @@ fn strict_codex_import_records_which_keys_the_source_spelled_out() {
     assert_eq!(keys("remote"), ["headers", "url"]);
 }
 
+/// #3062 review (R3-1): the stdio branch drops a Codex `oauth_client_id`, so
+/// a stdio source decides no client id. A force import of an identical stdio
+/// source leaves the local entry, its client id and comment included, byte
+/// for byte; an HTTP source still decides the id it carries.
+#[test]
+fn a_codex_stdio_client_id_is_not_a_key_the_source_decides() {
+    let report = parse_codex_mcp_toml_for_import(
+        "[mcp_servers.fs]\ncommand = \"/bin/true\"\noauth_client_id = \"client-A\"\n\n\
+         [mcp_servers.remote]\nurl = \"https://mcp.example.test/mcp\"\n\
+         oauth_client_id = \"client-A\"\n",
+    )
+    .unwrap();
+    let keys = |name: &str| report.provided[name].iter().copied().collect::<Vec<_>>();
+    assert_eq!(keys("fs"), ["command"]);
+    assert_eq!(keys("remote"), ["oauth_client_id", "url"]);
+
+    let local = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"/bin/true\"\n\
+                 oauth_client_id = \"client-A\" # registered by ops\n";
+    let fs = report
+        .entries
+        .iter()
+        .find(|entry| entry.name == "fs")
+        .unwrap();
+    assert_eq!(
+        crate::config::Config::with_mcp_server_merged(local, fs, &report.provided["fs"]).unwrap(),
+        local
+    );
+}
+
 /// #3062 review (G8): `CODEX_IMPORT_FIELDS` decides which keys a source
 /// provided and how a rejected entry is labelled, so it must name every field
 /// the strict parser accepts. It is held to the serde derive itself.

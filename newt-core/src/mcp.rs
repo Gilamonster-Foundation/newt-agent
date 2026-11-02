@@ -1525,17 +1525,21 @@ pub fn parse_codex_mcp_toml_for_import(
     };
 
     let entries = parse_codex_mcp_toml(text);
-    let accepted: std::collections::BTreeSet<&str> =
-        entries.iter().map(|entry| entry.name.as_str()).collect();
+    let accepted: BTreeMap<&str, TransportKind> = entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.transport))
+        .collect();
     let mut rejected = Vec::new();
     let mut provided = BTreeMap::new();
     for (name, raw) in raw_servers {
-        if accepted.contains(name.as_str()) {
+        if let Some(transport) = accepted.get(name.as_str()) {
             if let Some(table) = raw.as_table() {
-                provided.insert(
-                    name.clone(),
-                    provided_keys(CODEX_IMPORT_FIELDS, table.keys()),
-                );
+                let mut keys = provided_keys(CODEX_IMPORT_FIELDS, table.keys());
+                // The stdio branch drops a client id, so it decides none there.
+                if *transport == TransportKind::Stdio {
+                    keys.remove("oauth_client_id");
+                }
+                provided.insert(name.clone(), keys);
             }
             continue;
         }
