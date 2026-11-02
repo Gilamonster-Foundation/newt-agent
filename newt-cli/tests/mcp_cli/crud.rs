@@ -220,10 +220,11 @@ fn mcp_config_errors_name_the_file_and_position_not_the_contents() {
 #[test]
 fn list_reports_malformed_mcp_toml_without_echoing_its_contents() {
     let sb = sandbox();
-    let marker = "private-mcp-marker";
+    // The marker is on the line the parser stops at, the line a raw TOML
+    // error would quote (#3062 review).
     std::fs::write(
         sb.config_dir.join("mcp.toml"),
-        format!("[[mcp_servers]]\nname = \"{marker}\"\ncommand = =\n"),
+        "[[mcp_servers]]\nname = \"docs\"\nheaders = { Authorization = \"SYNTHETIC_SECRET_MARKER\" \n",
     )
     .unwrap();
 
@@ -232,5 +233,5 @@ fn list_reports_malformed_mcp_toml_without_echoing_its_contents() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid MCP TOML syntax"))
-        .stderr(predicate::str::contains(marker).not());
+        .stderr(predicate::str::contains("SYNTHETIC_SECRET_MARKER").not());
 }

@@ -702,10 +702,12 @@ fn entry_of(text: &str) -> crate::mcp::McpServerEntry {
 
 #[test]
 fn with_mcp_server_removed_does_not_echo_malformed_config_contents() {
-    let text = "[[mcp_servers]]\nname = \"private-marker\"\ncommand = =\n";
-    let error = Config::with_mcp_server_removed(text, "private-marker").unwrap_err();
+    // The marker is on the line the parser stops at, the line a raw TOML
+    // error would quote (#3062 review).
+    let text = "[[mcp_servers]]\nname = \"docs\"\nheaders = { Authorization = \"SYNTHETIC_SECRET_MARKER\" \n";
+    let error = Config::with_mcp_server_removed(text, "docs").unwrap_err();
     assert!(error.to_string().contains("invalid MCP TOML syntax"));
-    assert!(!error.to_string().contains("private-marker"));
+    assert!(!error.to_string().contains("SYNTHETIC_SECRET_MARKER"));
 }
 
 #[test]
