@@ -72,6 +72,52 @@ fn duplicate_add_fails_nonzero_with_a_clear_error() {
 }
 
 #[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_duplicate_add_names_the_remove_for_the_file_it_writes() {
+    // #3062 review (R2-8): `newt mcp add` writes mcp.toml when it exists, but
+    // the default `newt mcp remove` edits the owner. With the live `alpha` in
+    // config.toml and an older copy in mcp.toml, "remove it first" led the
+    // operator to delete the live entry. The refusal names the command that
+    // removes the copy in the file the add writes, and the copy newt uses.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let live = "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/true\"\nrequest_timeout_secs = 90 # live, tuned\n";
+    let stale = "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/false\"\n";
+    std::fs::write(&config, live).unwrap();
+    std::fs::write(&mcp, stale).unwrap();
+    let remove = |path: &Path| {
+        format!(
+            "`newt --config {} mcp remove alpha`",
+            newt_core::mcp::shell_quote_arg(&path.to_string_lossy())
+        )
+    };
+    let add = || {
+        newt(&sb)
+            .args(["mcp", "add", "alpha", "--command", "/bin/echo"])
+            .assert()
+            .failure()
+    };
+
+    add()
+        .stderr(predicate::str::contains(remove(&mcp)))
+        .stderr(predicate::str::contains(format!(
+            "shadowed by the one newt uses in {}",
+            config.display()
+        )));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), live);
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), stale);
+
+    // Without the copy, the add writes config.toml, whose entry newt uses.
+    std::fs::remove_file(&mcp).unwrap();
+    add()
+        .stderr(predicate::str::contains(remove(&config)))
+        .stderr(predicate::str::contains("shadowed").not());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), live);
+}
+
+#[test]
 fn remove_deletes_the_entry_and_an_absent_name_errors() {
     let sb = sandbox();
     newt(&sb)

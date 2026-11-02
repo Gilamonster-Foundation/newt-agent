@@ -508,6 +508,27 @@ pub(crate) fn add_to_config(
     let path = mcp_write_target(config_path, project, false)?;
     let (destination, _guard) = resolve_and_lock_write_target(&path)?;
     let text = read_config_text(destination.as_path())?;
+    // The default `newt mcp remove` edits the owner, which may be another
+    // file, so name the command for this one, and the copy newt uses (#2915).
+    if newt_core::mcp::parse_newt_mcp_toml_checked(&text)
+        .is_ok_and(|held| held.iter().any(|held| held.name == entry.name))
+    {
+        let (name, here) = (&entry.name, path.display());
+        let remove = remove_from(&path, name);
+        let owner = Config::mcp_server_owner_path(name)
+            .ok()
+            .flatten()
+            .filter(|owner| ResolvedPath::resolve(owner).ok().as_ref() != Some(&destination));
+        if let Some(owner) = owner {
+            let owner = owner.display();
+            bail!(
+                "MCP server `{name}` already exists in {here}, a copy shadowed by the one newt uses in {owner}: remove that copy with {remove}, or change the server in {owner}"
+            );
+        }
+        bail!(
+            "MCP server `{name}` already exists in {here}: remove it first with {remove}, or toggle it with `/mcp enable|disable`"
+        );
+    }
     let updated = Config::with_mcp_server_added(&text, entry)
         .with_context(|| format!("updating {}", destination.as_path().display()))?;
     write_back(&destination, &updated)?;
