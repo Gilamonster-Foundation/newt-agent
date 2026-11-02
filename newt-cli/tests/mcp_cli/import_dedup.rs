@@ -236,6 +236,50 @@ fn force_import_updates_an_owner_an_appended_project_does_not_outrank() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn import_into_the_base_refuses_a_namespace_clash_with_an_appended_project() {
+    // #3062 review (F5 follow-up): an appended project's entries do not
+    // outrank an import into the base, but they share its tool namespace.
+    // `my_srv` and the project's `my-srv` sanitize to one prefix, so both the
+    // redirected --force import and a --grant-net import refuse, as a default
+    // import does, and nothing is written.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let config_text = "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/true\"\n";
+    std::fs::write(&config, config_text).unwrap();
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    std::fs::write(
+        sb.cwd.join(".newt/config.toml"),
+        "[merge]\narrays = \"append\"\n\n[[mcp_servers]]\nname = \"my-srv\"\ncommand = \"/bin/false\"\n",
+    )
+    .unwrap();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "alpha": { "command": "/bin/true" }, "my_srv": { "command": "/bin/true" } } }"#,
+    )
+    .unwrap();
+    for extra in [&[][..], &["--grant-net"][..]] {
+        newt(&sb)
+            .args([
+                "mcp",
+                "import",
+                source.to_str().unwrap(),
+                "--all",
+                "--force",
+            ])
+            .args(extra)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "conflicts with existing server `my-srv`",
+            ));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), config_text);
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_updates_the_owner_in_place_beside_a_shadowed_copy() {
     // #3062 review (F4, G3): config.toml owns `alpha` and mcp.toml holds an
     // older, shadowed copy. The import updates the owner in place, since the

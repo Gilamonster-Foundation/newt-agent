@@ -1890,8 +1890,10 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                 !is_appended_project
             })
             .collect::<Vec<_>>();
+    // An appended project outranks nothing, but it shares the tool namespace.
     let mut existing_names = existing.clone();
     existing_names.extend(breakout_existing.iter().cloned());
+    existing_names.extend(lower_precedence_names.iter().cloned());
     for (_, names) in &outranking {
         existing_names.extend(names.iter().cloned());
     }
