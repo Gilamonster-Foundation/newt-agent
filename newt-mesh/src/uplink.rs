@@ -179,7 +179,8 @@ impl DockUplink {
     /// ceremony — never by its address.
     ///
     /// # Errors
-    /// The outbound-only bus failed to bind.
+    /// The outbound-only bus failed to bind, or the revocation log in
+    /// `state_dir` does not open.
     pub async fn start(
         user: &UserKey,
         instance: &str,
@@ -192,11 +193,14 @@ impl DockUplink {
             pubkey: agent.public_bytes(),
             instance: instance.to_owned(),
         };
+        let revocation = crate::dock::dock_revocation(&state_dir, user)?;
         // A hub that outlives this uplink still admits the next one under this
         // key (agent-mesh#100).
         let bus = match crate::dock::dock_sequences(&state_dir, &agent) {
-            Some(reserved) => Bus::bind_outbound_only_reserving(user, agent, reserved).await?,
-            None => Bus::bind_outbound_only(user, agent).await?,
+            Some(reserved) => {
+                Bus::bind_outbound_only_reserving(user, agent, reserved, revocation).await?
+            }
+            None => Bus::bind_outbound_only(user, agent, revocation).await?,
         };
         let local_port = bus.local_port();
         let (stop, stopped) = oneshot::channel();
@@ -1429,7 +1433,8 @@ mod tests {
         hub: PeerEndpoint,
     ) -> (DockUplink, Fingerprint) {
         let host_fp = dock_agent(user, DockRole::Host, instance).fingerprint();
-        let dir = std::env::temp_dir();
+        // Kept for the uplink's lifetime: its revocation log and sequences.
+        let dir = tempfile::tempdir().unwrap().keep();
         let uplink = DockUplink::start(user, instance, dir, hub).await.unwrap();
         (uplink, host_fp)
     }
@@ -1478,7 +1483,9 @@ mod tests {
     #[ignore = "live transport — nightly/full mesh-integration tier only"]
     async fn dock_uplink_closes_during_backoff() {
         let user = UserKey::generate();
-        let refusing = Bus::bind_outbound_only(&user, dock_agent(&user, DockRole::Hub, "x"))
+        let refusing = dock_agent(&user, DockRole::Hub, "x");
+        let revocation = agent_mesh_core::RevocationGuard::in_memory(&user);
+        let refusing = Bus::bind_outbound_only(&user, refusing, revocation)
             .await
             .unwrap();
         let hub_ep = PeerEndpoint::new(
