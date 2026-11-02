@@ -526,6 +526,43 @@ fn dropping_an_inline_member_keeps_the_comment_of_a_member_that_stays() {
 }
 
 #[test]
+fn a_header_spelled_in_another_case_is_the_same_member() {
+    // #3062 review (R3-3): HTTP header names are case-insensitive, so a
+    // source header that differs from a local one only in case is that
+    // member. The same value leaves the file as it is; a new one is written
+    // in place under the operator's spelling. A second local spelling of the
+    // header the source names goes, so one value is sent.
+    let merge = |text: &str, headers: &str| {
+        let entry: crate::mcp::McpServerEntry = toml::from_str(&format!(
+            "name = \"web\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nheaders = {headers}\n"
+        ))
+        .unwrap();
+        let provided = ["type", "url", "headers"].into_iter().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let head =
+        "[[mcp_servers]]\nname = \"web\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\n";
+    let local = format!(
+        "{head}headers = {{ authorization = \"Bearer ${{SYNTHETIC_TOKEN}}\" }} # team token\n"
+    );
+    assert_eq!(
+        merge(&local, "{ Authorization = \"Bearer ${SYNTHETIC_TOKEN}\" }"),
+        local
+    );
+    assert_eq!(
+        merge(&local, "{ Authorization = \"Bearer ${SYNTHETIC_TOKEN2}\" }"),
+        local.replace("TOKEN}", "TOKEN2}")
+    );
+    let twice = format!(
+        "{head}headers = {{ X-Api-Key = \"${{SYNTHETIC_KEY}}\", x-api-key = \"${{SYNTHETIC_OLD}}\" }}\n"
+    );
+    assert_eq!(
+        merge(&twice, "{ X-API-KEY = \"${SYNTHETIC_KEY}\" }"),
+        format!("{head}headers = {{ X-Api-Key = \"${{SYNTHETIC_KEY}}\" }}\n")
+    );
+}
+
+#[test]
 fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
     // #2915 review (P1): a new URL must not inherit the credential configured
     // for the old destination, and the refusal must not quote either.

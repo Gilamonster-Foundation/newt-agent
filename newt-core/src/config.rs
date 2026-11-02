@@ -2940,7 +2940,7 @@ fn local_mcp_spelling(
 /// Update the map field `key` (`env`, `headers`) to `wanted` member by member,
 /// so a sub-table, dotted keys or an inline table keeps its layout, and each
 /// member its comments: a dropped member goes, a changed one is replaced in
-/// place, a new one is added.
+/// place under the operator's spelling of its name, a new one is added.
 fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::TableLike) {
     let member = |name: &str, item: &toml_edit::Item| {
         let mut one = toml_edit::Table::new();
@@ -2950,19 +2950,22 @@ fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::T
     let Some(have) = map.as_table_like() else {
         return;
     };
-    let dropped: Vec<String> = have
-        .iter()
-        .map(|(name, _)| name.to_owned())
-        .filter(|name| !wanted.contains_key(name))
-        .collect();
-    let changed: Vec<(&str, &toml_edit::Item)> = wanted
-        .iter()
-        .filter(|(name, value)| {
-            !have.get(name).is_some_and(|old| {
-                same_mcp_field(key, Some(&member(name, old)), Some(&member(name, value)))
-            })
-        })
-        .collect();
+    // Each wanted member is one local member at most: a header name in any
+    // case (`authorization` for `Authorization`). Any other local one goes.
+    let mut unmatched: Vec<&str> = have.iter().map(|(name, _)| name).collect();
+    let mut changed = Vec::new();
+    for (name, value) in wanted.iter() {
+        let local = unmatched
+            .iter()
+            .position(|local| crate::mcp::same_mcp_map_member(key, local, name))
+            .map(|at| unmatched.remove(at));
+        if !local.and_then(|local| have.get(local)).is_some_and(|old| {
+            same_mcp_field(key, Some(&member(name, old)), Some(&member(name, value)))
+        }) {
+            changed.push((local.unwrap_or(name).to_owned(), value));
+        }
+    }
+    let dropped: Vec<String> = unmatched.into_iter().map(str::to_owned).collect();
     match map {
         toml_edit::Item::Value(toml_edit::Value::InlineTable(map)) => {
             for name in &dropped {
@@ -2970,10 +2973,10 @@ fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::T
             }
             for (name, value) in changed {
                 match value.as_value() {
-                    Some(value) if !map.contains_key(name) => {
-                        push_inline_member(map, name, value.clone());
+                    Some(value) if !map.contains_key(&name) => {
+                        push_inline_member(map, &name, value.clone());
                     }
-                    _ => replace_in_place(map, name, value.clone()),
+                    _ => replace_in_place(map, &name, value.clone()),
                 }
             }
         }
@@ -2983,7 +2986,7 @@ fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::T
                     let _ = map.remove(name);
                 }
                 for (name, value) in changed {
-                    replace_in_place(map, name, value.clone());
+                    replace_in_place(map, &name, value.clone());
                 }
             }
         }

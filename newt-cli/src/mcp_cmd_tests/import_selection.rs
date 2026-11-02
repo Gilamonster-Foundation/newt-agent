@@ -564,6 +564,31 @@ fn removed_local_settings_names_the_oauth_pins_a_merge_dropped() {
     );
 }
 
+/// #3062 review (R3-3): HTTP header names are case-insensitive, so a source
+/// that spells a local header in another case names that header, and the
+/// notice never lists it as removed. Environment variable names are not.
+#[test]
+fn removed_local_settings_matches_header_names_in_any_case() {
+    let mut previous = stdio_entry("web", None);
+    previous.transport = TransportKind::Http;
+    previous.url = Some("https://mcp.example.test/mcp".into());
+    let token = SecretValue::literal("Bearer ${SYNTHETIC_TOKEN}");
+    previous.headers = BTreeMap::from([("authorization".into(), token.clone())]);
+    let mut saved = previous.clone();
+    saved.headers = BTreeMap::from([("Authorization".into(), token)]);
+    assert_eq!(
+        removed_local_settings(&previous, &saved),
+        Vec::<String>::new()
+    );
+
+    let mut previous = stdio_entry("fs", Some("fs-mcp"));
+    let path = SecretValue::literal("${SYNTHETIC_PATH}");
+    previous.env = BTreeMap::from([("path".into(), path.clone())]);
+    let mut saved = previous.clone();
+    saved.env = BTreeMap::from([("PATH".into(), path)]);
+    assert_eq!(removed_local_settings(&previous, &saved), ["env path"]);
+}
+
 /// #3062 review (G5 follow-up): a merge keeps a local `login_argv`, which no
 /// source can supply, and the notice names it when the stdio command, the
 /// whole argv, is not the one it was written for.

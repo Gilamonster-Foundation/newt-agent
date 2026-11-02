@@ -1337,14 +1337,18 @@ fn removed_local_settings(previous: &McpServerEntry, saved: &McpServerEntry) -> 
     .filter(|(_, gone)| *gone)
     .map(|(field, _)| field.to_string())
     .collect();
-    for (kind, before, after) in [
-        ("env", &previous.env, &saved.env),
-        ("header", &previous.headers, &saved.headers),
+    for (field, kind, before, after) in [
+        ("env", "env", &previous.env, &saved.env),
+        ("headers", "header", &previous.headers, &saved.headers),
     ] {
         removed.extend(
             before
                 .keys()
-                .filter(|name| !after.contains_key(*name))
+                .filter(|name| {
+                    !after
+                        .keys()
+                        .any(|kept| newt_core::mcp::same_mcp_map_member(field, name, kept))
+                })
                 .map(|name| format!("{kind} {name}")),
         );
     }

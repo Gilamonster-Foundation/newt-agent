@@ -1715,6 +1715,17 @@ fn newt_mcp_file_servers(
     }
 }
 
+/// Whether `a` and `b` name one member of the `[[mcp_servers]]` map `field`:
+/// HTTP header names are case-insensitive, environment variable names are not.
+#[must_use]
+pub fn same_mcp_map_member(field: &str, a: &str, b: &str) -> bool {
+    if field == "headers" {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 /// Whether `entry` configures an `Authorization` header (any value).
 pub fn has_configured_authorization_header(entry: &McpServerEntry) -> bool {
     entry
