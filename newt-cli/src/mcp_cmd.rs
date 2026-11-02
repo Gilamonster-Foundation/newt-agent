@@ -586,11 +586,14 @@ fn remove_from(path: &Path, name: &str) -> String {
 /// Why a --grant-net import does not write `entry` to `target` while the
 /// break-out file `breakout` holds a `copy` of it and `target` holds none
 /// discovery keeps (only a dropped `stub`, if any). The route that keeps the
-/// copy's local settings leads; the remove, which loses them, is last (#2915).
+/// copy's local settings leads; the remove, which loses them, is last. In a
+/// `batch`, that route is a re-run of `entry` alone: a --force re-run of the
+/// batch refuses servers with different owning files (#2915).
 fn cross_file_refusal(
     entry: &McpServerEntry,
     copy: Option<&McpServerEntry>,
     stub: bool,
+    batch: bool,
     breakout: &Path,
     target: &Path,
 ) -> anyhow::Result<String> {
@@ -610,8 +613,19 @@ fn cross_file_refusal(
     } else {
         ", `enabled = false` included"
     };
+    let (rerun, rest) = if batch {
+        (
+            format!(
+                "Re-run it alone with --name {} and without --grant-net",
+                newt_core::mcp::shell_quote_arg(name)
+            ),
+            " Keep --grant-net for the others, each imported by --name.",
+        )
+    } else {
+        ("Re-run without --grant-net".to_string(), "")
+    };
     Ok(format!(
-        "MCP server `{name}` exists in {} but the import writes atomically to {}{stub}; refusing a cross-file overwrite that would leave a dormant duplicate. Re-run without --grant-net to update that copy in place, keeping its local settings{grant}. Removing that copy with {} before the re-run instead loses those settings{paused}",
+        "MCP server `{name}` exists in {} but the import writes atomically to {}{stub}; refusing a cross-file overwrite that would leave a dormant duplicate. {rerun} to update that copy in place, keeping its local settings{grant}.{rest} Removing that copy with {} before the re-run instead loses those settings{paused}",
         breakout.display(),
         target.display(),
         remove_from(breakout, name)
@@ -2115,6 +2129,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                                 entry,
                                 effective(&copies, &entry.name).as_ref(),
                                 exists_in_target,
+                                imported.len() > 1,
                                 &breakout_target,
                                 &target
                             )?

@@ -783,6 +783,58 @@ fn the_cross_file_refusal_leads_with_the_route_that_keeps_the_copy() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn a_batch_cross_file_refusal_names_a_route_the_batch_can_take() {
+    // #3062 review (R4-3): in a batch, the refusal's lead "Re-run without
+    // --grant-net" ran the --force owner redirect over every server, and
+    // `alpha` (config.toml) and `review` (mcp.toml) have different owners,
+    // so it failed. The refusal names the re-run of `review` alone, and
+    // --grant-net, by name, for the others; both routes work.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let tuned = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://review.example.test/mcp\"\nrequest_timeout_secs = 90 # tuned\n";
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"alpha\"\ntype = \"http\"\nurl = \"https://alpha.example.test/mcp\"\n",
+    )
+    .unwrap();
+    std::fs::write(&mcp, tuned).unwrap();
+    let source = sb.cwd.join("s.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "alpha": { "type": "http", "url": "https://alpha.example.test/mcp" },
+              "review": { "type": "http", "url": "https://review.example.test/mcp" }
+        } }"#,
+    )
+    .unwrap();
+    let import = |args: &[&str]| {
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap(), "--force"])
+            .args(args)
+            .assert()
+    };
+
+    import(&["--all", "--grant-net"])
+        .failure()
+        .stderr(predicate::str::contains(
+            "Re-run it alone with --name review and without --grant-net",
+        ))
+        .stderr(predicate::str::contains(
+            "Keep --grant-net for the others, each imported by --name.",
+        ));
+    import(&["--name", "review"])
+        .success()
+        .stdout(predicate::str::contains("1 unchanged"));
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), tuned);
+    import(&["--name", "alpha", "--grant-net"])
+        .success()
+        .stdout(predicate::str::contains(": alpha.example.test\n"));
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn a_grant_import_is_not_blocked_by_an_entry_discovery_drops() {
     // #3062 review (R2-3): C2's rule, that an entry discovery drops counts
     // for nothing, also holds for the other files a --grant-net import

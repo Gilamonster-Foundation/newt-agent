@@ -126,7 +126,7 @@ fn the_cross_file_refusal_grants_a_paused_copy_once_it_is_enabled() {
             ..entry.clone()
         };
         let (breakout, target) = (Path::new("mcp.toml"), Path::new("config.toml"));
-        cross_file_refusal(&entry, Some(&copy), false, breakout, target).unwrap()
+        cross_file_refusal(&entry, Some(&copy), false, false, breakout, target).unwrap()
     };
     let grant =
         "grant the exact hostname review.example.test in trusted [tui.permissions] net of config.toml.";
