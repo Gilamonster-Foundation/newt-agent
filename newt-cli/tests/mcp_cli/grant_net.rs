@@ -594,3 +594,85 @@ fn grant_net_kill_boundaries_recover_to_an_atomic_connector_and_grant() {
                 .ends_with(".tmp")));
     }
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_grant_import_does_not_revive_a_dropped_stub_over_the_live_copy() {
+    // #3062 review (R2-7): config.toml holds a `docs` whose url is commented
+    // out, so discovery drops it; mcp.toml holds the live `docs`, paused. A
+    // --grant-net import writes config.toml, and F4 lets it update an entry
+    // that file really holds. Merging into the stub instead would revive it
+    // over the paused copy and grant its host, so the cross-file refusal
+    // stands and neither file changes.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let stub = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n# url = \"https://docs.example.test/mcp\"\n";
+    let live = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\nurl = \"https://docs.example.test/mcp\"\nenabled = false # paused until security review\n";
+    std::fs::write(&config, stub).unwrap();
+    std::fs::write(&mcp, live).unwrap();
+    let source = sb.cwd.join("s.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "docs": { "type": "http", "url": "https://docs.example.test/mcp" } } }"#,
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args(["mcp", "import", source.to_str().unwrap(), "--name", "docs"])
+        .args(["--force", "--grant-net"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refusing a cross-file overwrite"));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), stub);
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), live);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_grant_import_is_not_blocked_by_an_entry_discovery_drops() {
+    // #3062 review (R2-3): C2's rule, that an entry discovery drops counts
+    // for nothing, also holds for the other files a --grant-net import
+    // checks: an appended project and the break-out mcp.toml. A `docs` stub
+    // with no url in either neither refuses nor skips the import, which
+    // adds a working `docs` to config.toml and says so, and leaves the stub.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let stub = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n";
+    let appended = format!("[merge]\narrays = \"append\"\n\n{stub}");
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    let source = sb.cwd.join("src.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "docs": { "type": "http", "url": "https://docs.example.test/mcp" } } }"#,
+    )
+    .unwrap();
+    for (holder, text) in [
+        (sb.cwd.join(".newt").join("config.toml"), appended.as_str()),
+        (sb.config_dir.join("mcp.toml"), stub),
+    ] {
+        for mode in [&[][..], &["--merge"][..], &["--force"][..]] {
+            std::fs::write(&config, "[tui.permissions]\nnet = []\n").unwrap();
+            std::fs::write(&holder, text).unwrap();
+            newt(&sb)
+                .args(["mcp", "import", source.to_str().unwrap(), "--name", "docs"])
+                .arg("--grant-net")
+                .args(mode)
+                .assert()
+                .success()
+                .stdout(predicate::str::contains(
+                    "Results: 1 added, 0 replaced, 0 unchanged, 0 skipped.",
+                ));
+            assert_eq!(std::fs::read_to_string(&holder).unwrap(), text);
+            let saved = load_config(&config);
+            assert_eq!(
+                saved.mcp_servers[0].url.as_deref(),
+                Some("https://docs.example.test/mcp"),
+                "{mode:?}"
+            );
+        }
+        std::fs::remove_file(&holder).unwrap();
+    }
+}

@@ -1850,6 +1850,8 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
+    // Another file's entry that discovery drops counts for nothing, as for
+    // the outranking files and the owner (#2915).
     let breakout_existing: std::collections::BTreeSet<String> =
         if target_destination == breakout_destination {
             existing.clone()
@@ -1861,6 +1863,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                 &breakout_target,
             )?
             .into_iter()
+            .filter(McpServerEntry::is_valid)
             .map(|entry| entry.name)
             .collect()
         };
@@ -1883,6 +1886,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                 config
                     .mcp_servers
                     .into_iter()
+                    .filter(McpServerEntry::is_valid)
                     .map(|entry| entry.name)
                     .collect()
             })
@@ -1980,8 +1984,12 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             if request.force {
                 // An entry the target already holds is updated in place: its
                 // shadowed copy predates the import, so it is named, not refused.
+                // A stub discovery drops is not that entry; updating it would
+                // revive it over the live copy.
                 if target_destination != breakout_destination && exists_in_breakout {
-                    if !exists_in_target {
+                    if !effective(&existing_entries, &entry.name)
+                        .is_some_and(|held| held.is_valid())
+                    {
                         bail!(
                             "MCP server `{}` exists in {} but the import writes atomically to {}; refusing a cross-file overwrite that would leave a dormant duplicate. Remove that copy with {}, then re-run the import",
                             entry.name,
