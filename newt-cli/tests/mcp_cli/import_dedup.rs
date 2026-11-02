@@ -207,6 +207,49 @@ fn merge_import_skips_a_name_a_higher_precedence_file_defines() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn import_is_not_outranked_by_an_entry_discovery_drops() {
+    // #3062 review (C2): config.toml's `docs` has no url, so discovery drops
+    // it and it outranks nothing, as for the owner (F11). --merge imports the
+    // name instead of calling it "already present", and --force updates the
+    // live mcp.toml copy instead of refusing the import as ineffective.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let dead = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n";
+    std::fs::write(&config, dead).unwrap();
+    let source = sb.cwd.join("c.json");
+    let import = |json: &str, mode: &str| {
+        std::fs::write(&source, json).unwrap();
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap(), "--all", mode])
+            .assert()
+    };
+
+    import(
+        r#"{ "mcpServers": { "docs": { "command": "/bin/true" } } }"#,
+        "--merge",
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "Results: 1 added, 0 replaced, 0 unchanged, 0 skipped.",
+    ));
+    import(
+        r#"{ "mcpServers": { "docs": { "command": "/bin/true", "requestTimeoutSecs": 30 } } }"#,
+        "--force",
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+    ));
+    assert!(std::fs::read_to_string(&mcp)
+        .unwrap()
+        .contains("request_timeout_secs = 30"));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), dead);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_updates_an_owner_an_appended_project_does_not_outrank() {
     // #3062 review (F5): with `[merge] arrays = "append"` the base entries
     // come first, so config.toml's `alpha` is effective and the project's

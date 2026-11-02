@@ -1472,37 +1472,28 @@ fn outranking_import_sources(
         return Ok(Vec::new());
     }
 
-    let mut sources = Vec::new();
-
     // Inspect each source locally instead of attributing Config::resolve()'s
     // merged names to its highest-precedence label. Otherwise a project file
     // with no MCP entries can make the user config's own names look project-
     // owned and falsely defeat `--merge` / `--force` on the authoritative file.
-    let user_config = user_dir.join("config.toml");
-    if user_config.is_file() {
-        sources.push((
-            user_config.clone(),
-            load_consulted_config(&user_config, held_locks)?
-                .mcp_servers
-                .into_iter()
-                .map(|entry| entry.name)
-                .collect(),
-        ));
-    }
-    for source in [ambient_newt_toml()?, Config::project_config_path()]
-        .into_iter()
-        .flatten()
+    // An entry discovery drops outranks nothing, as for the owner (#2915).
+    let mut sources = Vec::new();
+    for source in [
+        Some(user_dir.join("config.toml")),
+        ambient_newt_toml()?,
+        Config::project_config_path(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|source| source.is_file())
     {
-        if source.is_file() {
-            sources.push((
-                source.clone(),
-                load_consulted_config(&source, held_locks)?
-                    .mcp_servers
-                    .into_iter()
-                    .map(|entry| entry.name)
-                    .collect(),
-            ));
-        }
+        let names = load_consulted_config(&source, held_locks)?
+            .mcp_servers
+            .into_iter()
+            .filter(McpServerEntry::is_valid)
+            .map(|entry| entry.name)
+            .collect();
+        sources.push((source, names));
     }
     Ok(sources)
 }
