@@ -530,11 +530,16 @@ fn write_back(destination: &ResolvedPath, text: &str) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", destination.as_path().display()))
 }
 
-/// The command that removes `name` from exactly `path`. Advice names this, not
-/// the default `newt mcp remove`, which edits the owning file: when a refusal
-/// is about a shadowed or outranking copy, that is another entry (#2915).
+/// The command that removes `name` from exactly `path`, quoted to paste.
+/// Advice names this, not the default `newt mcp remove`, which edits the
+/// owning file: when a refusal is about a shadowed or outranking copy, that
+/// is another entry (#2915).
 fn remove_from(path: &Path, name: &str) -> String {
-    format!("`newt --config {} mcp remove {name}`", path.display())
+    format!(
+        "`newt --config {} mcp remove {}`",
+        newt_core::mcp::shell_quote_arg(&path.to_string_lossy()),
+        newt_core::mcp::shell_quote_arg(name)
+    )
 }
 
 /// Remove `name`, resolving the target the same way `add` does. An explicit

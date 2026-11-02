@@ -502,6 +502,20 @@ fn removed_local_settings_names_dropped_map_members_and_foreign_fields() {
     assert!(removed_local_settings(&previous, &previous).is_empty());
 }
 
+/// #3062 review (R1-12): the advice is a command to paste, so a path or name
+/// a shell would split is quoted; a plain one stays bare.
+#[test]
+fn remove_advice_quotes_what_a_shell_would_split() {
+    assert_eq!(
+        remove_from(Path::new("sp ace/cfg/mcp.toml"), "alpha"),
+        "`newt --config 'sp ace/cfg/mcp.toml' mcp remove alpha`"
+    );
+    assert_eq!(
+        remove_from(Path::new("cfg/mcp.toml"), "my srv"),
+        "`newt --config cfg/mcp.toml mcp remove 'my srv'`"
+    );
+}
+
 /// #3062 review (R1-2): a Claude `oauth` object decides the client id, scopes
 /// and callback port together, so a member it omits removes the local pin.
 /// The notice names each pin that went, never its value; a changed value is

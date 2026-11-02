@@ -495,7 +495,7 @@ fn force_grant_net_refuses_a_cross_file_legacy_override() {
         .stderr(predicate::str::contains("cross-file overwrite"))
         .stderr(predicate::str::contains(format!(
             "`newt --config {} mcp remove review`",
-            breakout.display()
+            newt_core::mcp::shell_quote_arg(&breakout.to_string_lossy())
         )));
 
     assert_eq!(std::fs::read_to_string(breakout).unwrap(), breakout_text);

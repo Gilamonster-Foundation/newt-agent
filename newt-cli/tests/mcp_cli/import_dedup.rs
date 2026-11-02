@@ -316,7 +316,7 @@ fn force_import_updates_the_owner_in_place_beside_a_shadowed_copy() {
             .stdout(predicate::str::contains("1 replaced"))
             .stdout(predicate::str::contains(format!(
                 "`newt --config {} mcp remove alpha`",
-                mcp.display()
+                newt_core::mcp::shell_quote_arg(&mcp.to_string_lossy())
             )));
         let updated = std::fs::read_to_string(&config).unwrap();
         assert!(
