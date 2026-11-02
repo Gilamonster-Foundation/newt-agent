@@ -994,12 +994,14 @@ pub enum McpConfigError {
 
 impl McpConfigError {
     /// The 1-based line and column in `text` where a parser error `span`
-    /// starts; the position quotes nothing from the file.
+    /// starts; the position quotes nothing from the file. A leading BOM,
+    /// which the parser skips and an editor hides, is not a column.
     pub(crate) fn position(
         text: &str,
         span: Option<std::ops::Range<usize>>,
     ) -> Option<(usize, usize)> {
         let before = text.get(..span?.start)?;
+        let before = before.strip_prefix('\u{feff}').unwrap_or(before);
         let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
         Some((
             before.matches('\n').count() + 1,

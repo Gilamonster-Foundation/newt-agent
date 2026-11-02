@@ -1309,6 +1309,22 @@ fn mcp_writer_errors_name_the_position_not_the_contents() {
 }
 
 #[test]
+fn mcp_error_columns_do_not_count_a_bom() {
+    // #3062 review (R1-9): the parser skips a leading BOM, but its spans are
+    // byte offsets into the text, and editors hide the BOM. A column on line
+    // 1 counts from the first visible character, as on every other line.
+    let error = |text: &str| Config::with_mcp_server_removed(text, "x").unwrap_err();
+    assert_eq!(
+        error("\u{feff}name = = 1\n").to_string(),
+        error("name = = 1\n").to_string()
+    );
+    assert_eq!(
+        error("\u{feff}name = = 1\n").to_string(),
+        "config error: invalid MCP TOML syntax at line 1, column 8"
+    );
+}
+
+#[test]
 fn with_mcp_server_removed_errors_when_absent() {
     let text = "[[mcp_servers]]\nname = \"present\"\ncommand = \"x\"\n";
     let err = Config::with_mcp_server_removed(text, "ghost").unwrap_err();
