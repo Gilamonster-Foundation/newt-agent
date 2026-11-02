@@ -385,6 +385,48 @@ fn the_outranking_refusal_offers_merge_only_where_config_toml_is_consulted() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn the_outranking_refusal_names_a_config_that_is_also_the_project_once() {
+    // #3062 review (R4-5): with the config dir at the cwd's `.newt`, the
+    // user config.toml is also the walked-up project config. The refusal
+    // named that one file twice, with two identical removes, and the second
+    // remove failed. Each file is named once, as the resolver reads it once.
+    let sb = sandbox();
+    let config_dir = sb.cwd.join(".newt");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"/bin/true\"\nrequest_timeout_secs = 90 # tuned\n",
+    )
+    .unwrap();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "alpha": { "command": "/bin/echo" } } }"#,
+    )
+    .unwrap();
+
+    let output = newt(&sb)
+        .env("NEWT_CONFIG_DIR", &config_dir)
+        .args(["mcp", "import", source.to_str().unwrap(), "--all"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let refusal = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        refusal.contains(&format!(
+            "already defined in {}, which outranks",
+            config.display()
+        )),
+        "{refusal}"
+    );
+    assert_eq!(refusal.matches("mcp remove alpha`").count(), 1, "{refusal}");
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn import_is_not_outranked_by_an_entry_discovery_drops() {
     // #3062 review (C2): config.toml's `docs` has no url, so discovery drops
     // it and it outranks nothing, as for the owner (F11). --merge imports the

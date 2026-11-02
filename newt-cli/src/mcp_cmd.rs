@@ -1588,8 +1588,11 @@ fn outranking_import_sources(
     // merged names to its highest-precedence label. Otherwise a project file
     // with no MCP entries can make the user config's own names look project-
     // owned and falsely defeat `--merge` / `--force` on the authoritative file.
-    // An entry discovery drops outranks nothing, as for the owner (#2915).
+    // An entry discovery drops outranks nothing, as for the owner. A config
+    // dir that is an ancestor's `.newt` makes config.toml the walked-up
+    // project too: one file, listed once, as the resolver reads it (#2915).
     let mut sources = Vec::new();
+    let mut seen = Vec::new();
     for source in [
         Some(user_dir.join("config.toml")),
         ambient_newt_toml()?,
@@ -1599,6 +1602,11 @@ fn outranking_import_sources(
     .flatten()
     .filter(|source| source.is_file())
     {
+        let resolved = ResolvedPath::resolve(&source)?;
+        if seen.contains(&resolved) {
+            continue;
+        }
+        seen.push(resolved);
         let names = load_consulted_config(&source, held_locks)?
             .mcp_servers
             .into_iter()
