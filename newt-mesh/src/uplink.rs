@@ -1415,28 +1415,33 @@ mod tests {
     /// window (`POLL_TIMEOUT`) still open.
     const RELEASE_BOUND: Duration = Duration::from_secs(5);
 
-    async fn hub_for(user: &UserKey) -> (DockClient, PeerEndpoint) {
+    /// Bind a hub; returns its state dir first, so a caller's binding drops
+    /// it after the hub.
+    async fn hub_for(user: &UserKey) -> (tempfile::TempDir, DockClient, PeerEndpoint) {
         let agent = dock_agent(user, DockRole::Hub, "hub");
         let pubkey = agent.public_bytes();
-        // Kept for the hub's lifetime: its sequence reservations live there.
-        let dir = tempfile::tempdir().unwrap().keep();
-        let hub = DockClient::bind(user, agent, 0, &dir).await.unwrap();
+        // The hub's revocation log and sequence reservations live here.
+        let dir = tempfile::tempdir().unwrap();
+        let hub = DockClient::bind(user, agent, 0, dir.path()).await.unwrap();
         hub.serve_all_uplinks();
         let addr = (Ipv4Addr::LOCALHOST, hub.local_port()).into();
-        (hub, PeerEndpoint::new(pubkey, addr))
+        (dir, hub, PeerEndpoint::new(pubkey, addr))
     }
 
-    /// Start an uplink as host `instance`; returns it with its fingerprint.
+    /// Start an uplink as host `instance`; returns its state dir first, as
+    /// `hub_for` does, then the uplink and its fingerprint.
     async fn uplink_to(
         user: &UserKey,
         instance: &str,
         hub: PeerEndpoint,
-    ) -> (DockUplink, Fingerprint) {
+    ) -> (tempfile::TempDir, DockUplink, Fingerprint) {
         let host_fp = dock_agent(user, DockRole::Host, instance).fingerprint();
-        // Kept for the uplink's lifetime: its revocation log and sequences.
-        let dir = tempfile::tempdir().unwrap().keep();
-        let uplink = DockUplink::start(user, instance, dir, hub).await.unwrap();
-        (uplink, host_fp)
+        // The uplink's revocation log and sequences live here.
+        let dir = tempfile::tempdir().unwrap();
+        let uplink = DockUplink::start(user, instance, dir.path().to_path_buf(), hub)
+            .await
+            .unwrap();
+        (dir, uplink, host_fp)
     }
 
     /// Close `uplink` within 5s and check its runner finished.
@@ -1459,8 +1464,8 @@ mod tests {
     #[ignore = "live transport — nightly/full mesh-integration tier only"]
     async fn dock_uplink_closes_during_an_outstanding_poll() {
         let user = UserKey::generate();
-        let (hub, hub_ep) = hub_for(&user).await;
-        let (uplink, host_fp) = uplink_to(&user, "laptop", hub_ep).await;
+        let (_hub_dir, hub, hub_ep) = hub_for(&user).await;
+        let (_dir, uplink, host_fp) = uplink_to(&user, "laptop", hub_ep).await;
         tokio::time::timeout(
             Duration::from_secs(5),
             hub.uplinks().wait_for_uplink(host_fp),
@@ -1492,7 +1497,7 @@ mod tests {
             dock_agent(&user, DockRole::Hub, "x").public_bytes(),
             (Ipv4Addr::LOCALHOST, refusing.local_port()).into(),
         );
-        let (mut uplink, _) = uplink_to(&user, "laptop", hub_ep).await;
+        let (_dir, mut uplink, _) = uplink_to(&user, "laptop", hub_ep).await;
         tokio::time::timeout(
             Duration::from_secs(10),
             uplink.reached(UplinkState::Backoff),
@@ -1512,10 +1517,11 @@ mod tests {
     #[ignore = "live transport — nightly/full mesh-integration tier only"]
     async fn dock_uplink_survives_repeated_start_close_cycles() {
         let user = UserKey::generate();
-        let (hub, hub_ep) = hub_for(&user).await;
+        let (_hub_dir, hub, hub_ep) = hub_for(&user).await;
         let mut ports = Vec::new();
         for cycle in 0..5 {
-            let (uplink, host_fp) = uplink_to(&user, &format!("laptop-{cycle}"), hub_ep).await;
+            let (_dir, uplink, host_fp) =
+                uplink_to(&user, &format!("laptop-{cycle}"), hub_ep).await;
             tokio::time::timeout(
                 Duration::from_secs(5),
                 hub.uplinks().wait_for_uplink(host_fp),
