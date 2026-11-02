@@ -558,7 +558,9 @@ fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyho
         write_back(&destination, &removed(&destination)?)?;
         return Ok(explicit);
     }
-    let owner = Config::mcp_server_edit_path(name)?;
+    let owner = Config::mcp_server_edit_path(name, true, |owner| {
+        format!("{} removes it there", remove_from(owner, name))
+    })?;
     let (destination, _guard) = resolve_and_lock_write_target(&owner)?;
     let current_owner = Config::mcp_server_owner_path(name)?
         .as_deref()

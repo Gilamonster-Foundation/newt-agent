@@ -2665,29 +2665,31 @@ impl Config {
     }
 
     /// The owner of `name` that a default-scope edit (`newt mcp remove`, `/mcp
-    /// enable|disable`) may change. A walked-up project config is borrowed
-    /// and repo-tracked, and the system config is shared, so neither is edited
-    /// unless named, as before owners were resolved (#2915): the error names
-    /// the explicit command. A project file the operator pinned as the base
-    /// is their named config, as it is for the resolver.
-    pub fn mcp_server_edit_path(name: &str) -> anyhow::Result<PathBuf> {
+    /// enable|disable`) may change; see `unnamed_owner_kind` for the files
+    /// it leaves alone (#2915). `ambient_is_default` says whether this edit
+    /// writes an unpinned `./newt.toml` by default, as `newt mcp add|remove`
+    /// do (#1291) and the toggle never did. A refusal names the file and ends
+    /// with `remedy`, the caller's own route to change it there.
+    pub fn mcp_server_edit_path(
+        name: &str,
+        ambient_is_default: bool,
+        remedy: impl FnOnce(&Path) -> String,
+    ) -> anyhow::Result<PathBuf> {
         let owner = Self::mcp_server_owner_path(name)?.ok_or_else(|| {
             anyhow::anyhow!("no MCP server named `{name}` in the effective Newt config")
         })?;
-        let kind = if Self::base_config_path().as_ref() == Some(&owner) {
-            if owner != Path::new(SYSTEM_CONFIG_PATH) {
-                return Ok(owner);
-            }
-            "system"
-        } else if Self::project_config_path().as_ref() == Some(&owner) {
-            "project"
-        } else {
+        let Some(kind) = unnamed_owner_kind(
+            &owner,
+            Self::pinned_config_path().as_deref(),
+            Self::project_config_path().as_deref(),
+            !ambient_is_default && layering::base_is_ambient_newt_toml(Some(&owner)),
+        ) else {
             return Ok(owner);
         };
         anyhow::bail!(
-            "MCP server `{name}` is defined in the {kind} config {}, which newt edits only when named: `newt --config {} mcp remove {name}` removes it there",
+            "MCP server `{name}` is defined in the {kind} config {}, which newt edits only when named: {}",
             owner.display(),
-            owner.display()
+            remedy(&owner)
         )
     }
 
@@ -2792,6 +2794,30 @@ impl Config {
 
         paths.push(PathBuf::from(SYSTEM_CONFIG_PATH));
         paths
+    }
+}
+
+/// The kind of config a default-scope MCP edit leaves alone unless the
+/// operator names it, or `None` when it may edit `owner`. A file pinned with
+/// `--config` or `$NEWT_CONFIG` is named. The system config is shared, and a
+/// walked-up project config and an `ambient` `./newt.toml` are borrowed and
+/// may be repo-tracked; main never wrote them implicitly (#2915). Pure.
+fn unnamed_owner_kind(
+    owner: &Path,
+    pinned: Option<&Path>,
+    project: Option<&Path>,
+    ambient: bool,
+) -> Option<&'static str> {
+    if pinned == Some(owner) {
+        None
+    } else if owner == Path::new(SYSTEM_CONFIG_PATH) {
+        Some("system")
+    } else if project == Some(owner) {
+        Some("project")
+    } else if ambient {
+        Some("ambient")
+    } else {
+        None
     }
 }
 

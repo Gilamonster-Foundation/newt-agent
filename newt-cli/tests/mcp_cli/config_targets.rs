@@ -82,6 +82,13 @@ fn add_prefers_cwd_newt_toml_when_present() {
         .assert()
         .success()
         .stdout(predicate::str::contains("x"));
+    // Remove undoes the add in the same file, as on main (#1291); only the
+    // TUI toggle leaves an ambient ./newt.toml alone (#3062 review, R1-1).
+    newt(&sb).args(["mcp", "remove", "x"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(&newt_toml).unwrap(),
+        "# local config\n"
+    );
 }
 
 #[test]

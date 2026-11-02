@@ -761,18 +761,18 @@ fn mcp_server_edit_path_refuses_a_project_owner() {
 
     let owner = Config::mcp_server_owner_path("proj").unwrap().unwrap();
     assert!(owner.ends_with(Path::new(".newt").join("config.toml")));
-    let error = Config::mcp_server_edit_path("proj")
-        .unwrap_err()
-        .to_string();
+    let edit = |name: &str| {
+        Config::mcp_server_edit_path(name, true, |owner| {
+            format!("remove it from {}", owner.display())
+        })
+    };
+    let error = edit("proj").unwrap_err().to_string();
     assert!(error.contains("project config"), "{error}");
     assert!(
-        error.contains(&format!(
-            "`newt --config {} mcp remove proj`",
-            owner.display()
-        )),
+        error.ends_with(&format!("remove it from {}", owner.display())),
         "{error}"
     );
-    assert_eq!(Config::mcp_server_edit_path("mine").unwrap(), mcp);
+    assert_eq!(edit("mine").unwrap(), mcp);
 
     // Pinned as the base, the same file is the operator's named config, not
     // a borrowed layer: the resolver reads it as the base, whatever its
@@ -780,7 +780,107 @@ fn mcp_server_edit_path_refuses_a_project_owner() {
     // SAFETY: the `real_fs` serial lane serializes env mutation; HomeSandbox
     // restores NEWT_CONFIG on drop.
     unsafe { std::env::set_var("NEWT_CONFIG", &owner) };
-    assert_eq!(Config::mcp_server_edit_path("proj").unwrap(), owner);
+    assert_eq!(edit("proj").unwrap(), owner);
+}
+
+/// #3062 review (R1-1): an unpinned `./newt.toml` is the resolver's ambient
+/// base, which a cloned repo can ship, and its MCP entries are untrusted
+/// (#1301). `/mcp enable|disable` never wrote it on main, so the toggle
+/// refuses it as it refuses a project config. `newt mcp add|remove` write it
+/// by default (#1291), so remove still may. Pinned, it is the named base.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn the_toggle_leaves_an_ambient_newt_toml_alone() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("newt.toml"),
+        "[[mcp_servers]]\nname = \"amb\"\ncommand = \"amb-mcp\"\n",
+    )
+    .unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+    let toggle = || Config::mcp_server_edit_path("amb", false, |_| "edit it by hand".into());
+
+    let error = toggle().unwrap_err().to_string();
+    assert!(error.contains("ambient config ./newt.toml"), "{error}");
+    let ambient = Path::new("./newt.toml");
+    assert_eq!(
+        Config::mcp_server_edit_path("amb", true, |_| unreachable!()).unwrap(),
+        ambient
+    );
+    // SAFETY: the `real_fs` serial lane serializes env mutation; HomeSandbox
+    // restores NEWT_CONFIG on drop.
+    unsafe { std::env::set_var("NEWT_CONFIG", ambient) };
+    assert_eq!(toggle().unwrap(), ambient);
+}
+
+/// #3062 review (R1-3): a refusal ends with the caller's own remedy and adds
+/// no command, so the toggle no longer advises `mcp remove`, which deletes
+/// the entry from the shared file instead of toggling it.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn the_toggle_refusal_does_not_advise_a_remove() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    std::fs::write(
+        workspace.join(".newt/config.toml"),
+        "[[mcp_servers]]\nname = \"proj\"\ncommand = \"proj-mcp\"\nenabled = false\n",
+    )
+    .unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+
+    let owner = Config::mcp_server_owner_path("proj").unwrap().unwrap();
+    let error = Config::mcp_server_edit_path("proj", false, |_| {
+        "set `enabled = true` there by hand".into()
+    })
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "MCP server `proj` is defined in the project config {}, which newt edits only when named: set `enabled = true` there by hand",
+            owner.display()
+        )
+    );
+}
+
+/// #3062 review (R1-13): a config the operator pinned with `--config` or
+/// `$NEWT_CONFIG` is named, so it stays editable even when it is the system
+/// config; unpinned, the system config, a project layer and an ambient
+/// `./newt.toml` are left alone. Pure: the system path needs no root here.
+#[test]
+fn a_default_scope_edit_leaves_an_unnamed_shared_file_alone() {
+    let system = Path::new(SYSTEM_CONFIG_PATH);
+    let project = Path::new("ws/.newt/config.toml");
+    let ambient = Path::new("./newt.toml");
+    let user = Path::new("cfg/mcp.toml");
+    assert_eq!(
+        unnamed_owner_kind(system, None, None, false),
+        Some("system")
+    );
+    assert_eq!(unnamed_owner_kind(system, Some(system), None, false), None);
+    assert_eq!(
+        unnamed_owner_kind(project, None, Some(project), false),
+        Some("project")
+    );
+    assert_eq!(
+        unnamed_owner_kind(project, Some(project), Some(project), false),
+        None
+    );
+    assert_eq!(
+        unnamed_owner_kind(ambient, None, None, true),
+        Some("ambient")
+    );
+    assert_eq!(unnamed_owner_kind(ambient, None, None, false), None);
+    assert_eq!(unnamed_owner_kind(user, None, Some(project), false), None);
 }
 
 /// #3062 review (G10): the owner is the file whose entry the resolver keeps.
