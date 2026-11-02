@@ -3008,15 +3008,20 @@ fn decor_text(part: Option<&toml_edit::RawString>) -> String {
 /// previous comma, so that member's comment. What ends the removed member's
 /// own line is the next member's key prefix, or after the last member the
 /// table's trailing text (its value's suffix with no trailing comma). The
-/// line before the member is joined to what follows the member's line.
+/// line before the member is joined to what follows the member's line. A
+/// member on the previous member's line shares it, so that line's end stays.
+/// Where commas lead their lines, the line before the last member ends in the
+/// previous value's suffix, which is kept up to there.
 fn remove_inline_member(table: &mut toml_edit::InlineTable, name: &str) {
     let names: Vec<String> = table.iter().map(|(name, _)| name.to_owned()).collect();
     let Some(at) = names.iter().position(|other| other == name) else {
         return;
     };
     let before = decor_text(table.key(name).and_then(|key| key.leaf_decor().prefix()));
-    let head = split_line(&before).0;
-    let join = |after: String| format!("{head}{}", split_line(&after).1);
+    let join = |after: String| match split_line(&before).0 {
+        "" if at > 0 => after,
+        head => format!("{head}{}", split_line(&after).1),
+    };
     if let Some(next) = names.get(at + 1) {
         if let Some(mut key) = table.key_mut(next) {
             let after = decor_text(key.leaf_decor().prefix());
@@ -3026,13 +3031,18 @@ fn remove_inline_member(table: &mut toml_edit::InlineTable, name: &str) {
         let after = decor_text(Some(table.trailing()));
         table.set_trailing(join(after));
     } else {
-        let after = join(decor_text(
-            table.get(name).and_then(|value| value.decor().suffix()),
-        ));
+        let end = decor_text(table.get(name).and_then(|value| value.decor().suffix()));
         let previous = at.checked_sub(1).and_then(|previous| names.get(previous));
         match previous.and_then(|previous| table.get_mut(previous)) {
-            Some(previous) => previous.decor_mut().set_suffix(after),
-            None => table.set_trailing(after),
+            Some(previous) => {
+                let suffix = decor_text(previous.decor().suffix());
+                let kept = match split_line(&suffix) {
+                    ("", _) => format!("{suffix}{}", join(end)),
+                    (line, _) => format!("{line}{}", split_line(&end).1),
+                };
+                previous.decor_mut().set_suffix(kept);
+            }
+            None => table.set_trailing(join(end)),
         }
     }
     let _ = table.remove(name);

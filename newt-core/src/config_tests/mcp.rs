@@ -486,6 +486,46 @@ fn with_mcp_server_merged_keeps_each_inline_comment_on_its_member() {
 }
 
 #[test]
+fn dropping_an_inline_member_keeps_the_comment_of_a_member_that_stays() {
+    // #3062 review (R3-2): a dropped member that shares its line with a kept
+    // one takes only its own text: the line's comment and the lines after it
+    // stay. In a comma-first layout the kept member's comment ends its own
+    // line, before the dropped member's comma, and stays with it too.
+    let merge = |text: &str, env: &str| {
+        let entry: crate::mcp::McpServerEntry = toml::from_str(&format!(
+            "name = \"fs\"\ncommand = \"fs-mcp\"\nenv = {env}\n"
+        ))
+        .unwrap();
+        let provided = ["command", "env"].into_iter().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let head = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\nenv = {\n";
+    let a = "  A = \"${SYNTHETIC_A}\"";
+    let b = "B = \"${SYNTHETIC_B}\"";
+    let c = "  C = \"${SYNTHETIC_C}\"\n}\n";
+    let only_a = "{ A = \"${SYNTHETIC_A}\" }";
+
+    let shared = format!("{head}{a}, {b}, # shared line note\n{c}");
+    assert_eq!(
+        merge(
+            &shared,
+            "{ A = \"${SYNTHETIC_A}\", C = \"${SYNTHETIC_C}\" }"
+        ),
+        format!("{head}{a}, # shared line note\n{c}")
+    );
+    let shared_last = format!("{head}{a}, {b} # shared line note\n}}\n");
+    assert_eq!(
+        merge(&shared_last, only_a),
+        format!("{head}{a} # shared line note\n}}\n")
+    );
+    let comma_first = format!("{head}{a} # keep: needed by the wrapper\n  , {b} # b\n}}\n");
+    assert_eq!(
+        merge(&comma_first, only_a),
+        format!("{head}{a} # keep: needed by the wrapper\n}}\n")
+    );
+}
+
+#[test]
 fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
     // #2915 review (P1): a new URL must not inherit the credential configured
     // for the old destination, and the refusal must not quote either.
