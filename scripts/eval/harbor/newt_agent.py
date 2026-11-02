@@ -17,11 +17,17 @@ bench behaviour cannot drift from TUI behaviour. Each trial:
    Ctrl-C and sends ``/exit``. newt's own records (``~/.newt/conversations.db``,
    ``usage.jsonl``) and the screen are copied to /logs/agent.
 
+The lifecycle reports only say when to stop. herdr keeps the latest state, so
+a turn that starts and ends before the reporter runs can leave no report, and a
+failure can be overwritten by the idle that follows it. Whether a turn ran, and
+how the last one ended, is read afterwards from newt's own record: the
+``turn_outcome`` artifacts in the copied ``conversations.db``.
+
 The driver types nothing but the instruction, that Ctrl-C and ``/exit``. A stop
-for a person is newt's behaviour, so the trial ends there and is graded. A
-failed last turn, or newt exiting non-zero at any point after the paste, raises
+for a person is newt's behaviour, so the trial ends there and is graded. A last
+turn that failed, or newt exiting non-zero at any point after the paste, raises
 ``NonZeroAgentExitCodeError`` (Harbor records it and still grades). newt never
-getting ready, or a pasted instruction never starting a turn, raises
+getting ready, or the instruction leaving no turn in newt's record, raises
 ``RuntimeError``, which Harbor does not grade: the apparatus failed, not the
 model. Both happen within ``READY_TIMEOUT_SEC + START_TIMEOUT_SEC``, under the
 shortest Terminal-Bench agent timeout (600 s).
@@ -49,6 +55,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import sqlite3
 import tempfile
 import time
 from pathlib import Path
@@ -286,6 +294,26 @@ class NewtAgent(BaseInstalledAgent):
         text = path.read_text(errors="replace") if path.exists() else ""
         return _states(text[: text.rfind("\n") + 1])  # complete lines only
 
+    def _turn_outcomes(self) -> list[str]:
+        """The `end_reason` of each turn newt saved, oldest first, from the copy
+        of its own store. Read from a scratch copy, so SQLite replays the WAL."""
+        src = self.logs_dir / "newt-home" / "conversations.db"
+        if not src.exists():
+            return []
+        with tempfile.TemporaryDirectory() as tmp:
+            for suffix in ("", "-wal"):
+                if Path(f"{src}{suffix}").exists():
+                    shutil.copy(f"{src}{suffix}", f"{tmp}/c.db{suffix}")
+            try:
+                db = sqlite3.connect(f"{tmp}/c.db")
+                rows = db.execute(
+                    "SELECT metadata FROM prompt_artifacts WHERE kind = 'turn_outcome' ORDER BY rowid"
+                ).fetchall()
+                db.close()
+            except sqlite3.Error:
+                return []
+        return [json.loads(meta or "{}").get("end_reason", "unknown") for (meta,) in rows]
+
     def _exit_code(self) -> int | None:
         path = self.logs_dir / "newt.exit"
         text = path.read_text().strip() if path.exists() else ""
@@ -352,10 +380,10 @@ class NewtAgent(BaseInstalledAgent):
             await self._type(environment, f"send-keys -t {SESSION} Enter")
             self._log("submitted")
 
+            # None: no start reported. The turn may still have run (see the
+            # module docstring); newt's record decides after the exit.
             state, seen = await self._wait(seen, {"working", "blocked"}, START_TIMEOUT_SEC)
-            if state is None:
-                raise RuntimeError("newt never started a turn:\n" + (await self._screen(environment))[-2000:])
-            while state.startswith("working"):
+            while state is not None and state.startswith("working"):
                 self._log("working")
                 # Runs until Harbor's agent timeout cancels the wait.
                 state, seen = await self._wait(seen, {"idle", "blocked"}, float("inf"))
@@ -363,12 +391,16 @@ class NewtAgent(BaseInstalledAgent):
                     nxt, after = await self._wait(seen, {"working", "blocked"}, SETTLE_SEC)
                     if nxt is not None:
                         state, seen = nxt, after
-            meta["stop"] = _stop_reason(state)
+            meta["stop"] = _stop_reason(state) if state else "no-start-reported"
             self._log("stopped", stop=meta["stop"])
             finished = True
         finally:
             await self._finish(environment, meta, graceful=finished)
-        if meta["stop"] == "turn-failed":
+        outcomes = meta["outcomes"]
+        if not outcomes and meta["stop"] == "no-start-reported":
+            raise RuntimeError("the instruction left no turn in newt's record; see /logs/agent/tui-screen.txt")
+        last = outcomes[-1] if outcomes else meta["stop"].removeprefix("turn-")
+        if last == "failed":
             raise NonZeroAgentExitCodeError("newt's last turn failed; see /logs/agent/tui-screen.txt")
         if meta["newt_exit"] != 0:
             # tb_campaign reads the status as `exit N` (137 is an infra kill).
@@ -395,9 +427,10 @@ class NewtAgent(BaseInstalledAgent):
             meta["newt_exit"] = "killed"
             await self.exec_as_root(environment, command=_KILL_NEWT)
         meta["states"] = self._lifecycle()
-        self._log("finished", newt_exit=meta["newt_exit"])
         await self.exec_as_agent(
             environment,
             command='mkdir -p /logs/agent/newt-home && cd "$HOME/.newt" && '
             "cp -p conversations.db* history *.jsonl /logs/agent/newt-home/ 2>/dev/null; true",
         )
+        meta["outcomes"] = self._turn_outcomes()
+        self._log("finished", newt_exit=meta["newt_exit"], outcomes=meta["outcomes"])

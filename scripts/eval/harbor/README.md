@@ -211,7 +211,7 @@ args. Those kwargs are where thinking is switched on or off, identically for
 every harness. A preset edit between cells is refused as
 `pin mismatch: model_fingerprint.chat_template_kwargs`. The fingerprint is not
 a content digest: the router exposes no weights hash. A digest written after a model id in the roster is recorded as
-declared and unverified, and newt receives it as `NEWT_MODEL_DIGEST`.
+declared and unverified. The headless lane passed it to newt as `NEWT_MODEL_DIGEST`; the TUI drive does not.
 
 `tb_campaign.py table <out> --pair` adds one section per treatment. It compares
 each treatment cell with its model and harness's `none` cell, task by task, for
@@ -253,6 +253,9 @@ Reading the table:
   and graded) is shown next to it.
 
 ## Smart-harness comparison
+
+This recipe ran on the headless lane. The TUI drive refuses `NEWT_BENCH_SMART`
+until the TUI has a smart arm.
 
 [`smart-ab.sh`](smart-ab.sh) runs the plain arm, then the smart arm, using the
 same binary and supplied job configuration:

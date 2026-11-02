@@ -8,7 +8,9 @@ Run: PYTHONPATH=scripts/eval/harbor:scripts/eval/harbor/tests/stubs \\
 """
 
 import asyncio
+import json
 import shlex
+import sqlite3
 import tempfile
 import types
 import unittest
@@ -120,10 +122,11 @@ class FakeEnv:
     """Plays newt's lifecycle log in chunks: the first when newt starts, the
     next on Enter, the rest one per driver poll after that. A chunk `exit N`
     is newt exiting with N. Writes `newt.exit` when /exit is pasted, noting
-    how many reports had arrived."""
+    how many reports had arrived, and newt's record (one `turn_outcome` per
+    entry in `outcomes`) when the driver copies it."""
 
-    def __init__(self, logs: Path, chunks):
-        self.logs, self.chunks, self.commands = logs, list(chunks), []
+    def __init__(self, logs: Path, chunks, outcomes):
+        self.logs, self.chunks, self.outcomes, self.commands = logs, list(chunks), outcomes, []
         self.submitted, self.states_at_exit = False, None
         self.task_env_config = types.SimpleNamespace(workdir="/app")
 
@@ -144,6 +147,14 @@ class FakeEnv:
         self.commands.append(command)
         if "new-session" in command:
             self.emit()
+        if "conversations.db" in command:
+            (self.logs / "newt-home").mkdir(exist_ok=True)
+            db = sqlite3.connect(self.logs / "newt-home" / "conversations.db")
+            db.execute("CREATE TABLE prompt_artifacts (kind TEXT, metadata TEXT)")
+            db.executemany("INSERT INTO prompt_artifacts VALUES ('turn_outcome', ?)",
+                           [(json.dumps({"end_reason": r}),) for r in self.outcomes])
+            db.commit()
+            db.close()
         if "-b quit" in command:
             self.states_at_exit = len(na._states((self.logs / na.LIFECYCLE).read_text()))
             (self.logs / "newt.exit").write_text("0\n")
@@ -155,7 +166,7 @@ class FakeEnv:
 
 
 class Flow(unittest.TestCase):
-    def drive(self, *chunks):
+    def drive(self, *chunks, outcomes=("completed",)):
         real_sleep = asyncio.sleep
 
         async def poll(_seconds):
@@ -164,15 +175,15 @@ class Flow(unittest.TestCase):
             await real_sleep(0.005)
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(na, "SETTLE_SEC", 0.2), \
-                mock.patch.object(na.asyncio, "sleep", poll):
+                mock.patch.object(na, "START_TIMEOUT_SEC", 0.3), mock.patch.object(na.asyncio, "sleep", poll):
             logs = Path(tmp)
-            env = FakeEnv(logs, chunks)
+            env = FakeEnv(logs, chunks, list(outcomes))
             context = types.SimpleNamespace(metadata=None)
             error = None
             try:
                 # Bounded: a driver that misses an exit would otherwise wait forever.
                 asyncio.run(asyncio.wait_for(na.NewtAgent(logs).run("Write /app/out.txt", env, context), 10))
-            except NonZeroAgentExitCodeError as exc:
+            except (NonZeroAgentExitCodeError, RuntimeError) as exc:
                 error = exc
             return context.metadata, env, error
 
@@ -180,7 +191,8 @@ class Flow(unittest.TestCase):
         """A retry or an approved plan starts the next turn with no input from a
         person, so the first idle is not the end."""
         meta, env, error = self.drive(report("idle"), report("working") + report("idle"),
-                                      report("working", "run_command"), report("idle"))
+                                      report("working", "run_command"), report("idle"),
+                                      outcomes=("completed", "completed"))
         self.assertIsNone(error)
         self.assertEqual((meta["stop"], meta["newt_exit"]), ("turn-ended", 0))
         self.assertEqual(env.states_at_exit, 5)
@@ -192,7 +204,8 @@ class Flow(unittest.TestCase):
         self.assertFalse(any("C-c" in c for c in env.commands))
 
     def test_a_stop_for_a_person_is_cancelled_then_exited(self):
-        meta, env, error = self.drive(report("idle"), report("working") + report("blocked"))
+        meta, env, error = self.drive(report("idle"), report("working") + report("blocked"),
+                                      outcomes=("cancelled",))
         self.assertIsNone(error)
         self.assertEqual(meta["stop"], "waiting-for-a-person")
         quit_at = next(i for i, c in enumerate(env.commands) if "-b quit" in c)
@@ -201,16 +214,38 @@ class Flow(unittest.TestCase):
     def test_newt_dying_mid_turn_is_graded_with_its_exit_status(self):
         """newt reports nothing on the way out; its exit status ends the wait
         instead of Harbor's agent timeout."""
-        meta, env, error = self.drive(report("idle"), report("working"), "exit 101")
+        meta, env, error = self.drive(report("idle"), report("working"), "exit 101", outcomes=())
         self.assertEqual((meta["stop"], meta["newt_exit"]), ("newt-exited", 101))
         self.assertIsInstance(error, NonZeroAgentExitCodeError)
         self.assertRegex(str(error), r"exit (\d+)")  # what tb_campaign.py parses
         self.assertFalse(any("-b quit" in c for c in env.commands))
 
     def test_a_failed_last_turn_is_raised_for_harbor_to_record(self):
-        meta, _, error = self.drive(report("idle"), report("working") + report("idle", "failed"))
+        meta, _, error = self.drive(report("idle"), report("working") + report("idle", "failed"),
+                                    outcomes=("failed",))
         self.assertEqual(meta["stop"], "turn-failed")
         self.assertIsInstance(error, NonZeroAgentExitCodeError)
+
+    def test_a_failure_the_reporter_overwrote_is_read_from_newts_record(self):
+        """herdr keeps only the latest state: the idle after a failed turn can
+        replace `idle:failed` before it is delivered."""
+        meta, _, error = self.drive(report("idle"), report("working") + report("idle"),
+                                    outcomes=("failed",))
+        self.assertEqual(meta["outcomes"], ["failed"])
+        self.assertIsInstance(error, NonZeroAgentExitCodeError)
+
+    def test_a_turn_with_no_start_report_is_graded_from_newts_record(self):
+        """A turn that started and ended while the reporter slept leaves only
+        the idle it began from; newt's record still shows it ran."""
+        meta, env, error = self.drive(report("idle"), outcomes=("completed",))
+        self.assertIsNone(error)
+        self.assertEqual((meta["stop"], meta["outcomes"]), ("no-start-reported", ["completed"]))
+        self.assertTrue(any("-b quit" in c for c in env.commands))
+
+    def test_an_instruction_that_left_no_turn_is_an_apparatus_failure(self):
+        _, _, error = self.drive(report("idle"), outcomes=())
+        self.assertIsInstance(error, RuntimeError)
+        self.assertNotIsInstance(error, NonZeroAgentExitCodeError)  # Harbor must not grade it
 
 
 if __name__ == "__main__":
