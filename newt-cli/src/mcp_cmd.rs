@@ -2015,11 +2015,13 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                         moved.push(&entry.name);
                     }
                     let previous = doc.clone();
+                    // A refusal here is about the entry in `target`: name it.
                     doc = Config::with_mcp_server_merged(
                         &doc,
                         entry,
                         &provided.get(&entry.name).cloned().unwrap_or_default(),
-                    )?;
+                    )
+                    .with_context(|| format!("updating {}", target.display()))?;
                     if doc == previous {
                         unchanged += 1;
                     } else {

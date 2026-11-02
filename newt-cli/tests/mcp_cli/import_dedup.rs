@@ -864,6 +864,37 @@ fn force_import_refuses_to_carry_args_to_a_different_program() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn a_moved_destination_refusal_names_the_file_holding_the_entry() {
+    // #3062 review (R2-10): config.toml owns `alpha` and mcp.toml holds a
+    // shadowed copy, so the import updates config.toml. Its refusal asks the
+    // operator to edit "the existing entry", so it names that file; the
+    // shadowed copy is not it.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let owner = "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"npx\"\nargs = [\"old-mcp\", \"--api-key\", \"SYNTHETIC_SECRET_MARKER\"]\n";
+    let shadowed = "[[mcp_servers]]\nname = \"alpha\"\ncommand = \"npx\"\nargs = [\"old-mcp\"]\n";
+    std::fs::write(&config, owner).unwrap();
+    std::fs::write(&mcp, shadowed).unwrap();
+
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "alpha": { "command": "other-vendor-mcp" } } }"#,
+    )
+    .failure()
+    .stderr(predicate::str::contains(format!(
+        "updating {}",
+        config.display()
+    )))
+    .stderr(predicate::str::contains("3 local argument(s)"))
+    .stderr(predicate::str::contains("SYNTHETIC_SECRET_MARKER").not());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), owner);
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), shadowed);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn force_import_names_the_local_settings_it_removed() {
     // #3062 review (F8): a source's `headers` replace the local map, and a
     // transport change drops the other transport's fields. Name what went,
