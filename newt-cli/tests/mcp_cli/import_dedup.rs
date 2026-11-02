@@ -810,7 +810,8 @@ fn force_import_names_the_local_settings_it_removed() {
 fn force_import_names_a_login_argv_it_kept_for_a_changed_command() {
     // #3062 review (G5 follow-up): no source can supply `login_argv`, so a
     // command change keeps the local one, but the notice names it, by key
-    // only: it runs host-side and was written for the previous command.
+    // only: it runs host-side and was written for the previous command. It is
+    // a kept setting, so it is never listed under "except:" (R1-11).
     let sb = sandbox();
     let mcp = sb.config_dir.join("mcp.toml");
     let login = "login_argv = [\"old-mcp\", \"login\", \"--write-token\"] # operator login";
@@ -826,7 +827,7 @@ fn force_import_names_a_login_argv_it_kept_for_a_changed_command() {
     )
     .success()
     .stdout(predicate::str::contains(
-        "preserved.\n  fs: kept login_argv, though the command changed\n",
+        "preserved.\nKept login_argv, though the command changed: fs\n",
     ))
     .stdout(predicate::str::contains("--write-token").not());
     let updated = std::fs::read_to_string(&mcp).unwrap();
@@ -840,6 +841,22 @@ fn force_import_names_a_login_argv_it_kept_for_a_changed_command() {
     .success()
     .stdout(predicate::str::contains("1 replaced"))
     .stdout(predicate::str::contains("login_argv").not());
+
+    // An HTTP entry that becomes stdio loses its url and headers and keeps its
+    // login_argv: the removals are the exceptions, the kept argv is not.
+    std::fs::write(
+        &mcp,
+        format!("[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nheaders = {{ Authorization = {{ env = \"SYNTHETIC_TOKEN_VAR\" }} }}\n{login}\n"),
+    )
+    .unwrap();
+    force_import(
+        &sb,
+        r#"{ "mcpServers": { "fs": { "command": "new-mcp" } } }"#,
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "preserved, except:\n  fs: removed url, header Authorization\nKept login_argv, though the command changed: fs\n",
+    ));
 }
 
 #[test]

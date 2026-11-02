@@ -2069,22 +2069,29 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                     .then(|| format!("  {}: removed {}", saved.name, removed.join(", ")))
             })
             .collect();
-        let kept = adopted.iter().filter_map(|saved| {
-            let previous = existing_entries.iter().find(|e| e.name == saved.name)?;
-            kept_login_argv_for_a_new_command(previous, saved).then(|| {
-                format!(
-                    "  {}: kept login_argv, though the command changed",
-                    saved.name
-                )
+        // A kept login_argv is a preserved setting, so it is named after the
+        // exceptions, not among them.
+        let kept: Vec<&str> = adopted
+            .iter()
+            .filter_map(|saved| {
+                let previous = existing_entries.iter().find(|e| e.name == saved.name)?;
+                kept_login_argv_for_a_new_command(previous, saved).then_some(saved.name.as_str())
             })
-        });
+            .collect();
         let except = if removed.is_empty() { "." } else { ", except:" };
         writeln!(
             out,
             "Overwrote {owner_replacements} existing server(s); local settings absent from the source were preserved{except}"
         )?;
-        for line in removed.into_iter().chain(kept) {
+        for line in removed {
             writeln!(out, "{line}")?;
+        }
+        if !kept.is_empty() {
+            writeln!(
+                out,
+                "Kept login_argv, though the command changed: {}",
+                kept.join(", ")
+            )?;
         }
     }
     for name in &moved {
