@@ -77,3 +77,20 @@ fn print_next_steps_never_offers_auth_to_a_disabled_stdio_server() {
     assert!(text.contains("not admitted"), "{text}");
     assert!(!text.contains("newt auth"), "{text}");
 }
+
+/// #3062 review (R2-13): a disabled server is turned back on, not imported
+/// again. A force import keeps a local `enabled = false` (G4), so "import/
+/// approve it" sent the operator round the same import, which kept it off.
+#[test]
+fn print_next_steps_tells_a_disabled_server_to_be_enabled() {
+    let mut entry = http_entry("remote");
+    entry.enabled = false;
+    let mut out = Vec::new();
+    print_next_steps(&mut out, &[entry]).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("enable it with `/mcp enable remote` before `newt auth`"),
+        "{text}"
+    );
+    assert!(!text.contains("import/approve"), "{text}");
+}

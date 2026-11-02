@@ -319,9 +319,16 @@ pub(crate) fn print_next_steps(
                 } else {
                     "`newt doctor`"
                 };
+                // A disabled server is turned back on; importing it again
+                // keeps a local `enabled = false` (#2915).
+                let fix = if denied == newt_core::mcp::AdmissionDenied::Disabled {
+                    format!("enable it with `/mcp enable {}`", entry.name)
+                } else {
+                    "import/approve it".to_string()
+                };
                 writeln!(
                     out,
-                    "  !  {} — not admitted ({denied}); import/approve it before {then}.",
+                    "  !  {} — not admitted ({denied}); {fix} before {then}.",
                     entry.name
                 )?;
             }
