@@ -783,6 +783,109 @@ fn mcp_server_edit_path_refuses_a_project_owner() {
     assert_eq!(Config::mcp_server_edit_path("proj").unwrap(), owner);
 }
 
+/// #3062 review (G10): the owner is the file whose entry the resolver keeps.
+/// A project `[[mcp_servers]]` replaces the base list by default, so the
+/// project owns a shared name and a base-only name is in no file. With
+/// `arrays = "append"` the base entries come first and keep precedence.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn mcp_server_owner_path_follows_the_project_array_strategy() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let base = dir.path().join("config.toml");
+    std::fs::write(
+        &base,
+        "[[mcp_servers]]\nname = \"shared\"\ncommand = \"base-shared\"\n\n\
+         [[mcp_servers]]\nname = \"base-only\"\ncommand = \"base-only\"\n",
+    )
+    .unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+    let project_entries = "[[mcp_servers]]\nname = \"shared\"\ncommand = \"project-shared\"\n\n\
+         [[mcp_servers]]\nname = \"project-only\"\ncommand = \"project-only\"\n";
+
+    for (merge, shared, base_only) in [("", "project", None), ("append", "base", Some("base"))] {
+        let merge = if merge.is_empty() {
+            String::new()
+        } else {
+            format!("[merge]\narrays = \"{merge}\"\n\n")
+        };
+        std::fs::write(
+            workspace.join(".newt").join("config.toml"),
+            format!("{merge}{project_entries}"),
+        )
+        .unwrap();
+        let project = Config::project_config_path().unwrap();
+        let file = |layer: Option<&str>| match layer {
+            Some("base") => Some(base.clone()),
+            Some(_) => Some(project.clone()),
+            None => None,
+        };
+        let owner = |name: &str| Config::mcp_server_owner_path(name).unwrap();
+        assert_eq!(owner("shared"), file(Some(shared)), "{merge}");
+        assert_eq!(owner("base-only"), file(base_only), "{merge}");
+        assert_eq!(owner("project-only"), file(Some("project")), "{merge}");
+
+        // Each owner supplies the entry the resolver keeps for that name.
+        let resolved = Config::resolve_unpublished(&mut |_| {}).unwrap();
+        for name in ["shared", "base-only", "project-only"] {
+            let kept = resolved
+                .mcp_servers
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.command.clone());
+            let owned = owner(name).map(|path| {
+                let text = std::fs::read_to_string(path).unwrap();
+                crate::mcp::parse_newt_mcp_toml_checked(&text)
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .unwrap()
+                    .command
+            });
+            assert_eq!(owned, kept, "{merge}{name}");
+        }
+    }
+}
+
+/// #3062 review (G10): `/mcp enable|disable` re-checks under the lock before
+/// it writes. When the file it resolved no longer owns the name, or the file
+/// changed after it was read, nothing is written and the newer contents stay.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn set_mcp_server_enabled_in_file_refuses_a_changed_owner_or_a_concurrent_edit() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let config = dir.path().join("config.toml");
+    let mcp = dir.path().join("mcp.toml");
+    let entry = "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\n";
+    std::fs::write(&mcp, entry).unwrap();
+    // config.toml takes the name after the toggle resolved mcp.toml.
+    std::fs::write(&config, entry).unwrap();
+    let error = Config::set_mcp_server_enabled_in_file(&mcp, "docs", false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ownership changed"), "{error}");
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), entry);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), entry);
+
+    std::fs::remove_file(&config).unwrap();
+    let edited = format!("# edited meanwhile\n{entry}");
+    let error = Config::set_mcp_server_enabled_in_file_with(&mcp, "docs", false, || {
+        std::fs::write(&mcp, &edited).unwrap();
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("concurrent edit detected"), "{error}");
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), edited);
+    assert!(!newt_core_lock_path(&mcp).exists());
+}
+
 fn newt_core_lock_path(path: &std::path::Path) -> std::path::PathBuf {
     crate::atomic_fs::ResolvedPath::resolve(path)
         .unwrap()

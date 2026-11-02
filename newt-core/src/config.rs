@@ -2698,6 +2698,17 @@ impl Config {
         name: &str,
         enabled: bool,
     ) -> anyhow::Result<()> {
+        Self::set_mcp_server_enabled_in_file_with(path, name, enabled, || {})
+    }
+
+    /// [`Self::set_mcp_server_enabled_in_file`], running `before_recheck`
+    /// between the read and the re-check: the window a concurrent edit lands in.
+    fn set_mcp_server_enabled_in_file_with(
+        path: &Path,
+        name: &str,
+        enabled: bool,
+        before_recheck: impl FnOnce(),
+    ) -> anyhow::Result<()> {
         let destination = crate::atomic_fs::ResolvedPath::resolve(path).map_err(|error| {
             anyhow::anyhow!("resolving MCP config {}: {error:#}", path.display())
         })?;
@@ -2718,6 +2729,7 @@ impl Config {
         if updated == original {
             return Ok(());
         }
+        before_recheck();
         let current = std::fs::read_to_string(destination.as_path()).map_err(|error| {
             anyhow::anyhow!("rechecking MCP config {}: {error}", path.display())
         })?;
