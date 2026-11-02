@@ -502,6 +502,25 @@ fn removed_local_settings_names_dropped_map_members_and_foreign_fields() {
     assert!(removed_local_settings(&previous, &previous).is_empty());
 }
 
+/// #3062 review (R2-4): the merge removes the other transport's fields from
+/// an HTTP or SSE entry whether or not its transport changed, so stray stdio
+/// `args` it deleted are named, as a stray `command` is.
+#[test]
+fn removed_local_settings_names_stray_args_a_same_transport_merge_deleted() {
+    let mut previous = stdio_entry("docs", None);
+    previous.transport = TransportKind::Http;
+    previous.url = Some("https://docs.example.test/mcp".into());
+    previous.args = vec!["--legacy-flag".into()];
+    let mut saved = previous.clone();
+    saved.args = vec![];
+    assert_eq!(removed_local_settings(&previous, &saved), ["args"]);
+    previous.command = Some("docs-server".into());
+    assert_eq!(
+        removed_local_settings(&previous, &saved),
+        ["command", "args"]
+    );
+}
+
 /// #3062 review (R1-12): the advice is a command to paste, so a path or name
 /// a shell would split is quoted; a plain one stays bare.
 #[test]
