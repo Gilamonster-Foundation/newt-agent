@@ -206,7 +206,11 @@ fn mcp_writers_never_change_a_value_to_keep_crlf() {
 
     let added = Config::with_mcp_server_added(crlf, &banner).unwrap();
     assert_eq!(args(&added, "banner"), ["line1\nline2"], "{added:?}");
-    assert_eq!(args(&added, "fs"), ["--banner", "line1\nline2"], "{added:?}");
+    assert_eq!(
+        args(&added, "fs"),
+        ["--banner", "line1\nline2"],
+        "{added:?}"
+    );
 
     let removed = Config::with_mcp_server_removed(crlf, "other").unwrap();
     assert_eq!(
