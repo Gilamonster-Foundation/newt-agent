@@ -420,6 +420,58 @@ fn with_mcp_server_merged_updates_a_map_member_by_member() {
 }
 
 #[test]
+fn with_mcp_server_merged_keeps_each_inline_comment_on_its_member() {
+    // #3062 review (R1-7): in a multi-line inline table, toml_edit stores the
+    // text after a member's comma, its comment included, with the next
+    // member, or as the table's trailing text after the last one. Dropping or
+    // adding a member keeps each comment on the member it follows, and a
+    // one-line table keeps its spacing.
+    let merge = |text: &str, env: &str| {
+        let entry: crate::mcp::McpServerEntry = toml::from_str(&format!(
+            "name = \"fs\"\ncommand = \"fs-mcp\"\nenv = {env}\n"
+        ))
+        .unwrap();
+        let provided = ["command", "env"].into_iter().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let head = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    let a = "  A = \"${SYNTHETIC_A}\", # A: staging token\n";
+    let b = "  B = \"${SYNTHETIC_B}\", # B: DO NOT SHIP\n";
+    let c = "  C = \"${SYNTHETIC_C}\",\n";
+    let only_a = "{ A = \"${SYNTHETIC_A}\" }";
+    let a_b_c = "{ A = \"${SYNTHETIC_A}\", B = \"${SYNTHETIC_B}\", C = \"${SYNTHETIC_C}\" }";
+
+    let text = format!("{head}env = {{\n{a}{b}}}\n");
+    assert_eq!(merge(&text, only_a), format!("{head}env = {{\n{a}}}\n"));
+    assert_eq!(
+        merge(&text, "{ B = \"${SYNTHETIC_B}\" }"),
+        format!("{head}env = {{\n{b}}}\n")
+    );
+    assert_eq!(
+        merge(&text, a_b_c),
+        format!("{head}env = {{\n{a}{b}{c}}}\n")
+    );
+
+    // Without a trailing comma, the last value carries the end of its line.
+    let open = format!("{head}env = {{\n{a}  B = \"${{SYNTHETIC_B}}\" # B: DO NOT SHIP\n}}\n");
+    assert_eq!(
+        merge(&open, only_a),
+        format!("{head}env = {{\n  A = \"${{SYNTHETIC_A}}\" # A: staging token\n}}\n")
+    );
+    assert_eq!(
+        merge(&open, a_b_c),
+        format!("{head}env = {{\n{a}{b}  C = \"${{SYNTHETIC_C}}\"\n}}\n")
+    );
+
+    let line = format!("{head}env = {{ A = \"${{SYNTHETIC_A}}\", B = \"${{SYNTHETIC_B}}\" }}\n");
+    assert_eq!(
+        merge(&line, only_a),
+        format!("{head}env = {{ A = \"${{SYNTHETIC_A}}\" }}\n")
+    );
+    assert_eq!(merge(&line, a_b_c), format!("{head}env = {a_b_c}\n"));
+}
+
+#[test]
 fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
     // #2915 review (P1): a new URL must not inherit the credential configured
     // for the old destination, and the refusal must not quote either.

@@ -2520,15 +2520,12 @@ impl Config {
                     .cloned()
                     .or_else(|| crate::mcp::implicit_default(key).map(toml_edit::Item::Value));
                 match wanted {
-                    Some(value) => match (
-                        existing
-                            .get_mut(&local)
-                            .and_then(toml_edit::Item::as_table_like_mut),
-                        value.as_table_like(),
-                    ) {
+                    Some(value) => match (existing.get_mut(&local), value.as_table_like()) {
                         // A map (`env`, `headers`) is updated member by member,
                         // so its layout and each member's comments stay.
-                        (Some(map), Some(members)) => merge_mcp_map(key, map, members),
+                        (Some(map), Some(members)) if map.is_table_like() => {
+                            merge_mcp_map(key, map, members);
+                        }
                         _ => replace_in_place(existing, &local, value),
                     },
                     None => {
@@ -2898,27 +2895,144 @@ fn local_mcp_spelling(
 /// so a sub-table, dotted keys or an inline table keeps its layout, and each
 /// member its comments: a dropped member goes, a changed one is replaced in
 /// place, a new one is added.
-fn merge_mcp_map(key: &str, map: &mut dyn toml_edit::TableLike, wanted: &dyn toml_edit::TableLike) {
-    let dropped: Vec<String> = map
+fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::TableLike) {
+    let member = |name: &str, item: &toml_edit::Item| {
+        let mut one = toml_edit::Table::new();
+        one.insert(name, item.clone());
+        toml_edit::Item::Table(one)
+    };
+    let Some(have) = map.as_table_like() else {
+        return;
+    };
+    let dropped: Vec<String> = have
         .iter()
         .map(|(name, _)| name.to_owned())
         .filter(|name| !wanted.contains_key(name))
         .collect();
-    for name in &dropped {
-        let _ = map.remove(name);
-    }
-    for (name, value) in wanted.iter() {
-        let member = |item: &toml_edit::Item| {
-            let mut one = toml_edit::Table::new();
-            one.insert(name, item.clone());
-            toml_edit::Item::Table(one)
-        };
-        if !map
-            .get(name)
-            .is_some_and(|old| same_mcp_field(key, Some(&member(old)), Some(&member(value))))
-        {
-            replace_in_place(map, name, value.clone());
+    let changed: Vec<(&str, &toml_edit::Item)> = wanted
+        .iter()
+        .filter(|(name, value)| {
+            !have.get(name).is_some_and(|old| {
+                same_mcp_field(key, Some(&member(name, old)), Some(&member(name, value)))
+            })
+        })
+        .collect();
+    match map {
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(map)) => {
+            for name in &dropped {
+                remove_inline_member(map, name);
+            }
+            for (name, value) in changed {
+                match value.as_value() {
+                    Some(value) if !map.contains_key(name) => {
+                        push_inline_member(map, name, value.clone());
+                    }
+                    _ => replace_in_place(map, name, value.clone()),
+                }
+            }
         }
+        map => {
+            if let Some(map) = map.as_table_like_mut() {
+                for name in &dropped {
+                    let _ = map.remove(name);
+                }
+                for (name, value) in changed {
+                    replace_in_place(map, name, value.clone());
+                }
+            }
+        }
+    }
+}
+
+/// `gap` split after its first newline: the end of the line it starts on,
+/// and the rest. A gap with no newline is all rest.
+fn split_line(gap: &str) -> (&str, &str) {
+    gap.find('\n').map_or(("", gap), |at| gap.split_at(at + 1))
+}
+
+/// The raw text of a decor part, empty when unset.
+fn decor_text(part: Option<&toml_edit::RawString>) -> String {
+    part.and_then(toml_edit::RawString::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Remove `name` from an inline table, keeping each comment on its line. A
+/// member's key prefix begins with the end of the line before it, after the
+/// previous comma, so that member's comment. What ends the removed member's
+/// own line is the next member's key prefix, or after the last member the
+/// table's trailing text (its value's suffix with no trailing comma). The
+/// line before the member is joined to what follows the member's line.
+fn remove_inline_member(table: &mut toml_edit::InlineTable, name: &str) {
+    let names: Vec<String> = table.iter().map(|(name, _)| name.to_owned()).collect();
+    let Some(at) = names.iter().position(|other| other == name) else {
+        return;
+    };
+    let before = decor_text(table.key(name).and_then(|key| key.leaf_decor().prefix()));
+    let head = split_line(&before).0;
+    let join = |after: String| format!("{head}{}", split_line(&after).1);
+    if let Some(next) = names.get(at + 1) {
+        if let Some(mut key) = table.key_mut(next) {
+            let after = decor_text(key.leaf_decor().prefix());
+            key.leaf_decor_mut().set_prefix(join(after));
+        }
+    } else if table.trailing_comma() {
+        let after = decor_text(Some(table.trailing()));
+        table.set_trailing(join(after));
+    } else {
+        let after = join(decor_text(
+            table.get(name).and_then(|value| value.decor().suffix()),
+        ));
+        let previous = at.checked_sub(1).and_then(|previous| names.get(previous));
+        match previous.and_then(|previous| table.get_mut(previous)) {
+            Some(previous) => previous.decor_mut().set_suffix(after),
+            None => table.set_trailing(after),
+        }
+    }
+    let _ = table.remove(name);
+}
+
+/// Append `name` = `value` to an inline table laid out as its last member
+/// is: on a line of its own with the same indent, or on the same line. The
+/// text that ended the table after the last member, that member's comment
+/// included, stays on that member's line.
+fn push_inline_member(table: &mut toml_edit::InlineTable, name: &str, mut value: toml_edit::Value) {
+    let Some(last) = table.iter().last().map(|(last, _)| last.to_owned()) else {
+        let _ = table.insert(name, value);
+        return;
+    };
+    let key_decor = table
+        .key(&last)
+        .map(|key| key.leaf_decor().clone())
+        .unwrap_or_default();
+    let value_prefix = decor_text(table.get(&last).and_then(|last| last.decor().prefix()));
+    let end = if table.trailing_comma() {
+        decor_text(Some(table.trailing()))
+    } else {
+        // The last value's suffix ends the table; the new member ends it now.
+        table.get_mut(&last).map_or_else(String::new, |last| {
+            let suffix = decor_text(last.decor().suffix());
+            last.decor_mut().set_suffix("");
+            suffix
+        })
+    };
+    let (head, tail) = split_line(&end);
+    let newline = &head[head.trim_end_matches(['\r', '\n']).len()..];
+    let new_end = format!("{newline}{tail}");
+    value.decor_mut().set_prefix(value_prefix);
+    if table.trailing_comma() {
+        value.decor_mut().set_suffix("");
+        table.set_trailing(new_end);
+    } else {
+        value.decor_mut().set_suffix(new_end);
+    }
+    let _ = table.insert(name, value);
+    let indent = decor_text(key_decor.prefix());
+    let indent = indent.rsplit('\n').next().unwrap_or_default();
+    if let Some(mut key) = table.key_mut(name) {
+        key.leaf_decor_mut().set_prefix(format!("{head}{indent}"));
+        key.leaf_decor_mut()
+            .set_suffix(decor_text(key_decor.suffix()));
     }
 }
 
