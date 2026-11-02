@@ -26,12 +26,14 @@ ignore = [
     "RUSTSEC-2026-0367", # zip 1.1.4: SUID/SGID bits kept on extraction — transitive
                          # via candle-core 0.8.4. candle only reads (ZipArchive::new,
                          # by_name) and writes (ZipWriter) .npz/.pth in memory and
-                         # never calls extract(), the vulnerable path. No fixed
-                         # parent: candle-core 0.11.0 still requires zip ^8.6 and
-                         # the fix is zip >=9.0. Trim when candle moves to zip >=9.
+                         # never calls extract(), the vulnerable path. The fix is
+                         # zip >=9.0, which candle-core 0.11.1 requires (^9.1.3).
+                         # Trim when newt-inference moves off candle 0.8.
     "RUSTSEC-2026-0368", # zip: extraction path, same crate/chain/condition as -0367.
     "RUSTSEC-2026-0369", # zip: extract() applies Unix permissions through symlinks;
                          # same crate/chain/condition as -0367.
+    "RUSTSEC-2026-0429", # zip: extract() aborts the process on a symlink entry with
+                         # a large declared size; same crate/chain/condition as -0367.
     # unmaintained / unsound — deep transitive, no drop-in fix
     "RUSTSEC-2025-0141", # bincode unmaintained
     "RUSTSEC-2024-0436", # paste unmaintained
