@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_mesh_bus::{Bus, BusOptions, PeerEndpoint, RequestContext, SequenceReservations, Topic};
-use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, UserKey};
+use agent_mesh_core::{
+    AgentKey, AgentMetadata, Caveats, Fingerprint, RevocationGuard, RevocationLog, UserKey,
+};
 use newt_core::dock_registry::PairingStep;
 use serde::{Deserialize, Serialize};
 
@@ -446,7 +448,8 @@ impl NewtDockService {
     /// its envelope sequences are also reserved ([`dock_sequences`]).
     ///
     /// # Errors
-    /// Propagates a bus bind failure.
+    /// Propagates a bus bind failure, or a revocation log in `state_dir` that
+    /// does not open.
     pub async fn bind(
         user: &UserKey,
         agent: AgentKey,
@@ -529,19 +532,60 @@ pub(crate) fn dock_sequences(
     })
 }
 
+/// The operator's revocation log, `revocation.json` beside `identity.pem` in
+/// `state_dir`: a dock bus refuses every peer it revokes, and a log that does
+/// not open refuses the bind (agent-mesh `RevocationGuard::open`, fail closed).
+///
+/// A state dir with neither the log nor the `Seen` record agent-mesh keeps
+/// beside it gets a genesis log first, the way newt mints `identity.pem` on
+/// first use. A `Seen` record without its log is a log that went missing, so
+/// it is not recreated.
+///
+/// # Errors
+/// The log cannot be created, or does not open: missing (but seen), garbled,
+/// rolled back, or another user's.
+pub(crate) fn dock_revocation(state_dir: &Path, user: &UserKey) -> anyhow::Result<RevocationGuard> {
+    let log = state_dir.join("revocation.json");
+    let open = || -> anyhow::Result<RevocationGuard> {
+        if !log.try_exists()? && !log.with_extension("seen.json").try_exists()? {
+            create_genesis(&log, user)?;
+        }
+        Ok(RevocationGuard::open(&log, user.fingerprint())?)
+    };
+    // One line with its cause: newt-web prints a failed bind with `{}`.
+    open().map_err(|e| anyhow::anyhow!("open the revocation log {}: {e:#}", log.display()))
+}
+
+/// Publish a genesis log for `user` at `log` unless a file is already there,
+/// so a start that loses the race to create it opens the winner's.
+fn create_genesis(log: &Path, user: &UserKey) -> anyhow::Result<()> {
+    let genesis = serde_json::to_vec_pretty(&RevocationLog::genesis(user)?)?;
+    let dest = newt_core::atomic_fs::ResolvedPath::resolve(log)?;
+    let staged = dest.stage_private(&genesis)?;
+    let created = dest.durable_create(&staged);
+    let _ = std::fs::remove_file(&staged);
+    created.or_else(|e| match e.downcast_ref::<std::io::Error>() {
+        Some(io) if io.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        _ => Err(e),
+    })
+}
+
 /// Bind a dock bus on `port` (0 = ephemeral) under a derived dock key, its
-/// sequences reserved in `state_dir` ([`dock_sequences`]).
+/// sequences reserved in `state_dir` ([`dock_sequences`]) and its peers checked
+/// against the revocation log there ([`dock_revocation`]).
 async fn bind_dock(
     user: &UserKey,
     agent: AgentKey,
     port: u16,
     state_dir: &Path,
 ) -> anyhow::Result<Bus> {
+    let revocation = dock_revocation(state_dir, user)?;
     Ok(match dock_sequences(state_dir, &agent) {
         Some(reserved) => {
-            Bus::bind_with_reserving(user, agent, port, BusOptions::default(), reserved).await?
+            let opts = BusOptions::default();
+            Bus::bind_with_reserving(user, agent, port, opts, reserved, revocation).await?
         }
-        None => Bus::bind(user, agent, port).await?,
+        None => Bus::bind(user, agent, port, revocation).await?,
     })
 }
 
@@ -560,7 +604,8 @@ impl DockClient {
     /// admit it ([`dock_sequences`]).
     ///
     /// # Errors
-    /// Propagates a bus bind failure, or an unreadable sequence reservation.
+    /// Propagates a bus bind failure, an unreadable sequence reservation, or a
+    /// revocation log in `state_dir` that does not open.
     pub async fn bind(
         user: &UserKey,
         agent: AgentKey,
@@ -725,7 +770,7 @@ impl DockClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_mesh_core::{AgentMetadata, Caveats};
+    use agent_mesh_core::{AgentMetadata, Caveats, RevocationEntry};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn agent(user: &UserKey, role: &str, caps: Vec<String>) -> AgentKey {
@@ -1471,7 +1516,8 @@ mod tests {
 
         // A poll signed by one agent but naming another's key: refused, and
         // the named key is not staged.
-        let spoofer = Bus::bind_outbound_only(&user, dock_agent(&user, DockRole::Host, "spoofer"))
+        let spoofer = dock_agent(&user, DockRole::Host, "spoofer");
+        let spoofer = Bus::bind_outbound_only(&user, spoofer, RevocationGuard::in_memory(&user))
             .await
             .unwrap();
         let spoofed = crate::uplink::Hello {
@@ -1907,5 +1953,157 @@ mod tests {
 
         host.close().await;
         hub.close().await.unwrap();
+    }
+
+    /// Write `log` to `dir`'s `revocation.json`, as the operator's log.
+    fn keep_log(dir: &Path, log: &RevocationLog) -> PathBuf {
+        let path = dir.join("revocation.json");
+        agent_mesh_core::atomic_write(&path, &serde_json::to_vec(log).unwrap()).unwrap();
+        path
+    }
+
+    /// Every production dock bind (the hub's client, the direct responder and
+    /// a host's uplink) refuses `dir` over its revocation log.
+    async fn every_dock_bind_refuses(user: &UserKey, dir: &Path) {
+        let hub = dock_agent(user, DockRole::Hub, "hub");
+        let host = dock_agent(user, DockRole::Host, "host");
+        let refusals = [
+            (
+                "hub client",
+                DockClient::bind(user, hub, 0, dir).await.err(),
+            ),
+            (
+                "responder",
+                NewtDockService::bind(user, host, dir.into(), 0).await.err(),
+            ),
+            (
+                "uplink",
+                crate::DockUplink::start(user, "host", dir.into(), loopback([7; 32], 9))
+                    .await
+                    .err(),
+            ),
+        ];
+        for (bind, refusal) in refusals {
+            let refusal = refusal.unwrap_or_else(|| panic!("the {bind} bound"));
+            assert!(
+                format!("{refusal:#}").contains("revocation log"),
+                "{bind}: {refusal:#}"
+            );
+        }
+    }
+
+    /// A state dir with no revocation log yet, as every install before
+    /// agent-mesh revocation, gets a genesis log of the operator beside
+    /// `identity.pem`, and the dock binds. Red while dock binds kept no log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_state_dir_gets_a_genesis_log_and_binds() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let hub = dock_agent(&user, DockRole::Hub, "hub");
+        let hub = DockClient::bind(&user, hub, 0, dir.path()).await.unwrap();
+        let log = dir.path().join("revocation.json");
+        let log = RevocationGuard::open(log, user.fingerprint()).expect("the operator's log");
+        assert_eq!(log.state().unwrap().len, 1, "a genesis log");
+        hub.close().await.unwrap();
+    }
+
+    /// A `Seen` record with no log beside it is a log that went missing, not a
+    /// fresh install: recreating it would forget every revocation, so no dock
+    /// bind does, and each refuses. Red while dock binds kept no log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seen_record_without_its_log_refuses_every_dock_bind() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let log = keep_log(dir.path(), &RevocationLog::genesis(&user).unwrap());
+        RevocationGuard::open(&log, user.fingerprint()).unwrap();
+        assert!(dir.path().join("revocation.seen.json").exists(), "seen");
+        std::fs::remove_file(&log).unwrap();
+        every_dock_bind_refuses(&user, dir.path()).await;
+        assert!(!log.exists(), "a missing log was recreated");
+    }
+
+    /// A log that does not parse, or is another user's, refuses every dock
+    /// bind. Red while dock binds kept no log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_garbled_or_foreign_revocation_log_refuses_every_dock_bind() {
+        let user = UserKey::generate();
+        let garbled = tempfile::tempdir().unwrap();
+        std::fs::write(garbled.path().join("revocation.json"), b"{not json").unwrap();
+        every_dock_bind_refuses(&user, garbled.path()).await;
+        let foreign = tempfile::tempdir().unwrap();
+        keep_log(
+            foreign.path(),
+            &RevocationLog::genesis(&UserKey::generate()).unwrap(),
+        );
+        every_dock_bind_refuses(&user, foreign.path()).await;
+    }
+
+    /// A start that loses the race to create the log keeps the winner's:
+    /// creating a genesis log never replaces a file, even one past genesis.
+    #[test]
+    fn creating_a_genesis_log_never_replaces_one() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut kept = RevocationLog::genesis(&user).unwrap();
+        let agent = Fingerprint([9; 32]);
+        kept.append(&user, RevocationEntry::Revoke { agent })
+            .unwrap();
+        let log = keep_log(dir.path(), &kept);
+        let before = std::fs::read(&log).unwrap();
+        create_genesis(&log, &user).expect("losing the race is not an error");
+        assert_eq!(std::fs::read(&log).unwrap(), before, "the log was replaced");
+    }
+
+    /// The operator revokes a hub in the host's revocation log: the host
+    /// refuses its next request though the hub is still approved in the
+    /// host's dock registry, and keeps serving a hub not revoked. Red while
+    /// dock binds kept no log. Real loopback QUIC.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live transport — nightly/full mesh-integration tier only"]
+    async fn a_hub_revoked_in_the_hosts_log_is_refused() {
+        let user = UserKey::generate();
+        let (host_dir, hub_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut kept = RevocationLog::genesis(&user).unwrap();
+        keep_log(host_dir.path(), &kept);
+        let host = dock_agent(&user, DockRole::Host, "host");
+        let host = NewtDockService::bind(&user, host, host_dir.path().into(), 0)
+            .await
+            .unwrap();
+        let peer = loopback(host.agent_pubkey(), host.local_port());
+        let mut hubs = Vec::new();
+        for name in ["revoked", "kept"] {
+            let hub = dock_agent(&user, DockRole::Hub, name);
+            approve_caller(
+                &user,
+                host_dir.path(),
+                &hub.public_bytes(),
+                DockScope::Mirror,
+            );
+            let hub = DockClient::bind(&user, hub, 0, hub_dir.path())
+                .await
+                .unwrap();
+            hub.list_sessions(peer)
+                .await
+                .expect("an approved hub is served");
+            hubs.push(hub);
+        }
+
+        let agent = dock_agent(&user, DockRole::Hub, "revoked").fingerprint();
+        kept.append(&user, RevocationEntry::Revoke { agent })
+            .unwrap();
+        keep_log(host_dir.path(), &kept);
+        assert!(
+            hubs[0].list_sessions(peer).await.is_err(),
+            "a revoked hub was served"
+        );
+        hubs[1]
+            .list_sessions(peer)
+            .await
+            .expect("a hub not revoked is still served");
+
+        host.close().await.unwrap();
+        for hub in hubs {
+            hub.close().await.unwrap();
+        }
     }
 }

@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use agent_mesh_bus::{Bus, Topic};
-use agent_mesh_core::{AgentKey, Fingerprint, UserKey};
+use agent_mesh_core::{AgentKey, Fingerprint, RevocationGuard, UserKey};
 use newt_inference::backend::{ChatRequest, InferenceBackend, Message};
 
 use crate::protocol::{InferenceReply, InferenceRequest, INFERENCE_TOPIC};
@@ -45,16 +45,19 @@ impl NewtMeshService {
     ///   requests. Wrapping in `Arc` lets multiple in-flight
     ///   handlers share it.
     /// * `port` — UDP port to bind to. `0` picks an ephemeral port.
+    /// * `revocation` — the user's revocation log (agent-mesh
+    ///   `RevocationGuard::open`); a peer it revokes is refused.
     pub async fn bind(
         user: &UserKey,
         agent: AgentKey,
         backend: Arc<dyn InferenceBackend>,
         port: u16,
+        revocation: RevocationGuard,
     ) -> anyhow::Result<Self> {
         let backend_name = backend.name().to_string();
         let backend_model = backend.model_id().to_string();
         let user_fp = user.fingerprint();
-        let bus = Bus::bind(user, agent, port).await?;
+        let bus = Bus::bind(user, agent, port, revocation).await?;
 
         let topic = Topic::new(user_fp, INFERENCE_TOPIC);
         let handler_backend = backend.clone();

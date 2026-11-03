@@ -14,7 +14,8 @@
 //!   `docs/decisions/newt_web_docking.md`).
 //!
 //! The trust root is loaded from `~/.agent-mesh/user.key` by default;
-//! both subcommands accept a `--user-key` override.
+//! both subcommands accept a `--user-key` override. The revocation log
+//! `revocation.json` must sit beside the key, as `amesh` keeps it.
 //!
 //! This binary lives in the out-of-workspace `newt-mesh` crate so the
 //! default newt workspace stays buildable without a side-by-side
@@ -24,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, UserKey};
+use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, RevocationGuard, UserKey};
 use agent_mesh_discovery::{Browser, BrowserEvent};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -61,7 +62,8 @@ enum Command {
         /// Bind port (`0` lets the OS choose).
         #[arg(long, default_value = "0")]
         port: u16,
-        /// Path to the user key (defaults to `~/.agent-mesh/user.key`).
+        /// Path to the user key (defaults to `~/.agent-mesh/user.key`); its
+        /// revocation log `revocation.json` sits beside it.
         #[arg(long)]
         user_key: Option<PathBuf>,
         /// Role label.
@@ -88,7 +90,8 @@ enum Command {
         /// Max output tokens.
         #[arg(long)]
         max_tokens: Option<u32>,
-        /// Path to the user key (defaults to `~/.agent-mesh/user.key`).
+        /// Path to the user key (defaults to `~/.agent-mesh/user.key`); its
+        /// revocation log `revocation.json` sits beside it.
         #[arg(long)]
         user_key: Option<PathBuf>,
         /// How long to wait for the peer + reply. Accepts `Ns`, `Nm`,
@@ -315,7 +318,7 @@ async fn announce(
     role: String,
     model: Option<String>,
 ) -> Result<()> {
-    let user = load_user_key(user_key_path)?;
+    let (user, revocation) = load_identity(user_key_path)?;
     let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
     let backend = LocalOllamaBackend::discover(&model)
@@ -329,7 +332,7 @@ async fn announce(
 
     let agent = issue_agent(&user, &role, caps.clone());
 
-    let service = NewtMeshService::bind(&user, agent, backend, port).await?;
+    let service = NewtMeshService::bind(&user, agent, backend, port, revocation).await?;
 
     println!("newt mesh service running");
     println!("  agent_fp:  {}", service.agent_fingerprint().hex());
@@ -358,9 +361,9 @@ async fn ask(
     max_tokens: Option<u32>,
     timeout: String,
 ) -> Result<()> {
-    let user = load_user_key(user_key_path)?;
+    let (user, revocation) = load_identity(user_key_path)?;
     let agent = issue_agent(&user, "newt-asker", vec!["newt-asker".to_string()]);
-    let asker = MeshAsker::bind(&user, agent).await?;
+    let asker = MeshAsker::bind(&user, agent, revocation).await?;
 
     let lookup_deadline = Duration::from_secs(5);
     let peer_fp = resolve_peer_fp(&peer_fp_str, user.fingerprint(), lookup_deadline).await?;
@@ -392,11 +395,19 @@ async fn ask(
     Ok(())
 }
 
-/// Load the user key, defaulting to `~/.agent-mesh/user.key` if no
-/// override is supplied.
-fn load_user_key(path: Option<PathBuf>) -> Result<UserKey> {
+/// Load the user key (default `~/.agent-mesh/user.key`) and, as `amesh` does,
+/// the revocation log beside it: no log, no peer.
+fn load_identity(path: Option<PathBuf>) -> Result<(UserKey, RevocationGuard)> {
     let p = path.unwrap_or_else(default_user_key_path);
-    UserKey::load(&p).with_context(|| format!("load user key {}", p.display()))
+    let user = UserKey::load(&p).with_context(|| format!("load user key {}", p.display()))?;
+    let log = p.with_file_name("revocation.json");
+    let revocation = RevocationGuard::open(&log, user.fingerprint()).with_context(|| {
+        format!(
+            "open {} — a revocation log is required (`amesh revocation init`)",
+            log.display()
+        )
+    })?;
+    Ok((user, revocation))
 }
 
 fn default_user_key_path() -> PathBuf {
@@ -555,6 +566,28 @@ mod tests {
             p.display()
         );
         assert!(p.ends_with("user.key"));
+    }
+
+    /// Fail closed, as `amesh` does: with no `revocation.json` beside the user
+    /// key there is no peer, so `announce` and `ask` refuse before they bind.
+    /// Red while they bound with an empty in-memory log.
+    #[test]
+    fn a_user_key_without_its_revocation_log_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("user.key");
+        let user = UserKey::generate();
+        user.save(&key).unwrap();
+        let refused = load_identity(Some(key.clone())).expect_err("refused without a log");
+        assert!(
+            format!("{refused:#}").contains("revocation log is required"),
+            "{refused:#}"
+        );
+        let genesis = agent_mesh_core::RevocationLog::genesis(&user).unwrap();
+        let log = dir.path().join("revocation.json");
+        std::fs::write(log, serde_json::to_vec(&genesis).unwrap()).unwrap();
+        load_identity(Some(key))
+            .map(drop)
+            .expect("the key loads with its log beside it");
     }
 
     #[test]

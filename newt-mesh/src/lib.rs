@@ -12,7 +12,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use std::time::Duration;
-//! use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, UserKey};
+//! use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, RevocationGuard, UserKey};
 //! use newt_mesh::{NewtMeshService, MeshAsker, InferenceRequest};
 //!
 //! # async fn demo() -> anyhow::Result<()> {
@@ -29,7 +29,9 @@
 //!
 //! // Caller provides any InferenceBackend implementation.
 //! let backend: Arc<dyn newt_inference::backend::InferenceBackend> = unimplemented!();
-//! let service = NewtMeshService::bind(&user, responder_agent, backend, 0).await?;
+//! // Production opens the user's log: `RevocationGuard::open(<home>/revocation.json, ..)`.
+//! let revocation = RevocationGuard::in_memory(&user);
+//! let service = NewtMeshService::bind(&user, responder_agent, backend, 0, revocation.clone()).await?;
 //!
 //! let asker_agent = AgentKey::issue(&user, AgentMetadata {
 //!     role: "newt-asker".into(),
@@ -39,7 +41,7 @@
 //!     expires_at: None,
 //!     caveats: Caveats::top(),
 //! });
-//! let asker = MeshAsker::bind(&user, asker_agent).await?;
+//! let asker = MeshAsker::bind(&user, asker_agent, revocation).await?;
 //! let reply = asker.ask(
 //!     responder_fp,
 //!     InferenceRequest { prompt: "hi".into(), tier: None, model: None, max_tokens: None },
