@@ -50,8 +50,9 @@ still apply. Later calls need standing authority or a fresh approval.
 ### Panels
 
 `/settings` is the primary entry point for harness controls: Session,
-Permissions, Audit, Backends, Themes, and MCP. Commands such as `/model`,
-`/backends`, and `/permissions` remain available as direct shortcuts.
+Permissions, Audit, Backends, Themes, MCP, Inference, and Workspaces. Commands
+such as `/model`, `/backends`, and `/permissions` remain available as direct
+shortcuts.
 
 Open `/settings` → **MCP**, or `/mcp`, to manage discovered servers. The list
 shows configuration sources, namespace conflicts, connection status, and tool
