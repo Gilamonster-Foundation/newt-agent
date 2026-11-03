@@ -188,3 +188,25 @@ fn discovery_stamps_the_origin_of_borrowed_entries() {
         Some(McpOrigin::File(workspace.join(".mcp.json")))
     );
 }
+
+/// Grounds `an_unloadable_newt_mcp_file_is_a_diagnostic_not_an_empty_list`
+/// against a real file: the diagnostic reaches the discovery report every
+/// consumer reads, and the remaining sources still load (#2915 review).
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+fn a_malformed_newt_mcp_file_reaches_the_discovery_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = dir.path().join("mcp.toml");
+    std::fs::write(
+        &native,
+        "[[mcp_servers]]\nname = \"docs\"\nheaders = { Authorization = \"SYNTHETIC_SECRET_MARKER\" \n",
+    )
+    .unwrap();
+    let configured = [stdio("configured", "tool")];
+    let report =
+        discover_report_with_namespace_mode(&configured, Some(&native), None, dir.path(), true);
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert!(report.diagnostics[0].contains("invalid MCP TOML syntax"));
+    assert!(!report.diagnostics[0].contains("SYNTHETIC_SECRET_MARKER"));
+    assert_eq!(report.servers.len(), 1, "startup stays nonfatal");
+}

@@ -140,6 +140,7 @@ fn import_selection_never_silently_discards_rejected_entries() {
             name: Some("rejected".into()),
             issue: newt_core::mcp::McpImportIssue::UnknownField,
         }],
+        ..Default::default()
     };
     assert!(select_import_entries(
         report.clone(),
@@ -185,6 +186,7 @@ fn import_rejected_name_via_name_flag_never_passes_malicious_key_verbatim() {
     let report = McpImportParseReport {
         entries: vec![],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -216,6 +218,7 @@ fn import_without_selector_lists_names_as_commands() {
             stdio_entry("alpha", Some("a")),
         ],
         rejected: vec![],
+        ..Default::default()
     };
     let err = select_import_entries(report, None, false, Path::new("s.json"), "--from-claude")
         .unwrap_err()
@@ -239,6 +242,7 @@ fn import_listing_never_renders_untrusted_names_as_commands() {
             stdio_entry("\u{1b}[31m", Some("c")),
         ],
         rejected: vec![],
+        ..Default::default()
     };
     let err = select_import_entries(report, None, false, Path::new("s"), "my dir/.mcp.json")
         .unwrap_err()
@@ -265,6 +269,7 @@ fn import_chooser_names_each_rejection_with_safe_reason_and_no_value() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -293,6 +298,7 @@ fn import_chooser_gives_rejected_entry_no_runnable_command() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -321,6 +327,7 @@ fn import_chooser_escapes_rejected_names_with_control_chars() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -362,6 +369,7 @@ fn import_all_names_each_rejection_and_refuses() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -390,6 +398,7 @@ fn import_all_reports_unnamed_rejection_without_empty_name() {
     let report = McpImportParseReport {
         entries: vec![valid],
         rejected: vec![rejected],
+        ..Default::default()
     };
     let err = select_import_entries(
         report,
@@ -457,4 +466,159 @@ fn import_flags_stdio_command_that_resolves_to_nothing() {
     let mut http = stdio_entry("h", None);
     http.transport = TransportKind::Http;
     assert!(missing_stdio_command(&http, &dirs, false, has).is_none());
+}
+
+/// #3062 review (F8): the import's "preserved" sentence names what a merge
+/// removed although the source did not name it, by name only.
+#[test]
+fn removed_local_settings_names_dropped_map_members_and_foreign_fields() {
+    let mut previous = stdio_entry("fs", Some("fs-mcp"));
+    previous.args = vec!["--token".into(), "SYNTHETIC_SECRET_MARKER".into()];
+    previous.env = BTreeMap::from([
+        ("KEEP".into(), SecretValue::literal("a")),
+        (
+            "LOG_LEVEL".into(),
+            SecretValue::literal("SYNTHETIC_SECRET_MARKER"),
+        ),
+    ]);
+    let mut saved = previous.clone();
+    saved.args = vec![];
+    saved.env.remove("LOG_LEVEL");
+    // Same transport: emptied args were the source's own value, not a removal.
+    assert_eq!(removed_local_settings(&previous, &saved), ["env LOG_LEVEL"]);
+
+    let mut http = stdio_entry("fs", None);
+    http.transport = TransportKind::Http;
+    http.url = Some("https://new.example.test/mcp".into());
+    assert_eq!(
+        removed_local_settings(&previous, &http),
+        ["command", "args", "env KEEP", "env LOG_LEVEL"]
+    );
+    assert_eq!(
+        removed_local_settings(&http, &previous),
+        ["url"],
+        "an HTTP entry has no args or env to lose"
+    );
+    assert!(removed_local_settings(&previous, &previous).is_empty());
+}
+
+/// #3062 review (R2-4): the merge removes the other transport's fields from
+/// an HTTP or SSE entry whether or not its transport changed, so stray stdio
+/// `args` it deleted are named, as a stray `command` is.
+#[test]
+fn removed_local_settings_names_stray_args_a_same_transport_merge_deleted() {
+    let mut previous = stdio_entry("docs", None);
+    previous.transport = TransportKind::Http;
+    previous.url = Some("https://docs.example.test/mcp".into());
+    previous.args = vec!["--legacy-flag".into()];
+    let mut saved = previous.clone();
+    saved.args = vec![];
+    assert_eq!(removed_local_settings(&previous, &saved), ["args"]);
+    previous.command = Some("docs-server".into());
+    assert_eq!(
+        removed_local_settings(&previous, &saved),
+        ["command", "args"]
+    );
+}
+
+/// #3062 review (R1-12): the advice is a command to paste, so a path or name
+/// a shell would split is quoted; a plain one stays bare.
+#[test]
+fn remove_advice_quotes_what_a_shell_would_split() {
+    assert_eq!(
+        remove_from(Path::new("sp ace/cfg/mcp.toml"), "alpha"),
+        "`newt --config 'sp ace/cfg/mcp.toml' mcp remove alpha`"
+    );
+    assert_eq!(
+        remove_from(Path::new("cfg/mcp.toml"), "my srv"),
+        "`newt --config cfg/mcp.toml mcp remove 'my srv'`"
+    );
+}
+
+/// #3062 review (R1-2): a Claude `oauth` object decides the client id, scopes
+/// and callback port together, so a member it omits removes the local pin.
+/// The notice names each pin that went, never its value; a changed value is
+/// the source's own, not a removal.
+#[test]
+fn removed_local_settings_names_the_oauth_pins_a_merge_dropped() {
+    let mut previous = stdio_entry("api", None);
+    previous.transport = TransportKind::Http;
+    previous.url = Some("https://mcp.example.test/mcp".into());
+    previous.oauth_client_id = Some("pinned-client".into());
+    previous.oauth_scopes = Some("read:repo".into());
+    previous.oauth_callback_port = Some(8123);
+    let mut saved = previous.clone();
+    saved.oauth_scopes = None;
+    assert_eq!(removed_local_settings(&previous, &saved), ["oauth_scopes"]);
+
+    saved.oauth_client_id = None;
+    saved.oauth_callback_port = None;
+    assert_eq!(
+        removed_local_settings(&previous, &saved),
+        ["oauth_client_id", "oauth_scopes", "oauth_callback_port"]
+    );
+    saved.oauth_client_id = Some("other-client".into());
+    assert_eq!(
+        removed_local_settings(&previous, &saved),
+        ["oauth_scopes", "oauth_callback_port"]
+    );
+}
+
+/// #3062 review (R3-3): HTTP header names are case-insensitive, so a source
+/// that spells a local header in another case names that header, and the
+/// notice never lists it as removed. Environment variable names are not.
+#[test]
+fn removed_local_settings_matches_header_names_in_any_case() {
+    let mut previous = stdio_entry("web", None);
+    previous.transport = TransportKind::Http;
+    previous.url = Some("https://mcp.example.test/mcp".into());
+    let token = SecretValue::literal("Bearer ${SYNTHETIC_TOKEN}");
+    previous.headers = BTreeMap::from([("authorization".into(), token.clone())]);
+    let mut saved = previous.clone();
+    saved.headers = BTreeMap::from([("Authorization".into(), token)]);
+    assert_eq!(
+        removed_local_settings(&previous, &saved),
+        Vec::<String>::new()
+    );
+
+    let mut previous = stdio_entry("fs", Some("fs-mcp"));
+    let path = SecretValue::literal("${SYNTHETIC_PATH}");
+    previous.env = BTreeMap::from([("path".into(), path.clone())]);
+    let mut saved = previous.clone();
+    saved.env = BTreeMap::from([("PATH".into(), path)]);
+    assert_eq!(removed_local_settings(&previous, &saved), ["env path"]);
+}
+
+/// #3062 review (G5 follow-up): a merge keeps a local `login_argv`, which no
+/// source can supply, and the notice names it when the stdio command, the
+/// whole argv, is not the one it was written for.
+#[test]
+fn a_kept_login_argv_is_named_only_when_the_command_changed() {
+    let mut previous = stdio_entry("fs", Some("npx"));
+    previous.args = vec!["old-mcp".into()];
+    previous.login_argv = vec!["old-mcp".into(), "login".into()];
+    let mut saved = previous.clone();
+    saved.request_timeout_secs = Some(30);
+    assert!(!kept_login_argv_for_a_new_command(&previous, &saved));
+
+    saved.args = vec!["new-mcp".into()];
+    assert!(kept_login_argv_for_a_new_command(&previous, &saved));
+    saved.args = previous.args.clone();
+    saved.command = Some("new-mcp".into());
+    assert!(kept_login_argv_for_a_new_command(&previous, &saved));
+
+    let mut http = stdio_entry("fs", None);
+    http.transport = TransportKind::Http;
+    http.url = Some("https://mcp.example.test/mcp".into());
+    http.login_argv = previous.login_argv.clone();
+    assert!(
+        kept_login_argv_for_a_new_command(&http, &previous),
+        "an HTTP entry's login_argv starts to run for the new command"
+    );
+    assert!(
+        !kept_login_argv_for_a_new_command(&previous, &http),
+        "an HTTP entry never runs its login_argv"
+    );
+    saved.login_argv.clear();
+    assert!(!kept_login_argv_for_a_new_command(&previous, &saved));
 }

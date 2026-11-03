@@ -39,9 +39,9 @@ fn with_mcp_enabled_toggles_and_preserves_comments() {
     let off = Config::with_mcp_enabled(text, "modulex", false).unwrap();
     assert!(off.contains("enabled = false"));
     assert!(off.contains("# my config"));
-    // re-enable → key REMOVED (default is enabled; file stays minimal)
+    // re-enable → written in place, so a comment on the line would stay
     let on = Config::with_mcp_enabled(&off, "modulex", true).unwrap();
-    assert!(!on.contains("enabled"));
+    assert!(on.contains("enabled = true"), "{on}");
     // unknown name errors loudly
     assert!(Config::with_mcp_enabled(text, "nope", false).is_err());
     // entry parses with default enabled=true; explicit false honored
@@ -50,6 +50,1343 @@ fn with_mcp_enabled_toggles_and_preserves_comments() {
     let d: crate::mcp::McpServerEntry =
         toml::from_str("name = \"x\"\ncommand = \"x\"\nenabled = false\n").unwrap();
     assert!(!d.enabled);
+}
+
+#[test]
+fn with_mcp_enabled_keeps_comments_and_leaves_a_settled_entry_alone() {
+    // #3062 review (F9): a toggle to the state the entry already has changes
+    // nothing, byte for byte; a real toggle writes the value in place, so the
+    // comments on and above the line stay, and so do CRLF line endings.
+    let head = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    for (text, enabled) in [
+        (
+            format!("{head}enabled = false # disabled: upstream leaks tokens\n"),
+            false,
+        ),
+        (
+            format!("{head}# pinned on for the review bot\nenabled = true # ask ops first\n"),
+            true,
+        ),
+        (
+            "# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n".to_owned(),
+            true,
+        ),
+    ] {
+        assert_eq!(
+            Config::with_mcp_enabled(&text, "fs", enabled).unwrap(),
+            text
+        );
+    }
+    let toggle = |line: &str, enabled: bool| {
+        Config::with_mcp_enabled(&format!("{head}# owner note\n{line}\n"), "fs", enabled).unwrap()
+    };
+    assert_eq!(
+        toggle("enabled = true # owner: platform team", false),
+        format!("{head}# owner note\nenabled = false # owner: platform team\n")
+    );
+    assert_eq!(
+        toggle("enabled = false # paused", true),
+        format!("{head}# owner note\nenabled = true # paused\n")
+    );
+    let crlf = "[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n";
+    assert_eq!(
+        Config::with_mcp_enabled(crlf, "fs", false).unwrap(),
+        format!("{crlf}enabled = false\r\n")
+    );
+}
+
+#[test]
+fn mcp_writers_edit_the_entry_discovery_keeps() {
+    // #3062 review (R1-5): within one file, discovery drops a same-name entry
+    // that is invalid and keeps the first valid one. The writers edit that
+    // one too, never a dropped stub ahead of it.
+    let stub = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n\n";
+    let live = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nenabled = false # paused by operator\n";
+    let text = format!("{stub}{live}");
+
+    let enabled = Config::with_mcp_enabled(&text, "docs", true).unwrap();
+    assert_eq!(
+        enabled,
+        format!(
+            "{stub}{}",
+            live.replace("enabled = false", "enabled = true")
+        )
+    );
+    assert_eq!(
+        Config::with_mcp_enabled(&text, "docs", false).unwrap(),
+        text,
+        "the live entry is already off"
+    );
+
+    let source: crate::mcp::McpServerEntry = toml::from_str(
+        "name = \"docs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\n",
+    )
+    .unwrap();
+    let provided = ["type", "url"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(&text, &source, &provided).unwrap(),
+        text,
+        "the live entry already matches; the stub stays as it is"
+    );
+}
+
+#[test]
+fn with_mcp_server_merged_updates_imported_fields_and_keeps_local_fields() {
+    let text = "# local MCP settings\n[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nenabled = false\nlogin_argv = [\"client\", \"login\"]\nrequest_timeout_secs = 90\n";
+    let incoming = crate::mcp::McpServerEntry {
+        name: "review".into(),
+        enabled: true,
+        transport: crate::mcp::TransportKind::Http,
+        command: None,
+        args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        url: Some("https://new.example/mcp/".into()),
+        headers: std::collections::BTreeMap::new(),
+        login_argv: Vec::new(),
+        request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
+        trust: crate::mcp::McpTrust::Untrusted,
+        origin: None,
+    };
+
+    let updated = Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap();
+    assert!(updated.contains("# local MCP settings"));
+    assert!(updated.contains("url = \"https://new.example/mcp/\""));
+    assert!(updated.contains("enabled = false"));
+    assert!(updated.contains("login_argv = [\"client\", \"login\"]"));
+    assert!(updated.contains("request_timeout_secs = 90"));
+    let parsed: Config = toml::from_str(&updated).unwrap();
+    assert_eq!(
+        parsed.mcp_servers[0].url.as_deref(),
+        Some("https://new.example/mcp/")
+    );
+    assert!(!parsed.mcp_servers[0].enabled);
+    assert_eq!(parsed.mcp_servers[0].login_argv, vec!["client", "login"]);
+    assert_eq!(parsed.mcp_servers[0].request_timeout_secs, Some(90));
+}
+
+#[test]
+fn with_mcp_server_merged_is_a_noop_when_source_fields_match() {
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"review-mcp\"\n";
+    let incoming: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\n").unwrap();
+    assert_eq!(
+        Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap(),
+        text
+    );
+}
+
+#[test]
+fn mcp_writers_keep_the_file_style() {
+    // #3062 review (F3): a merge that changes no setting hands back the text
+    // byte for byte, whatever toml_edit would re-render; a real change keeps
+    // the file's missing final newline, CRLF line endings and BOM.
+    let server = |name: &str, command: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!("name = \"{name}\"\ncommand = \"{command}\"\n")).unwrap()
+    };
+    let merge = |text: &str, command: &str| {
+        let provided = ["command"].into_iter().collect();
+        Config::with_mcp_server_merged(text, &server("fs", command), &provided).unwrap()
+    };
+    for text in [
+        "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"",
+        "# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n\r\n[[mcp_servers]]\r\nname = \"other\"\r\ncommand = \"other-mcp\"\r\n",
+        "\u{feff}[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n",
+    ] {
+        assert_eq!(merge(text, "fs-mcp"), text, "unchanged");
+        assert_eq!(
+            merge(text, "fs-v2"),
+            text.replacen("\"fs-mcp\"", "\"fs-v2\"", 1),
+            "changed"
+        );
+    }
+    // Layouts toml_edit respaces or reorders stay as written on a no-op.
+    for text in [
+        "[[ mcp_servers ]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n\n[[mcp_servers]]\nname = \"other\"\ncommand = \"other-mcp\"\n",
+        "[[mcp_servers]]\nname = \"fs\"\nenv.A = \"a\"\ncommand = \"fs-mcp\"\nenv.B = \"b\"\n",
+    ] {
+        assert_eq!(merge(text, "fs-mcp"), text);
+    }
+    // Adding and removing a server keep the style too.
+    let styled =
+        "\u{feff}# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"fs-mcp\"\r\n";
+    let added = Config::with_mcp_server_added(styled, &server("other", "other-mcp")).unwrap();
+    assert!(added.starts_with('\u{feff}'), "{added:?}");
+    assert_eq!(added.matches('\n').count(), added.matches("\r\n").count());
+    assert_eq!(
+        Config::with_mcp_server_removed(&added, "other").unwrap(),
+        styled
+    );
+}
+
+#[test]
+fn a_bom_only_file_counts_as_empty() {
+    // #3062 review (R1-8): Notepad saves an empty UTF-8 file as just a BOM.
+    // That file has no last line missing its newline, so an added entry
+    // ends with one, as it does in an empty file, and the BOM stays.
+    let entry: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"fs\"\ncommand = \"/bin/true\"\n").unwrap();
+    let added = Config::with_mcp_server_added("\u{feff}", &entry).unwrap();
+    assert_eq!(
+        added,
+        format!(
+            "\u{feff}{}",
+            Config::with_mcp_server_added("", &entry).unwrap()
+        )
+    );
+}
+
+#[test]
+fn mcp_writers_never_change_a_value_to_keep_crlf() {
+    // #3062 review (R1-4): a raw newline inside a multi-line string is part of
+    // its value, so restoring CRLF line endings must not rewrite it, in a new
+    // value, in a merged one, or in an entry the edit did not touch.
+    let args = |text: &str, name: &str| {
+        crate::mcp::parse_newt_mcp_toml_checked(text)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .unwrap()
+            .args
+    };
+    let banner: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"banner\"\ncommand = \"/bin/echo\"\nargs = [\"line1\\nline2\"]\n")
+            .unwrap();
+    let crlf = "# servers\r\n[[mcp_servers]]\r\nname = \"fs\"\r\ncommand = \"/bin/true\"\r\nargs = [\"--banner\", \"\"\"\nline1\nline2\"\"\"]\r\n\r\n[[mcp_servers]]\r\nname = \"other\"\r\ncommand = \"/bin/true\"\r\n";
+
+    let added = Config::with_mcp_server_added(crlf, &banner).unwrap();
+    assert_eq!(args(&added, "banner"), ["line1\nline2"], "{added:?}");
+    assert_eq!(
+        args(&added, "fs"),
+        ["--banner", "line1\nline2"],
+        "{added:?}"
+    );
+
+    let removed = Config::with_mcp_server_removed(crlf, "other").unwrap();
+    assert_eq!(
+        args(&removed, "fs"),
+        ["--banner", "line1\nline2"],
+        "{removed:?}"
+    );
+
+    let stored = "# servers\r\n[[mcp_servers]]\r\nname = \"banner\"\r\ncommand = \"/bin/echo\"\r\nargs = [\"\"\"\r\nline1\r\nline2\"\"\"]\r\n";
+    let provided = ["command", "args"].into_iter().collect();
+    let merged = Config::with_mcp_server_merged(stored, &banner, &provided).unwrap();
+    assert_eq!(args(&merged, "banner"), ["line1\nline2"], "{merged:?}");
+}
+
+#[test]
+fn a_crlf_inside_a_string_value_does_not_decide_the_line_endings() {
+    // #3062 review (R2-5): the line-ending style is the file's own, so the
+    // CRLFs inside a multi-line string value do not count toward it. An LF
+    // file whose one string holds more raw CRLFs than the file has lines
+    // keeps its LF lines on an unrelated add, and the string its CRLFs.
+    let lf = "# servers\n[[mcp_servers]]\nname = \"banner\"\ncommand = \"/bin/echo\"\nargs = [\"\"\"\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nl7\"\"\"]\n";
+    let fs: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"fs\"\ncommand = \"/bin/true\"\n").unwrap();
+    let added = Config::with_mcp_server_added(lf, &fs).unwrap();
+    assert!(added.starts_with(lf), "{added:?}");
+    assert_eq!(added.matches("\r\n").count(), 7, "{added:?}");
+}
+
+#[test]
+fn with_mcp_server_merged_resets_a_changed_transport_to_default_stdio() {
+    let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nheaders = { Authorization = \"Bearer old\" }\n";
+    let incoming: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\n").unwrap();
+
+    let updated = Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap();
+    let parsed: Config = toml::from_str(&updated).unwrap();
+    assert_eq!(
+        parsed.mcp_servers[0].transport,
+        crate::mcp::TransportKind::Stdio
+    );
+    assert_eq!(parsed.mcp_servers[0].command.as_deref(), Some("review-mcp"));
+    assert!(parsed.mcp_servers[0].url.is_none());
+    assert!(parsed.mcp_servers[0].headers.is_empty());
+    // #3062 review: the reset is written in place so a comment on it survives.
+    assert!(updated.contains("type = \"stdio\""), "{updated}");
+}
+
+#[test]
+fn with_mcp_server_merged_removes_stdio_fields_when_switching_to_http() {
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"old-mcp\"\nargs = [\"serve\"]\nenv = { TOKEN = \"secret\" }\n";
+    let incoming: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ntype = \"http\"\nurl = \"https://new.example/mcp\"\n")
+            .unwrap();
+
+    let updated = Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap();
+    let parsed: Config = toml::from_str(&updated).unwrap();
+    let server = &parsed.mcp_servers[0];
+    assert_eq!(server.transport, crate::mcp::TransportKind::Http);
+    assert_eq!(server.url.as_deref(), Some("https://new.example/mcp"));
+    assert!(server.command.is_none());
+    assert!(server.args.is_empty());
+    assert!(server.env.is_empty());
+}
+
+#[test]
+fn with_mcp_server_merged_applies_explicit_empties_and_keeps_omitted_fields() {
+    // #2915 review: an explicit empty/default source value is applied; only a
+    // key the source omits keeps its local value.
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"review-mcp\"\nargs = [\"--old-target\"]\nenv = { RUST_LOG = \"debug\" }\nenabled = false\nrequest_timeout_secs = 90\n";
+    let incoming: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\n").unwrap();
+
+    let provided = ["command", "args", "env", "enabled"].into_iter().collect();
+    let updated = Config::with_mcp_server_merged(text, &incoming, &provided).unwrap();
+    let server = &toml::from_str::<Config>(&updated).unwrap().mcp_servers[0];
+    assert!(server.args.is_empty(), "{updated}");
+    assert!(server.env.is_empty(), "{updated}");
+    assert!(server.enabled, "{updated}");
+    assert_eq!(
+        server.request_timeout_secs,
+        Some(90),
+        "omitted by the source"
+    );
+
+    let omitted = Config::with_mcp_server_merged(text, &incoming, &Default::default()).unwrap();
+    assert_eq!(omitted, text, "nothing provided, nothing changed");
+}
+
+#[test]
+fn with_mcp_server_merged_keeps_equal_items_and_comments() {
+    // #2915 review: a same-value import is a no-op, even when the local entry
+    // restates a default; a changed value keeps the comment on its line.
+    let text = "[[mcp_servers]]\nname = \"review\" # identity note\ntype = \"stdio\"\ncommand = 'review-mcp' # operator note\nargs = [ \"--a\" ]\n";
+    let same: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-mcp\"\nargs = [\"--a\"]\n").unwrap();
+    let provided = ["command", "args"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(text, &same, &provided).unwrap(),
+        text
+    );
+
+    let changed: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"review\"\ncommand = \"review-v2\"\nargs = [\"--a\"]\n").unwrap();
+    let updated = Config::with_mcp_server_merged(text, &changed, &provided).unwrap();
+    assert!(
+        updated.contains("name = \"review\" # identity note"),
+        "{updated}"
+    );
+    assert!(
+        updated.contains("command = \"review-v2\" # operator note"),
+        "{updated}"
+    );
+    assert!(
+        updated.contains("args = [ \"--a\" ]"),
+        "equal item untouched: {updated}"
+    );
+}
+
+#[test]
+fn with_mcp_server_merged_updates_a_map_member_by_member() {
+    // #3062 review (F10): changing one `env` or `headers` member keeps the
+    // map's layout (a sub-table, dotted keys, a multi-line inline table) and
+    // every member's comments, instead of rewriting it as one inline table.
+    let merge = |text: &str, source: &str, provided: &[&'static str]| {
+        let entry: crate::mcp::McpServerEntry =
+            toml::from_str(&format!("name = \"fs\"\n{source}")).unwrap();
+        let provided = provided.iter().copied().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let stdio = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    let env = "command = \"fs-mcp\"\nenv = { A = \"${SYNTHETIC_A}\", B = \"${SYNTHETIC_B2}\" }\n";
+    for map in [
+        "\n[mcp_servers.env]\n# staging token\nA = \"${SYNTHETIC_A}\" # keep A\nB = \"${SYNTHETIC_B}\" # b note\n",
+        "env.A = \"${SYNTHETIC_A}\" # keep A\nenv.B = \"${SYNTHETIC_B}\" # b note\n",
+        "env = {\n  A = \"${SYNTHETIC_A}\", # keep A\n  B = \"${SYNTHETIC_B}\", # b note\n}\n",
+    ] {
+        let text = format!("{stdio}{map}");
+        assert_eq!(
+            merge(&text, env, &["command", "env"]),
+            text.replace("SYNTHETIC_B}", "SYNTHETIC_B2}")
+        );
+    }
+
+    // A member the source drops goes, a new one is added, the rest stay.
+    let text = format!("{stdio}\n[mcp_servers.env]\n# staging token\nA = \"${{SYNTHETIC_A}}\" # keep A\nB = \"${{SYNTHETIC_B}}\"\n");
+    let reshaped = merge(
+        &text,
+        "command = \"fs-mcp\"\nenv = { A = \"${SYNTHETIC_A}\", C = \"${SYNTHETIC_C}\" }\n",
+        &["command", "env"],
+    );
+    assert!(
+        reshaped.contains("[mcp_servers.env]\n# staging token\nA = \"${SYNTHETIC_A}\" # keep A\n"),
+        "{reshaped}"
+    );
+    assert_eq!(
+        entry_of(&reshaped).env.keys().collect::<Vec<_>>(),
+        ["A", "C"]
+    );
+
+    let http = "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\n\n[mcp_servers.headers]\nX-Tenant = \"tenant-a\" # tenant note\nAuthorization = \"Bearer ${SYNTHETIC_TOKEN}\"\n";
+    assert_eq!(
+        merge(
+            http,
+            "type = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nheaders = { X-Tenant = \"tenant-a\", Authorization = \"Bearer ${SYNTHETIC_TOKEN2}\" }\n",
+            &["type", "url", "headers"],
+        ),
+        http.replace("SYNTHETIC_TOKEN}", "SYNTHETIC_TOKEN2}")
+    );
+}
+
+#[test]
+fn with_mcp_server_merged_keeps_each_inline_comment_on_its_member() {
+    // #3062 review (R1-7): in a multi-line inline table, toml_edit stores the
+    // text after a member's comma, its comment included, with the next
+    // member, or as the table's trailing text after the last one. Dropping or
+    // adding a member keeps each comment on the member it follows, and a
+    // one-line table keeps its spacing.
+    let merge = |text: &str, env: &str| {
+        let entry: crate::mcp::McpServerEntry = toml::from_str(&format!(
+            "name = \"fs\"\ncommand = \"fs-mcp\"\nenv = {env}\n"
+        ))
+        .unwrap();
+        let provided = ["command", "env"].into_iter().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let head = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    let a = "  A = \"${SYNTHETIC_A}\", # A: staging token\n";
+    let b = "  B = \"${SYNTHETIC_B}\", # B: DO NOT SHIP\n";
+    let c = "  C = \"${SYNTHETIC_C}\",\n";
+    let only_a = "{ A = \"${SYNTHETIC_A}\" }";
+    let a_b_c = "{ A = \"${SYNTHETIC_A}\", B = \"${SYNTHETIC_B}\", C = \"${SYNTHETIC_C}\" }";
+
+    let text = format!("{head}env = {{\n{a}{b}}}\n");
+    assert_eq!(merge(&text, only_a), format!("{head}env = {{\n{a}}}\n"));
+    assert_eq!(
+        merge(&text, "{ B = \"${SYNTHETIC_B}\" }"),
+        format!("{head}env = {{\n{b}}}\n")
+    );
+    assert_eq!(
+        merge(&text, a_b_c),
+        format!("{head}env = {{\n{a}{b}{c}}}\n")
+    );
+
+    // Without a trailing comma, the last value carries the end of its line.
+    let open = format!("{head}env = {{\n{a}  B = \"${{SYNTHETIC_B}}\" # B: DO NOT SHIP\n}}\n");
+    assert_eq!(
+        merge(&open, only_a),
+        format!("{head}env = {{\n  A = \"${{SYNTHETIC_A}}\" # A: staging token\n}}\n")
+    );
+    assert_eq!(
+        merge(&open, a_b_c),
+        format!("{head}env = {{\n{a}{b}  C = \"${{SYNTHETIC_C}}\"\n}}\n")
+    );
+
+    let line = format!("{head}env = {{ A = \"${{SYNTHETIC_A}}\", B = \"${{SYNTHETIC_B}}\" }}\n");
+    assert_eq!(
+        merge(&line, only_a),
+        format!("{head}env = {{ A = \"${{SYNTHETIC_A}}\" }}\n")
+    );
+    assert_eq!(merge(&line, a_b_c), format!("{head}env = {a_b_c}\n"));
+}
+
+#[test]
+fn dropping_an_inline_member_keeps_the_comment_of_a_member_that_stays() {
+    // #3062 review (R3-2): a dropped member that shares its line with a kept
+    // one takes only its own text: the line's comment and the lines after it
+    // stay. In a comma-first layout the kept member's comment ends its own
+    // line, before the dropped member's comma, and stays with it too.
+    let merge = |text: &str, env: &str| {
+        let entry: crate::mcp::McpServerEntry = toml::from_str(&format!(
+            "name = \"fs\"\ncommand = \"fs-mcp\"\nenv = {env}\n"
+        ))
+        .unwrap();
+        let provided = ["command", "env"].into_iter().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let head = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\nenv = {\n";
+    let a = "  A = \"${SYNTHETIC_A}\"";
+    let b = "B = \"${SYNTHETIC_B}\"";
+    let c = "  C = \"${SYNTHETIC_C}\"\n}\n";
+    let only_a = "{ A = \"${SYNTHETIC_A}\" }";
+
+    let shared = format!("{head}{a}, {b}, # shared line note\n{c}");
+    assert_eq!(
+        merge(
+            &shared,
+            "{ A = \"${SYNTHETIC_A}\", C = \"${SYNTHETIC_C}\" }"
+        ),
+        format!("{head}{a}, # shared line note\n{c}")
+    );
+    let shared_last = format!("{head}{a}, {b} # shared line note\n}}\n");
+    assert_eq!(
+        merge(&shared_last, only_a),
+        format!("{head}{a} # shared line note\n}}\n")
+    );
+    let comma_first = format!("{head}{a} # keep: needed by the wrapper\n  , {b} # b\n}}\n");
+    assert_eq!(
+        merge(&comma_first, only_a),
+        format!("{head}{a} # keep: needed by the wrapper\n}}\n")
+    );
+}
+
+#[test]
+fn a_header_spelled_in_another_case_is_the_same_member() {
+    // #3062 review (R3-3): HTTP header names are case-insensitive, so a
+    // source header that differs from a local one only in case is that
+    // member. The same value leaves the file as it is; a new one is written
+    // in place under the operator's spelling. A second local spelling of the
+    // header the source names goes, so one value is sent.
+    let merge = |text: &str, headers: &str| {
+        let entry: crate::mcp::McpServerEntry = toml::from_str(&format!(
+            "name = \"web\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nheaders = {headers}\n"
+        ))
+        .unwrap();
+        let provided = ["type", "url", "headers"].into_iter().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let head =
+        "[[mcp_servers]]\nname = \"web\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\n";
+    let local = format!(
+        "{head}headers = {{ authorization = \"Bearer ${{SYNTHETIC_TOKEN}}\" }} # team token\n"
+    );
+    assert_eq!(
+        merge(&local, "{ Authorization = \"Bearer ${SYNTHETIC_TOKEN}\" }"),
+        local
+    );
+    assert_eq!(
+        merge(&local, "{ Authorization = \"Bearer ${SYNTHETIC_TOKEN2}\" }"),
+        local.replace("TOKEN}", "TOKEN2}")
+    );
+    let twice = format!(
+        "{head}headers = {{ X-Api-Key = \"${{SYNTHETIC_KEY}}\", x-api-key = \"${{SYNTHETIC_OLD}}\" }}\n"
+    );
+    assert_eq!(
+        merge(&twice, "{ X-API-KEY = \"${SYNTHETIC_KEY}\" }"),
+        format!("{head}headers = {{ X-Api-Key = \"${{SYNTHETIC_KEY}}\" }}\n")
+    );
+}
+
+#[test]
+fn with_mcp_server_merged_refuses_to_carry_headers_to_a_moved_endpoint() {
+    // #2915 review (P1): a new URL must not inherit the credential configured
+    // for the old destination, and the refusal must not quote either.
+    let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example/mcp\"\nheaders = { Authorization = \"Bearer ${PRIVATE_MARKER}\" }\n";
+    let at = |url: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!(
+            "name = \"review\"\ntype = \"http\"\nurl = \"{url}\"\n"
+        ))
+        .unwrap()
+    };
+    let provided: std::collections::BTreeSet<&str> = ["type", "url"].into_iter().collect();
+
+    let error = Config::with_mcp_server_merged(text, &at("https://new.example/mcp"), &provided)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refusing to send them"), "{error}");
+    assert!(
+        !error.contains("PRIVATE_MARKER") && !error.contains("example"),
+        "{error}"
+    );
+
+    // The same endpoint, respelled, keeps its headers.
+    let respelled =
+        Config::with_mcp_server_merged(text, &at("https://OLD.example/mcp"), &provided).unwrap();
+    assert!(respelled.contains("PRIVATE_MARKER"), "{respelled}");
+
+    // Headers the source spells out (here: none) replace the local ones.
+    let with_headers = provided.iter().copied().chain(["headers"]).collect();
+    let moved = Config::with_mcp_server_merged(text, &at("https://new.example/mcp"), &with_headers)
+        .unwrap();
+    assert!(!moved.contains("PRIVATE_MARKER"), "{moved}");
+}
+
+#[test]
+fn with_mcp_server_merged_refuses_to_carry_oauth_settings_to_a_moved_endpoint() {
+    // #3062 review (G5): a static OAuth client, pinned scopes and callback
+    // port were registered with the old endpoint's authorization server; a
+    // moved endpoint must not present them to a new one.
+    let text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\noauth_client_id = \"old-as-client\"\noauth_scopes = \"repo admin:org\"\noauth_callback_port = 8123\n";
+    let at = |url: &str, oauth: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!(
+            "name = \"review\"\ntype = \"http\"\nurl = \"{url}\"\n{oauth}"
+        ))
+        .unwrap()
+    };
+    let with = |keys: &[&'static str]| keys.iter().copied().collect();
+
+    let error = Config::with_mcp_server_merged(
+        text,
+        &at("https://new.example.test/mcp", ""),
+        &with(&["type", "url"]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("3 local OAuth setting(s)"), "{error}");
+    assert!(
+        error.contains("refusing to send them to the new endpoint"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("old-as-client") && !error.contains("example"),
+        "{error}"
+    );
+
+    // The same endpoint keeps them; settings the source supplies are not a
+    // transfer (Claude's `oauth` object decides all three).
+    let same = Config::with_mcp_server_merged(
+        text,
+        &at("https://old.example.test/mcp", ""),
+        &with(&["type", "url"]),
+    )
+    .unwrap();
+    assert_eq!(same, text);
+    let supplied = entry_of(
+        &Config::with_mcp_server_merged(
+            text,
+            &at(
+                "https://new.example.test/mcp",
+                "oauth_client_id = \"new-client\"\n",
+            ),
+            &with(&[
+                "type",
+                "url",
+                "oauth_client_id",
+                "oauth_scopes",
+                "oauth_callback_port",
+            ]),
+        )
+        .unwrap(),
+    );
+    assert_eq!(supplied.oauth_client_id.as_deref(), Some("new-client"));
+    assert_eq!(
+        (supplied.oauth_scopes, supplied.oauth_callback_port),
+        (None, None)
+    );
+}
+
+#[test]
+fn a_moved_destination_refusal_offers_only_remedies_every_source_can_follow() {
+    // #3062 review (R2-2): every import format can supply headers, env, args
+    // and an OAuth client id, but a Codex source has no field for OAuth
+    // scopes or a callback port. A refusal that keeps such a pin offers only
+    // removing it, so its advice can always be followed.
+    let local = "[[mcp_servers]]\nname = \"remote\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\n";
+    let moved: crate::mcp::McpServerEntry = toml::from_str(
+        "name = \"remote\"\ntype = \"http\"\nurl = \"https://new.example.test/mcp\"\n",
+    )
+    .unwrap();
+    let provided = ["type", "url"].into_iter().collect();
+    let refusal = |pins: &str| {
+        Config::with_mcp_server_merged(&format!("{local}{pins}"), &moved, &provided)
+            .unwrap_err()
+            .to_string()
+    };
+    let supply = "Supply them in the source, or remove them from the existing entry";
+    for pins in [
+        "oauth_scopes = \"read write\"\n",
+        "oauth_client_id = \"old-client\"\noauth_callback_port = 3118\n",
+    ] {
+        let error = refusal(pins);
+        assert!(!error.contains("Supply"), "{error}");
+        assert!(
+            error.ends_with("Remove them from the existing entry, then re-run the import"),
+            "{error}"
+        );
+    }
+    for pins in [
+        "oauth_client_id = \"old-client\"\n",
+        "headers = { X-Tenant = \"${TENANT}\" }\n",
+    ] {
+        let error = refusal(pins);
+        assert!(error.contains(supply), "{error}");
+    }
+}
+
+#[test]
+fn with_mcp_server_merged_keeps_the_operators_spelling_of_one_endpoint() {
+    // #3062 review (F6): `https://h` and `https://h/` are one request target,
+    // but a saved login is bound to the exact spelling. An import that only
+    // canonicalises the URL leaves the operator's spelling, and the login.
+    let text =
+        "[[mcp_servers]]\nname = \"fs\"\ntype = \"http\"\nurl = \"https://api.example.test\"\n";
+    let at = |url: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!(
+            "name = \"fs\"\ntype = \"http\"\nurl = \"{url}\"\n"
+        ))
+        .unwrap()
+    };
+    let provided = ["type", "url"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(text, &at("https://api.example.test/"), &provided).unwrap(),
+        text
+    );
+    // A real resource change is still written.
+    let moved =
+        Config::with_mcp_server_merged(text, &at("https://api.example.test/mcp"), &provided)
+            .unwrap();
+    assert!(
+        moved.contains("url = \"https://api.example.test/mcp\""),
+        "{moved}"
+    );
+}
+
+#[test]
+fn with_mcp_server_merged_refuses_to_carry_env_to_a_different_program() {
+    // #2915: the stdio twin of the header transfer. The program is the argv,
+    // so a launcher running other args counts as a different program too.
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"npx\"\nargs = [\"old-mcp\"]\nenv = { API_TOKEN = { env = \"PRIVATE_MARKER\" } }\n";
+    let runs = |argv: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!("name = \"review\"\n{argv}\n")).unwrap()
+    };
+    let with = |keys: &[&'static str]| {
+        keys.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    for (argv, provided) in [
+        ("command = \"new-mcp\"", with(&["command"])),
+        (
+            "command = \"npx\"\nargs = [\"new-mcp\"]",
+            with(&["command", "args"]),
+        ),
+    ] {
+        let error = Config::with_mcp_server_merged(text, &runs(argv), &provided)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing to send them to the new command"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("PRIVATE_MARKER") && !error.contains("API_TOKEN"),
+            "{error}"
+        );
+    }
+
+    // The same program keeps its env; an env the source supplies replaces it.
+    // (The source supplies args too: the old program's argv is not carried
+    // either, see the args twin below.)
+    let same =
+        Config::with_mcp_server_merged(text, &runs("command = \"npx\""), &with(&["command"]))
+            .unwrap();
+    assert_eq!(same, text);
+    let supplied = runs("command = \"new-mcp\"");
+    let moved = Config::with_mcp_server_merged(text, &supplied, &with(&["command", "args", "env"]))
+        .unwrap();
+    assert!(!moved.contains("PRIVATE_MARKER"), "{moved}");
+}
+
+#[test]
+fn with_mcp_server_merged_refuses_to_carry_args_to_a_different_program() {
+    // #3062 review (F1): argv written for one program, a credential flag
+    // included, must not follow a changed command the source names without
+    // args. Any kept argument refuses: newt cannot tell a credential flag it
+    // does not know from any other.
+    let text = "[[mcp_servers]]\nname = \"review\"\ncommand = \"npx\"\nargs = [\"--api-key\", \"SYNTHETIC_SECRET_MARKER\"]\n";
+    let runs = |argv: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!("name = \"review\"\n{argv}\n")).unwrap()
+    };
+    let with = |keys: &[&'static str]| keys.iter().copied().collect();
+
+    let error = Config::with_mcp_server_merged(
+        text,
+        &runs("command = \"other-vendor-mcp\""),
+        &with(&["command"]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("2 local argument(s)"), "{error}");
+    assert!(
+        error.contains("refusing to send them to the new command"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("SYNTHETIC_SECRET_MARKER") && !error.contains("--api-key"),
+        "{error}"
+    );
+
+    // Args the source supplies are not a transfer, and the same program keeps
+    // its own.
+    let supplied = Config::with_mcp_server_merged(
+        text,
+        &runs("command = \"other-vendor-mcp\"\nargs = [\"--serve\"]"),
+        &with(&["command", "args"]),
+    )
+    .unwrap();
+    assert_eq!(entry_of(&supplied).args, ["--serve"]);
+    let same =
+        Config::with_mcp_server_merged(text, &runs("command = \"npx\""), &with(&["command"]))
+            .unwrap();
+    assert_eq!(same, text);
+}
+
+#[test]
+fn with_mcp_server_merged_keeps_comments_on_defaults_and_resets() {
+    // #3062 review: a value reset to its default keeps the comment on its
+    // line, and an unchanged default-valued key is untouched even when another
+    // key in the same entry changes.
+    let merge = |text: &str, source: &str, provided: &[&'static str]| {
+        let entry: crate::mcp::McpServerEntry =
+            toml::from_str(&format!("name = \"review\"\n{source}")).unwrap();
+        let provided = provided.iter().copied().collect();
+        Config::with_mcp_server_merged(text, &entry, &provided).unwrap()
+    };
+    let head = "[[mcp_servers]]\nname = \"review\"\ncommand = \"review-mcp\"\n";
+
+    let cleared = merge(
+        &format!("{head}args = [\"--old-target\"] # argument policy\n"),
+        "command = \"review-mcp\"\n",
+        &["command", "args"],
+    );
+    assert!(cleared.contains("args = [] # argument policy"), "{cleared}");
+
+    let enabled = merge(
+        &format!("{head}enabled = false # operator policy\n"),
+        "command = \"review-mcp\"\n",
+        &["command", "enabled"],
+    );
+    assert!(
+        enabled.contains("enabled = true # operator policy"),
+        "{enabled}"
+    );
+
+    let mixed = merge(
+        &format!("{head}enabled = true # enabled policy\ntype = \"stdio\" # transport policy\nrequest_timeout_secs = 90\n"),
+        "command = \"review-mcp\"\nrequest_timeout_secs = 30\n",
+        &["command", "enabled", "request_timeout_secs"],
+    );
+    assert!(mixed.contains("enabled = true # enabled policy"), "{mixed}");
+    assert!(
+        mixed.contains("type = \"stdio\" # transport policy"),
+        "{mixed}"
+    );
+    assert!(mixed.contains("request_timeout_secs = 30"), "{mixed}");
+}
+
+#[test]
+fn with_mcp_server_merged_updates_an_alias_spelled_field_in_place() {
+    // #3062 review: `requestTimeoutSecs` is the same field as
+    // `request_timeout_secs`. A force import must update it where the
+    // operator wrote it, never add a second spelling the reader rejects.
+    let names = crate::mcp::serde_field_names::<crate::mcp::McpServerEntry>();
+    assert!(names.contains(&"requestTimeoutSecs"), "{names:?}");
+    let samples = [
+        "30",
+        "90",
+        "'a'",
+        "'b'",
+        "false",
+        "['a']",
+        "['b']",
+        "{ A = 'a' }",
+        "{ B = 'b' }",
+    ];
+    let entry = |body: &str| -> Option<crate::mcp::McpServerEntry> {
+        toml::from_str(&format!("name = 'review'\ncommand = 'review-mcp'\n{body}")).ok()
+    };
+    let base = entry("").unwrap();
+    let mut aliases = 0;
+    for name in names {
+        // Values this spelling accepts, and the key newt itself would write.
+        let accepted: Vec<(&str, String)> = samples
+            .iter()
+            .filter_map(|value| {
+                let parsed = entry(&format!("{name} = {value}")).filter(|e| *e != base)?;
+                let rendered = crate::mcp::entry_to_toml_table(&parsed, None).ok()?;
+                let mut keys = rendered
+                    .iter()
+                    .map(|(key, _)| key)
+                    .filter(|key| !["name", "command"].contains(key));
+                Some((*value, keys.next()?.to_owned()))
+            })
+            .collect();
+        let [(old, canonical), (new, _), ..] = accepted.as_slice() else {
+            continue;
+        };
+        if canonical == name {
+            continue;
+        }
+        aliases += 1;
+        let text = format!(
+            "[[mcp_servers]]\nname = 'review'\ncommand = 'review-mcp'\n{name} = {old} # note\n"
+        );
+        let provided = [canonical.as_str()].into_iter().collect();
+        let merge = |incoming: &crate::mcp::McpServerEntry| {
+            let merged = Config::with_mcp_server_merged(&text, incoming, &provided).unwrap();
+            assert!(
+                crate::mcp::parse_newt_mcp_toml_checked(&merged).is_ok(),
+                "{name}: {merged}"
+            );
+            assert!(
+                !merged.contains(&format!("{canonical} =")),
+                "{name}: {merged}"
+            );
+            merged
+        };
+        let changed = merge(&entry(&format!("{name} = {new}")).unwrap());
+        assert!(
+            changed.contains(&format!("{name} = {new} # note")),
+            "{changed}"
+        );
+        let same = merge(&entry(&format!("{name} = {old}")).unwrap());
+        assert_eq!(same, text, "{name}: an unchanged value keeps its line");
+        let reset = merge(&base);
+        assert_eq!(entry_of(&reset), base, "{name}: reset to the default");
+    }
+    assert!(aliases > 0, "no alias found among {names:?}");
+}
+
+fn entry_of(text: &str) -> crate::mcp::McpServerEntry {
+    crate::mcp::parse_newt_mcp_toml_checked(text)
+        .unwrap()
+        .remove(0)
+}
+
+#[test]
+fn with_mcp_server_removed_does_not_echo_malformed_config_contents() {
+    // The marker is on the line the parser stops at, the line a raw TOML
+    // error would quote (#3062 review).
+    let text = "[[mcp_servers]]\nname = \"docs\"\nheaders = { Authorization = \"SYNTHETIC_SECRET_MARKER\" \n";
+    let error = Config::with_mcp_server_removed(text, "docs").unwrap_err();
+    assert!(error.to_string().contains("invalid MCP TOML syntax"));
+    assert!(!error.to_string().contains("SYNTHETIC_SECRET_MARKER"));
+}
+
+#[test]
+#[serial_test::serial(real_fs)]
+fn set_mcp_server_enabled_in_file_uses_atomic_writeback() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let path = dir.path().join("mcp.toml");
+    let original =
+        "# keep this comment\n[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\n";
+    std::fs::write(&path, original).unwrap();
+
+    Config::set_mcp_server_enabled_in_file(&path, "docs", false).unwrap();
+
+    let updated = std::fs::read_to_string(&path).unwrap();
+    assert!(updated.contains("# keep this comment"));
+    assert!(updated.contains("enabled = false"));
+    assert!(!newt_core_lock_path(&path).exists());
+}
+
+/// Grounds the owner rule on real files (#3062 review, F11): the owner is
+/// the file that supplies the effective entry, so a same-name entry that
+/// discovery drops as invalid owns the name only when no valid one exists.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn mcp_server_owner_path_skips_an_entry_discovery_drops() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let config = dir.path().join("config.toml");
+    let mcp = dir.path().join("mcp.toml");
+    // An http entry with its url commented out: discovery drops it.
+    let dead = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n# url = \"https://docs.example.test/mcp\"\n";
+    std::fs::write(&config, dead).unwrap();
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        Config::mcp_server_owner_path("docs").unwrap().as_ref(),
+        Some(&mcp)
+    );
+    Config::set_mcp_server_enabled_in_file(&mcp, "docs", false).unwrap();
+    assert!(std::fs::read_to_string(&mcp)
+        .unwrap()
+        .contains("enabled = false"));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), dead);
+
+    // With no valid `docs` left, the broken one still owns the name, so
+    // `newt mcp remove` can delete it.
+    std::fs::write(&mcp, "").unwrap();
+    assert_eq!(Config::mcp_server_owner_path("docs").unwrap(), Some(config));
+}
+
+/// #3062 review (G2): `newt mcp remove` and `/mcp enable|disable` edit the
+/// owning file by default, but never a walked-up project config, which is
+/// repo-tracked: main never wrote one implicitly. The refusal names the
+/// explicit command. Grounds the rule both callers share on real files.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn mcp_server_edit_path_refuses_a_project_owner() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    std::fs::write(
+        workspace.join(".newt/config.toml"),
+        "[[mcp_servers]]\nname = \"proj\"\ncommand = \"proj-mcp\"\n",
+    )
+    .unwrap();
+    let mcp = dir.path().join("mcp.toml");
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"mine\"\ncommand = \"mine-mcp\"\n",
+    )
+    .unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+
+    let owner = Config::mcp_server_owner_path("proj").unwrap().unwrap();
+    assert!(owner.ends_with(Path::new(".newt").join("config.toml")));
+    let edit = |name: &str| {
+        Config::mcp_server_edit_path(name, true, |owner| {
+            format!("remove it from {}", owner.display())
+        })
+    };
+    let error = edit("proj").unwrap_err().to_string();
+    assert!(error.contains("project config"), "{error}");
+    assert!(
+        error.ends_with(&format!("remove it from {}", owner.display())),
+        "{error}"
+    );
+    assert_eq!(edit("mine").unwrap(), mcp);
+
+    // Pinned as the base, the same file is the operator's named config, not
+    // a borrowed layer: the resolver reads it as the base, whatever its
+    // spelling, and so does the edit rule.
+    // SAFETY: the `real_fs` serial lane serializes env mutation; HomeSandbox
+    // restores NEWT_CONFIG on drop.
+    unsafe { std::env::set_var("NEWT_CONFIG", &owner) };
+    assert_eq!(edit("proj").unwrap(), owner);
+}
+
+/// #3062 review (R2-1): a config dir that is an ancestor's `.newt` holds the
+/// operator's own config, which the resolver reads as the trusted base. The
+/// walk-up finds the same file, but a project layer is a file other than the
+/// base, so default-scope `newt mcp remove` and `/mcp enable|disable` edit
+/// it, as on main, whatever the cwd.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn the_base_config_the_walk_up_also_finds_is_not_a_project_config() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let config_dir = dir.path().join("data").join(".newt");
+    let workspace = dir.path().join("data").join("ws").join("sub");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = config_dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"mine\"\ncommand = \"mine-mcp\"\n",
+    )
+    .unwrap();
+    // SAFETY: the `real_fs` serial lane serializes env mutation; HomeSandbox
+    // restores NEWT_CONFIG_DIR on drop.
+    unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, &config_dir) };
+    std::env::set_current_dir(&workspace).unwrap();
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+    assert_eq!(
+        Config::project_config_path().as_deref().map(canonical),
+        Some(canonical(&config))
+    );
+
+    for ambient_is_default in [true, false] {
+        let edit =
+            Config::mcp_server_edit_path("mine", ambient_is_default, |_| "edit it by hand".into());
+        assert_eq!(edit.unwrap(), config, "{ambient_is_default}");
+    }
+}
+
+/// #3062 review (R1-1): an unpinned `./newt.toml` is the resolver's ambient
+/// base, which a cloned repo can ship, and its MCP entries are untrusted
+/// (#1301). `/mcp enable|disable` never wrote it on main, so the toggle
+/// refuses it as it refuses a project config. `newt mcp add|remove` write it
+/// by default (#1291), so remove still may. Pinned, it is the named base.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn the_toggle_leaves_an_ambient_newt_toml_alone() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("newt.toml"),
+        "[[mcp_servers]]\nname = \"amb\"\ncommand = \"amb-mcp\"\n",
+    )
+    .unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+    let toggle = || Config::mcp_server_edit_path("amb", false, |_| "edit it by hand".into());
+
+    let error = toggle().unwrap_err().to_string();
+    assert!(error.contains("ambient config ./newt.toml"), "{error}");
+    let ambient = Path::new("./newt.toml");
+    assert_eq!(
+        Config::mcp_server_edit_path("amb", true, |_| unreachable!()).unwrap(),
+        ambient
+    );
+    // SAFETY: the `real_fs` serial lane serializes env mutation; HomeSandbox
+    // restores NEWT_CONFIG on drop.
+    unsafe { std::env::set_var("NEWT_CONFIG", ambient) };
+    assert_eq!(toggle().unwrap(), ambient);
+}
+
+/// #3062 review (R1-3): a refusal ends with the caller's own remedy and adds
+/// no command, so the toggle no longer advises `mcp remove`, which deletes
+/// the entry from the shared file instead of toggling it.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn the_toggle_refusal_does_not_advise_a_remove() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    std::fs::write(
+        workspace.join(".newt/config.toml"),
+        "[[mcp_servers]]\nname = \"proj\"\ncommand = \"proj-mcp\"\nenabled = false\n",
+    )
+    .unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+
+    let owner = Config::mcp_server_owner_path("proj").unwrap().unwrap();
+    let error = Config::set_mcp_server_enabled("proj", true)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "MCP server `proj` is defined in the project config {}, which newt edits only when named: set `enabled = true` there by hand",
+            owner.display()
+        )
+    );
+}
+
+/// #3062 review (R2-6): an entry already in the requested state needs no
+/// edit, so `/mcp enable|disable` reports it set wherever it is defined and
+/// writes nothing. Only a real change to a file newt edits only when named
+/// is refused; advising a hand edit to the value it already has misleads.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn the_toggle_accepts_an_entry_already_in_that_state_in_a_borrowed_file() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+    let entry = "[[mcp_servers]]\nname = \"fs\"\ncommand = \"fs-mcp\"\n";
+    for borrowed in [
+        workspace.join(".newt").join("config.toml"),
+        workspace.join("newt.toml"),
+    ] {
+        std::fs::write(&borrowed, entry).unwrap();
+        let owner = Config::mcp_server_owner_path("fs").unwrap().unwrap();
+        assert_eq!(Config::set_mcp_server_enabled("fs", true).unwrap(), owner);
+        let error = Config::set_mcp_server_enabled("fs", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.ends_with("set `enabled = false` there by hand"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&borrowed).unwrap(), entry);
+        std::fs::remove_file(&borrowed).unwrap();
+    }
+}
+
+/// #3062 review (R3-5): advice that would send the operator to `/mcp
+/// enable|disable` gives the toggle's own refusal where the toggle refuses,
+/// so it never names a toggle that cannot help. Where the toggle would edit
+/// the file, find the entry already set, or find no entry, there is none.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn advice_gives_the_toggle_refusal_where_the_toggle_refuses() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    let disabled = |name: &str| {
+        format!("[[mcp_servers]]\nname = \"{name}\"\ncommand = \"x\"\nenabled = false\n")
+    };
+    std::fs::write(workspace.join(".newt/config.toml"), disabled("proj")).unwrap();
+    std::fs::write(dir.path().join("mcp.toml"), disabled("mine")).unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+
+    let refusal = Config::set_mcp_server_enabled("proj", true).unwrap_err();
+    assert_eq!(
+        Config::mcp_toggle_refusal("proj", true),
+        Some(refusal.to_string())
+    );
+    assert_eq!(Config::mcp_toggle_refusal("proj", false), None);
+    assert_eq!(Config::mcp_toggle_refusal("mine", true), None);
+    assert_eq!(Config::mcp_toggle_refusal("absent", true), None);
+}
+
+/// #3062 review (R4-7): only the toggle's ownership refusal is advice. Any
+/// other error, here the inline-array writer's, names no edit to make, and a
+/// hint that appended it read as one.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn advice_gives_no_writer_error_as_the_toggle_refusal() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    std::fs::write(
+        dir.path().join("mcp.toml"),
+        "mcp_servers = [ { name = \"inline\", command = \"x\", enabled = false } ]\n",
+    )
+    .unwrap();
+
+    let error = Config::set_mcp_server_enabled("inline", true).unwrap_err();
+    assert!(
+        error.to_string().contains("not an array of tables"),
+        "{error}"
+    );
+    assert_eq!(Config::mcp_toggle_refusal("inline", true), None);
+}
+
+/// #3062 review (R1-13): a config the operator pinned with `--config` or
+/// `$NEWT_CONFIG` is named, so it stays editable even when it is the system
+/// config; unpinned, the system config, a project layer and an ambient
+/// `./newt.toml` are left alone. Pure: the system path needs no root here.
+#[test]
+fn a_default_scope_edit_leaves_an_unnamed_shared_file_alone() {
+    let system = Path::new(SYSTEM_CONFIG_PATH);
+    let project = Path::new("ws/.newt/config.toml");
+    let ambient = Path::new("./newt.toml");
+    let user = Path::new("cfg/mcp.toml");
+    assert_eq!(
+        unnamed_owner_kind(system, None, None, false),
+        Some("system")
+    );
+    assert_eq!(unnamed_owner_kind(system, Some(system), None, false), None);
+    assert_eq!(
+        unnamed_owner_kind(project, None, Some(project), false),
+        Some("project")
+    );
+    assert_eq!(
+        unnamed_owner_kind(project, Some(project), Some(project), false),
+        None
+    );
+    assert_eq!(
+        unnamed_owner_kind(ambient, None, None, true),
+        Some("ambient")
+    );
+    assert_eq!(unnamed_owner_kind(ambient, None, None, false), None);
+    assert_eq!(unnamed_owner_kind(user, None, Some(project), false), None);
+}
+
+/// #3062 review (G10): the owner is the file whose entry the resolver keeps.
+/// A project `[[mcp_servers]]` replaces the base list by default, so the
+/// project owns a shared name and a base-only name is in no file. With
+/// `arrays = "append"` the base entries come first and keep precedence.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn mcp_server_owner_path_follows_the_project_array_strategy() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let base = dir.path().join("config.toml");
+    std::fs::write(
+        &base,
+        "[[mcp_servers]]\nname = \"shared\"\ncommand = \"base-shared\"\n\n\
+         [[mcp_servers]]\nname = \"base-only\"\ncommand = \"base-only\"\n",
+    )
+    .unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".newt")).unwrap();
+    std::env::set_current_dir(&workspace).unwrap();
+    let project_entries = "[[mcp_servers]]\nname = \"shared\"\ncommand = \"project-shared\"\n\n\
+         [[mcp_servers]]\nname = \"project-only\"\ncommand = \"project-only\"\n";
+
+    for (merge, shared, base_only) in [("", "project", None), ("append", "base", Some("base"))] {
+        let merge = if merge.is_empty() {
+            String::new()
+        } else {
+            format!("[merge]\narrays = \"{merge}\"\n\n")
+        };
+        std::fs::write(
+            workspace.join(".newt").join("config.toml"),
+            format!("{merge}{project_entries}"),
+        )
+        .unwrap();
+        let project = Config::project_config_path().unwrap();
+        let file = |layer: Option<&str>| match layer {
+            Some("base") => Some(base.clone()),
+            Some(_) => Some(project.clone()),
+            None => None,
+        };
+        let owner = |name: &str| Config::mcp_server_owner_path(name).unwrap();
+        assert_eq!(owner("shared"), file(Some(shared)), "{merge}");
+        assert_eq!(owner("base-only"), file(base_only), "{merge}");
+        assert_eq!(owner("project-only"), file(Some("project")), "{merge}");
+
+        // Each owner supplies the entry the resolver keeps for that name.
+        let resolved = Config::resolve_unpublished(&mut |_| {}).unwrap();
+        for name in ["shared", "base-only", "project-only"] {
+            let kept = resolved
+                .mcp_servers
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.command.clone());
+            let owned = owner(name).map(|path| {
+                let text = std::fs::read_to_string(path).unwrap();
+                crate::mcp::parse_newt_mcp_toml_checked(&text)
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .unwrap()
+                    .command
+            });
+            assert_eq!(owned, kept, "{merge}{name}");
+        }
+    }
+}
+
+/// #3062 review (G10): `/mcp enable|disable` re-checks under the lock before
+/// it writes. When the file it resolved no longer owns the name, or the file
+/// changed after it was read, nothing is written and the newer contents stay.
+#[test]
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn set_mcp_server_enabled_in_file_refuses_a_changed_owner_or_a_concurrent_edit() {
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    let _sandbox = HomeSandbox::enter(dir.path());
+    let config = dir.path().join("config.toml");
+    let mcp = dir.path().join("mcp.toml");
+    let entry = "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\n";
+    std::fs::write(&mcp, entry).unwrap();
+    // config.toml takes the name after the toggle resolved mcp.toml.
+    std::fs::write(&config, entry).unwrap();
+    let error = Config::set_mcp_server_enabled_in_file(&mcp, "docs", false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ownership changed"), "{error}");
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), entry);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), entry);
+
+    std::fs::remove_file(&config).unwrap();
+    let edited = format!("# edited meanwhile\n{entry}");
+    let error = Config::set_mcp_server_enabled_in_file_with(&mcp, "docs", false, || {
+        std::fs::write(&mcp, &edited).unwrap();
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("concurrent edit detected"), "{error}");
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), edited);
+    assert!(!newt_core_lock_path(&mcp).exists());
+}
+
+fn newt_core_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    crate::atomic_fs::ResolvedPath::resolve(path)
+        .unwrap()
+        .lock_path()
 }
 
 // ---- `newt mcp add|remove` comment-preserving config writers ----
@@ -234,6 +1571,63 @@ command = \"drop-mcp\"
 }
 
 #[test]
+fn an_edit_that_changes_nothing_in_an_inline_array_section_is_no_edit() {
+    // #3062 review (R3-4): the reader accepts an inline-array `mcp_servers`,
+    // which the writers cannot edit in place. Whether an edit changes
+    // anything is decided from the typed entry first, so a toggle to the
+    // entry's state or a same-source merge hands the text back, as for
+    // `[[mcp_servers]]`. A real change is still refused.
+    let on = "mcp_servers = [ { name = \"alpha\", command = \"echo\" } ]\n";
+    let off = "mcp_servers = [ { name = \"alpha\", command = \"echo\", enabled = false } ]\n";
+    assert_eq!(Config::with_mcp_enabled(on, "alpha", true).unwrap(), on);
+    assert_eq!(Config::with_mcp_enabled(off, "alpha", false).unwrap(), off);
+    let source = |command: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!("name = \"alpha\"\ncommand = \"{command}\"\n")).unwrap()
+    };
+    let provided = ["command"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(on, &source("echo"), &provided).unwrap(),
+        on
+    );
+    for error in [
+        Config::with_mcp_enabled(on, "alpha", false).unwrap_err(),
+        Config::with_mcp_server_merged(on, &source("echo-v2"), &provided).unwrap_err(),
+    ] {
+        assert!(
+            error.to_string().contains("not an array of tables"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_header_differing_only_in_case_is_no_edit_in_an_inline_array_section() {
+    // #3062 review (R4-6): R3-3 made `authorization` and `Authorization` one
+    // header, so a `[[mcp_servers]]` merge reports it unchanged. R3-4's early
+    // no-op check compared the typed header maps case-sensitively, so the
+    // inline-array form was refused for a change that is none. A changed
+    // value is still a real change, and still refused.
+    let text = "mcp_servers = [ { name = \"web\", type = \"http\", url = \"https://mcp.example.test/mcp\", headers = { authorization = \"Bearer ${SYNTHETIC_TOKEN}\" } } ]\n";
+    let source = |value: &str| -> crate::mcp::McpServerEntry {
+        toml::from_str(&format!(
+            "name = \"web\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nheaders = {{ Authorization = \"Bearer ${{{value}}}\" }}\n"
+        ))
+        .unwrap()
+    };
+    let provided = ["type", "url", "headers"].into_iter().collect();
+    assert_eq!(
+        Config::with_mcp_server_merged(text, &source("SYNTHETIC_TOKEN"), &provided).unwrap(),
+        text
+    );
+    let error =
+        Config::with_mcp_server_merged(text, &source("OTHER_TOKEN"), &provided).unwrap_err();
+    assert!(
+        error.to_string().contains("not an array of tables"),
+        "{error}"
+    );
+}
+
+#[test]
 fn with_mcp_server_removed_reports_a_non_array_section_accurately() {
     // The inline-array form is valid TOML the serde reader accepts; the
     // writer must say it cannot edit that shape, not falsely claim the
@@ -272,9 +1666,9 @@ fn mcp_writer_error_branches_are_loud() {
     };
     // Invalid TOML input text.
     let err = Config::with_mcp_server_added("not toml [", &entry).unwrap_err();
-    assert!(err.to_string().contains("not valid TOML"), "{err}");
+    assert!(err.to_string().contains("invalid MCP TOML syntax"), "{err}");
     let err = Config::with_mcp_server_removed("not toml [", "x").unwrap_err();
-    assert!(err.to_string().contains("not valid TOML"), "{err}");
+    assert!(err.to_string().contains("invalid MCP TOML syntax"), "{err}");
     // A section that is not an array of tables.
     let err = Config::with_mcp_server_added("mcp_servers = 3\n", &entry).unwrap_err();
     assert!(err.to_string().contains("not an array of tables"), "{err}");
@@ -289,6 +1683,43 @@ fn mcp_writer_error_branches_are_loud() {
     };
     let err = Config::with_mcp_server_added("", &oversized).unwrap_err();
     assert!(err.to_string().contains("out of range"), "{err}");
+}
+
+#[test]
+fn mcp_writer_errors_name_the_position_not_the_contents() {
+    // #3062 review (F13): every MCP writer reports where the file stops
+    // parsing, never what is there: the parser's own message quotes the
+    // line, here a credential.
+    let text = "[[mcp_servers]]\nname = \"x\"\ncommand = \"SYNTHETIC_SECRET_MARKER\n";
+    let entry: crate::mcp::McpServerEntry =
+        toml::from_str("name = \"x\"\ncommand = \"x-mcp\"\n").unwrap();
+    for error in [
+        Config::with_mcp_server_added(text, &entry).unwrap_err(),
+        Config::with_mcp_server_removed(text, "x").unwrap_err(),
+        Config::with_mcp_enabled(text, "x", false).unwrap_err(),
+        Config::with_mcp_server_merged(text, &entry, &Default::default()).unwrap_err(),
+    ] {
+        assert_eq!(
+            error.to_string(),
+            "config error: invalid MCP TOML syntax at line 3, column 35"
+        );
+    }
+}
+
+#[test]
+fn mcp_error_columns_do_not_count_a_bom() {
+    // #3062 review (R1-9): the parser skips a leading BOM, but its spans are
+    // byte offsets into the text, and editors hide the BOM. A column on line
+    // 1 counts from the first visible character, as on every other line.
+    let error = |text: &str| Config::with_mcp_server_removed(text, "x").unwrap_err();
+    assert_eq!(
+        error("\u{feff}name = = 1\n").to_string(),
+        error("name = = 1\n").to_string()
+    );
+    assert_eq!(
+        error("\u{feff}name = = 1\n").to_string(),
+        "config error: invalid MCP TOML syntax at line 1, column 8"
+    );
 }
 
 #[test]

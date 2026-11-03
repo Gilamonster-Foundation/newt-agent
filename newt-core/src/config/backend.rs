@@ -12,7 +12,8 @@ use crate::error::{NewtError, Result};
 use crate::router::Tier;
 
 use super::dropin::{
-    classify_untagged_dropin, disk_record_tag, parse_probe_record, DropinOwner, ProbeObservation,
+    classify_untagged_dropin, disk_record_tag, parse_dropin, parse_probe_record, DropinOwner,
+    ProbeObservation,
 };
 use super::{
     backend_is_routable, expand_tilde, pin_requested_selection, select_backend_slot, Config,
@@ -1231,7 +1232,7 @@ impl BackendAssembly {
                 Some(RecordTag::ProbeV1) => self.stage_probe(&path, stem, &text),
                 Some(RecordTag::OperatorV1) => self.merge_operator(&path, stem, &text),
                 None => {
-                    let backend = match toml::from_str::<BackendConfig>(&text) {
+                    let backend = match parse_dropin::<BackendConfig>(&text) {
                         Ok(backend) => backend,
                         Err(e) => {
                             // The header parse is laxer than the full parse
@@ -1262,7 +1263,7 @@ impl BackendAssembly {
     /// NOTHING (a skipped record must not strip what an earlier layer
     /// established).
     fn merge_operator(&mut self, path: &Path, stem: &str, text: &str) {
-        let mut backend = match toml::from_str::<BackendConfig>(text) {
+        let mut backend = match parse_dropin::<BackendConfig>(text) {
             Ok(backend) => backend,
             Err(e) => {
                 self.warn(format!(

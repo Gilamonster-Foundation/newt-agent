@@ -511,3 +511,149 @@ fn uat_import_rejects_every_url_query_without_echoing_it() {
         .stderr(predicate::str::contains("do-not-echo").not());
     assert!(!sb.config_dir.join("mcp.toml").exists());
 }
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn uat_import_reports_a_malformed_config_without_quoting_its_line() {
+    // #2915 review: a TOML parser error quotes the offending line, which here
+    // carries a credential. Both the explicit `--config` route and the default
+    // route must name the file without echoing that line.
+    let sb = sandbox();
+    let marker = "SYNTHETIC_SECRET_MARKER";
+    let malformed = format!(
+        "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://review.example.test/mcp\"\nheaders = {{ Authorization = \"{marker}\" \n"
+    );
+    let source = sb.cwd.join("borrowed.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "other": { "command": "other-mcp" } } }"#,
+    )
+    .unwrap();
+
+    let target = sb.cwd.join("target.toml");
+    std::fs::write(&target, &malformed).unwrap();
+    newt(&sb)
+        .args(["--config", target.to_str().unwrap()])
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--all",
+            "--force",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target.toml"))
+        .stderr(predicate::str::contains(marker).not());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), malformed);
+
+    let user_config = sb.config_dir.join("config.toml");
+    std::fs::write(&user_config, &malformed).unwrap();
+    newt(&sb)
+        .args(["mcp", "import", source.to_str().unwrap(), "--all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config.toml"))
+        .stderr(predicate::str::contains(marker).not());
+    assert_eq!(std::fs::read_to_string(&user_config).unwrap(), malformed);
+    assert!(!sb.config_dir.join("mcp.toml").exists());
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn uat_default_route_never_logs_a_malformed_dropin_line() {
+    // #3062 review (F7, G1): the default-route import resolves the runtime
+    // config, which loads the drop-in directories and logs each malformed
+    // file it skips. A TOML error quotes the offending line, here a
+    // credential: the log names the file and position, never the line.
+    let sb = sandbox();
+    let marker = "SYNTHETIC_SECRET_MARKER";
+    let kinds = ["backends", "bundles", "crews", "dgx", "loadouts"];
+    for kind in kinds {
+        let dir = sb.config_dir.join(kind);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{kind}-leaky.toml")),
+            format!("endpoint = \"https://user:{marker}@example.invalid/v1\nmodel = \"x\"\n"),
+        )
+        .unwrap();
+    }
+    let source = sb.cwd.join("borrowed.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "other": { "command": "/bin/true" } } }"#,
+    )
+    .unwrap();
+
+    for args in [
+        &["mcp", "import", source.to_str().unwrap(), "--all"][..],
+        &["mcp", "list"][..],
+    ] {
+        let assert = newt(&sb)
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(marker).not())
+            .stderr(predicate::str::contains(marker).not());
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+        for kind in kinds {
+            assert!(stderr.contains(&format!("{kind}-leaky.toml")), "{stderr}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn import_reports_a_config_validation_error_as_itself() {
+    // #3062 review (F12, G7): only a TOML decode error quotes the file, so
+    // only it is withheld. A config that decodes but fails validation keeps
+    // the resolver's own message, which names the cause, and the import
+    // names the file it resolved.
+    let sb = sandbox();
+    let source = sb.cwd.join("borrowed.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "other": { "command": "/bin/true" } } }"#,
+    )
+    .unwrap();
+    let config = sb.config_dir.join("config.toml");
+    for (text, cause) in [
+        (
+            "[[backends]]\nname = \"local\"\nendpoint = \"http://127.0.0.1:9\"\n\n[[backends]]\nname = \"local\"\nendpoint = \"http://127.0.0.1:10\"\n",
+            "two backends share the name `local`",
+        ),
+        (
+            "[[providers]]\nname = \"p\"\ncommand = \"/bin/true\"\ntiers = []\n\n[[providers]]\nname = \"p\"\ncommand = \"/bin/true\"\ntiers = []\n",
+            "two providers share the name `p`",
+        ),
+    ] {
+        std::fs::write(&config, text).unwrap();
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap(), "--all"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(cause))
+            .stderr(predicate::str::contains(config.display().to_string()))
+            .stderr(predicate::str::contains("withheld").not());
+    }
+
+    // A legacy drop-in names itself in the resolver's message.
+    std::fs::remove_file(&config).unwrap();
+    std::fs::create_dir_all(sb.config_dir.join("backends")).unwrap();
+    std::fs::write(
+        sb.config_dir.join("backends/old.toml"),
+        "endpoint = \"http://127.0.0.1:9\"\nmodel = \"warm-pick\"\n\n[provenance]\nsource = \"newt adopt v0.5.0 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args(["mcp", "import", source.to_str().unwrap(), "--all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("old.toml"))
+        .stderr(predicate::str::contains("newt-adopt probe marker"))
+        .stderr(predicate::str::contains("withheld").not());
+    assert!(!sb.config_dir.join("mcp.toml").exists());
+}

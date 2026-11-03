@@ -18,7 +18,7 @@
 //! transport semantics must fail instead of being silently erased.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::agent_identity::{Secret, SecretRef};
@@ -722,6 +722,19 @@ pub(crate) fn entry_to_toml_table(
     Ok(table)
 }
 
+/// The written form of a default [`entry_to_toml_table`] leaves out, so a local
+/// value reset to it can be overwritten in place with its comment kept. `None`
+/// for an optional field, whose only default is absence.
+pub(crate) fn implicit_default(key: &str) -> Option<toml_edit::Value> {
+    match key {
+        "enabled" => Some(true.into()),
+        "type" => Some(TransportKind::Stdio.as_str().into()),
+        "args" | "login_argv" => Some(toml_edit::Array::new().into()),
+        "env" | "headers" => Some(toml_edit::InlineTable::new().into()),
+        _ => None,
+    }
+}
+
 /// Render a `SecretValue` as a `toml_edit` value: a literal becomes a string, a
 /// reference becomes an inline table with only its set `{ env | file | cmd }`
 /// key — the inverse of the `untagged` deserialize, so a config round-trips.
@@ -903,7 +916,123 @@ pub struct McpImportRejection {
 pub struct McpImportParseReport {
     pub entries: Vec<McpServerEntry>,
     pub rejected: Vec<McpImportRejection>,
+    /// The newt `[[mcp_servers]]` keys each accepted entry's source spelled
+    /// out, by server name. Deserialization cannot tell `"args": []` from an
+    /// omitted `args`; a force import applies these keys even when empty or
+    /// default and keeps local values only for the keys the source omits.
+    pub provided: BTreeMap<String, BTreeSet<&'static str>>,
 }
+
+/// A source field and the newt `[[mcp_servers]]` keys it sets.
+type ImportField = (&'static str, &'static [&'static str]);
+
+/// Every field the strict Claude parser accepts, and the keys it sets.
+const CLAUDE_IMPORT_FIELDS: &[ImportField] = &[
+    ("enabled", &["enabled"]),
+    ("type", &["type"]),
+    ("command", &["command"]),
+    ("args", &["args"]),
+    ("env", &["env"]),
+    ("url", &["url"]),
+    ("headers", &["headers"]),
+    ("request_timeout_secs", &["request_timeout_secs"]),
+    ("requestTimeoutSecs", &["request_timeout_secs"]),
+    (
+        "oauth",
+        &["oauth_client_id", "oauth_scopes", "oauth_callback_port"],
+    ),
+];
+
+/// Every field the strict Codex parser accepts, and the keys it sets.
+const CODEX_IMPORT_FIELDS: &[ImportField] = &[
+    ("url", &["url"]),
+    ("command", &["command"]),
+    ("args", &["args"]),
+    ("env", &["env"]),
+    ("bearer_token_env_var", &["headers"]),
+    ("http_headers", &["headers"]),
+    ("env_http_headers", &["headers"]),
+    ("env_vars", &["env"]),
+    ("auth", &[]),
+    ("oauth_client_id", &["oauth_client_id"]),
+    ("startup_timeout_sec", &[]),
+    ("tool_timeout_sec", &["request_timeout_secs"]),
+    ("required", &[]),
+    ("enabled", &["enabled"]),
+];
+
+fn import_field_supported(fields: &[ImportField], field: &str) -> bool {
+    fields.iter().any(|(name, _)| *name == field)
+}
+
+/// Whether every import source format has a field that sets the newt `key`,
+/// so advice to supply it in the source can be followed whatever the source.
+pub(crate) fn every_import_format_sets(key: &str) -> bool {
+    [CLAUDE_IMPORT_FIELDS, CODEX_IMPORT_FIELDS]
+        .iter()
+        .all(|fields| fields.iter().any(|(_, keys)| keys.contains(&key)))
+}
+
+fn provided_keys<'a>(
+    fields: &[ImportField],
+    present: impl IntoIterator<Item = &'a String>,
+) -> BTreeSet<&'static str> {
+    present
+        .into_iter()
+        .flat_map(|field| {
+            fields
+                .iter()
+                .filter(move |(name, _)| *name == field.as_str())
+                .flat_map(|(_, keys)| keys.iter().copied())
+        })
+        .collect()
+}
+
+/// A value-independent error for a Newt-owned MCP TOML file: what kind, and
+/// the 1-based line and column where parsing stopped, when known.
+///
+/// TOML parser errors include the offending line, which may contain credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpConfigError {
+    /// The file is not valid TOML.
+    Syntax(Option<(usize, usize)>),
+    /// Valid TOML whose `mcp_servers` do not fit the MCP server schema.
+    Shape(Option<(usize, usize)>),
+}
+
+impl McpConfigError {
+    /// The 1-based line and column in `text` where a parser error `span`
+    /// starts; the position quotes nothing from the file. A leading BOM,
+    /// which the parser skips and an editor hides, is not a column.
+    pub(crate) fn position(
+        text: &str,
+        span: Option<std::ops::Range<usize>>,
+    ) -> Option<(usize, usize)> {
+        let before = text.get(..span?.start)?;
+        let before = before.strip_prefix('\u{feff}').unwrap_or(before);
+        let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+        Some((
+            before.matches('\n').count() + 1,
+            before[line_start..].chars().count() + 1,
+        ))
+    }
+}
+
+impl std::fmt::Display for McpConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (what, at) = match self {
+            Self::Syntax(at) => ("invalid MCP TOML syntax", at),
+            Self::Shape(at) => ("invalid MCP config", at),
+        };
+        f.write_str(what)?;
+        match at {
+            Some((line, column)) => write!(f, " at line {line}, column {column}"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for McpConfigError {}
 
 /// Secret-safe syntax error for borrowed Codex TOML. The original TOML parser
 /// error embeds the complete offending line, so it must never cross the CLI
@@ -994,6 +1123,18 @@ pub fn canonical_mcp_http_url(
     })
 }
 
+/// Whether `next` names a different MCP endpoint than `previous`. URLs are
+/// compared in canonical form, so a respelling is not a move but a resource
+/// path change (`/mcp` → `/mcp/`) is: a saved login is bound to the exact
+/// resource, and configured credentials to the destination they were set for.
+#[must_use]
+pub fn mcp_endpoint_changed(previous: Option<&str>, next: Option<&str>) -> bool {
+    let canonical = |url: Option<&str>| {
+        url.map(|url| canonical_mcp_http_url(url).map_or_else(|_| url.to_owned(), |c| c.url))
+    };
+    canonical(previous) != canonical(next)
+}
+
 fn portable_env_names<T>(values: &BTreeMap<String, T>) -> bool {
     let mut canonical = std::collections::BTreeSet::new();
     values
@@ -1026,19 +1167,6 @@ pub fn is_transport_owned_mcp_header(name: &str) -> bool {
 /// semantics before stamping an entry trusted.
 #[must_use]
 pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseReport {
-    const SUPPORTED_FIELDS: &[&str] = &[
-        "enabled",
-        "type",
-        "command",
-        "args",
-        "env",
-        "url",
-        "headers",
-        "request_timeout_secs",
-        "requestTimeoutSecs",
-        "oauth",
-    ];
-
     let Some(servers) = value.get("mcpServers") else {
         return McpImportParseReport::default();
     };
@@ -1049,6 +1177,7 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
                 name: None,
                 issue: McpImportIssue::InvalidShape,
             }],
+            provided: BTreeMap::new(),
         };
     };
 
@@ -1063,7 +1192,7 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
         };
         if object
             .keys()
-            .any(|field| !SUPPORTED_FIELDS.contains(&field.as_str()))
+            .any(|field| !import_field_supported(CLAUDE_IMPORT_FIELDS, field))
         {
             report.rejected.push(McpImportRejection {
                 name: Some(name.clone()),
@@ -1112,6 +1241,10 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
         };
         if semantics_preserved {
             report.entries.push(entry);
+            report.provided.insert(
+                name.clone(),
+                provided_keys(CLAUDE_IMPORT_FIELDS, object.keys()),
+            );
         } else {
             report.rejected.push(McpImportRejection {
                 name: Some(name.clone()),
@@ -1120,6 +1253,54 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
         }
     }
     report
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcedCodexEnvVar {
+    name: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CodexEnvVar {
+    Name(String),
+    Sourced(SourcedCodexEnvVar),
+}
+
+impl CodexEnvVar {
+    fn local_name(self) -> Option<String> {
+        match self {
+            Self::Name(name) => Some(name),
+            Self::Sourced(SourcedCodexEnvVar { name, source }) => match source.as_deref() {
+                None | Some("local") => Some(name),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A Codex `[mcp_servers.<name>]` table. [`CODEX_IMPORT_FIELDS`] has a row
+/// for each field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexEntry {
+    url: Option<String>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
+    bearer_token_env_var: Option<String>,
+    http_headers: Option<BTreeMap<String, String>>,
+    env_http_headers: Option<BTreeMap<String, String>>,
+    env_vars: Option<Vec<CodexEnvVar>>,
+    auth: Option<String>,
+    oauth_client_id: Option<String>,
+    startup_timeout_sec: Option<u64>,
+    tool_timeout_sec: Option<u64>,
+    required: Option<bool>,
+    enabled: Option<bool>,
 }
 
 /// Parse Codex's `[mcp_servers.<name>]` TOML tables into newt's shared MCP
@@ -1144,52 +1325,6 @@ pub fn parse_claude_mcp_for_import(value: &serde_json::Value) -> McpImportParseR
 /// `newt mcp import` is required before its process or endpoint may be used.
 #[must_use]
 pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct SourcedCodexEnvVar {
-        name: String,
-        #[serde(default)]
-        source: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum CodexEnvVar {
-        Name(String),
-        Sourced(SourcedCodexEnvVar),
-    }
-
-    impl CodexEnvVar {
-        fn local_name(self) -> Option<String> {
-            match self {
-                Self::Name(name) => Some(name),
-                Self::Sourced(SourcedCodexEnvVar { name, source }) => match source.as_deref() {
-                    None | Some("local") => Some(name),
-                    _ => None,
-                },
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct CodexEntry {
-        url: Option<String>,
-        command: Option<String>,
-        args: Option<Vec<String>>,
-        env: Option<BTreeMap<String, String>>,
-        bearer_token_env_var: Option<String>,
-        http_headers: Option<BTreeMap<String, String>>,
-        env_http_headers: Option<BTreeMap<String, String>>,
-        env_vars: Option<Vec<CodexEnvVar>>,
-        auth: Option<String>,
-        oauth_client_id: Option<String>,
-        startup_timeout_sec: Option<u64>,
-        tool_timeout_sec: Option<u64>,
-        required: Option<bool>,
-        enabled: Option<bool>,
-    }
-
     let Ok(document) = toml::from_str::<toml::Value>(text) else {
         return Vec::new();
     };
@@ -1374,22 +1509,6 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
 pub fn parse_codex_mcp_toml_for_import(
     text: &str,
 ) -> std::result::Result<McpImportParseReport, McpImportSyntaxError> {
-    const SUPPORTED_FIELDS: &[&str] = &[
-        "url",
-        "command",
-        "args",
-        "env",
-        "bearer_token_env_var",
-        "http_headers",
-        "env_http_headers",
-        "env_vars",
-        "auth",
-        "startup_timeout_sec",
-        "tool_timeout_sec",
-        "required",
-        "enabled",
-    ];
-
     let document = toml::from_str::<toml::Value>(text).map_err(|_| McpImportSyntaxError)?;
     let Some(raw_servers) = document.get("mcp_servers") else {
         return Ok(McpImportParseReport::default());
@@ -1401,15 +1520,27 @@ pub fn parse_codex_mcp_toml_for_import(
                 name: None,
                 issue: McpImportIssue::InvalidShape,
             }],
+            provided: BTreeMap::new(),
         });
     };
 
     let entries = parse_codex_mcp_toml(text);
-    let accepted: std::collections::BTreeSet<&str> =
-        entries.iter().map(|entry| entry.name.as_str()).collect();
+    let accepted: BTreeMap<&str, TransportKind> = entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.transport))
+        .collect();
     let mut rejected = Vec::new();
+    let mut provided = BTreeMap::new();
     for (name, raw) in raw_servers {
-        if accepted.contains(name.as_str()) {
+        if let Some(transport) = accepted.get(name.as_str()) {
+            if let Some(table) = raw.as_table() {
+                let mut keys = provided_keys(CODEX_IMPORT_FIELDS, table.keys());
+                // The stdio branch drops a client id, so it decides none there.
+                if *transport == TransportKind::Stdio {
+                    keys.remove("oauth_client_id");
+                }
+                provided.insert(name.clone(), keys);
+            }
             continue;
         }
         let issue = match raw.as_table() {
@@ -1417,9 +1548,17 @@ pub fn parse_codex_mcp_toml_for_import(
             Some(table)
                 if table
                     .keys()
-                    .any(|field| !SUPPORTED_FIELDS.contains(&field.as_str())) =>
+                    .any(|field| !import_field_supported(CODEX_IMPORT_FIELDS, field)) =>
             {
                 McpImportIssue::UnknownField
+            }
+            // As in a Claude source, an unusable client id is a bad value.
+            Some(table)
+                if table
+                    .get("oauth_client_id")
+                    .is_some_and(|id| !id.as_str().is_some_and(valid_oauth_client_id)) =>
+            {
+                McpImportIssue::InvalidShape
             }
             Some(_) => McpImportIssue::UnsupportedSemantics,
         };
@@ -1428,7 +1567,11 @@ pub fn parse_codex_mcp_toml_for_import(
             issue,
         });
     }
-    Ok(McpImportParseReport { entries, rejected })
+    Ok(McpImportParseReport {
+        entries,
+        rejected,
+        provided,
+    })
 }
 
 /// Count fields omitted by [`parse_codex_mcp_toml`] because Codex represents
@@ -1512,23 +1655,75 @@ fn load_claude_file(path: &Path) -> Vec<McpServerEntry> {
 /// document yields an empty list (discovery is never fatal — mirrors
 /// [`load_claude_file`]). Pure.
 pub fn parse_newt_mcp_toml(text: &str) -> Vec<McpServerEntry> {
+    parse_newt_mcp_toml_checked(text).unwrap_or_default()
+}
+
+/// Parse a Newt-owned MCP TOML document without discarding syntax or shape
+/// errors. Management commands use this instead of discovery's best-effort
+/// parser so malformed files cannot look empty and be overwritten.
+pub fn parse_newt_mcp_toml_checked(
+    text: &str,
+) -> std::result::Result<Vec<McpServerEntry>, McpConfigError> {
     #[derive(Deserialize, Default)]
     struct Doc {
         #[serde(default)]
         mcp_servers: Vec<McpServerEntry>,
     }
+
+    let at = |error: toml::de::Error| McpConfigError::position(text, error.span());
+    toml::from_str::<toml::Table>(text).map_err(|error| McpConfigError::Syntax(at(error)))?;
     toml::from_str::<Doc>(text)
-        .map(|d| d.mcp_servers)
-        .unwrap_or_default()
+        .map(|doc| doc.mcp_servers)
+        .map_err(|error| McpConfigError::Shape(at(error)))
 }
 
-/// Read + parse a newt-owned `~/.newt/mcp.toml`. Missing or malformed files
-/// yield an empty list (best-effort, never fatal).
-fn load_newt_mcp_toml(path: &Path) -> Vec<McpServerEntry> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// Which of one file's `entries` is the one named `name`: the first valid
+/// entry, which discovery keeps, else the first, which `newt mcp list` flags
+/// as dropped. The writers and the import read and edit this one (#2915).
+#[must_use]
+pub fn effective_entry_index(entries: &[McpServerEntry], name: &str) -> Option<usize> {
+    let named = || {
+        entries
+            .iter()
+            .enumerate()
+            .filter(move |(_, entry)| entry.name == name)
     };
-    parse_newt_mcp_toml(&text)
+    named()
+        .find(|(_, entry)| entry.is_valid())
+        .or_else(|| named().next())
+        .map(|(index, _)| index)
+}
+
+/// Read + parse a newt-owned `~/.newt/mcp.toml`. A missing file is empty; one
+/// that cannot be read or parsed is a value-independent diagnostic, so it never
+/// looks like a file with no servers (#2915).
+fn load_newt_mcp_toml(path: &Path) -> std::result::Result<Vec<McpServerEntry>, String> {
+    newt_mcp_file_servers(path, std::fs::read_to_string(path))
+}
+
+/// [`load_newt_mcp_toml`] over an already-attempted read. Pure.
+fn newt_mcp_file_servers(
+    path: &Path,
+    read: std::io::Result<String>,
+) -> std::result::Result<Vec<McpServerEntry>, String> {
+    let skipped = "its MCP servers were not loaded";
+    match read {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("{}: {error}; {skipped}", path.display())),
+        Ok(text) => parse_newt_mcp_toml_checked(&text)
+            .map_err(|error| format!("{}: {error}; {skipped}", path.display())),
+    }
+}
+
+/// Whether `a` and `b` name one member of the `[[mcp_servers]]` map `field`:
+/// HTTP header names are case-insensitive, environment variable names are not.
+#[must_use]
+pub fn same_mcp_map_member(field: &str, a: &str, b: &str) -> bool {
+    if field == "headers" {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 /// Whether `entry` configures an `Authorization` header (any value).
@@ -1660,6 +1855,9 @@ pub struct McpDiscoveryReport {
     pub servers: Vec<DiscoveredMcpServer>,
     /// Valid entries shadowed by an earlier namespace.
     pub conflicts: Vec<McpConflict>,
+    /// Newt-owned sources that could not be loaded, as value-independent
+    /// messages. Discovery continues without them, but says so.
+    pub diagnostics: Vec<String>,
 }
 
 fn dedup_report(sources: Vec<DiscoveredMcpServer>, sanitize: bool) -> McpDiscoveryReport {
@@ -1736,17 +1934,21 @@ pub fn discover_with_namespace_mode(
     workspace: &Path,
     sanitize_server_names: bool,
 ) -> Vec<McpServerEntry> {
-    discover_report_with_namespace_mode(
+    let report = discover_report_with_namespace_mode(
         newt_servers,
         newt_mcp_toml,
         home,
         workspace,
         sanitize_server_names,
-    )
-    .servers
-    .into_iter()
-    .map(|server| server.entry)
-    .collect()
+    );
+    for diagnostic in &report.diagnostics {
+        tracing::warn!("{diagnostic}");
+    }
+    report
+        .servers
+        .into_iter()
+        .map(|server| server.entry)
+        .collect()
 }
 
 /// The same discovery and precedence used for connection, retaining origins and conflicts.
@@ -1768,8 +1970,11 @@ pub fn discover_report_with_namespace_mode(
         );
     };
     append(newt_servers.to_vec(), McpSource::Configuration);
-    if let Some(path) = newt_mcp_toml {
-        append(load_newt_mcp_toml(path), McpSource::UserMcpFile);
+    let mut diagnostics = Vec::new();
+    match newt_mcp_toml.map(load_newt_mcp_toml) {
+        Some(Ok(entries)) => append(entries, McpSource::UserMcpFile),
+        Some(Err(diagnostic)) => diagnostics.push(diagnostic),
+        None => {}
     }
     // Borrowed files record where they came from, so a refusal can name the
     // import command for that exact file.
@@ -1796,7 +2001,44 @@ pub fn discover_report_with_namespace_mode(
         ),
         McpSource::ClaudeProject,
     );
-    dedup_report(sources, sanitize_server_names)
+    McpDiscoveryReport {
+        diagnostics,
+        ..dedup_report(sources, sanitize_server_names)
+    }
+}
+
+/// Every name serde accepts for a field of `T`, aliases included, read from
+/// the derive itself, so a test can hold a hand-kept field list to it.
+#[cfg(test)]
+pub(crate) fn serde_field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    use serde::de::{Error, Visitor};
+    struct Names(std::cell::Cell<&'static [&'static str]>);
+    impl<'de> serde::Deserializer<'de> for &Names {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: Visitor<'de>>(
+            self,
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            Err(Error::custom("field names only"))
+        }
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            self.0.set(fields);
+            Err(Error::custom("field names only"))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+    let names = Names(std::cell::Cell::new(&[]));
+    let _ = T::deserialize(&names);
+    names.0.get()
 }
 
 #[cfg(test)]

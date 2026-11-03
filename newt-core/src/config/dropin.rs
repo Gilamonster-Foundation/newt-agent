@@ -59,6 +59,21 @@ pub enum DropinOwnership {
     Probe,
 }
 
+/// Deserialize a drop-in file's TOML. A failure says only where parsing
+/// stopped: a TOML error quotes the offending line and a serde message can
+/// quote a value, either of which may be a credential, and a skipped drop-in
+/// is logged on every config load (#2915).
+pub(crate) fn parse_dropin<T: serde::de::DeserializeOwned>(
+    text: &str,
+) -> std::result::Result<T, String> {
+    toml::from_str(text).map_err(|error| {
+        match crate::mcp::McpConfigError::position(text, error.span()) {
+            Some((line, column)) => format!("parse error at line {line}, column {column}"),
+            None => "parse error".to_string(),
+        }
+    })
+}
+
 /// Classify a backend drop-in file's raw text — the SAME ownership decision
 /// the loader and [`persist_probe_observation`] make, exposed for panel /
 /// setup surfaces. Ownership only: a probe-owned file that later fails the
@@ -73,7 +88,7 @@ pub fn classify_backend_dropin(text: &str) -> std::result::Result<DropinOwnershi
         Some(RecordTag::ProbeV1) => Ok(DropinOwnership::Probe),
         Some(RecordTag::OperatorV1) => Ok(DropinOwnership::Operator),
         None => {
-            let backend = toml::from_str::<BackendConfig>(text).map_err(|e| e.to_string())?;
+            let backend = parse_dropin::<BackendConfig>(text)?;
             match classify_untagged_dropin(&backend, text)? {
                 DropinOwner::Operator => Ok(DropinOwnership::Operator),
                 DropinOwner::Probe => Ok(DropinOwnership::Probe),
@@ -329,9 +344,7 @@ struct DiskRecordHeader {
 /// The `record` tag of a drop-in's raw text, if any. Unknown sibling keys
 /// are ignored — this reads the header, nothing else.
 pub(super) fn disk_record_tag(text: &str) -> std::result::Result<Option<RecordTag>, String> {
-    toml::from_str::<DiskRecordHeader>(text)
-        .map(|h| h.record)
-        .map_err(|e| e.to_string())
+    parse_dropin::<DiskRecordHeader>(text).map(|h| h.record)
 }
 
 /// The strict machine-record schema for a probe drop-in — a
@@ -393,7 +406,7 @@ struct ProbeProvenanceV1 {
 /// the key set, which the permissive [`BackendConfig`] parse cannot police.
 pub(super) fn parse_probe_record(text: &str) -> std::result::Result<ProbeRecordV1, String> {
     let r: ProbeRecordV1 =
-        toml::from_str(text).map_err(|e| format!("not a valid probe record: {e}"))?;
+        parse_dropin(text).map_err(|e| format!("not a valid probe record: {e}"))?;
     validate_probe_record(&r).map(|()| r)
 }
 
@@ -480,7 +493,7 @@ pub fn persist_probe_observation(
                 Some(RecordTag::ProbeV1) => true,
                 Some(RecordTag::OperatorV1) => false,
                 None => {
-                    let prior = toml::from_str::<BackendConfig>(&text)
+                    let prior = parse_dropin::<BackendConfig>(&text)
                         .map_err(|e| format!("parse {}: {e}", path.display()))?;
                     match classify_untagged_dropin(&prior, &text) {
                         Ok(DropinOwner::Probe) => true,

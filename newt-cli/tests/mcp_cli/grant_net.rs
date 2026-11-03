@@ -50,6 +50,154 @@ fn merge_does_not_grant_network_authority_for_a_skipped_server() {
 #[test]
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
+fn force_import_grants_and_reports_the_entry_it_saved() {
+    // #3062 review (F2, G4): a force import keeps a local `enabled = false`
+    // the source omits, so the saved server stays disabled. Its host must not
+    // be granted, and the next steps must not call it admitted.
+    let sb = sandbox();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "remote": { "type": "http", "url": "https://mcp.example.test/mcp" },
+              "docs": { "command": "/bin/true" }
+        } }"#,
+    )
+    .unwrap();
+    let config = sb.config_dir.join("config.toml");
+    let config_text = "[[mcp_servers]]\nname = \"remote\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nenabled = false # keep off until review\n";
+    std::fs::write(&config, config_text).unwrap();
+
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--name",
+            "remote",
+            "--force",
+            "--grant-net",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remote — not admitted"))
+        .stdout(predicate::str::contains("Granted").not());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), config_text);
+
+    let mcp = sb.config_dir.join("mcp.toml");
+    std::fs::write(
+        &mcp,
+        "[[mcp_servers]]\nname = \"docs\"\ncommand = \"/bin/true\"\nenabled = false # paused by operator\n",
+    )
+    .unwrap();
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--name",
+            "docs",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docs — not admitted"))
+        .stdout(predicate::str::contains("docs — admitted").not());
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_grant_withheld_from_a_disabled_server_is_named_with_its_host() {
+    // #3062 review (R3-8): --grant-net grants no host to a server the merge
+    // keeps disabled (F2), and said nothing of it, so the grant the operator
+    // asked for went missing without a word. Each withheld host is named,
+    // with how to grant it once the server is enabled.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"remote\"\ntype = \"http\"\nurl = \"https://mcp.example.test/mcp\"\nenabled = false # keep off until review\n",
+    )
+    .unwrap();
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "remote": { "type": "http", "url": "https://mcp.example.test/mcp" },
+              "open": { "type": "http", "url": "https://open.example.test/mcp" }
+        } }"#,
+    )
+    .unwrap();
+    let import = |extra: &[&str]| {
+        newt(&sb)
+            .args([
+                "mcp",
+                "import",
+                source.to_str().unwrap(),
+                "--all",
+                "--force",
+            ])
+            .args(extra)
+            .assert()
+            .success()
+    };
+
+    import(&["--grant-net"])
+        .stdout(predicate::str::contains("host(s) in").and(predicate::str::contains(
+            ": open.example.test\n",
+        )))
+        .stdout(predicate::str::contains(
+            "Withheld the network grant for `remote`, which stays disabled: once it is enabled, grant the exact hostname mcp.example.test in trusted [tui.permissions] net",
+        ))
+        .stdout(predicate::str::contains("for `open`").not());
+    // Nothing was asked for without --grant-net, so nothing is withheld.
+    import(&[]).stdout(predicate::str::contains("Withheld").not());
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_host_already_granted_is_not_named_as_withheld() {
+    // #3062 review (R4-1): the withheld line named the host of a disabled
+    // server even when the same import granted it to an enabled one, or the
+    // target's net already held it, so it asked for a grant that is there.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let remote = "[[mcp_servers]]\nname = \"remote\"\ntype = \"http\"\nurl = \"https://shared.example.test/a/mcp\"\nenabled = false # keep off until review\n";
+    let source = sb.cwd.join("c.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "remote": { "type": "http", "url": "https://shared.example.test/a/mcp" },
+              "open": { "type": "http", "url": "https://shared.example.test/b/mcp" }
+        } }"#,
+    )
+    .unwrap();
+    let import = |selection: &[&str]| {
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap()])
+            .args(selection)
+            .args(["--force", "--grant-net"])
+            .assert()
+            .success()
+    };
+
+    // Granted in this run, to `open` on the same host.
+    std::fs::write(&config, remote).unwrap();
+    import(&["--all"])
+        .stdout(predicate::str::contains(": shared.example.test\n"))
+        .stdout(predicate::str::contains("Withheld").not());
+    // Already in the target's net.
+    let granted = format!("{remote}\n[tui.permissions]\nnet = [\"shared.example.test\"]\n");
+    std::fs::write(&config, &granted).unwrap();
+    import(&["--name", "remote"]).stdout(predicate::str::contains("Withheld").not());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), granted);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
 fn grant_net_merge_under_a_project_config_recognizes_the_user_owned_server() {
     let sb = sandbox();
     std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
@@ -242,7 +390,12 @@ fn appended_project_same_name_obeys_default_merge_and_force_semantics() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Overwrote 1"));
+        .stdout(predicate::str::contains(
+            "Replaced 1 lower-precedence server(s)",
+        ))
+        .stdout(predicate::str::contains(
+            "Results: 0 added, 1 replaced, 0 unchanged, 0 skipped.",
+        ));
     let config = load_config(&sb.config_dir.join("config.toml"));
     assert_eq!(config.mcp_servers[0].name, "review");
     assert_eq!(config.tui.unwrap().permissions.net, ["review.example.test"]);
@@ -400,48 +553,43 @@ fn explicit_grant_uses_the_explicit_base_merge_strategy() {
 #[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
 #[serial_test::serial(real_fs)]
 fn force_grant_net_refuses_a_cross_file_legacy_override() {
-    for target_also_exists in [false, true] {
-        let sb = sandbox();
-        let breakout = sb.config_dir.join("mcp.toml");
-        let breakout_text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\n";
-        std::fs::write(&breakout, breakout_text).unwrap();
-        let config = sb.config_dir.join("config.toml");
-        let config_text = target_also_exists.then_some(
-            "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://active.example.test/mcp\"\n",
-        );
-        if let Some(text) = config_text {
-            std::fs::write(&config, text).unwrap();
-        }
-        let source = sb.cwd.join("source.json");
-        std::fs::write(
-            &source,
-            r#"{ "mcpServers": {
-                  "review": { "type": "http", "url": "https://new.example.test/mcp" }
-            } }"#,
-        )
-        .unwrap();
+    // Adding `review` to config.toml would shadow the mcp.toml copy. When
+    // config.toml already holds it, the update is in place instead (#3062
+    // review, F4; see force_import_updates_the_owner_in_place_beside_a_shadowed_copy).
+    let sb = sandbox();
+    let breakout = sb.config_dir.join("mcp.toml");
+    let breakout_text = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://old.example.test/mcp\"\n";
+    std::fs::write(&breakout, breakout_text).unwrap();
+    let config = sb.config_dir.join("config.toml");
+    let source = sb.cwd.join("source.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "review": { "type": "http", "url": "https://new.example.test/mcp" }
+        } }"#,
+    )
+    .unwrap();
 
-        newt(&sb)
-            .args([
-                "mcp",
-                "import",
-                source.to_str().unwrap(),
-                "--name",
-                "review",
-                "--grant-net",
-                "--force",
-            ])
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("cross-file overwrite"))
-            .stderr(predicate::str::contains("Remove the existing server first"));
+    newt(&sb)
+        .args([
+            "mcp",
+            "import",
+            source.to_str().unwrap(),
+            "--name",
+            "review",
+            "--grant-net",
+            "--force",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cross-file overwrite"))
+        .stderr(predicate::str::contains(format!(
+            "`newt --config {} mcp remove review`",
+            newt_core::mcp::shell_quote_arg(&breakout.to_string_lossy())
+        )));
 
-        assert_eq!(std::fs::read_to_string(breakout).unwrap(), breakout_text);
-        match config_text {
-            Some(text) => assert_eq!(std::fs::read_to_string(config).unwrap(), text),
-            None => assert!(!config.exists()),
-        }
-    }
+    assert_eq!(std::fs::read_to_string(breakout).unwrap(), breakout_text);
+    assert!(!config.exists());
 }
 
 #[test]
@@ -534,5 +682,200 @@ fn grant_net_kill_boundaries_recover_to_an_atomic_connector_and_grant() {
                 .file_name()
                 .to_string_lossy()
                 .ends_with(".tmp")));
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_grant_import_does_not_revive_a_dropped_stub_over_the_live_copy() {
+    // #3062 review (R2-7): config.toml holds a `docs` whose url is commented
+    // out, so discovery drops it; mcp.toml holds the live `docs`, paused. A
+    // --grant-net import writes config.toml, and F4 lets it update an entry
+    // that file really holds. Merging into the stub instead would revive it
+    // over the paused copy and grant its host, so the cross-file refusal
+    // stands and neither file changes.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let stub = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n# url = \"https://docs.example.test/mcp\"\n";
+    let live = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\nurl = \"https://docs.example.test/mcp\"\nenabled = false # paused until security review\n";
+    std::fs::write(&config, stub).unwrap();
+    std::fs::write(&mcp, live).unwrap();
+    let source = sb.cwd.join("s.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "docs": { "type": "http", "url": "https://docs.example.test/mcp" } } }"#,
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args(["mcp", "import", source.to_str().unwrap(), "--name", "docs"])
+        .args(["--force", "--grant-net"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refusing a cross-file overwrite"));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), stub);
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), live);
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn the_cross_file_refusal_leads_with_the_route_that_keeps_the_copy() {
+    // #3062 review (R3-6): a --grant-net import writes config.toml, so it
+    // refuses a name the break-out mcp.toml holds. Its one remedy, removing
+    // that copy, dropped `enabled = false` and the timeout: the re-run added
+    // the server enabled and granted its host, or, with a dropped stub in
+    // config.toml, revived the stub (R2-7). The refusal leads with the re-run
+    // without --grant-net, which keeps the copy as it is, names the host to
+    // grant and the stub, and says what the remove, last, loses.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let live = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://review.example.test/mcp\"\nenabled = false # paused: security review pending\nrequest_timeout_secs = 90\n";
+    let stub = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\n# url = \"https://review.example.test/mcp\"\n";
+    let source = sb.cwd.join("s.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "review": { "type": "http", "url": "https://review.example.test/mcp" } } }"#,
+    )
+    .unwrap();
+    let import = |extra: &[&str]| {
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap()])
+            .args(["--name", "review", "--force"])
+            .args(extra)
+            .assert()
+    };
+
+    for held in [None, Some(stub)] {
+        std::fs::write(&mcp, live).unwrap();
+        match held {
+            Some(text) => std::fs::write(&config, text).unwrap(),
+            None => assert!(!config.exists()),
+        }
+        let output = import(&["--grant-net"]).failure().get_output().clone();
+        let refusal = String::from_utf8(output.stderr).unwrap();
+        let rerun = refusal.find("Re-run without --grant-net").expect(&refusal);
+        let remove = refusal.find("mcp remove review`").expect(&refusal);
+        assert!(rerun < remove, "{refusal}");
+        assert!(
+            refusal[rerun..remove].contains("review.example.test in trusted [tui.permissions] net"),
+            "{refusal}"
+        );
+        assert!(refusal[remove..].contains("`enabled = false`"), "{refusal}");
+        assert_eq!(
+            refusal.contains("only a `review` entry that discovery drops"),
+            held.is_some(),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), live);
+
+        // Following it keeps the paused, tuned copy as it was.
+        import(&[])
+            .success()
+            .stdout(predicate::str::contains("1 unchanged"));
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), live);
+    }
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_batch_cross_file_refusal_names_a_route_the_batch_can_take() {
+    // #3062 review (R4-3): in a batch, the refusal's lead "Re-run without
+    // --grant-net" ran the --force owner redirect over every server, and
+    // `alpha` (config.toml) and `review` (mcp.toml) have different owners,
+    // so it failed. The refusal names the re-run of `review` alone, and
+    // --grant-net, by name, for the others; both routes work.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let mcp = sb.config_dir.join("mcp.toml");
+    let tuned = "[[mcp_servers]]\nname = \"review\"\ntype = \"http\"\nurl = \"https://review.example.test/mcp\"\nrequest_timeout_secs = 90 # tuned\n";
+    std::fs::write(
+        &config,
+        "[[mcp_servers]]\nname = \"alpha\"\ntype = \"http\"\nurl = \"https://alpha.example.test/mcp\"\n",
+    )
+    .unwrap();
+    std::fs::write(&mcp, tuned).unwrap();
+    let source = sb.cwd.join("s.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": {
+              "alpha": { "type": "http", "url": "https://alpha.example.test/mcp" },
+              "review": { "type": "http", "url": "https://review.example.test/mcp" }
+        } }"#,
+    )
+    .unwrap();
+    let import = |args: &[&str]| {
+        newt(&sb)
+            .args(["mcp", "import", source.to_str().unwrap(), "--force"])
+            .args(args)
+            .assert()
+    };
+
+    import(&["--all", "--grant-net"])
+        .failure()
+        .stderr(predicate::str::contains(
+            "Re-run it alone with --name review and without --grant-net",
+        ))
+        .stderr(predicate::str::contains(
+            "Keep --grant-net for the others, each imported by --name.",
+        ));
+    import(&["--name", "review"])
+        .success()
+        .stdout(predicate::str::contains("1 unchanged"));
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), tuned);
+    import(&["--name", "alpha", "--grant-net"])
+        .success()
+        .stdout(predicate::str::contains(": alpha.example.test\n"));
+}
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn a_grant_import_is_not_blocked_by_an_entry_discovery_drops() {
+    // #3062 review (R2-3): C2's rule, that an entry discovery drops counts
+    // for nothing, also holds for the other files a --grant-net import
+    // checks: an appended project and the break-out mcp.toml. A `docs` stub
+    // with no url in either neither refuses nor skips the import, which
+    // adds a working `docs` to config.toml and says so, and leaves the stub.
+    let sb = sandbox();
+    let config = sb.config_dir.join("config.toml");
+    let stub = "[[mcp_servers]]\nname = \"docs\"\ntype = \"http\"\n";
+    let appended = format!("[merge]\narrays = \"append\"\n\n{stub}");
+    std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
+    let source = sb.cwd.join("src.json");
+    std::fs::write(
+        &source,
+        r#"{ "mcpServers": { "docs": { "type": "http", "url": "https://docs.example.test/mcp" } } }"#,
+    )
+    .unwrap();
+    for (holder, text) in [
+        (sb.cwd.join(".newt").join("config.toml"), appended.as_str()),
+        (sb.config_dir.join("mcp.toml"), stub),
+    ] {
+        for mode in [&[][..], &["--merge"][..], &["--force"][..]] {
+            std::fs::write(&config, "[tui.permissions]\nnet = []\n").unwrap();
+            std::fs::write(&holder, text).unwrap();
+            newt(&sb)
+                .args(["mcp", "import", source.to_str().unwrap(), "--name", "docs"])
+                .arg("--grant-net")
+                .args(mode)
+                .assert()
+                .success()
+                .stdout(predicate::str::contains(
+                    "Results: 1 added, 0 replaced, 0 unchanged, 0 skipped.",
+                ));
+            assert_eq!(std::fs::read_to_string(&holder).unwrap(), text);
+            let saved = load_config(&config);
+            assert_eq!(
+                saved.mcp_servers[0].url.as_deref(),
+                Some("https://docs.example.test/mcp"),
+                "{mode:?}"
+            );
+        }
+        std::fs::remove_file(&holder).unwrap();
     }
 }

@@ -39,3 +39,55 @@ fn bare_mcp_action_serves_when_stdin_is_piped() {
 fn bare_mcp_action_prints_help_when_stdin_is_a_terminal() {
     assert_eq!(bare_mcp_action(true), BareMcpAction::Help);
 }
+
+/// #3062 review (R1-14): the import help names every destination. A plain
+/// import writes `~/.newt/mcp.toml`, but --grant-net writes the connector
+/// and its grants to `~/.newt/config.toml`, and refuses to update a server
+/// `~/.newt/mcp.toml` defines.
+#[test]
+fn import_help_names_the_grant_net_destination() {
+    use clap::CommandFactory;
+    let cli = crate::Cli::command();
+    let import = cli
+        .find_subcommand("mcp")
+        .and_then(|mcp| mcp.find_subcommand("import"))
+        .unwrap();
+    let help = import
+        .get_long_about()
+        .or(import.get_about())
+        .unwrap()
+        .to_string();
+    assert!(
+        help.contains("--grant-net writes `~/.newt/config.toml`"),
+        "{help}"
+    );
+}
+
+/// #3062 review (R2-11): --merge skips a name already defined, except one
+/// that only a borrowed project config or an ambient `./newt.toml` defines,
+/// which it refuses (C1). Its help no longer promises "no error".
+#[test]
+fn import_merge_help_names_the_clash_it_still_refuses() {
+    use clap::CommandFactory;
+    let cli = crate::Cli::command();
+    let merge = cli
+        .find_subcommand("mcp")
+        .and_then(|mcp| mcp.find_subcommand("import"))
+        .and_then(|import| {
+            import
+                .get_arguments()
+                .find(|arg| arg.get_id() == "merge")
+                .cloned()
+        })
+        .unwrap();
+    let help = merge
+        .get_long_help()
+        .or(merge.get_help())
+        .unwrap()
+        .to_string();
+    assert!(!help.contains("no error"), "{help}");
+    assert!(
+        help.contains("project config or an ambient `./newt.toml`"),
+        "{help}"
+    );
+}

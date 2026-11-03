@@ -106,6 +106,9 @@ use tools::{
 /// Process-scoped user config root override, set by the CLI's `--config-dir`.
 pub const NEWT_CONFIG_DIR_ENV: &str = "NEWT_CONFIG_DIR";
 
+/// The shared system config, the last base candidate.
+const SYSTEM_CONFIG_PATH: &str = "/etc/newt/config.toml";
+
 // ---------------------------------------------------------------------------
 // Config types
 // ---------------------------------------------------------------------------
@@ -1546,7 +1549,7 @@ impl Config {
         report: &mut dyn FnMut(crate::tty::Notice<'static>),
         held_locks: &[&crate::atomic_fs::LockGuard],
     ) -> Result<ResolvedConfig> {
-        let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
+        let base_path = Self::base_config_path();
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
         // root — `cd repo && newt` → same host-RCE class as the walk-up) rather
@@ -1901,7 +1904,8 @@ impl Config {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            match std::fs::read_to_string(&path).map(|t| toml::from_str::<crate::dgx::DgxNode>(&t))
+            match std::fs::read_to_string(&path)
+                .map(|t| dropin::parse_dropin::<crate::dgx::DgxNode>(&t))
             {
                 Ok(Ok(mut node)) => {
                     // The filename is authoritative for the name (collision-free).
@@ -2361,33 +2365,24 @@ impl Config {
     }
 
     /// Set `enabled` on the named `[[mcp_servers]]` entry, preserving comments
-    /// and formatting (`/mcp enable|disable`, #1149). PURE (no I/O) like
-    /// [`with_net_host`](Self::with_net_host); the caller does the read/write.
-    /// Errors when the server name isn't present.
+    /// and formatting (`/mcp enable|disable`, #1149). An entry already in that
+    /// state (absent means enabled) is left byte for byte; otherwise the value
+    /// is written in place, keeping the comments on and above its line. PURE
+    /// (no I/O) like [`with_net_host`](Self::with_net_host); the caller does
+    /// the read/write. Errors when the server name isn't present.
     pub fn with_mcp_enabled(text: &str, name: &str, enabled: bool) -> Result<String> {
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
-        let servers =
-            doc.as_table_mut()
-                .entry("mcp_servers")
-                .or_insert(toml_edit::Item::ArrayOfTables(
-                    toml_edit::ArrayOfTables::new(),
-                ));
-        let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
-            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-        })?;
-        let entry = arr
-            .iter_mut()
-            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+        let (index, entry) = mcp_entry(text, name)?
             .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
-        if enabled {
-            // Default is enabled: remove the key so the file stays minimal.
-            entry.remove("enabled");
-        } else {
-            entry["enabled"] = toml_edit::value(false);
+        // Decided from the typed entry, so a section the writers cannot edit
+        // (an inline array) refuses only a real change.
+        if entry.enabled == enabled {
+            return Ok(text.to_owned());
         }
-        Ok(doc.to_string())
+        edit_mcp_toml(text, |doc| {
+            let entry = mcp_entry_table(doc, index)?;
+            replace_in_place(entry, "enabled", toml_edit::value(enabled));
+            Ok(())
+        })
     }
 
     /// Append a `[[mcp_servers]]` entry to the TOML `text`, preserving comments
@@ -2400,57 +2395,444 @@ impl Config {
     /// server never lands in the file.
     pub fn with_mcp_server_added(text: &str, entry: &crate::mcp::McpServerEntry) -> Result<String> {
         crate::mcp::validate_entry_for_write(entry)?;
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
-        let servers =
-            doc.as_table_mut()
-                .entry("mcp_servers")
-                .or_insert(toml_edit::Item::ArrayOfTables(
-                    toml_edit::ArrayOfTables::new(),
-                ));
-        let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
-            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-        })?;
-        if arr
-            .iter()
-            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(entry.name.as_str()))
-        {
+        edit_mcp_toml(text, |doc| {
+            let servers =
+                doc.as_table_mut()
+                    .entry("mcp_servers")
+                    .or_insert(toml_edit::Item::ArrayOfTables(
+                        toml_edit::ArrayOfTables::new(),
+                    ));
+            let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
+                NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+            })?;
+            if arr
+                .iter()
+                .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(entry.name.as_str()))
+            {
+                return Err(NewtError::Config(format!(
+                    "an [[mcp_servers]] entry named `{}` already exists (remove it first, \
+                     or toggle it with `/mcp enable|disable`)",
+                    entry.name
+                )));
+            }
+            arr.push(crate::mcp::entry_to_toml_table(entry, None)?);
+            Ok(())
+        })
+    }
+
+    /// Replace the source-provided fields of a same-name `[[mcp_servers]]`
+    /// entry while retaining local fields the source did not provide. Appends
+    /// the entry when it is not already present. `provided` names the keys the
+    /// source spelled out (see `McpImportParseReport::provided`), so an explicit
+    /// empty or default value is applied rather than mistaken for an omission.
+    /// Pure; the caller owns locking and durable writeback.
+    pub fn with_mcp_server_merged(
+        text: &str,
+        entry: &crate::mcp::McpServerEntry,
+        provided: &std::collections::BTreeSet<&str>,
+    ) -> Result<String> {
+        crate::mcp::validate_entry_for_write(entry)?;
+        let entries = crate::mcp::parse_newt_mcp_toml_checked(text)
+            .map_err(|error| NewtError::Config(error.to_string()))?;
+        let Some(index) = crate::mcp::effective_entry_index(&entries, &entry.name) else {
+            return Self::with_mcp_server_added(text, entry);
+        };
+        let previous = &entries[index];
+        let fresh = crate::mcp::entry_to_toml_table(entry, None)?;
+        let sourced = |key: &str| fresh.contains_key(key) || provided.contains(key);
+        // Local settings the source leaves alone would follow a moved
+        // destination: headers, and a static OAuth client with its pinned
+        // scopes and callback port (registered with the old authorization
+        // server), to a new endpoint; env, and argv written for the old
+        // program (a credential flag included), to a different one. The
+        // program is the whole argv, since a launcher such as `npx` picks it
+        // by its args. A refusal says to supply a kept setting in the source
+        // only when every import format has a field for it.
+        let mut suppliable = true;
+        let mut kept = |key: &str, count: usize| {
+            if sourced(key) || count == 0 {
+                return 0;
+            }
+            suppliable &= crate::mcp::every_import_format_sets(key);
+            count
+        };
+        let (destination, moved, carried) = match entry.transport {
+            crate::mcp::TransportKind::Stdio => {
+                let args = if sourced("args") {
+                    &entry.args
+                } else {
+                    &previous.args
+                };
+                (
+                    "command",
+                    previous.command != entry.command || previous.args != *args,
+                    vec![
+                        (kept("env", previous.env.len()), "environment variable(s)"),
+                        (kept("args", previous.args.len()), "argument(s)"),
+                    ],
+                )
+            }
+            crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => (
+                "endpoint",
+                crate::mcp::mcp_endpoint_changed(previous.url.as_deref(), entry.url.as_deref()),
+                vec![
+                    (kept("headers", previous.headers.len()), "header(s)"),
+                    (
+                        kept("oauth_client_id", previous.oauth_client_id.iter().count())
+                            + kept("oauth_scopes", previous.oauth_scopes.iter().count())
+                            + kept(
+                                "oauth_callback_port",
+                                previous.oauth_callback_port.iter().count(),
+                            ),
+                        "OAuth setting(s)",
+                    ),
+                ],
+            ),
+        };
+        let carried: Vec<String> = carried
+            .into_iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, noun)| format!("{count} local {noun}"))
+            .collect();
+        if moved && !carried.is_empty() {
+            let remedy = if suppliable {
+                "Supply them in the source, or remove them"
+            } else {
+                "Remove them"
+            };
             return Err(NewtError::Config(format!(
-                "an [[mcp_servers]] entry named `{}` already exists (remove it first, \
-                 or toggle it with `/mcp enable|disable`)",
-                entry.name
+                "MCP server `{}` would change its {destination} while keeping {} the source does not provide; refusing to send them to the new {destination}. {remedy} from the existing entry, then re-run the import",
+                entry.name,
+                carried.join(" and ")
             )));
         }
-        arr.push(crate::mcp::entry_to_toml_table(entry, None)?);
-        Ok(doc.to_string())
+        // The source decides what it spelled out, what the entry renders, and
+        // the transport; a key `fresh` omits is the default. A key whose
+        // meaning does not change is left as written, comment included, even
+        // when it only restates a default (`enabled = true`, `type = "stdio"`).
+        let decided: std::collections::BTreeSet<&str> = fresh
+            .iter()
+            .map(|(key, _)| key)
+            .chain(provided.iter().copied())
+            .chain(["type"])
+            .collect();
+        // The other transport's fields do not belong to this entry.
+        let foreign: &[&str] = match entry.transport {
+            crate::mcp::TransportKind::Stdio => &["url", "headers"],
+            crate::mcp::TransportKind::Sse | crate::mcp::TransportKind::Http => {
+                &["command", "args", "env"]
+            }
+        };
+        // Whether anything changes is decided from the typed entry, so a
+        // section the writers cannot edit (an inline array) refuses only a
+        // real change. A map is compared member by member, as it is merged.
+        let held = crate::mcp::entry_to_toml_table(previous, None)?;
+        let same = |key: &str| {
+            let (have, wanted) = (held.get(key), fresh.get(key));
+            same_mcp_field(key, have, wanted)
+                || have
+                    .and_then(toml_edit::Item::as_table_like)
+                    .zip(wanted.and_then(toml_edit::Item::as_table_like))
+                    .is_some_and(|(have, wanted)| {
+                        let (changed, dropped) = mcp_map_edits(key, have, wanted);
+                        changed.is_empty() && dropped.is_empty()
+                    })
+        };
+        if decided.iter().all(|key| same(key))
+            && foreign
+                .iter()
+                .all(|key| same_mcp_field(key, held.get(key), None))
+        {
+            return Ok(text.to_owned());
+        }
+        let merged = edit_mcp_toml(text, |doc| {
+            let existing = mcp_entry_table(doc, index)?;
+            for key in decided {
+                let wanted = fresh.get(key);
+                // An accepted alias (`requestTimeoutSecs`) is this same field: it
+                // is updated where and as the operator spelled it, never doubled.
+                let local = local_mcp_spelling(existing, key, wanted);
+                if same_mcp_field(key, existing.get(&local), wanted) {
+                    continue;
+                }
+                // A reset to a default the minimal rendering leaves out is
+                // written in place (`args = []`) so the line keeps its comment.
+                let wanted = wanted
+                    .cloned()
+                    .or_else(|| crate::mcp::implicit_default(key).map(toml_edit::Item::Value));
+                match wanted {
+                    Some(value) => match (existing.get_mut(&local), value.as_table_like()) {
+                        // A map (`env`, `headers`) is updated member by member,
+                        // so its layout and each member's comments stay.
+                        (Some(map), Some(members)) if map.is_table_like() => {
+                            merge_mcp_map(key, map, members);
+                        }
+                        _ => replace_in_place(existing, &local, value),
+                    },
+                    None => {
+                        let _ = existing.remove(&local);
+                    }
+                }
+            }
+            for key in foreign {
+                let local = local_mcp_spelling(existing, key, None);
+                if !same_mcp_field(key, existing.get(&local), None) {
+                    let _ = existing.remove(&local);
+                }
+            }
+            Ok(())
+        })?;
+        // Backstop: never hand back a document the MCP reader would reject.
+        crate::mcp::parse_newt_mcp_toml_checked(&merged)
+            .map_err(|error| NewtError::Config(error.to_string()))?;
+        Ok(merged)
     }
 
     /// Remove the named `[[mcp_servers]]` entry from the TOML `text`, preserving
     /// comments and formatting (`newt mcp remove`). PURE (no I/O); the caller
     /// does the read/write. Errors when the server name isn't present.
     pub fn with_mcp_server_removed(text: &str, name: &str) -> Result<String> {
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
-        // Distinguish "no section" (→ the entry is absent) from "a section this
-        // writer cannot edit" (e.g. the inline-array form, which the serde
-        // reader accepts) — misreporting the latter as absent would be a lie.
-        let item = doc
-            .as_table_mut()
-            .get_mut("mcp_servers")
-            .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
-        let arr = item.as_array_of_tables_mut().ok_or_else(|| {
-            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
-        })?;
-        let before = arr.len();
-        arr.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
-        if arr.len() == before {
-            return Err(NewtError::Config(format!(
-                "no [[mcp_servers]] entry named `{name}`"
-            )));
+        edit_mcp_toml(text, |doc| {
+            // Distinguish "no section" (→ the entry is absent) from "a section
+            // this writer cannot edit" (e.g. the inline-array form, which the
+            // serde reader accepts) — misreporting the latter as absent would
+            // be a lie.
+            let item = doc.as_table_mut().get_mut("mcp_servers").ok_or_else(|| {
+                NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`"))
+            })?;
+            let arr = item.as_array_of_tables_mut().ok_or_else(|| {
+                NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+            })?;
+            let before = arr.len();
+            arr.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
+            if arr.len() == before {
+                return Err(NewtError::Config(format!(
+                    "no [[mcp_servers]] entry named `{name}`"
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    /// Find the first file that contributes `name` to the effective Newt MCP
+    /// list. A project array replaces the base by default; with `arrays =
+    /// "append"`, base entries retain precedence over project entries. The
+    /// dedicated user `mcp.toml` follows the resolved config layers. Discovery
+    /// drops an invalid entry, so one owns the name only when no file has a
+    /// valid one; `newt mcp remove` can then still delete it.
+    pub fn mcp_server_owner_path(name: &str) -> anyhow::Result<Option<PathBuf>> {
+        let base = Self::base_config_path();
+        let project = Self::project_layer_path(base.as_deref());
+
+        let base_value = base
+            .as_deref()
+            .map(Self::read_mcp_source_value)
+            .transpose()?;
+        let project_value = project
+            .as_deref()
+            .map(Self::read_mcp_source_value)
+            .transpose()?;
+        let project_declares_mcp = project_value
+            .as_ref()
+            .is_some_and(|value| value.get("mcp_servers").is_some());
+        let strategy = project_value
+            .as_ref()
+            .zip(base_value.as_ref())
+            .map(|(project, base)| layering::array_merge_strategy(project, base))
+            .unwrap_or_default();
+
+        let layers = if project_declares_mcp && strategy == ArrayMergeStrategy::Replace {
+            vec![project]
+        } else {
+            vec![base, project]
+        };
+        let mcp_toml = Self::user_config_dir()
+            .map(|dir| dir.join("mcp.toml"))
+            .filter(|path| path.is_file());
+        let files: Vec<PathBuf> = layers.into_iter().flatten().chain(mcp_toml).collect();
+        for valid_only in [true, false] {
+            for path in &files {
+                if Self::mcp_file_contains(path, name, valid_only)? {
+                    return Ok(Some(path.clone()));
+                }
+            }
         }
-        Ok(doc.to_string())
+        Ok(None)
+    }
+
+    /// The walked-up project config when it is a layer of its own. One that
+    /// is also `base` (a config dir that is an ancestor's `.newt`) is read
+    /// once, as the trusted base, as the resolver reads it (#2915).
+    fn project_layer_path(base: Option<&Path>) -> Option<PathBuf> {
+        Self::project_config_path().filter(|project| {
+            base.is_none_or(|base| {
+                match (
+                    crate::atomic_fs::ResolvedPath::resolve(project),
+                    crate::atomic_fs::ResolvedPath::resolve(base),
+                ) {
+                    (Ok(project), Ok(base)) => project != base,
+                    _ => project.as_path() != base,
+                }
+            })
+        })
+    }
+
+    /// The owner of `name` that a default-scope edit (`newt mcp remove`, `/mcp
+    /// enable|disable`) may change; see `unnamed_owner_kind` for the files
+    /// it leaves alone (#2915). `ambient_is_default` says whether this edit
+    /// writes an unpinned `./newt.toml` by default, as `newt mcp add|remove`
+    /// do (#1291) and the toggle never did. A refusal names the file and ends
+    /// with `remedy`, the caller's own route to change it there.
+    pub fn mcp_server_edit_path(
+        name: &str,
+        ambient_is_default: bool,
+        remedy: impl FnOnce(&Path) -> String,
+    ) -> anyhow::Result<PathBuf> {
+        let owner = Self::mcp_server_owner_path(name)?.ok_or_else(|| {
+            anyhow::anyhow!("no MCP server named `{name}` in the effective Newt config")
+        })?;
+        let Some(kind) = unnamed_owner_kind(
+            &owner,
+            Self::pinned_config_path().as_deref(),
+            Self::project_layer_path(Self::base_config_path().as_deref()).as_deref(),
+            !ambient_is_default && layering::base_is_ambient_newt_toml(Some(&owner)),
+        ) else {
+            return Ok(owner);
+        };
+        Err(UnnamedOwnerRefusal(format!(
+            "MCP server `{name}` is defined in the {kind} config {}, which newt edits only when named: {}",
+            owner.display(),
+            remedy(&owner)
+        ))
+        .into())
+    }
+
+    /// `/mcp enable|disable`: set `enabled` on `name` in its owning file and
+    /// return that file. An entry already in that state needs no edit, so it
+    /// is never refused; a change to a file newt edits only when named is,
+    /// with the edit to make there by hand (#2915).
+    pub fn set_mcp_server_enabled(name: &str, enabled: bool) -> anyhow::Result<PathBuf> {
+        let (path, set) = Self::mcp_toggle_target(name, enabled)?;
+        if !set {
+            Self::set_mcp_server_enabled_in_file(&path, name, enabled)?;
+        }
+        Ok(path)
+    }
+
+    /// The refusal [`Self::set_mcp_server_enabled`] gives instead of setting
+    /// `enabled` on `name` in a file newt edits only when named, or `None`:
+    /// it would set it, find it set, find no such server, or fail for another
+    /// reason, which names no edit to make. Advice that would send the
+    /// operator to `/mcp enable|disable` gives this instead, so it never
+    /// names a toggle that refuses (#2915).
+    pub fn mcp_toggle_refusal(name: &str, enabled: bool) -> Option<String> {
+        let error = Self::mcp_toggle_target(name, enabled).err()?;
+        error
+            .downcast::<UnnamedOwnerRefusal>()
+            .ok()
+            .map(|refusal| refusal.0)
+    }
+
+    /// The file the toggle edits for `name`, and whether its entry already
+    /// holds `enabled`, which needs no edit and so is never refused.
+    fn mcp_toggle_target(name: &str, enabled: bool) -> anyhow::Result<(PathBuf, bool)> {
+        if let Some(owner) = Self::mcp_server_owner_path(name)? {
+            let text = std::fs::read_to_string(&owner).map_err(|error| {
+                anyhow::anyhow!("reading MCP config {}: {error}", owner.display())
+            })?;
+            if Self::with_mcp_enabled(&text, name, enabled)? == text {
+                return Ok((owner, true));
+            }
+        }
+        let path = Self::mcp_server_edit_path(name, false, |_| {
+            format!("set `enabled = {enabled}` there by hand")
+        })?;
+        Ok((path, false))
+    }
+
+    /// Change an MCP entry under the shared config lock and atomically replace
+    /// the file only if its contents still match the snapshot read under lock.
+    pub fn set_mcp_server_enabled_in_file(
+        path: &Path,
+        name: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        Self::set_mcp_server_enabled_in_file_with(path, name, enabled, || {})
+    }
+
+    /// [`Self::set_mcp_server_enabled_in_file`], running `before_recheck`
+    /// between the read and the re-check: the window a concurrent edit lands in.
+    fn set_mcp_server_enabled_in_file_with(
+        path: &Path,
+        name: &str,
+        enabled: bool,
+        before_recheck: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        let destination = crate::atomic_fs::ResolvedPath::resolve(path).map_err(|error| {
+            anyhow::anyhow!("resolving MCP config {}: {error:#}", path.display())
+        })?;
+        let _guard = crate::atomic_fs::acquire_lock(&destination.lock_path())
+            .map_err(|error| anyhow::anyhow!("locking MCP config {}: {error:#}", path.display()))?;
+        let current_owner = Self::mcp_server_owner_path(name)?
+            .map(|owner| crate::atomic_fs::ResolvedPath::resolve(&owner))
+            .transpose()?;
+        if current_owner.as_ref() != Some(&destination) {
+            anyhow::bail!(
+                "MCP config ownership changed for `{name}`; no file was modified, retry the command"
+            );
+        }
+        let original = std::fs::read_to_string(destination.as_path())
+            .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
+        let updated = Self::with_mcp_enabled(&original, name, enabled)
+            .map_err(|error| anyhow::anyhow!("updating MCP config {}: {error}", path.display()))?;
+        if updated == original {
+            return Ok(());
+        }
+        before_recheck();
+        let current = std::fs::read_to_string(destination.as_path()).map_err(|error| {
+            anyhow::anyhow!("rechecking MCP config {}: {error}", path.display())
+        })?;
+        if current != original {
+            anyhow::bail!(
+                "concurrent edit detected in MCP config {}; the newer contents were preserved",
+                path.display()
+            );
+        }
+        destination
+            .atomic_write(updated.as_bytes())
+            .map_err(|error| anyhow::anyhow!("writing MCP config {}: {error:#}", path.display()))
+    }
+
+    fn read_mcp_source_value(path: &Path) -> anyhow::Result<toml::Value> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
+        toml::from_str(&text).map_err(|error| {
+            let at = crate::mcp::McpConfigError::position(&text, error.span());
+            anyhow::anyhow!(
+                "{}: {}",
+                path.display(),
+                crate::mcp::McpConfigError::Syntax(at)
+            )
+        })
+    }
+
+    fn mcp_file_contains(path: &Path, name: &str, valid_only: bool) -> anyhow::Result<bool> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("reading MCP config {}: {error}", path.display()))?;
+        let entries = crate::mcp::parse_newt_mcp_toml_checked(&text)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+        Ok(entries
+            .iter()
+            .any(|entry| entry.name == name && (entry.is_valid() || !valid_only)))
+    }
+
+    /// The base config file the resolver reads: the first candidate that
+    /// exists (`$NEWT_CONFIG`, `./newt.toml`, the user config, the system
+    /// config). The project config, if any, is layered over it.
+    pub fn base_config_path() -> Option<PathBuf> {
+        Self::candidate_paths()
+            .into_iter()
+            .find(|path| path.is_file())
     }
 
     /// Build the ordered list of candidate config file paths.
@@ -2467,9 +2849,336 @@ impl Config {
             paths.push(path);
         }
 
-        paths.push(PathBuf::from("/etc/newt/config.toml"));
+        paths.push(PathBuf::from(SYSTEM_CONFIG_PATH));
         paths
     }
+}
+
+/// The `[[mcp_servers]]` entry named `name` that the writers edit
+/// ([`crate::mcp::effective_entry_index`]) and its index, from the typed parse.
+fn mcp_entry(text: &str, name: &str) -> Result<Option<(usize, crate::mcp::McpServerEntry)>> {
+    let mut entries = crate::mcp::parse_newt_mcp_toml_checked(text)
+        .map_err(|error| NewtError::Config(error.to_string()))?;
+    Ok(crate::mcp::effective_entry_index(&entries, name)
+        .map(|index| (index, entries.swap_remove(index))))
+}
+
+/// The `[[mcp_servers]]` table at `index`, which the typed parse found, so
+/// only an inline-array `mcp_servers` (which the writers cannot edit) misses.
+fn mcp_entry_table(
+    doc: &mut toml_edit::DocumentMut,
+    index: usize,
+) -> Result<&mut toml_edit::Table> {
+    doc.get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .and_then(|servers| servers.get_mut(index))
+        .ok_or_else(|| NewtError::Config("[[mcp_servers]] is not an array of tables".to_string()))
+}
+
+/// A default-scope MCP edit refused because newt edits the owning file only
+/// when it is named ([`Config::mcp_server_edit_path`]). Advice repeats this
+/// refusal and no other error (#2915).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct UnnamedOwnerRefusal(String);
+
+/// The kind of config a default-scope MCP edit leaves alone unless the
+/// operator names it, or `None` when it may edit `owner`. A file pinned with
+/// `--config` or `$NEWT_CONFIG` is named. The system config is shared, and a
+/// `project` layer (a walked-up file other than the base) and an `ambient`
+/// `./newt.toml` are borrowed and may be repo-tracked; main never wrote them
+/// implicitly (#2915). Pure.
+fn unnamed_owner_kind(
+    owner: &Path,
+    pinned: Option<&Path>,
+    project: Option<&Path>,
+    ambient: bool,
+) -> Option<&'static str> {
+    if pinned == Some(owner) {
+        None
+    } else if owner == Path::new(SYSTEM_CONFIG_PATH) {
+        Some("system")
+    } else if project == Some(owner) {
+        Some("project")
+    } else if ambient {
+        Some("ambient")
+    } else {
+        None
+    }
+}
+
+/// Apply `edit` to the MCP TOML `text`, the one parse-and-render path of the
+/// `[[mcp_servers]]` writers, keeping the file's style ([`in_file_style`]).
+fn edit_mcp_toml(
+    text: &str,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+) -> Result<String> {
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        let at = crate::mcp::McpConfigError::position(text, error.span());
+        NewtError::Config(crate::mcp::McpConfigError::Syntax(at).to_string())
+    })?;
+    let before = doc.to_string();
+    edit(&mut doc)?;
+    Ok(in_file_style(text, &before, doc.to_string()))
+}
+
+/// `after`, `toml_edit`'s rendering of an edit to `text` (`before` renders
+/// it unedited), in the file's own style. An edit that changes nothing hands
+/// back `text` itself; a real one keeps the missing final newline, CRLF line
+/// endings and BOM that `toml_edit` drops when it renders a document, never
+/// at the cost of a value.
+fn in_file_style(text: &str, before: &str, mut after: String) -> String {
+    if after == before {
+        return text.to_owned();
+    }
+    // A file holding only a BOM is empty: it has no last line to keep open.
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if !body.is_empty() && !body.ends_with('\n') && after.ends_with('\n') {
+        after.pop();
+    }
+    // A CRLF inside a multi-line string is part of its value, which `before`
+    // keeps as written, so only the file's own line endings decide its style.
+    let in_values = before.matches("\r\n").count();
+    if 2 * body.matches("\r\n").count().saturating_sub(in_values)
+        > body.matches('\n').count().saturating_sub(in_values)
+    {
+        // A raw newline inside a multi-line string is part of its value, so
+        // CRLF comes back only where every value stays as written.
+        let crlf = after.replace("\r\n", "\n").replace('\n', "\r\n");
+        let values = |text: &str| toml::from_str::<toml::Table>(text).ok();
+        if values(&crlf) == values(&after) {
+            after = crlf;
+        }
+    }
+    if body.len() < text.len() {
+        after.insert(0, '\u{feff}');
+    }
+    after
+}
+
+/// The key under which `table` already holds the field newt writes as `key`:
+/// `key` itself, or an alias serde accepts for it. An alias is recognised by
+/// what it means, not by a list: `name = value` (its own value, or the
+/// incoming one) deserializes and renders back under `key`.
+fn local_mcp_spelling(
+    table: &toml_edit::Table,
+    key: &str,
+    wanted: Option<&toml_edit::Item>,
+) -> String {
+    let renders_as = |name: &str, item: &toml_edit::Item| {
+        let mut doc = toml_edit::DocumentMut::new();
+        doc.insert(name, item.clone());
+        let entry = toml::from_str::<crate::mcp::McpServerEntry>(&doc.to_string()).ok()?;
+        let rendered = crate::mcp::entry_to_toml_table(&entry, None).ok()?;
+        let mut keys = rendered
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| *key != "name");
+        match (keys.next(), keys.next()) {
+            (Some(only), None) => Some(only == key),
+            _ => None,
+        }
+    };
+    table
+        .iter()
+        .find(|(name, item)| {
+            *name != key
+                && (renders_as(name, item) == Some(true)
+                    || wanted.is_some_and(|wanted| renders_as(name, wanted) == Some(true)))
+        })
+        .map_or(key, |(name, _)| name)
+        .to_owned()
+}
+
+/// What merging `wanted` into the local map field `key` (`env`, `headers`)
+/// changes: each wanted member whose value differs, under the local spelling
+/// of the member it matches, and each local member none matches, which goes.
+fn mcp_map_edits<'a>(
+    key: &str,
+    have: &dyn toml_edit::TableLike,
+    wanted: &'a dyn toml_edit::TableLike,
+) -> (Vec<(String, &'a toml_edit::Item)>, Vec<String>) {
+    let member = |name: &str, item: &toml_edit::Item| {
+        let mut one = toml_edit::Table::new();
+        one.insert(name, item.clone());
+        toml_edit::Item::Table(one)
+    };
+    // Each wanted member is one local member at most: a header name in any
+    // case (`authorization` for `Authorization`). Any other local one goes.
+    let mut unmatched: Vec<&str> = have.iter().map(|(name, _)| name).collect();
+    let mut changed = Vec::new();
+    for (name, value) in wanted.iter() {
+        let local = unmatched
+            .iter()
+            .position(|local| crate::mcp::same_mcp_map_member(key, local, name))
+            .map(|at| unmatched.remove(at));
+        if !local.and_then(|local| have.get(local)).is_some_and(|old| {
+            same_mcp_field(key, Some(&member(name, old)), Some(&member(name, value)))
+        }) {
+            changed.push((local.unwrap_or(name).to_owned(), value));
+        }
+    }
+    (changed, unmatched.into_iter().map(str::to_owned).collect())
+}
+
+/// Update the map field `key` (`env`, `headers`) to `wanted` member by member,
+/// so a sub-table, dotted keys or an inline table keeps its layout, and each
+/// member its comments: a dropped member goes, a changed one is replaced in
+/// place under the operator's spelling of its name, a new one is added.
+fn merge_mcp_map(key: &str, map: &mut toml_edit::Item, wanted: &dyn toml_edit::TableLike) {
+    let Some(have) = map.as_table_like() else {
+        return;
+    };
+    let (changed, dropped) = mcp_map_edits(key, have, wanted);
+    match map {
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(map)) => {
+            for name in &dropped {
+                remove_inline_member(map, name);
+            }
+            for (name, value) in changed {
+                match value.as_value() {
+                    Some(value) if !map.contains_key(&name) => {
+                        push_inline_member(map, &name, value.clone());
+                    }
+                    _ => replace_in_place(map, &name, value.clone()),
+                }
+            }
+        }
+        map => {
+            if let Some(map) = map.as_table_like_mut() {
+                for name in &dropped {
+                    let _ = map.remove(name);
+                }
+                for (name, value) in changed {
+                    replace_in_place(map, &name, value.clone());
+                }
+            }
+        }
+    }
+}
+
+/// `gap` split after its first newline: the end of the line it starts on,
+/// and the rest. A gap with no newline is all rest.
+fn split_line(gap: &str) -> (&str, &str) {
+    gap.find('\n').map_or(("", gap), |at| gap.split_at(at + 1))
+}
+
+/// The raw text of a decor part, empty when unset.
+fn decor_text(part: Option<&toml_edit::RawString>) -> String {
+    part.and_then(toml_edit::RawString::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Remove `name` from an inline table, keeping each comment on its line. A
+/// member's key prefix begins with the end of the line before it, after the
+/// previous comma, so that member's comment. What ends the removed member's
+/// own line is the next member's key prefix, or after the last member the
+/// table's trailing text (its value's suffix with no trailing comma). The
+/// line before the member is joined to what follows the member's line. A
+/// member on the previous member's line shares it, so that line's end stays.
+/// Where commas lead their lines, the line before the last member ends in the
+/// previous value's suffix, which is kept up to there.
+fn remove_inline_member(table: &mut toml_edit::InlineTable, name: &str) {
+    let names: Vec<String> = table.iter().map(|(name, _)| name.to_owned()).collect();
+    let Some(at) = names.iter().position(|other| other == name) else {
+        return;
+    };
+    let before = decor_text(table.key(name).and_then(|key| key.leaf_decor().prefix()));
+    let join = |after: String| match split_line(&before).0 {
+        "" if at > 0 => after,
+        head => format!("{head}{}", split_line(&after).1),
+    };
+    if let Some(next) = names.get(at + 1) {
+        if let Some(mut key) = table.key_mut(next) {
+            let after = decor_text(key.leaf_decor().prefix());
+            key.leaf_decor_mut().set_prefix(join(after));
+        }
+    } else if table.trailing_comma() {
+        let after = decor_text(Some(table.trailing()));
+        table.set_trailing(join(after));
+    } else {
+        let end = decor_text(table.get(name).and_then(|value| value.decor().suffix()));
+        let previous = at.checked_sub(1).and_then(|previous| names.get(previous));
+        match previous.and_then(|previous| table.get_mut(previous)) {
+            Some(previous) => {
+                let suffix = decor_text(previous.decor().suffix());
+                let kept = match split_line(&suffix) {
+                    ("", _) => format!("{suffix}{}", join(end)),
+                    (line, _) => format!("{line}{}", split_line(&end).1),
+                };
+                previous.decor_mut().set_suffix(kept);
+            }
+            None => table.set_trailing(join(end)),
+        }
+    }
+    let _ = table.remove(name);
+}
+
+/// Append `name` = `value` to an inline table laid out as its last member
+/// is: on a line of its own with the same indent, or on the same line. The
+/// text that ended the table after the last member, that member's comment
+/// included, stays on that member's line.
+fn push_inline_member(table: &mut toml_edit::InlineTable, name: &str, mut value: toml_edit::Value) {
+    let Some(last) = table.iter().last().map(|(last, _)| last.to_owned()) else {
+        let _ = table.insert(name, value);
+        return;
+    };
+    let key_decor = table
+        .key(&last)
+        .map(|key| key.leaf_decor().clone())
+        .unwrap_or_default();
+    let value_prefix = decor_text(table.get(&last).and_then(|last| last.decor().prefix()));
+    let end = if table.trailing_comma() {
+        decor_text(Some(table.trailing()))
+    } else {
+        // The last value's suffix ends the table; the new member ends it now.
+        table.get_mut(&last).map_or_else(String::new, |last| {
+            let suffix = decor_text(last.decor().suffix());
+            last.decor_mut().set_suffix("");
+            suffix
+        })
+    };
+    let (head, tail) = split_line(&end);
+    let newline = &head[head.trim_end_matches(['\r', '\n']).len()..];
+    let new_end = format!("{newline}{tail}");
+    value.decor_mut().set_prefix(value_prefix);
+    if table.trailing_comma() {
+        value.decor_mut().set_suffix("");
+        table.set_trailing(new_end);
+    } else {
+        value.decor_mut().set_suffix(new_end);
+    }
+    let _ = table.insert(name, value);
+    let indent = decor_text(key_decor.prefix());
+    let indent = indent.rsplit('\n').next().unwrap_or_default();
+    if let Some(mut key) = table.key_mut(name) {
+        key.leaf_decor_mut().set_prefix(format!("{head}{indent}"));
+        key.leaf_decor_mut()
+            .set_suffix(decor_text(key_decor.suffix()));
+    }
+}
+
+/// Whether two spellings of one `[[mcp_servers]]` key configure the same
+/// thing, whatever their quoting, spacing or comments; an absent key equals a
+/// written default. Two URLs of one endpoint (`https://h`, `https://h/`) are
+/// the same, so the operator's spelling, which a saved login is bound to,
+/// stays.
+fn same_mcp_field(key: &str, a: Option<&toml_edit::Item>, b: Option<&toml_edit::Item>) -> bool {
+    if key == "url" {
+        return !crate::mcp::mcp_endpoint_changed(
+            a.and_then(toml_edit::Item::as_str),
+            b.and_then(toml_edit::Item::as_str),
+        );
+    }
+    let typed = |item: Option<&toml_edit::Item>| {
+        let mut doc = toml_edit::DocumentMut::new();
+        if let Some(item) = item {
+            doc.insert(key, item.clone());
+        }
+        toml::from_str::<crate::mcp::McpServerEntry>(&doc.to_string()).ok()
+    };
+    matches!((typed(a), typed(b)), (Some(a), Some(b)) if a == b)
 }
 
 // ---------------------------------------------------------------------------
@@ -2615,8 +3324,9 @@ fn dir_has_toml(dir: &Path) -> bool {
 
 /// Set `key` to `item`, keeping the key and the old value's decoration (comments,
 /// spacing) when the key already exists: the key's own comment lives with the key,
-/// so replace the item in place rather than inserting a fresh key.
-fn replace_in_place(table: &mut toml_edit::Table, key: &str, mut item: toml_edit::Item) {
+/// so replace the item in place rather than inserting a fresh key. `table` may be
+/// a table, dotted keys or an inline table.
+fn replace_in_place(table: &mut dyn toml_edit::TableLike, key: &str, mut item: toml_edit::Item) {
     match table.get_mut(key) {
         Some(existing) => {
             if let (Some(new), Some(old)) = (item.as_value_mut(), existing.as_value()) {

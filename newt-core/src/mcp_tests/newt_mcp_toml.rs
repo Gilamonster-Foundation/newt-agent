@@ -105,3 +105,55 @@ RUST_LOG = "debug"
         Some(SecretValue::Ref(SecretRef { cmd: Some(_), .. }))
     ));
 }
+
+#[test]
+fn checked_newt_mcp_parser_reports_malformed_toml_without_source_text() {
+    let error = parse_newt_mcp_toml_checked(
+        "[[mcp_servers]]\nname = \"private-token-marker\"\ncommand = =\n",
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid MCP TOML syntax at line 3, column 11"
+    );
+    assert!(!error.to_string().contains("private-token-marker"));
+    assert!(parse_newt_mcp_toml_checked("other = 1").unwrap().is_empty());
+}
+
+#[test]
+fn checked_newt_mcp_parser_tells_a_shape_error_from_a_syntax_error() {
+    // #3062 review (F13): valid TOML whose entry does not fit the MCP schema
+    // is not a syntax error. Both say where, never what: the parser's own
+    // message quotes the line, here a credential.
+    let error = parse_newt_mcp_toml_checked(
+        "[[mcp_servers]]\nname = \"docs\"\ncommand = \"docs-mcp\"\nheaders = \"SYNTHETIC_SECRET_MARKER\"\n",
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "invalid MCP config at line 4, column 11");
+}
+
+#[test]
+fn an_unloadable_newt_mcp_file_is_a_diagnostic_not_an_empty_list() {
+    // #2915 review: discovery used to turn a malformed `mcp.toml` into no
+    // servers. A missing file is still empty; anything else is named, without
+    // quoting the line (here, a credential) the parser stopped on.
+    let path = Path::new("cfg/mcp.toml");
+    let malformed = "[[mcp_servers]]\nname = \"docs\"\nheaders = { Authorization = \"SYNTHETIC_SECRET_MARKER\" \n";
+    let diagnostic = newt_mcp_file_servers(path, Ok(malformed.into())).unwrap_err();
+    assert!(diagnostic.contains("mcp.toml"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("invalid MCP TOML syntax"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("SYNTHETIC_SECRET_MARKER"),
+        "{diagnostic}"
+    );
+
+    let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+    assert!(newt_mcp_file_servers(path, Err(missing))
+        .unwrap()
+        .is_empty());
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(newt_mcp_file_servers(path, Err(denied)).is_err());
+}

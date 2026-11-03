@@ -98,8 +98,11 @@ pub enum McpCmd {
     Serve,
     /// Import selected MCP servers from Claude Code, Codex, or a config file.
     /// The equivalent trusted newt TOML is written to `~/.newt/mcp.toml`
-    /// (created if absent). Literal or active secret-bearing values make the
-    /// selected import fail; environment references survive.
+    /// (created if absent), or with --force to the file that already defines
+    /// a selected server. --grant-net writes `~/.newt/config.toml` instead,
+    /// with the grants, and refuses to update a server `~/.newt/mcp.toml`
+    /// defines. Literal or active secret-bearing values make the selected
+    /// import fail; environment references survive.
     Import {
         /// Path to a Claude JSON or Codex TOML MCP config. An alternative to
         /// --from-claude / --from-codex: give exactly one source.
@@ -125,10 +128,15 @@ pub enum McpCmd {
         /// `[tui.permissions] net`.
         #[arg(long)]
         grant_net: bool,
-        /// Overwrite entries whose name already exists (default: error on a clash).
+        /// Update entries whose name already exists: the source's fields
+        /// replace the local ones, other local settings are kept (default:
+        /// error on a clash).
         #[arg(long)]
         force: bool,
-        /// Keep existing entries — import only names not already present (no error).
+        /// Keep existing entries: skip names already defined instead of
+        /// failing. A name that only a project config or an ambient
+        /// `./newt.toml` defines still fails a default import, since the
+        /// import would not take effect.
         #[arg(long, conflicts_with = "force")]
         merge: bool,
         /// Rejected for imports: project config is borrowed and untrusted.
@@ -311,9 +319,16 @@ pub(crate) fn print_next_steps(
                 } else {
                     "`newt doctor`"
                 };
+                // A disabled server is turned back on; importing it again
+                // keeps a local `enabled = false` (#2915).
+                let fix = if denied == newt_core::mcp::AdmissionDenied::Disabled {
+                    format!("enable it with `/mcp enable {}`", entry.name)
+                } else {
+                    "import/approve it".to_string()
+                };
                 writeln!(
                     out,
-                    "  !  {} — not admitted ({denied}); import/approve it before {then}.",
+                    "  !  {} — not admitted ({denied}); {fix} before {then}.",
                     entry.name
                 )?;
             }
@@ -503,7 +518,38 @@ pub(crate) fn add_to_config(
     let path = mcp_write_target(config_path, project, false)?;
     let (destination, _guard) = resolve_and_lock_write_target(&path)?;
     let text = read_config_text(destination.as_path())?;
-    let updated = Config::with_mcp_server_added(&text, entry)?;
+    // The default `newt mcp remove` edits the owner, which may be another
+    // file, so name the command for this one, and the copy newt uses (#2915).
+    let held = newt_core::mcp::parse_newt_mcp_toml_checked(&text).unwrap_or_default();
+    if let Some(index) = newt_core::mcp::effective_entry_index(&held, &entry.name) {
+        let (name, here) = (&entry.name, path.display());
+        let remove = remove_from(&path, name);
+        let owner = Config::mcp_server_owner_path(name)
+            .ok()
+            .flatten()
+            .filter(|owner| ResolvedPath::resolve(owner).ok().as_ref() != Some(&destination));
+        if let Some(owner) = owner {
+            let owner = owner.display();
+            bail!(
+                "MCP server `{name}` already exists in {here}, a copy shadowed by the one newt uses in {owner}: remove that copy with {remove}, or change the server in {owner}"
+            );
+        }
+        // A disabled copy can be enabled instead; where `/mcp enable` would
+        // refuse this file, its own refusal names the hand edit (#2915).
+        let toggle = if held[index].enabled {
+            String::new()
+        } else {
+            match Config::mcp_toggle_refusal(name, true) {
+                Some(refusal) => format!(", or enable it ({refusal})"),
+                None => ", or toggle it with `/mcp enable|disable`".to_string(),
+            }
+        };
+        bail!(
+            "MCP server `{name}` already exists in {here}: remove it first with {remove}{toggle}"
+        );
+    }
+    let updated = Config::with_mcp_server_added(&text, entry)
+        .with_context(|| format!("updating {}", destination.as_path().display()))?;
     write_back(&destination, &updated)?;
     Ok(path)
 }
@@ -526,40 +572,107 @@ fn write_back(destination: &ResolvedPath, text: &str) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", destination.as_path().display()))
 }
 
-/// Whether TOML `text` carries a `[[mcp_servers]]` entry named `name`.
-fn config_has_mcp_server(text: &str, name: &str) -> bool {
-    newt_core::mcp::parse_newt_mcp_toml(text)
-        .iter()
-        .any(|e| e.name == name)
+/// The command that removes `name` from exactly `path`, quoted to paste.
+/// Advice names this, not the default `newt mcp remove`, which edits the
+/// owning file: when a refusal is about a shadowed or outranking copy, that
+/// is another entry (#2915).
+fn remove_from(path: &Path, name: &str) -> String {
+    format!(
+        "`newt --config {} mcp remove {}`",
+        newt_core::mcp::shell_quote_arg(&path.to_string_lossy()),
+        newt_core::mcp::shell_quote_arg(name)
+    )
+}
+
+/// Why a --grant-net import does not write `entry` to `target` while the
+/// break-out file `breakout` holds a `copy` of it and `target` holds none
+/// discovery keeps (only a dropped `stub`, if any). The route that keeps the
+/// copy's local settings leads; the remove, which loses them, is last. In a
+/// `batch`, that route is a re-run of `entry` alone: a --force re-run of the
+/// batch refuses servers with different owning files (#2915).
+fn cross_file_refusal(
+    entry: &McpServerEntry,
+    copy: Option<&McpServerEntry>,
+    stub: bool,
+    batch: bool,
+    breakout: &Path,
+    target: &Path,
+) -> anyhow::Result<String> {
+    let name = &entry.name;
+    let stub = if stub {
+        format!(", which holds only a `{name}` entry that discovery drops")
+    } else {
+        String::new()
+    };
+    let enabled = copy.is_none_or(|copy| copy.enabled);
+    let grant = imported_http_hosts(std::slice::from_ref(entry))?
+        .first()
+        .map(|host| format!(", then {}", hand_grant(host, enabled, target)))
+        .unwrap_or_default();
+    let paused = if enabled {
+        ""
+    } else {
+        ", `enabled = false` included"
+    };
+    let (rerun, rest) = if batch {
+        (
+            format!(
+                "Re-run it alone with --name {} and without --grant-net",
+                newt_core::mcp::shell_quote_arg(name)
+            ),
+            " Keep --grant-net for the others, each imported by --name.",
+        )
+    } else {
+        ("Re-run without --grant-net".to_string(), "")
+    };
+    Ok(format!(
+        "MCP server `{name}` exists in {} but the import writes atomically to {}{stub}; refusing a cross-file overwrite that would leave a dormant duplicate. {rerun} to update that copy in place, keeping its local settings{grant}.{rest} Removing that copy with {} before the re-run instead loses those settings{paused}",
+        breakout.display(),
+        target.display(),
+        remove_from(breakout, name)
+    ))
+}
+
+/// How to grant `host` in `target` by hand, worded as newt asks for a
+/// missing grant (`HttpNetGrantRequired`). A disabled server gets no grant
+/// from an import, so it is granted once it is enabled (#2915).
+fn hand_grant(host: &str, enabled: bool, target: &Path) -> String {
+    let once = if enabled { "" } else { "once it is enabled, " };
+    format!(
+        "{once}grant the exact hostname {host} in trusted [tui.permissions] net of {}",
+        target.display()
+    )
 }
 
 /// Remove `name`, resolving the target the same way `add` does. An explicit
-/// target (`--project`/`--config`/`$NEWT_CONFIG`/`./newt.toml`) is acted on
-/// directly. At the user level the entry may live in either the broken-out
-/// `~/.newt/mcp.toml` or `~/.newt/config.toml`, so the first of those that
-/// actually contains the name is edited — a `remove` never fails just because
-/// the operator has broken some servers out and left others inline.
+/// target (`--project`/`--config`/`$NEWT_CONFIG`) is acted on directly. At the
+/// default scope, resolve the file that contributes the entry to the effective
+/// MCP list rather than guessing from file existence; a project or system
+/// owner must be named ([`Config::mcp_server_edit_path`]).
 fn remove_server(name: &str, config_path: Option<&Path>, project: bool) -> anyhow::Result<PathBuf> {
-    if let Some(explicit) = explicit_write_target(config_path, project)? {
-        let (destination, _guard) = resolve_and_lock_write_target(&explicit)?;
+    let removed = |destination: &ResolvedPath| {
         let text = read_config_text(destination.as_path())?;
-        let updated = Config::with_mcp_server_removed(&text, name)?;
-        write_back(&destination, &updated)?;
+        Config::with_mcp_server_removed(&text, name)
+            .with_context(|| format!("updating {}", destination.as_path().display()))
+    };
+    if let Some(explicit) = strong_explicit_write_target(config_path, project)? {
+        let (destination, _guard) = resolve_and_lock_write_target(&explicit)?;
+        write_back(&destination, &removed(&destination)?)?;
         return Ok(explicit);
     }
-    let dir =
-        Config::user_config_dir().ok_or_else(|| anyhow!("cannot resolve ~/.newt (no home dir)"))?;
-    for candidate in [dir.join("mcp.toml"), dir.join("config.toml")] {
-        let (destination, _guard) = resolve_and_lock_write_target(&candidate)?;
-        if let Some(text) = read_optional(destination.as_path())? {
-            if config_has_mcp_server(&text, name) {
-                let updated = Config::with_mcp_server_removed(&text, name)?;
-                write_back(&destination, &updated)?;
-                return Ok(candidate);
-            }
-        }
+    let owner = Config::mcp_server_edit_path(name, true, |owner| {
+        format!("{} removes it there", remove_from(owner, name))
+    })?;
+    let (destination, _guard) = resolve_and_lock_write_target(&owner)?;
+    let current_owner = Config::mcp_server_owner_path(name)?
+        .as_deref()
+        .map(ResolvedPath::resolve)
+        .transpose()?;
+    if current_owner.as_ref() != Some(&destination) {
+        bail!("MCP config ownership changed for `{name}`; no file was modified, retry the command");
     }
-    bail!("no MCP server named `{name}` in ~/.newt/mcp.toml or ~/.newt/config.toml");
+    write_back(&destination, &removed(&destination)?)?;
+    Ok(owner)
 }
 
 /// Assemble a validated [`McpServerEntry`] from the `add` flags. Pure.
@@ -762,6 +875,7 @@ fn cmd_list(config_path: Option<&Path>, out: &mut dyn Write) -> anyhow::Result<(
     };
     let mcp_toml = Config::user_config_dir()
         .map(|d| load_newt_mcp_toml(&d.join("mcp.toml")))
+        .transpose()?
         .unwrap_or_default();
     let claude_user = crate::home_dir()
         .map(|h| load_claude_json(&h.join(".claude.json")))
@@ -783,14 +897,18 @@ fn load_claude_json(path: &Path) -> Vec<McpServerEntry> {
         .unwrap_or_default()
 }
 
-/// Best-effort read of a newt-owned `~/.newt/mcp.toml` (`[[mcp_servers]]`) —
-/// missing or malformed yields an empty list, the same contract as discovery.
-fn load_newt_mcp_toml(path: &Path) -> Vec<McpServerEntry> {
-    read_optional(path)
-        .ok()
-        .flatten()
-        .map(|text| newt_core::mcp::parse_newt_mcp_toml(&text))
-        .unwrap_or_default()
+/// Read a newt-owned `~/.newt/mcp.toml`. A missing file is empty; malformed
+/// TOML is a safe, path-specific error instead of an empty view.
+fn load_newt_mcp_toml(path: &Path) -> anyhow::Result<Vec<McpServerEntry>> {
+    let Some(text) = read_optional(path)? else {
+        return Ok(Vec::new());
+    };
+    parse_mcp_config(&text, path)
+}
+
+fn parse_mcp_config(text: &str, path: &Path) -> anyhow::Result<Vec<McpServerEntry>> {
+    newt_core::mcp::parse_newt_mcp_toml_checked(text)
+        .map_err(|error| anyhow!("{}: {error}", path.display()))
 }
 
 /// Where a resolved catalog entry came from — so an error about a broken
@@ -1054,18 +1172,58 @@ fn import_namespace_sanitization(
 ) -> anyhow::Result<bool> {
     let user_mcp = Config::user_config_dir().map(|dir| dir.join("mcp.toml"));
     let cfg = if user_mcp.as_deref() == Some(target) && !strong_explicit_target {
+        let base = Config::base_config_path();
+        let project =
+            Config::project_config_path().filter(|project| base.as_ref() != Some(project));
+        let layers: Vec<PathBuf> = base.into_iter().chain(project).collect();
         crate::migration_notices::read(|report| {
             Config::resolve_runtime_unpublished_with_held_locks(report, held_locks)
                 .map(ResolvedConfig::into_config)
+        })
+        .map_err(|error| {
+            // A layer that fails to decode on its own quotes its contents, so
+            // it is withheld. Otherwise the layers decode and the resolver
+            // rejected what they say (a duplicate name, a legacy drop-in): its
+            // message quotes no contents and names the cause (#2915).
+            layers
+                .iter()
+                .find_map(|path| load_consulted_config(path, held_locks).err())
+                .unwrap_or_else(|| {
+                    let files: Vec<String> =
+                        layers.iter().map(|p| p.display().to_string()).collect();
+                    let context = if files.is_empty() {
+                        "resolving the Newt config".to_owned()
+                    } else {
+                        format!("resolving the Newt config from {}", files.join(" and "))
+                    };
+                    anyhow::Error::new(error).context(context)
+                })
         })?
     } else if target.is_file() {
-        crate::migration_notices::read(|report| {
-            Config::load_with_held_locks(target, held_locks, report)
-        })?
+        load_consulted_config(target, held_locks)?
     } else {
         Config::default()
     };
     Ok(cfg.tui.unwrap_or_default().sanitize_mcp_server_names)
+}
+
+/// Decode a config `newt mcp import` consults, under its held locks. I/O
+/// errors carry no file contents; a decode error does, so it is withheld.
+fn load_consulted_config(path: &Path, held_locks: &[&LockGuard]) -> anyhow::Result<Config> {
+    crate::migration_notices::read(|report| Config::load_with_held_locks(path, held_locks, report))
+        .map_err(|error| match error {
+            newt_core::NewtError::Io(error) => anyhow!("reading {}: {error}", path.display()),
+            _ => withheld_config_error(path),
+        })
+}
+
+/// A TOML parser error quotes the offending line, which may hold a credential
+/// (#2915): name the file, never its text.
+fn withheld_config_error(path: &Path) -> anyhow::Error {
+    anyhow!(
+        "{}: invalid Newt config (TOML diagnostic withheld: it would quote the file's contents)",
+        path.display()
+    )
 }
 
 fn valid_env_identifier(value: &str) -> bool {
@@ -1214,21 +1372,88 @@ fn canonicalize_import_http_url(entry: &mut McpServerEntry) -> anyhow::Result<Op
     Ok(Some(canonical.host))
 }
 
+/// Local settings a merge removed although the source does not name them: the
+/// other transport's fields, OAuth pins an `oauth` object left out, and
+/// members of an `env` or `headers` map the source replaced. Names only; a
+/// value may be a credential.
+fn removed_local_settings(previous: &McpServerEntry, saved: &McpServerEntry) -> Vec<String> {
+    let mut removed: Vec<String> = [
+        ("url", previous.url.is_some() && saved.url.is_none()),
+        (
+            "command",
+            previous.command.is_some() && saved.command.is_none(),
+        ),
+        // A stdio entry's args are kept or the source's own; an HTTP or SSE
+        // entry loses them, whether or not its transport changed.
+        (
+            "args",
+            saved.transport != TransportKind::Stdio && !previous.args.is_empty(),
+        ),
+        (
+            "oauth_client_id",
+            previous.oauth_client_id.is_some() && saved.oauth_client_id.is_none(),
+        ),
+        (
+            "oauth_scopes",
+            previous.oauth_scopes.is_some() && saved.oauth_scopes.is_none(),
+        ),
+        (
+            "oauth_callback_port",
+            previous.oauth_callback_port.is_some() && saved.oauth_callback_port.is_none(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, gone)| *gone)
+    .map(|(field, _)| field.to_string())
+    .collect();
+    for (field, kind, before, after) in [
+        ("env", "env", &previous.env, &saved.env),
+        ("headers", "header", &previous.headers, &saved.headers),
+    ] {
+        removed.extend(
+            before
+                .keys()
+                .filter(|name| {
+                    !after
+                        .keys()
+                        .any(|kept| newt_core::mcp::same_mcp_map_member(field, name, kept))
+                })
+                .map(|name| format!("{kind} {name}")),
+        );
+    }
+    removed
+}
+
+/// Whether a merge kept a local `login_argv` although the stdio command
+/// changed. No source can supply one, and it runs host-side, so the notice
+/// names it (#2915). As in the moved-command refusal, the command is the
+/// whole argv: a launcher such as `npx` picks the program by its args.
+fn kept_login_argv_for_a_new_command(previous: &McpServerEntry, saved: &McpServerEntry) -> bool {
+    saved.transport == TransportKind::Stdio
+        && !saved.login_argv.is_empty()
+        && (&previous.command, &previous.args) != (&saved.command, &saved.args)
+}
+
 fn imported_http_hosts(entries: &[McpServerEntry]) -> anyhow::Result<Vec<String>> {
     let mut hosts = std::collections::BTreeSet::new();
-    for entry in entries {
-        if !entry.enabled || entry.transport != TransportKind::Http {
-            continue;
-        }
-        let raw = entry
-            .url
-            .as_deref()
-            .ok_or_else(|| anyhow!("MCP server `{}` has no HTTP URL", entry.name))?;
-        let canonical = newt_core::mcp::canonical_mcp_http_url(raw)
-            .map_err(|issue| anyhow!("MCP server `{}` has {issue}", entry.name))?;
-        hosts.insert(canonical.host);
+    for entry in entries.iter().filter(|entry| entry.enabled) {
+        hosts.extend(http_host(entry)?);
     }
     Ok(hosts.into_iter().collect())
+}
+
+/// The exact host an HTTP `entry` connects to; `None` for another transport.
+fn http_host(entry: &McpServerEntry) -> anyhow::Result<Option<String>> {
+    if entry.transport != TransportKind::Http {
+        return Ok(None);
+    }
+    let raw = entry
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("MCP server `{}` has no HTTP URL", entry.name))?;
+    let canonical = newt_core::mcp::canonical_mcp_http_url(raw)
+        .map_err(|issue| anyhow!("MCP server `{}` has {issue}", entry.name))?;
+    Ok(Some(canonical.host))
 }
 
 /// Whether an active walked-up project config structurally replaces the base
@@ -1246,8 +1471,7 @@ fn project_replaces_base_mcp_servers(
     }
     let text = std::fs::read_to_string(&project)
         .with_context(|| format!("reading project config {}", project.display()))?;
-    let value: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("parsing project config {}", project.display()))?;
+    let value: toml::Value = toml::from_str(&text).map_err(|_| withheld_config_error(&project))?;
     let has_project_mcp_array = value
         .get("mcp_servers")
         .and_then(toml::Value::as_array)
@@ -1259,11 +1483,7 @@ fn project_replaces_base_mcp_servers(
     let base_strategy = base
         .as_path()
         .is_file()
-        .then(|| {
-            crate::migration_notices::read(|report| {
-                Config::load_with_held_locks(base.as_path(), held_locks, report)
-            })
-        })
+        .then(|| load_consulted_config(base.as_path(), held_locks))
         .transpose()?
         .and_then(|config| config.merge)
         .map(|merge| merge.arrays);
@@ -1288,8 +1508,7 @@ fn project_appends_to_base_mcp_servers(
     }
     let text = std::fs::read_to_string(&project)
         .with_context(|| format!("reading project config {}", project.display()))?;
-    let value: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("parsing project config {}", project.display()))?;
+    let value: toml::Value = toml::from_str(&text).map_err(|_| withheld_config_error(&project))?;
     if value
         .get("mcp_servers")
         .and_then(toml::Value::as_array)
@@ -1304,11 +1523,7 @@ fn project_appends_to_base_mcp_servers(
     let base_strategy = base
         .as_path()
         .is_file()
-        .then(|| {
-            crate::migration_notices::read(|report| {
-                Config::load_with_held_locks(base.as_path(), held_locks, report)
-            })
-        })
+        .then(|| load_consulted_config(base.as_path(), held_locks))
         .transpose()?
         .and_then(|config| config.merge)
         .map(|merge| merge.arrays);
@@ -1370,41 +1585,36 @@ fn outranking_import_sources(
         return Ok(Vec::new());
     }
 
-    let mut sources = Vec::new();
-
     // Inspect each source locally instead of attributing Config::resolve()'s
     // merged names to its highest-precedence label. Otherwise a project file
     // with no MCP entries can make the user config's own names look project-
     // owned and falsely defeat `--merge` / `--force` on the authoritative file.
-    let user_config = user_dir.join("config.toml");
-    if user_config.is_file() {
-        sources.push((
-            user_config.clone(),
-            crate::migration_notices::read(|report| {
-                Config::load_with_held_locks(&user_config, held_locks, report)
-            })?
+    // An entry discovery drops outranks nothing, as for the owner. A config
+    // dir that is an ancestor's `.newt` makes config.toml the walked-up
+    // project too: one file, listed once, as the resolver reads it (#2915).
+    let mut sources = Vec::new();
+    let mut seen = Vec::new();
+    for source in [
+        Some(user_dir.join("config.toml")),
+        ambient_newt_toml()?,
+        Config::project_config_path(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|source| source.is_file())
+    {
+        let resolved = ResolvedPath::resolve(&source)?;
+        if seen.contains(&resolved) {
+            continue;
+        }
+        seen.push(resolved);
+        let names = load_consulted_config(&source, held_locks)?
             .mcp_servers
             .into_iter()
+            .filter(McpServerEntry::is_valid)
             .map(|entry| entry.name)
-            .collect(),
-        ));
-    }
-    for source in [ambient_newt_toml()?, Config::project_config_path()]
-        .into_iter()
-        .flatten()
-    {
-        if source.is_file() {
-            sources.push((
-                source.clone(),
-                crate::migration_notices::read(|report| {
-                    Config::load_with_held_locks(&source, held_locks, report)
-                })?
-                .mcp_servers
-                .into_iter()
-                .map(|entry| entry.name)
-                .collect(),
-            ));
-        }
+            .collect();
+        sources.push((source, names));
     }
     Ok(sources)
 }
@@ -1628,13 +1838,14 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     };
     let text = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {}", source.display()))?;
-    let imported = parse_import_entries(&text, format)
+    let mut parsed = parse_import_entries(&text, format)
         .with_context(|| format!("parsing {}", source.display()))?;
-    if imported.entries.is_empty() && imported.rejected.is_empty() {
+    if parsed.entries.is_empty() && parsed.rejected.is_empty() {
         bail!("no MCP server entries found in {}", source.display());
     }
+    let provided = std::mem::take(&mut parsed.provided);
     let mut imported =
-        select_import_entries(imported, request.name, request.all, &source, &selector)?;
+        select_import_entries(parsed, request.name, request.all, &source, &selector)?;
     let mut source_omissions = newt_core::mcp::codex_mcp_omitted_field_counts(&text);
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -1665,9 +1876,9 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let strong_explicit_target =
         strong_explicit_write_target(request.config_path, request.project)?.is_some();
     let breakout_target = mcp_write_target(request.config_path, request.project, true)?;
-    let target =
+    let mut target =
         authoritative_import_target(&breakout_target, request.grant_net, strong_explicit_target)?;
-    let target_destination = ResolvedPath::resolve(&target)
+    let mut target_destination = ResolvedPath::resolve(&target)
         .with_context(|| format!("resolving MCP import target {}", target.display()))?;
     let breakout_destination = ResolvedPath::resolve(&breakout_target).with_context(|| {
         format!(
@@ -1684,6 +1895,40 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     )?;
     let _transaction_locks = acquire_import_target_locks(lock_targets)?;
     let held_locks: Vec<&LockGuard> = _transaction_locks.iter().collect();
+
+    // A default --force import updates the file that currently owns an entry.
+    // Keep a batch in one file so the existing atomic replacement remains the
+    // transaction boundary; borrowed project/system owners still require an
+    // explicit target.
+    if request.force && !request.grant_net && !strong_explicit_target {
+        let user_config = Config::user_config_path()
+            .map(|path| ResolvedPath::resolve(&path))
+            .transpose()?;
+        let mut owner_target: Option<ResolvedPath> = None;
+        for entry in &imported {
+            let Some(owner) = Config::mcp_server_owner_path(&entry.name)? else {
+                continue;
+            };
+            let owner = ResolvedPath::resolve(&owner)?;
+            if owner_target.as_ref().is_some_and(|target| target != &owner) {
+                bail!(
+                    "selected MCP servers have different owning files; split the import so each atomic update targets one file"
+                );
+            }
+            owner_target = Some(owner);
+        }
+        if let Some(owner) = owner_target.filter(|owner| owner != &breakout_destination) {
+            if user_config.as_ref() != Some(&owner) {
+                bail!(
+                    "selected MCP server is owned by {}; refusing to modify a project or system config during a user import. Re-run with an explicit --config target",
+                    owner.as_path().display()
+                );
+            }
+            target = owner.as_path().to_path_buf();
+            target_destination = owner;
+        }
+    }
+
     target_destination
         .cleanup_abandoned_stages()
         .with_context(|| format!("cleaning abandoned stages for {}", target.display()))?;
@@ -1715,26 +1960,38 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     if let Some(migration) = newt_core::psyche_import::migrate_config_text(&doc) {
         doc = migration.text;
     }
-    let existing: std::collections::BTreeSet<String> = newt_core::mcp::parse_newt_mcp_toml(&doc)
-        .into_iter()
-        .map(|e| e.name)
+    let existing_entries = parse_mcp_config(&doc, &target)?;
+    // Where a file holds one name twice, the entry discovery keeps (#2915).
+    let effective = |entries: &[McpServerEntry], name: &str| {
+        newt_core::mcp::effective_entry_index(entries, name).map(|index| entries[index].clone())
+    };
+    let existing: std::collections::BTreeSet<String> = existing_entries
+        .iter()
+        .map(|entry| entry.name.clone())
         .collect();
+    // Another file's entry that discovery drops counts for nothing, as for
+    // the outranking files and the owner (#2915).
     let breakout_existing: std::collections::BTreeSet<String> =
         if target_destination == breakout_destination {
             existing.clone()
         } else {
-            newt_core::mcp::parse_newt_mcp_toml(
+            parse_mcp_config(
                 read_optional(breakout_destination.as_path())?
                     .as_deref()
                     .unwrap_or_default(),
-            )
+                &breakout_target,
+            )?
             .into_iter()
+            .filter(McpServerEntry::is_valid)
             .map(|entry| entry.name)
             .collect()
         };
 
-    let project_appends =
-        request.grant_net && project_appends_to_base_mcp_servers(&target_destination, &held_locks)?;
+    // Writing the base config (a grant, or a force import redirected to the
+    // owner): an appended project's entries follow the base's, so they do not
+    // outrank the target (#2915).
+    let project_appends = (request.grant_net || target_destination != breakout_destination)
+        && project_appends_to_base_mcp_servers(&target_destination, &held_locks)?;
     let project_path = Config::project_config_path()
         .map(|path| ResolvedPath::resolve(&path))
         .transpose()?;
@@ -1742,16 +1999,13 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         project_path
             .as_ref()
             .map(ResolvedPath::as_path)
-            .map(|path| {
-                crate::migration_notices::read(|report| {
-                    Config::load_with_held_locks(path, &held_locks, report)
-                })
-            })
+            .map(|path| load_consulted_config(path, &held_locks))
             .transpose()?
             .map(|config| {
                 config
                     .mcp_servers
                     .into_iter()
+                    .filter(McpServerEntry::is_valid)
                     .map(|entry| entry.name)
                     .collect()
             })
@@ -1775,8 +2029,10 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                 !is_appended_project
             })
             .collect::<Vec<_>>();
+    // An appended project outranks nothing, but it shares the tool namespace.
     let mut existing_names = existing.clone();
     existing_names.extend(breakout_existing.iter().cloned());
+    existing_names.extend(lower_precedence_names.iter().cloned());
     for (_, names) in &outranking {
         existing_names.extend(names.iter().cloned());
     }
@@ -1797,21 +2053,70 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     }
 
     let mut added = 0usize;
-    let mut overwritten = 0usize;
+    let mut replaced = 0usize;
+    let mut higher_precedence_replacements = 0usize;
+    let mut unchanged = 0usize;
+    let mut moved: Vec<&str> = Vec::new();
+    let mut shadowed: Vec<&str> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut adopted = Vec::new();
     for entry in &imported {
-        // A clash with an actually outranking config is always fatal. The
-        // authoritative write target itself was filtered above, so its entries
-        // retain the normal `--force` / `--merge` behavior.
-        if let Some((path, _)) = outranking
+        // A clash with an actually outranking config is fatal, except that
+        // `--merge` keeps the operator's own entry, as its help says; a
+        // borrowed one (an ambient ./newt.toml, a project) is named instead.
+        // The authoritative write target itself was filtered above, so its
+        // entries retain the normal `--force` / `--merge` behavior.
+        // Every such file is named: removing one copy leaves the next (#2915).
+        let holders: Vec<&PathBuf> = outranking
             .iter()
-            .find(|(_, names)| names.contains(&entry.name))
-        {
+            .filter(|(_, names)| names.contains(&entry.name))
+            .map(|(path, _)| path)
+            .collect();
+        if !holders.is_empty() {
+            let user_config = Config::user_config_path();
+            let user_copy = holders
+                .iter()
+                .find(|path| user_config.as_ref() == Some(**path));
+            if request.merge && user_copy.is_some() {
+                skipped.push(entry.name.clone());
+                continue;
+            }
+            let (files, removes): (Vec<_>, Vec<_>) = holders
+                .iter()
+                .map(|path| (path.display().to_string(), remove_from(path, &entry.name)))
+                .unzip();
+            let removes = removes.join(" and ");
+            // Removing an entry drops its local settings; --merge keeps the
+            // operator's own, and --force, where it updates the owner in
+            // place, keeps them too. So the removes come last, except where
+            // newt does not consult that copy (neither the base config nor
+            // the owner): --merge would keep a copy that is not in use.
+            let owned =
+                user_copy.is_some() && Config::mcp_server_owner_path(&entry.name)? == user_config;
+            let advice = match user_copy {
+                None => format!(
+                    "Re-run with an explicit --config target, or remove it there first with {removes}"
+                ),
+                Some(_) if owned => format!(
+                    "Re-run with --force to update it there or --merge to skip it, or remove it there first with {removes}"
+                ),
+                Some(_) if Config::base_config_path() == user_config => format!(
+                    "Re-run with --merge to skip it, or with an explicit --config target, or remove it there first with {removes}"
+                ),
+                Some(copy) => format!(
+                    "{} is not consulted from this directory: remove it there first with {removes}, or re-run with an explicit --config target",
+                    copy.display()
+                ),
+            };
+            let outrank = if holders.len() == 1 {
+                "outranks"
+            } else {
+                "outrank"
+            };
             bail!(
-                "`{}` is already defined in {}, which outranks or can outrank {} — an import here would be ineffective. Remove it there first, or re-run with an explicit --config target",
+                "`{}` is already defined in {}, which {outrank} or can outrank {} — an import here would be ineffective. {advice}",
                 entry.name,
-                path.display(),
+                files.join(" and "),
                 target.display()
             );
         }
@@ -1824,20 +2129,69 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
                 continue;
             }
             if request.force {
+                // An entry the target already holds is updated in place: its
+                // shadowed copy predates the import, so it is named, not refused.
+                // A stub discovery drops is not that entry; updating it would
+                // revive it over the live copy.
                 if target_destination != breakout_destination && exists_in_breakout {
-                    bail!(
-                        "MCP server `{}` exists in {} but --grant-net writes atomically to {}; refusing a cross-file overwrite that would leave a dormant duplicate. Remove the existing server first, then re-run the import",
-                        entry.name,
-                        breakout_target.display(),
-                        target.display()
-                    );
+                    if !effective(&existing_entries, &entry.name)
+                        .is_some_and(|held| held.is_valid())
+                    {
+                        let copies = parse_mcp_config(
+                            read_optional(breakout_destination.as_path())?
+                                .as_deref()
+                                .unwrap_or_default(),
+                            &breakout_target,
+                        )?;
+                        bail!(
+                            "{}",
+                            cross_file_refusal(
+                                entry,
+                                effective(&copies, &entry.name).as_ref(),
+                                exists_in_target,
+                                imported.len() > 1,
+                                &breakout_target,
+                                &target
+                            )?
+                        );
+                    }
+                    shadowed.push(entry.name.as_str());
                 }
                 if exists_in_target {
-                    doc = Config::with_mcp_server_removed(&doc, &entry.name)?;
+                    let previous_url =
+                        effective(&existing_entries, &entry.name).and_then(|existing| existing.url);
+                    if previous_url.is_some()
+                        && entry.url.is_some()
+                        && newt_core::mcp::mcp_endpoint_changed(
+                            previous_url.as_deref(),
+                            entry.url.as_deref(),
+                        )
+                    {
+                        moved.push(&entry.name);
+                    }
+                    let previous = doc.clone();
+                    // A refusal here is about the entry in `target`: name it.
+                    doc = Config::with_mcp_server_merged(
+                        &doc,
+                        entry,
+                        &provided.get(&entry.name).cloned().unwrap_or_default(),
+                    )
+                    .with_context(|| format!("updating {}", target.display()))?;
+                    if doc == previous {
+                        unchanged += 1;
+                    } else {
+                        replaced += 1;
+                    }
+                } else {
+                    doc = Config::with_mcp_server_added(&doc, entry)?;
+                    if exists_lower_precedence {
+                        replaced += 1;
+                        higher_precedence_replacements += 1;
+                    } else {
+                        added += 1;
+                    }
                 }
-                doc = Config::with_mcp_server_added(&doc, entry)?;
-                overwritten += 1;
-                adopted.push(entry.clone());
+                adopted.push(entry.name.as_str());
                 continue;
             }
             let existing_path = if exists_in_target {
@@ -1859,15 +2213,42 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         }
         doc = Config::with_mcp_server_added(&doc, entry)?;
         added += 1;
-        adopted.push(entry.clone());
+        adopted.push(entry.name.as_str());
     }
+    // A merge keeps local settings the source omits (`enabled = false`, a
+    // timeout, OAuth pins), so grants and readiness describe each server as
+    // the document now holds it, not as the source spelled it (#2915).
+    let saved = parse_mcp_config(&doc, &target)?;
+    let adopted: Vec<McpServerEntry> = adopted
+        .iter()
+        .filter_map(|name| effective(&saved, name))
+        .collect();
     let hosts = if request.grant_net {
         imported_http_hosts(&adopted)?
     } else {
         Vec::new()
     };
+    let mut granted = Vec::new();
     for host in &hosts {
-        doc = Config::with_net_host(&doc, host)?;
+        let with_host = Config::with_net_host(&doc, host)?;
+        if with_host != doc {
+            granted.push(host.as_str());
+            doc = with_host;
+        }
+    }
+    // A server the document keeps disabled gets no grant; --grant-net asked
+    // for one, so each host it withholds is named below, unless the net
+    // already holds it, granted now for another server or before (#2915).
+    let mut withheld = Vec::new();
+    for entry in adopted
+        .iter()
+        .filter(|entry| request.grant_net && !entry.enabled)
+    {
+        if let Some(host) = http_host(entry)? {
+            if !Config::with_net_host(&doc, &host).is_ok_and(|with_host| with_host == doc) {
+                withheld.push((entry.name.as_str(), host));
+            }
+        }
     }
     if !adopted.is_empty() && target_original.as_deref() != Some(doc.as_str()) {
         atomic_import_commit(&target_destination, target_original.as_deref(), &doc)?;
@@ -1879,8 +2260,53 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         source.display(),
         target.display()
     )?;
-    if overwritten > 0 {
-        writeln!(out, "Overwrote {overwritten} existing server(s).")?;
+    let owner_replacements = replaced - higher_precedence_replacements;
+    if owner_replacements > 0 {
+        let removed: Vec<String> = adopted
+            .iter()
+            .filter_map(|saved| {
+                let previous = effective(&existing_entries, &saved.name)?;
+                let removed = removed_local_settings(&previous, saved);
+                (!removed.is_empty())
+                    .then(|| format!("  {}: removed {}", saved.name, removed.join(", ")))
+            })
+            .collect();
+        // A kept login_argv is a preserved setting, so it is named after the
+        // exceptions, not among them.
+        let kept: Vec<&str> = adopted
+            .iter()
+            .filter_map(|saved| {
+                let previous = effective(&existing_entries, &saved.name)?;
+                kept_login_argv_for_a_new_command(&previous, saved).then_some(saved.name.as_str())
+            })
+            .collect();
+        let except = if removed.is_empty() { "." } else { ", except:" };
+        writeln!(
+            out,
+            "Overwrote {owner_replacements} existing server(s); local settings absent from the source were preserved{except}"
+        )?;
+        for line in removed {
+            writeln!(out, "{line}")?;
+        }
+        if !kept.is_empty() {
+            writeln!(
+                out,
+                "Kept login_argv, though the command changed: {}",
+                kept.join(", ")
+            )?;
+        }
+    }
+    for name in &moved {
+        writeln!(
+            out,
+            "Endpoint changed for {name}: a saved login for the previous endpoint is not used; run `newt auth {name}`."
+        )?;
+    }
+    if higher_precedence_replacements > 0 {
+        writeln!(
+            out,
+            "Replaced {higher_precedence_replacements} lower-precedence server(s) with higher-precedence entries; their original config entries were left intact."
+        )?;
     }
     if !skipped.is_empty() {
         writeln!(
@@ -1890,12 +2316,32 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
             skipped.join(", ")
         )?;
     }
-    if !hosts.is_empty() {
+    writeln!(
+        out,
+        "Results: {added} added, {replaced} replaced, {unchanged} unchanged, {} skipped.",
+        skipped.len()
+    )?;
+    for name in &shadowed {
+        writeln!(
+            out,
+            "warning: MCP server `{name}` also has a shadowed copy in {}, left as it was; remove it with {}",
+            breakout_target.display(),
+            remove_from(&breakout_target, name)
+        )?;
+    }
+    if !granted.is_empty() {
         writeln!(
             out,
             "Granted exact MCP network host(s) in {}: {}",
             target.display(),
-            hosts.join(", ")
+            granted.join(", ")
+        )?;
+    }
+    for (name, host) in &withheld {
+        writeln!(
+            out,
+            "Withheld the network grant for `{name}`, which stays disabled: {}.",
+            hand_grant(host, false, &target)
         )?;
     }
     print_next_steps(out, &adopted)

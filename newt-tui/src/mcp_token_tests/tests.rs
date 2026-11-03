@@ -1250,7 +1250,7 @@ async fn a_fallback_bearer_carries_the_refused_grant_to_a_non_401_failure_3028()
     );
     let mut mcp = crate::mcp::Mcp::empty();
     mcp.statuses = vec![(name.into(), crate::mcp::McpStatus::from_error(&failure))];
-    let line = &mcp.status_lines()[1];
+    let line = &mcp.status_lines(|_| None)[1];
     assert!(line.contains("invalid_grant"), "{line}");
     assert!(line.contains(crate::mcp::LOGIN_REMEDIATION), "{line}");
 }

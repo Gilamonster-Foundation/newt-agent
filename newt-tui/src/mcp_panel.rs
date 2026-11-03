@@ -49,6 +49,9 @@ pub(crate) struct McpPanel {
     sanitize_names: bool,
     action: Option<Action>,
     pub message: String,
+    /// Discovery diagnostics, e.g. a malformed `mcp.toml`, shown above the
+    /// list so an unloadable file never reads as one with no servers.
+    pub notices: Vec<String>,
 }
 
 fn source_label(source: McpSource) -> &'static str {
@@ -146,6 +149,7 @@ impl McpPanel {
             sanitize_names,
             action: None,
             message: String::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -258,12 +262,15 @@ impl McpPanel {
             selected,
             editable: false,
         };
+        let notices = self.notices.iter().map(|notice| row(notice.clone(), false));
         let Some(server) = self.servers.get(self.server.at()) else {
-            return vec![row("No MCP servers discovered".into(), false)];
+            return notices
+                .chain([row("No MCP servers discovered".into(), false)])
+                .collect();
         };
         match self.page {
             Page::Servers => {
-                let mut rows = Vec::new();
+                let mut rows: Vec<_> = notices.collect();
                 let mut source = None;
                 for (i, server) in self.servers.iter().enumerate() {
                     if source != Some(server.source) {
@@ -620,5 +627,24 @@ mod tests {
             "connect timeout reaching https://idp.example.test/oauth/authorize"
         )));
         assert_eq!(connection(&timeout), "disconnected · reconnect to diagnose");
+    }
+
+    /// #2915 review: a malformed `mcp.toml` is named on the server list, both
+    /// when it leaves nothing discovered and above the servers that remain.
+    #[test]
+    fn discovery_notices_show_on_the_server_list() {
+        let notice = "mcp.toml: invalid MCP TOML syntax; its MCP servers were not loaded";
+        let mut empty = McpPanel::new(Vec::new(), true);
+        empty.notices = vec![notice.into()];
+        let text = render(&empty, 100, 12);
+        assert!(text.contains("invalid MCP TOML syntax"), "{text}");
+        assert!(text.contains("No MCP servers discovered"), "{text}");
+
+        let mut listed = McpPanel::new(vec![server("documents")], true);
+        listed.notices = vec![notice.into()];
+        let text = render(&listed, 100, 12);
+        // Both must be found: `None < Some(_)` would pass with no notice.
+        let notice = text.find("invalid MCP TOML syntax").expect(&text);
+        assert!(notice < text.find("documents").expect(&text), "{text}");
     }
 }
