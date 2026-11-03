@@ -9,6 +9,60 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+## [0.8.6] — 2026-11-03
+
+### Added
+
+- `mcp_status` (#3036, #3048): a read-only tool that reports each MCP server's state
+  (connected, skipped, rejected or disabled), its last error and its tool count, with
+  secrets redacted. It is offered only when MCP servers are configured.
+- `newt caps digest <dir> [--json]` (#3034, #3053) prints the content id of a tool tree,
+  so an approval can name exact bytes. It refuses a tree holding a symlink, a hard link,
+  or a fifo, socket or device, and every tree on a platform that cannot detect hard links.
+- The flight recorder (`$NEWT_FLIGHT_RECORDER`) records each MCP connect and auth outcome
+  on a new `mcp` axis. `ocap propose` never turns it into policy (#3037, #3049).
+
+### Changed
+
+- newt-mesh checks peers against the operator's revocation log (agent-mesh 0.8.3, #3067).
+  `newt-mesh announce` and `ask` refuse to start without `revocation.json` beside the user
+  key, as `amesh` does. Docking (the newt-web hub and responder, `newt-mesh dock`) creates
+  a genesis log in the state dir of an install that has none.
+- The Terminal-Bench (Harbor) adapter drives the TUI instead of `newt headless` (#3070):
+  `newt --disable-ocap --full-access` in tmux, with switches only `newt headless` has
+  refused. The TUI writes no run trace yet (#3069).
+
+### Fixed
+
+- `newt mcp import --force`, `newt mcp remove` and `/mcp enable|disable` act on the file
+  that owns the MCP entry discovery uses. A forced import merges into that entry and keeps
+  its comments and layout; it refuses before writing when a local header, env value,
+  argument or OAuth client setting would follow a moved endpoint or a changed program. A
+  malformed MCP file is reported by file and position instead of looking empty (#2915,
+  #2979, #3062).
+- `/mcp` asks for the exact-host approval ("OCAP network approval needed for <host>")
+  instead of a login when an OAuth discovery hop, an authorization-server endpoint or a
+  token refresh is on a host outside the network grant. A hostname that resolves to a
+  private address asks for a hostname grant (#2914, #2924).
+- File tools expand a leading `~` to your home directory instead of reading
+  `<workspace>/~/…`. `~user` is refused, and a not-found error says where the path
+  resolved (#3039, #3045).
+- A window you open with a `/command` (`/settings`, `/mcp`, a form) draws on the alternate
+  screen, so closing it restores the screen exactly. Prompts and clarifications the
+  session raises stay inline. A long `/settings` value keeps a space before its
+  annotation (#3056, #3057).
+- An unmeasured resize no longer leaves blank rows above the prompt or erases output
+  after a narrow (#3041, #3061).
+- The `lifecycle` tool says when it picked the pyo3 pack only because the root has both
+  `Cargo.toml` and `pyproject.toml`, and names the `[lifecycle]` override (#3040, #3050).
+- On Windows, loading the drift cache while a save replaces its head no longer falls back
+  to a rebuild (#3055).
+
+### Security
+
+- RUSTSEC-2026-0429 (zip 1.1.4, via candle-core 0.8.4) is accepted: candle reads and
+  writes zip archives in memory and never calls the affected `extract()` (#3071).
+
 ## [0.8.5] — 2026-10-27
 
 ### Added
