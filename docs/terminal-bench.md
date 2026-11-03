@@ -1,9 +1,10 @@
 # Terminal-Bench scoreboard
 
 Measured on [Terminal-Bench](https://github.com/harbor-framework/terminal-bench)
-via `newt headless` and the Harbor adapter, confined (**OCAP on**) and unconfined
+via the Harbor adapter, confined (**OCAP on**) and unconfined
 (**OCAP off**). Each lane is a per-model monotonic ratchet: a score never goes
-down across releases.
+down across releases. The rows below were measured through `newt headless`; the
+adapter now drives the TUI, OCAP off only.
 
 <!-- BENCH-SCOREBOARD:START -->
 _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do not edit by hand._

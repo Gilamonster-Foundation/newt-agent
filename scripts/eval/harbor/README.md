@@ -1,12 +1,30 @@
 # newt ↔ Harbor / Terminal-Bench adapter (WS3, #1419)
 
-[`newt_agent.py`](newt_agent.py) injects a branch-built `newt` binary and a local
-backend profile into each Harbor task container, then runs `newt headless`.
-It uses Harbor's `task_env_config.workdir`, otherwise the container's `pwd`,
-falling back to `/app` if neither supplies a directory. The trace goes to
-`/logs/agent/newt-events.jsonl`; smart mode also stores its frame under
-`/logs/agent/frame`. The configured inference endpoint must be reachable from
-inside the container.
+[`newt_agent.py`](newt_agent.py) drives the newt TUI, the one a person runs, so
+bench behaviour cannot drift from it. In each Harbor task container it installs
+tmux and uploads a `newt` binary, the backend profile as `~/.newt/config.toml`,
+and the on-host summarizer model. It then starts `newt --no-splash
+--disable-ocap --full-access` in a detached tmux pane in the task's working
+directory: Harbor's `task_env_config.workdir`, else the container's `pwd`, else
+`/app`. The instruction goes in as one bracketed paste and Enter. newt's herdr
+lifecycle reports, written to `/logs/agent/lifecycle.log`, say when the turn
+is over or newt is waiting for a person; the driver then sends `/exit`.
+
+The driver types nothing else, apart from a Ctrl-C that closes an open prompt
+before `/exit`. A question, clarification or approval newt waits on ends the
+trial, and the trial is graded. `/logs/agent` keeps `driver.jsonl`, the screen
+(`tui-screen.txt`, raw `tui.pane`) and newt's own records under `newt-home/`.
+
+The TUI writes no contract or `newt-events.jsonl` yet. `tb_campaign.py` reads
+that file for newt's model replies and terminal error, which decide whether an
+errored trial is infra or agent; for its claim and false-completion columns;
+and for the served model and treatment checks. `cross-tab.py` reads it too. For
+TUI runs all of these read nothing; only Harbor's reward is measured.
+
+Switches that only `newt headless` has (`NEWT_BENCH_OCAP=on`,
+`NEWT_BENCH_SMART`, `NEWT_BENCH_REQUIRE_FEATURES`, a round cap other than 40)
+are refused when Harbor creates the agent, before it builds a container. The
+configured inference endpoint must be reachable from inside the container.
 
 ## Run
 
@@ -147,9 +165,10 @@ Treatments apply to newt only. The file's sha256 is recorded as the treatment's
 identity.
 
 *Required features.* A treatment may declare `requires = ["scratchpad", ...]`,
-using newt's receipt keys (`scratchpad`, `code_search`, `crew`). The adapter
-passes each one as `newt headless --require-feature`, so a feature the run cannot
-supply refuses before any inference. A cell whose trials all refuse is recorded
+using newt's receipt keys (`scratchpad`, `code_search`, `crew`). The TUI has no
+`--require-feature`, so the adapter now refuses such a treatment outright; the
+headless lane passed each key as `newt headless --require-feature`, so a feature
+the run could not supply refused before any inference. A cell whose trials all refuse is recorded
 as skipped with newt's refusal text. It is never graded, and no claim is counted
 for it. The baseline requires nothing.
 
@@ -192,7 +211,7 @@ args. Those kwargs are where thinking is switched on or off, identically for
 every harness. A preset edit between cells is refused as
 `pin mismatch: model_fingerprint.chat_template_kwargs`. The fingerprint is not
 a content digest: the router exposes no weights hash. A digest written after a model id in the roster is recorded as
-declared and unverified, and newt receives it as `NEWT_MODEL_DIGEST`.
+declared and unverified. The headless lane passed it to newt as `NEWT_MODEL_DIGEST`; the TUI drive does not.
 
 `tb_campaign.py table <out> --pair` adds one section per treatment. It compares
 each treatment cell with its model and harness's `none` cell, task by task, for
@@ -227,13 +246,16 @@ Reading the table:
 - **Tokens** for pi and Codex are Harbor's `agent_result`, parsed from the
   harness log. newt's contract emits output tokens only, so newt's input tokens
   are missing, not zero.
-- **Sandbox and round caps:** newt runs `--unsafe-host-exec` because pi and Codex
-  run unsandboxed. newt stops at `NEWT_BENCH_MAX_ROUNDS` (40), while pi and Codex
+- **Sandbox and round caps:** newt runs `--disable-ocap --full-access` because pi
+  and Codex run unsandboxed. newt stops at `NEWT_BENCH_MAX_ROUNDS` (40), while pi and Codex
   have no round cap. The agent timeout is the only limit all three share.
 - **Wilson interval:** computed over graded trials. Coverage (expected, observed
   and graded) is shown next to it.
 
 ## Smart-harness comparison
+
+This recipe ran on the headless lane. The TUI drive refuses `NEWT_BENCH_SMART`
+until the TUI has a smart arm.
 
 [`smart-ab.sh`](smart-ab.sh) runs the plain arm, then the smart arm, using the
 same binary and supplied job configuration:

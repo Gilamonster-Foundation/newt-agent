@@ -1,119 +1,251 @@
-"""Regression: the OCAP-off lane must opt in explicitly.
+"""The newt TUI drive (newt_agent.py): what it types, what it refuses, and how it
+reads newt's own lifecycle reports.
 
-Since #1582 a plain ``newt solve`` is confined. The adapter used to append
-nothing for ``NEWT_BENCH_OCAP`` unset/off, so every "off" run after 2026-08-07
-measured the confined lane and recorded ``ocap: on`` in its solve_result.
-Run: PYTHONPATH=scripts/eval/harbor python -m unittest scripts/eval/harbor/tests/test_lanes.py
+Terminal-Bench runs drive the TUI a person uses, so bench behaviour cannot drift
+from it. The flow tests replay a lifecycle log against a fake environment.
+Run: PYTHONPATH=scripts/eval/harbor:scripts/eval/harbor/tests/stubs \\
+     python -m unittest scripts/eval/harbor/tests/test_lanes.py
 """
 
+import asyncio
+import json
+import shlex
+import sqlite3
+import tempfile
+import types
 import unittest
+from pathlib import Path
+from unittest import mock
 
-import newt_agent
-from newt_agent import _lane_flag
+import newt_agent as na
+from harbor.agents.installed.base import NonZeroAgentExitCodeError
 
-
-class LaneFlag(unittest.TestCase):
-    def test_off_lane_opts_in_to_unsafe_host_exec(self):
-        for raw in ("", "off", "OFF", " anything "):
-            self.assertEqual(_lane_flag(raw), " --unsafe-host-exec", raw)
-
-    def test_on_lane_is_confined(self):
-        for raw in ("on", "ON", " on "):
-            self.assertEqual(_lane_flag(raw), " --confined", raw)
-
-    def test_lanes_never_collapse(self):
-        self.assertNotEqual(_lane_flag("off"), _lane_flag("on"))
+KNOBS = ("_OCAP", "_SMART", "_REQUIRE_FEATURES", "_MAX_ROUNDS", "_SELF_VERIFY",
+         "_VERIFY_OUTCOMES", "_INITIATIVE", "_TENACITY")
 
 
-class BenchWriteRoots(unittest.TestCase):
-    """The confined lane's fence no longer includes the system roots or /home by
-    default (a default must be safe on a developer host). Disposable bench
-    containers need package installs (#1487), so the adapter ASKS for them."""
+class Knobs(unittest.TestCase):
+    def setUp(self):
+        self.saved = {k: getattr(na, k) for k in KNOBS}
 
-    ROOTS = "/usr:/usr/local:/var:/etc:/opt:/root:/home"
-
-    def test_confined_lane_requests_the_broad_roots_and_off_lane_does_not(self):
-        try:
-            newt_agent._OCAP = "on"
-            self.assertIn(f"NEWT_WRITE_PATHS={self.ROOTS} ", newt_agent._container_env_prefix())
-            newt_agent._OCAP = ""
-            self.assertNotIn("NEWT_WRITE_PATHS", newt_agent._container_env_prefix())
-        finally:
-            newt_agent._OCAP = ""
-
-    def test_smart_arm_never_gets_the_broad_roots(self):
-        """The smart-harness lane refuses a write grant with a model-writable
-        ancestor (`/usr` above `/usr/local`), so asking for them would stop the
-        arm launching. It keeps its workspace-only fence."""
-        try:
-            newt_agent._OCAP = "on"
-            for raw in ("1", "on", "true"):
-                newt_agent._SMART = raw
-                self.assertNotIn("NEWT_WRITE_PATHS", newt_agent._container_env_prefix(), raw)
-        finally:
-            newt_agent._OCAP = ""
-            newt_agent._SMART = ""
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(na, k, v)
 
 
-class ModelDigest(unittest.TestCase):
-    """#2318: a declared digest reaches the container as NEWT_MODEL_DIGEST, and
-    none is invented when the operator declared nothing."""
+class Command(Knobs):
+    def test_off_lane_is_the_unsafe_host_exec_pair_without_ambient(self):
+        argv = na._newt_argv()
+        self.assertEqual(argv[:4], ["newt", "--no-splash", "--disable-ocap", "--full-access"])
+        self.assertNotIn("--yolo", argv)
+        self.assertNotIn("--ambient", argv)
 
-    def test_declared_digest_is_passed_and_absent_is_absent(self):
-        try:
-            newt_agent._MODEL_DIGEST = "sha256:abc"
-            self.assertIn("NEWT_MODEL_DIGEST=sha256:abc ", newt_agent._container_env_prefix())
-            newt_agent._MODEL_DIGEST = ""
-            self.assertNotIn("NEWT_MODEL_DIGEST", newt_agent._container_env_prefix())
-        finally:
-            newt_agent._MODEL_DIGEST = ""
+    def test_posture_flags_follow_the_knobs(self):
+        na._INITIATIVE, na._TENACITY = "decisive", "relentless"
+        argv = na._newt_argv()
+        self.assertIn(["--initiative", "decisive"], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIn(["--tenacity", "relentless"], [argv[i:i + 2] for i in range(len(argv))])
+        na._INITIATIVE, na._TENACITY = "", ""
+        self.assertNotIn("--initiative", na._newt_argv())
 
-
-class RequiredFeatures(unittest.TestCase):
-    """#2318/#2356: a treatment's `requires` becomes `--require-feature` on the
-    built newt command, so a default-off feature that cannot be supplied refuses
-    before inference; the baseline passes no flag."""
-
-    def test_declared_requirements_become_flags_and_none_adds_none(self):
-        try:
-            newt_agent._REQUIRE_FEATURES = "scratchpad,crew"
-            command = newt_agent._solve_command("/app")
-            self.assertIn(" --require-feature scratchpad --require-feature crew", command)
-            newt_agent._REQUIRE_FEATURES = ""
-            self.assertNotIn("--require-feature", newt_agent._solve_command("/app"))
-        finally:
-            newt_agent._REQUIRE_FEATURES = ""
+    def test_pane_shell_outlives_newt_and_records_its_exit(self):
+        """A pane shell that exits hangs up the terminal's foreground group,
+        which would kill servers a task asked the agent to leave running."""
+        cmd = na._start_command("/my work")
+        self.assertIn("exec sleep infinity", cmd)
+        self.assertIn("newt.exit", cmd)
+        self.assertIn("-c '/my work'", cmd)
+        shlex.split(cmd)  # the nested quoting still parses
 
 
-class VerifyOutcomes(unittest.TestCase):
-    """#2315: the result-aware verification treatment reaches the container, and
-    stays absent when the operator did not ask for it (a switch nothing sets is
-    the #1943 defect)."""
+class Refusals(Knobs):
+    def test_headless_only_knobs_are_refused_not_ignored(self):
+        for name, value in (("_OCAP", "on"), ("_SMART", "1"), ("_REQUIRE_FEATURES", "crew"),
+                            ("_MAX_ROUNDS", "60")):
+            for k in KNOBS:
+                setattr(na, k, self.saved[k])
+            na._OCAP = na._SMART = na._REQUIRE_FEATURES = na._MAX_ROUNDS = ""
+            setattr(na, name, value)
+            self.assertEqual(len(na._refusals()), 1, name)
 
-    def test_opt_in_is_injected_and_absent_is_absent(self):
-        try:
-            newt_agent._VERIFY_OUTCOMES = "1"
-            self.assertIn("NEWT_VERIFY_OUTCOMES=1 ", newt_agent._container_env_prefix())
-            newt_agent._VERIFY_OUTCOMES = ""
-            self.assertNotIn("NEWT_VERIFY_OUTCOMES", newt_agent._container_env_prefix())
-        finally:
-            newt_agent._VERIFY_OUTCOMES = ""
+    def test_a_refused_knob_stops_the_agent_before_harbor_builds_a_container(self):
+        na._OCAP = "on"
+        with self.assertRaises(ValueError):
+            na.NewtAgent(Path("."))
+
+    def test_the_campaign_defaults_pass(self):
+        na._OCAP = na._SMART = na._REQUIRE_FEATURES = ""
+        for rounds in ("", "40"):
+            na._MAX_ROUNDS = rounds
+            self.assertEqual(na._refusals(), [], rounds)
 
 
-class SelfVerifyAblation(unittest.TestCase):
-    """newt's self-verify gate is ON by default (#1961), so the baseline already runs
-    it and =1 changes nothing. The ablation is =0, which must reach the container."""
+class PaneEnv(Knobs):
+    def test_reports_go_to_the_shim_and_set_knobs_reach_the_pane(self):
+        na._SELF_VERIFY, na._VERIFY_OUTCOMES = "off", "1"
+        env = na._pane_env()
+        self.assertEqual((env["HERDR_ENV"], env["HERDR_BIN_PATH"]), ("1", na.HERDR_SHIM))
+        self.assertNotIn("HERDR_SOCKET_PATH", env)  # a socket would win over the shim
+        self.assertEqual((env["NEWT_SELF_VERIFY"], env["NEWT_VERIFY_OUTCOMES"]), ("0", "1"))
 
-    def test_off_is_injected_as_zero_and_absent_is_absent(self):
-        try:
-            for value, injected in (("0", "NEWT_SELF_VERIFY=0 "), ("off", "NEWT_SELF_VERIFY=0 "),
-                                    ("false", "NEWT_SELF_VERIFY=0 "), ("1", "NEWT_SELF_VERIFY=1 ")):
-                newt_agent._SELF_VERIFY = value
-                self.assertIn(injected, newt_agent._container_env_prefix(), value)
-            newt_agent._SELF_VERIFY = ""
-            self.assertNotIn("NEWT_SELF_VERIFY", newt_agent._container_env_prefix())
-        finally:
-            newt_agent._SELF_VERIFY = ""
+    def test_unset_knobs_stay_absent_and_retries_stay_newts_own(self):
+        na._SELF_VERIFY = na._VERIFY_OUTCOMES = ""
+        env = na._pane_env()
+        for key in ("NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES", "NEWT_MODEL_DIGEST", "NEWT_HTTP_MAX_RETRIES"):
+            self.assertNotIn(key, env)
+
+
+def report(state, message=None):
+    tail = f" --message {message}" if message else ""
+    return f"1 pane report-agent bench --source custom:newt --agent newt --state {state}{tail}\n"
+
+
+class Lifecycle(unittest.TestCase):
+    def test_states_keep_report_agent_lines_only(self):
+        log = ("0 pane report-agent-session bench --source custom:newt --agent newt --agent-session-id s\n"
+               + report("idle") + report("working", "thinking") + report("idle", "failed")
+               + "9 pane release-agent bench --source custom:newt --agent newt\n")
+        self.assertEqual(na._states(log), ["idle", "working:thinking", "idle:failed"])
+
+    def test_stop_reasons(self):
+        for state, stop in (("idle", "turn-ended"), ("idle:failed", "turn-failed"),
+                            ("blocked", "waiting-for-a-person"), ("exited", "newt-exited")):
+            self.assertEqual(na._stop_reason(state), stop)
+
+    def test_probe_is_the_end_of_the_last_line(self):
+        probe = na._probe("Do X.\n\n  Then   write /app/out.txt  \n\n")
+        self.assertTrue("Then write /app/out.txt".endswith(probe))
+        self.assertEqual(len(probe), 16)
+
+
+class FakeEnv:
+    """Plays newt's lifecycle log in chunks: the first when newt starts, the
+    next on Enter, the rest one per driver poll after that. A chunk `exit N`
+    is newt exiting with N. Writes `newt.exit` when /exit is pasted, noting
+    how many reports had arrived, and newt's record (one `turn_outcome` per
+    entry in `outcomes`) when the driver copies it."""
+
+    def __init__(self, logs: Path, chunks, outcomes):
+        self.logs, self.chunks, self.outcomes, self.commands = logs, list(chunks), outcomes, []
+        self.submitted, self.states_at_exit = False, None
+        self.task_env_config = types.SimpleNamespace(workdir="/app")
+
+    def emit(self):
+        if not self.chunks:
+            return
+        chunk = self.chunks.pop(0)
+        if chunk.startswith("exit "):
+            (self.logs / "newt.exit").write_text(chunk.split()[1] + "\n")
+            return
+        with open(self.logs / na.LIFECYCLE, "a") as fh:
+            fh.write(chunk)
+
+    async def upload_file(self, source, target):
+        self.commands.append(f"upload {target}")
+
+    async def exec(self, command, **kwargs):
+        self.commands.append(command)
+        if "new-session" in command:
+            self.emit()
+        if "conversations.db" in command:
+            (self.logs / "newt-home").mkdir(exist_ok=True)
+            db = sqlite3.connect(self.logs / "newt-home" / "conversations.db")
+            db.execute("CREATE TABLE prompt_artifacts (kind TEXT, metadata TEXT)")
+            db.executemany("INSERT INTO prompt_artifacts VALUES ('turn_outcome', ?)",
+                           [(json.dumps({"end_reason": r}),) for r in self.outcomes])
+            db.commit()
+            db.close()
+        if "-b quit" in command:
+            self.states_at_exit = len(na._states((self.logs / na.LIFECYCLE).read_text()))
+            (self.logs / "newt.exit").write_text("0\n")
+        elif command.endswith("Enter"):
+            self.submitted = True
+            self.emit()
+        screen = "write /app/out.txt" if "capture-pane" in command else ""
+        return types.SimpleNamespace(stdout=screen)
+
+
+class Flow(unittest.TestCase):
+    def drive(self, *chunks, outcomes=("completed",)):
+        real_sleep = asyncio.sleep
+
+        async def poll(_seconds):
+            if env.submitted:
+                env.emit()
+            await real_sleep(0.005)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(na, "SETTLE_SEC", 0.2), \
+                mock.patch.object(na, "START_TIMEOUT_SEC", 0.3), mock.patch.object(na.asyncio, "sleep", poll):
+            logs = Path(tmp)
+            env = FakeEnv(logs, chunks, list(outcomes))
+            context = types.SimpleNamespace(metadata=None)
+            error = None
+            try:
+                # Bounded: a driver that misses an exit would otherwise wait forever.
+                asyncio.run(asyncio.wait_for(na.NewtAgent(logs).run("Write /app/out.txt", env, context), 10))
+            except (NonZeroAgentExitCodeError, RuntimeError) as exc:
+                error = exc
+            return context.metadata, env, error
+
+    def test_a_queued_turn_runs_before_exit(self):
+        """A retry or an approved plan starts the next turn with no input from a
+        person, so the first idle is not the end."""
+        meta, env, error = self.drive(report("idle"), report("working") + report("idle"),
+                                      report("working", "run_command"), report("idle"),
+                                      outcomes=("completed", "completed"))
+        self.assertIsNone(error)
+        self.assertEqual((meta["stop"], meta["newt_exit"]), ("turn-ended", 0))
+        self.assertEqual(env.states_at_exit, 5)
+        typed = [c for c in env.commands if "paste-buffer" in c or "send-keys" in c]
+        self.assertIn("paste-buffer -p", typed[0])  # bracketed: one submission
+        self.assertIn("-b task", typed[0])
+        self.assertTrue(typed[1].endswith("Enter"))
+        self.assertIn("-b quit", typed[-1])
+        self.assertFalse(any("C-c" in c for c in env.commands))
+
+    def test_a_stop_for_a_person_is_cancelled_then_exited(self):
+        meta, env, error = self.drive(report("idle"), report("working") + report("blocked"),
+                                      outcomes=("cancelled",))
+        self.assertIsNone(error)
+        self.assertEqual(meta["stop"], "waiting-for-a-person")
+        quit_at = next(i for i, c in enumerate(env.commands) if "-b quit" in c)
+        self.assertTrue(any("C-c" in c for c in env.commands[:quit_at]))
+
+    def test_newt_dying_mid_turn_is_graded_with_its_exit_status(self):
+        """newt reports nothing on the way out; its exit status ends the wait
+        instead of Harbor's agent timeout."""
+        meta, env, error = self.drive(report("idle"), report("working"), "exit 101", outcomes=())
+        self.assertEqual((meta["stop"], meta["newt_exit"]), ("newt-exited", 101))
+        self.assertIsInstance(error, NonZeroAgentExitCodeError)
+        self.assertRegex(str(error), r"exit (\d+)")  # what tb_campaign.py parses
+        self.assertFalse(any("-b quit" in c for c in env.commands))
+
+    def test_a_failed_last_turn_is_raised_for_harbor_to_record(self):
+        meta, _, error = self.drive(report("idle"), report("working") + report("idle", "failed"),
+                                    outcomes=("failed",))
+        self.assertEqual(meta["stop"], "turn-failed")
+        self.assertIsInstance(error, NonZeroAgentExitCodeError)
+
+    def test_a_failure_the_reporter_overwrote_is_read_from_newts_record(self):
+        """herdr keeps only the latest state: the idle after a failed turn can
+        replace `idle:failed` before it is delivered."""
+        meta, _, error = self.drive(report("idle"), report("working") + report("idle"),
+                                    outcomes=("failed",))
+        self.assertEqual(meta["outcomes"], ["failed"])
+        self.assertIsInstance(error, NonZeroAgentExitCodeError)
+
+    def test_a_turn_with_no_start_report_is_graded_from_newts_record(self):
+        """A turn that started and ended while the reporter slept leaves only
+        the idle it began from; newt's record still shows it ran."""
+        meta, env, error = self.drive(report("idle"), outcomes=("completed",))
+        self.assertIsNone(error)
+        self.assertEqual((meta["stop"], meta["outcomes"]), ("no-start-reported", ["completed"]))
+        self.assertTrue(any("-b quit" in c for c in env.commands))
+
+    def test_an_instruction_that_left_no_turn_is_an_apparatus_failure(self):
+        _, _, error = self.drive(report("idle"), outcomes=())
+        self.assertIsInstance(error, RuntimeError)
+        self.assertNotIsInstance(error, NonZeroAgentExitCodeError)  # Harbor must not grade it
 
 
 if __name__ == "__main__":

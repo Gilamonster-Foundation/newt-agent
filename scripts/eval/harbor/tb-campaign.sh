@@ -176,7 +176,7 @@ for MLINE in "${MODELS[@]}"; do
       model_fingerprint_json "${fp:-null}" model_digest_declared "${DIGEST:-}" instrument_commit "$INSTRUMENT" \
       engine "$ENGINE" ctx_served "$ctx" ctx_pinned "$TB_CTX_SIZE" loaded_at_start "$(loaded)" \
       task_set_sha256 "$(sha256sum "$TASKS" | cut -d' ' -f1)" n_tasks "$N_TASKS" trials "$TRIALS" \
-      expected "$((N_TASKS * TRIALS))" agent_timeout_multiplier "$MULT" sandbox "none (newt --unsafe-host-exec)" \
+      expected "$((N_TASKS * TRIALS))" agent_timeout_multiplier "$MULT" sandbox "none (newt TUI --disable-ocap --full-access)" \
       newt_max_rounds "${NEWT_BENCH_MAX_ROUNDS:-40}" pi_codex_round_cap "none" \
       newt_binary_sha256 "$(sha256sum "$NEWT_BENCH_BIN" | cut -d' ' -f1)" skipped "$skip" started_at "$(date -Is)"
     [ -n "$skip" ] || { bad=$(tbc pin-check "$OUT" "$CELL") || skip="pin mismatch: $bad"; }
