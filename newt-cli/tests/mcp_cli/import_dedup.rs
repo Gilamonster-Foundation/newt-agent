@@ -221,7 +221,10 @@ fn merge_import_refuses_a_name_only_a_borrowed_config_defines() {
     )
     .unwrap();
     std::fs::create_dir_all(sb.cwd.join(".newt")).unwrap();
-    for borrowed in [sb.cwd.join(".newt/config.toml"), sb.cwd.join("newt.toml")] {
+    // newt spells the path from the cwd it sees: macOS resolves the temp
+    // dir's /var symlink and Windows joins with `\`. Match the file's tail.
+    for rel in [Path::new(".newt").join("config.toml"), "newt.toml".into()] {
+        let borrowed = sb.cwd.join(&rel);
         std::fs::write(&borrowed, entry).unwrap();
         newt(&sb)
             .args([
@@ -233,9 +236,10 @@ fn merge_import_refuses_a_name_only_a_borrowed_config_defines() {
             ])
             .assert()
             .failure()
+            .stderr(predicate::str::contains("`github` is already defined in "))
             .stderr(predicate::str::contains(format!(
-                "`github` is already defined in {}",
-                borrowed.display()
+                "{}, which outranks",
+                rel.display()
             )));
         assert_eq!(std::fs::read_to_string(&borrowed).unwrap(), entry);
         assert!(!sb.config_dir.join("mcp.toml").exists());
