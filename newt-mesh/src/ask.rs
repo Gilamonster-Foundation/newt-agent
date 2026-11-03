@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use agent_mesh_bus::{Bus, Topic};
-use agent_mesh_core::{AgentKey, Fingerprint, UserKey};
+use agent_mesh_core::{AgentKey, Fingerprint, RevocationGuard, UserKey};
 
 use crate::error::{MeshIntegrationError, Result};
 use crate::protocol::{InferenceReply, InferenceRequest, INFERENCE_TOPIC};
@@ -27,8 +27,15 @@ impl MeshAsker {
     /// stable port because nobody dials it back. mDNS still announces
     /// the asker (the bus owns the announcer), so a peer browser can
     /// see "asker came up" if it wants to.
-    pub async fn bind(user: &UserKey, agent: AgentKey) -> Result<Self> {
-        let bus = Bus::bind(user, agent, 0).await?;
+    ///
+    /// `revocation` is the user's revocation log (agent-mesh
+    /// `RevocationGuard::open`): a peer it revokes is refused.
+    pub async fn bind(
+        user: &UserKey,
+        agent: AgentKey,
+        revocation: RevocationGuard,
+    ) -> Result<Self> {
+        let bus = Bus::bind(user, agent, 0, revocation).await?;
         Ok(Self { bus })
     }
 
@@ -97,7 +104,8 @@ mod tests {
         let user = UserKey::generate();
         let a = agent(&user, "asker");
         let a_fp = a.fingerprint();
-        let asker = MeshAsker::bind(&user, a).await.unwrap();
+        let revocation = RevocationGuard::in_memory(&user);
+        let asker = MeshAsker::bind(&user, a, revocation).await.unwrap();
         assert_eq!(asker.user_fingerprint(), user.fingerprint());
         assert_eq!(asker.agent_fingerprint(), a_fp);
         asker.close().await.unwrap();
@@ -107,7 +115,8 @@ mod tests {
     async fn ask_unknown_peer_returns_bus_error() {
         let user = UserKey::generate();
         let a = agent(&user, "asker");
-        let asker = MeshAsker::bind(&user, a).await.unwrap();
+        let revocation = RevocationGuard::in_memory(&user);
+        let asker = MeshAsker::bind(&user, a, revocation).await.unwrap();
         let phantom = Fingerprint([0xeeu8; 32]);
         let req = InferenceRequest {
             prompt: "ping".into(),

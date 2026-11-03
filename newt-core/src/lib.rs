@@ -95,6 +95,7 @@ pub mod mcp;
 pub mod mcp_catalog;
 pub mod mcp_probe;
 pub mod memory;
+pub mod meter;
 pub mod metrics;
 pub mod model_card;
 pub mod model_id;

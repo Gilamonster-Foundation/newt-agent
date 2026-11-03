@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, UserKey};
+use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, RevocationGuard, UserKey};
 use newt_mesh::{InferenceRequest, MeshAsker, MeshIntegrationError, NewtMeshService};
 use tests_common::MockBackend;
 
@@ -67,11 +67,12 @@ async fn ask_receives_inference_reply() {
     let backend: Arc<dyn newt_inference::backend::InferenceBackend> =
         Arc::new(MockBackend::all_tiers("rt-backend", "rename complete"));
 
-    let service = NewtMeshService::bind(&user, responder_agent, backend, 0)
+    let revocation = RevocationGuard::in_memory(&user);
+    let service = NewtMeshService::bind(&user, responder_agent, backend, 0, revocation.clone())
         .await
         .expect("bind service");
 
-    let asker = MeshAsker::bind(&user, asker_agent)
+    let asker = MeshAsker::bind(&user, asker_agent, revocation)
         .await
         .expect("bind asker");
 
@@ -126,7 +127,8 @@ async fn service_reports_backend_metadata() {
     let backend: Arc<dyn newt_inference::backend::InferenceBackend> =
         Arc::new(MockBackend::all_tiers("metadata-test", "x"));
 
-    let service = NewtMeshService::bind(&user, responder, backend, 0)
+    let revocation = RevocationGuard::in_memory(&user);
+    let service = NewtMeshService::bind(&user, responder, backend, 0, revocation)
         .await
         .expect("bind");
 

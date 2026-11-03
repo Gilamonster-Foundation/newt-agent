@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_mesh_bus::{Bus, BusOptions, Topic};
-use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, UserKey};
+use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, RevocationGuard, UserKey};
 use async_trait::async_trait;
 use newt_inference::backend::{ChatReply, ChatRequest, InferenceBackend};
 use newt_mesh::NewtMeshService;
@@ -92,7 +92,8 @@ async fn bind_echo_responder(user: &UserKey) -> (NewtMeshService, Fingerprint) {
     let responder_agent = agent(user, "newt-inference");
     let fp = responder_agent.fingerprint();
     let backend: Arc<dyn InferenceBackend> = Arc::new(EchoBackend);
-    let service = NewtMeshService::bind(user, responder_agent, backend, 0)
+    let revocation = RevocationGuard::in_memory(user);
+    let service = NewtMeshService::bind(user, responder_agent, backend, 0, revocation)
         .await
         .expect("bind responder");
     (service, fp)
@@ -138,7 +139,8 @@ async fn raw_bus_client_round_trips_the_wire_contract() {
     let user = UserKey::generate();
     let (service, responder_fp) = bind_echo_responder(&user).await;
 
-    let client = Bus::bind(&user, agent(&user, "raw-client"), 0)
+    let revocation = RevocationGuard::in_memory(&user);
+    let client = Bus::bind(&user, agent(&user, "raw-client"), 0, revocation)
         .await
         .expect("bind client");
     // No fixed mDNS-settle sleep: `raw_ask` polls with a deadline on
@@ -166,7 +168,8 @@ async fn raw_bus_client_holds_a_threaded_conversation() {
     let user = UserKey::generate();
     let (service, responder_fp) = bind_echo_responder(&user).await;
 
-    let client = Bus::bind(&user, agent(&user, "conversing-client"), 0)
+    let revocation = RevocationGuard::in_memory(&user);
+    let client = Bus::bind(&user, agent(&user, "conversing-client"), 0, revocation)
         .await
         .expect("bind client");
 
@@ -211,6 +214,7 @@ async fn quiet_client_gets_replies_via_dial_back() {
         agent(&user, "quiet-client"),
         0,
         BusOptions { announce: false },
+        RevocationGuard::in_memory(&user),
     )
     .await
     .expect("bind quiet client");
