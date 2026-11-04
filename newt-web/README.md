@@ -6,9 +6,8 @@ agent loop.
 
 Conversation output is canonical GFM Markdown. The TUI projects that source to
 ANSI, while newt-web projects it to sanitized HTML. Fenced `mermaid` blocks are
-progressively enhanced by a pinned, locally served Mermaid 11.15.0 runtime.
-Invalid diagrams fall back to their original source, and Mermaid runs with
-`securityLevel: "strict"`. The front end has no JavaScript build step.
+drawn on the server as sanitized SVG; a diagram that cannot be drawn is shown
+as its source. The front end has no JavaScript build step.
 
 Run the development server:
 
@@ -38,5 +37,4 @@ npm run test:uat
 BAT gates pull requests and `main`; both BAT and UAT gate `release/**` branches.
 The workflow can also run either tier through `workflow_dispatch`.
 
-Licensed under Apache-2.0. The vendored Mermaid bundle is MIT-licensed; its
-license is kept in `assets/mermaid.LICENSE`.
+Licensed under Apache-2.0.
