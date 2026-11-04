@@ -93,6 +93,23 @@ jobs:
           Run-Diag "git --version" (Get-Command git.exe).Source @("--version")
           Run-Diag "git status (real repo)" (Get-Command git.exe).Source @("status")
           Run-Diag "git add pending.txt (the actual failing operation)" (Get-Command git.exe).Source @("add", "--", "pending.txt")
+          # Experiment: why does confined git refuse its own work tree?
+          $git = (Get-Command git.exe).Source
+          icacls.exe $work
+          $env:GIT_TRACE_SETUP = '1'
+          Run-Diag "rev-parse (no chdir)" $git @('rev-parse', '--is-bare-repository', '--show-toplevel')
+          Run-Diag "git -C work status" $git @('-C', $work, 'status')
+          Run-Diag "cmd cd into .git (SetCurrentDirectoryW, no git)" "cmd" @('/d', '/c', "cd /d $work\.git && echo CD_OK")
+          cargo install agent-bridle-aclaunch --git https://github.com/Gilamonster-Foundation/agent-bridle --tag v0.8.0-rc.6 --locked --root "$env:RUNNER_TEMP\aclaunch-rc6"
+          $old = $launcher; $launcher = "$env:RUNNER_TEMP\aclaunch-rc6\bin\agent-bridle-aclaunch.exe"
+          Run-Diag "rc.6 launcher: git status" $git @('status', '--short')
+          Run-Diag "rc.6 launcher: git add" $git @('add', '--', 'pending.txt')
+          $launcher = $old
+          git reset -q -- pending.txt
+          icacls.exe $work /grant '*S-1-15-2-1:(X)'
+          Run-Diag "0.7.10 after +X: git status" $git @('status', '--short')
+          Run-Diag "0.7.10 after +X: git add" $git @('add', '--', 'pending.txt')
+          Remove-Item Env:GIT_TRACE_SETUP
 
       - name: Stage launcher next to test binaries and run the actual failing test
         if: always()
