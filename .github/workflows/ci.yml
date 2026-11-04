@@ -751,4 +751,9 @@ jobs:
           cargo test -p newt-core --features windows-appcontainer --lib --test windows_appcontainer_adversarial --no-run
           Copy-Item (Get-Command agent-bridle-aclaunch.exe).Source target\debug\deps\
           cargo test -p newt-core --features windows-appcontainer --lib run_command_windows_ -- --test-threads=1
+          # Git through newt's own launch path under AppContainer (#2614).
+          cargo test -p newt-core --features windows-appcontainer --lib -- --test-threads=1 `
+            agentic::tools::disable_ocap_tests::native_git_status_requires_exec_and_reads_the_actual_repository `
+            agentic::tools::disable_ocap_tests::state_modifying_git_add_is_not_routed `
+            agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants
           cargo test -p newt-core --features windows-appcontainer --test windows_appcontainer_adversarial -- --ignored --test-threads=1
