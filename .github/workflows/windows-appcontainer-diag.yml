@@ -81,9 +81,9 @@ jobs:
           git -c user.name="diag" -c user.email="diag@example.invalid" commit -qm init
           "stage me`n" | Out-File pending.txt -NoNewline
 
-          function Run-Diag($label, $exe, $args) {
+          function Run-Diag($label, $exe, $argv) {
             Write-Output "== $label =="
-            & $launcher --fs-write $work $exe @args
+            & $launcher --fs-write $work $exe @argv
             Write-Output "EXIT=$LASTEXITCODE"
             Write-Output ""
           }
