@@ -116,14 +116,8 @@ function Trial($label, $repo, [string[]]$grants, [switch]$Trace) {
     $out | ForEach-Object { "    $_" }
 }
 
-Trial 'repro: short TEMP path, no DOS ACEs' $shortRepo @() -Trace
-Trial 'long-name path, no DOS ACEs' $longRepo @() -Trace
-Trial 'C:\ root path, no DOS ACEs' $cRepo @() -Trace
-$all = @($objects.Keys)
-foreach ($repo in @($shortRepo, $longRepo)) {
-    Trial 'all five' $repo $all
-    foreach ($k in $all) { Trial "only $k" $repo @($k) }
-    foreach ($k in $all) { Trial "all minus $k" $repo @($all | Where-Object { $_ -ne $k }) }
+# Round 2: narrowest MountPointManager device mask (per-SID, device ACE only).
+foreach ($m in @(0x00100000, 0x00000080, 0x00100080, 0x00020000, 0x00000008, 0x00120088)) {
+    $objects['MPM-device'] = @('dev', '\Device\MountPointManager', $m)
+    Trial ("MPM-device mask 0x{0:X8}" -f $m) $shortRepo @('MPM-device')
 }
-Trial 'GLOBAL?? + MPM-link + C-link (no device, no D)' $shortRepo @('GLOBAL??', 'MPM-link', 'C-link')
-Trial 'GLOBAL?? + C-link + MPM-device' $shortRepo @('GLOBAL??', 'C-link', 'MPM-device') -Trace
