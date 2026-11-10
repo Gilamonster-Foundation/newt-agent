@@ -2507,6 +2507,19 @@ fn session_body(
         }
     }
 
+    // --net (#3089): name the session's launch net grants.
+    let net_hosts = newt_core::caveats::cli_net_hosts();
+    if !net_hosts.is_empty() {
+        print_newt(
+            &format!(
+                "net granted for this session (--net): {}",
+                net_hosts.join(", ")
+            ),
+            color,
+            verbose,
+        );
+    }
+
     // --ambient / --yolo (#978): say plainly what is off, after the per-axis banners above.
     let authority = newt_core::launch_authority::current();
     if authority.ambient() {
