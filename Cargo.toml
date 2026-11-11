@@ -296,19 +296,16 @@ grit-lib = "0.4"
 # `bundled` compiles SQLite from source so newt has zero system deps
 # (local-first; no libsqlite3-dev requirement). FTS5 is enabled in 17.3
 # as promised (the recall index, newt-core/src/store.rs) — with one
-# correction to the earlier note here: rusqlite 0.31 has NO `fts5` cargo
+# correction to the earlier note here: rusqlite has NO `fts5` cargo
 # feature to flip (adding one is a hard resolution error, verified).
 # `bundled` already compiles SQLite with -DSQLITE_ENABLE_FTS5 and
 # -DSQLITE_ENABLE_JSON1 unconditionally (libsqlite3-sys 0.28 build.rs),
 # so 17.3 "enables" FTS5 by building on it; the store's schema creation
 # and the tests/store.rs FTS suite fail loudly if the bundled build ever
 # stops shipping it.
-# Pinned to 0.31 historically: the newest rusqlite that compiled at the old
-# 1.75 floor (0.32+ used post-1.75 features; 0.40 pulls edition-2024 hashlink,
-# Cargo 1.85+). With the floor now 1.90 those are all allowed — relax in a
-# follow-up if desired; kept at 0.31 here to avoid churning the lock + the
-# bundled-SQLite/FTS5 story. Same minimal-change stance as diffy 0.4 above.
-rusqlite = { version = "0.31", features = ["bundled"] }
+# 0.41 (libsqlite3-sys 0.39): RUSTSEC-2026-0459 is a bundled-SQLite CVE fixed
+# only in libsqlite3-sys >= 0.39. Needs Rust 1.89, under the 1.91 floor.
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # CSV ingest for the Phase 21 `newt-data` engine (docs/design/centaur-data-scientist.md).
 # csv 1.3+ compiles on MSRV 1.75 (pure-Rust, no C deps; the resolved 1.4 declares

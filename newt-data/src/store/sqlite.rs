@@ -93,7 +93,7 @@ impl DataStore for SqliteBackend {
     fn query(&self, sql: &str, row_cap: usize) -> Result<QueryResult> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(sql)?;
-        let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let columns: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
 
         // A non-row statement (INSERT/UPDATE/CREATE/…): execute it via the same
         // prepared statement and report an empty, untruncated result.
