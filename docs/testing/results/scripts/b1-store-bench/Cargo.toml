@@ -28,9 +28,9 @@ publish = false
 newt-core = { path = "../../../../../newt-core" }
 tempfile = "3"
 anyhow = "1"
-# Same major as the workspace's rusqlite (0.31 bundled) so the Phase C
+# Same major as the workspace's rusqlite (0.41 bundled) so the Phase C
 # replica runs the same SQLite build the store does.
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 blake3 = "1"
 
 # Cargo applies patches only from the active workspace root. Keep these aligned
