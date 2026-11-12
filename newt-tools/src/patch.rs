@@ -159,13 +159,18 @@ fn escape_error(rel: &Path) -> anyhow::Error {
 }
 
 /// Object-bound atomic write of `content` to `rel` beneath `workspace` — the one
-/// owner of the applier backends' write step. On Linux the target is resolved
-/// through the workspace root fd (`openat2 RESOLVE_BENEATH`), so a symlink *under*
-/// the workspace cannot redirect the write outside it — closing the residual the
-/// lexical [`is_workspace_contained`] leaves open (#522). Missing parents are
-/// created; a sibling temp is written then renamed (partial-write safety). The
-/// non-Linux fallback keeps the lexical-gate + `std::fs` temp-then-rename path.
-#[cfg(target_os = "linux")]
+/// owner of the applier backends' write step. On Linux and macOS the target is
+/// resolved through the workspace root fd ([`WorkspaceDir`]: `openat2
+/// RESOLVE_BENEATH` on Linux, a descriptor-relative no-follow walk on macOS), so
+/// a symlink *under* the workspace cannot redirect the write outside it — closing
+/// the residual the lexical [`is_workspace_contained`] leaves open (#522). macOS
+/// refuses every symlinked component, including one that stays in the tree.
+/// Missing parents are created; a sibling temp is written then renamed
+/// (partial-write safety). Other platforms keep the lexical-gate + `std::fs`
+/// temp-then-rename path.
+///
+/// [`WorkspaceDir`]: newt_core::fs_cap::WorkspaceDir
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Result<()> {
     use newt_core::fs_cap::WorkspaceDir;
     use std::io::Write;
@@ -185,7 +190,7 @@ fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Resul
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Result<()> {
     let abs = workspace.join(rel);
     if let Some(parent) = abs.parent() {
@@ -199,9 +204,9 @@ fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Resul
 
 /// Object-bound read of `rel`'s current contents beneath `workspace` for a
 /// patch/whole-file apply — `None` if the file does not exist (a fresh create).
-/// A symlink-escape path is refused (not silently read from outside). Linux-only
-/// object-binding; non-Linux keeps `std::fs`.
-#[cfg(target_os = "linux")]
+/// A symlink-escape path is refused (not silently read from outside). Object-bound
+/// on Linux and macOS; other platforms keep `std::fs`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<String>> {
     use newt_core::fs_cap::WorkspaceDir;
     use std::io::Read;
@@ -217,7 +222,7 @@ fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<Stri
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<String>> {
     let abs = workspace.join(rel);
     if abs.exists() {
@@ -229,7 +234,7 @@ fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<Stri
 
 /// A sibling temp path in the *same* parent as `rel` (so the atomic rename stays
 /// within one contained directory): `<parent>/<name>.newt-tmp`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sibling_tmp(rel: &Path) -> std::path::PathBuf {
     let mut name = rel
         .file_name()
@@ -806,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn apply_whole_files_denies_symlink_escape_object_bound() {
         // step-52.7 (#522 CLOSURE): a symlink UNDER the workspace pointing outside
         // must not let the applier write through it — even though the lexical
@@ -815,6 +820,10 @@ mod tests {
         // This is the escape `is_workspace_contained` cannot see (the #522 residual),
         // now closed. Verified red→green (neuter the resolve flags → the write lands
         // outside).
+        //
+        // macOS regression: `write_contained` was object-bound on Linux only, so on
+        // macOS this exact write landed in `outside/evil.rs`. It failed there until
+        // the macOS branch moved onto `WorkspaceDir`.
         let ws = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("evil.rs"), "original\n").unwrap();
