@@ -118,3 +118,15 @@ Per `CLAUDE.md` "Push Hook Governance": the per-PR jobs in `ci.yml` are mirrored
 by `.githooks/pre-push` (`just check` + `just cov-ci`). `eval-hosted.yml` is a
 documented parity *exception* (the live tier can't run in a push gate). When you
 edit either CI file, re-check the hook/pipeline cross-reference comments.
+
+## The regression register
+
+`docs/testing/regressions.toml` lists each regression an operator saw in a
+live run, with the mocked test that guards it on every PR and the
+real-resource test that grounds that mock. Both are required: a mocked guard
+alone was green while its regression was still live.
+
+`newt-core/tests/regression_register.rs` enforces the register. Every named
+test must exist, be a test and not be ignored, and the entry count may only go
+up. When a live run shows a regression, fix it, write both tests, add the
+entry, and raise `REGISTERED` in that test.
