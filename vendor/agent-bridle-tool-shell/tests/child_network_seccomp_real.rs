@@ -9,9 +9,10 @@
 //! `ShellTool::with_sandbox_policy` through `run_confined` → `Sandbox::apply` on
 //! the same thread that spawns the child.
 //!
-//! Linux + `linux-landlock`, gated on kernel Landlock + a `python3` probe (the
-//! child that attempts an AF_INET socket). Where either is absent the test skips.
-#![cfg(all(target_os = "linux", feature = "linux-landlock"))]
+//! Linux + `linux-landlock` + `shell` (which provides `ShellTool`), gated on
+//! kernel Landlock + a `python3` probe (the child that attempts an AF_INET
+//! socket). Where either is absent the test skips.
+#![cfg(all(target_os = "linux", feature = "linux-landlock", feature = "shell"))]
 
 use agent_bridle_core::{
     landlock_is_supported, Caveats, ChildNetworkPolicy, Gate, SandboxPolicy, Scope, Tool,
