@@ -31,6 +31,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 - The Terminal-Bench (Harbor) adapter drives the TUI instead of `newt headless` (#3070):
   `newt --disable-ocap --full-access` in tmux, with switches only `newt headless` has
   refused. The TUI writes no run trace yet (#3069).
+- `git fetch` in a confined session runs through a host-side broker (#3099): the host's
+  git downloads with your credentials or SSH agent, and a confined git with no network
+  copies the result into the repository. It asks for the remote's host, so a session grant
+  covers later fetches, and SSH remotes work. With unrestricted network (`--ambient`) git
+  fetches directly as before.
 
 ### Fixed
 
