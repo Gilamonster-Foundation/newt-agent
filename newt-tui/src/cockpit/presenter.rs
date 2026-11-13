@@ -551,7 +551,8 @@ impl Screen {
     }
 
     /// Change the block's height (the editor grew, the status row appeared…).
-    /// Scrolls the transcript up if the taller block would not fit below it.
+    /// Scrolls the transcript up if the taller block would not fit below it, and
+    /// slides it back down when a block on the bottom row gets shorter.
     fn relayout(&mut self, editor_rows: u16, status_rows: u16) -> io::Result<()> {
         self.moved_cursor();
         let new_h = (editor_rows + status_rows).clamp(1, self.rows.max(1));
@@ -565,6 +566,13 @@ impl Screen {
             queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
             buf.extend(std::iter::repeat_n(b'\n', d as usize));
             self.top = self.rows - new_h;
+        } else if new_h < self.block_h && self.top + self.block_h == self.rows {
+            // A block on the bottom row stays there when it gets shorter (the palette
+            // closed, the editor emptied): slide the transcript down onto the rows it gave
+            // up. Left where it was, the prompt sat mid-screen over blank rows.
+            let d = self.block_h - new_h;
+            queue!(buf, crossterm::terminal::ScrollDown(d))?;
+            self.top += d;
         }
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
@@ -642,6 +650,16 @@ impl Screen {
         let erase_from = resize_erase_from(old_top, self.top, self.rows);
         let mut buf = Vec::new();
         queue!(buf, MoveTo(0, erase_from), Clear(ClearType::FromCursorDown))?;
+        // A block that moved DOWN left blank rows between the transcript and itself.
+        // Slide the transcript down onto them, so the blanks sit at the top of the screen
+        // instead. A later shrink scrolls the top rows away: with the gap under the
+        // transcript that was transcript, one row per row shrunk, until a drag of the pane
+        // edge down and back left the screen empty above the prompt. Every row from
+        // `erase_from` down is blank by now, so the rows this pushes off the bottom are too.
+        let gap = self.top.saturating_sub(old_top);
+        if gap > 0 {
+            queue!(buf, crossterm::terminal::ScrollDown(gap))?;
+        }
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
         self.rebuild_term()
@@ -851,8 +869,9 @@ fn restore_terminal_modes() {
 /// **A terminal that GROWS pins the block to the new bottom** (maintainer decision on
 /// #3014 item 2). Terminals disagree on what a grow does to the transcript (some add rows
 /// below it, some pull it down), but the prompt stays where the operator's eyes and the
-/// keyboard are, the bottom row; the gap a bottom-adding terminal leaves above it is the
-/// accepted cost. This reverses the #2632 "stay under the content" rule for grows only.
+/// keyboard are, the bottom row. The rows a bottom-adding terminal leaves blank above it
+/// are moved to the top of the screen by `resize`, which slides the transcript down with
+/// the block. This reverses the #2632 "stay under the content" rule for grows only.
 ///
 /// Every other resize (same size, or a shrink) leaves the transcript where it was, so
 /// `old_top` is still ground truth there. Move the block only when it no longer fits at
@@ -2355,6 +2374,81 @@ mod tests {
             erased.iter().all(|&r| r >= 10),
             "transcript erased: erase rows {erased:?}"
         );
+    }
+
+    /// The live recording: the `/` palette opened on a bottom-row block and scrolled the
+    /// transcript up 7 rows; closing it left the prompt 7 rows above the bottom. A block
+    /// on the bottom row keeps it when it shrinks; one under short content does not move.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_shrinking_block_on_the_bottom_row_stays_there() {
+        fn written(mut file: std::fs::File) -> String {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let mut bytes = Vec::new();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_to_end(&mut bytes).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        let (mut screen, log) = screen_with_block(80, 24, 14, 10, &[40; 10], (2, 22));
+        screen.relayout(2, 1).unwrap();
+        assert_eq!((screen.top, screen.block_h), (21, 3));
+        let text = written(log);
+        let erase = text.find("\x1b[J").expect("the tall block is erased");
+        let slide = text
+            .find("\x1b[7T")
+            .expect("the transcript slides down 7 rows");
+        assert!(
+            erase < slide,
+            "slide before erase would push block chrome down"
+        );
+        drop(screen);
+
+        let (mut screen, log) = screen_with_block(80, 24, 5, 10, &[40; 10], (2, 13));
+        screen.relayout(2, 1).unwrap();
+        assert_eq!((screen.top, screen.block_h), (5, 3));
+        assert!(
+            !written(log).contains('T'),
+            "a block under short content stays put"
+        );
+    }
+
+    /// The live recording: a pane edge dragged down left blank rows between the transcript
+    /// and the pinned block, and dragging it back scrolled transcript off the top while
+    /// those rows stayed. A grow whose block moves down now slides the transcript with it.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_grow_slides_the_transcript_down_with_the_block() {
+        fn written(mut file: std::fs::File) -> String {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let mut bytes = Vec::new();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_to_end(&mut bytes).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        // The terminal added 8 rows below a 3-row block at the bottom of 24 rows.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[40, 40, 10], (2, 22));
+        screen.resize(80, 32, 2, 1, Some(21)).unwrap();
+        assert_eq!(screen.top, 29, "the block is pinned to the new bottom");
+        let text = written(log);
+        let erase = text.find("\x1b[J").expect("the old block is erased");
+        let slide = text
+            .find("\x1b[8T")
+            .expect("the transcript slides down 8 rows");
+        assert!(
+            erase < slide,
+            "slide before erase would push block chrome down"
+        );
+
+        // The terminal pulled 8 rows of scrollback down instead: the block is already at
+        // the bottom, so nothing is left blank and nothing slides.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[40, 40, 10], (2, 22));
+        screen.resize(80, 32, 2, 1, Some(29)).unwrap();
+        assert_eq!(screen.top, 29);
+        // A shrink never slides either.
+        screen.caret_frame = None;
+        screen.resize(80, 24, 2, 1, None).unwrap();
+        let text = written(log);
+        assert!(!text.contains('T'), "nothing slid: {text:?}");
     }
 
     /// #3021 review: a width shrink whose footer wraps BELOW the caret. The terminal's
