@@ -3339,6 +3339,67 @@ mod governed_push_tests {
         git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
     }
 
+    /// Grounds `a_git_network_read_asks_for_one_commands_egress`: that mocked test
+    /// was green while a live fetch still failed, because approving the network did
+    /// not let Git run its own transport helper under a restricted exec scope. Here
+    /// the real confined shell, with only `git` and `head` granted and no network,
+    /// must reach a loopback HTTP remote once the operator approves, and must not
+    /// dial at all when the operator declines.
+    #[test]
+    fn an_approved_network_read_dials_an_http_remote_from_the_confined_shell() {
+        struct Egress(bool);
+        impl PermissionGate for Egress {
+            fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+                PermissionDecision::Deny
+            }
+            fn ask_dependency_fetch(
+                &mut self,
+                prepared: &Caveats,
+                _: &PermissionRequest,
+            ) -> PermissionDecision {
+                if self.0 {
+                    PermissionDecision::Allow(prepared.clone())
+                } else {
+                    PermissionDecision::Deny
+                }
+            }
+            fn ask_question(&mut self, _: &str) -> crate::agentic::HumanQuestionOutcome {
+                crate::agentic::HumanQuestionOutcome::Unavailable
+            }
+        }
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let caveats = Caveats {
+            exec: Scope::only(["git".to_string(), "head".to_string()]),
+            ..with_net(Scope::only([]))
+        };
+        for allow in [true, false] {
+            let (port, endpoint) = receive_pack_endpoint(false);
+            let command = format!("git ls-remote http://127.0.0.1:{port}/o/r.git 2>&1 | head -3");
+            let (output, _) = dispatch_run_command_with_gate(
+                repo.path(),
+                &command,
+                &caveats,
+                Some(&mut Egress(allow)),
+            );
+            let seen = stop(port, endpoint);
+            let dialed = seen
+                .requests
+                .iter()
+                .any(|line| line.contains("/o/r.git/info/refs?service=git-upload-pack"));
+            assert_eq!(dialed, allow, "allow={allow}: {output} / {seen:?}");
+            if !allow {
+                assert!(
+                    output.contains("operator declined network access"),
+                    "{output}"
+                );
+            }
+        }
+    }
+
     /// #2719: the actual run_command path folds a worktree cd, intercepts
     /// wrappers, and reaches the operator. Denial prevents staging/dialing.
     #[test]
