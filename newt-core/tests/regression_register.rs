@@ -28,7 +28,7 @@ fn workspace_root() -> std::path::PathBuf {
 
 /// Entries in the register. Raise it in the PR that adds an entry; it never
 /// goes down.
-const REGISTERED: usize = 3;
+const REGISTERED: usize = 4;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]

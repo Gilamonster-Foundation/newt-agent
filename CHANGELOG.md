@@ -61,7 +61,8 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   network access instead of failing at the sandbox with no prompt. An approved command can
   run Git's own http(s) transport helper under a restricted exec scope (#3097).
 - Dragging a pane edge no longer blanks the transcript above the prompt, and a shrink no
-  longer erases the last transcript row (#3097).
+  longer erases the last transcript row. A pane shrunk and grown again repaints the
+  transcript rows the shrink scrolled away (#3097).
 - Closing the `/` command palette on a full screen returns the prompt to the bottom rows
   instead of leaving it mid-screen (#3097).
 

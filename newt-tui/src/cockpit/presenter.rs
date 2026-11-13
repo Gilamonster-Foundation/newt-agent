@@ -329,7 +329,13 @@ struct Screen<W: Write = File> {
     /// resize that narrows the terminal reflows any row wider than the new
     /// width onto extra rows, lifting the old block's top above `top`.
     painted_widths: Vec<usize>,
+    /// The last [`TAIL_ROWS`] rows inserted into the transcript, oldest first. A terminal
+    /// cannot scroll back down, so this is what [`reveal_bytes`] repaints from.
+    tail: VecDeque<Row>,
 }
+
+/// Transcript rows kept for [`reveal_bytes`]: more than any screen is tall.
+const TAIL_ROWS: usize = 512;
 
 /// The block's rows, as the arbiter names them.
 fn block_region(top: u16, block_h: u16) -> newt_core::tty::Region {
@@ -531,6 +537,9 @@ impl Screen {
         if phys.is_empty() || phys.len() > u16::MAX as usize {
             return Ok(());
         }
+        self.tail.extend(rows);
+        let excess = self.tail.len().saturating_sub(TAIL_ROWS);
+        self.tail.drain(..excess);
         let (buf, plan) = render_insert(self.top, self.block_h, self.rows, &phys)?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
@@ -573,6 +582,7 @@ impl Screen {
             let d = self.block_h - new_h;
             queue!(buf, crossterm::terminal::ScrollDown(d))?;
             self.top += d;
+            buf.extend(reveal_bytes(&self.tail, self.cols, self.top, self.top - d)?);
         }
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
@@ -679,6 +689,7 @@ impl Screen {
         let gap = self.top.saturating_sub(old_top);
         if gap > 0 {
             queue!(buf, crossterm::terminal::ScrollDown(gap))?;
+            buf.extend(reveal_bytes(&self.tail, self.cols, self.top, old_top)?);
         }
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
@@ -923,6 +934,35 @@ fn caret_row_wrap(x: u16, width: usize, cols: u16) -> Option<u16> {
     } else {
         None
     }
+}
+
+/// The bytes that fill the rows a slide down left blank at the top of the screen.
+///
+/// `shown` transcript rows were above the block before the slide, and `top` rows are
+/// above it now. A terminal moves rows into its scrollback and never back, so the rows
+/// a shrink (or an opening menu) scrolled away are repainted from `tail`: its last `top`
+/// rows, ending on the row above the block. Empty when `tail` holds no more than was
+/// already on screen, so rows this screen did not write (the shell's, before the
+/// session) are never painted over. The repainted rows are in scrollback as well.
+fn reveal_bytes(tail: &VecDeque<Row>, cols: u16, top: u16, shown: u16) -> io::Result<Vec<u8>> {
+    let mut phys: Vec<Row> = Vec::new();
+    for row in tail.iter().rev() {
+        if phys.len() >= usize::from(top) {
+            break;
+        }
+        phys.extend(wrap_row(row, usize::from(cols)).into_iter().rev());
+    }
+    phys.truncate(usize::from(top));
+    let mut buf = Vec::new();
+    if phys.len() <= usize::from(shown) {
+        return Ok(buf);
+    }
+    for (above, row) in (1u16..).zip(&phys) {
+        queue!(buf, MoveTo(0, top - above), Clear(ClearType::CurrentLine))?;
+        buf.extend_from_slice(row);
+        buf.extend_from_slice(b"\x1b[0m");
+    }
+    Ok(buf)
 }
 
 /// The row `resize` clears downward from so the OLD cockpit region cannot
@@ -1185,6 +1225,7 @@ impl Presenter {
             queued: 0,
             region,
             painted_widths: Vec::new(),
+            tail: VecDeque::new(),
         };
         screen.term.clear()?;
         let ephemeral: Arc<dyn newt_core::tty::Ephemeral> = Arc::new(NoOpEphemeral);
@@ -2342,6 +2383,7 @@ mod tests {
             queued: 0,
             region,
             painted_widths: widths.to_vec(),
+            tail: VecDeque::new(),
         }
     }
 
@@ -2505,6 +2547,101 @@ mod tests {
             "transcript lost: {shrunk:#?}"
         );
         assert_eq!(shrunk[20], "T20", "{shrunk:#?}");
+    }
+
+    /// Grounds `a_grow_repaints_the_rows_a_shrink_scrolled_away`, which only checks the
+    /// bytes written. Here a real terminal holding 30 transcript rows shrinks from 24
+    /// rows to 10 and grows back, as a pane edge dragged up and down does. tmux pulls its
+    /// history back down on a grow and the recorded terminal does not, so the history is
+    /// cleared after the shrink: tmux then adds the new rows at the bottom, and without
+    /// the repaint the 14 rows above `T23` stay blank (the live recording of 2026-11-13).
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_real_terminal_shows_the_transcript_again_after_a_shrink_and_grow() {
+        let Some(term) = RealTerminal::open() else {
+            return;
+        };
+        term.write("\x1b[H\x1b[J");
+        term.paint_block(0, 3);
+        let mut screen = screen_on(term.tty(), 80, 24, 0, 3, &[2, 2, 2], (2, 1));
+        let transcript = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
+        screen.insert_rows(transcript).unwrap();
+        assert_eq!(screen.top, 21);
+        term.paint_block(screen.top, 3);
+        let full = term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
+        assert_eq!((full[0].as_str(), full[20].as_str()), ("T09", "T29"));
+
+        for rows in [10, 24] {
+            screen.painted_widths = vec![2, 2, 2];
+            screen.caret_frame = Some(CaretFrame {
+                top: screen.top,
+                block_h: 3,
+                cols: 80,
+                rows: screen.rows,
+                y: screen.top + 1,
+                x: 2,
+            });
+            term.rows(rows);
+            let measured = term.cursor_row() - 1;
+            screen.resize(80, rows, 2, 1, Some(measured)).unwrap();
+            term.paint_block(screen.top, 3);
+            term.tmux(&["clear-history"]);
+        }
+        let back = term.screen(|rows| rows.len() == 24 && rows[23] == "B2");
+        let expected: Vec<String> = (9..30).map(|n| format!("T{n:02}")).collect();
+        assert_eq!(back[..21], expected, "{back:#?}");
+    }
+
+    /// The live recording of 2026-11-13: a pane dragged small and then large again came
+    /// back with only the rows that fit the small pane, under blank rows. The rows the
+    /// shrink scrolled away are repainted from the transcript this screen inserted.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_grow_repaints_the_rows_a_shrink_scrolled_away() {
+        fn written(mut file: std::fs::File) -> String {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let mut bytes = Vec::new();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_to_end(&mut bytes).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        let tail: VecDeque<Row> = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
+        // 7 rows were on screen above the block; 21 are above it after the grow.
+        let bytes = reveal_bytes(&tail, 80, 21, 7).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("\x1b[21;1H\x1b[2KT29"), "{text:?}");
+        assert!(text.contains("\x1b[1;1H\x1b[2KT09"), "{text:?}");
+        assert!(!text.contains("T08"), "only the rows that fit: {text:?}");
+        // A row wider than the screen takes the rows it wraps onto.
+        let wide: VecDeque<Row> = [b"T00".to_vec(), b"abcdef".to_vec()].into();
+        let text = String::from_utf8_lossy(&reveal_bytes(&wide, 4, 3, 0).unwrap()).into_owned();
+        for row in [
+            "\x1b[1;1H\x1b[2KT00",
+            "\x1b[2;1H\x1b[2Kabcd",
+            "\x1b[3;1H\x1b[2Kef",
+        ] {
+            assert!(text.contains(row), "{row:?} in {text:?}");
+        }
+        // Nothing this screen wrote is hidden: rows it did not write are left alone.
+        assert!(reveal_bytes(&tail, 80, 21, 30).unwrap().is_empty());
+        assert!(reveal_bytes(&VecDeque::new(), 80, 21, 7)
+            .unwrap()
+            .is_empty());
+
+        // Through `resize`: 30 rows inserted on a 24-row screen, shrunk to 10, grown back.
+        let (mut screen, log) = screen_with_block(80, 24, 0, 3, &[2, 2, 2], (2, 1));
+        let transcript = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
+        screen.insert_rows(transcript).unwrap();
+        screen.resize(80, 10, 2, 1, None).unwrap();
+        assert_eq!(screen.top, 7);
+        let before = written(log.try_clone().unwrap()).len();
+        screen.resize(80, 24, 2, 1, Some(7)).unwrap();
+        let text = written(log)[before..].to_string();
+        let slide = text.find("\x1b[14T").expect("the transcript slides down");
+        let repaint = text
+            .find("\x1b[1;1H\x1b[2KT09")
+            .expect("the top row is repainted");
+        assert!(slide < repaint, "a repaint before the slide is pushed down");
     }
 
     /// Grounds `a_shrinking_block_on_the_bottom_row_stays_there`. The command palette
@@ -3048,6 +3185,7 @@ mod tests {
             queued: 0,
             region,
             painted_widths: Vec::new(),
+            tail: VecDeque::new(),
         };
         let editor = MountedEditor::new(crate::rich_input::Edit::Emacs, None, Vec::new(), "hi");
         let chrome = crate::rich_input::Chrome {

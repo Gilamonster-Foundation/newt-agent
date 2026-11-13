@@ -44,3 +44,14 @@ Opening the `/` command palette on a full screen scrolled the transcript up; \
 closing it left the prompt mid-screen with blank rows beneath it."""
 guard = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_shrinking_block_on_the_bottom_row_stays_there" }
 ground = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_real_terminal_returns_the_block_to_the_bottom_when_a_menu_closes" }
+
+[[regression]]
+id = "resize-shrink-then-grow-blanks-transcript"
+seen = "2026-11-13"
+symptom = """
+Dragging a pane edge up and back down left blank rows above the few \
+transcript rows that had fit the small pane. The shrink scrolled the rest \
+into scrollback, and a terminal that adds rows at the bottom on a grow does \
+not bring them back."""
+guard = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_grow_repaints_the_rows_a_shrink_scrolled_away" }
+ground = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_real_terminal_shows_the_transcript_again_after_a_shrink_and_grow" }
