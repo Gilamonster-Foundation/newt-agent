@@ -76,6 +76,36 @@ pub(super) fn needs_commit_broker(source: &str) -> bool {
 /// tooling packs once a second forge CLI needs the same prompt.
 const NETWORK_READ_VERBS: &[&str] = &["fetch", "pull", "clone", "ls-remote"];
 
+/// Git's own http(s) transport helpers, from the exec-path the host git
+/// reports, each passing the broker's trust predicate (never model-writable).
+/// Empty when git, its exec-path, or a helper cannot be established.
+fn http_transport_helpers(cwd: &Path, caveats: &Caveats) -> Vec<String> {
+    let exec_path = crate::git_hardening::hardened_git(cwd, &["--exec-path"])
+        .and_then(|mut git| git.output())
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            Path::new(String::from_utf8_lossy(&output.stdout).trim())
+                .canonicalize()
+                .ok()
+        });
+    let (Some(exec_path), Ok(trust)) = (
+        exec_path,
+        crate::git_staging::TrustContext::bind(&caveats.fs_write),
+    ) else {
+        return Vec::new();
+    };
+    let trust = trust.with_git(&exec_path);
+    ["git-remote-https", "git-remote-http"]
+        .iter()
+        .map(|name| exec_path.join(name))
+        .filter(|helper| {
+            helper.is_file() && crate::git_staging::trust_check(helper, &trust).is_ok()
+        })
+        .map(|helper| helper.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// A confined shell child has no network unless the session's `net` is `All`:
 /// a host allowlist cannot be bound to a spawn (`caveats::spawn_net_scope`),
 /// and the kernel's refusal is not a structured denial, so nothing prompts
@@ -89,6 +119,7 @@ const NETWORK_READ_VERBS: &[&str] = &["fetch", "pull", "clone", "ls-remote"];
 /// the fence.
 pub(super) fn approve_network_read(
     source: &str,
+    cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
 ) -> Result<Option<Caveats>, String> {
@@ -99,23 +130,35 @@ pub(super) fn approve_network_read(
     else {
         return Ok(None);
     };
-    let prepared = Caveats {
+    let mut prepared = Caveats {
         net: crate::Scope::All,
         ..caveats.clone()
     };
+    // Git reaches an http(s) remote through a helper it spawns itself, which a
+    // restricted exec scope refuses at the kernel (`cannot exec
+    // 'git-remote-https'`). The approval covers that helper. SSH stays off:
+    // `core.sshCommand=false` is the hardening that keeps the operator's keys
+    // out of a confined child, and this prompt does not lift it.
+    if let crate::Scope::Only(exec) = &mut prepared.exec {
+        exec.extend(http_transport_helpers(cwd, caveats));
+    }
     let request = PermissionRequest {
         tool: "run_command".into(),
         kind: DenialKind::Net,
         target: format!("all destinations for one git {verb}"),
         reason: format!(
-            "Run `{source}` once with network access. A shell command cannot be held to a host              allowlist: this ONE command gets unrestricted network egress, with every other              limit unchanged. This does NOT grant network access to later commands or the session."
+            "Run `{source}` once with network access. A shell command cannot be held to a host \
+             allowlist: this ONE command gets unrestricted network egress and may run Git's own \
+             http(s) transport helper, with every other limit unchanged. SSH remotes stay \
+             disabled. This does NOT grant network access to later commands or the session."
         ),
         harness_bound: true,
     };
     match gate.ask_dependency_fetch(&prepared, &request) {
         PermissionDecision::Allow(granted) if prepared.leq(&granted) => Ok(Some(prepared)),
         _ => Err(format!(
-            "denied: the operator declined network access for this `git {verb}`, or the session's              authority ceiling forbids it. No command ran. Do not retry it; take a different approach."
+            "denied: the operator declined network access for this `git {verb}`, or the session's \
+             authority ceiling forbids it. No command ran. Do not retry it; take a different approach."
         )),
     }
 }
@@ -1310,7 +1353,7 @@ mod tests {
             ..Caveats::top()
         };
         let mut gate = gate.map(|gate| gate as &mut dyn PermissionGate);
-        approve_network_read(source, &caveats, &mut gate)
+        approve_network_read(source, Path::new("."), &caveats, &mut gate)
     }
 
     /// The live transcript: `git fetch` and `git ls-remote` wrapped in a
