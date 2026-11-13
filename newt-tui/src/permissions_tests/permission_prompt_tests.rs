@@ -4765,6 +4765,60 @@ fn cold_cache_fetch_cannot_bypass_denial_or_ceiling() {
     }
 }
 
+/// A git network read's egress is the same one-operation approval: no lasting
+/// allow is offered, nothing is recorded, and an ordinary `run_command` host request
+/// (not harness-bound) cannot enter the operation-only path.
+#[test]
+fn run_command_network_read_is_a_one_operation_approval() {
+    let base = base_caveats("/ws");
+    let request = PermissionRequest {
+        tool: "run_command".into(),
+        target: "all destinations for one git fetch".into(),
+        ..cold_cache_fetch_request()
+    };
+    let (offered, _) = permission_policy(&request, &production_danger_table(), Audience::Terminal);
+    assert!(
+        !offered.iter().any(|offer| matches!(
+            offer.action,
+            PromptChoice::AllowSession | PromptChoice::AllowPermanent
+        )),
+        "a one-operation approval must not offer a lasting allow"
+    );
+
+    let prepared = newt_core::Caveats {
+        net: Scope::All,
+        ..base.clone()
+    };
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    let newt_core::PermissionDecision::Allow(allowed) =
+        gate.ask_dependency_fetch(&prepared, &request)
+    else {
+        panic!("network read declined")
+    };
+    assert_eq!(allowed, prepared);
+    let host_request = PermissionRequest {
+        harness_bound: false,
+        ..request.clone()
+    };
+    assert!(matches!(
+        gate.ask_dependency_fetch(&prepared, &host_request),
+        newt_core::PermissionDecision::Deny
+    ));
+    drop(gate);
+    assert_eq!(prompts.get(), 1);
+    assert!(state.session_grants.is_empty());
+    assert!(state.pending_once_grants.is_empty());
+}
+
 #[cfg(unix)]
 #[path = "exec_grant_retry.rs"]
 mod exec_grant_retry;
