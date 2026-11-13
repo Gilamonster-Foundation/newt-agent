@@ -424,7 +424,7 @@ mod tests {
             ..Caveats::top()
         };
         let report = enforcement_report(&caveats, SandboxKind::Landlock);
-        let bare = ToolEnvelope::new(SandboxKind::Landlock).with_enforcement(report);
+        let bare = ToolEnvelope::new(SandboxKind::Landlock).with_enforcement(report.clone());
         let disclosed = ToolEnvelope::new(SandboxKind::Landlock)
             .with_enforcement(report)
             .with_disclosure(Disclosure {

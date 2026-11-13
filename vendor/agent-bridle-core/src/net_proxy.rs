@@ -2427,19 +2427,38 @@ mod tests {
     /// from another thread) — the #372 test seam for deterministically pausing
     /// a connection worker at a chosen [`ConnHooks`] phase.
     #[derive(Clone, Default)]
-    struct Gate(Arc<(Mutex<bool>, Condvar)>);
+    struct Gate(Arc<(Mutex<(bool, usize)>, Condvar)>);
     impl Gate {
+        /// Park until released, first recording the arrival so a test can wait
+        /// for a worker to actually reach this phase.
         fn wait(&self) {
             let (m, cvar) = &*self.0;
-            let mut released = m.lock().unwrap();
-            while !*released {
-                released = cvar.wait(released).unwrap();
+            let mut state = m.lock().unwrap();
+            state.1 += 1;
+            cvar.notify_all();
+            while !state.0 {
+                state = cvar.wait(state).unwrap();
             }
         }
         fn release(&self) {
             let (m, cvar) = &*self.0;
-            *m.lock().unwrap() = true;
+            m.lock().unwrap().0 = true;
             cvar.notify_all();
+        }
+        /// Block (bounded) until `want` workers have reached the gate. Unlike
+        /// `wait_for_active_count`, this proves the worker ran up to the hook,
+        /// so finalization can no longer abort it before it gets there.
+        fn wait_arrived(&self, want: usize) {
+            let (m, cvar) = &*self.0;
+            let state = m.lock().unwrap();
+            let (state, timeout) = cvar
+                .wait_timeout_while(state, Duration::from_secs(10), |s| s.1 < want)
+                .unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "only {} of {want} workers reached the gate",
+                state.1
+            );
         }
         fn as_hook(&self) -> Arc<dyn Fn() + Send + Sync> {
             let g = self.clone();
@@ -2587,7 +2606,7 @@ mod tests {
         client
             .write_all(b"CONNECT evil.test:443 HTTP/1.1\r\n\r\n")
             .unwrap();
-        wait_for_active_count(&proxy, 1);
+        gate.wait_arrived(1);
 
         let (tx, rx) = mpsc::channel();
         let finalize = thread::spawn(move || {
