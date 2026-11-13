@@ -111,6 +111,7 @@ pub(super) fn execute_with(
     let held = staging::HeldRoots::bind(&caveats.fs_read).ok()?;
     let tools =
         staging::TrustedTools::authenticate(staging::TrustContext::bind(&caveats.fs_write).ok()?)
+            .map_err(|refusal| unavailable_notice(&refusal, std::io::stdout()))
             .ok()?;
     let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &held).ok()?;
     let writable = [&common_dir, &git_dir].map(|dir| dir.to_string_lossy().into_owned());
@@ -145,6 +146,18 @@ pub(super) fn execute_with(
         });
     let success = result.is_ok();
     Some(command.render(result.unwrap_or_else(|reason| reason), success))
+}
+
+/// Tells the operator why a fetch was not brokered. The model sees nothing:
+/// the command falls through to the shell and its one-command egress prompt.
+fn unavailable_notice(refusal: &staging::Refusal, mut notice: impl std::io::Write) {
+    crate::agentic::display::write_harness_notice(
+        &mut notice,
+        "the git fetch broker is unavailable (a host tool failed its trust check); \
+         falling back to a one-command network prompt. SSH remotes will not fetch.",
+        false,
+    );
+    super::notice_trust_hints(refusal, notice);
 }
 
 struct Plan<'a> {
@@ -270,6 +283,20 @@ mod tests {
 
     fn argv(command: &str) -> Vec<String> {
         command.split(' ').map(str::to_string).collect()
+    }
+
+    /// A fall-through for an untrusted host tool is announced to the operator,
+    /// and the refusal's detail (which can quote repository bytes) is not.
+    #[test]
+    fn an_unavailable_broker_tells_the_operator_it_fell_through() {
+        let mut sink = Vec::new();
+        unavailable_notice(&staging::Refusal::from("DETAIL".to_string()), &mut sink);
+        let notice = String::from_utf8(sink).unwrap();
+        assert!(
+            notice.contains("git fetch broker is unavailable"),
+            "{notice}"
+        );
+        assert!(!notice.contains("DETAIL"), "{notice}");
     }
 
     #[test]

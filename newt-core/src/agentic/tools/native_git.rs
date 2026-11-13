@@ -348,6 +348,21 @@ fn fixed_form(result: Result<crate::git_staging::Outcome, crate::git_staging::Re
         .to_string()
 }
 
+/// Writes a refusal's typed operator hints (a chmod fix) to the harness notice
+/// channel. Shared by the push and fetch brokers.
+fn notice_trust_hints(refusal: &crate::git_staging::Refusal, mut notice: impl std::io::Write) {
+    for hint in refusal.hints() {
+        crate::agentic::display::write_harness_notice(&mut notice, &hint.render(), false);
+    }
+    if !refusal.hints().is_empty() {
+        crate::agentic::display::write_harness_notice(
+            &mut notice,
+            "Run `newt doctor` to check all git broker tool paths.",
+            false,
+        );
+    }
+}
+
 /// Item 8: routes the operator-actionable hint (a chmod fix) to the harness
 /// notice channel before normalising the model-facing result to F6 fixed
 /// form. The hint is the refusal's TYPED [`TrustHint`] field — the detail
@@ -357,19 +372,10 @@ fn fixed_form(result: Result<crate::git_staging::Outcome, crate::git_staging::Re
 /// [`TrustHint`]: crate::git_staging::TrustHint
 fn fixed_form_with_notice(
     result: Result<crate::git_staging::Outcome, crate::git_staging::Refusal>,
-    mut notice: impl std::io::Write,
+    notice: impl std::io::Write,
 ) -> String {
     if let Err(refusal) = &result {
-        for hint in refusal.hints() {
-            crate::agentic::display::write_harness_notice(&mut notice, &hint.render(), false);
-        }
-        if !refusal.hints().is_empty() {
-            crate::agentic::display::write_harness_notice(
-                &mut notice,
-                "Run `newt doctor` to check all push tool paths.",
-                false,
-            );
-        }
+        notice_trust_hints(refusal, notice);
     }
     fixed_form(result)
 }

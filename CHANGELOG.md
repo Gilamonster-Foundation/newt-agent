@@ -35,7 +35,8 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   git downloads with your credentials or SSH agent, and a confined git with no network
   copies the result into the repository. It asks for the remote's host, so a session grant
   covers later fetches, and SSH remotes work. With unrestricted network (`--ambient`) git
-  fetches directly as before.
+  fetches directly as before. When a host tool fails its trust check the broker steps
+  aside, and a notice names the `chmod` fix.
 
 ### Fixed
 
