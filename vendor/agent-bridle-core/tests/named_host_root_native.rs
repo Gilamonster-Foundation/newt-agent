@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use agent_bridle_core::{
     Caveats, ChildNetworkPolicy, CountBound, EnforcementFloor, ExecutionEvent, ExecutionEventKind,
@@ -15,6 +15,11 @@ use agent_bridle_core::{
 };
 
 static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// #440: a fork on another test thread inherits an open write descriptor of
+/// a helper copy until its child execs, so exec of that copy can fail with
+/// ETXTBSY. Copies take this lock exclusively; every spawn takes it shared.
+static IMAGE_WRITE: RwLock<()> = RwLock::new(());
 
 struct Fixture {
     directory: PathBuf,
@@ -51,8 +56,11 @@ impl Fixture {
         };
         let child = tools.join("child-image");
         let grandchild = tools.join("grandchild-image");
-        for executable in [&root, &child, &grandchild] {
-            std::fs::copy(&source, executable).unwrap();
+        {
+            let _copying = IMAGE_WRITE.write().unwrap_or_else(|e| e.into_inner());
+            for executable in [&root, &child, &grandchild] {
+                std::fs::copy(&source, executable).unwrap();
+            }
         }
         let outside = directory.join("outside-secret");
         std::fs::write(&outside, b"outside-control-sentinel").unwrap();
@@ -168,6 +176,7 @@ fn run_with_inventory(
         ..SandboxPolicy::default()
     };
     let backend = LocalExecutionBackend::with_sandbox_policy(Arc::new(policy));
+    let spawning = IMAGE_WRITE.read().unwrap_or_else(|e| e.into_inner());
     // Only the operation changes from the measured existing-0.8 red; the
     // effective read grants, request and controls remain identical.
     let mut handle = if named {
@@ -176,6 +185,7 @@ fn run_with_inventory(
         backend.start(cx, request)
     }
     .unwrap();
+    drop(spawning);
     let mut run = Run {
         stdout: String::new(),
         stderr: String::new(),
@@ -222,6 +232,7 @@ fn unfenced_control(request: &ExecutionRequest) -> std::process::Output {
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
+    let _spawning = IMAGE_WRITE.read().unwrap_or_else(|e| e.into_inner());
     command.output().unwrap()
 }
 

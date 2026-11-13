@@ -66,7 +66,10 @@ construction.
 
 Coverage is scope-shaped and is surfaced per axis. Landlock's loader-trampoline
 residual keeps `exec` at interceptor strength; Seatbelt confines restricted
-exec; AppContainer reports exec as kernel only for deny-all. General hostname
+exec; AppContainer reports exec as kernel only for deny-all. An exec grant that
+resolves to a multicall binary (a multi-link file, or busybox/toybox/coreutils)
+admits every tool it dispatches to, so it reports `exec` at interceptor strength
+under every backend and a strong principal refuses it (ADR 0011 D6). General hostname
 network allowlists are not directly expressible by the native kernels. Their
 support is backend-specific, and the macOS proxy path is currently held. A
 restricted filesystem scope fails closed when no native backend can enforce it.

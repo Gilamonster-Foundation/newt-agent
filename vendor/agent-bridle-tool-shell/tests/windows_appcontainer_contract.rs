@@ -6,7 +6,11 @@
 //! `enforcement_report` tests by proving the route really selects AppContainer
 //! and fails closed when `agent-bridle-aclaunch.exe` cannot be found.
 
-#![cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+#![cfg(all(
+    target_os = "windows",
+    feature = "windows-appcontainer",
+    feature = "shell"
+))]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,16 +70,19 @@ fn newt_contract(workspace: &Path) -> Caveats {
 }
 
 fn launcher_path() -> PathBuf {
-    let mut p = std::env::current_exe().expect("current test executable");
-    p.pop(); // deps
-    p.pop(); // debug
-    p.push("agent-bridle-aclaunch.exe");
-    assert!(
-        p.exists(),
-        "Windows contract proof requires agent-bridle-aclaunch.exe to be built at {p:?}; \
-         run `cargo test -p agent-bridle-aclaunch --bins` before this test"
-    );
-    p
+    // Nearest ancestor of the test exe holding the launcher: `target/<profile>`
+    // under both the `deps/` layout and rustc 1.100's `build/<pkg>/<hash>/` one.
+    let exe = std::env::current_exe().expect("current test executable");
+    exe.ancestors()
+        .skip(1)
+        .map(|d| d.join("agent-bridle-aclaunch.exe"))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "Windows contract proof requires agent-bridle-aclaunch.exe in a parent of \
+                 {exe:?}; run `cargo test -p agent-bridle-aclaunch --bins` before this test"
+            )
+        })
 }
 
 fn sandbox_with_launcher(launcher: &Path) -> SandboxPolicy {
