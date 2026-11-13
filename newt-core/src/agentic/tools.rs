@@ -4767,6 +4767,13 @@ async fn execute_authorized_tool(
                     return host_return(reason);
                 }
             }
+            // A `git fetch` the confined child could not dial runs through the
+            // host-side fetch broker; whatever it does not handle falls through.
+            if governed_git && native_git::fetch::wanted(cmd, caveats) {
+                if let Some(result) = native_git::fetch::execute(cmd, std::path::Path::new(&run_cwd), caveats, &mut permission_gate) {
+                    return host_return(result);
+                }
+            }
             // A git network read gets its one command's egress approved up
             // front; every later use of `caveats` in this arm is that dispatch.
             let network_read = if governed_git {

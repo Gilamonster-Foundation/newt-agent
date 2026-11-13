@@ -1240,6 +1240,46 @@ pub(crate) fn confined_fetch_with(
 ) -> Result<(), Refusal> {
     let staging_dir = staging.path().to_string_lossy().into_owned();
     let source = source_repo.to_string_lossy();
+    let out = confined_beside_staging(
+        tools,
+        staging,
+        &[
+            "-C",
+            &staging_dir,
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            &source,
+            oid,
+        ],
+        Scope::only([staging_dir.clone()]),
+        session,
+        held,
+        after_verify,
+    )?;
+    if out.success {
+        Ok(())
+    } else {
+        Err("refused: the confined copy of the approved commit failed"
+            .to_string()
+            .into())
+    }
+}
+
+/// One confined git that may read the held roots plus staging and write only
+/// `fs_write`: the fence both directions of the broker share. A push copies
+/// workspace objects INTO staging ([`confined_fetch`]); a fetch seeds staging
+/// the same way and then copies the fetched refs back OUT ([`confined_git`]).
+fn confined_beside_staging(
+    tools: &TrustedTools,
+    staging: &StagingRepo,
+    args: &[&str],
+    fs_write: Scope<String>,
+    session: &Caveats,
+    held: &HeldRoots,
+    after_verify: impl FnOnce(),
+) -> Result<crate::confined_exec::ConfinedOutput, Refusal> {
+    let staging_dir = staging.path().to_string_lossy().into_owned();
     held.verify_identities()?;
     #[cfg(target_os = "linux")]
     let held_fds = held.held_read_roots()?;
@@ -1252,33 +1292,35 @@ pub(crate) fn confined_fetch_with(
             held.canonical()
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
-                .chain([staging_dir.clone()]),
+                .chain([staging_dir]),
         ),
     };
-    let out = run_confined_git(
+    Ok(run_confined_git(
         tools,
-        &[
-            "-C",
-            &staging_dir,
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            &source,
-            oid,
-        ],
+        args,
         staging.path(),
         session,
         fs_read,
-        Scope::only([staging_dir.clone()]),
+        fs_write,
         held_fds,
-    )?;
-    if out.success {
-        Ok(())
-    } else {
-        Err("refused: the confined copy of the approved commit failed"
-            .to_string()
-            .into())
-    }
+    )?)
+}
+
+/// A confined git for the fetch broker: reads the held roots plus staging,
+/// writes only `fs_write`, and never reaches the network on a platform whose
+/// fence bounds it (see [`run_confined_git`]).
+///
+/// # Errors
+/// As [`confined_fetch`].
+pub fn confined_git(
+    tools: &TrustedTools,
+    staging: &StagingRepo,
+    args: &[&str],
+    fs_write: Scope<String>,
+    session: &Caveats,
+    held: &HeldRoots,
+) -> Result<crate::confined_exec::ConfinedOutput, Refusal> {
+    confined_beside_staging(tools, staging, args, fs_write, session, held, || {})
 }
 
 // ---------------------------------------------------------------------------

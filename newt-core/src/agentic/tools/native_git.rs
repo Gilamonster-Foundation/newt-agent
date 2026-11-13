@@ -2,6 +2,7 @@
 //! Keep the caller's shell source unchanged and preserve the embedded adapter's
 //! destructive-operation confirmations while the command interface migrates.
 
+pub(super) mod fetch;
 pub(super) mod publication;
 pub(super) mod push_command;
 mod push_failure;
@@ -3398,6 +3399,111 @@ mod governed_push_tests {
                 );
             }
         }
+    }
+
+    /// Grounds `fetch::tests`: those pin which commands the fetch broker takes;
+    /// this runs one for real. The seed and deliver steps run in the kernel
+    /// fence, the dial fetches a real repository, and the workspace ends up
+    /// with the remote's new branch and its objects, and without the branch
+    /// the remote deleted. A local repository stands in for the forge.
+    #[test]
+    fn a_brokered_fetch_brings_new_refs_and_objects_into_the_workspace() {
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let remote = tempdir();
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let remote_url = remote.path().to_str().unwrap();
+        git(repo.path(), &["remote", "set-url", "origin", remote_url]);
+        git(
+            repo.path(),
+            &[
+                "push",
+                "-q",
+                remote_url,
+                "HEAD:refs/heads/main",
+                "HEAD:refs/heads/gone",
+            ],
+        );
+        let caveats = Caveats {
+            fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
+            ..with_net(Scope::only(["forge.example".to_string()]))
+        };
+        let fetch = |command: &str| {
+            fetch::execute_with(command, repo.path(), &caveats, &mut None, |_| {
+                Some("forge.example".to_string())
+            })
+            .expect("the broker handles this fetch")
+        };
+
+        let first = fetch("git fetch");
+        let tracked = refs(repo.path());
+        assert!(
+            tracked.contains("refs/remotes/origin/gone"),
+            "{first} / {tracked}"
+        );
+
+        // Elsewhere, someone adds a branch the workspace has no objects for
+        // and deletes one it tracks.
+        let other = tempdir();
+        git(other.path(), &["clone", "-q", remote_url, "."]);
+        let fresh = commit(other.path(), "new.txt", "new\n");
+        git(
+            other.path(),
+            &["push", "-q", "origin", "HEAD:refs/heads/fresh"],
+        );
+        git(remote.path(), &["update-ref", "-d", "refs/heads/gone"]);
+
+        let second = fetch("git fetch --prune 2>&1 | head -20");
+        let tracked = refs(repo.path());
+        assert!(
+            tracked.contains(&format!("refs/remotes/origin/fresh {fresh}")),
+            "{second} / {tracked}"
+        );
+        assert!(
+            !tracked.contains("refs/remotes/origin/gone"),
+            "{second} / {tracked}"
+        );
+        assert_eq!(git(repo.path(), &["cat-file", "-t", &fresh]), "commit");
+        assert!(
+            second.contains("fresh") && second.contains(remote_url),
+            "{second}"
+        );
+        assert!(!second.contains("staging-"), "{second}");
+    }
+
+    /// The broker asks for the remote's HOST, and a decline runs nothing.
+    #[test]
+    fn a_declined_brokered_fetch_changes_nothing_and_names_the_host() {
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let caveats = Caveats {
+            fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
+            ..with_net(Scope::only(["lms.example.com".to_string()]))
+        };
+        let before = refs(repo.path());
+        let mut gate = Gate {
+            allow: false,
+            requests: vec![],
+        };
+        let (output, _) = dispatch_run_command_with_gate(
+            repo.path(),
+            "git fetch --prune",
+            &caveats,
+            Some(&mut gate),
+        );
+        assert!(
+            output.contains("did not grant network access to 'github.com'"),
+            "{output}"
+        );
+        assert_eq!(gate.requests.len(), 1, "{:?}", gate.requests);
+        assert_eq!(gate.requests[0].target, "github.com");
+        assert_eq!(refs(repo.path()), before);
     }
 
     /// #2719: the actual run_command path folds a worktree cd, intercepts
