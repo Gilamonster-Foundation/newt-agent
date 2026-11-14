@@ -174,6 +174,48 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
     let write = parse("NEWT_WRITE_PATHS");
 
     lock_fs_to_workspace(caveats, workspace, &read, &write);
+    grant_net_hosts(caveats, &cli_net_hosts());
+}
+
+/// Env var `newt-cli` sets from repeated `--net <host>` (comma-joined, #3089).
+pub const NEWT_NET_HOSTS_ENV: &str = "NEWT_NET_HOSTS";
+
+/// The `--net` launch grants from [`NEWT_NET_HOSTS_ENV`]; malformed entries are
+/// dropped (the CLI already rejected them via [`parse_net_host`]).
+#[must_use]
+pub fn cli_net_hosts() -> Vec<String> {
+    std::env::var(NEWT_NET_HOSTS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|h| parse_net_host(h).ok())
+        .collect()
+}
+
+/// Add launch-granted `hosts` to an `Only` net scope. `All` is left untouched:
+/// a grant never narrows, and never widens past the hosts it names.
+pub fn grant_net_hosts(caveats: &mut Caveats, hosts: &[String]) {
+    if let Scope::Only(set) = &mut caveats.net {
+        set.extend(hosts.iter().cloned());
+    }
+}
+
+/// Validate one `--net` host: a bare, exact host as `[tui.permissions].net`
+/// lists it (no scheme, port, path or wildcard), lowercased to match the
+/// lowercased host the `net` gate checks.
+pub fn parse_net_host(raw: &str) -> Result<String, String> {
+    let host = raw.trim().to_ascii_lowercase();
+    let ok = !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if ok {
+        Ok(host)
+    } else {
+        Err(format!(
+            "invalid --net host {raw:?}: expected a bare host like github.com \
+             (no scheme, port, path or wildcard)"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,5 +547,81 @@ mod tests {
             "the worktree's HEAD must NOT be write-granted — that would let a \
              model retarget it to main with no prompt"
         );
+    }
+
+    /// #3089: a `--net <host>` launch grant joins an `Only` net scope, so the
+    /// named host no longer prompts while an unnamed one still does.
+    #[test]
+    fn launch_net_grant_permits_named_hosts_only() {
+        let mut c = Caveats {
+            net: Scope::only(["docs.rs".to_string()]),
+            ..Caveats::top()
+        };
+        grant_net_hosts(&mut c, &["github.com".to_string(), "doi.org".to_string()]);
+        assert!(c.permits_net("github.com"));
+        assert!(c.permits_net("doi.org"));
+        assert!(c.permits_net("docs.rs"), "configured hosts are kept");
+        assert!(
+            !c.permits_net("evil.example.com"),
+            "ungranted host still prompts"
+        );
+
+        let mut none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        grant_net_hosts(&mut none, &["github.com".to_string()]);
+        assert_eq!(none.net, Scope::only(["github.com".to_string()]));
+    }
+
+    /// #3089: a launch grant never narrows an already-unbounded net scope.
+    #[test]
+    fn launch_net_grant_leaves_all_untouched() {
+        let mut c = Caveats::top();
+        grant_net_hosts(&mut c, &["github.com".to_string()]);
+        assert_eq!(c.net, Scope::All);
+    }
+
+    /// #3089: `apply_cli_fs_grants` (the single session entry point) reads
+    /// `NEWT_NET_HOSTS`, as it reads `NEWT_READ_PATHS` / `NEWT_WRITE_PATHS`.
+    #[test]
+    fn apply_cli_grants_reads_net_hosts_env() {
+        let _g = crate::process_env::lock();
+        crate::process_env::set_var(NEWT_NET_HOSTS_ENV, "github.com,doi.org");
+        let mut c = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        apply_cli_fs_grants(&mut c, "/ws");
+        crate::process_env::remove_var(NEWT_NET_HOSTS_ENV);
+        assert!(c.permits_net("github.com"));
+        assert!(c.permits_net("doi.org"));
+        assert!(!c.permits_net("example.com"));
+    }
+
+    /// #3089: `--net` takes a bare host — the `[tui.permissions].net` grammar
+    /// minus `*` (use `--full-access` or config for every host).
+    #[test]
+    fn parse_net_host_accepts_bare_hosts_only() {
+        assert_eq!(parse_net_host("GitHub.com"), Ok("github.com".to_string()));
+        assert_eq!(
+            parse_net_host("api.github.com"),
+            Ok("api.github.com".to_string())
+        );
+        assert_eq!(parse_net_host("192.0.2.5"), Ok("192.0.2.5".to_string()));
+        for bad in [
+            "",
+            "*",
+            "*.github.com",
+            "https://github.com",
+            "github.com/x",
+            "github.com:443",
+            ".github.com",
+            "github..com",
+            "git hub.com",
+            "github.com,doi.org",
+        ] {
+            assert!(parse_net_host(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 }

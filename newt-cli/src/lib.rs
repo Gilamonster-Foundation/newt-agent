@@ -407,7 +407,9 @@ pub struct Cli {
 
     /// Grant the agent READ access to a file or directory OUTSIDE the workspace.
     /// A directory grants everything under it; a file grants just that file. May
-    /// be repeated. Reference the path by its absolute path in tools.
+    /// be repeated. Reference the path by its absolute path in tools. A tool's
+    /// credential dir can be granted the same way without the whole home dir,
+    /// e.g. `--read ~/.config/gh` for `gh`.
     /// Example: `newt --read ~/.newt --read ~/.hotseat/config.yml`.
     #[arg(long = "read", global = true, value_name = "PATH")]
     pub read_paths: Vec<PathBuf>,
@@ -417,6 +419,13 @@ pub struct Cli {
     /// Example: `newt --write ~/scratch`.
     #[arg(long = "write", global = true, value_name = "PATH")]
     pub write_paths: Vec<PathBuf>,
+
+    /// Grant the agent network access to `<HOST>` for this session (exact host,
+    /// no scheme/port/wildcard), so it does not prompt. Adds to
+    /// `[tui.permissions] net`; an ungranted host still prompts. May be
+    /// repeated. Example: `newt --net github.com --net doi.org`.
+    #[arg(long = "net", global = true, value_name = "HOST", value_parser = newt_core::caveats::parse_net_host)]
+    pub net_hosts: Vec<String>,
 
     /// Backend override flags (`--backend-*`): pin the model backend from the
     /// command line, bypassing discovery and probe drop-ins.
@@ -1318,6 +1327,16 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
             Err(e) => eprintln!(
                 "warning: ignoring --write grants (path contains the path separator): {e}"
             ),
+        }
+    }
+
+    // --net (#3089): exact hosts, already validated by `parse_net_host`.
+    if !cli.net_hosts.is_empty() {
+        unsafe {
+            std::env::set_var(
+                newt_core::caveats::NEWT_NET_HOSTS_ENV,
+                cli.net_hosts.join(","),
+            );
         }
     }
 
@@ -2963,6 +2982,19 @@ mod tests {
             err.contains("--ambient") && err.contains("interactive"),
             "{err}"
         );
+    }
+
+    /// #3089: `--net` is repeatable and validated at the CLI boundary.
+    #[test]
+    fn parses_repeated_net_grants_and_rejects_non_hosts() {
+        let cli = Cli::try_parse_from(["newt", "--net", "GitHub.com", "--net", "doi.org"]).unwrap();
+        assert_eq!(cli.net_hosts, ["github.com", "doi.org"]);
+        for bad in ["*", "https://github.com", "github.com:443", ""] {
+            assert!(
+                Cli::try_parse_from(["newt", "--net", bad]).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
