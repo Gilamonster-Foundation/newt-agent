@@ -295,8 +295,9 @@ from documentation.
 | Listeners: Prometheus endpoint (all interfaces when enabled), OAuth callback, newt-web, mesh bus, Bridle's loopback proxy | None | None |
 
 - Production code has about 45 `reqwest::Client` construction sites in eight
-  crates (`git grep`, test modules excluded) and no shared constructor. The two
-  gated ones are in `newt-mcp-client`. newt-web also dials with `ureq`.
+  crates (`git grep`, test modules excluded) and no shared constructor. At that
+  snapshot the two gated ones were in `newt-mcp-client`. newt-web also dials
+  with `ureq`.
 - Only primary inference passes `attempt_capture::send`. `AttemptRecord` holds
   the configured backend URL, not the destination actually contacted. The
   inference clients use `reqwest` defaults, so they follow redirects and honour
@@ -308,8 +309,9 @@ from documentation.
   and encrypted permanent store, in-memory session grants, and launch flags.
   The permission log records each prompted decision with its host.
 - [#3093](https://github.com/Gilamonster-Foundation/newt-agent/pull/3093),
-  merged after this inventory, adds launch grants (`--net <host>`) and a
-  per-request host check for brokered `gh` reads.
+  merged after this inventory, adds launch grants (`--net <host>`), a
+  per-request host check for brokered `gh` reads, and with it a third gated
+  client.
 
 Child boundary, per platform:
 
@@ -322,9 +324,10 @@ Child boundary, per platform:
   loopback included, and still connects to a pathname Unix socket held by its
   parent). Only clients that can reach a proxy over a Unix socket can use it.
 - **macOS.** Seatbelt can restrict a child's own sockets to loopback, and by
-  port, without privilege (Bridle ADR 0015, measured with `sandbox-exec`). It
-  does not cover OS services acting for the child, so Bridle does not admit a
-  proxy-fenced shape (ADRs 0015/0016). `sandbox-exec` is deprecated.
+  port, without privilege (Bridle ADR 0015 reports native `sandbox-exec`
+  measurements; not rerun here). It does not cover OS services acting for the
+  child, so Bridle does not admit a proxy-fenced shape (ADRs 0015/0016).
+  `sandbox-exec` is deprecated.
 - **Windows.** An AppContainer reaches a loopback proxy only after a loopback
   exemption. That needs elevation, opens every loopback port, and is documented
   as a debugging facility.
@@ -336,7 +339,7 @@ Socket observer, per platform:
   sockets in the network namespace, so the console filters to its own process
   tree. It does not see inside a child's own network namespace, and it is
   polled, so a short connection can be missed. UDP sockets show no byte
-  counters (measured with `ss -uinp`).
+  counters (measured with `ss -uainp`).
 - **Windows.** `GetExtendedTcpTable` lists TCP peers with the owning process.
   Per-connection byte counts need administrator rights.
 - **macOS.** Not established. `nettop` reports per-process bytes through a
@@ -407,8 +410,9 @@ are explicit; pruning leaves a verified retention event and head anchor.
 
 The chained journals (event, denial, permission) are best-effort today, sync on
 every line and have no writer lock across threads or processes. Blocking a dial
-on audit loss is therefore new behaviour. Step 2 records without blocking; step 3
-decides the blocking rule.
+on audit loss is therefore new behaviour. Step 2 requires no audit write, so it
+records without blocking. Step 3 decides which writes are required; the rule
+above then applies to them.
 
 ## Delivery and acceptance
 
@@ -443,8 +447,8 @@ that every descendant has stopped.
    requests can actually be mediated. Test redirects, DNS label boundaries,
    ports, encoded paths, denied-over-allowed overlaps, expiry and revocation.
    Decide grants for the harness traffic that has none today, whether an
-   inference redirect to another host is refused, and whether a failed audit
-   write blocks a dial. The grant record gains port, scheme and purpose, matched
+   inference redirect to another host is refused, and which audit writes are
+   required. The grant record gains port, scheme and purpose, matched
    through the decision point of
    [agent-bridle#152](https://github.com/Gilamonster-Foundation/agent-bridle/issues/152).
 4. Enable destination-constrained native subprocesses per platform only after
