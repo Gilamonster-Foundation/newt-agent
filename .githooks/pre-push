@@ -84,6 +84,10 @@
 #     (required after integration of PR #2818),
 #     and plan approval (PR #2814). Portable tests remain scoped here; native
 #     macOS confinement is CI-only because it needs the macOS kernel.
+#   - pinned AppContainer rc.7 launcher installation and confined native Git
+#     status/add/retry/refresh evidence, ci.yml Windows job; manual launcher
+#     diagnostic in windows-appcontainer-diag.yml. Needs native Windows.
+#     scripts/test_carried_cache.py covers shared pinned-byte acquisition.
 #   - pinned carried artifact caches + bounded retry downloads (#2817),
 #     .github/workflows/ci.yml Windows job (actions/cache requires CI), and
 #     scripts/test_carried_cache.py in its lint job (workflow contract).

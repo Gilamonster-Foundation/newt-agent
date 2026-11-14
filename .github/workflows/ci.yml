@@ -619,7 +619,11 @@ jobs:
         with:
           key: windows
       - name: Install AppContainer launcher
-        run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
+        run: ./scripts/windows/Install-AppContainerLauncher.ps1
+      # The release archive omits the network evidence helper. Install ONLY
+      # that binary from crates.io; never replace the verified rc.7 launcher.
+      - name: Install AppContainer network probe
+        run: cargo install agent-bridle-aclaunch --bin ab-netprobe --version 0.7.10 --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
       # HOOK PARITY: CI-only artifact caches and bounded downloads (#2817);

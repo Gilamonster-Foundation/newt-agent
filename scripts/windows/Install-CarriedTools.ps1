@@ -10,6 +10,7 @@ param(
     [string]$BusyboxArchive
 )
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/Get-PinnedArtifact.ps1"
 $binary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $destination = (Resolve-Path -LiteralPath $NewtDirectory).Path
 $tools = Join-Path $destination 'tools'
@@ -25,19 +26,9 @@ $busyboxSha256 = '6e263d154d8548d1eb936f65d1d8312c80df31c45974e48d6335e4dcc0f4f3
 try {
     New-Item -ItemType Directory -Path $stage | Out-Null
     $busybox = Join-Path $stage $busyboxName
-    if ($BusyboxArchive) { Copy-Item -LiteralPath $BusyboxArchive -Destination $busybox }
-    else { Invoke-WebRequest "https://frippery.org/files/busybox/$busyboxName" -OutFile $busybox }
-    if ((Get-FileHash -LiteralPath $busybox -Algorithm SHA256).Hash.ToLowerInvariant() -ne $busyboxSha256) {
-        throw "Pinned busybox-w32 $busyboxVersion SHA256 mismatch; refusing installation."
-    }
+    Get-PinnedArtifact -Uri "https://frippery.org/files/busybox/$busyboxName" -Destination $busybox -Sha256 $busyboxSha256 -Archive $BusyboxArchive
     $archive = Join-Path $stage $archiveName
-    if ($RipgrepArchive) { Copy-Item -LiteralPath $RipgrepArchive -Destination $archive }
-    else {
-        Invoke-WebRequest "https://github.com/BurntSushi/ripgrep/releases/download/$version/$archiveName" -OutFile $archive
-    }
-    if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sha256) {
-        throw 'Pinned ripgrep 14.1.1 archive SHA256 mismatch; refusing installation.'
-    }
+    Get-PinnedArtifact -Uri "https://github.com/BurntSushi/ripgrep/releases/download/$version/$archiveName" -Destination $archive -Sha256 $sha256 -Archive $RipgrepArchive
     Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $stage 'unpacked')
     $pack = Join-Path $stage 'tools'
     New-Item -ItemType Directory -Path $pack | Out-Null

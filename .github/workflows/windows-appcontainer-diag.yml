@@ -43,7 +43,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install AppContainer launcher
-        run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
+        run: ./scripts/windows/Install-AppContainerLauncher.ps1
+      # The release archive omits the network evidence helper. Install ONLY
+      # that binary from crates.io; never replace the verified rc.7 launcher.
+      - name: Install AppContainer network probe
+        run: cargo install agent-bridle-aclaunch --bin ab-netprobe --version 0.7.10 --locked
 
       - name: Prepare NUL device for AppContainer tools
         shell: pwsh

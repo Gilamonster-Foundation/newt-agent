@@ -73,7 +73,30 @@ class CarriedCacheTests(unittest.TestCase):
                     f'-{argument} "$env:RUNNER_TEMP/carried-downloads/{filename}"',
                     windows,
                 )
-                self.assertIn(f"-ne ${hash_var}", installer)
+                self.assertIn(f"-Sha256 ${hash_var}", installer)
+
+    def test_launcher_reuses_verified_download_before_extracting(self):
+        installer = (ROOT / "scripts/windows/Install-AppContainerLauncher.ps1").read_text()
+        helper = (ROOT / "scripts/windows/Get-PinnedArtifact.ps1").read_text()
+        carried = (ROOT / "scripts/windows/Install-CarriedTools.ps1").read_text()
+        for workflow_name in ["ci.yml", "windows-appcontainer-diag.yml"]:
+            workflow = (ROOT / ".github/workflows" / workflow_name).read_text()
+            self.assertIn("./scripts/windows/Install-AppContainerLauncher.ps1", workflow)
+            self.assertNotIn("cargo install agent-bridle-aclaunch --version", workflow)
+        for script in [installer, carried]:
+            self.assertIn('"$PSScriptRoot/Get-PinnedArtifact.ps1"', script)
+            self.assertIn("Get-PinnedArtifact", script)
+        self.assertIn("6ca23258e1bf8c3eb7881d0836c8186039c176e6f472cfe9d948acf313c4816d", installer)
+        self.assertIn("agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64", installer)
+        self.assertLess(installer.index("Get-PinnedArtifact -"), installer.index("tar.exe -xzf"))
+        self.assertIn('"$release/agent-bridle-aclaunch.exe"', installer)
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw", installer)
+        for flag in ["--fail", "--location", "--retry 4", "--retry-all-errors",
+                     "--retry-max-time 180", "--connect-timeout 20", "--max-time 60"]:
+            self.assertIn(flag, helper)
+        self.assertIn("Get-FileHash -LiteralPath $Destination -Algorithm SHA256", helper)
+        self.assertIn("-ne $Sha256", helper)
+        self.assertIn("throw", helper)
 
 
 if __name__ == "__main__":
