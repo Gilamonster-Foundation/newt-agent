@@ -33,8 +33,8 @@
 //! - **#8** the child cannot inherit credentials or authority switches — its
 //!   environment is EMPTY plus only the explicit grants,
 //! - **#9** an empty `net` fence requires deny-all enforcement. A platform whose
-//!   complete network authority is unknown refuses the spawn (including current
-//!   Seatbelt restricted-net admission), rather than imply a proved boundary,
+//!   complete network authority is unknown refuses the spawn. Seatbelt admits
+//!   deny-all only with its audited, unprivileged kernel network witness,
 //! - **#10** where the required kernel enforcement is unavailable the spawn is
 //!   **refused**, never silently downgraded to an unconfined run.
 //!
@@ -133,10 +133,10 @@ pub enum NetGrant {
     /// * **Linux** — the child is wrapped in `newt-net-guard`, which installs
     ///   the seccomp `socket()`-family deny (TCP/UDP/DNS/raw) *in addition to*
     ///   the inherited Landlock fs fence.
-    /// * **macOS** — the child's `net` caveat is narrowed to deny-all. Current
-    ///   Bridle admission refuses every restricted Seatbelt net scope because
-    ///   OS-deputy egress is not proven bounded. Generated direct-socket rules
-    ///   are defense in depth, not evidence of a complete network boundary.
+    /// * **macOS** — the child's `net` caveat is narrowed to deny-all. Seatbelt
+    ///   must supply Bridle's kernel network witness for the audited pipe/null,
+    ///   unprivileged launch shape. Missing backend or witness refuses before
+    ///   spawn; backend availability alone never establishes the floor.
     ///
     /// On a platform with neither floor the spawn is **refused**
     /// (`ExecRefused::ConfinementUnenforceable`), never run with a weaker net
@@ -604,8 +604,8 @@ impl ConstrainedExecutor {
         cgroup_procs: Option<&Path>,
     ) -> Result<(String, Vec<String>, Caveats), ExecRefused> {
         // Only the Linux `DenyAll` arm reads `cgroup_procs`; on other platforms
-        // that arm is `#[cfg]`'d out and `DenyAll` fails closed, so the parameter
-        // is genuinely unused there. Consume it to keep `-D warnings` happy
+        // that arm is `#[cfg]`'d out, so the parameter is unused there.
+        // Consume it to keep `-D warnings` happy
         // without weakening the Linux signature both callers share.
         #[cfg(not(target_os = "linux"))]
         let _ = cgroup_procs;
@@ -642,23 +642,21 @@ impl ConstrainedExecutor {
             }
             #[cfg(target_os = "macos")]
             NetGrant::DenyAll => {
-                // Preserve the requested deny-all scope for Bridle admission.
-                // Seatbelt availability alone does not prove the network floor:
-                // current Bridle reports restricted macOS networking as
-                // unenforceable and refuses it before spawning. Never weaken
-                // the requested boundary merely because sandbox-exec exists.
-                if !agent_bridle::seatbelt_is_supported() {
-                    return Err(ExecRefused::ConfinementUnenforceable(
-                        "NetGrant::DenyAll needs a kernel egress floor; the Seatbelt \
-                         backend (sandbox-exec) is unavailable on this host"
-                            .into(),
-                    ));
-                }
-                Ok((
-                    req.program.clone(),
-                    req.args.clone(),
-                    deny_all_net(&req.caveats),
-                ))
+                // Use Bridle's witness for the same pipe/null stdio configured
+                // below; it includes the deputy audit and caller privilege.
+                // Admission checks the actual spawn again, so this preflight
+                // cannot replace or weaken the kernel floor.
+                let caveats = deny_all_net(&req.caveats);
+                let mechanism = agent_bridle::ConfinementMechanism::new(
+                    agent_bridle::SandboxKind::Seatbelt,
+                    runtime_sandbox_policy().child_network,
+                )
+                .with_stdio_posture(agent_bridle::StdioPosture::Audited);
+                seatbelt_deny_all_policy(
+                    agent_bridle::seatbelt_is_supported(),
+                    agent_bridle::enforcement_report(&caveats, mechanism).net,
+                )?;
+                Ok((req.program.clone(), req.args.clone(), caveats))
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             NetGrant::DenyAll => Err(ExecRefused::ConfinementUnenforceable(
@@ -785,6 +783,25 @@ fn deny_all_net(caveats: &Caveats) -> Caveats {
     let mut narrowed = caveats.clone();
     narrowed.net = Scope::only([] as [String; 0]);
     narrowed
+}
+
+/// Conditional macOS admission; the witness comes from Bridle's audited
+/// pipe/null launch report, including its deputy audit and caller privilege.
+/// Bridle checks the actual command again before spawning it.
+#[cfg(any(target_os = "macos", test))]
+fn seatbelt_deny_all_policy(
+    backend_available: bool,
+    net_witness: Option<AxisEnforcement>,
+) -> Result<(), ExecRefused> {
+    if backend_available && net_witness == Some(AxisEnforcement::Kernel) {
+        Ok(())
+    } else {
+        Err(ExecRefused::ConfinementUnenforceable(
+            "NetGrant::DenyAll requires Seatbelt and a kernel network witness for an audited, \
+             unprivileged launch"
+                .into(),
+        ))
+    }
 }
 
 /// Add one read root to a caveats fs-read scope (the `lock_fs_to_workspace`
@@ -2155,6 +2172,78 @@ mod tests {
         assert_eq!(narrowed.exec, base.exec);
         // Idempotent, and already-deny-all stays deny-all.
         assert_eq!(deny_all_net(&narrowed), narrowed);
+    }
+
+    /// The fetch copy must admit a witnessed launch and refuse every missing
+    /// witness before spawn. Native fetch transfer and rewrite grounds exercise
+    /// the admitted arm with real Seatbelt; this guard also covers unavailable
+    /// backends and privileged/unaudited launches without running a process.
+    #[test]
+    fn seatbelt_deny_all_policy_requires_a_kernel_witness() {
+        for backend in [false, true] {
+            for witness in [
+                None,
+                Some(AxisEnforcement::Advisory),
+                Some(AxisEnforcement::Interceptor),
+                Some(AxisEnforcement::Kernel),
+            ] {
+                let result = seatbelt_deny_all_policy(backend, witness);
+                if backend && witness == Some(AxisEnforcement::Kernel) {
+                    assert!(result.is_ok(), "witnessed launch refused: {result:?}");
+                } else {
+                    assert!(
+                        matches!(result, Err(ExecRefused::ConfinementUnenforceable(_))),
+                        "unwitnessed launch admitted: backend={backend}, witness={witness:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pure policy guard for the fetch broker; real rewrite refusal grounds it
+    /// in the ignored weekly/release tier, including native macOS admission.
+    #[test]
+    fn fetch_copy_requires_deny_all_even_with_ambient_session_network() {
+        let baseline = Caveats {
+            net: Scope::All,
+            ..workspace_confined_caveats(Path::new("/ws"))
+        };
+        let request = ExecRequest::new(
+            ExecOrigin::AgentInfluenced,
+            "git",
+            ["fetch"],
+            "/ws",
+            baseline.clone(),
+        );
+        let request = crate::git_staging::fetch_copy_request(request);
+        assert_eq!(
+            request.net_grant,
+            NetGrant::DenyAll,
+            "fetch copy lacks a fail-closed network floor"
+        );
+        assert_eq!(request.caveats.fs_read, baseline.fs_read);
+        assert_eq!(request.caveats.fs_write, baseline.fs_write);
+        assert_eq!(request.caveats.exec, baseline.exec);
+        assert!(request
+            .env_grants()
+            .iter()
+            .any(|(k, v)| k == "GIT_ALLOW_PROTOCOL" && v == "file"));
+        for (key, value) in [
+            ("core.hooksPath", "/dev/null"),
+            ("core.fsmonitor", ""),
+            ("protocol.ext.allow", "never"),
+        ] {
+            let (env_key, _) = request
+                .env_grants()
+                .iter()
+                .find(|(k, v)| k.starts_with("GIT_CONFIG_KEY_") && v == key)
+                .unwrap();
+            let value_key = env_key.replace("_KEY_", "_VALUE_");
+            assert!(request
+                .env_grants()
+                .iter()
+                .any(|(k, v)| k == &value_key && v == value));
+        }
     }
 
     #[test]

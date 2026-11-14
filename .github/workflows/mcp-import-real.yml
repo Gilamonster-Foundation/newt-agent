@@ -230,6 +230,40 @@ jobs:
           -p newt-core --lib a_hostile_path_git_never_runs_during_network_read_approval
           -- --ignored --test-threads=1
 
+      # PR #3099: both copies require DenyAll. Linux and audited, unprivileged
+      # macOS launches exercise successful transfer and hostile rewrites;
+      # Linux additionally exercises the independently locked destination ref.
+      - name: Build fetch copy network guard
+        if: runner.os == 'Linux'
+        run: cargo build -p newt-core --bin newt-net-guard
+
+      - name: Run fetch broker hostile fallback and delivery grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test fetch_broker_delivery_refuses_hostile_url_rewriting
+          -p newt-core --lib fetch_broker_
+          -- --ignored --test-threads=1
+
+      - name: Run fetch broker declined-host grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test a_declined_brokered_fetch_changes_nothing_and_names_the_host
+          -p newt-core --lib a_declined_brokered_fetch_changes_nothing_and_names_the_host
+          -- --ignored --test-threads=1
+
+      - name: Run fetch broker transfer grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test a_brokered_fetch_brings_new_refs_and_objects_into_the_workspace
+          -p newt-core --lib a_brokered_fetch_brings_new_refs_and_objects_into_the_workspace
+          -- --ignored --test-threads=1
+
       - name: Run presenter regression grounding
         if: runner.os != 'Windows'
         shell: bash
