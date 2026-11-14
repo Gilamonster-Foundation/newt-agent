@@ -40,14 +40,15 @@ fn unique_temp(tag: &str) -> PathBuf {
     ))
 }
 
-/// The built launcher, next to the test binary's target profile dir
-/// (`target/<profile>/agent-bridle-aclaunch.exe`), present when the workspace is
-/// built. Returns `None` if not found.
+/// The built launcher in the nearest ancestor of the test binary
+/// (`target/<profile>/agent-bridle-aclaunch.exe`, under both the `deps/` layout
+/// and rustc 1.100's `build/<pkg>/<hash>/` one). Returns `None` if not found.
 fn locate_launcher() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/<test>.exe
-    let profile = exe.parent()?.parent()?; // .../target/<profile>
-    let cand = profile.join("agent-bridle-aclaunch.exe");
-    cand.exists().then_some(cand)
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors()
+        .skip(1)
+        .map(|d| d.join("agent-bridle-aclaunch.exe"))
+        .find(|p| p.is_file())
 }
 
 /// Whether `BRIDLE_REQUIRE_APPCONTAINER` demands a real AppContainer (CI sets it).

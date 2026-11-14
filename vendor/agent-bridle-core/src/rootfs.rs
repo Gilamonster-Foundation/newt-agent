@@ -51,8 +51,11 @@ fn search_dirs(fallback: &[String]) -> Vec<PathBuf> {
 }
 
 /// Resolve a granted `exec` entry (a bare name or a path) to an absolute, existing
-/// program file — canonicalized so the plan anchors the real inode.
-fn resolve_program(entry: &str, search_fallback: &[String]) -> Option<PathBuf> {
+/// program file — canonicalized so the plan anchors the real inode — plus the
+/// granted *name* (parent canonicalized, file name kept). They differ when the
+/// name is a symlink (Ubuntu 26.04: `/usr/bin/cat` → uutils `coreutils/cat`,
+/// #449); the name is what a `PATH` lookup inside the jail finds.
+fn resolve_program(entry: &str, search_fallback: &[String]) -> Option<(PathBuf, PathBuf)> {
     let candidate = if entry.contains('/') {
         let p = PathBuf::from(entry);
         p.is_file().then_some(p)
@@ -62,7 +65,12 @@ fn resolve_program(entry: &str, search_fallback: &[String]) -> Option<PathBuf> {
             .map(|d| d.join(entry))
             .find(|c| c.is_file())
     }?;
-    candidate.canonicalize().ok()
+    let name = candidate
+        .parent()?
+        .canonicalize()
+        .ok()?
+        .join(candidate.file_name()?);
+    Some((name, candidate.canonicalize().ok()?))
 }
 
 /// The shared-library closure of `bin` as the loader sees it: parse `ldd`'s output
@@ -225,8 +233,9 @@ pub fn build_rootfs_plan(
     let mut rw_dirs: BTreeSet<PathBuf> = BTreeSet::new();
 
     for prog in programs {
-        let bin = resolve_program(prog, search_fallback)
+        let (name, bin) = resolve_program(prog, search_fallback)
             .ok_or_else(|| format!("granted program not found: {prog}"))?;
+        files.insert(name);
         // Toggle: the static `ldd` closure. Disabling only removes `.so`s from the
         // plan (more minimal) — a granted dynamic program then fails to load, so
         // this is a capability/degradation knob, never a confinement relaxation.

@@ -1,6 +1,6 @@
 # Temporary Newt trusted-control integration patch
 
-Base: the exact crates.io `agent-bridle-core` 0.8.0-rc.6 package. Original
+Base: the exact crates.io `agent-bridle-core` 0.8.0-rc.7 package. Original
 `Cargo.toml.orig`, Cargo package metadata, and license notices are retained.
 
 The privacy-policy citation in `src/net_proxy.rs` belongs to the upstream

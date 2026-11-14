@@ -97,6 +97,16 @@ impl StdioPosture {
 pub struct ConfinementMechanism {
     kind: SandboxKind,
     child_network: ChildNetworkPolicy,
+    /// An explicitly enabled per-AppContainer-SID ACE on the host `NUL` device.
+    /// This is a host mechanism widening rather than a Caveat axis, and remains
+    /// off unless the operator chose it in [`crate::SandboxPolicy`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    appcontainer_nul_device_ace: bool,
+    /// An explicitly enabled per-AppContainer-SID `FILE_READ_ATTRIBUTES |
+    /// SYNCHRONIZE` ACE on the host MountPointManager device. Same rules as
+    /// the `NUL` widening above.
+    #[serde(default, skip_serializing_if = "is_false")]
+    appcontainer_mount_manager_ace: bool,
     // Omission preserves the existing default canonical body and fence CID.
     #[serde(default, skip_serializing_if = "ExecBoundary::is_process_tree")]
     exec_boundary: ExecBoundary,
@@ -113,6 +123,8 @@ impl ConfinementMechanism {
         Self {
             kind,
             child_network,
+            appcontainer_nul_device_ace: false,
+            appcontainer_mount_manager_ace: false,
             exec_boundary: ExecBoundary::ProcessTree,
             stdio: StdioPosture::Unaudited,
         }
@@ -124,9 +136,28 @@ impl ConfinementMechanism {
         Self {
             kind,
             child_network,
+            appcontainer_nul_device_ace: false,
+            appcontainer_mount_manager_ace: false,
             exec_boundary: ExecBoundary::NamedRoot,
             stdio: StdioPosture::Unaudited,
         }
+    }
+
+    /// Carry the explicit Windows AppContainer `NUL` device-ACE mechanism choice
+    /// into reporting. It does not alter any Caveat or enforcement strength.
+    #[must_use]
+    pub fn with_appcontainer_nul_device_ace(mut self, enabled: bool) -> Self {
+        self.appcontainer_nul_device_ace = enabled;
+        self
+    }
+
+    /// Carry the explicit Windows AppContainer MountPointManager device-ACE
+    /// mechanism choice into reporting. Like the `NUL` ACE, it does not alter
+    /// any Caveat or enforcement strength.
+    #[must_use]
+    pub fn with_appcontainer_mount_manager_ace(mut self, enabled: bool) -> Self {
+        self.appcontainer_mount_manager_ace = enabled;
+        self
     }
 
     /// The actual executable-identity proof domain.
@@ -172,6 +203,10 @@ impl ConfinementMechanism {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl From<SandboxKind> for ConfinementMechanism {
     fn from(kind: SandboxKind) -> Self {
         Self::backend(kind)
@@ -203,6 +238,20 @@ pub enum AxisEnforcement {
     /// Validated at admission, then **ambient** — nothing backstops the spawned
     /// interior. Honest "we checked the request, we cannot confine the effect."
     Advisory,
+}
+
+/// A named, operator-approved host mechanism widening disclosed alongside the
+/// axis-strength report. These are not Caveats and never change `meet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnforcementWidening {
+    /// The launcher installed `FILE_GENERIC_READ | FILE_GENERIC_WRITE` for this
+    /// launch's AppContainer SID on the host `\\.\NUL` device.
+    #[serde(rename = "appcontainer-nul-device-ace")]
+    AppContainerNulDeviceAce,
+    /// The launcher installed `FILE_READ_ATTRIBUTES | SYNCHRONIZE` for this
+    /// launch's AppContainer SID on the host MountPointManager device.
+    #[serde(rename = "appcontainer-mount-manager-ace")]
+    AppContainerMountManagerAce,
 }
 
 impl AxisEnforcement {
@@ -244,8 +293,12 @@ impl PartialOrd for AxisEnforcement {
 /// `All` is unrestricted — there is nothing to confine — and is `None`. The
 /// `max_calls` / `valid_for_generation` axes are gate-enforced budget/causality,
 /// not OS-confinement axes, so they are not part of this report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EnforcementReport {
+    /// Every explicit host mechanism widening active for this run, in a fixed
+    /// order (`NUL` before MountPointManager). Empty — and omitted — by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widenings: Vec<EnforcementWidening>,
     /// Enforcement of the `fs_read` axis, when restricted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_read: Option<AxisEnforcement>,
@@ -265,7 +318,8 @@ impl EnforcementReport {
     /// carries no information and may be omitted from a result envelope.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.fs_read.is_none()
+        self.widenings.is_empty()
+            && self.fs_read.is_none()
             && self.fs_write.is_none()
             && self.exec.is_none()
             && self.net.is_none()
@@ -278,7 +332,8 @@ fn is_restricted<T: Ord + Clone>(scope: &Scope<T>) -> bool {
 }
 
 /// Classify each restricted axis of `effective` under the `active` sandbox
-/// (ADR 0004 D1). Pure; no IO.
+/// (ADR 0004 D1). Pure except that a restricted `exec` grant is resolved and
+/// stat'ed to detect a multi-command binary (ADR 0011 D6, #449).
 ///
 /// The mapping reflects what each layer *actually* enforces today:
 ///
@@ -309,9 +364,25 @@ pub fn enforcement_report(
     let ConfinementMechanism {
         kind: active,
         child_network,
+        appcontainer_nul_device_ace,
+        appcontainer_mount_manager_ace,
         exec_boundary,
         stdio,
     } = mechanism.into();
+    let appcontainer = active == SandboxKind::AppContainer;
+    let widenings = [
+        (
+            appcontainer_nul_device_ace,
+            EnforcementWidening::AppContainerNulDeviceAce,
+        ),
+        (
+            appcontainer_mount_manager_ace,
+            EnforcementWidening::AppContainerMountManagerAce,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, widening)| (appcontainer && enabled).then_some(widening))
+    .collect();
     // Filesystem axes: kernel when an OS sandbox actually governs them, else the
     // in-process interceptor. Exhaustive over `SandboxKind` so a new backend
     // must decide its mapping rather than silently defaulting.
@@ -336,10 +407,15 @@ pub fn enforcement_report(
         })
     };
     EnforcementReport {
+        widenings,
         fs_read: fs(&effective.fs_read),
         fs_write: fs(&effective.fs_write),
         exec: is_restricted(&effective.exec).then_some(match active {
             _ if exec_boundary == ExecBoundary::NamedRoot => AxisEnforcement::Interceptor,
+            // ADR 0011 D6 (#449): a grant that resolves to a multi-command binary
+            // (hard-linked or busybox/toybox/coreutils) admits every name linked
+            // to it, so no backend's identity rule is an exact witness.
+            _ if crate::sandbox::exec_grant_is_multicall(effective) => AxisEnforcement::Interceptor,
             // `exec → kernel` is reserved for modes that close the axis by
             // *identity*: Seatbelt (macOS) via `process-exec*` — interior-covering,
             // no trampoline bypass on Apple Silicon (ADR 0014) — and the Linux
@@ -760,7 +836,8 @@ impl fmt::Display for UnenforceableAxis {
 }
 
 /// The first restricted axis whose enforcement (under `active`) fails to reach
-/// its per-axis floor, or `None` if every restricted axis meets it. Pure; no IO.
+/// its per-axis floor, or `None` if every restricted axis meets it. IO only as
+/// [`enforcement_report`] does.
 ///
 /// The acceptance rule, per restricted **Caveat** axis (not per report entry —
 /// the caveats decide the obligation):
@@ -826,12 +903,29 @@ mod tests {
     use super::*;
     use crate::{CountBound, Scope};
 
+    /// A granted program that resolves nowhere, keeping exec classification
+    /// host-independent: on Ubuntu 26.04 `echo`/`cat` resolve to the hard-linked
+    /// uutils multicall and are honestly `exec ≡ All` (#449).
+    const PROGRAM: &str = "agent-bridle-test-program";
+
+    /// `name` on macOS, where it resolves to the Xcode locator stub — a 78-link
+    /// inode that is *not* a multicall (#449) — else the host-independent
+    /// [`PROGRAM`].
+    fn via_macos_stub(name: &str) -> String {
+        if cfg!(target_os = "macos") {
+            name
+        } else {
+            PROGRAM
+        }
+        .to_string()
+    }
+
     /// All axes restricted, so every axis appears in the report.
     fn fully_restricted() -> Caveats {
         Caveats {
             fs_read: Scope::only(["/r".to_string()]),
             fs_write: Scope::only(["/w".to_string()]),
-            exec: Scope::only(["echo".to_string()]),
+            exec: Scope::only([PROGRAM.to_string()]),
             net: Scope::only(["example.com".to_string()]),
             max_calls: CountBound::Unlimited,
             valid_for_generation: Scope::All,
@@ -845,6 +939,76 @@ mod tests {
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Interceptor));
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    #[test]
+    fn appcontainer_nul_device_ace_widening_is_explicit_in_the_report() {
+        let off = enforcement_report(&Caveats::top(), SandboxKind::AppContainer);
+        assert!(
+            off.widenings.is_empty(),
+            "the default report must remain quiet"
+        );
+
+        let on = enforcement_report(
+            &Caveats::top(),
+            ConfinementMechanism::new(SandboxKind::AppContainer, ChildNetworkPolicy::LandlockOnly)
+                .with_appcontainer_nul_device_ace(true),
+        );
+        assert_eq!(
+            on.widenings,
+            [EnforcementWidening::AppContainerNulDeviceAce]
+        );
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["widenings"],
+            serde_json::json!(["appcontainer-nul-device-ace"])
+        );
+    }
+
+    #[test]
+    fn every_active_appcontainer_device_widening_is_reported_in_order() {
+        let mechanism =
+            ConfinementMechanism::new(SandboxKind::AppContainer, ChildNetworkPolicy::LandlockOnly);
+        let mm_only = enforcement_report(
+            &Caveats::top(),
+            mechanism.with_appcontainer_mount_manager_ace(true),
+        );
+        assert_eq!(
+            mm_only.widenings,
+            [EnforcementWidening::AppContainerMountManagerAce]
+        );
+        assert!(!mm_only.is_empty());
+
+        let both = enforcement_report(
+            &Caveats::top(),
+            mechanism
+                .with_appcontainer_mount_manager_ace(true)
+                .with_appcontainer_nul_device_ace(true),
+        );
+        assert_eq!(
+            both.widenings,
+            [
+                EnforcementWidening::AppContainerNulDeviceAce,
+                EnforcementWidening::AppContainerMountManagerAce,
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&both).unwrap()["widenings"],
+            serde_json::json!([
+                "appcontainer-nul-device-ace",
+                "appcontainer-mount-manager-ace"
+            ])
+        );
+
+        let elsewhere = enforcement_report(
+            &Caveats::top(),
+            ConfinementMechanism::new(SandboxKind::None, ChildNetworkPolicy::LandlockOnly)
+                .with_appcontainer_mount_manager_ace(true)
+                .with_appcontainer_nul_device_ace(true),
+        );
+        assert!(
+            elsewhere.widenings.is_empty(),
+            "a widening is reported only when the AppContainer launcher applied it"
+        );
     }
 
     /// Blocker 2 (mechanism-aware net witness): a Landlock `net:none` child reaches
@@ -1013,13 +1177,14 @@ mod tests {
     /// zero-grant shape. This is the end-to-end proof the mechanism's pure
     /// unit test (below) promised: the real production constant, not a
     /// parameterized stand-in. macOS-only: `seatbelt_mach_deputy_audit_complete`
-    /// is unconditionally `false` off macOS (the audit only exists where
-    /// Seatbelt does), so this assertion is platform-specific by
-    /// construction, not an oversight. The bare `SandboxKind::Seatbelt`
+    /// is unconditionally `false` off macOS or without the `macos-seatbelt`
+    /// feature (the audit only exists where Seatbelt does), so this
+    /// assertion is platform-specific by construction (agent-bridle#442).
+    /// The bare `SandboxKind::Seatbelt`
     /// conversion (`StdioPosture::Unaudited`) must NOT reach Kernel
     /// (agent-bridle#416 round-2 review, item 1).
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
     fn seatbelt_net_none_reports_kernel_now_the_audit_is_complete() {
         let none = Caveats {
             net: Scope::none(),
@@ -1153,7 +1318,7 @@ mod tests {
     #[test]
     fn exec_is_kernel_under_seatbelt_interceptor_elsewhere() {
         let cav = Caveats {
-            exec: Scope::only(["git".to_string()]),
+            exec: Scope::only([via_macos_stub("git")]),
             ..Caveats::top()
         };
         assert_eq!(
@@ -1188,7 +1353,7 @@ mod tests {
     #[test]
     fn exec_is_kernel_under_minimal_rootfs_interceptor_under_landlock() {
         let cav = Caveats {
-            exec: Scope::only(["cat".to_string()]),
+            exec: Scope::only([PROGRAM.to_string()]),
             ..Caveats::top()
         };
         assert_eq!(
@@ -1395,7 +1560,7 @@ mod tests {
             );
         }
         assert_eq!(
-            enforcement_report(&exec("echo"), SandboxKind::Seatbelt).exec,
+            enforcement_report(&exec(PROGRAM), SandboxKind::Seatbelt).exec,
             Some(AxisEnforcement::Kernel),
             "a no-variant allow-list is an exact identity witness → Kernel"
         );
@@ -1560,7 +1725,7 @@ mod tests {
     #[test]
     fn exec_kernel_is_identity_not_interpreter_behavior() {
         let interp = Caveats {
-            exec: Scope::only(["python3".to_string()]),
+            exec: Scope::only([via_macos_stub("python3")]),
             ..Caveats::top()
         };
         let r = enforcement_report(&interp, SandboxKind::Seatbelt);
@@ -1574,6 +1739,68 @@ mod tests {
         assert_eq!(r.fs_read, None);
         assert_eq!(r.fs_write, None);
         assert_eq!(r.net, None);
+    }
+
+    /// #449 / ADR 0011 D6: on Ubuntu 26.04 `cat` and `head` are one hard-linked
+    /// uutils inode, so an exec grant of one admits the other under every
+    /// identity-closing backend. A grant resolving to a multi-link file (or a
+    /// recognized multicall) must never be reported `Kernel`, and a strong
+    /// principal (exec floor `Kernel`) must refuse it. A single-link file is the
+    /// control: it keeps `Kernel`.
+    #[cfg(unix)]
+    #[test]
+    fn multicall_exec_grant_is_never_kernel_and_strong_principal_refuses() {
+        let dir = std::env::temp_dir().join(format!("agent-bridle-449-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let single = dir.join("single");
+        let linked = dir.join("cat");
+        let busybox = dir.join("busybox");
+        for f in [&single, &linked, &busybox] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        std::fs::hard_link(&linked, dir.join("head")).unwrap();
+        // Single-link multicalls reached by name: a versioned real file behind an
+        // applet symlink, and a `busybox` symlink to a renamed real file.
+        let versioned = dir.join("busybox.static");
+        let renamed = dir.join("bb");
+        for f in [&versioned, &renamed] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let applet = dir.join("applet");
+        std::os::unix::fs::symlink(&versioned, &applet).unwrap();
+        std::fs::create_dir_all(dir.join("l")).unwrap();
+        let bb_named = dir.join("l/busybox");
+        std::os::unix::fs::symlink(&renamed, &bb_named).unwrap();
+        let grant = |p: &std::path::Path| Caveats {
+            exec: Scope::only([p.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let strong = EnforcementFloor::from_scalar(AxisEnforcement::Kernel);
+        for kind in [
+            SandboxKind::Seatbelt,
+            SandboxKind::MinimalRootfs,
+            SandboxKind::MicroVm,
+        ] {
+            let control = grant(&single);
+            assert_eq!(
+                enforcement_report(&control, kind).exec,
+                Some(AxisEnforcement::Kernel),
+                "{kind:?}: single-link control keeps exec→kernel"
+            );
+            assert_eq!(unenforceable_axis(&control, kind, strong), None);
+            for multi in [&linked, &busybox, &applet, &bb_named] {
+                let cav = grant(multi);
+                assert_eq!(
+                    enforcement_report(&cav, kind).exec,
+                    Some(AxisEnforcement::Interceptor),
+                    "{kind:?}: multicall grant {multi:?} is exec ≡ All, never kernel"
+                );
+                let refused = unenforceable_axis(&cav, kind, strong)
+                    .expect("a strong principal must refuse a multicall exec grant");
+                assert_eq!(refused.axis, ConfinedAxis::Exec);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Per-axis strength floor (EnforcementFloor / unenforceable_axis) ──────
@@ -1601,11 +1828,11 @@ mod tests {
         }
     }
     fn only_exec() -> Caveats {
-        // A non-launcher program: `echo` does not pull an implementation variant,
+        // A non-launcher program: `PROGRAM` does not pull an implementation variant,
         // so Seatbelt's process-exec* fence is an exact identity witness (Kernel).
         // (A granted `sh` would widen to `/bin/bash` — model B, tested separately.)
         Caveats {
-            exec: Scope::only(["echo".to_string()]),
+            exec: Scope::only([PROGRAM.to_string()]),
             ..Caveats::top()
         }
     }

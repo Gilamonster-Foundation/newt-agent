@@ -37,28 +37,6 @@ fn sandbox() -> Sandbox {
     }
 }
 
-/// Controlled stdio transport fixtures must reach the MCP handshake.
-/// macOS currently refuses every restricted network grant before spawn. Declare
-/// network authority explicitly for these known self-MCP/echo children while
-/// preserving read-only filesystem access and exact configured-command exec.
-/// Other platforms keep the default net:none positive control.
-fn stdio_transport_sandbox() -> Sandbox {
-    #[cfg(not(target_os = "macos"))]
-    {
-        sandbox()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let sb = sandbox();
-        std::fs::write(
-            sb.config_dir.join("config.toml"),
-            "[tui.permissions]\npreset = \"read_only\"\nnet = [\"*\"]\n",
-        )
-        .unwrap();
-        sb
-    }
-}
-
 fn newt(sb: &Sandbox) -> Command {
     let mut cmd = common::newt_at(&sb.home);
     cmd.env("NEWT_CONFIG_DIR", &sb.config_dir)
@@ -74,7 +52,7 @@ fn newt_bin() -> String {
 
 #[test]
 fn probe_derives_identity_tools_and_posture_from_a_live_server() {
-    let sb = stdio_transport_sandbox();
+    let sb = sandbox();
     newt(&sb)
         .args(["mcp", "probe", &newt_bin(), "--arg", "mcp", "--yes"])
         .assert()
@@ -89,7 +67,7 @@ fn probe_derives_identity_tools_and_posture_from_a_live_server() {
 
 #[test]
 fn probe_save_writes_the_config_and_duplicate_suggests_a_rename() {
-    let sb = stdio_transport_sandbox();
+    let sb = sandbox();
     newt(&sb)
         .args([
             "mcp",
@@ -135,7 +113,7 @@ fn probe_save_writes_the_config_and_duplicate_suggests_a_rename() {
 
 #[test]
 fn probe_to_catalog_then_install_round_trips() {
-    let sb = stdio_transport_sandbox();
+    let sb = sandbox();
     newt(&sb)
         .args([
             "mcp",
@@ -191,7 +169,7 @@ fn probe_without_yes_fails_closed_off_a_terminal() {
 #[cfg(unix)]
 #[test]
 fn probe_never_certifies_a_stdin_echoing_process() {
-    let sb = stdio_transport_sandbox();
+    let sb = sandbox();
     let config_before = std::fs::read(sb.config_dir.join("config.toml")).ok();
     // `/bin/cat` echoes the initialize request back verbatim (matching id, no
     // error) — before handshake validation this "probed OK" with zero tools
@@ -209,32 +187,6 @@ fn probe_never_certifies_a_stdin_echoing_process() {
     assert!(!sb.config_dir.join("mcp-catalog.toml").exists());
 }
 
-/// Default probe authority remains fail-closed on macOS. The positive
-/// transport fixtures above do not turn --yes into network permission or
-/// weaken this real restricted-spawn assertion.
-#[cfg(target_os = "macos")]
-#[test]
-fn probe_default_network_refusal_never_saves_registration_or_catalog() {
-    let sb = sandbox();
-    newt(&sb)
-        .args([
-            "mcp",
-            "probe",
-            &newt_bin(),
-            "--arg",
-            "mcp",
-            "--save",
-            "--to-catalog",
-            "--yes",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Net axis"))
-        .stderr(predicate::str::contains("L3 BOUND"));
-    assert!(!sb.config_dir.join("config.toml").exists());
-    assert!(!sb.config_dir.join("mcp-catalog.toml").exists());
-}
-
 #[test]
 fn probe_failure_reports_every_candidate_tried() {
     let sb = sandbox();
@@ -249,7 +201,7 @@ fn probe_failure_reports_every_candidate_tried() {
 
 #[test]
 fn probe_json_emits_a_machine_readable_report() {
-    let sb = stdio_transport_sandbox();
+    let sb = sandbox();
     let assert = newt(&sb)
         .args([
             "mcp",
@@ -343,7 +295,7 @@ async fn probe_url_reports_auth_required_on_401() {
 
 #[test]
 fn probe_json_with_save_keeps_stdout_a_single_json_value() {
-    let sb = stdio_transport_sandbox();
+    let sb = sandbox();
     let assert = newt(&sb)
         .args([
             "mcp",
@@ -413,7 +365,7 @@ fn unreadable_catalog_drop_in_fails_install_loudly() {
 
 #[test]
 fn probe_rules_project_drop_in_beats_the_user_one() {
-    let sb = stdio_transport_sandbox();
+    let sb = sandbox();
     // User rules would never speak MCP; the project rules pin `mcp`. Success
     // proves the project file won the whole-file replacement.
     std::fs::write(
