@@ -46,15 +46,24 @@
 #   - settings concurrent-update grounding (#3090), mcp-import-real.yml:
 #     settings_update_fs is ignored and runs with --ignored --test-threads=1
 #     weekly and on release; pure settings update guards stay in this hook.
+#   - environment-selected Cargo fallback: scripts/test_cargo_fallback.py in
+#     ci.yml's lint job (pure dict/bool decisions; also in local `just check`).
 #   - GitHub Pages deploy and site entry-point check, .github/workflows/pages.yml
 #     (deployment/validation only; site-only pushes skip tests here).
 #   - hosted-model live eval, .github/workflows/eval-hosted.yml (weekly +
 #     release/**; needs EVAL_BASE_URL/EVAL_API_KEY, skips when unconfigured).
 #   - MCP import real-resource tier, .github/workflows/mcp-import-real.yml
 #     (weekly + release): --ignored subprocess/filesystem acceptance on all OSes,
-#     including the macOS-only stdio MCP net:none Seatbelt admission grounding
+#     including PR #3097's ignored Git network-read and tmux regression grounds
+#     (mocked guards remain in this hook), and the macOS-only stdio MCP net:none
+#     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
 #     needs the macOS kernel and a non-root caller).
+#   - patch read/write symlink containment, mcp-import-real.yml (weekly +
+#     release, Linux/macOS): newt-tools patch::tests::{apply_whole_files,
+#     read_contained_opt,fuzzy_patch,diffy_patch}_denies_symlink_escape_object_bound,
+#     with applier-diffy enabled and --ignored --test-threads=1. Ordinary push
+#     tests skip these via #[ignore]; the in-memory lexical guard stays scoped.
 #   - linked-worktree build metadata reads and hostile-env fixture (#2835),
 #     .github/workflows/macos-confined-contract.yml: linked_worktree_build_git
 #     runs natively under Seatbelt; Linux covers the same binary in scope.

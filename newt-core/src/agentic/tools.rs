@@ -4767,6 +4767,17 @@ async fn execute_authorized_tool(
                     return host_return(reason);
                 }
             }
+            // A git network read gets its one command's egress approved up
+            // front; every later use of `caveats` in this arm is that dispatch.
+            let network_read = if governed_git {
+                match native_git::approve_network_read(cmd, caveats, &mut permission_gate) {
+                    Ok(approved) => approved,
+                    Err(reason) => return host_return(reason),
+                }
+            } else {
+                None
+            };
+            let caveats = network_read.as_ref().unwrap_or(caveats);
             let filesystem_requests = match declared_filesystem_requests(args, cmd, &run_cwd) {
                 Ok(requests) => requests,
                 Err(error) => return host_return(error),

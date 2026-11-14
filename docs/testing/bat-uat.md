@@ -118,3 +118,25 @@ Per `CLAUDE.md` "Push Hook Governance": the per-PR jobs in `ci.yml` are mirrored
 by `.githooks/pre-push` (`just check` + `just cov-ci`). `eval-hosted.yml` is a
 documented parity *exception* (the live tier can't run in a push gate). When you
 edit either CI file, re-check the hook/pipeline cross-reference comments.
+
+## The regression register
+
+`docs/testing/regressions.toml` lists each regression an operator saw in a
+live run, with the mocked test that guards it on every PR and the
+real-resource test that grounds that mock. Both are required: a mocked guard
+alone was green while its regression was still live.
+
+`newt-core/tests/regression_register.rs` enforces the register. Every named
+test must exist in the embedded source and carry a test attribute. Guards must
+be enabled in the unit tier; grounds must use `#[ignore]`. The entry count may
+only go up. When a live run shows a regression, fix it, write both tests, add
+the entry (and its source to `SOURCES` if new), and raise `REGISTERED`.
+
+The registered Git/HTTP and tmux grounds run single-threaded in the existing
+`mcp-import-real.yml` weekly/release workflow, using `--ignored --test-threads=1`.
+That lane also runs the hostile-PATH Git approval ground. The cockpit's broader
+PTY workflow excludes `a_real_terminal_` so these tmux grounds remain in the
+weekly/release tier. They are CI-only exceptions in `.githooks/pre-push`;
+per-PR guards capture presenter bytes in memory and inject helper discovery.
+The register checker embeds sources with `include_str!`, so it does no runtime
+filesystem I/O. It checks names and tier markers, not whether a ground ran.

@@ -147,7 +147,7 @@ fn permission_policy(
     // one-shot `cargo fetch`. A recorded session/permanent grant would flow
     // into `recalled_caveats` and widen the shell worker's net to crates.io,
     // which the prompt does not say. Offer allow-once/deny only.
-    let one_shot = req.tool == "lifecycle" && req.kind == DenialKind::Net;
+    let one_shot = req.operation_egress();
     if !one_shot && (tier == danger::DangerTier::Low || req.kind == DenialKind::Build) {
         actions.push(OfferedAction {
             action: PromptChoice::AllowSession,
@@ -2157,8 +2157,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         use newt_core::PermissionDecision::{Allow, Deny};
         if operation_only
             && (requests.len() != 1
-                || requests[0].tool != "lifecycle"
-                || requests[0].kind != newt_core::DenialKind::Net
+                || !requests[0].operation_egress()
                 || baseline.net != newt_core::Scope::All)
         {
             return Deny;
