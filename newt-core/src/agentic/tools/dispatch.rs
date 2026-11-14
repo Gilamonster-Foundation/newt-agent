@@ -29,6 +29,9 @@ use crate::agentic::tools::{execute_tool_inner, shell, tool_presentation};
 /// `Default` uses absent collaborators and the ordinary default command budget.
 #[derive(Default)]
 pub(crate) struct ToolCollaborators<'a, 'gate> {
+    /// Resource-only probe for the real run_command route; absent in production.
+    #[cfg(test)]
+    pub(crate) command_probe: Option<&'a super::gh_read_tests::Probe>,
     pub(crate) command_budget: crate::RunCommandBudget,
     /// Empty in legacy fixtures: use the default POSIX guidance.
     pub(crate) shell_dialect: &'static str,
