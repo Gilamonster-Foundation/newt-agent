@@ -2,6 +2,7 @@
 //! Keep the caller's shell source unchanged and preserve the embedded adapter's
 //! destructive-operation confirmations while the command interface migrates.
 
+pub(super) mod fetch;
 pub(super) mod publication;
 pub(super) mod push_command;
 mod push_failure;
@@ -97,7 +98,8 @@ fn http_transport_helpers(caveats: &Caveats) -> Vec<String> {
 /// command reads no remote, or no operator is present (headless runs as
 /// before). A declined prompt refuses the command rather than running it into
 /// the fence.
-pub(super) fn approve_network_read(
+#[cfg(test)]
+fn approve_network_read(
     source: &str,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
@@ -154,6 +156,41 @@ fn approve_network_read_with(
             "denied: the operator declined network access for this `git {verb}`, or the session's \
              authority ceiling forbids it. No command ran. Do not retry it; take a different approach."
         )),
+    }
+}
+
+/// Shared dispatch boundary: a broker refusal falls through only to the same
+/// consent-first network-read path used by pull, clone and ls-remote.
+pub(super) fn dispatch_network_read(
+    source: &str,
+    cwd: &Path,
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+) -> std::ops::ControlFlow<String, Option<Caveats>> {
+    dispatch_network_read_with(
+        source,
+        caveats,
+        gate,
+        |gate| fetch::execute(source, cwd, caveats, gate),
+        || http_transport_helpers(caveats),
+    )
+}
+
+fn dispatch_network_read_with(
+    source: &str,
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+    broker: impl FnOnce(&mut Option<&mut dyn PermissionGate>) -> Option<String>,
+    helpers: impl FnOnce() -> Vec<String>,
+) -> std::ops::ControlFlow<String, Option<Caveats>> {
+    if fetch::wanted(source, caveats) {
+        if let Some(result) = broker(gate) {
+            return std::ops::ControlFlow::Break(result);
+        }
+    }
+    match approve_network_read_with(source, caveats, gate, helpers) {
+        Ok(approved) => std::ops::ControlFlow::Continue(approved),
+        Err(reason) => std::ops::ControlFlow::Break(reason),
     }
 }
 
@@ -341,6 +378,21 @@ fn fixed_form(result: Result<crate::git_staging::Outcome, crate::git_staging::Re
         .to_string()
 }
 
+/// Writes a refusal's typed operator hints (a chmod fix) to the harness notice
+/// channel. Shared by the push and fetch brokers.
+fn notice_trust_hints(refusal: &crate::git_staging::Refusal, mut notice: impl std::io::Write) {
+    for hint in refusal.hints() {
+        crate::agentic::display::write_harness_notice(&mut notice, &hint.render(), false);
+    }
+    if !refusal.hints().is_empty() {
+        crate::agentic::display::write_harness_notice(
+            &mut notice,
+            "Run `newt doctor` to check all git broker tool paths.",
+            false,
+        );
+    }
+}
+
 /// Item 8: routes the operator-actionable hint (a chmod fix) to the harness
 /// notice channel before normalising the model-facing result to F6 fixed
 /// form. The hint is the refusal's TYPED [`TrustHint`] field — the detail
@@ -350,19 +402,10 @@ fn fixed_form(result: Result<crate::git_staging::Outcome, crate::git_staging::Re
 /// [`TrustHint`]: crate::git_staging::TrustHint
 fn fixed_form_with_notice(
     result: Result<crate::git_staging::Outcome, crate::git_staging::Refusal>,
-    mut notice: impl std::io::Write,
+    notice: impl std::io::Write,
 ) -> String {
     if let Err(refusal) = &result {
-        for hint in refusal.hints() {
-            crate::agentic::display::write_harness_notice(&mut notice, &hint.render(), false);
-        }
-        if !refusal.hints().is_empty() {
-            crate::agentic::display::write_harness_notice(
-                &mut notice,
-                "Run `newt doctor` to check all push tool paths.",
-                false,
-            );
-        }
+        notice_trust_hints(refusal, notice);
     }
     fixed_form(result)
 }
@@ -1426,6 +1469,44 @@ mod tests {
             "declined approval with empty exec scope reached host helper discovery"
         );
         assert!(result.unwrap_err().contains("No command ran"));
+        assert_eq!(gate.seen.len(), 1);
+    }
+
+    /// Grounds the actual broker/fallback dispatch decision without filesystem
+    /// or processes: trust rejection returns None, then consent must stop discovery.
+    #[test]
+    fn broker_trust_failure_then_declined_approval_never_spawns() {
+        let caveats = Caveats {
+            net: crate::Scope::none(),
+            exec: crate::Scope::only(["git".to_string()]),
+            ..Caveats::top()
+        };
+        let mut gate = EgressGate::default();
+        let mut rejected = false;
+        let mut spawned = false;
+        let result = dispatch_network_read_with(
+            "git fetch origin",
+            &caveats,
+            &mut Some(&mut gate),
+            |_| {
+                // The broker's authentication refusal is a fall-through, not
+                // permission to execute the rejected executable in the fallback.
+                rejected = true;
+                None
+            },
+            || {
+                spawned = true;
+                Vec::new()
+            },
+        );
+        assert!(rejected, "fetch broker was not offered the dispatch");
+        assert!(
+            !spawned,
+            "broker trust failure plus declined approval reached host discovery"
+        );
+        assert!(
+            matches!(result, std::ops::ControlFlow::Break(ref reason) if reason.contains("No command ran"))
+        );
         assert_eq!(gate.seen.len(), 1);
     }
 
@@ -3499,6 +3580,351 @@ mod governed_push_tests {
                 );
             }
         }
+    }
+
+    /// Grounds `broker_trust_failure_then_declined_approval_never_spawns` at
+    /// the real run_command boundary, with a writable Git first on PATH.
+    #[test]
+    #[ignore = "real Git and hostile PATH; weekly/release real-resource tier"]
+    fn fetch_broker_hostile_path_fallback_never_spawns_after_decline() {
+        assert!(fence(), "this grounding requires the native kernel fence");
+        let env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let planted = env.bin.path().join("git");
+        let marker = env.bin.path().join("spawned");
+        std::fs::write(
+            &planted,
+            format!(
+                "#!/bin/sh\n: > {}\n",
+                crate::mcp::shell_quote_arg(&marker.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let caveats = Caveats {
+            net: Scope::none(),
+            exec: Scope::only(["git".into()]),
+            fs_write: Scope::only([
+                repo.path().to_string_lossy().into_owned(),
+                env.bin.path().to_string_lossy().into_owned(),
+            ]),
+            ..Caveats::top()
+        };
+        let mut gate = super::tests::EgressGate::default();
+        let (output, _) = dispatch_run_command_with_gate(
+            repo.path(),
+            "git fetch origin",
+            &caveats,
+            Some(&mut gate),
+        );
+        assert!(
+            output.contains("operator declined network access"),
+            "{output}"
+        );
+        assert_eq!(gate.seen.len(), 1);
+        assert!(!marker.exists(), "broker-refused Git ran in the fallback");
+    }
+
+    /// Grounds the deny-all policy guard with malicious repository URL config.
+    /// The unfenced negative control reaches the loopback server, proving that
+    /// the configured rewrite applies. Under an admitted deny-all fence on
+    /// Linux or macOS, Git rejects the transport before reaching either target.
+    /// Also grounds `seatbelt_deny_all_policy_requires_a_kernel_witness`.
+    #[test]
+    #[ignore = "real Git, HTTP and native fence; weekly/release real-resource tier"]
+    fn fetch_broker_delivery_refuses_hostile_url_rewriting() {
+        assert!(fence(), "this grounding requires the native kernel fence");
+        let env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let caveats = Caveats {
+            fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        let tools = crate::git_staging::TrustedTools::authenticate(
+            crate::git_staging::TrustContext::bind(&caveats.fs_write).unwrap(),
+        )
+        .unwrap();
+        let staging =
+            crate::git_staging::StagingRepo::create(&env._state.path().join("copy"), tools.ctx())
+                .unwrap();
+        let held = crate::git_staging::HeldRoots::bind(&caveats.fs_read).unwrap();
+        let source = staging.path().to_str().unwrap();
+        let workspace = repo.path().to_str().unwrap();
+        let args = [
+            "-C",
+            workspace,
+            "fetch",
+            "--no-auto-maintenance",
+            "--no-recurse-submodules",
+            source,
+            "+refs/heads/*:refs/remotes/origin/*",
+        ];
+        let (port, endpoint) = receive_pack_endpoint(false);
+        let rewrite = format!("url.http://127.0.0.1:{port}/rewrite.insteadOf");
+        git(repo.path(), &["config", &rewrite, source]);
+        let before = refs(repo.path());
+        let result = crate::git_staging::confined_git(
+            &tools,
+            &staging,
+            &args,
+            Scope::only([format!("{workspace}/.git")]),
+            &caveats,
+            &held,
+        );
+        let seen = stop(port, endpoint);
+        assert!(
+            seen.requests.is_empty(),
+            "delivery reached a rewritten host: {seen:?}"
+        );
+        let output = result.expect("the audited, unprivileged copy must be admitted");
+        assert!(
+            !output.success,
+            "hostile source must not succeed: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("transport 'http' not allowed"),
+            "Git must reject the rewritten transport: {output:?}"
+        );
+        assert_eq!(refs(repo.path()), before);
+
+        // Negative control: the exact same repository rewrite has a witness.
+        let (port, endpoint) = receive_pack_endpoint(false);
+        git(repo.path(), &["config", "--unset", &rewrite]);
+        git(
+            repo.path(),
+            &[
+                "config",
+                &format!("url.http://127.0.0.1:{port}/rewrite.insteadOf"),
+                source,
+            ],
+        );
+        let _ = tools
+            .git(args)
+            .current_dir(staging.path())
+            .output()
+            .unwrap();
+        let seen = stop(port, endpoint);
+        assert!(
+            !seen.requests.is_empty(),
+            "negative control did not exercise URL rewriting"
+        );
+
+        // A repository can also rewrite the source into an executable transport.
+        // The file-only protocol floor must reject it even if local config opts in.
+        git(
+            repo.path(),
+            &[
+                "config",
+                "--remove-section",
+                &format!("url.http://127.0.0.1:{port}/rewrite"),
+            ],
+        );
+        let marker = repo.path().join(".git/transport-ran");
+        let helper = repo.path().join("transport");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\n: > {}\n",
+                crate::mcp::shell_quote_arg(&marker.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        git(repo.path(), &["config", "protocol.ext.allow", "always"]);
+        git(
+            repo.path(),
+            &[
+                "config",
+                &format!("url.ext::{}.insteadOf", helper.display()),
+                source,
+            ],
+        );
+        let result = crate::git_staging::confined_git(
+            &tools,
+            &staging,
+            &args,
+            Scope::only([format!("{workspace}/.git")]),
+            &caveats,
+            &held,
+        );
+        assert!(
+            !marker.exists(),
+            "repository-selected executable ran: {result:?}"
+        );
+        let output = result.expect("the audited, unprivileged copy must be admitted");
+        assert!(
+            !output.success,
+            "executable transport succeeded: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("transport 'ext' not allowed"),
+            "Git must reject the executable transport: {output:?}"
+        );
+        let _ = tools
+            .git(args)
+            .current_dir(staging.path())
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "negative control did not execute the rewritten transport"
+        );
+    }
+
+    /// Grounds the partial-delivery reporting guard with an independently
+    /// locked ref. Git can update `good` while refusing `locked`; the broker
+    /// must report uncertainty instead of claiming a rollback it never made.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "real Git refs and native fence; weekly/release real-resource tier"]
+    fn fetch_broker_delivery_reports_an_independent_ref_failure() {
+        assert!(fence(), "this grounding requires the native kernel fence");
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let remote = tempdir();
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let url = remote.path().to_str().unwrap();
+        git(repo.path(), &["remote", "set-url", "origin", url]);
+        git(
+            repo.path(),
+            &[
+                "push",
+                "-q",
+                url,
+                "HEAD:refs/heads/good",
+                "HEAD:refs/heads/locked",
+            ],
+        );
+        let refs_dir = repo.path().join(".git/refs/remotes/origin");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(refs_dir.join("locked.lock"), "independent writer").unwrap();
+        let caveats = Caveats {
+            fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
+            ..with_net(Scope::only(["forge.example".to_string()]))
+        };
+        let result = fetch::execute_with("git fetch", repo.path(), &caveats, &mut None, |_| {
+            Some("forge.example".into())
+        })
+        .unwrap();
+        let after = refs(repo.path());
+        assert!(
+            after.contains("refs/remotes/origin/good"),
+            "successful ref did not update: {result} / {after}"
+        );
+        assert!(
+            !after.contains("refs/remotes/origin/locked"),
+            "locked ref unexpectedly updated: {after}"
+        );
+        assert!(result.contains("may have changed"), "{result}");
+        assert!(
+            !result.contains("Nothing in the repository changed"),
+            "{result}"
+        );
+    }
+
+    /// Grounds `fetch::tests`: those pin which commands the fetch broker takes;
+    /// this runs one for real. The seed and deliver steps run in the kernel
+    /// fence, the dial fetches a real repository, and the workspace ends up
+    /// with the remote's new branch and its objects, and without the branch
+    /// the remote deleted. A local repository stands in for the forge. On macOS
+    /// this also grounds the admitted arm of the pure deny-all witness policy.
+    #[test]
+    #[ignore = "real Git and native fence; weekly/release real-resource tier"]
+    fn a_brokered_fetch_brings_new_refs_and_objects_into_the_workspace() {
+        assert!(fence(), "this grounding requires the native kernel fence");
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let remote = tempdir();
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let remote_url = remote.path().to_str().unwrap();
+        git(repo.path(), &["remote", "set-url", "origin", remote_url]);
+        git(
+            repo.path(),
+            &[
+                "push",
+                "-q",
+                remote_url,
+                "HEAD:refs/heads/main",
+                "HEAD:refs/heads/gone",
+            ],
+        );
+        let caveats = Caveats {
+            fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
+            ..with_net(Scope::only(["forge.example".to_string()]))
+        };
+        let fetch = |command: &str| {
+            fetch::execute_with(command, repo.path(), &caveats, &mut None, |_| {
+                Some("forge.example".to_string())
+            })
+            .expect("the broker handles this fetch")
+        };
+
+        let first = fetch("git fetch");
+        let tracked = refs(repo.path());
+        assert!(
+            tracked.contains("refs/remotes/origin/gone"),
+            "{first} / {tracked}"
+        );
+
+        // Elsewhere, someone adds a branch the workspace has no objects for
+        // and deletes one it tracks.
+        let other = tempdir();
+        git(other.path(), &["clone", "-q", remote_url, "."]);
+        let fresh = commit(other.path(), "new.txt", "new\n");
+        git(
+            other.path(),
+            &["push", "-q", "origin", "HEAD:refs/heads/fresh"],
+        );
+        git(remote.path(), &["update-ref", "-d", "refs/heads/gone"]);
+
+        let second = fetch("git fetch --prune 2>&1 | head -20");
+        let tracked = refs(repo.path());
+        assert!(
+            tracked.contains(&format!("refs/remotes/origin/fresh {fresh}")),
+            "{second} / {tracked}"
+        );
+        assert!(
+            !tracked.contains("refs/remotes/origin/gone"),
+            "{second} / {tracked}"
+        );
+        assert_eq!(git(repo.path(), &["cat-file", "-t", &fresh]), "commit");
+        assert!(
+            second.contains("fresh") && second.contains(remote_url),
+            "{second}"
+        );
+        assert!(!second.contains("staging-"), "{second}");
+    }
+
+    /// Grounds the fetch selection and approval guards: a real dispatch asks
+    /// for the remote's HOST, and a decline runs no transfer.
+    #[test]
+    #[ignore = "real Git and dispatch; weekly/release real-resource tier"]
+    fn a_declined_brokered_fetch_changes_nothing_and_names_the_host() {
+        assert!(fence(), "this grounding requires the native kernel fence");
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let caveats = Caveats {
+            fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
+            ..with_net(Scope::only(["lms.example.com".to_string()]))
+        };
+        let before = refs(repo.path());
+        let mut gate = Gate {
+            allow: false,
+            requests: vec![],
+        };
+        let (output, _) = dispatch_run_command_with_gate(
+            repo.path(),
+            "git fetch --prune",
+            &caveats,
+            Some(&mut gate),
+        );
+        assert!(
+            output.contains("did not grant network access to 'github.com'"),
+            "{output}"
+        );
+        assert_eq!(gate.requests.len(), 1, "{:?}", gate.requests);
+        assert_eq!(gate.requests[0].target, "github.com");
+        assert_eq!(refs(repo.path()), before);
     }
 
     /// #2719: the actual run_command path folds a worktree cd, intercepts

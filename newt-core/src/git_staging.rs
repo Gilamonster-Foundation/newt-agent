@@ -1099,7 +1099,8 @@ pub fn literal_remote_url(
 // Confined git (F4): the only steps that read workspace objects
 // ---------------------------------------------------------------------------
 
-/// Run the checked git CONFINED: `fs_read`/`fs_write` as given, no network,
+/// Run the checked git under the existing push-copy policy: `fs_read`/`fs_write`
+/// as given, with the platform network limitation documented below. It is
 /// minted under the `AgentInfluenced` KERNEL floor, and the sandbox kind the
 /// executor ACTUALLY applied is checked afterwards: an advisory
 /// (`SandboxKind::None`) run refuses even if it succeeded.
@@ -1125,6 +1126,23 @@ pub fn run_confined_git(
     fs_write: Scope<String>,
     held: Vec<agent_bridle::HeldReadRoot>,
 ) -> Result<crate::confined_exec::ConfinedOutput, String> {
+    execute_confined_git(confined_git_request(
+        tools, args, cwd, session, fs_read, fs_write, held,
+    ))
+}
+
+fn confined_git_request(
+    tools: &TrustedTools,
+    args: &[&str],
+    cwd: &Path,
+    session: &Caveats,
+    fs_read: Scope<String>,
+    fs_write: Scope<String>,
+    held: Vec<agent_bridle::HeldReadRoot>,
+) -> crate::confined_exec::ExecRequest {
+    // The historical push-copy policy, preserved here. Fetch copies additionally
+    // require NetGrant::DenyAll through fetch_copy_request; they must never rely
+    // on this local-source assumption.
     // macOS Seatbelt is advisory for both net AND exec in this path: the
     // kernel profile it receives does not prevent the confined copy from
     // spawning arbitrary children or opening network sockets.  Net is safe
@@ -1149,7 +1167,7 @@ pub fn run_confined_git(
         net: net_scope,
         ..session.clone()
     };
-    let req = crate::confined_exec::ExecRequest::new(
+    crate::confined_exec::ExecRequest::new(
         crate::confined_exec::ExecOrigin::AgentInfluenced,
         tools.git.to_string_lossy().into_owned(),
         args.iter().copied(),
@@ -1157,7 +1175,12 @@ pub fn run_confined_git(
         caveats,
     )
     .envs(tools.env.iter().cloned())
-    .held_read_roots(held);
+    .held_read_roots(held)
+}
+
+fn execute_confined_git(
+    req: crate::confined_exec::ExecRequest,
+) -> Result<crate::confined_exec::ConfinedOutput, String> {
     let out = crate::confined_exec::ConstrainedExecutor::run(&req)
         .map_err(|e| format!("refused: confined git could not run — {e}"))?;
     require_kernel_fence(out.sandbox_kind)?;
@@ -1251,6 +1274,47 @@ pub(crate) fn confined_fetch_with(
 ) -> Result<(), Refusal> {
     let staging_dir = staging.path().to_string_lossy().into_owned();
     let source = source_repo.to_string_lossy();
+    let request = confined_beside_staging(
+        tools,
+        staging,
+        &[
+            "-C",
+            &staging_dir,
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            &source,
+            oid,
+        ],
+        Scope::only([staging_dir.clone()]),
+        session,
+        held,
+        after_verify,
+    )?;
+    let out = execute_confined_git(request)?;
+    if out.success {
+        Ok(())
+    } else {
+        Err("refused: the confined copy of the approved commit failed"
+            .to_string()
+            .into())
+    }
+}
+
+/// One confined git that may read the held roots plus staging and write only
+/// `fs_write`: the fence both directions of the broker share. A push copies
+/// workspace objects INTO staging ([`confined_fetch`]); a fetch seeds staging
+/// the same way and then copies the fetched refs back OUT ([`confined_git`]).
+fn confined_beside_staging(
+    tools: &TrustedTools,
+    staging: &StagingRepo,
+    args: &[&str],
+    fs_write: Scope<String>,
+    session: &Caveats,
+    held: &HeldRoots,
+    after_verify: impl FnOnce(),
+) -> Result<crate::confined_exec::ExecRequest, Refusal> {
+    let staging_dir = staging.path().to_string_lossy().into_owned();
     held.verify_identities()?;
     #[cfg(target_os = "linux")]
     let held_fds = held.held_read_roots()?;
@@ -1263,33 +1327,54 @@ pub(crate) fn confined_fetch_with(
             held.canonical()
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
-                .chain([staging_dir.clone()]),
+                .chain([staging_dir]),
         ),
     };
-    let out = run_confined_git(
+    Ok(confined_git_request(
         tools,
-        &[
-            "-C",
-            &staging_dir,
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            &source,
-            oid,
-        ],
+        args,
         staging.path(),
         session,
         fs_read,
-        Scope::only([staging_dir.clone()]),
+        fs_write,
         held_fds,
-    )?;
-    if out.success {
-        Ok(())
-    } else {
-        Err("refused: the confined copy of the approved commit failed"
-            .to_string()
-            .into())
-    }
+    ))
+}
+
+/// A confined git for the fetch broker: reads the held roots plus staging,
+/// writes only `fs_write`, and requires the executor's deny-all network floor.
+/// macOS admits audited, unprivileged Seatbelt launches with a kernel network
+/// witness; absent that witness, the executor refuses before the copy spawns.
+/// Repository transport configuration cannot relax the floor.
+///
+/// # Errors
+/// As [`confined_fetch`].
+pub fn confined_git(
+    tools: &TrustedTools,
+    staging: &StagingRepo,
+    args: &[&str],
+    fs_write: Scope<String>,
+    session: &Caveats,
+    held: &HeldRoots,
+) -> Result<crate::confined_exec::ConfinedOutput, Refusal> {
+    let request = confined_beside_staging(tools, staging, args, fs_write, session, held, || {})?;
+    Ok(execute_confined_git(fetch_copy_request(request))?)
+}
+
+/// The fetch copy's network floor, independent of the push-copy policy.
+pub(crate) fn fetch_copy_request(
+    request: crate::confined_exec::ExecRequest,
+) -> crate::confined_exec::ExecRequest {
+    request
+        .net_grant(crate::confined_exec::NetGrant::DenyAll)
+        // Reuse the shell's repository-config hardening (hooks, fsmonitor,
+        // SSH, ext transport, etc.). File-only transport also defeats a
+        // repository's protocol.*.allow overrides after URL rewriting.
+        .envs(crate::git_hardening::sandbox_git_env(
+            ("", ""),
+            &Default::default(),
+        ))
+        .env("GIT_ALLOW_PROTOCOL", "file")
 }
 
 // ---------------------------------------------------------------------------
