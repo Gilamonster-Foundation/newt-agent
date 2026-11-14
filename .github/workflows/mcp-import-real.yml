@@ -92,6 +92,15 @@ jobs:
           -p newt-core --lib atomic_fs::tests::
           -- --ignored --test-threads=1
 
+      # HOOK PARITY: CI-only; settings_update_fs is ignored by ordinary tests.
+      - name: Run settings concurrent-update filesystem grounding (#3090)
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test concurrent_updates_for_different_projects_all_persist
+          -p newt-core --test settings_update_fs
+          -- --ignored --test-threads=1
+
       # The real-file tests for MCP config ownership, toggles and discovery
       # diagnostics (#2915). Each filter is a module, so a new ignored test
       # there is selected without editing this step.

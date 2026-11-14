@@ -30,9 +30,10 @@
 //!
 //! An entry exists only while it differs from the global `[session]` choice
 //! (or the default backend), is dropped when switched back, is capped at
-//! [`MAX_PROJECTS`] with least-recently-switched eviction (a start never writes), and is pruned when its
-//! path no longer exists. `[session]` is now hand-set: the app no longer
-//! writes it.
+//! [`MAX_PROJECTS`] with least-recently-switched eviction (a start never writes). It is
+//! never pruned for a path that looks missing: inside a confinement fence every
+//! other project looks missing (#3090), so the LRU cap is the only bound.
+//! `[session]` is now hand-set: the app no longer writes it.
 //!
 //! # Design
 //!
@@ -234,14 +235,14 @@ pub enum Choice<'a> {
 /// Record `choice` for `project` in `doc`: keep only what differs from the
 /// global `[session]` choice (`default_provider` is the config default backend,
 /// the baseline when `[session]` names none), drop the entry when nothing does,
-/// then prune paths that no longer `exist` and evict least-recently-switched beyond
-/// [`MAX_PROJECTS`]. Pure over `doc` so it unit-tests without a filesystem.
+/// then evict least-recently-switched beyond [`MAX_PROJECTS`]. No existence
+/// prune: a confined session cannot tell a missing path from an out-of-fence
+/// one (#3090). Pure over `doc` so it unit-tests without a filesystem.
 pub fn apply_project_choice(
     doc: &mut toml::Table,
     project: &str,
     choice: Choice<'_>,
     default_provider: Option<&str>,
-    exists: impl Fn(&str) -> bool,
 ) {
     let global = Session::from_doc(doc);
     let old = project_entry(doc, project);
@@ -267,7 +268,6 @@ pub fn apply_project_choice(
     let Some(projects) = projects.as_table_mut() else {
         return;
     };
-    projects.retain(|path, _| exists(path));
     let used = |v: &toml::Value| v.get("used").and_then(toml::Value::as_integer).unwrap_or(0);
     let tick = projects.values().map(used).max().unwrap_or(0) + 1;
     projects.remove(project);
@@ -305,7 +305,7 @@ const HEADER: &str = "\
 # (/model <name>) in the TUI: the choice is remembered PER PROJECT, under
 # [projects.\"<repo root>\"], and restored the next time newt starts there.
 # Only choices that differ from [session] (your own default, hand-set) are
-# kept; at most 32 projects, least recently SWITCHED dropped (reads never touch it), missing (or unmounted) paths pruned.
+# kept; at most 32 projects, least recently SWITCHED dropped (reads never touch it).
 # Restore is the LOWEST precedence: an explicit NEWT_PROVIDER / NEWT_DGX_MODEL
 # in the environment, a --backend-* flag or a --loadout, or a resumed
 # conversation's pin, always wins. Delete this file to forget every choice.
@@ -364,15 +364,11 @@ fn read_doc(path: &Path) -> toml::Table {
         .unwrap_or_default()
 }
 
-/// Write the document back, creating `~/.newt/` if needed. A serialization
-/// failure is surfaced as an error *before* any write, so a broken document
-/// never truncates the file.
-fn write_doc(path: &Path, doc: &toml::Table) -> std::io::Result<()> {
-    let text = to_toml_string(doc).map_err(|e| std::io::Error::other(e.to_string()))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, text)
+/// Write the document back atomically (stage + rename), so a concurrent reader
+/// never sees a truncated file and parses it as empty. A serialization failure
+/// is surfaced *before* any write, so a broken document never touches the file.
+fn write_doc(path: &crate::atomic_fs::ResolvedPath, doc: &toml::Table) -> anyhow::Result<()> {
+    path.atomic_write(to_toml_string(doc)?.as_bytes())
 }
 
 /// The repo root for `cwd`: the parent of the nearest ancestor `.git` (a dir,
@@ -434,11 +430,48 @@ fn update(choice: Choice<'_>, default_provider: Option<&str>) {
     let (Some(path), Some(key)) = (settings_path(), project_key()) else {
         return;
     };
-    let mut doc = read_doc(&path);
-    apply_project_choice(&mut doc, &key, choice, default_provider, |p| {
-        Path::new(p).exists()
-    });
-    let _ = write_doc(&path, &doc);
+    let _ = update_at(&path, &key, choice, default_provider);
+}
+
+/// Record `choice` for `project` in the settings file at `path` (the seam
+/// [`record_provider`] / [`record_model`] go through, with the path explicit
+/// so the integration tier can point it at a temp file). The read-modify-write
+/// holds the `settings.toml.lock` sidecar, so concurrent sessions cannot drop
+/// each other's entries (#3090).
+pub fn update_at(
+    path: &Path,
+    project: &str,
+    choice: Choice<'_>,
+    default_provider: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let path = crate::atomic_fs::ResolvedPath::resolve(path)?;
+    update_with(
+        project,
+        choice,
+        default_provider,
+        || crate::atomic_fs::acquire_lock(&path.lock_path()),
+        || read_doc(path.as_path()),
+        |doc| write_doc(&path, doc),
+    )
+}
+
+/// Inject lock and document I/O so the update contract can be checked in memory.
+/// The returned lock guard covers both callbacks.
+fn update_with<L>(
+    project: &str,
+    choice: Choice<'_>,
+    default_provider: Option<&str>,
+    lock: impl FnOnce() -> anyhow::Result<L>,
+    read: impl FnOnce() -> toml::Table,
+    write: impl FnOnce(&toml::Table) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let _lock = lock()?;
+    let mut doc = read();
+    apply_project_choice(&mut doc, project, choice, default_provider);
+    write(&doc)
 }
 
 /// Persist the provider chosen via `/backends <name>` for this project,
@@ -627,7 +660,7 @@ mod tests {
     }
 
     fn switch(d: &mut toml::Table, proj: &str, c: Choice<'_>) {
-        apply_project_choice(d, proj, c, Some("dflt"), all_exist);
+        apply_project_choice(d, proj, c, Some("dflt"));
     }
 
     /// (a)+(b): a switch in A leaves B on the global choice; A restores its own.
@@ -705,16 +738,60 @@ mod tests {
         assert!(t.contains_key("/p0") && !t.contains_key("/p1"));
     }
 
-    /// (e): a path that no longer exists is pruned on the next write.
+    /// Regression for #3090: inside a confinement fence, paths outside the
+    /// workspace look missing, so `/model` in one confined session pruned every
+    /// other project's entry. An entry the session cannot see must survive:
+    /// there is no existence check left to falsify.
     #[test]
-    fn a_deleted_path_is_pruned_on_the_next_write() {
+    fn an_out_of_fence_project_survives_a_switch() {
         let mut d = doc("");
-        switch(&mut d, "/gone", Choice::Provider("y"));
-        apply_project_choice(&mut d, "/here", Choice::Provider("y"), Some("dflt"), |p| {
-            p != "/gone"
-        });
+        switch(&mut d, "/outside", Choice::Provider("y"));
+        switch(&mut d, "/inside", Choice::Model("m"));
         let t = d["projects"].as_table().expect("projects table");
-        assert!(!t.contains_key("/gone") && t.contains_key("/here"));
+        assert!(t.contains_key("/outside") && t.contains_key("/inside"));
+    }
+
+    /// In-memory read/write callbacks ground the update contract without a
+    /// filesystem, threads or sleeps. The ignored settings_update_fs test
+    /// checks that the real adapter also serializes concurrent updates.
+    #[test]
+    fn update_preserves_prior_projects_and_unknown_content() {
+        let lock = std::sync::Mutex::new(());
+        let file = std::cell::RefCell::new(
+            "keep = true\n[projects.\"/outside\"]\nmodel = \"outside-m\"\n".to_string(),
+        );
+        for project in ["/inside", "/another"] {
+            update_with(
+                project,
+                Choice::Model("m"),
+                Some("dflt"),
+                || Ok(lock.try_lock().expect("uncontended in-memory lock")),
+                || {
+                    assert!(lock.try_lock().is_err(), "read must hold the lock");
+                    doc(&file.borrow())
+                },
+                |updated| {
+                    assert!(lock.try_lock().is_err(), "write must hold the lock");
+                    *file.borrow_mut() = to_toml_string(updated)?;
+                    Ok(())
+                },
+            )
+            .expect("update in-memory settings");
+            assert!(lock.try_lock().is_ok(), "update must release the lock");
+        }
+        let saved = doc(&file.borrow());
+        assert_eq!(saved["keep"].as_bool(), Some(true));
+        for (project, model) in [
+            ("/outside", "outside-m"),
+            ("/inside", "m"),
+            ("/another", "m"),
+        ] {
+            assert_eq!(
+                Session::for_project(&saved, project).model.as_deref(),
+                Some(model),
+                "lost {project}"
+            );
+        }
     }
 
     /// (f): ephemeral sessions write nothing (the gate the callers use).
