@@ -2140,6 +2140,9 @@ pub(crate) fn supported() -> bool {
         && std::env::var_os("NEWT_NO_COCKPIT").is_none()
 }
 
+// Test screens lease the process-global arbiter until they drop. Keep the whole
+// module on its existing serial lane, including future callers of the helpers.
+#[cfg_attr(test, serial_test::serial(tty_arbiter))]
 #[cfg(test)]
 mod tests {
     /// **The presenter USES the guard** (#1925), which the PTY tests cannot
@@ -2344,6 +2347,10 @@ mod tests {
         widths: &[usize],
         (caret_x, caret_y): (u16, u16),
     ) -> Screen<W> {
+        assert!(
+            serial_test::is_locked_serially(Some("tty_arbiter")),
+            "test screens require the tty_arbiter lock for their entire lifetime"
+        );
         let tty = WrapFence::new(file);
         let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
         let backend = CaretBackend {
@@ -2510,7 +2517,6 @@ mod tests {
     /// dragged pane edge does. Every transcript row must still be on screen, ending on
     /// the row above the block. Before the slide, the shrink scrolled 8 of them away
     /// and left 8 blank rows in their place.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     #[ignore = "real tmux terminal; weekly/release real-resource tier"]
     fn a_real_terminal_keeps_the_transcript_through_a_grow_and_shrink() {
@@ -2560,7 +2566,6 @@ mod tests {
     /// history back down on a grow and the recorded terminal does not, so the history is
     /// cleared after the shrink: tmux then adds the new rows at the bottom, and without
     /// the repaint the 14 rows above `T23` stay blank (the live recording of 2026-11-13).
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     #[ignore = "real tmux terminal; weekly/release real-resource tier"]
     fn a_real_terminal_shows_the_transcript_again_after_a_shrink_and_grow() {
@@ -2601,7 +2606,6 @@ mod tests {
     /// The live recording of 2026-11-13: a pane dragged small and then large again came
     /// back with only the rows that fit the small pane, under blank rows. The rows the
     /// shrink scrolled away are repainted from the transcript this screen inserted.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_grow_repaints_the_rows_a_shrink_scrolled_away() {
         let tail: VecDeque<Row> = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
@@ -2647,7 +2651,6 @@ mod tests {
     /// makes the block 7 rows taller on a full screen and then closes. On a real
     /// terminal the block must be back on the bottom rows with the transcript ending
     /// right above it. Before the slide it stayed 7 rows up, over blank rows.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     #[ignore = "real tmux terminal; weekly/release real-resource tier"]
     fn a_real_terminal_returns_the_block_to_the_bottom_when_a_menu_closes() {
@@ -2705,7 +2708,6 @@ mod tests {
     /// #3041: split (narrow), draw, close the split (widen), draw. A screen part-filled
     /// with transcript keeps the block where it is through both reflows, so no erase may
     /// start above row 10: rows 0..10 are transcript.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_narrow_then_widen_resize_never_erases_above_the_block() {
         let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (60, 11));
@@ -2735,7 +2737,6 @@ mod tests {
     /// The live recording: the `/` palette opened on a bottom-row block and scrolled the
     /// transcript up 7 rows; closing it left the prompt 7 rows above the bottom. A block
     /// on the bottom row keeps it when it shrinks; one under short content does not move.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_shrinking_block_on_the_bottom_row_stays_there() {
         let (mut screen, log) = screen_with_block(80, 24, 14, 10, &[40; 10], (2, 22));
@@ -2764,7 +2765,6 @@ mod tests {
     /// The live recording: a pane edge dragged down left blank rows between the transcript
     /// and the pinned block, and dragging it back scrolled transcript off the top while
     /// those rows stayed. A grow whose block moves down now slides the transcript with it.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_grow_slides_the_transcript_down_with_the_block() {
         // The terminal added 8 rows below a 3-row block at the bottom of 24 rows.
@@ -2796,7 +2796,6 @@ mod tests {
     /// #3021 review: a width shrink whose footer wraps BELOW the caret. The terminal's
     /// reply already includes the scroll that reflow caused (block top 20), so erasing
     /// from `20 - growth` deleted the last transcript row above the block.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_measured_width_shrink_does_not_erase_transcript_above_the_block() {
         // 80x24, three-row block at row 21, caret on row 22; shrink to 40 wraps the
@@ -2808,7 +2807,6 @@ mod tests {
 
     /// The other side: a row ABOVE the caret wraps, pushing the caret down past the
     /// block's own offset, so the measured top reads one row too low.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_measured_width_shrink_with_a_wrapped_row_above_the_caret_erases_the_whole_block() {
         // Header (70 cols) wraps to two rows: the block now starts at 20 with the
@@ -2825,7 +2823,6 @@ mod tests {
     /// #3021 review, round 3: the caret's OWN row wraps before the caret. The input row
     /// (70 cols, caret at column 60) splits at 40, carrying the caret one row further down,
     /// so the reply reads one row lower than the header's wrap alone explains.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_measured_width_shrink_with_the_caret_row_wrapped_before_the_caret_erases_the_whole_block()
     {
@@ -2838,7 +2835,6 @@ mod tests {
 
     /// The control: the caret sits in the first fragment of its row, so only the header's
     /// wrap moved it.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_measured_width_shrink_with_the_caret_before_its_rows_wrap_point_erases_the_block() {
         let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (10, 11));
@@ -2848,7 +2844,6 @@ mod tests {
 
     /// The caret past its row's text, beyond the new width: terminals disagree on where
     /// reflow puts it, so the reply is not trusted and the unmeasured guess stands.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_caret_past_its_rows_text_beyond_the_new_width_falls_back_to_the_guess() {
         let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 50, 10], (60, 11));
@@ -2858,7 +2853,6 @@ mod tests {
     }
 
     /// Unmeasured, the guess still subtracts the whole reflow.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn an_unmeasured_width_shrink_still_lifts_by_the_whole_reflow() {
         let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], (5, 22));
@@ -2872,7 +2866,6 @@ mod tests {
     /// width: its caret sits past its row's text, so the measurement is refused. Seen in tmux
     /// and in a libghostty-vt terminal multiplexer; both kept the block's bottom row and lifted
     /// it by its reflow.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn an_unmeasured_narrow_puts_the_block_where_the_reflow_lifted_it_3041() {
         let (mut screen, log) = screen_with_block(120, 40, 37, 3, &[11, 98, 75], (98, 38));
@@ -2897,7 +2890,6 @@ mod tests {
     /// draw, or a `!` command holding the terminal) lifted the erase by the widths of a block
     /// no longer on screen and wiped committed rows. Live: narrowing during `! seq` lost the
     /// command's last output line.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn an_unmeasured_narrow_after_the_block_was_erased_lifts_nothing_3041() {
         let (mut screen, log) = screen_with_block(120, 40, 37, 3, &[11, 70, 75], (2, 38));
@@ -3140,46 +3132,9 @@ mod tests {
     /// writes, fails here; the fence unit test above cannot see either.
     #[test]
     fn a_production_draw_reaches_the_writer_as_one_synchronized_write() {
-        let log = Boundaries::default();
-        let tty = WrapFence::new(log.clone());
-        let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
-        let backend = CaretBackend {
-            inner: CrosstermBackend::new(WrapFence {
-                file: log.clone(),
-                state: Arc::clone(&tty.state),
-            }),
-            caret: Arc::clone(&caret),
-        };
-        let (cols, top, block_h) = (40, 2, 4);
-        let term = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, top, cols, block_h)),
-            },
-        )
-        .unwrap();
-        let region = newt_core::tty::Terminal::lease_region(
-            block_region(top, block_h),
-            newt_core::tty::OnCollision::Refuse,
-        )
-        .expect("the test owns these rows");
-        let mut screen = Screen {
-            tty,
-            term,
-            caret,
-            caret_frame: None,
-            can_query_cursor: true,
-            cols,
-            rows: 10,
-            top,
-            block_h,
-            status_rows: 1,
-            status: b"working".to_vec(),
-            queued: 0,
-            region,
-            painted_widths: Vec::new(),
-            tail: VecDeque::new(),
-        };
+        let (mut screen, log) = screen_with_block(40, 10, 2, 4, &[], (0, 0));
+        screen.caret_frame = None;
+        screen.status = b"working".to_vec();
         let editor = MountedEditor::new(crate::rich_input::Edit::Emacs, None, Vec::new(), "hi");
         let chrome = crate::rich_input::Chrome {
             model: "m",
