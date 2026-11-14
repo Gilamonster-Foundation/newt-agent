@@ -3,6 +3,8 @@
 //! destructive-operation confirmations while the command interface migrates.
 
 pub(super) mod fetch;
+#[cfg(test)]
+mod gh_http;
 pub(super) mod gh_read;
 pub(super) mod publication;
 pub(super) mod push_command;

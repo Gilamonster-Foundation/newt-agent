@@ -8,6 +8,7 @@ pub(crate) struct Probe {
     pub(super) remote: String,
     pub(super) calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
     pub(super) output: String,
+    pub(super) exit_code: i32,
 }
 
 impl Default for Probe {
@@ -18,6 +19,7 @@ impl Default for Probe {
             remote: "github.com/owner/repo".into(),
             calls: Default::default(),
             output: "issue 1".into(),
+            exit_code: 0,
         }
     }
 }
@@ -32,6 +34,10 @@ impl Probe {
             .lock()
             .unwrap()
             .push((host.into(), argv.to_vec()));
+        // Mirror the current real child's outcome boundary, including its bug.
+        if self.exit_code != 0 {
+            return Err("host gh read failed; check trusted gh credentials and read grants".into());
+        }
         Ok(self.output.clone())
     }
 }
@@ -442,4 +448,46 @@ fn gh_read_literal_arguments_are_not_classified_as_commands() {
             "{source}"
         );
     }
+}
+
+#[tokio::test]
+async fn gh_read_failed_and_pending_checks_keep_stdout_and_wrapper_status() {
+    for code in [1, 8] {
+        let probe = Probe {
+            output: "build pending\nlint failed\n".into(),
+            exit_code: code,
+            ..Default::default()
+        };
+        for (wrapper, expected) in [
+            ("", "build pending\nlint failed".to_string()),
+            ("; echo status=$?", format!("status={code}")),
+            (
+                " | head -1; echo status=$?",
+                "build pending\nstatus=0".into(),
+            ),
+        ] {
+            let out = dispatch(
+                &format!("gh pr checks 1 -R o/r{wrapper}"),
+                &granted(),
+                &probe,
+                &mut Gate::default(),
+            )
+            .await;
+            assert!(out.contains(&expected), "lost read output/status: {out}");
+            assert!(out.contains(&format!("(exit {code})")), "{out}");
+            assert!(!out.contains("credentials"), "{out}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn gh_read_decline_has_one_refused_prefix() {
+    let out = dispatch(
+        "gh issue view 1 -R otherhost/o/r",
+        &granted(),
+        &Probe::default(),
+        &mut Gate::default(),
+    )
+    .await;
+    assert_eq!(out.matches("refused:").count(), 1, "{out}");
 }
