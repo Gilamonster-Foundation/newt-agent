@@ -52,6 +52,24 @@ jobs:
         shell: bash
         run: bash .github/scripts/test-cargo-test-nonempty.sh
 
+      # Patch containment needs native filesystem semantics; keep it out of
+      # the unit tier and require every regression, including optional diffy.
+      - name: Run patch read/write symlink containment grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for test in \
+            apply_whole_files_denies_symlink_escape_object_bound \
+            read_contained_opt_denies_symlink_escape_object_bound \
+            fuzzy_patch_denies_symlink_escape_object_bound \
+            diffy_patch_denies_symlink_escape_object_bound
+          do
+            bash .github/scripts/cargo-test-nonempty.sh \
+              --require-test "$test" \
+              -p newt-tools --features applier-diffy --lib "$test" \
+              -- --ignored --test-threads=1
+          done
+
       - name: Run MCP import CLI real-resource tests
         shell: bash
         run: >-

@@ -810,7 +810,10 @@ mod tests {
         assert!(ws.join("sub/ok.rs").exists());
     }
 
+    /// Grounds the in-memory `is_workspace_contained_rejects_escapes` guard:
+    /// a lexically admitted path still needs the kernel's symlink boundary.
     #[test]
+    #[ignore = "real filesystem containment; weekly/release tier"]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn apply_whole_files_denies_symlink_escape_object_bound() {
         // step-52.7 (#522 CLOSURE): a symlink UNDER the workspace pointing outside
@@ -841,6 +844,80 @@ mod tests {
         );
     }
 
+    /// Grounds the lexical guard's admitted relative paths against real symlinks.
+    /// There is no injected filesystem seam in `read_contained_opt`; an in-memory
+    /// path check cannot prove the kernel refuses an escaping link.
+    #[test]
+    #[ignore = "real filesystem containment; weekly/release tier"]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn read_contained_opt_denies_symlink_escape_object_bound() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(ws.path().join("ordinary.txt"), "ordinary\n").unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        assert_eq!(
+            read_contained_opt(ws.path(), "ordinary.txt").unwrap(),
+            Some("ordinary\n".to_owned())
+        );
+        assert_eq!(read_contained_opt(ws.path(), "missing.txt").unwrap(), None);
+        let result = read_contained_opt(ws.path(), "link/secret.txt");
+        assert!(
+            result.is_err(),
+            "an escaping read must be refused: {result:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_patch_read_containment(applier: &dyn PatchApplier) {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(ws.path().join("ordinary.txt"), "original\n").unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+        let diff = "--- a/ordinary.txt\n+++ b/ordinary.txt\n@@ -1 +1 @@\n-original\n+updated\n";
+        applier.apply(ws.path(), diff).unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.path().join("ordinary.txt")).unwrap(),
+            "updated\n"
+        );
+
+        // Deliberately mismatching context distinguishes read refusal from a
+        // later hunk/write refusal. Reverting only the read cfg yields a patch
+        // error here, not the required I/O error, even with safe writes intact.
+        let escaping = diff.replace("ordinary.txt", "link/secret.txt");
+        let err = applier.apply(ws.path(), &escaping).unwrap_err();
+        assert!(
+            err.downcast_ref::<std::io::Error>().is_some(),
+            "{} must refuse the read before hunk application: {err}",
+            applier.name()
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "outside\n"
+        );
+    }
+
+    /// Grounds the in-memory lexical guard and fuzzy hunk tests at the read boundary.
+    #[test]
+    #[ignore = "real filesystem containment; weekly/release tier"]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fuzzy_patch_denies_symlink_escape_object_bound() {
+        assert_patch_read_containment(&FuzzyApplier);
+    }
+
+    /// Grounds the same lexical guard through the optional strict patch backend.
+    #[test]
+    #[ignore = "real filesystem containment; weekly/release tier"]
+    #[cfg(all(
+        feature = "applier-diffy",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn diffy_patch_denies_symlink_escape_object_bound() {
+        assert_patch_read_containment(&DiffyApplier);
+    }
+
     #[test]
     fn apply_patch_rejects_path_escape() {
         // Same containment for the legacy unified-diff path (fuzzy applier).
@@ -868,6 +945,9 @@ mod tests {
     #[test]
     fn is_workspace_contained_rejects_escapes() {
         // Pure component check — the load-bearing predicate, no fs.
+        // A lexical guard admits this shape; only the real-resource tests can
+        // tell whether `link` resolves outside the workspace.
+        assert!(is_workspace_contained(Path::new("link/secret.txt")));
         assert!(is_workspace_contained(Path::new("a/b.rs")));
         assert!(is_workspace_contained(Path::new("./a.rs")));
         assert!(is_workspace_contained(Path::new("sub/dir/file.txt")));
